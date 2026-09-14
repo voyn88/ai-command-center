@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -47,25 +48,36 @@ def pair(tmp_path):
 @pytest.fixture
 def calls(monkeypatch, tmp_path):
     """Fake the two privileged seams; git stays real."""
-    recorded = {"systemctl": [], "migrate": 0, "smoke_rc": 0, "systemctl_rc": {}}
+    recorded = {"systemctl": [], "migrate": 0, "smoke_rc": 0, "systemctl_rc": {}, "order": []}
 
     def fake_systemctl(args, timeout):
         recorded["systemctl"].append(args)
+        recorded["order"].append(f"systemctl:{args[0]}")
         rc = recorded["systemctl_rc"].get(tuple(args[:1]), 0)
         out = "active" if args[0] == "is-active" and rc == 0 else ""
         return subprocess.CompletedProcess(args, rc, out, "" if rc == 0 else "boom")
 
     def fake_migrations(repo_path, timeout):
         recorded["migrate"] += 1
+        recorded["order"].append("migrate")
         recorded["migrate_cwd"] = repo_path
         return subprocess.CompletedProcess([], 0, "", "")
 
     def fake_smoke(repo_path, timeout):
+        recorded["smoke_cwd"] = repo_path
         return subprocess.CompletedProcess([], recorded["smoke_rc"], "", "import boom")
+
+    def fake_dispatch_smoke(repo_path, timeout):
+        recorded["dispatch_smoke"] = recorded.get("dispatch_smoke", 0) + 1
+        recorded["order"].append("dispatch_smoke")
+        return subprocess.CompletedProcess(
+            [], recorded.get("dispatch_smoke_rc", 0), "", "permission denied for view"
+        )
 
     monkeypatch.setattr(self_deploy, "_systemctl", fake_systemctl)
     monkeypatch.setattr(self_deploy, "_run_migrations", fake_migrations)
     monkeypatch.setattr(self_deploy, "_import_smoke", fake_smoke)
+    monkeypatch.setattr(self_deploy, "_dispatch_smoke", fake_dispatch_smoke)
     return recorded
 
 
@@ -82,6 +94,50 @@ def test_noop_when_already_at_origin(pair, calls, tmp_path):
     assert report.target_sha == first
     assert calls["systemctl"] == [] and calls["migrate"] == 0
     assert not (tmp_path / "provenance.jsonl").exists()  # noops leave no rows
+
+
+def test_refuses_while_a_staged_rollout_holds_the_lock(pair, calls, tmp_path):
+    """A self-deploy tick that fires while the staged rollout holds its lock
+    must refuse before touching git or systemctl -- a restart issued mid-drain
+    is exactly what raced the rollout's own `stop` of the canary lane on
+    worker-01 (live 2026-09-08). The next tick, five minutes later once the
+    rollout has finished and removed the lock, picks the deploy back up."""
+    origin, clone, first = pair
+    _commit(origin, "advance")  # a real fast-forward is available and skipped
+    lock = tmp_path / "aicc-staged-rollout.lock"
+    lock.write_text("12345\n", encoding="utf-8")
+    cfg = _cfg(
+        tmp_path,
+        services=("voyn-aicc-worker.service",),
+        rollout_lock_path=str(lock),
+    )
+
+    report = self_deploy_once(str(clone), cfg)
+
+    assert (report.outcome, report.detail) == ("refused", "staged_rollout_in_progress")
+    assert calls["systemctl"] == [] and calls["migrate"] == 0
+    assert _git(clone, "rev-parse", "HEAD") == first  # untouched
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "provenance.jsonl").read_text().splitlines()
+    ]
+    assert rows[-1]["outcome"] == "refused"
+    assert rows[-1]["detail"] == "staged_rollout_in_progress"
+
+
+def test_deploys_normally_once_the_rollout_lock_is_absent(pair, calls, tmp_path):
+    origin, clone, _first = pair
+    new = _commit(origin, "advance")
+    cfg = _cfg(
+        tmp_path,
+        services=("voyn-aicc-worker.service",),
+        rollout_lock_path=str(tmp_path / "no-such-lock"),
+    )
+
+    report = self_deploy_once(str(clone), cfg)
+
+    assert (report.outcome, report.detail) == ("deployed", new)
+    assert ["restart", "voyn-aicc-worker.service"] in calls["systemctl"]
 
 
 def test_fast_forward_deploys_migrates_restarts_and_records(pair, calls, tmp_path):
@@ -104,6 +160,144 @@ def test_fast_forward_deploys_migrates_restarts_and_records(pair, calls, tmp_pat
         for line in (tmp_path / "provenance.jsonl").read_text().splitlines()
     ]
     assert rows[-1]["outcome"] == "deployed" and rows[-1]["target_sha"] == new
+
+
+def test_immutable_release_is_staged_and_selected(pair, calls, tmp_path):
+    origin, clone, _first = pair
+    new = _commit(origin, "advance")
+    release_root = tmp_path / "opt-aicc"
+    runtime_venv = tmp_path / "runtime-venv"
+    runtime_venv.mkdir()
+
+    report = self_deploy_once(
+        str(clone),
+        _cfg(
+            tmp_path,
+            migrate=True,
+            release_root=str(release_root),
+            release_venv=str(runtime_venv),
+        ),
+    )
+
+    release = release_root / "releases" / new
+    assert (report.outcome, report.detail) == ("deployed", new)
+    assert release.is_dir()
+    assert (release / "tracked.txt").read_text() == "advance"
+    assert (release / ".aicc-release-sha").read_text() == new + "\n"
+    assert (release / ".venv").is_symlink()
+    assert (release / ".venv").readlink() == runtime_venv
+    assert (release_root / "current").readlink() == Path(f"releases/{new}")
+    assert calls["smoke_cwd"] == str(release)
+    assert calls["migrate_cwd"] == str(release)
+    assert "release_selected:" + new in report.steps
+
+
+def test_already_current_checkout_still_selects_missing_immutable_release(
+    pair, calls, tmp_path
+):
+    _origin, clone, current = pair
+    release_root = tmp_path / "opt-aicc"
+    release_root.mkdir()
+    (release_root / "current").symlink_to(clone)
+    runtime_venv = tmp_path / "runtime-venv"
+    runtime_venv.mkdir()
+
+    report = self_deploy_once(
+        str(clone),
+        _cfg(
+            tmp_path,
+            migrate=True,
+            release_root=str(release_root),
+            release_venv=str(runtime_venv),
+        ),
+    )
+
+    release = release_root / "releases" / current
+    assert (report.outcome, report.detail) == ("deployed", current)
+    assert release.is_dir()
+    assert (release_root / "current").readlink() == Path(f"releases/{current}")
+    assert calls["smoke_cwd"] == str(release)
+    assert calls["migrate_cwd"] == str(release)
+    assert "checkout_already_current:" + current in report.steps
+    assert "release_selected:" + current in report.steps
+
+
+def test_noop_when_checkout_and_immutable_release_are_current(pair, calls, tmp_path):
+    _origin, clone, current = pair
+    release_root = tmp_path / "opt-aicc"
+    release = release_root / "releases" / current
+    release.mkdir(parents=True)
+    (release_root / "current").symlink_to(f"releases/{current}")
+
+    report = self_deploy_once(
+        str(clone),
+        _cfg(tmp_path, migrate=True, release_root=str(release_root)),
+    )
+
+    assert (report.outcome, report.detail) == ("noop", current)
+    assert calls["migrate"] == 0
+    assert "smoke_cwd" not in calls
+
+
+def test_failed_restart_restores_previous_release_selector(pair, calls, tmp_path):
+    origin, clone, first = pair
+    release_root = tmp_path / "opt-aicc"
+    old_release = release_root / "releases" / first
+    old_release.mkdir(parents=True)
+    (release_root / "current").symlink_to(f"releases/{first}")
+    _commit(origin, "advance")
+    calls["systemctl_rc"][("restart",)] = 1
+
+    report = self_deploy_once(
+        str(clone),
+        _cfg(
+            tmp_path,
+            services=("voyn-aicc-worker.service",),
+            release_root=str(release_root),
+            release_venv=str(tmp_path / "missing-venv"),
+        ),
+    )
+
+    assert report.outcome == "failed"
+    assert "rollback_incomplete_services" in report.detail
+    assert _git(clone, "rev-parse", "HEAD") == first
+    assert (release_root / "current").readlink() == Path(f"releases/{first}")
+
+
+def test_committed_control_unit_deploys_an_immutable_release():
+    root = Path(__file__).parents[2]
+    service = (root / "deploy/systemd/voyn-aicc-self-deploy.service").read_text()
+
+    assert "WorkingDirectory=/opt/aicc/current" in service
+    assert "--release-root /opt/aicc" in service
+    assert "--release-venv ${AICC_RUNTIME_VENV}" in service
+    assert "--repo-path ${AICC_SOURCE_REPO}" in service  # pragma: allowlist secret
+    assert "Environment=AICC_PREPROD_ROOT=/home/voynadmin/aicc-preprod" in service  # pragma: allowlist secret
+    assert "Environment=AICC_SOURCE_REPO=/home/voynadmin/aicc-preprod/repo" in service  # pragma: allowlist secret
+    assert (
+        "Environment=AICC_RUNTIME_VENV=/home/voynadmin/aicc-preprod/repo/.venv"
+        in service
+    )
+    assert "exec /opt/aicc/current/.venv/bin/python" in service
+
+
+def test_committed_worker_unit_deploys_an_immutable_release_without_migrations():
+    root = Path(__file__).parents[2]
+    service = (
+        root / "deploy/systemd/voyn-aicc-self-deploy-worker.service"
+    ).read_text()
+
+    assert "WorkingDirectory=/opt/aicc/source" in service
+    assert "--release-root /opt/aicc" in service
+    assert "--release-venv ${AICC_RUNTIME_VENV}" in service
+    assert "--repo-path ${AICC_SOURCE_REPO}" in service
+    assert "--migrate" not in service
+    assert "--restart voyn-aicc-worker@1.service" in service
+    assert "--restart voyn-aicc-worker@4.service" in service
+    assert "source ${AICC_PREPROD_ROOT}/worker.env" in service
+    assert "Environment=AICC_SOURCE_REPO=/opt/aicc/source" in service  # pragma: allowlist secret
+    assert "Environment=AICC_RUNTIME_VENV=/opt/aicc/runtime-venv" in service  # pragma: allowlist secret
+    assert "exec ${AICC_SOURCE_REPO}/.venv/bin/python" in service  # pragma: allowlist secret
 
 
 def test_noop_looking_migration_still_records_unrolled_back_write(
@@ -331,3 +525,32 @@ def test_migration_failure_provenance_names_the_partial_database(
     assert report.outcome == "rolled_back"
     assert "database_may_hold_partial_migrations" in report.detail
     assert _git(clone, "rev-parse", "HEAD") == first
+
+
+def test_failed_dispatch_smoke_after_migration_rolls_back_before_restart(pair, calls, tmp_path):
+    """0019 on control-01 (2026-09-08): the migration applied, import-smoke was
+    green, services restarted, and every planner tick died on a view whose
+    owner the migration had changed. The dispatch smoke runs with exactly
+    dispatch's privileges AFTER the migration and BEFORE any restart; a
+    refusal rolls the checkout back with no service touched."""
+    origin, clone, first = pair
+    _commit(origin, "advance with a migration that breaks dispatch")
+    calls["dispatch_smoke_rc"] = 1
+    cfg = _cfg(tmp_path, services=("voyn-aicc-worker.service",), migrate=True)
+    report = self_deploy_once(str(clone), cfg)
+    assert report.outcome == "rolled_back"
+    assert "dispatch_smoke_failed_after_migration" in report.detail
+    assert calls["migrate"] == 1
+    assert calls["dispatch_smoke"] == 1
+    # The safety guarantee is an ORDER: migration, then the dispatch smoke,
+    # then rollback -- and no service start/restart at all (review of
+    # fc167cf7: counts alone passed with the smoke before the migration or
+    # after a restart).
+    assert calls["order"].index("migrate") < calls["order"].index("dispatch_smoke")
+    assert not any(
+        event.startswith("systemctl:") and event.split(":", 1)[1] in {"restart", "start", "reload"}
+        for event in calls["order"]
+    ), calls["order"]
+    assert _git(clone, "rev-parse", "HEAD") == first
+    assert "database_upgrade_ran_not_rolled_back" in report.steps
+    assert "dispatch_smoke_passed" not in report.steps

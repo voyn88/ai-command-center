@@ -23,11 +23,29 @@ ProtectClock=yes
 ProtectHostname=yes
 ProtectProc=invisible
 ProcSubset=pid
-RestrictSUIDSGID=yes
+# No RestrictSUIDSGID here: this root broker deliberately sets the setgid bit
+# on every workspace directory (fchmod 2770, so files the agent creates
+# inherit the aicc-workspace group the worker reads them through), and
+# RestrictSUIDSGID turns exactly that chmod into EPERM -- every isolated
+# launch died with "[Errno 1] Operation not permitted" (worker-01,
+# 2026-09-08). The AGENT's transient unit keeps its own RestrictSUIDSGID.
 LockPersonality=yes
 KeyringMode=private
 RestrictAddressFamilies=AF_UNIX
-ReadWritePaths=/run/aicc-agent-launcher /run/aicc-agent-homes /run/aicc-agent-workspace-binds /srv/aicc-workspaces /srv/aicc-quarantine
+# Every entry is declared in deploy/tmpfiles.d/aicc-agent.conf and the
+# socket unit re-creates that declaration (systemd-tmpfiles --create) before
+# it accepts the first connection: this namespace is built before ExecStart,
+# so a path only the launcher creates refused the connection with
+# 226/NAMESPACE (worker-01, 2026-09-08). Strict entries, deliberately: a
+# '-' would only let the namespace come up around an ABSENT path, and a
+# directory created afterwards never becomes writable inside it (review of
+# 5736dd6c) -- the connection would fail one step later instead.
+# /var/lib/aicc-agent: the model-auth store the broker writes a refreshed
+# provider credential back into at teardown. Without it the write-back hit
+# EROFS under ProtectSystem=strict, the rotated refresh token died with the
+# ephemeral home, and Claude was dead again after its first refresh
+# (worker-01 2026-09-09 06:38 UTC).
+ReadWritePaths=/run/aicc-agent-launcher /run/aicc-agent-homes /run/aicc-agent-workspace-binds /srv/aicc-workspaces /srv/aicc-quarantine /var/lib/aicc-agent
 UMask=0077
 MemoryMax=256M
 TasksMax=64

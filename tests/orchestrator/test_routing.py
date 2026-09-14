@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from command_center import agent_runner
-from command_center.orchestrator.planner import PlanLimits, _payload_for
+from command_center.orchestrator.planner import PlanLimits, _payload_for, repo_route
 from command_center.orchestrator.routing import ROUTING_MATRIX, cascade_for
 
 #: The executors the worker can actually run, read from the SAME table the
@@ -52,14 +52,41 @@ def test_cascade_for_returns_copies_not_the_matrix():
     assert ROUTING_MATRIX["review"][0]["executor"] == "codex"
 
 
-def test_review_uses_copilot_then_claude_once_each():
+def test_review_uses_codex_then_claude_once_each():
     cascade = cascade_for("review")
-    assert [link["executor"] for link in cascade] == ["codex", "copilot", "claude"]
+    assert [link["executor"] for link in cascade] == ["codex", "claude"]
     assert all(link["task_type"] == "review" for link in cascade)
+
+
+def test_every_link_is_an_executor_the_isolated_worker_will_launch():
+    """ADR-0010: the fleet runs under principal isolation and the broker
+    launches only `PRINCIPAL_EXECUTOR_BINARIES`. A link outside that set is a
+    phantom link -- the worker refuses it at preflight and the attempt is
+    burned (live 2026-09-08: copilot ate the last attempt of every task whose
+    first two failed). This test is the gate that keeps such a link out."""
+    for task_class, cascade in ROUTING_MATRIX.items():
+        for link in cascade:
+            assert link["executor"] in agent_runner.PRINCIPAL_EXECUTOR_BINARIES, (
+                task_class, link, "not launchable under principal isolation"
+            )
 
 
 def test_unknown_task_class_falls_back_to_implementation():
     assert cascade_for("martian") == cascade_for("implementation")
+
+
+def test_default_repo_routes_include_crm_lane(monkeypatch) -> None:
+    """CRM backlog tasks must be dispatchable without a per-host override.
+
+    This is deliberately hermetic rather than in the database planner suite:
+    the route table is a static planner contract and must be checked even
+    where the PostgreSQL integration fixtures are unavailable.
+    """
+    monkeypatch.delenv("AICC_PLANNER_REPO_ROUTES", raising=False)
+    assert repo_route("voyn-logistics-crm") == (
+        "CRM",
+        "/home/voynadmin/Projects/voyn-logistics-crm",
+    )
 
 
 def test_dispatch_prompt_asks_for_the_commit_and_not_for_a_pull_request() -> None:

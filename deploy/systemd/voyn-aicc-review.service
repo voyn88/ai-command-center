@@ -1,0 +1,19 @@
+[Unit]
+Description=AICC backlog review tick
+After=network-online.target postgresql@16-main.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=voynadmin
+WorkingDirectory=/opt/aicc/current
+Environment=AICC_PREPROD_ROOT=/home/voynadmin/aicc-preprod
+Environment=AICC_FLEET_REPO=/opt/aicc/source
+Environment=GH_REPO=voyn88/ai-command-center
+Environment=GIT_TERMINAL_PROMPT=0
+EnvironmentFile=/etc/aicc/github-app.env
+EnvironmentFile=-/etc/aicc/review-merge.env
+ExecStart=/bin/bash -lc "set -a && source ${AICC_PREPROD_ROOT}/.env && set +a && exec /opt/aicc/current/.venv/bin/python -m command_center.db backlog-review --repo-path ${AICC_FLEET_REPO}"
+TimeoutStartSec=900s
+NoNewPrivileges=true
+PrivateTmp=true

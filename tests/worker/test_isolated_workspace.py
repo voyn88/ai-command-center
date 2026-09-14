@@ -609,6 +609,40 @@ def test_trusted_git_environment_ignores_ambient_home_and_xdg_config(
     assert lookup.returncode == 1 and lookup.stdout == ""
 
 
+def test_trusted_git_environment_honours_only_root_owned_system_config(
+    tmp_path, monkeypatch
+):
+    trusted_root = tmp_path / "trusted"
+    trusted_root.mkdir()
+    worker_owned = tmp_path / "gitconfig"
+    worker_owned.write_text("[credential]\n\thelper = evil\n")
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", str(worker_owned))
+
+    environment = workspace_provisioning._trusted_git_environment(trusted_root)
+
+    # A worker-writable file is not operator authority: system config stays off.
+    if os.getuid() != 0:
+        assert environment["GIT_CONFIG_NOSYSTEM"] == "1"
+        assert "GIT_CONFIG_SYSTEM" not in environment
+
+    monkeypatch.delenv("GIT_CONFIG_SYSTEM")
+    environment = workspace_provisioning._trusted_git_environment(trusted_root)
+    assert environment["GIT_CONFIG_NOSYSTEM"] == "1"
+
+    # Root-owned, not group/world writable: the operator's fleet gitconfig
+    # (credential helper + ssh->https rewrite) is carried into the trusted
+    # publisher clone.
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", "/etc/aicc/gitconfig")
+    monkeypatch.setattr(
+        workspace_provisioning,
+        "_system_gitconfig_stat",
+        lambda path: os.stat_result((0o100640, 1, 1, 1, 0, 0, 10, 0, 0, 0)),
+    )
+    environment = workspace_provisioning._trusted_git_environment(trusted_root)
+    assert environment["GIT_CONFIG_SYSTEM"] == "/etc/aicc/gitconfig"
+    assert "GIT_CONFIG_NOSYSTEM" not in environment
+
+
 def test_dirty_checkpoint_uses_one_shared_git_ref_lock(tmp_path):
     repo = _make_repo(tmp_path / "repo")
 

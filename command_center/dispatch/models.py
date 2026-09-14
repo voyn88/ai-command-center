@@ -46,6 +46,14 @@ DEFER_REASONS = frozenset(
     }
 )
 
+# An alternative-candidate-only reason: the executor was eligible, available
+# and within every budget guardrail, but a cheaper (or local-preferred)
+# candidate was assigned instead. Never appears as a `DispatchDecision.reason`
+# (that field is always `ASSIGNED` or a member of `DEFER_REASONS`) — only on
+# an `AlternativeCandidate`, where it explains why *this* candidate specifically
+# wasn't the one chosen.
+ALT_NOT_CHEAPEST = "not_selected_more_expensive"
+
 # Human-readable one-liners, kept next to the codes so both the API and the
 # operator UI render the same explanation.
 REASON_EXPLANATIONS: dict[str, str] = {
@@ -79,6 +87,10 @@ REASON_EXPLANATIONS: dict[str, str] = {
         "cost of error (probability x impact) exceeds its configured limit: "
         "dispatch is refused until the scenario is revised or the limit is "
         "raised, never assigned anyway."
+    ),
+    ALT_NOT_CHEAPEST: (
+        "Eligible, available and within budget, but a cheaper (or "
+        "local-preferred) candidate was assigned instead."
     ),
 }
 
@@ -437,6 +449,33 @@ class DispatchPolicy:
 
 
 @dataclass(frozen=True)
+class AlternativeCandidate:
+    """One executor the engine looked at for a task but did not choose.
+
+    Exists so a `DispatchDecision` can report not just its own outcome but
+    the other options weighed against it — the "why not X instead" half of
+    the explanation, without which "assigned to A" or "deferred" reads as a
+    single unexplained answer rather than a comparison among candidates.
+    """
+
+    executor_id: str
+    cost_per_task_usd: float
+    reason: str  # a DEFER_* code, or ALT_NOT_CHEAPEST
+
+    @property
+    def explanation(self) -> str:
+        return explanation_for(self.reason)
+
+    def as_dict(self) -> dict:
+        return {
+            "executor_id": self.executor_id,
+            "cost_per_task_usd": self.cost_per_task_usd,
+            "reason": self.reason,
+            "explanation": self.explanation,
+        }
+
+
+@dataclass(frozen=True)
 class DispatchDecision:
     """The outcome for exactly one task."""
 
@@ -448,6 +487,12 @@ class DispatchDecision:
     estimated_cost_usd: float = 0.0
     # Set only when reason == DEFER_TAIL_RISK: which scenario blocked it.
     blocked_scenario_id: str | None = None
+    # Other executors the engine weighed for this task, each with its own
+    # reason for not being the one chosen. Empty when the plan never reached
+    # candidate comparison for this task (kill switch, unknown budget, tail
+    # risk, or no permitted/available executor at all) — there is nothing to
+    # compare against in those cases.
+    alternatives: tuple[AlternativeCandidate, ...] = ()
 
     @property
     def assigned(self) -> bool:
@@ -456,6 +501,35 @@ class DispatchDecision:
     @property
     def explanation(self) -> str:
         return explanation_for(self.reason)
+
+    @property
+    def briefing(self) -> str:
+        """A plain-language, spoken-style instruction: the decision, the
+        chain of reasoning behind it, and the alternatives considered — for
+        a caller that wants to explain *why*, not just report the outcome.
+
+        Every sentence is short and declarative (no markdown, no jargon
+        codes) so this string can be read aloud as-is."""
+        if self.assigned:
+            lead = (
+                f"Task {self.task_id} ({self.priority} priority) is assigned "
+                f"to {self.assigned_executor}, at an estimated cost of "
+                f"${self.estimated_cost_usd:.2f}. {self.explanation}"
+            )
+        else:
+            lead = f"Task {self.task_id} ({self.priority} priority) stays queued. {self.explanation}"
+
+        if not self.alternatives:
+            return lead
+
+        verb = "considered" if self.assigned else "considered and rejected"
+        parts = [
+            f"{alt.executor_id} (${alt.cost_per_task_usd:.2f} — {alt.explanation})"
+            for alt in self.alternatives
+        ]
+        count = len(self.alternatives)
+        noun = "alternative" if count == 1 else "alternatives"
+        return f"{lead} {count} other {noun} {verb}: " + "; ".join(parts) + "."
 
     def as_dict(self) -> dict:
         return {
@@ -468,7 +542,50 @@ class DispatchDecision:
             "estimated_cost_usd": self.estimated_cost_usd,
             "blocked_scenario_id": self.blocked_scenario_id,
             "explanation": self.explanation,
+            "alternatives": [alt.as_dict() for alt in self.alternatives],
+            "briefing": self.briefing,
         }
+
+
+# --------------------------------------------------------------------------
+# Spend measurement provenance
+# --------------------------------------------------------------------------
+
+# The trailing-24h spend was actually read.
+SPEND_MEASURED = "measured"
+# The read failed (e.g. a DB outage): there is nothing to report.
+SPEND_UNAVAILABLE = "unavailable"
+
+# `daily_spend_usd`/`projected_spend_usd` are backed by a real reading.
+SPEND_KIND_ACTUAL = "actual"
+# There is no reading and nothing stands in for it: the spend/projected/
+# remaining fields are all `None`. There is deliberately no "assumed ceiling"
+# (or any other stand-in) kind — this contract never substitutes a fabricated
+# figure for one that could not be read, in any field.
+SPEND_KIND_UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class SpendMeasurement:
+    """Provenance for `DispatchPlan.daily_spend_usd`/`projected_spend_usd`.
+
+    Exists so a consumer can tell "this number is a real trailing-24h
+    reading" from "there is no reading" without inferring it from `None`
+    alone — and so that inference is impossible to get wrong, because every
+    `DispatchPlan` must state it explicitly (see the field below: there is no
+    default that could silently claim "measured" for a plan built outside
+    `plan_dispatch`).
+    """
+
+    status: str
+    kind: str
+
+    def as_dict(self) -> dict:
+        return {"status": self.status, "kind": self.kind}
+
+
+SPEND_MEASUREMENT_ACTUAL = SpendMeasurement(SPEND_MEASURED, SPEND_KIND_ACTUAL)
+SPEND_MEASUREMENT_UNAVAILABLE = SpendMeasurement(SPEND_UNAVAILABLE, SPEND_KIND_UNKNOWN)
 
 
 @dataclass(frozen=True)
@@ -483,7 +600,15 @@ class DispatchPlan:
     # never a fabricated `0.0` that reads as "nothing spent today".
     daily_spend_usd: float | None
     max_daily_spend_usd: float
+    # None in lockstep with `daily_spend_usd`: whatever is unmeasured never
+    # flows into a derived figure either, so `budget_remaining_usd` below
+    # reads "unknown" too rather than a confident (and fabricated) number.
     projected_spend_usd: float | None
+    # No default: every `DispatchPlan` must say explicitly whether its spend
+    # figures are a real reading, so a caller constructed outside
+    # `plan_dispatch` can't silently inherit a "measured" claim it never
+    # earned.
+    spend_measurement: SpendMeasurement
     # True when the trailing-24h spend could not be read (e.g. a DB outage):
     # dispatch is refused wholesale rather than guessing a spend figure that a
     # zero/unset daily cap or a free executor could silently sail past.
@@ -513,6 +638,7 @@ class DispatchPlan:
             "daily_spend_usd": self.daily_spend_usd,
             "max_daily_spend_usd": self.max_daily_spend_usd,
             "projected_spend_usd": self.projected_spend_usd,
+            "spend_measurement": self.spend_measurement.as_dict(),
             "budget_remaining_usd": (
                 None if remaining is None or remaining == float("inf") else remaining
             ),

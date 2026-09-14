@@ -8,6 +8,7 @@ Wants=network-online.target tailscaled.service
 Type=oneshot
 User=voynadmin
 WorkingDirectory=/home/voynadmin/aicc-preprod/repo
+Environment=AICC_SOURCE_CLONE_REPO=.
 ExecStart=/home/voynadmin/aicc-preprod/repo/.venv/bin/python -m command_center.ops.infra_monitor --minimum-active-workers 4 --skip-queue --prometheus-url http://100.114.209.119:9090/-/ready
 NoNewPrivileges=true
 PrivateTmp=true
