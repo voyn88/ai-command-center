@@ -5101,6 +5101,8 @@ WORKER_ONLY_TARGETS = frozenset(
         "/etc/systemd/system/aicc-agent-launcher@.service",
         "/etc/systemd/system/voyn-aicc-source-clone-refresh.service",
         "/etc/systemd/system/voyn-aicc-source-clone-refresh.timer",
+        "/etc/systemd/system/voyn-infra-monitor.service",
+        "/etc/systemd/system/voyn-infra-monitor.timer",
         "/etc/aicc/agent-workspace-roots",
         "/etc/aicc/worker-lanes",
         "/etc/aicc/gitconfig",
@@ -5176,6 +5178,12 @@ CONTROL_ONLY_UNITS = (
     "voyn-aicc-remediate.timer",
     "voyn-aicc-pr-window.service",
     "voyn-aicc-pr-window.timer",
+    # The control host's own fail-closed probe -- the queue, the dead-letter
+    # classes and the PR review-window reconciler's output. It is the control
+    # counterpart of WORKER_MONITOR_UNITS below and, like it, replaces an
+    # unversioned /usr/local/sbin script this generation retires.
+    "voyn-queue-monitor.service",
+    "voyn-queue-monitor.timer",
 )
 #: The timers of `CONTROL_ONLY_UNITS` the installer enables after commit, so
 #: installed units are *running* ticks and not just files on disk.
@@ -5184,8 +5192,80 @@ CONTROL_ONLY_TIMERS = (
     "voyn-aicc-merge.timer",
     "voyn-aicc-remediate.timer",
     "voyn-aicc-pr-window.timer",
+    "voyn-queue-monitor.timer",
 )
 CONTROL_ONLY_TIMER = "voyn-aicc-pr-window.timer"
+
+#: The per-host self-deploy tick, repo-owned on BOTH profiles.
+#:
+#: This is the five-minute tick that pulls merged code onto a host, and until
+#: now it was the installer's own crutch: on both hosts
+#: `/etc/systemd/system/voyn-aicc-self-deploy.{service,timer}` were symlinks
+#: into a directory under the operator's home, so the one unit whose job is
+#: "track the repository" was itself the least tracked thing on the fleet
+#: (VOYN-W0-AICC-SYSTEMD-DRIFT-VERSIONED-UNITS, drift audit item 3). An
+#: operator's home directory is not a deployment: it is not reviewed, not
+#: rolled back with a generation, and does not survive a rebuilt host.
+#:
+#: The two profiles install DIFFERENT sources onto the SAME target. That is
+#: deliberate: the ExecStart is all that differs (the control host migrates
+#: and holds DDL authority, the worker host never does and restarts its lanes
+#: instead), while the timer, `hold_lane_timers`, the staged rollout and every
+#: runbook name one unit -- `voyn-aicc-self-deploy.service`. Shipping the
+#: worker variant under its own unit name would have left the host's
+#: hand-made file in place under the name everything actually uses, which is
+#: the failure mode this entry exists to end.
+SELF_DEPLOY_UNIT_SOURCES = {
+    "worker": "voyn-aicc-self-deploy-worker.service",
+    "control": "voyn-aicc-self-deploy.service",
+}
+SELF_DEPLOY_SERVICE_TARGET = "/etc/systemd/system/voyn-aicc-self-deploy.service"
+SELF_DEPLOY_TIMER = "voyn-aicc-self-deploy.timer"
+
+#: The worker host's own fail-closed probe, repo-owned. Worker-only because
+#: what it measures is a worker: lane count, crash loops across every service
+#: unit on the box, and the deployed release of the product the lanes ship.
+#: It lands in `WORKER_ONLY_TARGETS` below, so a control conversion purges it
+#: with the rest of the worker layer rather than leaving a probe that demands
+#: four active lanes on a host that runs none.
+#:
+#: Deliberately NOT added to `CONTROL_PURGE_UNITS`, matching how the other
+#: worker-only timer family (`voyn-aicc-source-clone-refresh`) is treated: a
+#: conversion removes the unit files and a `timers.target.wants` symlink is
+#: left dangling until the next `daemon-reload` logs it. Quiescing it instead
+#: would trade that warning for a worse failure -- the rollback's service
+#: snapshot admits only worker and launcher units (`RESTORABLE_UNIT_RE`), so a
+#: conversion that failed after the quiesce would put the unit file back with
+#: the timer disabled, silently ending the worker host's own monitoring.
+WORKER_MONITOR_UNITS = (
+    "voyn-infra-monitor.service",
+    "voyn-infra-monitor.timer",
+)
+WORKER_MONITOR_TIMER = "voyn-infra-monitor.timer"
+
+#: Unversioned, root-owned, ownerless ops scripts outside the repository that
+#: this generation RETIRES on every profile (drift audit item 4).
+#:
+#: `/usr/local/sbin/voyn-infra-monitor` is superseded by
+#: `deploy/systemd/voyn-infra-monitor.service`, whose own header has called
+#: itself "the repo-owned replacement for the retired /usr/local/sbin monitor"
+#: since before anything installed it. `/usr/local/sbin/voyn-worker-health`
+#: has no replacement and needs none: it probes `claude_supervisor`, a
+#: component this architecture stopped running, and has been exiting 1 on
+#: every tick for that reason. Both are root-owned and unreadable to
+#: `voynadmin`, so neither the fleet nor the operator principal could read,
+#: fix or even diff them -- they were only ever legible as a failed unit.
+#:
+#: Retired through the ordinary removal machinery, in the same generation as
+#: the units that replace them, so the retirement inherits the transaction's
+#: atomicity: it commits only if the whole generation does, and `recover()`
+#: puts both scripts back byte-for-byte from the generation backup (a
+#: committed generation keeps its backups -- only `sensitive` targets are
+#: destroyed). A host that never had them removes nothing.
+LEGACY_RETIRED_TARGETS = (
+    "/usr/local/sbin/voyn-infra-monitor",
+    "/usr/local/sbin/voyn-worker-health",
+)
 
 
 def _runtime_target(target: str) -> bool:
@@ -5239,10 +5319,19 @@ def default_specs(
 
     The control-plane's own ticks become repo-owned under VOYN-W0-AICC-
     CONTROL-PLANE-REPO-OWNED-UNITS, one at a time as each is needed.
-    `CONTROL_ONLY_UNITS` is the set that has arrived: the PR review-window
-    tick, which had never been installed on control-01 at all. The rest
-    (planner, review, merge, reaper, rotation) are still symlinks into the
-    operator's home and still follow.
+    `CONTROL_ONLY_UNITS` is the set that has arrived: the review, merge,
+    remediate and PR review-window ticks, plus the control host's own
+    fail-closed probe. `SELF_DEPLOY_UNIT_SOURCES` and `WORKER_MONITOR_UNITS`
+    are the same move for the units both profiles (or the worker alone) run,
+    and `LEGACY_RETIRED_TARGETS` retires the two unversioned /usr/local/sbin
+    probes in the same generation.
+
+    What is still hand-made on the fleet, and therefore still follows: the
+    backlog planner, the queue reaper, and the credential-rotation switch.
+    Rotation is deliberately last -- flipping the old `voyn-aicc-rotate.timer`
+    for the repo's `voyn-aicc-credential-rotation.timer` has credential-wide
+    blast radius and needs its own maintenance window and a rehearsed
+    rollback, not a line in an installer that runs for other reasons.
 
     What the transition does and does not remove, stated exactly, because
     "the agent principal is absent" is a claim this cannot make:
@@ -5270,6 +5359,11 @@ def default_specs(
     if profile not in PROFILES:
         raise ValueError(f"unknown installation profile: {profile!r}")
     root_uid, root_gid = 0, 0
+    # Retired on every profile: an unversioned root-owned script is drift on
+    # whichever host it is on, and neither of these has a host it belongs to.
+    legacy_retirement = tuple(
+        removal_spec(target) for target in LEGACY_RETIRED_TARGETS
+    )
     # `aicc-agent` is resolved only where the agent layer is installed. That
     # identity comes from deploy/sysusers.d/aicc-agent.conf, which a control
     # host deliberately never runs (see the installer): demanding the group
@@ -5295,6 +5389,10 @@ def default_specs(
         CONTROL_AUTHORITY_GROUP if profile == "control" else AUTHORITY_GROUP
     )
     authority_gid = grp.getgrnam(authority_group).gr_gid if resolve_identities else 0
+    # Same target on both profiles, different ExecStart. See
+    # `SELF_DEPLOY_UNIT_SOURCES` for why the worker variant is not shipped
+    # under a unit name of its own.
+    self_deploy_source = SELF_DEPLOY_UNIT_SOURCES[profile]
     specs = (
         # The recovery generator is a permanent bootstrap anchor installed
         # atomically before prepare(), not part of reversible generations.
@@ -5432,6 +5530,36 @@ def default_specs(
             root_uid,
             root_gid,
         ),
+        # The self-deploy tick itself. Both profiles install it; only the
+        # source differs (`SELF_DEPLOY_UNIT_SOURCES`). Until this spec existed
+        # the target was a symlink into the operator's home on both hosts,
+        # which is why a unit fix merged into main changed nothing on the
+        # fleet: the deploy tick updated the CODE and nothing updated the
+        # UNITS that run it.
+        FileSpec(
+            repo_root / "deploy/systemd" / self_deploy_source,
+            SELF_DEPLOY_SERVICE_TARGET,
+            0o644,
+            root_uid,
+            root_gid,
+        ),
+        FileSpec(
+            repo_root / "deploy/systemd/voyn-aicc-self-deploy.timer",
+            f"/etc/systemd/system/{SELF_DEPLOY_TIMER}",
+            0o644,
+            root_uid,
+            root_gid,
+        ),
+        *(
+            FileSpec(
+                repo_root / "deploy/systemd" / unit,
+                f"/etc/systemd/system/{unit}",
+                0o644,
+                root_uid,
+                root_gid,
+            )
+            for unit in WORKER_MONITOR_UNITS
+        ),
         FileSpec(
             repo_root / "deploy/aicc/privileged-principals",
             "/etc/aicc/privileged-principals",
@@ -5539,8 +5667,11 @@ def default_specs(
         purge_directories = tuple(
             directory_removal_spec(target) for target in WORKER_ONLY_DIRECTORIES
         )
-        return kept + control_units + purge + purge_directories
-    return specs
+        # File removals stay contiguous and strictly before the directory
+        # removals: `apply()` may only reach a directory once this generation
+        # has taken out everything it is removing from it.
+        return kept + control_units + purge + legacy_retirement + purge_directories
+    return specs + legacy_retirement
 
 
 def _dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:

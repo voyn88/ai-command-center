@@ -640,6 +640,18 @@ trap - EXIT HUP INT TERM
 # review-window labeller instead of "someone typed it once on 2026-09-09"
 # (VOYN-W0-AICC-PR-WINDOW-RECONCILER-NOT-DEPLOYED-ON-CONTROL).
 if [ "$install_profile" = "control" ]; then
-  systemctl enable --now voyn-aicc-review.timer voyn-aicc-merge.timer voyn-aicc-remediate.timer voyn-aicc-pr-window.timer
+  systemctl enable --now voyn-aicc-review.timer voyn-aicc-merge.timer voyn-aicc-remediate.timer voyn-aicc-pr-window.timer voyn-queue-monitor.timer
 fi
+if [ "$install_profile" = "worker" ]; then
+  systemctl enable --now voyn-infra-monitor.timer
+fi
+# Both profiles run the self-deploy tick, and the generation above just
+# replaced its unit file -- on the live fleet, a symlink into the operator's
+# home. `release_lane_timers` only puts back the RUNNING state this script
+# stopped; a host whose timer was never enabled (a rebuild, or one whose
+# enablement symlink pointed at the retired home unit) needs the enable too,
+# and a timer that is not enabled is a self-deploy tick that dies at the next
+# boot. Same placement rule as the ticks above: after commit, after the trap
+# is disarmed, and before the install announces itself.
+systemctl enable --now voyn-aicc-self-deploy.timer
 echo "AICC_AGENT_PRINCIPAL_ISOLATION_INSTALLED"

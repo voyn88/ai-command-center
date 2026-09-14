@@ -8,6 +8,49 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Fixed — The fleet's systemd units come from the repository (`VOYN-W0-AICC-SYSTEMD-DRIFT-VERSIONED-UNITS`)
+- The drift audit of 2026-08-29 found that not one systemd unit on either host
+  came from this repository: all 22 versioned units in `deploy/systemd/` were
+  unused and the fleet ran hand-made copies under different names. The units
+  were never the point — the consequence was that **every unit fix merged
+  through the pipeline was inert on the fleet**, which is how the repo template
+  could carry a per-lane `RuntimeDirectory=` while the host copy caused
+  `VOYN-W0-AICC-WORKER-RUNTIMEDIR-COLLISION`.
+- `ops/aicc_install_transaction.py`: the self-deploy tick is now repo-owned on
+  both profiles (`SELF_DEPLOY_UNIT_SOURCES`). It was the sharpest case — the
+  one unit whose entire job is "track the repository" was a pair of symlinks
+  into a directory under the operator's home on both hosts, so the tick updated
+  the CODE every five minutes while nothing updated the UNITS that run it. The
+  two variants (control migrates; worker restarts lanes and holds no DDL
+  privilege) install onto the one target the timer, `hold_lane_timers`, the
+  staged rollout and every runbook name. The worker variant is a committed file
+  rather than a commented-out `ExecStart` an operator had to paste back in.
+- Each profile's fail-closed probe is repo-owned and enabled after commit:
+  `voyn-infra-monitor.{service,timer}` on the worker (and in
+  `WORKER_ONLY_TARGETS`, so a control conversion purges it),
+  `voyn-queue-monitor.{service,timer}` on the control host. The same generation
+  retires the unversioned `/usr/local/sbin/voyn-infra-monitor` and
+  `/usr/local/sbin/voyn-worker-health` — root-owned, ownerless, not in git, and
+  failing on every tick (the second probing `claude_supervisor`, a component
+  this architecture no longer runs). Retired through the ordinary removal
+  machinery, so the retirement rolls back with the generation that replaces it.
+- `command_center/ops/infra_monitor.py`: a `--unit-drift-repo`/
+  `--unit-drift-profile` probe compares every unit target the installer owns
+  with the file on the host, and both deploy-managed probes now run it. It
+  reads `default_specs()` rather than a second list of unit names, so the probe
+  and the installer cannot disagree about what the repository owns. Four
+  finding classes because each has a different fix: `unit_hand_made` (the
+  target is a symlink — an operator's home standing in for a deployment),
+  `unit_drift` (installed but not byte-identical: a merged fix that has not
+  reached the host), `unit_absent`, and `unit_retired_present`. A probe that
+  cannot measure fails closed as `unit_drift_probe_failed`.
+- Still deliberately hand-made, and why: the backlog planner and queue reaper
+  follow under `VOYN-W0-AICC-CONTROL-PLANE-REPO-OWNED-UNITS`; the credential
+  rotation switch has credential-wide blast radius and needs its own
+  maintenance window and a rehearsed rollback, not a line in an installer that
+  runs for other reasons. See
+  [`docs/operations/SYSTEMD_UNIT_OWNERSHIP.md`](docs/operations/SYSTEMD_UNIT_OWNERSHIP.md).
+
 ### Fixed — Control ticks have their own GitHub quota (`VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS`)
 - `command_center/orchestrator/gh_access.py`: every `gh` call the review,
   merge and PR-window ticks make now runs under the `voyn-aicc-fleet` App's

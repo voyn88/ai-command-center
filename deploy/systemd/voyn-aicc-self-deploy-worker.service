@@ -1,9 +1,12 @@
 # Worker-host self-deploy tick.
 #
 # Installed as /etc/systemd/system/voyn-aicc-self-deploy.service on worker
-# hosts. Unlike the control host variant, this never runs migrations: the
-# worker role has no DDL authority. It stages/selects /opt/aicc/releases/<sha>
-# and then restarts worker lanes so the new code is picked up after drain.
+# hosts -- the same target the control variant
+# (deploy/systemd/voyn-aicc-self-deploy.service) takes on the control plane,
+# chosen by profile in `SELF_DEPLOY_UNIT_SOURCES`. Unlike the control variant,
+# this never runs migrations: the worker role has no DDL authority. It
+# stages/selects /opt/aicc/releases/<sha> and then restarts worker lanes so
+# the new code is picked up after drain.
 [Unit]
 Description=AICC worker self-deploy tick (merged -> immutable worker release)
 After=network-online.target

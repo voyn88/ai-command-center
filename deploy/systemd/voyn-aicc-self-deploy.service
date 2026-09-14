@@ -1,13 +1,16 @@
 # Per-host self-deploy tick (VOYN-W0-AICC-DEPLOY-AUTOMATION).
 #
-# Two install variants -- the difference is ONLY the ExecStart flags, and the
-# committed default is the CONTROL host (database owner: migrations run,
-# no restarts -- its ticks are oneshot units that re-exec from /opt/aicc/current
-# on their next firing). A WORKER host replaces ExecStart with the variant
-# below: no --migrate (the worker role holds no DDL privilege) and its own
-# --restart list (SIGTERM is a graceful drain for the daemons):
-#
-#   ExecStart=/bin/bash -lc "exec /opt/aicc/current/.venv/bin/python -m command_center.db self-deploy --repo-path ${AICC_SOURCE_REPO} --release-root /opt/aicc --release-venv ${AICC_RUNTIME_VENV} --restart voyn-aicc-worker.service --restart voyn-aicc-worker-2.service --restart voyn-aicc-worker@3.service --restart voyn-aicc-worker@4.service"
+# This is the CONTROL host variant: the database owner, so migrations run and
+# no service is restarted (its ticks are oneshot units that re-exec from
+# /opt/aicc/current on their next firing). The WORKER variant is a committed
+# file of its own -- deploy/systemd/voyn-aicc-self-deploy-worker.service --
+# and not a commented-out ExecStart in this header: the installer picks
+# between the two by profile (`SELF_DEPLOY_UNIT_SOURCES`) and installs the
+# chosen one as /etc/systemd/system/voyn-aicc-self-deploy.service. Before that
+# existed, a host got this unit by an operator copying it and editing the line
+# back in, which is how both hosts ended up running symlinks into a
+# directory under the operator's home instead of anything in this repository
+# (VOYN-W0-AICC-SYSTEMD-DRIFT-VERSIONED-UNITS).
 #
 # The command is fail-closed (diverged/dirty checkout, dependency-manifest
 # change) and rolls back checkout + services on migration/smoke/restart

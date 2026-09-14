@@ -8,13 +8,17 @@ lanes, the durable queue, and the configured metrics endpoint instead.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import http.client
+import importlib.util
 import json
 import os
 import subprocess
+import sys
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -114,6 +118,59 @@ class UnitHealthSnapshot:
 #: listing of instance names is the thing the template collapse exists to stop.
 UNIT_LISTING_CAP = 20
 
+#: Where systemd keeps the host's own (non-vendor) unit files. The drift probe
+#: judges nothing outside it: a distro unit under /usr/lib is not this
+#: repository's to own.
+SYSTEM_UNIT_DIR = "/etc/systemd/system"
+
+
+@dataclass(frozen=True, slots=True)
+class UnitDriftSnapshot:
+    """Whether the systemd units on this host are the ones in the repository.
+
+    The drift audit of 2026-08-29 found that not one systemd unit on either
+    host came from the repository: all 22 versioned units in `deploy/systemd/`
+    were unused and the fleet ran hand-made copies under different names, some
+    of them symlinks into an operator's home directory. The consequence is the
+    part worth alarming on -- every unit fix merged through the pipeline was
+    inert. PR #383's principal-isolation architecture was the visible casualty
+    and the per-lane `RuntimeDirectory=` collision was a direct product of it:
+    the repository template had the fix, the host copy did not
+    (VOYN-W0-AICC-SYSTEMD-DRIFT-VERSIONED-UNITS).
+
+    Nothing measured that. It took a human audit to notice, which is why this
+    probe exists: the installer's own spec list is the authority for what the
+    repository owns, so the probe and the installer cannot disagree about it.
+    Four distinct things are drift, and each is its own finding class because
+    each has a different fix:
+
+    * `unmanaged` -- the target is a SYMLINK. A repo-owned unit is installed
+      as a regular file by the transaction; a link means something else put it
+      there, and on this fleet that something was the operator's home.
+    * `diverged` -- installed, but not byte-identical to the repository. This
+      is the "merged fix is inert" state, and it is expected to go red as soon
+      as a unit change merges and stay red until the root installer runs.
+      That is the signal, not noise: until the installer runs, the merged fix
+      is not on the host.
+    * `absent` -- the repository owns the unit and the host does not have it.
+    * `retired` -- the generation removes this unit and it is still there.
+
+    Read-only and unprivileged: unit files under /etc/systemd/system are
+    world-readable, so the probe needs nothing the monitor's sandbox denies.
+    """
+
+    profile: str
+    #: Unit targets compared, install and removal together.
+    judged: int
+    absent: tuple[str, ...]
+    diverged: tuple[str, ...]
+    unmanaged: tuple[str, ...]
+    retired: tuple[str, ...]
+    #: Set when the probe could not measure (no checkout, unreadable source,
+    #: an installer spec list that will not load). A probe that cannot see is
+    #: not a probe that saw nothing.
+    error: str | None = None
+
 
 @dataclass(frozen=True, slots=True)
 class DeployLagSnapshot:
@@ -161,6 +218,7 @@ class MonitorReport:
     source_clone: SourceCloneSnapshot | None = None
     unit_health: UnitHealthSnapshot | None = None
     deploy_lag: DeployLagSnapshot | None = None
+    unit_drift: UnitDriftSnapshot | None = None
 
 
 def parse_worker_units(output: str) -> dict[str, str]:
@@ -563,6 +621,16 @@ def _unit_listing(entries: tuple[tuple[str, int], ...]) -> str:
     return f"{shown},+{hidden}_more" if hidden > 0 else shown
 
 
+def _target_listing(targets: tuple[str, ...]) -> str:
+    """The same bounded listing for unit TARGETS, relative to the unit
+    directory every one of them is under -- the absolute prefix is twenty
+    identical characters that push the names themselves past the cap."""
+    names = [target[len(SYSTEM_UNIT_DIR) + 1 :] for target in targets]
+    shown = ",".join(names[:UNIT_LISTING_CAP])
+    hidden = len(names) - UNIT_LISTING_CAP
+    return f"{shown},+{hidden}_more" if hidden > 0 else shown
+
+
 def read_unit_health_snapshot(*, crash_loop_restarts: int) -> UnitHealthSnapshot:
     """Two unprivileged systemctl calls for the whole host, never raising."""
     try:
@@ -610,6 +678,103 @@ def read_unit_health_snapshot(*, crash_loop_restarts: int) -> UnitHealthSnapshot
         return UnitHealthSnapshot(
             crash_loops=(),
             failed_units=(),
+            error=f"{type(exc).__name__}: {exc}"[:200],
+        )
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1 << 16), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def load_install_specs(repo_path: str, *, profile: str) -> tuple[Any, ...]:
+    """The installer's own spec list, loaded from a checkout.
+
+    `ops/aicc_install_transaction.py` is a privileged script, not an importable
+    package (there is no `ops/__init__.py`), so it is loaded by path exactly
+    the way its own tests load it. Loading it -- rather than restating a list
+    of unit names here -- is the point: a second list would itself drift, and
+    a drift probe that disagrees with the installer about what the repository
+    owns is worse than no probe. `resolve_identities=False` keeps the call
+    unprivileged: no `getgrnam` for identities this read-only probe never uses.
+    """
+    source = Path(repo_path) / "ops" / "aicc_install_transaction.py"
+    spec = importlib.util.spec_from_file_location("aicc_install_transaction", source)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"no installer spec list at {source}")
+    module = importlib.util.module_from_spec(spec)
+    # Registered BEFORE exec, the way the installer's own tests load it:
+    # `@dataclass` resolves a field's annotation through `sys.modules[
+    # cls.__module__]`, so a module executed while unregistered raises
+    # `AttributeError: 'NoneType' object has no attribute '__dict__'` on the
+    # first dataclass in the file -- which is `FileSpec`, the thing this
+    # probe is here to read.
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    # Three source paths the unit targets never reference. They are read by
+    # specs for /etc/aicc and /var/lib credentials, all of which this probe
+    # filters out before it touches a source; passing os.devnull keeps the
+    # call from depending on host state the probe does not judge.
+    placeholder = Path(os.devnull)
+    return tuple(
+        module.default_specs(
+            Path(repo_path),
+            authority_env=placeholder,
+            claude_auth=placeholder,
+            codex_auth=placeholder,
+            resolve_identities=False,
+            profile=profile,
+        )
+    )
+
+
+def read_unit_drift_snapshot(
+    repo_path: str, *, profile: str, root: str = "/"
+) -> UnitDriftSnapshot:
+    """Compare every repo-owned unit target with the file on this host."""
+    try:
+        specs = load_install_specs(repo_path, profile=profile)
+        prefix = SYSTEM_UNIT_DIR + "/"
+        units = [spec for spec in specs if spec.target.startswith(prefix)]
+        if not units:
+            raise RuntimeError("the installer owns no unit under " + SYSTEM_UNIT_DIR)
+        absent: list[str] = []
+        diverged: list[str] = []
+        unmanaged: list[str] = []
+        retired: list[str] = []
+        for spec in units:
+            installed = Path(root) / spec.target.lstrip("/")
+            present = os.path.lexists(installed)
+            if spec.remove:
+                # A removal spec asserts the opposite thing about its target:
+                # after this generation the unit must not be there at all.
+                if present:
+                    retired.append(spec.target)
+            elif not present:
+                absent.append(spec.target)
+            elif installed.is_symlink():
+                unmanaged.append(spec.target)
+            elif _sha256_file(installed) != _sha256_file(Path(spec.source)):
+                diverged.append(spec.target)
+        return UnitDriftSnapshot(
+            profile=profile,
+            judged=len(units),
+            absent=tuple(sorted(absent)),
+            diverged=tuple(sorted(diverged)),
+            unmanaged=tuple(sorted(unmanaged)),
+            retired=tuple(sorted(retired)),
+        )
+    except Exception as exc:  # noqa: BLE001 - see read_pr_window_snapshot
+        return UnitDriftSnapshot(
+            profile=profile,
+            judged=0,
+            absent=(),
+            diverged=(),
+            unmanaged=(),
+            retired=(),
             error=f"{type(exc).__name__}: {exc}"[:200],
         )
 
@@ -783,6 +948,7 @@ def evaluate(
     source_clone: SourceCloneSnapshot | None = None,
     unit_health: UnitHealthSnapshot | None = None,
     deploy_lag: DeployLagSnapshot | None = None,
+    unit_drift: UnitDriftSnapshot | None = None,
 ) -> MonitorReport:
     active_workers = sum(state == "active" for state in worker_states.values())
     failures: list[str] = []
@@ -870,6 +1036,27 @@ def evaluate(
                 f"_{int(deploy_lag.lag_seconds or 0)}s>{int(deploy_lag.grace_seconds)}s"
             )
 
+    if unit_drift is not None:
+        if unit_drift.error is not None:
+            failures.append(f"unit_drift_probe_failed:{unit_drift.error}")
+        else:
+            # One finding per class, every unit in the detail, and the classes
+            # are separate because their fixes are: a symlinked unit is an
+            # operator's home directory standing in for a deployment, a
+            # diverged unit is a merged fix that has not reached the host, an
+            # absent unit was never installed, and a retired unit is one the
+            # generation removes and something put back.
+            for code, targets in (
+                ("unit_hand_made", unit_drift.unmanaged),
+                ("unit_drift", unit_drift.diverged),
+                ("unit_absent", unit_drift.absent),
+                ("unit_retired_present", unit_drift.retired),
+            ):
+                if targets:
+                    failures.append(
+                        f"{code}:{len(targets)}:{_target_listing(targets)}"
+                    )
+
     return MonitorReport(
         ok=not failures,
         active_workers=active_workers,
@@ -881,6 +1068,7 @@ def evaluate(
         source_clone=source_clone,
         unit_health=unit_health,
         deploy_lag=deploy_lag,
+        unit_drift=unit_drift,
     )
 
 
@@ -898,6 +1086,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if bool(args.deploy_lag_repo) != bool(args.deploy_lag_version_url):
         parser.error("--deploy-lag-repo and --deploy-lag-version-url must be given together")
+    if bool(args.unit_drift_repo) != bool(args.unit_drift_profile):
+        parser.error(
+            "--unit-drift-repo and --unit-drift-profile must be given together"
+        )
     return args
 
 
@@ -990,6 +1182,28 @@ def build_parser() -> argparse.ArgumentParser:
         "--deploy-lag-version-url",
         default=None,
         help="URL of the deployed service's /version document carrying release_sha.",
+    )
+    parser.add_argument(
+        "--unit-drift-repo",
+        default=os.environ.get("AICC_UNIT_DRIFT_REPO", ""),
+        metavar="PATH",
+        help=(
+            "Checkout whose deploy/systemd units this host is supposed to be "
+            "running. When set, every unit target the installer owns is "
+            "compared with the file on disk. Empty (the default) skips the "
+            "probe. Defaults to $AICC_UNIT_DRIFT_REPO, which is how the "
+            "deploy-managed units turn it on."
+        ),
+    )
+    parser.add_argument(
+        "--unit-drift-profile",
+        default=os.environ.get("AICC_UNIT_DRIFT_PROFILE", ""),
+        choices=("", "worker", "control"),
+        help=(
+            "Which installation profile this host runs. The profiles own "
+            "different unit sets, so guessing would report every unit of the "
+            "other role as missing."
+        ),
     )
     parser.add_argument("--deploy-lag-branch", default="main")
     parser.add_argument(
@@ -1088,6 +1302,13 @@ def main(argv: list[str] | None = None) -> int:
             if args.deploy_lag_repo
             else None
         )
+        unit_drift = (
+            read_unit_drift_snapshot(
+                args.unit_drift_repo, profile=args.unit_drift_profile
+            )
+            if args.unit_drift_repo
+            else None
+        )
         report = evaluate(
             workers,
             queue,
@@ -1099,6 +1320,7 @@ def main(argv: list[str] | None = None) -> int:
             source_clone=source_clone,
             unit_health=unit_health,
             deploy_lag=deploy_lag,
+            unit_drift=unit_drift,
         )
     except Exception as exc:  # noqa: BLE001 - the monitor itself must fail closed
         print(json.dumps({"ok": False, "failures": [f"monitor_error:{exc}"]}))

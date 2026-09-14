@@ -3499,7 +3499,7 @@ def test_the_whole_control_generation_validates_as_one_spec_set(tmp_path):
     assert len(validated) == len(specs)
     assert {
         spec.target for spec in specs if spec.remove and not spec.directory
-    } == module.WORKER_ONLY_TARGETS
+    } == module.WORKER_ONLY_TARGETS | set(module.LEGACY_RETIRED_TARGETS)
     assert [spec.target for spec in specs if spec.remove and spec.directory] == list(
         module.WORKER_ONLY_DIRECTORIES
     )

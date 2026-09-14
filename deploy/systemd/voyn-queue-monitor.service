@@ -23,6 +23,12 @@ EnvironmentFile=/home/voynadmin/aicc-preprod/.env
 # remote. The finding reaches the planner through this unit's
 # --record-findings source, exactly like every other failure class.
 Environment=AICC_PR_WINDOW_REPO=.
+# The control host's half of the systemd-drift probe
+# (VOYN-W0-AICC-SYSTEMD-DRIFT-VERSIONED-UNITS). Same clone, same reason it is
+# an environment default rather than a flag; the profile differs because the
+# two roles own different unit sets.
+Environment=AICC_UNIT_DRIFT_REPO=.
+Environment=AICC_UNIT_DRIFT_PROFILE=control
 ExecStart=/home/voynadmin/aicc-preprod/repo/.venv/bin/python -m command_center.ops.infra_monitor --skip-workers --minimum-active-workers 0 --max-stalled-seconds 900 --max-recent-dead 0 --prometheus-url http://100.114.209.119:9090/-/ready
 NoNewPrivileges=true
 PrivateTmp=true
