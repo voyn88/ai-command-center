@@ -578,6 +578,7 @@ def test_git_argv_refuses_replacement_objects_and_execution_config():
         "core.sshCommand=/bin/false",
         "filter.lfs.smudge=",
         "uploadpack.packObjectsHook=",
+        "http.version=HTTP/1.1",
     ):
         assert knob in flags, knob
     assert module._safe_environment(Path("/tmp"))["GIT_NO_REPLACE_OBJECTS"] == "1"
