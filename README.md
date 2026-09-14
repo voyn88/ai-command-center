@@ -466,8 +466,13 @@ merges are to be blocked on it.
 - `app.py` and several runtime/Portfolio service modules are large, concentrated change surfaces.
 - A static type checker is configured (permissive, non-strict) via `pyproject.toml` and surfaced as a
   non-blocking CI step; it is not yet a merge gate and the codebase is not fully typed.
-- The checked-in CI workflow does not itself enforce branch protection. Enable "Require status checks
-  to pass before merging" on `main` with the `Quality gates` check to make it a real gate.
+- The checked-in CI workflow does not itself enforce branch protection, and as last measured
+  (2026-08-26) the API reported none in force on `main`: no required status checks,
+  `required_approving_review_count` 0, `enforce_admins` false — so the application-level
+  `merge_once` gate is the only thing gating a merge. See
+  [DR-GITHUB-TIER-ENFORCEMENT-001](docs/GITHUB_TIER_ENFORCEMENT_GAP_DECISION.md), which is pending a
+  founder decision, and re-check before relying on it:
+  `python3 scripts/verify_branch_protection.py --repo <owner/name>`.
 - The execution-queue lock is same-host and cooperative; raw queue mutation primitives can bypass it,
   and there is no distributed coordination.
 - Scheduler decisions are point-in-time advice, not persisted claims. Task-id, capacity, and

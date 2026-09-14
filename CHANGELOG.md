@@ -8,6 +8,27 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Added — branch protection is claimed only from the API (`VOYN-W0-AICC-GITHUB-TIER-ENFORCEMENT-GAP`)
+
+- `scripts/verify_branch_protection.py`: reads the branch-protection endpoint and
+  reports what it *actually* enforces. Exit 0 = every stated requirement is backed
+  by the API, exit 1 = it is not (or nothing gates a merge at all), exit 2 = the
+  state could not be read — unverified is not unprotected, and neither is a
+  verdict. 403 "Upgrade to GitHub Pro" and 404 "Branch not protected" are both
+  reported as not enforced, quoting GitHub's own message.
+- `tests/test_branch_protection_verifier.py`: pins the payload measured on `main`
+  (no required checks, 0 required reviews, `enforce_admins` false) as the
+  "enforces nothing" case, and fails the suite if any Markdown document asserts
+  branch protection as a working control without qualifying it or citing
+  DR-GITHUB-TIER-ENFORCEMENT-001.
+
+### Fixed
+
+- `scripts/enable-branch-protection.sh` printed "Branch 'main' is now protected."
+  on the strength of its own `PUT`, without ever reading the setting back — on
+  this repository's plan a false statement from its own tooling. It now verifies
+  through the endpoint and announces success only for what the API confirms.
+
 ### Added (SRV-05 slice 2)
 - `command_center/worker/payloads.py` — versioned `agent_run` payload contract
   (v1): refusals as data, timeout bounded by the queue's visibility ceiling,

@@ -120,7 +120,11 @@ Current boundaries:
 - Fail-closed workspace verification is scoped to normal task-v2 callers that supply
   `WorkspaceSpec`; low-level/ad-hoc launches preserve their separate behavior.
 - The current private-repository plan does not expose branch protection/rulesets, so CI is
-  automatic but required-check enforcement remains an operator merge discipline.
+  automatic but required-check enforcement remains an operator merge discipline. Confirmed against
+  the API on 2026-08-26 (no required checks, 0 required reviews, `enforce_admins` false) and open as
+  a founder decision — [DR-GITHUB-TIER-ENFORCEMENT-001](docs/GITHUB_TIER_ENFORCEMENT_GAP_DECISION.md).
+  Re-check with `python3 scripts/verify_branch_protection.py --repo <owner/name>` before describing
+  it as a control.
 - Git worktree creation, push, pull-request creation and merge are privileged capabilities with
   confirmation or policy safeguards.
 - The native PySide6 desktop client remains documentation and design work only.
