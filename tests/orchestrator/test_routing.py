@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from command_center import agent_runner
-from command_center.orchestrator.planner import PlanLimits, _payload_for
+from command_center.orchestrator.planner import PlanLimits, _payload_for, repo_route
 from command_center.orchestrator.routing import ROUTING_MATRIX, cascade_for
 
 #: The executors the worker can actually run, read from the SAME table the
@@ -73,6 +73,20 @@ def test_every_link_is_an_executor_the_isolated_worker_will_launch():
 
 def test_unknown_task_class_falls_back_to_implementation():
     assert cascade_for("martian") == cascade_for("implementation")
+
+
+def test_default_repo_routes_include_crm_lane(monkeypatch) -> None:
+    """CRM backlog tasks must be dispatchable without a per-host override.
+
+    This is deliberately hermetic rather than in the database planner suite:
+    the route table is a static planner contract and must be checked even
+    where the PostgreSQL integration fixtures are unavailable.
+    """
+    monkeypatch.delenv("AICC_PLANNER_REPO_ROUTES", raising=False)
+    assert repo_route("voyn-logistics-crm") == (
+        "CRM",
+        "/home/voynadmin/Projects/voyn-logistics-crm",
+    )
 
 
 def test_dispatch_prompt_asks_for_the_commit_and_not_for_a_pull_request() -> None:
