@@ -21,8 +21,9 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+from contextlib import ExitStack
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 import command_center.runtime.db as db  # facade (late-bound; see docstring)
 
@@ -677,7 +678,7 @@ def list_digest_items(
         return [_decode_digest_row(dict(row)) for row in rows]
 
 
-def list_digest_items_stored(db_path: Path) -> list[dict]:
+def list_digest_items_stored(db_path: Path) -> Iterator[dict]:
     """Every digest row in the shape SQLite **stores**, for reconciliation.
 
     Every other reader here returns :func:`_decode_digest_row` output, which
@@ -697,10 +698,42 @@ def list_digest_items_stored(db_path: Path) -> list[dict]:
     Deliberately without ``exclude_projects``: redaction is a read-surface
     policy, and a reconciliation that skipped redacted rows would certify a
     cutover over a subset of the table while reporting it as the whole.
+
+    **Streams, deliberately.** This is reconciliation's first real entry point
+    into the authority table, feeding ``mirror_support.divergence`` — which
+    was written to accept an iterator precisely so the authority table
+    never has to fit in one process's memory (see
+    ``test_reconciliation_accepts_a_generator_of_authority_rows``). Returning a
+    ``list`` here would have thrown that property away at the only place it
+    mattered: ``fetchall()`` materialises the whole table before the first
+    row reaches the caller, on a table sized for a production cutover rather
+    than a test fixture.
+
+    The connection is opened and the query issued **eagerly**, before this
+    function returns — not on the caller's first ``next()`` — so a bad
+    ``db_path`` fails at the call site the way the ``list``-returning version
+    did, rather than surfacing later inside whatever loop happens to consume
+    the rows. Only the row-by-row fetch (and the connection it holds open) is
+    deferred to iteration; that connection closes as soon as the caller
+    finishes (or abandons) the iterator, whichever comes first.
     """
-    with db.connect(db_path) as conn:
-        rows = conn.execute("SELECT * FROM digest_item ORDER BY id").fetchall()
-        return [dict(row) for row in rows]
+    stack = ExitStack()
+    conn = stack.enter_context(db.connect(db_path))
+    cursor = conn.execute("SELECT * FROM digest_item ORDER BY id")
+
+    def _rows() -> Iterator[dict]:
+        try:
+            # Iterating the cursor pulls one row at a time from SQLite
+            # (``sqlite3.Cursor.__next__`` -> ``fetchone``); never call
+            # ``fetchall()``/``fetchmany()`` here, or the table is back to
+            # being materialised in one process regardless of this
+            # function's declared return type.
+            for row in cursor:
+                yield dict(row)
+        finally:
+            stack.close()
+
+    return _rows()
 
 
 def _decode_digest_row(row: dict) -> dict:
