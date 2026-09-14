@@ -68,6 +68,15 @@ development keeps running.
   DIRTY (`branch_dirty_needs_rebase` — a real conflict, left for a rebase). It
   never reaches DONE and never lands.
 
+Nothing waits on the queue but the queue. A task's repo writer lease — the
+thing the planner's WIP limit actually counts (`backlog_dispatch` counts live
+`repo:%` leases, `command_center/db/sql/0006_backlog_planner.up.sql`) — is
+released at ingest, when the PR is published and the task becomes
+READY_TO_REVIEW (`0011_backlog_ingest_requires_pr.up.sql`). A PR sitting in the
+merge queue therefore holds no WIP slot and no repo lease: the planner keeps
+dispatching and the workers keep building while `main` is entered one entry at
+a time.
+
 Queue membership is read with the same `repository.mergeQueue(branch:).entries`
 query `scripts/assert_independent_acceptance.py` already runs on every
 `merge_group` event — a surface proven against the live repository — and the
