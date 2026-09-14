@@ -9,7 +9,11 @@ Type=oneshot
 User=voynadmin
 WorkingDirectory=/home/voynadmin/aicc-preprod/repo
 Environment=AICC_SOURCE_CLONE_REPO=.
-ExecStart=/home/voynadmin/aicc-preprod/repo/.venv/bin/python -m command_center.ops.infra_monitor --minimum-active-workers 4 --skip-queue --prometheus-url http://100.114.209.119:9090/-/ready
+# Host probes (VOYN-MON-CRASH-LOOP-DETECTION): every service unit's NRestarts and
+# failed state, and production's /version release_sha against the CRM main head.
+# `gh` reads the fleet GitHub App store; the loopback /version needs no credential.
+Environment=GH_CONFIG_DIR=/var/lib/aicc/github/gh
+ExecStart=/home/voynadmin/aicc-preprod/repo/.venv/bin/python -m command_center.ops.infra_monitor --minimum-active-workers 4 --skip-queue --prometheus-url http://100.114.209.119:9090/-/ready --unit-health --deploy-lag-repo voyn88/voyn-logistics-crm --deploy-lag-version-url http://127.0.0.1:8089/version
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=read-only

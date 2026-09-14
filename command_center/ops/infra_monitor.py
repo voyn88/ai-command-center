@@ -84,6 +84,62 @@ class SourceCloneSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class UnitState:
+    restarts: int
+    active_state: str
+    result: str
+
+
+@dataclass(frozen=True, slots=True)
+class UnitHealthSnapshot:
+    """Every service unit on the host, judged by restarts and failed state.
+
+    worker-01 2026-09-02..14: `ollama.service` restarted every 3 s for twelve
+    days (315 891 restarts) and `voyn-canary.service` every 15 s for eighteen
+    (70 305) while every monitor stayed green, because each probe asked
+    `is-active` of its own hand-picked units and a `Restart=always` unit is
+    `activating` again by the time anyone looks. NRestarts is the number that
+    cannot be hidden. Failed template instances (per-connection launcher
+    units) collapse to one `template@*.service` with a count so a hundred
+    dead connections are one finding, not a hundred.
+    """
+
+    crash_loops: tuple[tuple[str, int], ...]
+    failed_units: tuple[tuple[str, int], ...]
+    error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class DeployLagSnapshot:
+    """What production reports versus the branch head it should be running.
+
+    worker-01 2026-09-13 14:48 .. 09-14 18:49: six merged PRs sat behind a
+    refused promotion for 28 hours while test and preprod advanced. A green
+    branch says nothing about what customers run; only comparing the two
+    SHAs does. The branch head is allowed a grace period (CI plus the merge
+    queue plus the promotion tick) before its absence from production is a
+    finding. A red branch head older than the grace period is a finding too,
+    deliberately: a branch that stays red that long is a delivery outage.
+    """
+
+    repo: str
+    branch: str
+    branch_head: str | None
+    branch_head_age_seconds: float | None
+    deployed_sha: str | None
+    grace_seconds: float
+    error: str | None = None
+
+    @property
+    def lagging(self) -> bool:
+        if self.error is not None or self.branch_head is None or self.deployed_sha is None:
+            return False
+        if self.deployed_sha == self.branch_head:
+            return False
+        return (self.branch_head_age_seconds or 0.0) > self.grace_seconds
+
+
+@dataclass(frozen=True, slots=True)
 class MonitorReport:
     ok: bool
     active_workers: int
@@ -93,6 +149,8 @@ class MonitorReport:
     failures: tuple[str, ...]
     pr_window: PrWindowSnapshot | None = None
     source_clone: SourceCloneSnapshot | None = None
+    unit_health: UnitHealthSnapshot | None = None
+    deploy_lag: DeployLagSnapshot | None = None
 
 
 def parse_worker_units(output: str) -> dict[str, str]:
@@ -419,6 +477,196 @@ def read_source_clone_snapshot(repo_path: str) -> SourceCloneSnapshot:
         )
 
 
+def parse_unit_show(output: str) -> dict[str, UnitState]:
+    """Parse blank-line separated `systemctl show` blocks into unit states."""
+    units: dict[str, UnitState] = {}
+    for block in output.strip().split("\n\n"):
+        fields: dict[str, str] = {}
+        for line in block.splitlines():
+            key, sep, value = line.partition("=")
+            if sep:
+                fields[key.strip()] = value.strip()
+        unit = fields.get("Id")
+        if not unit:
+            continue
+        try:
+            restarts = int(fields.get("NRestarts", "0") or 0)
+        except ValueError:
+            restarts = 0
+        units[unit] = UnitState(
+            restarts=restarts,
+            active_state=fields.get("ActiveState", ""),
+            result=fields.get("Result", ""),
+        )
+    return units
+
+
+def _template_name(unit: str) -> str:
+    """`aicc-agent-launcher@2079-27636-984.service` -> `aicc-agent-launcher@*.service`."""
+    name, at, rest = unit.partition("@")
+    if not at:
+        return unit
+    suffix = rest[rest.rfind(".") :] if "." in rest else ""
+    return f"{name}@*{suffix}"
+
+
+def evaluate_unit_health(
+    units: dict[str, UnitState], *, crash_loop_restarts: int
+) -> UnitHealthSnapshot:
+    crash_loops = tuple(
+        sorted(
+            (unit, state.restarts)
+            for unit, state in units.items()
+            if state.restarts >= max(crash_loop_restarts, 1)
+        )
+    )
+    failed: dict[str, int] = {}
+    for unit, state in units.items():
+        if state.active_state == "failed":
+            key = _template_name(unit)
+            failed[key] = failed.get(key, 0) + 1
+    return UnitHealthSnapshot(
+        crash_loops=crash_loops, failed_units=tuple(sorted(failed.items()))
+    )
+
+
+def read_unit_health_snapshot(*, crash_loop_restarts: int) -> UnitHealthSnapshot:
+    """Two unprivileged systemctl calls for the whole host, never raising."""
+    try:
+        listed = subprocess.run(
+            [
+                "systemctl",
+                "list-units",
+                "--type=service",
+                "--all",
+                "--plain",
+                "--no-legend",
+                "--no-pager",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        names = sorted(
+            {
+                line.split(None, 1)[0]
+                for line in listed.stdout.splitlines()
+                if line.strip() and line.split(None, 1)[0].endswith(".service")
+            }
+        )
+        if not names:
+            raise RuntimeError("systemctl listed no service units")
+        shown = subprocess.run(
+            [
+                "systemctl",
+                "show",
+                "--property=Id,NRestarts,ActiveState,Result",
+                "--no-pager",
+                "--",
+                *names,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return evaluate_unit_health(
+            parse_unit_show(shown.stdout), crash_loop_restarts=crash_loop_restarts
+        )
+    except Exception as exc:  # noqa: BLE001 - see read_pr_window_snapshot
+        return UnitHealthSnapshot(
+            crash_loops=(),
+            failed_units=(),
+            error=f"{type(exc).__name__}: {exc}"[:200],
+        )
+
+
+def _fetch_json(url: str, timeout: int = 5) -> dict[str, Any]:
+    """GET a small loopback/LAN JSON document with the same URL hygiene as
+    the Prometheus probe (no credentials in the URL, http(s) only)."""
+    parsed = urlsplit(url)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise RuntimeError("version url must be a plain http(s) url")
+    client = (
+        http.client.HTTPSConnection
+        if parsed.scheme == "https"
+        else http.client.HTTPConnection
+    )
+    connection = client(parsed.hostname, parsed.port, timeout=timeout)
+    try:
+        target = parsed.path or "/"
+        if parsed.query:
+            target = f"{target}?{parsed.query}"
+        connection.request("GET", target)
+        response = connection.getresponse()
+        body = response.read(64 * 1024).decode("utf-8", errors="replace")
+        if response.status != 200:
+            raise RuntimeError(f"version url returned {response.status}")
+        document = json.loads(body)
+    finally:
+        connection.close()
+    if not isinstance(document, dict):
+        raise TypeError("version url returned no object")
+    return document
+
+
+def read_deploy_lag_snapshot(
+    repo: str, version_url: str, *, branch: str, grace_seconds: float
+) -> DeployLagSnapshot:
+    """One `gh api` request for the branch head, one GET for what runs.
+
+    `gh` authenticates from the unit's GH_CONFIG_DIR (the fleet's GitHub App
+    store on the worker), never from a token in arguments or logs.
+    """
+    try:
+        deployed = _fetch_json(version_url)
+        deployed_sha = str(deployed.get("release_sha") or "").strip()
+        if not deployed_sha:
+            raise RuntimeError("version document carries no release_sha")
+        completed = subprocess.run(
+            ["gh", "api", f"repos/{repo}/commits/{branch}"],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=60,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(
+                f"gh api failed: {(completed.stderr or '').strip()[:120]}"
+            )
+        commit = json.loads(completed.stdout or "{}")
+        head = str(commit.get("sha") or "").strip()
+        committed = _parse_iso8601(
+            str(commit.get("commit", {}).get("committer", {}).get("date") or "")
+        )
+        if not head or committed is None:
+            raise RuntimeError("gh api returned no sha or committer date")
+        return DeployLagSnapshot(
+            repo=repo,
+            branch=branch,
+            branch_head=head,
+            branch_head_age_seconds=max(time.time() - committed, 0.0),
+            deployed_sha=deployed_sha,
+            grace_seconds=grace_seconds,
+        )
+    except Exception as exc:  # noqa: BLE001 - see read_pr_window_snapshot
+        return DeployLagSnapshot(
+            repo=repo,
+            branch=branch,
+            branch_head=None,
+            branch_head_age_seconds=None,
+            deployed_sha=None,
+            grace_seconds=grace_seconds,
+            error=f"{type(exc).__name__}: {exc}"[:200],
+        )
+
+
 def prometheus_is_ready(url: str) -> bool:
     connection: http.client.HTTPConnection | None = None
     try:
@@ -460,6 +708,8 @@ def evaluate(
     max_recent_dead: int = 0,
     pr_window: PrWindowSnapshot | None = None,
     source_clone: SourceCloneSnapshot | None = None,
+    unit_health: UnitHealthSnapshot | None = None,
+    deploy_lag: DeployLagSnapshot | None = None,
 ) -> MonitorReport:
     active_workers = sum(state == "active" for state in worker_states.values())
     failures: list[str] = []
@@ -519,6 +769,34 @@ def evaluate(
             remote = (source_clone.remote_head or "unknown")[:12]
             failures.append(f"source_clone_stale:{local}!={remote}")
 
+    if unit_health is not None:
+        if unit_health.error is not None:
+            failures.append(f"unit_health_probe_failed:{unit_health.error}")
+        else:
+            # One finding per class, every unit in the detail: the identity
+            # is the code before the first ':' (`finding_key`).
+            if unit_health.crash_loops:
+                listing = ",".join(f"{u}={n}" for u, n in unit_health.crash_loops)
+                failures.append(
+                    f"crash_loop:{len(unit_health.crash_loops)}_units:{listing}"
+                )
+            if unit_health.failed_units:
+                listing = ",".join(f"{u}={n}" for u, n in unit_health.failed_units)
+                failures.append(
+                    f"failed_units:{len(unit_health.failed_units)}:{listing}"
+                )
+
+    if deploy_lag is not None:
+        if deploy_lag.error is not None:
+            failures.append(f"deploy_lag_probe_failed:{deploy_lag.error}")
+        elif deploy_lag.lagging:
+            failures.append(
+                f"deploy_lag:{deploy_lag.repo}:{(deploy_lag.deployed_sha or '')[:8]}"
+                f"!={(deploy_lag.branch_head or '')[:8]}"
+                f"_age_{int(deploy_lag.branch_head_age_seconds or 0)}s"
+                f">{int(deploy_lag.grace_seconds)}s"
+            )
+
     return MonitorReport(
         ok=not failures,
         active_workers=active_workers,
@@ -528,6 +806,8 @@ def evaluate(
         failures=tuple(failures),
         pr_window=pr_window,
         source_clone=source_clone,
+        unit_health=unit_health,
+        deploy_lag=deploy_lag,
     )
 
 
@@ -600,6 +880,34 @@ def build_parser() -> argparse.ArgumentParser:
             "a red monitor into a pipeline task instead of a failed unit."
         ),
     )
+    parser.add_argument(
+        "--unit-health",
+        action="store_true",
+        help="Read every service unit on the host: NRestarts crash loops and failed units.",
+    )
+    parser.add_argument(
+        "--crash-loop-restarts",
+        type=int,
+        default=5,
+        help="NRestarts at or above which a unit is a crash loop (default 5).",
+    )
+    parser.add_argument(
+        "--deploy-lag-repo",
+        default=None,
+        help="GitHub owner/name whose branch head production must run (off by default).",
+    )
+    parser.add_argument(
+        "--deploy-lag-version-url",
+        default=None,
+        help="URL of the deployed service's /version document carrying release_sha.",
+    )
+    parser.add_argument("--deploy-lag-branch", default="main")
+    parser.add_argument(
+        "--deploy-lag-grace-seconds",
+        type=float,
+        default=2700.0,
+        help="How old the branch head may be before its absence from production is a finding.",
+    )
     return parser
 
 
@@ -649,6 +957,9 @@ def record_findings(
 def _json_report(report: MonitorReport) -> dict[str, Any]:
     payload = asdict(report)
     payload["failures"] = list(report.failures)
+    if report.deploy_lag is not None:
+        # `asdict` serialises fields only; the verdict is a property.
+        payload["deploy_lag"]["lagging"] = report.deploy_lag.lagging
     return payload
 
 
@@ -672,6 +983,25 @@ def main(argv: list[str] | None = None) -> int:
             if args.source_clone_repo
             else None
         )
+        unit_health = (
+            read_unit_health_snapshot(crash_loop_restarts=args.crash_loop_restarts)
+            if args.unit_health
+            else None
+        )
+        if bool(args.deploy_lag_repo) != bool(args.deploy_lag_version_url):
+            raise RuntimeError(
+                "--deploy-lag-repo and --deploy-lag-version-url must be given together"
+            )
+        deploy_lag = (
+            read_deploy_lag_snapshot(
+                args.deploy_lag_repo,
+                args.deploy_lag_version_url,
+                branch=args.deploy_lag_branch,
+                grace_seconds=args.deploy_lag_grace_seconds,
+            )
+            if args.deploy_lag_repo
+            else None
+        )
         report = evaluate(
             workers,
             queue,
@@ -681,6 +1011,8 @@ def main(argv: list[str] | None = None) -> int:
             max_recent_dead=args.max_recent_dead,
             pr_window=pr_window,
             source_clone=source_clone,
+            unit_health=unit_health,
+            deploy_lag=deploy_lag,
         )
     except Exception as exc:  # noqa: BLE001 - the monitor itself must fail closed
         print(json.dumps({"ok": False, "failures": [f"monitor_error:{exc}"]}))
