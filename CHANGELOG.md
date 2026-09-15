@@ -8,6 +8,63 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Fixed — one writer-lease refusal stopped the whole queue (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
+- `control-01:queue` reported `queue_stalled` again (`monitor_finding` #2840),
+  and this time the probe was right: the queue really had stopped. Every
+  earlier entry below made the MEASUREMENT honest; this is the thing it was
+  honestly measuring.
+- `queue_claim` derived the new `work_attempt.attempt_no` from
+  `work_item.attempt_count`. That was free while the two moved together, and
+  migration 0022 separated them: `queue_fail_lease_wait` exists so a lost
+  writer-lease race does not spend the work's budget, so it requeues with
+  `attempt_count = greatest(attempt_count - 1, 0)` while deliberately KEEPING
+  the refunded `work_attempt` row — it is the audit trail 0002 promises, and
+  `work_event` references it. The item then carries `attempt_count = N-1`
+  beside an attempt that still holds `attempt_no = N`, the next claim
+  recomputes `N`, and `UNIQUE (work_item_id, attempt_no)` refuses it:
+  `duplicate key value violates unique constraint "idx_work_attempt_item_no"`.
+- The cost is the whole fleet, not the one item. The exception aborts
+  `queue_claim`, so the item is not merely un-retried but UNCLAIMABLE — and
+  `queue_claim` takes the oldest due row (`ORDER BY priority DESC,
+  available_at, created_at`), so it is head-of-line: every lane's next claim
+  selects it and raises, and healthy work behind it is never reached.
+  `worker.daemon.run_forever` has no handler for it either — it handles
+  `QueueRefusal`, which an exception is not — so the lane crash-loops under
+  systemd. One refusal of a kind the fleet is built to produce
+  (`backlog_dispatch` bounds concurrency by per-repository writer leases across
+  three repositories with two lanes; 0022's header records the live contention
+  that motivated the refund) stops every queue consumer.
+- That is why the finding kept reopening and could never be cleared by fleet
+  action: the monitor measures due ready work that no lane is holding while the
+  fleet clock stands still, which is exactly this state, and no amount of
+  correct measuring or restarting can claim an item whose next `attempt_no` is
+  already taken.
+- Migration 0025 numbers the delivery from the history that constrains it —
+  `attempt_no` is `max(attempt_no) + 1` over the item's own attempts, computed
+  under the row lock the claim already holds, so the unique index stays the
+  backstop its comment says it is rather than the thing that decides.
+  `attempt_count` stays the budget. It is also the recovery: an item already
+  poisoned carries `attempt_count = N-1` and a stuck `attempt_no = N`, and its
+  next claim takes `N+1` and succeeds — no data fix-up, no redrive, no
+  operator. Routing is unaffected: `worker.handlers._cascade_step` reads
+  `attempt_no` modulo the cascade length and already tolerates a number that
+  climbs independently of the budget (`queue_redrive` does the same), so a
+  lease-wait retry advances a cascade link exactly as it did before 0022, when
+  it was a plain `queue_fail(retryable => true)`.
+- Nothing had exercised the round trip, which is how this landed: the daemon's
+  routing to `fail_lease_wait`, the grant, and 0022's refund arithmetic were
+  all covered, but no test CLAIMED THE ITEM AGAIN afterwards — the only place
+  the collision can appear. Four regressions now do, each mutation-checked
+  against the migration: the refunded attempt taking the next number, the
+  head-of-line item that must not wedge the queue behind it, the lease-wait
+  bound still terminating in the DLQ with every delivery numbered afresh, and
+  — in the monitor's own suite — the stalled shape draining to a green probe.
+  Re-driven as a simulation of the deployed fleet against a real PostgreSQL 16
+  server (2 lanes, 40-minute attempts, a 4-deep backlog, retries, the reaper on
+  its 1-minute timer, sampled every 2 minutes as the timer samples): 24
+  simulated hours with writer-lease contention in the mix, zero red samples,
+  where the same run without the migration dies at the first refusal.
+
 ### Fixed — the queue monitor called a working fleet stalled (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
 - The measurement spanned EVERY queue while the verdict knew exactly one fleet
   (`monitor_finding` #2766). `work_item.queue` is a real dimension —

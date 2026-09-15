@@ -470,6 +470,66 @@ def test_a_queue_no_lane_has_ever_claimed_from_has_no_fleet_clock(monitor) -> No
 # ---------------------------------------------------------------------------
 
 
+def test_a_lease_wait_refund_leaves_the_queue_claimable(monitor) -> None:
+    """THE ROOT CAUSE THIS FINDING WAS ACTUALLY REPORTING (monitor_finding
+    #2840), measured end to end: the probe's verdict against the fleet's
+    ability to act on it.
+
+    Every earlier fix here made the MEASUREMENT honest. This one is the thing
+    it was honestly measuring. `queue_fail_lease_wait` refunds `attempt_count`
+    while the refunded `work_attempt` row keeps its `attempt_no`, and
+    `queue_claim` derived the next number from the refunded budget -- so the
+    item's next claim raised `UniqueViolation` instead of claiming. Since
+    `queue_claim` takes the oldest due row, that item was head-of-line: no lane
+    could claim ANYTHING, the fleet clock froze because no attempt was ever
+    created, and the probe reported due ready work nobody was attending.
+
+    That is a true `queue_stalled` with no exit reachable by the fleet, which
+    is exactly the finding that kept reopening. Here the same shape drains:
+    three claims, three completions, and a green probe."""
+    measure, app, worker, age = monitor
+    # Oldest first, so the lease-wait item is the one `queue_claim` selects.
+    app.enqueue(QUEUE, idempotency_key="contended", payload={"kind": "agent_run"})
+    contended = _claim(worker)
+    assert worker.fail_lease_wait(contended, reason="lease_unavailable") is True
+    for n in range(2):
+        app.enqueue(QUEUE, idempotency_key=f"behind-{n}", payload={"kind": "agent_run"})
+    # The lease-wait backoff elapses, and the whole queue has been due for an
+    # hour -- long past the stall window, so nothing here is excused by youth.
+    age(
+        "UPDATE work_item SET available_at = now() - interval '1 hour', "
+        "updated_at = now() - interval '1 hour' WHERE state = 'ready'"
+    )
+    age("UPDATE work_attempt SET created_at = now() - interval '1 hour', "
+        "updated_at = now() - interval '1 hour'")
+
+    stalled = measure()
+    assert (stalled.ready_due, stalled.attended_claims) == (3, 0)
+    assert stalled.ready_due_age_seconds > MAX_STALLED
+    # The fleet clock is frozen at the refunded attempt: nothing has been
+    # claimed since, because nothing COULD be.
+    assert stalled.fleet_idle_seconds > MAX_STALLED
+    assert "queue_stalled" in infra_monitor.evaluate(
+        {}, stalled, minimum_active_workers=0, max_stalled_seconds=MAX_STALLED,
+        prometheus_ready=True, claim_capacity=2,
+    ).failures
+
+    # THE FLEET CAN NOW ACT. Before the fix the first of these raised
+    # UniqueViolation out of `queue_claim` -- and out of `run_forever`, which
+    # handles refusals and not exceptions.
+    for _ in range(3):
+        claimed = _claim(worker)
+        assert worker.complete(claimed, {"ok": True}) is True
+
+    drained = measure()
+    assert (drained.ready, drained.claimed, drained.succeeded) == (0, 0, 3)
+    report = infra_monitor.evaluate(
+        {}, drained, minimum_active_workers=0, max_stalled_seconds=MAX_STALLED,
+        prometheus_ready=True, claim_capacity=2,
+    )
+    assert report.ok, report.failures
+
+
 def test_another_queues_ready_work_is_not_this_fleets_stall(monitor) -> None:
     """An item on a queue no lane claims from must not redden this probe.
 

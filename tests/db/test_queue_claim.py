@@ -1235,6 +1235,179 @@ def test_redrive_of_an_unknown_item_is_refused_and_the_refusal_survives(
 
 
 # ---------------------------------------------------------------------------
+# The lease-wait refund, and the number it must not rewind
+# ---------------------------------------------------------------------------
+# VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED (monitor_finding #2840). 0022 made
+# `attempt_count` a REFUNDABLE budget; `attempt_no` stayed the monotonic index
+# of the item's attempt history, which UNIQUE(work_item_id, attempt_no)
+# enforces. `queue_claim` derived the second from the first -- free while every
+# path moved them together, and a duplicate key the moment one path stopped.
+#
+# Nothing exercised the round trip. `test_a_lease_wait_failure_routes_to_the
+# _lease_wait_store_method` proves the daemon calls it, `test_roles_render`
+# proves the grant exists, and 0022's own suite proves the refund arithmetic --
+# but no test CLAIMED THE ITEM AGAIN afterwards, which is the only place the
+# collision can appear.
+
+
+def test_a_refunded_lease_wait_does_not_reuse_its_attempt_number(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """THE REGRESSION. A writer-lease refusal refunds the budget and keeps the
+    history, so the next delivery must take the NEXT attempt number -- not the
+    one the refunded attempt still occupies.
+
+    Both numbers are asserted, because the fix is precisely that they diverge:
+    the budget goes back to 0 (a lease wait spends nothing) while the history
+    goes on to 2 (there really were two deliveries)."""
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
+    with psycopg.connect(app_dsn, autocommit=True) as app:
+        item_id = _enqueue(app, "lease-wait-retry", max_attempts=3, backoff_seconds=0)
+
+    with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
+        with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+            token, token_hash = _token()
+            first = _claim(worker, token_hash)
+            assert first[0] and first[4] == 1
+            assert _item(admin_conn, item_id)[1] == 1, "the claim spent one attempt"
+
+            assert _call(
+                worker,
+                "SELECT ok, reason FROM queue_fail_lease_wait(%s, %s, %s, 20)",
+                (first[3], token, "lease_unavailable: held by a sibling lane"),
+            ) == (True, "lease_wait_requeued")
+            # The refund is what 0022 exists for, and what breaks the derived
+            # number: the budget is back to 0 while `attempt_no = 1` is taken.
+            assert _item(admin_conn, item_id)[1] == 0
+
+            token2, token_hash2 = _token()
+            second = _claim(worker, token_hash2)
+
+    # Before the fix this never returned: `queue_claim` recomputed
+    # `attempt_no = 0 + 1` and the INSERT raised UniqueViolation.
+    assert second[0] is True, second
+    assert second[4] == 2, "the second delivery is the second attempt in the history"
+    state, attempt_count, _max, current_attempt, _result, _dead = _item(
+        admin_conn, item_id
+    )
+    assert (state, attempt_count) == ("claimed", 1)
+    assert current_attempt == second[3]
+
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "SELECT attempt_no, state FROM work_attempt WHERE work_item_id = %s "
+            "ORDER BY attempt_no",
+            (item_id,),
+        )
+        # The refunded attempt is KEPT, which is why its number cannot be
+        # handed out again: it is the audit trail 0002 promises.
+        assert cur.fetchall() == [(1, "failed"), (2, "active")]
+
+
+def test_one_lease_wait_does_not_wedge_the_queue_behind_it(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """THE BLAST RADIUS, which is why this was a `queue_stalled` and not one
+    slow item. `queue_claim` takes the OLDEST DUE ROW, so an item whose next
+    attempt number is already taken is selected by every claim and raises out
+    of every one of them -- healthy work queued behind it is never reached, and
+    `worker.daemon.run_forever` has no handler for an exception (it handles
+    `QueueRefusal`, which this is not), so the lane crash-loops instead.
+
+    The fleet must drain all four items with no claim raising."""
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
+    with psycopg.connect(app_dsn, autocommit=True) as app:
+        # Enqueued first, so it sorts oldest and `queue_claim` reaches it first.
+        poisoned = _enqueue(app, "lease-wait-head", max_attempts=3, backoff_seconds=0)
+        behind = [
+            _enqueue(app, f"behind-{n}", max_attempts=3, backoff_seconds=0)
+            for n in range(3)
+        ]
+
+    with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
+        with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+            token, token_hash = _token()
+            first = _claim(worker, token_hash)
+            assert first[0] and first[2] == poisoned
+            assert _call(
+                worker,
+                "SELECT ok, reason FROM queue_fail_lease_wait(%s, %s, %s, 20)",
+                (first[3], token, "lease_unavailable"),
+            ) == (True, "lease_wait_requeued")
+
+            served = []
+            for _ in range(4):
+                token_n, hash_n = _token()
+                got = _claim(worker, hash_n)
+                assert got[0] is True, got
+                served.append(got[2])
+                assert _call(
+                    worker,
+                    "SELECT ok, reason FROM queue_complete(%s, %s, %s::jsonb)",
+                    (got[3], token_n, '{"ok": true}'),
+                )[0] is True
+
+    # Every item, the head-of-line one included, and each exactly once.
+    assert sorted(served) == sorted([poisoned, *behind])
+    for item_id in (poisoned, *behind):
+        assert _item(admin_conn, item_id)[0] == "succeeded"
+
+
+def test_the_attempt_number_climbs_across_repeated_lease_waits(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """The bound still terminates. `p_max_lease_waits` is a budget of its own,
+    so pathological contention dead-letters instead of retrying forever -- and
+    every delivery along the way takes a fresh number, which is what makes the
+    retries reachable at all. The cascade reads `attempt_no` modulo its length
+    (`worker.handlers._cascade_step`), so a climbing number routes rather than
+    collides -- the behaviour a lease wait had before 0022, when it was a plain
+    `queue_fail(retryable => true)`."""
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
+    with psycopg.connect(app_dsn, autocommit=True) as app:
+        item_id = _enqueue(app, "lease-wait-bound", max_attempts=3, backoff_seconds=0)
+
+    numbers = []
+    with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
+        with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+            for _ in range(3):
+                token, token_hash = _token()
+                got = _claim(worker, token_hash)
+                assert got[0] is True, got
+                numbers.append(got[4])
+                assert _call(
+                    worker,
+                    "SELECT ok, reason FROM queue_fail_lease_wait(%s, %s, %s, 3)",
+                    (got[3], token, "lease_unavailable"),
+                )[0] is True
+            # The fourth lease wait is past `p_max_lease_waits = 3`.
+            token, token_hash = _token()
+            got = _claim(worker, token_hash)
+            assert got[0] is True and got[4] == 4
+            assert _call(
+                worker,
+                "SELECT ok, reason FROM queue_fail_lease_wait(%s, %s, %s, 3)",
+                (got[3], token, "lease_unavailable"),
+            ) == (True, "lease_wait_dead_lettered")
+
+    assert numbers == [1, 2, 3], "each delivery takes the next number"
+    state, attempt_count, max_attempts, _current, _result, dead_reason = _item(
+        admin_conn, item_id
+    )
+    # It terminates on the LEASE-WAIT bound, not the attempt budget: four
+    # deliveries against `max_attempts = 3` would have dead-lettered as
+    # `attempt_budget_exhausted` had the refunds not happened. `attempt_count`
+    # is 1 rather than 0 because only the REQUEUE branch refunds -- the
+    # dead-letter branch is terminal and leaves the last claim's spend standing,
+    # which is 0022's behaviour and not this migration's business.
+    assert (state, attempt_count, max_attempts) == ("dead", 1, 3)
+    assert dead_reason.startswith("lease_wait_exhausted: ")
+
+
+# ---------------------------------------------------------------------------
 # The audit, and the rule that makes it survivable
 # ---------------------------------------------------------------------------
 
