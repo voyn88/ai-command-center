@@ -353,3 +353,163 @@ def test_in_progress_checks_keep_the_active_window_label(monkeypatch):
     assert report.active == [(1, head)]
     assert report.blocked == []
     assert labels == [(1, "review-window:active")]
+
+
+def test_blocked_queue_active_pr_does_not_hold_the_window(monkeypatch):
+    """`queue-active` is an operator's priority, not a bypass of eligibility.
+
+    Live 2026-09-15: five PRs from 2026-09-06 with red checks carried a
+    hand-set `queue-active` and were counted ACTIVE unconditionally, holding
+    all five window slots for nine hours while fourteen eligible PRs waited.
+    """
+    stale = _pr(1, "a" * 40, label="queue-active", merge_state="DIRTY")
+    clean = _pr(2, "b" * 40)
+    labels: list[tuple[int, str]] = []
+    queue_removed: list[tuple[int, frozenset[str]]] = []
+
+    monkeypatch.setattr(
+        review_merge, "_list_open_pulls", lambda _repo_path, _cfg: ([stale, clean], None)
+    )
+    monkeypatch.setattr(
+        review_merge,
+        "_set_pr_window_labels",
+        lambda _repo_path, pr, _cfg, desired: labels.append((pr["number"], desired))
+        or True,
+    )
+    monkeypatch.setattr(
+        review_merge,
+        "_remove_queue_labels",
+        lambda _repo_path, pr, remove: queue_removed.append(
+            (pr["number"], frozenset(remove))
+        )
+        or True,
+    )
+
+    report = reconcile_pr_window(
+        "/repo", PrWindowConfig(max_active=1, stale_seconds=10**12)
+    )
+
+    assert report.blocked == [(1, "merge_conflict")]
+    assert report.active == [(2, "b" * 40)]
+    assert labels == [(1, "review-window:blocked"), (2, "review-window:active")]
+    assert queue_removed == [(1, frozenset({"queue-active"}))]
+
+
+def test_eligible_queue_active_pr_is_prioritised_without_a_window_label(monkeypatch):
+    older_plain = _pr(1, "a" * 40)
+    younger_queued = _pr(2, "b" * 40, label="queue-active")
+    labels: list[tuple[int, str]] = []
+    window_removed: list[tuple[int, frozenset[str]]] = []
+    queue_removed: list[tuple[int, frozenset[str]]] = []
+
+    monkeypatch.setattr(
+        review_merge,
+        "_list_open_pulls",
+        lambda _repo_path, _cfg: ([older_plain, younger_queued], None),
+    )
+    monkeypatch.setattr(
+        review_merge,
+        "_set_pr_window_labels",
+        lambda _repo_path, pr, _cfg, desired: labels.append((pr["number"], desired))
+        or True,
+    )
+    monkeypatch.setattr(
+        review_merge,
+        "_remove_pr_window_labels",
+        lambda _repo_path, pr, _cfg, remove: window_removed.append(
+            (pr["number"], frozenset(remove))
+        )
+        or True,
+    )
+    monkeypatch.setattr(
+        review_merge,
+        "_remove_queue_labels",
+        lambda _repo_path, pr, remove: queue_removed.append(
+            (pr["number"], frozenset(remove))
+        )
+        or True,
+    )
+
+    report = reconcile_pr_window(
+        "/repo", PrWindowConfig(max_active=1, stale_seconds=10**12)
+    )
+
+    assert report.active == [(2, "b" * 40)], "operator priority is kept"
+    assert report.waiting == [(1, "a" * 40)]
+    assert labels == [(1, "review-window:waiting")], "queue-owned PRs get no window label"
+    assert window_removed == [(2, frozenset({"review-window:waiting", "review-window:blocked"}))]
+    assert queue_removed == [], "an eligible queue-active label is never touched"
+
+
+def _stale_queue_active_pr(number: int, head: str):
+    """Old head, no accept marker: `stale_exact_head_acceptance` once
+    `stale_seconds` is small -- a reason the in-window ticks can remediate."""
+    pr = _pr(number, head, label="queue-active")
+    pr["commits"] = [{"oid": head, "committedDate": "2020-01-01T00:00:00Z"}]
+    return pr
+
+
+def _window_with_queue_label_age(monkeypatch, prs, age_seconds):
+    labels: list[tuple[int, str]] = []
+    window_removed: list[tuple[int, frozenset[str]]] = []
+    queue_removed: list[tuple[int, frozenset[str]]] = []
+    monkeypatch.setattr(review_merge, "_list_open_pulls", lambda _r, _c: (prs, None))
+    monkeypatch.setattr(
+        review_merge,
+        "_set_pr_window_labels",
+        lambda _r, pr, _c, desired: labels.append((pr["number"], desired)) or True,
+    )
+    monkeypatch.setattr(
+        review_merge,
+        "_remove_pr_window_labels",
+        lambda _r, pr, _c, remove: window_removed.append((pr["number"], frozenset(remove)))
+        or True,
+    )
+    monkeypatch.setattr(
+        review_merge,
+        "_remove_queue_labels",
+        lambda _r, pr, remove: queue_removed.append((pr["number"], frozenset(remove)))
+        or True,
+    )
+    monkeypatch.setattr(
+        review_merge, "_queue_active_label_age_seconds", lambda _r, _pr, *, now: age_seconds
+    )
+    report = reconcile_pr_window(
+        "/repo", PrWindowConfig(max_active=1, stale_seconds=1, queue_active_ttl_seconds=3600)
+    )
+    return report, labels, window_removed, queue_removed
+
+
+def test_fresh_queue_active_override_holds_a_remediable_block(monkeypatch):
+    """Within its TTL the operator's label keeps an old, unaccepted PR in the
+    window so the ticks can re-review it (#935's contract), shedding only the
+    contradictory window labels."""
+    report, labels, window_removed, queue_removed = _window_with_queue_label_age(
+        monkeypatch, [_stale_queue_active_pr(1, "a" * 40), _pr(2, "b" * 40)], 60.0
+    )
+    assert report.active == [(1, "a" * 40)]
+    assert report.blocked == []
+    assert report.waiting == [(2, "b" * 40)]
+    assert labels == [(2, "review-window:waiting")]
+    assert window_removed == [(1, frozenset({"review-window:waiting", "review-window:blocked"}))]
+    assert queue_removed == []
+
+
+def test_expired_queue_active_override_frees_the_slot(monkeypatch):
+    """Past the TTL the same PR is blocked like any other and loses the label:
+    the ticks had their window and the checks are still not green."""
+    report, labels, _window_removed, queue_removed = _window_with_queue_label_age(
+        monkeypatch, [_stale_queue_active_pr(1, "a" * 40), _pr(2, "b" * 40)], 7 * 3600.0
+    )
+    assert report.blocked == [(1, "stale_exact_head_acceptance")]
+    assert report.active == [(2, "b" * 40)]
+    assert labels == [(1, "review-window:blocked"), (2, "review-window:active")]
+    assert queue_removed == [(1, frozenset({"queue-active"}))]
+
+
+def test_unreadable_queue_active_label_age_fails_open_to_the_override(monkeypatch):
+    report, _labels, _window_removed, queue_removed = _window_with_queue_label_age(
+        monkeypatch, [_stale_queue_active_pr(1, "a" * 40)], None
+    )
+    assert report.active == [(1, "a" * 40)] and report.blocked == []
+    assert queue_removed == []
