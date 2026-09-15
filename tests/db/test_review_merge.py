@@ -4283,3 +4283,51 @@ def test_a_failed_detail_lookup_leaves_the_existing_label_untouched(monkeypatch)
     assert {n for n, _ in report.unreadable} == {1, 2, 3}
     assert report.active == [] and report.waiting == [] and report.blocked == []
     assert fake.labels == [], "no evidence, no label change"
+
+
+def _rollup_entry(name: str, conclusion: str, started_at: str | None):
+    entry = {"name": name, "conclusion": conclusion}
+    if started_at is not None:
+        entry["startedAt"] = started_at
+    return entry
+
+
+def test_agreeing_twin_runs_of_one_check_are_not_ambiguous():
+    """Live 2026-09-15, #974: the label-noise placeholder job shares one
+    expression-shaped name across every skipped run; several started in the
+    same second, and the ACCEPTED PR sat unmergeable on `AMBIGUOUS`."""
+    noise = "((github.event_name == 'pull_request' && ...) && 'Gate not run' || 'Build gates'"
+    rollup = [
+        _rollup_entry(noise, "SKIPPED", "2026-09-15T07:13:02Z"),
+        _rollup_entry(noise, "SKIPPED", "2026-09-15T07:13:02Z"),
+        _rollup_entry(noise, "SKIPPED", "2026-09-15T13:11:40Z"),
+        _rollup_entry("Final merge gate", "SUCCESS", "2026-09-15T07:20:00Z"),
+    ]
+    latest = {c["name"]: c for c in review_merge._latest_checks_by_name(rollup)}
+    assert latest[noise]["conclusion"] == "SKIPPED"
+    assert all(review_merge._check_is_green(c) for c in latest.values())
+
+
+def test_disagreeing_twin_runs_of_one_check_stay_ambiguous():
+    rollup = [
+        _rollup_entry("Linux quality shard 1 of 4", "SUCCESS", "2026-09-15T07:13:02Z"),
+        _rollup_entry("Linux quality shard 1 of 4", "FAILURE", "2026-09-15T07:13:02Z"),
+    ]
+    (only,) = review_merge._latest_checks_by_name(rollup)
+    assert only["conclusion"] == "AMBIGUOUS"
+    assert not review_merge._check_is_green(only)
+    unstamped = [
+        _rollup_entry("Final merge gate", "SUCCESS", None),
+        _rollup_entry("Final merge gate", "FAILURE", "2026-09-15T07:13:02Z"),
+    ]
+    (only,) = review_merge._latest_checks_by_name(unstamped)
+    assert only["conclusion"] == "AMBIGUOUS"
+
+
+def test_agreeing_unstamped_twins_carry_their_shared_verdict():
+    rollup = [
+        _rollup_entry("Build gates (web production)", "SKIPPED", None),
+        _rollup_entry("Build gates (web production)", "SKIPPED", "2026-09-15T07:13:02Z"),
+    ]
+    (only,) = review_merge._latest_checks_by_name(rollup)
+    assert only["conclusion"] == "SKIPPED"
