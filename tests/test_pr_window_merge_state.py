@@ -568,3 +568,34 @@ def test_blocked_queue_waiting_pr_stays_waiting_without_a_blocked_label(monkeypa
     assert labels == []
     assert window_removed == [(1, frozenset({"review-window:active", "review-window:blocked"}))]
     assert queue_removed == []
+
+
+def _check(name: str, conclusion: str):
+    return {"name": name, "conclusion": conclusion, "startedAt": "2026-01-01T00:00:00Z"}
+
+
+def test_the_acceptance_gates_own_failure_does_not_block_the_window(monkeypatch):
+    """The gate fails on every head until the window has produced a verdict;
+    reading that as red CI parked fresh PRs as BLOCKED before any review
+    (live 2026-09-15: #973/#974)."""
+    fresh = _pr(1, "a" * 40)
+    fresh["statusCheckRollup"] = [
+        _check("Final merge gate", "SUCCESS"),
+        _check("Acceptance gate (independent verdict on exact SHA)", "FAILURE"),
+    ]
+    red_ci = _pr(2, "b" * 40)
+    red_ci["statusCheckRollup"] = [
+        _check("Final merge gate", "FAILURE"),
+        _check("Acceptance gate (independent verdict on exact SHA)", "FAILURE"),
+    ]
+    labels: list[tuple[int, str]] = []
+    monkeypatch.setattr(review_merge, "_list_open_pulls", lambda _r, _c: ([fresh, red_ci], None))
+    monkeypatch.setattr(
+        review_merge,
+        "_set_pr_window_labels",
+        lambda _r, pr, _c, desired: labels.append((pr["number"], desired)) or True,
+    )
+    report = reconcile_pr_window("/repo", PrWindowConfig(max_active=2, stale_seconds=10**12))
+    assert report.active == [(1, "a" * 40)]
+    assert report.blocked == [(2, "checks_stale")], "real red CI still blocks"
+    assert labels == [(1, "review-window:active"), (2, "review-window:blocked")]

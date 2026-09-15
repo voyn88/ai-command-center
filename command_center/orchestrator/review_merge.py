@@ -118,9 +118,16 @@ __all__ = [
 
 #: See `ReviewConfig.required_checks`. A module constant (not a dataclass
 #: attribute read at call time) because `ReviewConfig` uses slots.
+#: The Acceptance gate is the review window's OWN output, not CI evidence:
+#: it fails on every head until an independent reviewer has posted a verdict
+#: for that head. The window must therefore never read its red as "checks
+#: red" -- doing so parked every fresh PR as BLOCKED before it could be
+#: reviewed (live 2026-09-15: #973/#974 blocked `checks_stale` on nothing but
+#: their own missing verdict).
+_ACCEPTANCE_GATE_CHECK = "Acceptance gate (independent verdict on exact SHA)"
 _DEFAULT_REQUIRED_MERGE_CHECKS: tuple[str, ...] = (
     "Final merge gate",
-    "Acceptance gate (independent verdict on exact SHA)",
+    _ACCEPTANCE_GATE_CHECK,
 )
 
 
@@ -4267,7 +4274,11 @@ def _window_block_reason(
     present = {str(check.get("name") or "") for check in rollup}
     if any(name not in present for name in cfg.required_checks):
         return "checks_missing"
-    if rollup and any(_check_is_red_for_window(check) for check in rollup):
+    if rollup and any(
+        _check_is_red_for_window(check)
+        for check in rollup
+        if str(check.get("name") or "") != _ACCEPTANCE_GATE_CHECK
+    ):
         return "checks_stale"
     if age_seconds > cfg.stale_seconds and not _accept_marker_on_latest_review(
         reviews, head, author_login
