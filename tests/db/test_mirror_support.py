@@ -9,6 +9,8 @@ no PostgreSQL, so this file runs on a laptop with no server and no Docker.
 
 from __future__ import annotations
 
+import os
+import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -24,19 +26,88 @@ from command_center.db.mirror_support import (
 # --- the conversion that was wrong once -------------------------------------
 
 
-def test_a_naive_timestamp_is_read_in_the_writers_zone() -> None:
+@pytest.fixture
+def process_tz():
+    """Run a test under an explicit process timezone.
+
+    The conversion's whole job is to be independent of this, and on a UTC host
+    a zone-dependent implementation is indistinguishable from a correct one —
+    so the tests that pin the scale set a non-UTC zone rather than trusting the
+    machine they run on.
+    """
+    original = os.environ.get("TZ")
+
+    def _set(name: str) -> None:
+        os.environ["TZ"] = name
+        time.tzset()
+
+    yield _set
+    if original is None:
+        os.environ.pop("TZ", None)
+    else:
+        os.environ["TZ"] = original
+    time.tzset()
+
+
+def test_a_naive_timestamp_is_read_as_utc(process_tz) -> None:
     """Naive text handed to `timestamptz` is stamped with the *session* zone.
 
     That is silent: no error, every row shifted by the gap between the writing
     machine and the server. The zone is attached here instead, so the instant
-    stored is the one the writer meant.
+    stored is the one the writer meant — and what the writer means is UTC
+    (`models.iso_now`, VOYN-W0-AICC-ISO-NOW-NAIVE-LOCAL).
     """
+    process_tz("Europe/Moscow")
     written = "2026-08-13T12:00:00"
 
     attached = to_instant(written)
 
     assert attached.tzinfo is not None
-    assert attached == datetime.fromisoformat(written).astimezone()
+    assert attached == datetime(2026, 8, 13, 12, 0, tzinfo=timezone.utc)
+
+
+def test_the_instant_no_longer_depends_on_who_mirrored_the_row(process_tz) -> None:
+    """The hazard this used to carry, now closed.
+
+    While the authority wrote naive *local* time, the only available reading
+    was the mirroring process's own zone — so the same row mirrored from an MSK
+    and a UTC process stored instants three hours apart, and `divergence`
+    reconciled both clean because the render inverted the same wrong
+    conversion. Reading the authority's own scale removes the dependency:
+    `VOYN-W0-AICC-TZ-AWARE-TIMESTAMPS` no longer has to be open for the mirror
+    to be trustworthy, and running it outside the writer's process is no longer
+    an unenforced operational constraint.
+    """
+    written = "2026-08-13T12:00:00"
+
+    process_tz("Europe/Moscow")
+    from_msk = to_instant(written)
+    process_tz("America/Los_Angeles")
+    from_pacific = to_instant(written)
+    process_tz("UTC")
+    from_utc = to_instant(written)
+
+    assert from_msk == from_pacific == from_utc
+    assert render_authority_timestamp(from_msk) == written
+
+
+def test_a_pre_switchover_row_is_read_on_the_new_scale_but_round_trips(
+    process_tz,
+) -> None:
+    """The residual, stated so it is not mistaken for an oversight.
+
+    Rows written before the switchover are local time and are read here as UTC,
+    so their mirrored *instant* is off by the writer's old offset. The mirror is
+    a copy rather than an authority and the render is the exact inverse, so
+    `divergence` still reconciles them — nothing is lost or reported wrong.
+    Retention is the case where a legacy row's instant genuinely matters,
+    because it deletes, and it keeps honouring the legacy zone explicitly
+    (`runtime.db.retention_cutoff`).
+    """
+    process_tz("Europe/Moscow")
+    legacy_local_row = "2026-08-13T12:00:00"  # 09:00 UTC in truth, unmarked
+
+    assert render_authority_timestamp(to_instant(legacy_local_row)) == legacy_local_row
 
 
 def test_an_already_aware_timestamp_keeps_its_own_offset() -> None:
@@ -51,8 +122,9 @@ def test_the_render_reproduces_exactly_what_the_application_writes() -> None:
     """The regression test for the defect that reached `main`.
 
     An earlier render emitted UTC with a `Z` suffix "matching what the
-    application writes". It does not — `models.iso_now()` writes naive local
-    time at second precision — so `divergence` called every row different: a
+    application writes". It does not — `models.iso_now()` writes an *offsetless*
+    timestamp at second precision, which is still true now that the scale
+    underneath it is UTC — so `divergence` called every row different: a
     cutover gate permanently red, which invites loosening the comparison.
     """
     from command_center import models
@@ -65,7 +137,7 @@ def test_the_render_reproduces_exactly_what_the_application_writes() -> None:
 
 def test_the_render_survives_a_mirror_read_in_another_zone() -> None:
     """`timestamptz` comes back in the session's zone, not the writer's. The
-    render converts to local first, so the same instant renders identically
+    render converts to UTC first, so the same instant renders identically
     however the server chose to present it."""
     written = "2026-08-13T12:00:00"
     instant = to_instant(written)

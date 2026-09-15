@@ -482,8 +482,11 @@ def _migrate_unlocked(db_path: Path) -> None:
             db._validate_finalization_claim_schema(conn)
         # Stamp the zone this file's naive timestamps are on, from a process
         # that also writes them. Retention reads it back instead of trusting
-        # its own `TZ` (VOYN-W0-AICC-RETENTION-TZ).
-        db._stamp_timestamp_zone(conn)
+        # its own `TZ` (VOYN-W0-AICC-RETENTION-TZ). `fresh` decides *which*
+        # zone is the truth about this file: a database this call just created
+        # holds only UTC rows, while one that already had a schema may hold
+        # pre-UTC local ones (VOYN-W0-AICC-ISO-NOW-NAIVE-LOCAL).
+        db._stamp_timestamp_zone(conn, fresh=initial_version == 0)
     if current >= 13:
         db.backfill_run_provenance(db_path, limit=500)
     # Optional, operator-opted-in retention: run after the migration connection
@@ -501,13 +504,33 @@ def _migrate_unlocked(db_path: Path) -> None:
 #: was written on. A separate domain table would also have to acquire a
 #: PostgreSQL counterpart in the store-migration lane before it could exist,
 #: which is a coupling this fix has no reason to create.
+#:
+#: Since `VOYN-W0-AICC-ISO-NOW-NAIVE-LOCAL` the writer emits naive UTC, so a
+#: recorded value has exactly two meanings, and both are load-bearing:
+#:
+#:   * `"UTC"` — every naive timestamp in this file is UTC. Stamped on a
+#:     database this code created.
+#:   * any other IANA zone — this file was *already in use* before the UTC
+#:     switchover, so it holds local-time rows written in that zone **as well
+#:     as** UTC rows written after. Retention has to satisfy both readings; see
+#:     `retention_cutoff`.
 LEDGER_TIMESTAMP_TZ_COLUMN = "timestamp_tz"
 RETENTION_TZ_ENV = "AICC_RUNTIME_TZ"
 
+#: The zone `models.iso_now` writes on every host, and therefore the zone
+#: stamped on any database this code creates.
+TIMESTAMP_ZONE_UTC = "UTC"
+
 
 def _machine_timestamp_zone() -> str | None:
-    """The IANA zone name this machine writes `models.iso_now` timestamps in,
-    or `None` when it cannot be identified as an IANA key.
+    """This machine's *local* IANA zone name, or `None` when it cannot be
+    identified as an IANA key.
+
+    Not the zone new rows are written in — since
+    `VOYN-W0-AICC-ISO-NOW-NAIVE-LOCAL` that is always UTC
+    (`TIMESTAMP_ZONE_UTC`). This is the zone in which rows written *before*
+    that change, on this host, have to be read, which is the only thing a
+    database that predates the switchover needs recorded about itself.
 
     Two sources, in order: an explicit `TZ` (what a container, a service unit
     or a cron entry sets), then the `/etc/localtime` symlink (macOS and Linux
@@ -553,22 +576,43 @@ def _read_timestamp_zone(conn: sqlite3.Connection) -> str | None:
     return row["zone"] if row else None
 
 
-def _stamp_timestamp_zone(conn: sqlite3.Connection) -> None:
+def _stamp_timestamp_zone(conn: sqlite3.Connection, *, fresh: bool) -> None:
     """Record, once, the zone this database's naive timestamps are on.
 
     Written by `migrate()`, i.e. by an application process that also writes
     those timestamps, and never overwritten: the recorded zone describes the
-    history already in the file. Moving a database to a machine in another zone
-    therefore keeps the old (correct) reading of the old rows; new rows written
-    there are on a different clock, which no retention cutoff can reconcile —
-    that is the `iso_now` convention's own limit, not this function's (see
-    `VOYN-W0-AICC-ISO-NOW-NAIVE-LOCAL`).
+    history already in the file.
+
+    `fresh` says whether `migrate()` found no schema at all, and it selects
+    which of two different truths gets recorded:
+
+    * **Fresh file.** Every row it will ever hold is written by this code,
+      which writes UTC, so it is stamped `"UTC"` — exactly, and independently
+      of whatever zone the creating host happens to be in.
+    * **Existing file.** It may already hold naive *local* rows from before
+      `VOYN-W0-AICC-ISO-NOW-NAIVE-LOCAL`, so the host's local zone is stamped,
+      as it was before that change. That is the only reading under which those
+      rows are correct, and `retention_cutoff` needs it to avoid deleting them
+      early. If the host's zone cannot be named, nothing is stamped — a zone we
+      cannot resolve is worse than no zone (see `_machine_timestamp_zone`), and
+      retention then says "process-local" instead of deleting against a guess.
+
+    `fresh` is deliberately not inferred from the row counts: a caller that has
+    just created the schema knows, and a heuristic would have to be right about
+    an empty-but-old database. The one shape it misreads is a file whose
+    `schema_version` ledger was wiped while its data rows were kept, which is
+    not a state any code path here produces.
+
+    Moving a database to a machine in another zone keeps the old (correct)
+    reading of its old rows, because the stamp is never rewritten. New rows are
+    UTC wherever they are written, so — unlike before this change — moving the
+    file no longer strands them on an unrecoverable third clock.
 
     Same idempotent check-then-`ALTER TABLE ADD COLUMN` shape the run-table
     migrations use, under the same `BEGIN IMMEDIATE`, so two processes racing
     a brand-new database cannot both decide the column is missing.
     """
-    zone = db._machine_timestamp_zone()
+    zone = db.TIMESTAMP_ZONE_UTC if fresh else db._machine_timestamp_zone()
     if zone is None:
         return
     try:
@@ -601,12 +645,18 @@ def _stamp_timestamp_zone(conn: sqlite3.Connection) -> None:
 
 
 def resolve_timestamp_zone(db_path: Path) -> tuple[str | None, str]:
-    """Which zone `completed_at`/`created_at` strings in `db_path` are on, and
-    where that answer came from (`"env"`, `"database"`, `"process-local"`).
+    """Which zone the *pre-UTC* `completed_at`/`created_at` strings in `db_path`
+    are on, and where that answer came from (`"env"`, `"database"`,
+    `"process-local"`).
 
     `AICC_RUNTIME_TZ` wins so an operator can state the truth for a database
     stamped on the wrong machine; an unusable value raises rather than falling
     back, because a wrong zone here silently changes which rows get deleted.
+
+    A `"UTC"` answer means the file has no pre-UTC rows at all. Any other zone
+    means it has some, and says how to read them; rows written after the
+    switchover are UTC regardless of what this returns, which is why
+    `retention_cutoff` never treats this answer as the whole story.
     """
     override = os.environ.get(RETENTION_TZ_ENV)
     if override:
@@ -629,34 +679,85 @@ def resolve_timestamp_zone(db_path: Path) -> tuple[str | None, str]:
     return None, "process-local"
 
 
+#: `zone_source` reported by `retention_cutoff` when UTC's own bound was the
+#: earlier of the two candidates and therefore the one applied. Distinct from
+#: `"database"`/`"env"`/`"process-local"`, which mean the *declared* zone
+#: rendered the bound, so a retention report always says which of the two
+#: readings actually judged the rows.
+RETENTION_ZONE_SOURCE_UTC_FLOOR = "utc-floor"
+
+
+def _cutoff_at(now_there: datetime, retention_days: int) -> str:
+    """`retention_days` before `now_there`, as that clock's naive wall time —
+    the textual shape `models.iso_now` writes, so it compares directly against
+    a stored column. The caller converts one UTC instant into each candidate
+    clock, which is what keeps the result independent of the pruning process's
+    own zone."""
+    return (
+        now_there.replace(tzinfo=None) - timedelta(days=retention_days)
+    ).isoformat(timespec="seconds")
+
+
 def retention_cutoff(db_path: Path, *, retention_days: int) -> tuple[str, str, str]:
     """The `completed_at < ?` bound for `retention_days`, as
-    `(cutoff, zone_name, zone_source)`.
+    `(cutoff, zone_name, zone_source)` — `zone_name`/`zone_source` naming the
+    clock the returned string is actually on.
 
-    The single reason this exists: `completed_at` is a naive local string, so
-    the bound has to be rendered on the *same* clock the rows were written on
-    — not on whatever clock the pruning process happens to be started with.
-    Anchoring to `datetime.now(timezone.utc)` and converting into the
-    database's declared zone makes the returned string identical in every
-    process timezone, which is what makes the deleted row *set* deterministic
-    (`VOYN-W0-AICC-RETENTION-TZ`).
+    The single reason this exists: `completed_at` is a naive string, so the
+    bound has to be rendered on the *same* clock the rows were written on — not
+    on whatever clock the pruning process happens to be started with. Every
+    candidate below is anchored to `datetime.now(timezone.utc)`, so the
+    returned string is identical in every process timezone, which is what makes
+    the deleted row *set* deterministic (`VOYN-W0-AICC-RETENTION-TZ`).
 
-    With no declared zone (a database that predates migration 24 and has not
-    been migrated since) the process clock is all there is; the third element
-    says so, so a caller can record that the answer was not pinned.
+    A database can hold rows on **two** clocks, and this is the function where
+    that matters, because it is the one that deletes:
+
+    * rows written since `VOYN-W0-AICC-ISO-NOW-NAIVE-LOCAL` are naive UTC;
+    * rows written before it, in a file that was already in use, are naive
+      local time in the zone the ledger recorded for itself (or, for a file
+      that was never stamped, in some zone nobody wrote down).
+
+    Nothing distinguishes the two by inspection — same format, same column —
+    so the bound is the **earlier of the two candidate renderings**. That is
+    the only choice under which no row is deleted before `retention_days` have
+    truly elapsed on its own clock, whichever clock that was. Rendering only
+    UTC would shift the boundary forward by the legacy zone's offset (up to
+    ~14h) for every pre-switchover row and prune it that much early, which is
+    irreversible; rendering only the legacy zone would do the mirror image to
+    the UTC rows. The cost of taking the minimum is bounded and lands on the
+    safe side: on a database with a non-UTC legacy zone, rows may survive up to
+    that offset *longer* than the configured window. A file stamped `"UTC"`
+    (anything this code created) has one candidate in effect and gets the
+    window exactly.
+
+    With no declared zone at all (a database that predates migration 24 and has
+    not been migrated since) the process clock is the only guess available for
+    its legacy rows, and it is used as that candidate — the pre-existing limit
+    of an unstamped file, narrowed, not widened: the result is never later than
+    what the process clock alone would have produced. The third element says
+    `"process-local"` so a caller can record that the answer was not pinned.
     """
-    zone_name, source = db.resolve_timestamp_zone(db_path)
-    if zone_name is None:
-        now_local = datetime.now()
-        zone_name = datetime.now().astimezone().tzname() or ""
+    declared, source = db.resolve_timestamp_zone(db_path)
+    now_utc = datetime.now(timezone.utc)
+    if declared is not None:
+        now_legacy = now_utc.astimezone(ZoneInfo(declared))
+        legacy_zone = declared
     else:
-        now_local = (
-            datetime.now(timezone.utc)
-            .astimezone(ZoneInfo(zone_name))
-            .replace(tzinfo=None)
-        )
-    cutoff = (now_local - timedelta(days=retention_days)).isoformat(timespec="seconds")
-    return cutoff, zone_name, source
+        # `astimezone()` with no argument = this process's local zone.
+        now_legacy = now_utc.astimezone()
+        legacy_zone = now_legacy.tzname() or ""
+    legacy = (db._cutoff_at(now_legacy, retention_days), legacy_zone, source)
+    utc = (
+        db._cutoff_at(now_utc, retention_days),
+        db.TIMESTAMP_ZONE_UTC,
+        db.RETENTION_ZONE_SOURCE_UTC_FLOOR,
+    )
+    # `min` keeps the first of equal elements, so a file whose declared zone is
+    # UTC reports its declaration (`"database"`/`"env"`) rather than the floor:
+    # the two renderings are the same string, and the declaration is the more
+    # informative of the two answers.
+    return min((legacy, utc), key=lambda candidate: candidate[0])
 
 
 def apply_runtime_retention(db_path: Path, *, retention_days: int) -> int:
@@ -667,12 +768,15 @@ def apply_runtime_retention(db_path: Path, *, retention_days: int) -> int:
     Bounded and conservative:
       * only *terminal* runs are eligible (their events are historical audit
         trail, not live state);
-      * the cutoff comes from `retention_cutoff`, which renders it in the zone
-        the database declares its naive timestamps are on — so the deleted row
-        *set* is the same whichever timezone the pruning process runs in. It
-        used to be a bare `datetime.now()`, i.e. the pruning process's own
-        zone, which deleted a different set of rows from the same database at
-        the same instant (`VOYN-W0-AICC-RETENTION-TZ`);
+      * the cutoff comes from `retention_cutoff`, which renders it on the
+        clock the rows were written on — so the deleted row *set* is the same
+        whichever timezone the pruning process runs in. It used to be a bare
+        `datetime.now()`, i.e. the pruning process's own zone, which deleted a
+        different set of rows from the same database at the same instant
+        (`VOYN-W0-AICC-RETENTION-TZ`). A file that predates
+        `VOYN-W0-AICC-ISO-NOW-NAIVE-LOCAL` holds rows on two clocks, and that
+        cutoff satisfies the earlier of them rather than pruning the legacy
+        rows an offset early;
       * the run row itself is kept (its `state`/`completed_at` remain visible
         in the Execution Center and to reconciliation); only the bulky
         per-output-event history is pruned;

@@ -17,7 +17,7 @@ import os
 from datetime import datetime
 from pathlib import Path
 
-from command_center.models import iso_now
+from command_center.models import iso_now, utc_now
 from command_center.storage import atomic_write_text
 
 ROOT = Path(__file__).resolve().parent.parent.parent
@@ -59,7 +59,9 @@ def report_path_for(run: dict) -> Path:
     try:
         started_dt = datetime.fromisoformat(started)
     except (ValueError, TypeError):
-        started_dt = datetime.now()
+        # Same clock as the `iso_now` string this normally parses, so a
+        # fallback filename sorts alongside the real ones.
+        started_dt = utc_now()
     timestamp = started_dt.strftime("%Y%m%d-%H%M%S")
     run_part = _safe_path_component(run.get("id") or "unknown", "unknown")[:12]
     return REPORTS_ROOT / project / f"{timestamp}_{run_part}.md"

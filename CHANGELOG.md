@@ -8,6 +8,59 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Fixed — Timestamps are naive UTC, not naive local time (`VOYN-W0-AICC-ISO-NOW-NAIVE-LOCAL`)
+- `command_center/models.py`: `iso_now()` now returns naive **UTC**. The text
+  shape is unchanged (offsetless, second precision), so every stored column
+  stays directly string-comparable with the records already in it — what
+  changed is the scale. Local time is not monotonic: at the autumn DST
+  fall-back the same wall clock is replayed, so a run started *later* got a
+  strictly *smaller* string (reproduced: `03:50` against a truly-later
+  `03:10`) and every `ORDER BY created_at DESC` answered with the *earlier*
+  row. Raising precision to microseconds does not help — verified; the
+  collision is an hour wide. Same-second *tiebreak* remains the separate
+  insertion-sequence record (`VOYN-W0-AICC-INSERT-SEQ`).
+- `models.utc_now()` is the one reference "now" that may be compared against a
+  stored timestamp, and `models.to_local()` its display-side inverse for the
+  two things an operator reads on their own clock (an absolute time in the UI,
+  a calendar-day bucket). Every site that compared a stored stamp against a
+  bare `datetime.now()` moved to `utc_now()`: the orphan-reap deadline
+  (`runtime/supervisor.py` — off by the host offset decided whether a live
+  adopted run was SIGKILLed hours early), completion retry scheduling
+  (`runtime/completion_service.py`, `daily_audit_backend.py`), the 24h
+  spend-cap window (`task_pipeline.daily_spend_usd`), the overnight digest
+  window (`digest/sources.py`), queue/SLA epochs (`runtime/scheduler.py`),
+  `models.format_age`, and the Execution Center / Home / Kanban / board
+  screens. Day-buckets went the other way and are localised explicitly, so
+  "today" stays the day the operator is having rather than the UTC one:
+  `app._runs_per_day`/`_run_started_date`/`_window_terminal_runs`,
+  `digest.service.today_str`, and `runtime/project_overview._is_today`
+  (the Execution Center's "завершено сегодня" count).
+- `command_center/db/mirror_support.py`: the PostgreSQL mirror reads an
+  offsetless authority timestamp as UTC and renders it back the same way. This
+  closes the hazard that module documented — while the authority wrote local
+  time, the instant stored depended on which process ran the mirror, and
+  `divergence` reconciled the mistake clean in both directions
+  (`VOYN-W0-AICC-TZ-AWARE-TIMESTAMPS`).
+- `web/src/lib/time.ts`: one helper for reading these timestamps in the SPA.
+  ECMAScript parses an offsetless date-time as *local*, so `new Date(created_at)`
+  displayed every API timestamp shifted by the browser's offset. `npm test
+  --prefix web` now names the vitest suite that covers it, which the repo had
+  configured (`vite.config.ts`) but never given a script.
+- **Retention keeps honouring pre-upgrade rows.** A database that was already
+  in use holds two clocks: naive local rows from before this change, in the
+  zone its `schema_version.timestamp_tz` ledger recorded, and naive UTC rows
+  after it. Nothing distinguishes them by inspection, so
+  `runtime.db.retention_cutoff` now applies the **earlier of the two candidate
+  renderings** — the only bound under which no row is deleted before its
+  window has truly elapsed on its own clock. Rendering only UTC would move the
+  boundary forward by the legacy zone's offset (up to ~14h) and prune every
+  pre-upgrade row that much early, which is irreversible. The cost is bounded
+  and on the safe side: on such a file rows may outlive the window by up to
+  that offset. A file this code created is stamped `"UTC"` and gets the window
+  exactly; `migrate()` stamps the host's local zone for a file that already had
+  a schema, precisely so its legacy rows stay readable. A retention report
+  names the clock that judged the rows (`utc-floor` when UTC's bound won).
+
 ### Fixed — Control ticks have their own GitHub quota (`VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS`)
 - `command_center/orchestrator/gh_access.py`: every `gh` call the review,
   merge and PR-window ticks make now runs under the `voyn-aicc-fleet` App's

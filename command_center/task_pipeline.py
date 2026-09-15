@@ -2427,7 +2427,11 @@ def daily_spend_usd(db_path: Path, *, now: str | None = None) -> float:
     import json as _json
     from datetime import datetime as _dt, timedelta as _td
 
-    anchor = _dt.fromisoformat(now) if now else _dt.now()
+    # Naive UTC, like the `completed_at`/`started_at` columns the window is
+    # compared against (`models.iso_now`); a bare `_dt.now()` moved the whole
+    # 24h spend window by the host's UTC offset, which silently changes what a
+    # spend cap gates on.
+    anchor = _dt.fromisoformat(now) if now else models.utc_now()
     cutoff = (anchor - _td(hours=24)).isoformat(timespec="seconds")
     total = 0.0
     with runtime_db.connect(db_path) as conn:

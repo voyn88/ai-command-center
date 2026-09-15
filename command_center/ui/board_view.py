@@ -79,6 +79,8 @@ class WeeklySummary:
 
 
 def _parse_ts(value: object) -> datetime | None:
+    """A stored task timestamp, naive UTC as written (`models.iso_now`), left
+    on that scale — `now` is handed in on the same one."""
     if not isinstance(value, str) or not value:
         return None
     try:
@@ -88,6 +90,9 @@ def _parse_ts(value: object) -> datetime | None:
 
 
 def _week_label(now: datetime) -> str:
+    """The week the board covers, named on the reader's local calendar (`now`
+    arrives on the app's UTC scale — see `build_weekly_summary`)."""
+    now = models.to_local(now)
     start = now - timedelta(days=now.weekday())
     end = start + timedelta(days=6)
     return f"неделя {start.strftime('%d.%m.%Y')} – {end.strftime('%d.%m.%Y')}"
@@ -215,7 +220,12 @@ def build_weekly_summary(
 ) -> WeeklySummary:
     """Pure assembly of the board page's data from the same task list every
     other screen reads — no separate "board truth", so this page can never
-    show a different reality than Kanban does."""
+    show a different reality than Kanban does.
+
+    `now` must be on the scale the task timestamps are stored on — naive UTC,
+    i.e. `models.utc_now()` — because that is what the seven-day window is
+    compared against. The week label and `generated_at` are the two values a
+    human reads off it, and they are localised at render time."""
     tasks_by_id = {t["id"]: t for t in tasks if t.get("id")}
     completed = _completed_this_week(tasks, now=now)
     risks = _collect_risks(tasks, tasks_by_id)
@@ -312,5 +322,6 @@ def render_board_view(summary: WeeklySummary) -> None:
 
     st.divider()
     st.caption(
-        f"Сформировано автоматически из текущих задач: {summary.generated_at.strftime('%d.%m.%Y %H:%M')}."
+        "Сформировано автоматически из текущих задач: "
+        f"{models.to_local(summary.generated_at).strftime('%d.%m.%Y %H:%M')}."
     )

@@ -18,6 +18,7 @@ import GlassPanel from '../components/GlassPanel'
 import LangToggle from '../components/LangToggle'
 import NavItem from '../components/NavItem'
 import { ExecutionIcon, HomeIcon, TasksIcon } from '../components/NavIcons'
+import { formatAppTimestamp } from '../lib/time'
 import {
   fetchQueueItem,
   fetchQueueItems,
@@ -43,13 +44,6 @@ function statusTone(state: string): string {
   return 'var(--tx3)'
 }
 
-function formatDate(value: string | null, language: string, fallback: string) {
-  if (!value) return fallback
-  const date = new Date(value)
-  return Number.isNaN(date.getTime())
-    ? value
-    : new Intl.DateTimeFormat(language, { dateStyle: 'medium', timeStyle: 'short' }).format(date)
-}
 
 /** A human name for a queue item: the repository or task it concerns —
  * never its wki_* id. */
@@ -112,7 +106,7 @@ function TaskRow({ item, language, fallback }: { item: QueueItem; language: stri
           {t(statusKey(item.state))}
         </span>
         <strong>{taskTitle(item, t('taskGeneric'))}</strong>
-        <span className="task-date">{formatDate(item.created_at, language, fallback)}</span>
+        <span className="task-date">{formatAppTimestamp(item.created_at, language, fallback)}</span>
         <button type="button" className="task-toggle" onClick={toggle}>
           {open ? t('taskHide') : t('taskDetails')}
         </button>

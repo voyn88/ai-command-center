@@ -24,6 +24,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 
+from command_center import models
+
 #: The five tournament tracks, in canonical display order.
 CATEGORIES: tuple[str, ...] = ("Dev", "Security", "Ops", "Planning", "UX")
 
@@ -53,8 +55,12 @@ def task_category(task: dict) -> str | None:
 
 
 def current_month(*, now: datetime | None = None) -> str:
-    """The `YYYY-MM` a protocol built now belongs to."""
-    return (now or datetime.now()).strftime("%Y-%m")
+    """The `YYYY-MM` a protocol built now belongs to.
+
+    On the app's UTC scale, because `_run_month` reads the month straight out
+    of a stored `iso_now` string — a local "now" would put runs from either
+    edge of the month in a bucket the protocol is not building."""
+    return (now or models.utc_now()).strftime("%Y-%m")
 
 
 def _run_month(run: dict) -> str | None:
@@ -135,7 +141,7 @@ def build_monthly_protocol(
 
     return TournamentProtocol(
         month=month,
-        generated_at=(now or datetime.now()).isoformat(timespec="seconds"),
+        generated_at=(now or models.utc_now()).isoformat(timespec="seconds"),
         categories={category: _rank_standings(tallies[category]) for category in CATEGORIES},
     )
 

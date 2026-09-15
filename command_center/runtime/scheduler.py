@@ -61,7 +61,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Mapping
 
 from command_center import agent_runner, executors, models
@@ -420,12 +420,20 @@ def _normalize_workspace(path: str) -> str:
 
 
 def _to_epoch(iso: str | None) -> float | None:
+    """A stored `iso_now` string as a true epoch. Offsetless input is read as
+    UTC, which is what this app writes (`models.iso_now`); `.timestamp()` on a
+    bare naive value would read it in the host's local zone instead, so every
+    queued-seconds and SLA figure would be off by that offset — and ambiguous
+    by an hour inside a DST fold."""
     if not iso:
         return None
     try:
-        return datetime.fromisoformat(iso).timestamp()
+        parsed = datetime.fromisoformat(iso)
     except (ValueError, TypeError):
         return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
 
 
 @dataclass(frozen=True)
@@ -553,10 +561,16 @@ def _sla_remaining(item: WorkItem, now_epoch: float | None) -> float | None:
 
 
 def _iso_add(iso: str | None, seconds: float) -> str | None:
+    """`iso` shifted by `seconds`, rendered back on the same clock it came in
+    on — naive UTC, the inverse of `_to_epoch`."""
     epoch = _to_epoch(iso)
     if epoch is None:
         return None
-    return datetime.fromtimestamp(epoch + seconds).isoformat(timespec="seconds")
+    return (
+        datetime.fromtimestamp(epoch + seconds, tz=timezone.utc)
+        .replace(tzinfo=None)
+        .isoformat(timespec="seconds")
+    )
 
 
 def plan(
