@@ -48,6 +48,7 @@ def publish(monkeypatch, snapshot, review_rows):
     monkeypatch.setattr(review_merge, "_pr_diff_and_head", lambda *_: snapshot)
     monkeypatch.setattr(review_merge, "_has_accept_marker", lambda *_: (False, HEAD))
     monkeypatch.setattr(review_merge, "_acceptance_app_credentials", object)
+    monkeypatch.setattr(review_merge, "_rerun_failing_acceptance_gate", lambda *_: None)
     monkeypatch.setattr(
         review_merge, "_post_marker_as_bot",
         lambda _c, _p, verdict, sha: (posted.append((verdict, sha)) or True, ""),
@@ -86,88 +87,33 @@ def test_chunk_completeness_failure_and_reject_are_fail_closed(monkeypatch):
     assert not posted and remediated and report.remediated
 
 
-def test_malformed_result_gets_fresh_bounded_retry_key(monkeypatch):
-    key = "review:identity:chunk:0001:abc"
-    monkeypatch.setattr(
-        review_merge,
-        "_latest_attempt",
-        lambda *_: (0, "succeeded", {"result_text": "tool transcript only"}),
-    )
-    assert review_merge._next_retry_key(None, TASK, key, HEAD) == f"{key}:retry:1"
-
-    monkeypatch.setattr(
-        review_merge,
-        "_latest_attempt",
-        lambda *_: (0, "succeeded", {"result_text": f"VERDICT: ACCEPT\nHEAD_SHA: {HEAD}"}),
-    )
-    assert review_merge._next_retry_key(None, TASK, key, HEAD) is None
-
-    monkeypatch.setattr(
-        review_merge,
-        "_latest_attempt",
-        lambda *_: (review_merge._MAX_RESULT_RETRY_ATTEMPTS, "succeeded", {"result_text": ""}),
-    )
-    assert review_merge._next_retry_key(None, TASK, key, HEAD) is None
+ACCEPT_TEXT = f"VERDICT: ACCEPT\nHEAD_SHA: {HEAD}"
+MALFORMED_TEXT = "tool transcript only, no verdict line"
 
 
-def test_reconcile_enqueues_only_fresh_chunk_retry(monkeypatch):
-    snapshot = snap("diff --git a/a b/a\n" + "x\n" * 40_000)
-    chunks = review_merge._review_chunks(snapshot, TASK, PR)
-    target = review_merge._chunk_review_key(TASK, PR, snapshot, chunks[1])
-    assert target is not None
-    monkeypatch.setattr(
-        review_merge, "_model_only_review_cascade", lambda: [{"executor": "copilot"}]
-    )
-    monkeypatch.setattr(planner, "repo_route", lambda _: ("AICC", "/repo"))
-    monkeypatch.setattr(review_merge, "_pr_diff_and_head", lambda *_: snapshot)
-    monkeypatch.setattr(review_merge, "_has_accept_marker", lambda *_: (False, HEAD))
-    monkeypatch.setattr(
-        review_merge,
-        "_next_retry_key",
-        lambda _factory, _task, base_key, _head: f"{base_key}:retry:1"
-        if base_key == target else None,
-    )
-    monkeypatch.setattr(
-        review_merge,
-        "_rows",
-        lambda _factory, sql, _params=(): [(TASK, PR)] if "SELECT t.task_id" in sql else [],
-    )
-    dispatched = []
-    report = review_merge.reconcile_review_once(
-        None, lambda *args: dispatched.append(args), "/repo"
-    )
-    assert [entry[1] for entry in dispatched] == [f"{target}:retry:1"]
-    assert report.retried == [(TASK, f"{target}:retry:1")]
+def reconcile(
+    monkeypatch, snapshot, attempt_rows, *,
+    marker=False, marker_head=None, tasks=None, cfg=None,
+):
+    """Drive reconcile_review_once over a faked work_item/work_result table.
 
-
-def test_six_chunk_review_retries_only_the_malformed_chunk(monkeypatch):
-    snapshot = snap("diff --git a/a b/a\n" + "x\n" * 100_000)
-    chunks = review_merge._review_chunks(snapshot, TASK, PR)
-    assert len(chunks) == 6
-
-    accept_output = {"result_text": f"VERDICT: ACCEPT\nHEAD_SHA: {HEAD}"}
-    malformed_output = {"result_text": "tool transcript only, no verdict"}
-
-    malformed_key = review_merge._chunk_review_key(TASK, PR, snapshot, chunks[2])
-    exhausted_key = review_merge._chunk_review_key(TASK, PR, snapshot, chunks[4])
-    attempt_rows = []
-    for index, chunk in enumerate(chunks):
-        key = review_merge._chunk_review_key(TASK, PR, snapshot, chunk)
-        if key == malformed_key:
-            attempt_rows.append((key, "succeeded", malformed_output))
-        elif key == exhausted_key:
-            attempt_rows.append((key, "succeeded", malformed_output))
-            attempt_rows.append((f"{key}:retry:1", "succeeded", malformed_output))
-            attempt_rows.append((f"{key}:retry:2", "succeeded", malformed_output))
-        else:
-            attempt_rows.append((key, "succeeded", accept_output))
+    ``attempt_rows`` are ``(idempotency_key, state, result_payload)`` triples --
+    the real rows, including every superseded attempt, so the tests exercise
+    the same newest-attempt selection production does.
+    """
+    claims = []
 
     def fake_rows(_factory, sql, params=()):
-        if "SELECT t.task_id" in sql:
-            return [(TASK, PR)]
-        assert "i.idempotency_key" in sql
-        _task_id, prefix, _prefix2 = params
-        return [row for row in attempt_rows if row[0].startswith(prefix)]
+        if "backlog_scan_cursor" in sql:
+            return []
+        if "backlog_scan_claim" in sql:
+            claims.append(params)
+            return []
+        if "i.idempotency_key" in sql:
+            _task_id, prefix, _prefix2 = params
+            return [row for row in attempt_rows if row[0].startswith(prefix)]
+        assert "READY_TO_REVIEW" in sql
+        return list(tasks) if tasks is not None else [(TASK, PR)]
 
     monkeypatch.setattr(review_merge, "_rows", fake_rows)
     monkeypatch.setattr(
@@ -175,15 +121,251 @@ def test_six_chunk_review_retries_only_the_malformed_chunk(monkeypatch):
     )
     monkeypatch.setattr(planner, "repo_route", lambda _: ("AICC", "/repo"))
     monkeypatch.setattr(review_merge, "_pr_diff_and_head", lambda *_: snapshot)
-    monkeypatch.setattr(review_merge, "_has_accept_marker", lambda *_: (False, HEAD))
-
+    monkeypatch.setattr(
+        review_merge,
+        "_has_accept_marker",
+        lambda *_: (marker, marker_head if marker_head is not None else snapshot.head),
+    )
     dispatched = []
     report = review_merge.reconcile_review_once(
-        None, lambda *args: dispatched.append(args), "/repo"
+        None, lambda *args: dispatched.append(args), "/repo", cfg
     )
+    return report, dispatched, claims
+
+
+def test_next_retry_key_is_exact_and_bounded(monkeypatch):
+    key = "review:identity:chunk:0001:abc"
+
+    def latest(value):
+        monkeypatch.setattr(review_merge, "_latest_attempt", lambda *_: value)
+
+    # A succeeded attempt with no parseable verdict earns the next identity.
+    latest((0, "succeeded", {"result_text": MALFORMED_TEXT}))
+    assert review_merge._next_retry_key(None, TASK, key, HEAD) == f"{key}:retry:1"
+    latest((1, "succeeded", {"result_text": MALFORMED_TEXT}))
+    assert review_merge._next_retry_key(None, TASK, key, HEAD) == f"{key}:retry:2"
+
+    # ... and nothing else does.
+    for value in (
+        (0, "succeeded", {"result_text": ACCEPT_TEXT}),               # valid ACCEPT
+        (0, "succeeded", {"result_text": f"VERDICT: REJECT\nHEAD_SHA: {HEAD}"}),
+        (review_merge._MAX_RESULT_RETRY_ATTEMPTS, "succeeded", {"result_text": ""}),
+        (0, "failed", None),                                          # queue-level failure
+        (0, "pending", None),                                         # in flight
+        (1, "running", None),                                         # retry in flight
+        None,                                                         # never enqueued
+    ):
+        latest(value)
+        assert review_merge._next_retry_key(None, TASK, key, HEAD) is None
+
+    # A verdict for a head that is no longer current is stale, not valid.
+    latest((0, "succeeded", {"result_text": ACCEPT_TEXT}))
+    assert review_merge._next_retry_key(None, TASK, key, "a" * 40) == f"{key}:retry:1"
+
+
+def test_latest_attempt_selects_newest_and_ignores_foreign_keys(monkeypatch):
+    base = "review:T:1:" + HEAD + ":v1"
+    supplied = [
+        (base, "succeeded", {"result_text": MALFORMED_TEXT}),
+        (f"{base}:retry:1", "succeeded", {"result_text": ACCEPT_TEXT}),
+        # Prefix-matching neighbours that are NOT this identity.
+        (f"{base}:chunk:0000:{'a' * 64}", "succeeded", {"result_text": ACCEPT_TEXT}),
+        (f"{base}:retry:1:chunk:0000", "succeeded", {"result_text": ACCEPT_TEXT}),
+    ]
+    monkeypatch.setattr(review_merge, "_rows", lambda *_a, **_k: supplied)
+    assert review_merge._latest_attempt(None, TASK, base) == (
+        1, "succeeded", {"result_text": ACCEPT_TEXT}
+    )
+    # The single-chunk publish path reads that same newest attempt.
+    assert review_merge._latest_review_result(None, TASK, base) == {
+        "result_text": ACCEPT_TEXT
+    }
+
+
+def test_chunk_rows_collapse_to_newest_attempt_under_the_base_identity(monkeypatch):
+    snapshot = snap("diff --git a/a b/a\n" + "x\n" * 40_000)
+    base_rows = rows(snapshot)
+    key, _state, payload, _output = base_rows[0]
+    supplied = [
+        (key, "succeeded", payload, {"result_text": MALFORMED_TEXT}),
+        *base_rows[1:],
+        (f"{key}:retry:1", "succeeded", payload, {"result_text": ACCEPT_TEXT}),
+    ]
+    monkeypatch.setattr(review_merge, "_rows", lambda *_a, **_k: supplied)
+    _prefix, collapsed = review_merge._chunk_review_rows(None, TASK, PR, snapshot)
+
+    assert len(collapsed) == len(base_rows)
+    # The retry is read under the BASE identity, so the manifest key check in
+    # _aggregate_chunk_verdict still binds it to its chunk index and content.
+    newest = {row[0]: row[3] for row in collapsed}
+    assert newest[key] == {"result_text": ACCEPT_TEXT}
+    assert not any(row[0].endswith(":retry:1") for row in collapsed)
+    # Read-only: every original row, superseded ones included, is untouched.
+    assert len(supplied) == len(base_rows) + 1
+
+
+def test_publish_accepts_on_the_retry_and_waits_while_one_is_in_flight(monkeypatch):
+    snapshot = snap("diff --git a/a b/a\n" + "x\n" * 40_000)
+    base_rows = rows(snapshot)
+    key, _state, payload, _output = base_rows[0]
+    malformed = (key, "succeeded", payload, {"result_text": MALFORMED_TEXT})
+
+    # The malformed attempt alone wedges the review -- the #606 stall.
+    report, posted, _ = publish(monkeypatch, snapshot, [malformed, *base_rows[1:]])
+    assert not posted and "review_chunk_verdict_missing:0" in report.skipped[0][1]
+
+    # An in-flight retry stays fail-closed rather than reading the stale row.
+    in_flight = (f"{key}:retry:1", "running", payload, None)
+    report, posted, _ = publish(
+        monkeypatch, snapshot, [malformed, *base_rows[1:], in_flight]
+    )
+    assert not posted and "not_succeeded" in report.skipped[0][1]
+
+    # Once the retry lands a verdict, the whole review resolves.
+    landed = (f"{key}:retry:1", "succeeded", payload, {"result_text": ACCEPT_TEXT})
+    report, posted, _ = publish(
+        monkeypatch, snapshot, [malformed, *base_rows[1:], landed]
+    )
+    assert posted == [("ACCEPT", HEAD)]
+
+
+def test_six_chunk_review_retries_only_the_malformed_chunk(monkeypatch):
+    snapshot = snap("diff --git a/a b/a\n" + "x\n" * 100_000)
+    chunks = review_merge._review_chunks(snapshot, TASK, PR)
+    assert len(chunks) == 6
+
+    def chunk_key(index):
+        return review_merge._chunk_review_key(TASK, PR, snapshot, chunks[index])
+
+    malformed_key, exhausted_key, in_flight_key = (
+        chunk_key(2), chunk_key(4), chunk_key(5)
+    )
+    attempt_rows = []
+    for index in range(len(chunks)):
+        key = chunk_key(index)
+        if key == malformed_key:
+            attempt_rows.append((key, "succeeded", {"result_text": MALFORMED_TEXT}))
+        elif key == exhausted_key:
+            # Both retries already spent, still malformed: fail closed.
+            attempt_rows.append((key, "succeeded", {"result_text": MALFORMED_TEXT}))
+            attempt_rows.append(
+                (f"{key}:retry:1", "succeeded", {"result_text": MALFORMED_TEXT})
+            )
+            attempt_rows.append(
+                (f"{key}:retry:2", "succeeded", {"result_text": MALFORMED_TEXT})
+            )
+        elif key == in_flight_key:
+            attempt_rows.append((key, "running", None))
+        else:
+            attempt_rows.append((key, "succeeded", {"result_text": ACCEPT_TEXT}))
+
+    report, dispatched, _ = reconcile(monkeypatch, snapshot, attempt_rows)
 
     assert [entry[1] for entry in dispatched] == [f"{malformed_key}:retry:1"]
     assert report.retried == [(TASK, f"{malformed_key}:retry:1")]
+    # Same payload and manifest as the attempt it replaces.
+    _queue, _key, payload, dispatched_task, _attempts = dispatched[0]
+    assert dispatched_task == TASK
+    assert payload["review_chunk"] == {
+        "version": 3, "index": 2, "count": 6,
+        "content_bytes": len(chunks[2].text.encode()),
+        "content_hash": chunks[2].content_hash,
+        "manifest_hash": chunks[2].manifest_hash,
+        "base_sha": snapshot.base, "head_sha": snapshot.head,
+        "diff_hash": snapshot.digest,
+    }
+    assert payload["prompt"] == review_merge._render_review_prompt(
+        TASK, PR, snapshot, chunks[2]
+    )
+    assert payload["untrusted"] is True
+
+
+def test_reconcile_retries_a_single_chunk_review_at_most_twice(monkeypatch):
+    snapshot = snap("diff --git a/a b/a\n@@ -1 +1 @@\n-old\n+new\n")
+    assert len(review_merge._review_chunks(snapshot, TASK, PR)) == 1
+    key = review_merge._review_key(TASK, PR, snapshot)
+
+    history = [(key, "succeeded", {"result_text": MALFORMED_TEXT})]
+    for attempt in (1, 2):
+        _report, dispatched, _ = reconcile(monkeypatch, snapshot, history)
+        assert [entry[1] for entry in dispatched] == [f"{key}:retry:{attempt}"]
+        # A single-chunk retry carries no chunk manifest, like its original.
+        assert "review_chunk" not in dispatched[0][2]
+        history.append(
+            (f"{key}:retry:{attempt}", "succeeded", {"result_text": MALFORMED_TEXT})
+        )
+
+    # Budget exhausted: the identity stays fail-closed from here on.
+    _report, dispatched, _ = reconcile(monkeypatch, snapshot, history)
+    assert dispatched == []
+
+
+def test_reconcile_refuses_stale_heads_and_posted_markers(monkeypatch):
+    snapshot = snap("diff --git a/a b/a\n@@ -1 +1 @@\n-old\n+new\n")
+    key = review_merge._review_key(TASK, PR, snapshot)
+    malformed = [(key, "succeeded", {"result_text": MALFORMED_TEXT})]
+
+    # The PR head moved between the marker read and the diff fetch.
+    report, dispatched, _ = reconcile(
+        monkeypatch, snapshot, malformed, marker_head="b" * 40
+    )
+    assert dispatched == [] and report.skipped == [(TASK, "pr_diff_snapshot_failed")]
+
+    # `gh pr view` failed outright -- no head to compare against.
+    report, dispatched, _ = reconcile(monkeypatch, snapshot, malformed, marker_head="")
+    assert dispatched == [] and report.skipped == [(TASK, "pr_view_failed")]
+
+    # A marker already stands; the review is over either way.
+    report, dispatched, _ = reconcile(
+        monkeypatch, snapshot, malformed, marker=True
+    )
+    assert dispatched == [] and report.skipped == [(TASK, "marker_already_posted")]
+
+
+def test_reconcile_scan_is_bounded_and_rotates(monkeypatch):
+    """A fixed LIMIT window would never examine tasks past the first page, so
+    a stalled review sorting late in the backlog could never be cleared."""
+    snapshot = snap("diff --git a/a b/a\n@@ -1 +1 @@\n-old\n+new\n")
+    cfg = review_merge.ReviewConfig()
+    backlog = [(f"{TASK}-{index:03d}", PR) for index in range(cfg.max_per_tick + 4)]
+    history = [
+        (review_merge._review_key(backlog_task, PR, snapshot), "succeeded",
+         {"result_text": MALFORMED_TEXT})
+        for backlog_task, _pr in backlog
+    ]
+
+    report, dispatched, claims = reconcile(
+        monkeypatch, snapshot, history, tasks=backlog
+    )
+    # Bounded: never more writes than the per-tick action budget.
+    assert len(dispatched) == cfg.max_per_tick
+    assert report.skipped == []
+    # Rotating: the cursor is committed at the last row actually processed,
+    # so the next tick resumes at the untouched tail instead of replaying
+    # this same page forever -- which is what a fixed LIMIT window would do.
+    assert claims and claims[-1][2].startswith(backlog[cfg.max_per_tick - 1][0])
+
+
+def test_reconcile_leaves_the_cursor_before_a_partially_retried_review(monkeypatch):
+    """Chunks left unretried when the budget runs out must be picked up by the
+    NEXT tick, not after a full cursor lap."""
+    snapshot = snap("diff --git a/a b/a\n" + "x\n" * 100_000)
+    chunks = review_merge._review_chunks(snapshot, TASK, PR)
+    assert len(chunks) == 6
+    history = [
+        (review_merge._chunk_review_key(TASK, PR, snapshot, chunk), "succeeded",
+         {"result_text": MALFORMED_TEXT})
+        for chunk in chunks
+    ]
+
+    cfg = review_merge.ReviewConfig(max_per_tick=4)
+    report, dispatched, claims = reconcile(monkeypatch, snapshot, history, cfg=cfg)
+
+    assert len(dispatched) == 4
+    assert report.skipped == [(TASK, "retry_deferred_write_budget")]
+    # The only task in the window was left half-done, so nothing is committed
+    # and the next tick re-enters on the same row.
+    assert claims == []
 
 
 def test_manifest_reorder_hash_and_snapshot_identity_are_bound():

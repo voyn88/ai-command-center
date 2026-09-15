@@ -1215,60 +1215,121 @@ def reconcile_review_once(
 ) -> LoopReport:
     """Add bounded fresh attempts for malformed terminal review results.
 
-    Existing work items and their outputs are immutable.  This only derives
-    the current PR snapshot again and enqueues an identical payload under a
-    fresh `:retry:N` key when the latest attempt succeeded but lacks a valid
-    verdict for that same head SHA.
+    A queue item that already reached a terminal state cannot be
+    redelivered, and its result row is immutable -- so a review run that
+    *succeeded* while emitting no parseable ``VERDICT:``/``HEAD_SHA:`` pair
+    for the PR's current head leaves that whole identity permanently
+    unreadable by ``publish_review_verdicts``. That is the live #606
+    acceptance stall: one malformed chunk of an otherwise complete six-chunk
+    review wedged the PR indefinitely, because no path existed that could
+    ever produce a readable verdict for that chunk again.
+
+    This ADDS -- never rewrites -- at most ``_MAX_RESULT_RETRY_ATTEMPTS``
+    fresh ``:retry:N`` identities per review identity, each carrying the
+    byte-identical payload and chunk manifest of the attempt it replaces, so
+    a retry is verifiably a re-run of the same work rather than a new review
+    of a different diff. Every other state stays fail-closed and produces
+    nothing here: a valid ACCEPT/REJECT, a queue-level failure, an in-flight
+    attempt, an attempt whose head is no longer the PR's head, and an
+    exhausted retry budget.
     """
     from command_center.orchestrator.planner import repo_route
 
     cfg = cfg or ReviewConfig()
     report = LoopReport()
-    where = " AND t.task_id = %s" if task_id is not None else ""
-    params: tuple[Any, ...] = (task_id, cfg.max_per_tick) if task_id else (cfg.max_per_tick,)
-    tasks = _rows(
-        factory,
-        "SELECT t.task_id, e.value FROM backlog_task t "
-        "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
-        "WHERE t.status = 'READY_TO_REVIEW'" + where + " ORDER BY t.task_id LIMIT %s",
-        params,
-    )
+    # Same bounded, rotating scan contract as review_once and
+    # publish_review_verdicts -- and for the same reason. A fixed
+    # `ORDER BY t.task_id LIMIT max_per_tick` window would mean every
+    # READY_TO_REVIEW task sorting after the first page is NEVER examined,
+    # so for those rows the stall this function exists to clear would just
+    # persist forever; and `ORDER BY t.task_id` alone is not even a total
+    # order over (task, pr) pairs, so which rows those are could vary tick
+    # to tick.
+    if task_id is not None:
+        # Targeted invocation: never touch the shared scan cursor, and bound
+        # by the action budget rather than the full-scan examination cap.
+        tasks, scan_token = _rows(
+            factory,
+            "SELECT DISTINCT t.task_id, e.value FROM backlog_task t "
+            "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
+            "WHERE t.status = 'READY_TO_REVIEW' AND t.task_id = %s "
+            "ORDER BY e.value LIMIT %s",
+            (task_id, cfg.max_per_tick),
+        ), None
+    else:
+        tasks, scan_token = _scan_tasks(
+            factory,
+            "scan:reconcile_review_once",
+            "SELECT task_id, value FROM ("
+            "  SELECT DISTINCT t.task_id, e.value FROM backlog_task t"
+            "  JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr'"
+            "  WHERE t.status = 'READY_TO_REVIEW') pairs "
+            "WHERE (task_id, value) > (%s, %s) ORDER BY task_id, value LIMIT %s",
+            (), cfg.scan_cap,
+        )
     cascade = _model_only_review_cascade()
+    last_processed = None
     actions = 0
     for current_task_id, pr_url in tasks:
         if actions >= cfg.max_per_tick:
             break
+        prev_processed = last_processed
+        last_processed = (current_task_id, pr_url)
         if not cascade:
             report.skipped.append((current_task_id, "no_review_executor_route"))
             continue
-        marker, _head = _has_accept_marker(repo_path, pr_url)
+        marker, current_head = _has_accept_marker(repo_path, pr_url)
         if marker:
             report.skipped.append((current_task_id, "marker_already_posted"))
+            continue
+        if not current_head:
+            report.skipped.append((current_task_id, "pr_view_failed"))
             continue
         repo = _repo_from_pr_url(pr_url)
         route = repo_route(repo) if repo else None
         snapshot = _pr_diff_and_head(repo_path, pr_url)
         if route is None or snapshot is None:
-            report.skipped.append((current_task_id, "pr_diff_fetch_failed"))
+            report.skipped.append(
+                (current_task_id, f"pr_diff_fetch_failed: {pr_url!r}")
+            )
+            continue
+        if snapshot.head != current_head:
+            # The head moved under us mid-examination. Spending the retry
+            # budget on the snapshot we happened to fetch would buy an
+            # identity no publisher will ever read; review_once enqueues the
+            # new head's own first attempt instead.
+            report.skipped.append((current_task_id, "pr_diff_snapshot_failed"))
             continue
         key = _review_key(current_task_id, pr_url, snapshot)
         if key is None:
-            report.skipped.append((current_task_id, "no_repo_route"))
+            report.skipped.append((current_task_id, f"no_repo_route: {pr_url!r}"))
             continue
         try:
             chunks = _review_chunks(snapshot, current_task_id, pr_url)
-        except (RuntimeError, ValueError):
-            report.skipped.append((current_task_id, "review_prompt_budget_invalid"))
+        except (RuntimeError, ValueError) as exc:
+            report.skipped.append(
+                (current_task_id, f"review_prompt_budget_invalid: {exc}")
+            )
             continue
         project_id, repository_path = route
         for chunk in chunks:
             if actions >= cfg.max_per_tick:
+                # Budget spent mid-task: leave the cursor BEFORE this row so
+                # the next tick re-enters here and finishes this review's
+                # remaining chunks, instead of making them wait a full
+                # cursor lap (same reasoning as the deferred marker write in
+                # publish_review_verdicts).
+                last_processed = prev_processed
+                report.skipped.append((current_task_id, "retry_deferred_write_budget"))
                 break
-            base_key = key if chunk.count == 1 else _chunk_review_key(
-                current_task_id, pr_url, snapshot, chunk
-            )
-            if base_key is None:
-                continue
+            if chunk.count == 1:
+                base_key = key
+            else:
+                base_key = _chunk_review_key(
+                    current_task_id, pr_url, snapshot, chunk
+                )
+                if base_key is None:
+                    raise RuntimeError("validated PR URL produced no chunk key")
             retry_key = _next_retry_key(
                 factory, current_task_id, base_key, snapshot.head
             )
@@ -1276,7 +1337,15 @@ def reconcile_review_once(
                 continue
             prompt = _render_review_prompt(current_task_id, pr_url, snapshot, chunk)
             if _prompt_size_bytes(prompt) > _MAX_REVIEW_PROMPT_BYTES:
-                continue
+                # _review_chunks already guarantees every chunk fits; refuse
+                # the whole review rather than enqueue an over-budget retry
+                # if that invariant ever breaks.
+                report.skipped.append(
+                    (current_task_id, "review_prompt_budget_invariant_failed")
+                )
+                break
+            # Byte-identical to the attempt being replaced: same prompt, same
+            # manifest, same cascade. Only the idempotency key differs.
             payload: dict[str, Any] = {
                 "kind": "agent_run", "v": 1, "project_id": project_id,
                 "repository_path": repository_path,
@@ -1296,6 +1365,10 @@ def reconcile_review_once(
             enqueue(cfg.queue, retry_key, payload, current_task_id, len(cascade))
             report.retried.append((current_task_id, retry_key))
             actions += 1
+    if scan_token is not None:
+        _scan_commit(
+            factory, "scan:reconcile_review_once", scan_token, last_processed
+        )
     return report
 
 
