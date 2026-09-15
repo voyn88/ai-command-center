@@ -773,16 +773,20 @@ def test_a_no_fault_outcome_that_forbids_retry_takes_the_ordinary_path() -> None
 class QueueModel:
     """A store that keeps the queue's ATTEMPT ACCOUNTING, not just a script.
 
-    Deliberately narrow: it mirrors only the three arithmetic rules the
-    dead-letter growth turns on, each already proven against real PostgreSQL
-    in tests/db/test_queue_claim.py --
+    Deliberately narrow: it mirrors only the arithmetic rules the dead-letter
+    growth turns on, each already proven against real PostgreSQL in
+    tests/db/test_queue_claim.py --
 
     * ``queue_claim`` advances ``attempt_count`` when it hands the delivery
       out (migration 0002);
     * ``queue_fail`` dead-letters when the report is non-retryable *or*
-      ``attempt_count >= max_attempts`` (0002);
+      ``attempt_count >= max_attempts`` (0002), and its requeue clears the
+      wait budget the item was carrying (0028);
     * ``queue_fail_lease_wait`` refunds that one increment and counts the
-      refusal against its own bounded ``lease_wait_count`` instead (0022).
+      refusal against its own bounded ``lease_wait_count`` instead (0022);
+    * exhausting THAT budget dead-letters only while the fleet is serving
+      other items -- ``fleet_is_serving`` here, `_queue_fleet_is_serving`
+      there (0028).
 
     Everything else about the protocol -- locking, tokens, audit -- is out of
     scope here; what this fake exists to show is which of those two exits the
@@ -796,6 +800,7 @@ class QueueModel:
         max_attempts: int,
         max_lease_waits: int = 20,
         delivery_cap: int = 5,
+        fleet_is_serving: bool = True,
     ):
         self.payload = payload
         self.max_attempts = max_attempts
@@ -804,6 +809,10 @@ class QueueModel:
         # stops watching; the loop ends on `no_work` either way, so an item
         # that dead-letters earlier simply never reaches this.
         self.delivery_cap = delivery_cap
+        # Whether the queue can show a delivery to some OTHER item that got
+        # past the fleet recently. False is a fleet-wide outage: every lane
+        # is refusing everything, so no refusal is evidence about this item.
+        self.fleet_is_serving = fleet_is_serving
         self.attempt_count = 0
         self.lease_wait_count = 0
         self.state = "ready"
@@ -835,15 +844,22 @@ class QueueModel:
             )
         else:
             self.state = "ready"
+            # 0028: this delivery reached the work and came back with a
+            # verdict about it, so the waits the item collected getting here
+            # are spent history, not a running total against its next outage.
+            self.lease_wait_count = 0
         return True
 
     def fail_lease_wait(self, work, *, reason):
         self.lease_wait_count += 1
-        if self.lease_wait_count > self.max_lease_waits:
+        # Both branches refund, including the one that gives up (0026) -- the
+        # refusal that exhausts the budget names no fault in the work either,
+        # so a DLQ row from it reads `attempt_count = 0`.
+        self.attempt_count = max(self.attempt_count - 1, 0)
+        if self.lease_wait_count > self.max_lease_waits and self.fleet_is_serving:
             self.state = "dead"
             self.dead_reason = f"lease_wait_exhausted: {reason}"
         else:
-            self.attempt_count = max(self.attempt_count - 1, 0)
             self.state = "ready"
         return True
 
@@ -911,12 +927,25 @@ def test_a_genuine_failure_still_dead_letters_on_the_cascade_budget() -> None:
     assert store.dead_reason.startswith("max_attempts_exhausted:")
 
 
-def test_permanent_fleet_contention_still_terminates_in_the_dlq() -> None:
+def test_contention_that_singles_out_one_item_still_terminates_in_the_dlq() -> None:
     """The refund budget is bounded, not infinite: contention that never
-    clears still reaches the dead-letter queue -- with a reason that tells
-    an operator it was the fleet, not the item -- so a pathological host
-    cannot hide behind an item that retries forever."""
-    store = QueueModel({"kind": "agent_run"}, max_attempts=2, max_lease_waits=3, delivery_cap=10)
+    clears *while the fleet serves everything else* still reaches the
+    dead-letter queue -- with a reason that tells an operator it was the
+    fleet, not the item -- so a pathological host cannot hide behind an item
+    that retries forever.
+
+    `fleet_is_serving=True` is the load-bearing half of that sentence since
+    0028, and it is the default here because it is the ordinary condition: a
+    queue with work moving through it. What it excludes is the case the test
+    below covers.
+    """
+    store = QueueModel(
+        {"kind": "agent_run"},
+        max_attempts=2,
+        max_lease_waits=3,
+        delivery_cap=10,
+        fleet_is_serving=True,
+    )
 
     def contended(payload, lease_lost, attempt_no=1):
         return HandlerOutcome(
@@ -934,6 +963,104 @@ def test_permanent_fleet_contention_still_terminates_in_the_dlq() -> None:
     # infra_monitor classifies the DLQ row by its reason: a capacity outage
     # that outlasts the wait budget must still land in the quota class.
     assert "quota" in store.dead_reason
+
+
+def test_an_outage_that_refuses_everything_no_longer_empties_the_queue_into_the_dlq() -> None:
+    """The finding this task closes, at the horizon the budget actually buys.
+
+    `_queue_backoff(2, n)` -- 2 being the backoff every dispatch enqueues
+    with -- runs 2, 4, 8 … 256 and then sits at its 300s cap, so the 20 waits
+    the budget allows are 68.5 minutes of waiting, after which the 21st
+    refusal dead-letters the item under `lease_wait_exhausted` with
+    `attempt_count = 0`: never delivered to a model, and nothing but an
+    operator's `queue-redrive` brings it back.
+
+    The fleet's dominant outage is four times longer than that.
+    `orchestrator.routing` records the measurement: the Claude credential is
+    a Max *subscription* with a five-hour rolling cap, and 142 of 167 parked
+    tasks on 2026-08-23 were "You've hit your session limit". Every item in
+    flight when that window closes is refused for five hours and spends its
+    whole budget in the first sixty-nine minutes, so the queue converted its
+    own backlog into dead letters -- the `dead_letter_growth` control-01
+    measures, arriving in the class `infra_monitor` calls
+    `executor_quota_exhausted`.
+
+    The budget was never meant to bound this. 0022 bounds "permanent,
+    PATHOLOGICAL contention" and 0027 the item "that somehow kills its worker
+    every time it is delivered": both are statements about one item being
+    singled out, and neither describes a window that refuses every lane
+    equally. So the budget now spends only against a serving fleet -- fifty
+    refusals with nothing else getting through leave the item `ready`, with
+    both its model attempts intact, for the fleet that comes back.
+    """
+    store = QueueModel(
+        {"kind": "agent_run"},
+        max_attempts=2,
+        max_lease_waits=20,
+        delivery_cap=50,
+        fleet_is_serving=False,
+    )
+
+    def capped(payload, lease_lost, attempt_no=1):
+        return HandlerOutcome(
+            ok=False,
+            reason=(
+                "executor infrastructure failure (provider/auth/quota): "
+                "You've hit your session limit"
+            ),
+            retryable=True,
+            no_fault=True,
+        )
+
+    _drain(store, {"agent_run": capped})
+
+    assert store.deliveries == 50, "the item was offered for the whole outage"
+    assert store.state == "ready", store.dead_reason
+    assert store.dead_reason is None, "the outage is not a verdict on the work"
+    assert store.attempt_count == 0, "and it still has not reached a model"
+    assert store.lease_wait_count == 50, "every refusal is still counted, and backs off"
+
+
+def test_a_delivery_that_reaches_the_work_clears_the_wait_budget() -> None:
+    """The second half of the same rule (0028).
+
+    `lease_wait_count` was cumulative over the item's whole life and reset by
+    nothing but `queue_redrive`, so an item that waited out one long outage
+    carried that number forever: an ordinary lease race weeks later would be
+    its 21st wait and would dead-letter it. `queue_fail`'s requeue is the one
+    non-terminal exit meaning a delivery got past the fleet and reported on
+    the work itself, so it clears the budget -- 20 *consecutive* refusals,
+    not 20 across the months an item may live.
+
+    This cannot become an unbounded retry: reaching the reset costs a real
+    `attempt_count`, and nothing refunds those. `max_attempts` -- the cascade
+    length -- is the ceiling on how many times the budget can be cleared.
+    """
+    store = QueueModel(
+        {"kind": "agent_run"}, max_attempts=3, max_lease_waits=2, delivery_cap=4
+    )
+    # Two fleet refusals (the budget's last one), then a delivery that runs
+    # and fails on the work, then a third fleet refusal. Without the reset
+    # that third refusal is wait number three and the item is dead.
+    script = [True, True, False, True]
+
+    def mixed(payload, lease_lost, attempt_no=1):
+        if script and script.pop(0):
+            return HandlerOutcome(
+                ok=False,
+                reason="writer lease unavailable: held by a sibling lane",
+                retryable=True,
+                no_fault=True,
+            )
+        return HandlerOutcome(
+            ok=False, reason="the agent produced no verdict", retryable=True
+        )
+
+    _drain(store, {"agent_run": mixed})
+
+    assert store.state != "dead", store.dead_reason
+    assert store.lease_wait_count == 1, "the real delivery reset the budget"
+    assert store.attempt_count == 1, "and that delivery is the one thing it spent"
 
 
 def test_a_host_that_cannot_provide_an_isolated_clone_no_longer_kills_the_item() -> None:

@@ -1239,6 +1239,41 @@ def test_redrive_of_an_unknown_item_is_refused_and_the_refusal_survives(
 # ---------------------------------------------------------------------------
 
 
+def _a_served_fleet(app, worker, *, priority: int = 50) -> str:
+    """Put one delivery that REACHED THE WORK into the queue's recent history.
+
+    Since 0028 the no-fault wait budget is spent only while the fleet is
+    demonstrably serving other items -- `_queue_fleet_is_serving`, the same
+    question `infra_monitor` asks as `recent_succeeded`. Exhausting that
+    budget is therefore a verdict about an item that was SINGLED OUT, and a
+    test that wants the dead-letter branch has to say so by supplying the
+    siblings it was singled out from. Without this, 21 refusals mean a
+    capacity outage, and the item correctly stays `ready`.
+
+    Deliberately terminal and deliberately first in line: a completed item
+    leaves the ready pool for good, and the priority means the claim inside
+    here cannot take the row the caller is testing (`queue_claim` orders
+    `priority DESC`). Returns the sibling's id so a caller asserting over the
+    whole queue can exclude it.
+    """
+    sibling = _enqueue(
+        app,
+        f"served-{secrets.token_hex(4)}",
+        max_attempts=1,
+        priority=priority,
+        backoff_seconds=0,
+    )
+    token, token_hash = _token()
+    verdict = _claim(worker, token_hash)
+    assert verdict[0] and verdict[2] == sibling, verdict[1]
+    assert _call(
+        worker,
+        "SELECT ok FROM queue_complete(%s, %s, %s::jsonb)",
+        (verdict[3], token, json.dumps({"served": True})),
+    ) == (True,)
+    return sibling
+
+
 def _waits(admin_conn, item_id: str) -> int:
     with admin_conn.cursor() as cur:
         cur.execute(
@@ -1361,10 +1396,15 @@ def test_the_no_fault_budget_is_bounded_and_names_its_own_cause(
 ):
     """The refund is not a licence to retry forever.
 
-    Contention that never clears still terminates in the DLQ -- with
-    `lease_wait_exhausted`, a cause an operator can tell apart from an item
-    whose own attempts kept failing, and which carries the refusal text so
-    `infra_monitor` can still classify a capacity outage as one.
+    Contention that never clears *while the fleet serves its siblings* still
+    terminates in the DLQ -- with `lease_wait_exhausted`, a cause an operator
+    can tell apart from an item whose own attempts kept failing, and which
+    carries the refusal text so `infra_monitor` can still classify a capacity
+    outage as one.
+
+    `_a_served_fleet` is what makes this item *singled out* rather than one
+    of a queue nobody is serving; see 0028 and the outage test below for the
+    other side of that line.
     """
     _provision(admin_conn, psycopg, test_dsn, role_passwords)
     app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
@@ -1374,6 +1414,8 @@ def test_the_no_fault_budget_is_bounded_and_names_its_own_cause(
     reason = "executor infrastructure failure (provider/auth/quota): session limit"
     with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
         with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+            with psycopg.connect(app_dsn, autocommit=True) as app:
+                _a_served_fleet(app, worker)
             for delivery, expected in enumerate(
                 ("lease_wait_requeued", "lease_wait_requeued",
                  "lease_wait_dead_lettered"),
@@ -1405,6 +1447,164 @@ def test_the_no_fault_budget_is_bounded_and_names_its_own_cause(
     assert state[1] == 0, "not one model attempt was ever spent on this item"
 
 
+def test_an_outage_that_refuses_everything_does_not_empty_the_queue_into_the_dlq(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH, at the horizon the wait
+    budget actually buys.
+
+    `_queue_backoff(2, n)` -- 2 is the backoff every dispatch enqueues with --
+    runs 2, 4, 8 … 256 and then sits at its 300s cap, so 20 waits is 68.5
+    minutes of waiting (asserted below from the database's own function, not
+    from arithmetic in this file). The fleet's dominant outage is four times
+    that: `orchestrator.routing` records the Claude credential as a Max
+    subscription with a FIVE-HOUR rolling cap, and 142 of 167 parked tasks on
+    2026-08-23 were "You've hit your session limit" -- a response
+    `worker.handlers` routes to `no_fault`, i.e. straight to this budget. So
+    every item in flight when that window closed spent its whole budget in
+    the first sixty-nine minutes and dead-lettered having never reached a
+    model, with nothing but an operator's `queue-redrive` to bring it back.
+
+    Both halves of the rule are the same item here. Twenty-five refusals with
+    NOTHING else getting through leave it `ready` with both model attempts
+    intact; one served sibling later, the very next refusal -- identical text,
+    identical budget -- is the dead letter, because now it is this item being
+    singled out.
+    """
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
+    with psycopg.connect(app_dsn, autocommit=True) as app:
+        item_id = _enqueue(app, "outage", max_attempts=2, backoff_seconds=0)
+
+    reason = (
+        "executor infrastructure failure (provider/auth/quota): "
+        "You've hit your session limit"
+    )
+    with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
+        with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+            for delivery in range(1, 26):
+                token, token_hash = _token()
+                verdict = _claim(worker, token_hash)
+                assert verdict[0], verdict[1]
+                ok, got = _call(
+                    worker,
+                    "SELECT ok, reason FROM queue_fail_lease_wait(%s, %s, %s, %s)",
+                    (verdict[3], token, reason, 20),
+                )
+                assert (ok, got) == (True, "lease_wait_requeued"), delivery
+
+            state = _item(admin_conn, item_id)
+            assert state[0] == "ready", "an outage is not a verdict on the work"
+            assert state[5] is None
+            assert state[1] == 0, "and the item still has not reached a model"
+            assert _waits(admin_conn, item_id) == 25, (
+                "every refusal is still counted -- the backoff is computed "
+                "from it, so an outage must not become a poll loop"
+            )
+
+            # Now the fleet is demonstrably serving its other work, and the
+            # identical refusal means something different about this item.
+            with psycopg.connect(app_dsn, autocommit=True) as app:
+                _a_served_fleet(app, worker)
+            token, token_hash = _token()
+            verdict = _claim(worker, token_hash)
+            assert verdict[0] and verdict[2] == item_id, verdict[1]
+            assert _call(
+                worker,
+                "SELECT ok, reason FROM queue_fail_lease_wait(%s, %s, %s, %s)",
+                (verdict[3], token, reason, 20),
+            ) == (True, "lease_wait_dead_lettered")
+
+    assert _item(admin_conn, item_id)[0] == "dead"
+
+    # The number the budget is measured against, read from the database
+    # rather than asserted from a comment: 20 waits at the enqueued backoff
+    # is about an hour, and the outage above is five.
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "SELECT sum(extract(epoch FROM _queue_backoff(2, n)))/60 "
+            "FROM generate_series(1, 20) n"
+        )
+        minutes = float(cur.fetchone()[0])
+    assert 60 < minutes < 90, minutes
+
+
+def test_a_delivery_that_reached_the_work_clears_the_wait_budget(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """The second half of 0028.
+
+    `lease_wait_count` was cumulative over an item's whole life and reset by
+    nothing but `queue_redrive` (0024), so an item that waited out one long
+    outage carried that number for the rest of its existence: an ordinary
+    lease race weeks later was its 21st wait and dead-lettered it on a budget
+    that had been spent by an unrelated, long-recovered condition.
+
+    `queue_fail`'s requeue is the one non-terminal exit that means a delivery
+    got past the fleet and came back with a verdict about the WORK, so it
+    clears the budget -- 20 CONSECUTIVE refusals, not 20 across the months an
+    item may live. It cannot become an unbounded retry: reaching the reset
+    costs a real `attempt_count`, which nothing refunds, so `max_attempts`
+    caps how many times the budget can be cleared. The cleared number travels
+    into the audit, exactly as the redrive's does.
+    """
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
+    with psycopg.connect(app_dsn, autocommit=True) as app:
+        item_id = _enqueue(app, "carried", max_attempts=3, backoff_seconds=0)
+
+    with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
+        with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+            with psycopg.connect(app_dsn, autocommit=True) as app:
+                _a_served_fleet(app, worker)
+            # Two no-fault refusals against a cap of two: the budget is now
+            # exactly spent, and a third would be the dead letter.
+            for _ in range(2):
+                token, token_hash = _token()
+                verdict = _claim(worker, token_hash)
+                assert verdict[0], verdict[1]
+                assert _call(
+                    worker,
+                    "SELECT ok, reason FROM queue_fail_lease_wait(%s, %s, %s, %s)",
+                    (verdict[3], token, "writer lease unavailable", 2),
+                ) == (True, "lease_wait_requeued")
+            assert _waits(admin_conn, item_id) == 2
+
+            # One delivery that actually ran and reported on the work.
+            token, token_hash = _token()
+            verdict = _claim(worker, token_hash)
+            assert verdict[0], verdict[1]
+            assert _call(
+                worker,
+                "SELECT ok, reason FROM queue_fail(%s, %s, %s, true)",
+                (verdict[3], token, "the agent produced no verdict"),
+            ) == (True, "requeued")
+            assert _waits(admin_conn, item_id) == 0, "the wait budget starts over"
+            assert _item(admin_conn, item_id)[1] == 1, "that delivery is spent"
+
+            # So the next fleet refusal is wait number one again, not the
+            # twenty-first of a lifetime -- the item survives it.
+            token, token_hash = _token()
+            verdict = _claim(worker, token_hash)
+            assert verdict[0], verdict[1]
+            assert _call(
+                worker,
+                "SELECT ok, reason FROM queue_fail_lease_wait(%s, %s, %s, %s)",
+                (verdict[3], token, "writer lease unavailable", 2),
+            ) == (True, "lease_wait_requeued")
+
+    assert _item(admin_conn, item_id)[0] == "ready"
+    assert _waits(admin_conn, item_id) == 1
+
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "SELECT detail ->> 'cleared_lease_wait_count' FROM work_event "
+            "WHERE work_item_id = %s AND event = 'fail' AND reason = 'requeued'",
+            (item_id,),
+        )
+        assert cur.fetchall() == [("2",)]
+
+
 def test_redrive_clears_the_no_fault_budget_it_widens_the_attempts_for(
     admin_conn, psycopg, test_dsn, role_passwords
 ):
@@ -1431,6 +1631,12 @@ def test_redrive_clears_the_no_fault_budget_it_widens_the_attempts_for(
 
     with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
         with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+            # The fleet is serving its other work throughout, so the refusals
+            # below are this item being singled out rather than an outage
+            # (0028) -- which is what lets them reach the dead letter this
+            # test is about redriving.
+            with psycopg.connect(app_dsn, autocommit=True) as app:
+                _a_served_fleet(app, worker)
             # One real attempt is spent first, so the assertions below can tell
             # "the attempt history survived" apart from "there was none".
             token, token_hash = _token()
@@ -1586,12 +1792,14 @@ def test_lapses_that_never_stop_still_terminate_in_the_dead_letter(
 ):
     """The refund is not a licence to retry forever.
 
-    A payload that somehow takes its worker down every single time still
-    reaches the DLQ -- on the bounded fleet budget (20 waits, the number
-    `work_queue_store.fail_lease_wait` passes) rather than on the cascade's
-    two. The cause names the budget that ran out AND the condition that spent
-    it, so the DLQ shows one class for "the fleet put it here" while an
-    operator can still tell a dying lane apart from writer-lease contention.
+    A payload that somehow takes its worker down every single time -- while
+    every OTHER item on the queue is being served, which is what makes the
+    payload the suspect (0028) -- still reaches the DLQ, on the bounded fleet
+    budget (20 waits, the number `work_queue_store.fail_lease_wait` passes)
+    rather than on the cascade's two. The cause names the budget that ran out
+    AND the condition that spent it, so the DLQ shows one class for "the
+    fleet put it here" while an operator can still tell a dying lane apart
+    from writer-lease contention.
     """
     _provision(admin_conn, psycopg, test_dsn, role_passwords)
     app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
@@ -1600,6 +1808,8 @@ def test_lapses_that_never_stop_still_terminate_in_the_dead_letter(
 
     with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
         with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+            with psycopg.connect(app_dsn, autocommit=True) as app:
+                _a_served_fleet(app, worker)
             for lapse in range(1, 22):
                 verdict = _claim(worker, _token()[1])
                 assert verdict[0], verdict[1]
@@ -1629,6 +1839,38 @@ def test_lapses_that_never_stop_still_terminate_in_the_dead_letter(
     with psycopg.connect(app_dsn, autocommit=True) as app:
         assert _call(app, "SELECT queue_redrive(%s, 1)", (item_id,))[0] is True
     assert _waits(admin_conn, item_id) == 0
+
+
+def test_lapses_while_nothing_is_being_served_are_an_outage_not_a_verdict(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """The reaper takes the same 0028 gate as the refusal path, and it is the
+    path that matters most for it: nobody reported anything here. A lapse
+    means the worker PROCESS stopped beating -- an OOM kill, a watchdog
+    restart, a host loss, a database outage -- and a rolling restart or a
+    cluster failover produces exactly this on every lane at once.
+
+    Twenty-five lapses with nothing else getting through leave the item
+    `ready` with its model attempts intact, instead of the DLQ row a
+    fleet-wide restart used to write for every item in flight.
+    """
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
+    with psycopg.connect(app_dsn, autocommit=True) as app:
+        item_id = _enqueue(app, "whole-fleet-restarted", max_attempts=2, backoff_seconds=0)
+
+    with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
+        with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+            for lapse in range(1, 26):
+                verdict = _claim(worker, _token()[1])
+                assert verdict[0], verdict[1]
+                _lose_the_worker(admin_conn, psycopg, app_dsn, verdict[3])
+                assert _item(admin_conn, item_id)[0] == "ready", lapse
+
+    state = _item(admin_conn, item_id)
+    assert state[5] is None, "no dead letter for a fleet that stopped beating"
+    assert state[1] == 0, "and not one model attempt spent"
+    assert _waits(admin_conn, item_id) == 25
 
 
 # ---------------------------------------------------------------------------
@@ -1791,6 +2033,12 @@ def test_every_reachable_audit_site_writes_a_row(
             # making an audit sweep into a twenty-claim loop, and the arithmetic
             # itself is pinned by
             # `test_lapses_that_never_stop_still_terminate_in_the_dead_letter`.
+            #
+            # The served sibling is the other half of that branch's condition
+            # since 0028: a budget exhausted while NOTHING is being served is
+            # an outage, requeues, and would never reach this audit site.
+            with psycopg.connect(app_dsn, autocommit=True) as app:
+                _a_served_fleet(app, worker)
             with admin_conn.cursor() as cur:
                 cur.execute(
                     "UPDATE work_item SET lease_wait_count = 20 WHERE work_item_id = %s",
@@ -1891,7 +2139,9 @@ def test_the_reaper_audits_both_of_its_branches(
     `max_attempts`. Both numbers travel into each audit row, because "why is
     this item back on the queue for the ninth time" is answered by the wait
     count and "how much of its own budget is left" by the attempt count, and
-    the whole bug was reading one of them as the other.
+    the whole bug was reading one of them as the other. Since 0028 it also
+    takes a fleet that is serving its siblings, which the audit rows record
+    as `fleet_is_serving` for the same reason.
     """
     _provision(admin_conn, psycopg, test_dsn, role_passwords)
     app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
@@ -1900,6 +2150,8 @@ def test_the_reaper_audits_both_of_its_branches(
 
     with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
         with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+            with psycopg.connect(app_dsn, autocommit=True) as app:
+                _a_served_fleet(app, worker)
             for _ in range(21):
                 verdict = _claim(worker, _token()[1], visibility=SHORT_VISIBILITY)
                 assert verdict[0], verdict[1]

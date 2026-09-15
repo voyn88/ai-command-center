@@ -149,6 +149,16 @@ class WorkQueueStore:
         smaller-than-forever budget (``lease_wait_count``, defaulting to 20
         waits with the queue's own capped backoff) instead of
         ``max_attempts``. The SQL keeps its migration-0022 name.
+
+        That budget is spent only while the fleet is serving OTHER items
+        (0028): 20 waits at the enqueued backoff is 68.5 minutes, and the
+        fleet's dominant outage — the Claude subscription's five-hour rolling
+        cap — is four times longer, so a count that ran during a total outage
+        dead-lettered every item in flight for a condition none of them
+        caused. Exhausting it is a verdict about an item that was singled
+        out; an outage surfaces through ``infra_monitor``'s ``queue_stalled``
+        instead, and ``fail``'s requeue (a delivery that reached the work)
+        clears the budget so it measures one outage rather than a lifetime.
         """
         row = self._call(
             "SELECT * FROM queue_fail_lease_wait(%s, %s, %s, %s)",

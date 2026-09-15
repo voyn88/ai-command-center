@@ -66,7 +66,10 @@ class WorkQueueAdmin:
 
     def reap(self) -> int:
         """Expire every lapsed lease: requeue it, dead-letter it once the
-        item's lease-wait budget is exhausted. Returns the number of attempts
+        item's lease-wait budget is exhausted *and the fleet is demonstrably
+        serving its other items* (0028 — with nothing getting through, lapsing
+        leases are a fleet-wide outage, and an outage must not be spelled as a
+        verdict on every item it caught). Returns the number of attempts
         expired.
 
         A lapse never spends ``max_attempts`` (0027). The heartbeat runs

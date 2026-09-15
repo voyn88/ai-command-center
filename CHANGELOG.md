@@ -8,6 +8,79 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Fixed — a capacity outage no longer converts the whole backlog into dead letters (`VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH`)
+- `command_center/db/sql/0028_queue_wait_budget_needs_a_serving_fleet.up.sql`:
+  the no-fault wait budget (`lease_wait_count`, 20 waits) is spent only while
+  the fleet is demonstrably serving OTHER items, and `queue_fail`'s requeue
+  clears it. **The horizon that budget actually buys is 68.5 minutes** —
+  `_queue_backoff(2, n)` (2 is the backoff every dispatch enqueues with) runs
+  2, 4, 8 … 256 and then sits at its 300s cap, so
+  `SELECT sum(extract(epoch FROM _queue_backoff(2, n)))/60 FROM
+  generate_series(1,20) n` is `68.5`. **The fleet's dominant outage is four
+  times that.** `orchestrator.routing` records the measurement: the Claude
+  credential is a Max *subscription* with a five-hour rolling cap, and 142 of
+  167 parked tasks on 2026-08-23 were literally "You've hit your session
+  limit" — a response `worker.handlers` routes to `no_fault`, i.e. straight
+  to this budget. So every item in flight when that window closed was refused
+  for five hours, spent its whole budget in the first sixty-nine minutes, and
+  dead-lettered under `lease_wait_exhausted` with `attempt_count = 0`:
+  provably never delivered to a model, and permanently parked, because
+  `queue_redrive` is operator-only. `control-01:queue` counted the arrivals
+  as `dead_letter_growth`, in the class `infra_monitor` calls
+  `executor_quota_exhausted`.
+- Why the gate rather than a bigger number: the budget's own migrations say
+  what it is for — 0022 bounds "permanent, PATHOLOGICAL contention", 0027 the
+  item "that somehow kills its worker every time it is delivered". Both are
+  statements about one item being SINGLED OUT, and neither describes a window
+  that refuses every lane equally. A count of polls is not a duration either:
+  the same outage kills an item or not depending on how often it happened to
+  be offered. `_queue_fleet_is_serving()` asks the question that actually
+  separates the two, and it is the question `infra_monitor` already asks as
+  `recent_succeeded` — has any OTHER item of this queue had a delivery reach
+  the work in the last hour (`complete`/`granted`, or `fail`/`granted` with
+  `requeued`/`dead_lettered`)? Refusals are deliberately not evidence, so a
+  queue where nothing but refusals is happening reads as a fleet that is not
+  serving, which is what it is.
+- During an outage the wait count still climbs (the backoff is computed from
+  it, so an outage cannot become a 2-second poll loop) and every refusal is
+  still audited, now with `fleet_is_serving` beside the two counters. What
+  changes is only that exhausting the budget does not dead-letter an item the
+  fleet was refusing along with everything else: the backlog stays `ready` at
+  the 300s cap — one claim per item per five minutes — and the outage
+  surfaces through `infra_monitor`'s `queue_stalled` and
+  `throughput_stalled:0_succeeded_in_1h`, the classes that name a fleet that
+  has stopped serving. A stall keeps the work and names the fleet; a dead
+  letter destroys the work and blames the item. Stated trade: a queue holding
+  ONE item that poisons every worker it touches has no sibling to be compared
+  against, so it now cycles at the 300s cap instead of dying after 20
+  deliveries — deliberate, because nothing there distinguishes "this item is
+  poison" from "the fleet is down", and dead-lettering would not have
+  repaired the host either way.
+- Second half, same rule: `lease_wait_count` was cumulative over an item's
+  whole life and reset by nothing but `queue_redrive` (0024), so an item that
+  waited out one long outage carried that number forever and an ordinary
+  lease race weeks later was its 21st wait. `queue_fail`'s requeue — the one
+  non-terminal exit meaning a delivery got past the fleet and reported on the
+  work itself — now clears it, so 20 means 20 *consecutive* refusals. This
+  cannot become an unbounded retry: reaching the reset costs a real
+  `attempt_count`, which nothing refunds, so `max_attempts` (the cascade
+  length) caps how many times the budget can be cleared. The cleared number
+  travels into the audit exactly as the redrive's does.
+- Tests: `tests/db/test_queue_claim.py` proves all of it against a real
+  server —
+  `test_an_outage_that_refuses_everything_does_not_empty_the_queue_into_the_dlq`
+  drives 25 refusals with nothing being served (item still `ready`, both
+  model attempts intact) and then dead-letters the same item with the
+  identical refusal once one sibling is served, and reads the 68.5 minutes
+  back out of `_queue_backoff` rather than asserting it from a comment;
+  `test_a_delivery_that_reached_the_work_clears_the_wait_budget` and
+  `test_lapses_while_nothing_is_being_served_are_an_outage_not_a_verdict`
+  cover the other two sites. The tests that pin the DLQ still working now say
+  what makes it work — `_a_served_fleet()`, the siblings the item was singled
+  out from. `tests/worker/test_daemon.py`'s `QueueModel` gained the same two
+  rules, so the accounting is pinned in the suite that runs without a
+  database as well.
+
 ### Fixed — a comment-only edit to migration 0022 was blocking every queue fix from reaching control-01 (`VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH`)
 - `command_center/db/sql/0022_queue_fail_lease_wait.up.sql`: restored
   byte-for-byte to what shipped. The file's header cites itself as `0020` —

@@ -134,6 +134,11 @@
       "down": "sha256:24fc8062a314f427c3da007bf70e54e984973b92f26a5f80e22a8d1f62161dfc",
       "slug": "queue_reap_lease_lapse_refunds",
       "up": "sha256:750179279bd1a25a914e22c3515213b34a92ebd382559e3ece241e74ce1b0738"
+    },
+    "0028": {
+      "down": "sha256:da3a4b7cbc61c177a4aa7b338dba736a668759ec3bab8f3938f1add7cf4c386a",
+      "slug": "queue_wait_budget_needs_a_serving_fleet",
+      "up": "sha256:1ff25169104250d8e67504d6833188c9556d203808939d63bb3dd45646fef7e7"
     }
   },
   "note": "SHA-256 of every migration file, recorded when the migration shipped. `up` is the value the database's own schema_migration ledger holds; MigrationRunner.upgrade verifies it BEFORE applying anything pending, so editing an already-applied migration does not correct that migration -- it stops the deploy from applying every LATER one. Changing an entry below is a deliberate act with a live consequence, not bookkeeping. After ADDING a migration, regenerate with: python -m command_center.db migration-lock --write"
