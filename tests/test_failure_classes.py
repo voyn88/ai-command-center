@@ -25,6 +25,9 @@ def test_an_authority_reason_classifies_bare_and_wrapped():
     for reason in (
         "requires_privileged_authority: root",
         "cascade_exhausted: requires_privileged_authority: postgres_role:postgres,root",
+        # The shape the live queue actually produces: `queue_fail` wraps a
+        # non-retryable refusal, then ingest wraps that.
+        "cascade_exhausted: non_retryable: requires_privileged_authority: root",
         "requires_privileged_authority: no_single_executor_grants: root",
     ):
         assert fc.classify_reason(reason) == FailureClass.AUTHORITY, reason
@@ -196,3 +199,20 @@ def test_the_fixed_world_measures_zero():
     assert counts.authority_share == 0.0
     assert counts.by_class[FailureClass.TASK_DEFECT] == 1
     assert counts.by_class[FailureClass.QUOTA] == 1
+
+
+def test_the_authority_token_is_anchored_exactly_like_the_sql_predicate():
+    """`backlog_reason_requires_authority` (0018) decides whether a park is
+    terminal; this module decides whether it is COUNTED as authority. If the
+    two anchors drift, the audited number and the parking decision measure
+    different populations."""
+    assert fc.classify_reason("requires_privileged_authority: root") == (
+        FailureClass.AUTHORITY
+    )
+    assert fc.classify_reason(
+        "cascade_exhausted: requires_privileged_authority: root"
+    ) == FailureClass.AUTHORITY
+    # A word-continuation is not the token — matching the SQL `[^a-z_]` guard.
+    assert fc.classify_reason("xrequires_privileged_authority: root") != (
+        FailureClass.AUTHORITY
+    )

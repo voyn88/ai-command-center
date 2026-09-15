@@ -992,7 +992,14 @@ def test_plan_once_blocks_a_task_that_requires_authority_the_fleet_lacks(rig) ->
 # ---------------------------------------------------------------------------
 
 
-_GATE_REASON = "cascade_exhausted: requires_privileged_authority: root"
+#: The reason string the live queue actually produces for a worker-gate
+#: refusal, wrapper for wrapper: `queue_fail` prefixes a non-retryable
+#: failure with `non_retryable: ` (0002) and `backlog_ingest_results` folds
+#: the dead_reason into `cascade_exhausted: ` (0011). Two wrappers, which is
+#: why 0018's predicate anchors on the TOKEN and not on a prefix.
+_GATE_REASON = (
+    "cascade_exhausted: non_retryable: requires_privileged_authority: root"
+)
 
 
 def test_an_authority_return_parks_for_the_owner_on_the_first_occurrence(rig) -> None:

@@ -34,9 +34,17 @@ Pure functions over strings and dicts: no I/O, no database. The CLI
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 from command_center.orchestrator import authority_preflight
+
+#: The same anchor `backlog_reason_requires_authority` (0018) applies in SQL:
+#: the token, not a bare substring, and at a word boundary so a wrapper that
+#: prefixes the reason cannot shift it out of view.
+_AUTHORITY_TOKEN = re.compile(
+    r"(^|[^a-z_])" + re.escape(authority_preflight.PARK_REASON_PREFIX.strip())
+)
 
 __all__ = [
     "FailureClass",
@@ -96,7 +104,12 @@ def classify_reason(reason: str | None) -> str | None:
     # the same reason reaches the store bare (parked by the planner's
     # preflight) and wrapped (refused by the worker gate, folded into
     # `cascade_exhausted: <dead_reason>` by ingest). One cause, one class.
-    if authority_preflight.PARK_REASON_PREFIX.strip() in text:
+    #
+    # Token-anchored, matching `backlog_reason_requires_authority` (0018)
+    # exactly: this classifier and that gate must never disagree about
+    # whether a reason is an authority reason, or the audited number and the
+    # parking decision would be measuring different populations.
+    if _AUTHORITY_TOKEN.search(text):
         return FailureClass.AUTHORITY
     if any(marker in lowered for marker in _QUOTA_MARKERS):
         return FailureClass.QUOTA

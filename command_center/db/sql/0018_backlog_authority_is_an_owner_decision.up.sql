@@ -31,10 +31,15 @@
 -- worker lane, or rewriting the task -- can change the answer.
 
 -- The single vocabulary both directions match. Token-anchored rather than
--- prefix-anchored precisely because the reason travels wrapped: the planner
--- writes it bare (`requires_privileged_authority: root`), ingest wraps it
--- (`cascade_exhausted: requires_privileged_authority: root`), and a future
--- wrapper must not silently reopen the loop by shifting the offset.
+-- prefix-anchored because the reason travels WRAPPED, twice over: the
+-- planner writes it bare (`requires_privileged_authority: root`), `queue_fail`
+-- (0002) prefixes a non-retryable refusal with `non_retryable: `, and
+-- `backlog_ingest_results` (0011) folds the dead_reason into
+-- `cascade_exhausted: `. What the store finally holds for a worker-gate
+-- refusal is
+--   `cascade_exhausted: non_retryable: requires_privileged_authority: root`
+-- and a third wrapper must not silently reopen the loop by shifting the
+-- offset again.
 CREATE FUNCTION backlog_reason_requires_authority(p_reason text)
     RETURNS boolean
     LANGUAGE sql IMMUTABLE PARALLEL SAFE SET search_path = pg_catalog, public AS $$
