@@ -284,6 +284,21 @@ def _host_granted_authority(executor: str) -> frozenset[str]:
     return frozenset(granted)
 
 
+def _missing_authority(
+    required: frozenset[str] | set[str] | list[str] | tuple[str, ...],
+    executor: str,
+) -> frozenset[str]:
+    """What the payload demands that running on `executor` HERE would not
+    grant — empty when this host can serve the contract on that lane.
+
+    Takes the executor as an argument rather than reading it from the request
+    because the answer is per-lane: the worker may select a different cascade
+    link than the one it was delivered, and every such choice has to be asked
+    this question separately.
+    """
+    return frozenset(required) - _host_granted_authority(executor)
+
+
 def _run_agent(
     payload: dict[str, Any], lease_lost: threading.Event, attempt_no: int = 1
 ) -> HandlerOutcome:
@@ -327,9 +342,7 @@ def _run_agent(
     # call. Non-retryable on purpose: redelivery cannot grant a privilege,
     # and 0018 classifies this reason as an owner decision rather than a
     # technical exhaustion, so the task parks instead of looping.
-    missing_authority = frozenset(request.required_authority) - _host_granted_authority(
-        executor
-    )
+    missing_authority = _missing_authority(request.required_authority, executor)
     if missing_authority:
         return HandlerOutcome(
             ok=False,
@@ -360,6 +373,22 @@ def _run_agent(
             candidate = request.cascade[candidate_step - 1]
             candidate_executor = str(candidate.get("executor"))
             if candidate_executor not in agent_runner.COMMAND_BUILDERS:
+                continue
+            if _missing_authority(request.required_authority, candidate_executor):
+                # The entry gate above was asked about the link we were
+                # DELIVERED. This loop re-chooses the link, so it has to ask
+                # again: switching to a lane that does not grant the payload's
+                # capability contract would walk around that gate and start
+                # the model anyway -- this task's own defect, one layer down.
+                # The planner narrows a privileged task's cascade to capable
+                # lanes, so this is unreachable for a payload it built; the
+                # gate does not get to assume it built this one.
+                #
+                # Skipped silently, leaving `detail`/`unavailable_reason` on
+                # the authorized lane we started from: that lane is merely
+                # DOWN, so the honest outcome stays its retryable
+                # infrastructure reason rather than a privilege refusal the
+                # authorized lane never earned.
                 continue
             candidate_task_type = str(candidate.get("task_type", request.task_type))
             candidate_available, candidate_detail, candidate_reason = (

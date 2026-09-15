@@ -1704,3 +1704,81 @@ def test_root_is_proved_not_taken_on_the_tables_word(handler, monkeypatch) -> No
     monkeypatch.setattr(handlers_module.os, "geteuid", lambda: 0)
     assert run_agent(_payload(required_authority=["root"]), _event(), 1).ok
     assert len(runs) == 1
+
+
+def test_the_fallback_link_is_gated_too_not_just_the_delivered_one(
+    handler, monkeypatch
+) -> None:
+    """The gate is asked about the link we were DELIVERED; this loop re-picks
+    the link, so it must ask again.
+
+    Otherwise the worker walks around its own entry gate: link 1 grants the
+    privilege but its CLI is down, so the cascade falls through to link 2 --
+    which does not grant it -- and the model starts anyway. That is this
+    task's defect one layer down, and the loop below is the only place that
+    can produce it.
+    """
+    from command_center.orchestrator import authority_preflight
+
+    monkeypatch.setitem(
+        authority_preflight.EXECUTOR_AUTHORITY,
+        "codex",
+        frozenset({"postgres_role:postgres"}),
+    )
+    monkeypatch.setitem(
+        authority_preflight.EXECUTOR_AUTHORITY, "claude", frozenset()
+    )
+    # Link 1 is the authorized lane, and it is DOWN. Link 2 is up and
+    # unprivileged -- the tempting, wrong choice.
+    payload = _cascade_payload()
+    payload["cascade"][0] = {"executor": "codex", "task_type": "review"}
+    payload["required_authority"] = ["postgres_role:postgres"]
+
+    def preflight(binary=None):
+        return (False, "not logged in") if binary == agent_runner.CODEX_BINARY else (True, "")
+
+    monkeypatch.setattr(agent_runner, "claude_cli_preflight", preflight)
+
+    run_agent, runs = handler
+    outcome = run_agent(payload, _event(), 1)
+
+    assert runs == [], "an unprivileged lane must not be substituted for a privileged one"
+    assert outcome.ok is False
+    # The authorized lane is merely DOWN, so the honest answer is its
+    # retryable infrastructure reason -- not a privilege refusal that lane
+    # never earned, and not a success on a lane that cannot serve the work.
+    assert outcome.retryable is True
+    assert "codex cli unavailable" in outcome.reason
+
+
+def test_an_authorized_fallback_link_is_still_taken(handler, monkeypatch) -> None:
+    """The converse, so the guard above is a gate and not a wall: when the
+    fallback lane DOES grant the requirement, the cascade still falls through
+    to it exactly as it would for an ordinary payload."""
+    from command_center.orchestrator import authority_preflight
+
+    monkeypatch.setitem(
+        authority_preflight.EXECUTOR_AUTHORITY,
+        "codex",
+        frozenset({"postgres_role:postgres"}),
+    )
+    monkeypatch.setitem(
+        authority_preflight.EXECUTOR_AUTHORITY,
+        "claude",
+        frozenset({"postgres_role:postgres"}),
+    )
+    payload = _cascade_payload()
+    payload["cascade"][0] = {"executor": "codex", "task_type": "review"}
+    payload["required_authority"] = ["postgres_role:postgres"]
+
+    def preflight(binary=None):
+        return (False, "not logged in") if binary == agent_runner.CODEX_BINARY else (True, "")
+
+    monkeypatch.setattr(agent_runner, "claude_cli_preflight", preflight)
+
+    run_agent, runs = handler
+    outcome = run_agent(payload, _event(), 1)
+
+    assert outcome.ok, outcome.reason
+    assert outcome.result["cascade_step"] == 2
+    assert runs[0]["executor"] == "claude"
