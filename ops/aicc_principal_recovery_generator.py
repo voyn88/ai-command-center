@@ -15,12 +15,34 @@ import json
 import os
 import re
 import stat
+import subprocess
 import sys
 from pathlib import Path
 
 STATE_DIR = Path("/var/lib/aicc-principal-isolation")
 ANCHOR = Path("/usr/lib/systemd/system-generators/aicc-principal-recovery")
 RECOVERY_UNIT = "aicc-principal-recovery.service"
+#: The second half of boot recovery. The barrier above runs before
+#: sysinit.target and therefore cannot synchronously start a worker that
+#: depends on it -- it can only enqueue those starts. Enqueueing is not
+#: starting, so this unit runs after the boot has settled and proves the
+#: queued jobs actually reached `active`, failing loudly if they did not
+#: (independent review on 988de49).
+COMPLETION_UNIT = "aicc-principal-recovery-complete.service"
+#: Written by `restore_service_snapshot(defer_starts=True)` in
+#: ops/aicc_install_transaction.py. That module cannot be imported from here
+#: (this file is a systemd generator, executed by PID 1 before anything else
+#: is installed), so the name, version and unit pattern are duplicated and
+#: held in lockstep by tests/ops/test_aicc_install_transaction.py.
+DEFERRED_STARTS = "deferred-starts.json"
+DEFERRED_STARTS_VERSION = 1
+DEFERRED_UNIT_RE = re.compile(
+    r"(?:voyn-aicc-worker@[^/@\s]+\.service|"
+    r"voyn-aicc-worker(?:-2)?\.service|"
+    r"aicc-worker\.service|"
+    r"aicc-agent-launcher@[^/@\s]+\.service|"
+    r"aicc-agent-launcher\.socket|aicc-principal-recovery\.service)"
+)
 CLAIMERS = (
     "aicc-agent-launcher.socket",
     "aicc-agent-launcher@.service",
@@ -292,6 +314,94 @@ def recover(state_dir: Path = STATE_DIR, *, expected_uid: int = 0) -> int:
     raise AssertionError("unreachable")
 
 
+def _boot_id() -> str:
+    """Per-boot random id; empty when unavailable so callers fail closed."""
+    try:
+        return (
+            Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
+        )
+    except OSError:
+        return ""
+
+
+def _systemctl(run, *arguments: str) -> tuple[int, str]:
+    result = run(
+        ["/usr/bin/systemctl", *arguments],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    return result.returncode, (result.stdout or "").strip()
+
+
+def complete_deferred_starts(
+    state_dir: Path = STATE_DIR, *, expected_uid: int = 0, run=subprocess.run
+) -> int:
+    """Prove the starts boot recovery could only enqueue actually happened.
+
+    Boot recovery restores files and unit enablement durably, but it runs
+    before sysinit.target and can only `--no-block start` the units the
+    snapshot recorded active -- it cannot wait for them without deadlocking on
+    its own ordering. It then consumes the WAL. Without this step a queued job
+    that fails afterwards leaves a previously active lane inactive and no
+    evidence that anything is owed (independent review on 988de49).
+
+    The journal is consumed only on proof, so a failure here keeps naming the
+    units that still owe an active state, and this unit stays `failed` where
+    an operator and the fleet's own health probes can see it.
+    """
+    journal = state_dir / DEFERRED_STARTS
+    try:
+        raw = _trusted_regular(journal, mode=0o600, expected_uid=expected_uid)
+    except FileNotFoundError:
+        return 0
+    try:
+        payload = json.loads(raw)
+    except ValueError as exc:
+        raise RuntimeError("deferred-start journal is malformed") from exc
+    units = payload.get("units") if isinstance(payload, dict) else None
+    recorded_boot = payload.get("boot_id") if isinstance(payload, dict) else None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("version") != DEFERRED_STARTS_VERSION
+        or not isinstance(units, list)
+        or not units
+        or not all(
+            isinstance(unit, str) and DEFERRED_UNIT_RE.fullmatch(unit)
+            for unit in units
+        )
+        or not isinstance(recorded_boot, str)
+    ):
+        raise RuntimeError("deferred-start journal is invalid")
+    current_boot = _boot_id()
+    # An empty id on either side means the binding cannot be evaluated at all.
+    # Refuse rather than guess: the journal stays, and so does the evidence.
+    if not current_boot or not recorded_boot:
+        raise RuntimeError("cannot bind deferred starts to a boot")
+    same_boot = recorded_boot == current_boot
+    unproven: list[str] = []
+    for unit in units:
+        if same_boot:
+            # Synchronous: when a start job for this unit is already queued,
+            # systemctl joins that job and reports ITS result, which is
+            # exactly the outcome the deferral left unproven.
+            _systemctl(run, "start", unit)
+        _active_rc, active = _systemctl(run, "is-active", unit)
+        if active != "active":
+            unproven.append(unit)
+    if unproven:
+        raise RuntimeError(
+            "deferred starts did not reach active: " + ", ".join(sorted(unproven))
+        )
+    journal.unlink(missing_ok=True)
+    descriptor = os.open(state_dir, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    return 0
+
+
 def _atomic_text(path: Path, content: str, mode: int = 0o644) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.parent / f".{path.name}.{os.getpid()}"
@@ -325,6 +435,45 @@ def generate(early_dir: Path, state_dir: Path = STATE_DIR) -> bool:
         "/usr/lib/tmpfiles.d /usr/libexec -/var/lib/aicc-agent "
         "/var/lib/aicc-principal-isolation\n",
     )
+    # The completion half. Emitted unconditionally, exactly like the barrier
+    # above: whether anything was deferred is not knowable while generators
+    # run, and a no-op run costs one journal lstat. Ordered after the boot has
+    # settled so the queued jobs have had their chance, and pulled in by
+    # `Wants=` rather than `Requires=` -- an unproven start must fail THIS
+    # unit loudly, not take multi-user.target down with it.
+    _atomic_text(
+        early_dir / COMPLETION_UNIT,
+        "[Unit]\n"
+        "Description=Prove AICC principal-isolation recovery finished its "
+        "deferred starts\n"
+        f"RequiresMountsFor={state_dir}\n"
+        "After=multi-user.target\n"
+        "Conflicts=shutdown.target\n\n"
+        "[Service]\n"
+        "Type=oneshot\n"
+        "RemainAfterExit=yes\n"
+        # Bounded: joining a queued job means waiting for it, and a job that
+        # never completes must surface as a failed completion (which keeps the
+        # journal) rather than as a unit that waits forever.
+        "TimeoutStartSec=15min\n"
+        f"ExecStart={ANCHOR} --complete-deferred-starts {state_dir}\n"
+        "NoNewPrivileges=yes\n"
+        "ProtectSystem=strict\n"
+        "ProtectHome=yes\n"
+        "PrivateTmp=yes\n"
+        f"ReadWritePaths={state_dir}\n",
+    )
+    wants = early_dir / "multi-user.target.wants"
+    wants.mkdir(parents=True, exist_ok=True)
+    completion = wants / COMPLETION_UNIT
+    try:
+        completion.symlink_to(f"../{COMPLETION_UNIT}")
+    except FileExistsError:
+        if (
+            not completion.is_symlink()
+            or os.readlink(completion) != f"../{COMPLETION_UNIT}"
+        ):
+            raise RuntimeError("recovery completion pull-in was pre-populated")
     requires = early_dir / "sysinit.target.requires"
     requires.mkdir(parents=True, exist_ok=True)
     dependency = requires / RECOVERY_UNIT
@@ -350,6 +499,9 @@ def main() -> int:
     if len(sys.argv) >= 2 and sys.argv[1] == "--recover":
         state_dir = Path(sys.argv[2]) if len(sys.argv) == 3 else STATE_DIR
         return recover(state_dir)
+    if len(sys.argv) >= 2 and sys.argv[1] == "--complete-deferred-starts":
+        state_dir = Path(sys.argv[2]) if len(sys.argv) == 3 else STATE_DIR
+        return complete_deferred_starts(state_dir)
     # systemd passes normal-dir, early-dir and late-dir. early-dir has higher
     # precedence than /etc, so an obsolete unit or mask cannot bypass recovery.
     if len(sys.argv) != 4:
