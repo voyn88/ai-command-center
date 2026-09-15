@@ -8,6 +8,21 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Fixed — a lost worker no longer dead-letters the work it was holding (`VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH`)
+- `command_center/db/sql/0027_queue_reap_lease_lapse_refunds.up.sql`:
+  `queue_reap()` refunds the attempt the lapsed delivery spent and counts the
+  lapse against the item's bounded `lease_wait_count` budget instead of its
+  `max_attempts`. A visibility lease can only lapse when the worker PROCESS
+  stopped heartbeating — an OOM kill, a watchdog restart, a host loss, a
+  database outage — because the heartbeat runs beside the handler, so a
+  handler that merely hangs keeps its lease and never reaches the reaper.
+  `max_attempts` is the executor cascade's length (two links), so two such
+  restarts used to dead-letter a task that had never reached a model, which
+  the `control-01:queue` monitor measured as `dead_letter_growth`. Permanent
+  lapses still terminate in the DLQ, now under
+  `lease_wait_exhausted: visibility_timeout`, and `queue_redrive()` resets
+  that budget as it has since 0024.
+
 ### Added — Home screen widget snippets (`VOYN-MIN-WIDGET-SNIP`)
 - `AICCNativeCore.WidgetIntentSnippet` / `WidgetFlow` / `WidgetDestination`
   (`clients/aicc-native/apple/Sources/AICCNativeCore/AICCNativeCore.swift`):

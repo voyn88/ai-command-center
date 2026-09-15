@@ -1,9 +1,10 @@
 """The control-plane surface over the queue's recovery protocol (SRV-06).
 
 Migration ``0002_queue_claim`` shipped recovery as PL/pgSQL — ``queue_reap()``
-requeues or dead-letters every lapsed lease, ``work_dlq`` is the dead-letter
-queue's interface, ``queue_redrive()`` is its audited exit — and granted all
-three to ``aicc_app`` and nothing to workers. Until this module, nothing in
+requeues every lapsed lease (and dead-letters the item once the lapses
+outlast its lease-wait budget, 0027), ``work_dlq`` is the dead-letter queue's
+interface, ``queue_redrive()`` is its audited exit — and granted all three to
+``aicc_app`` and nothing to workers. Until this module, nothing in
 production called any of them: the reaper existed only for tests, which means
 a worker host that lost power held its items hostage for exactly as long as
 no human ran ``SELECT queue_reap()`` by hand.
@@ -64,8 +65,18 @@ class WorkQueueAdmin:
     # -- recovery -------------------------------------------------------------
 
     def reap(self) -> int:
-        """Expire every lapsed lease: requeue items with budget left, dead-
-        letter the exhausted. Returns the number of attempts expired.
+        """Expire every lapsed lease: requeue it, dead-letter it once the
+        item's lease-wait budget is exhausted. Returns the number of attempts
+        expired.
+
+        A lapse never spends ``max_attempts`` (0027). The heartbeat runs
+        beside the handler, so a lease can only lapse when the worker PROCESS
+        stopped beating — a kill, a restart, a host loss, a database outage —
+        and none of that is evidence about the work item. It is counted
+        against ``lease_wait_count`` instead, the same bounded fleet budget a
+        no-fault handler refusal spends (see
+        ``work_queue_store.fail_lease_wait``), and the attempt ``queue_claim``
+        spent for the lapsed delivery is refunded.
 
         Safe to run at any moment and from any number of schedulers —
         ``queue_reap()`` takes each item's row lock, so it cannot race a

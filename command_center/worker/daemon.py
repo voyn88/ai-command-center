@@ -16,6 +16,14 @@ Design decisions, each traceable to the shipped substrate:
   current attempt runs to completion inside systemd's stop timeout. A second
   signal — or the timeout's SIGKILL — abandons it, and the lease expiry plus
   the control plane's reaper make that abandonment safe by construction.
+  Safe, and now also *free*: a lapse is charged to the queue's bounded
+  fleet budget rather than to the item's ``max_attempts`` (migration 0027),
+  because the heartbeat below runs beside the handler — so a lease can only
+  lapse when this PROCESS stopped beating, which is never evidence about the
+  payload it was holding. Every "the lease will lapse and a later delivery
+  retries" branch in this module depends on that; while the reaper spent
+  ``max_attempts``, two restarts dead-lettered a task that never ran
+  (VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH).
 * **Auth failure means stop, not retry.** A refused connection may mean the
   credential was rotated out from under us (`enroll_rotate_self` is
   first-writer-wins); hammering the server with a dead secret is
@@ -345,7 +353,9 @@ class WorkerDaemon:
             # payload crash this module already closed once. The lease is
             # left to lapse on its own (visibility expiry, then the reaper),
             # exactly like the stale-owner refusal below; a later delivery
-            # retries.
+            # retries, and since migration 0027 the lapse costs the item no
+            # attempt -- the database outage that stopped us writing is the
+            # fleet's, not the payload's.
             logger.exception(
                 "attempt %s: writing the outcome raised; the attempt's lease "
                 "will lapse and a later delivery will retry",
