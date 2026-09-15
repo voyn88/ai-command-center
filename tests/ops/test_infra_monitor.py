@@ -357,6 +357,37 @@ def test_executor_quota_refusals_are_their_own_failure_class() -> None:
     assert not any(f.startswith("dead_letter_growth") for f in report.failures)
 
 
+def test_quota_deaths_do_not_double_count_as_dead_letter_growth() -> None:
+    """One cause, one finding: a death already surfaced as
+    executor_quota_exhausted is not also dead-letter growth."""
+    from command_center.ops.infra_monitor import evaluate
+
+    report = evaluate(
+        {"voyn-aicc-worker@1.service": "active"},
+        _queue(recent_dead=2, recent_quota_dead=2),
+        minimum_active_workers=1,
+        max_stalled_seconds=900,
+        prometheus_ready=True,
+        max_recent_dead=0,
+    )
+    assert "executor_quota_exhausted:2" in report.failures
+    assert not any(f.startswith("dead_letter_growth") for f in report.failures)
+
+
+def test_unexplained_deaths_beyond_the_quota_class_still_raise_growth() -> None:
+    from command_center.ops.infra_monitor import evaluate
+
+    report = evaluate(
+        {"voyn-aicc-worker@1.service": "active"},
+        _queue(recent_dead=3, recent_quota_dead=2),
+        minimum_active_workers=1,
+        max_stalled_seconds=900,
+        prometheus_ready=True,
+        max_recent_dead=0,
+    )
+    assert "dead_letter_growth:1>0" in report.failures
+
+
 def test_spinning_lanes_with_no_success_in_an_hour_are_a_throughput_stall() -> None:
     from command_center.ops.infra_monitor import evaluate
 
