@@ -106,13 +106,20 @@ __all__ = [
     "PrWindowReport",
     "ReconcileReport",
     "ReviewConfig",
+    "VerdictLatencySummary",
+    "VerdictRow",
     "autonomy_remediate_once",
+    "median_and_p95",
     "merge_once",
+    "percentile",
     "publish_review_verdicts",
     "reconcile_merge_evidence",
     "reconcile_pr_window",
     "reconcile_review_once",
+    "review_cycle_and_chunk",
     "review_once",
+    "review_verdict_latencies",
+    "summarize_verdict_latencies",
 ]
 
 
@@ -666,6 +673,32 @@ _COMPLETE_REVIEW_PROMPT = (
 _REVIEW_INPUT_MARKER = "\nINPUT_ENVELOPE_JSON:\n"
 
 _MAX_REVIEW_PROMPT_BYTES = 16_000
+
+#: The single-prompt byte budget for a diff `_review_pr_risk` calls
+#: RISK_LOW -- pure documentation prose, on none of the deny-lists in that
+#: module. Nothing else in this file reads the risk class to make a decision:
+#: RISK_HIGH and RISK_STANDARD both get `_MAX_REVIEW_PROMPT_BYTES` and the
+#: identical chunk fan-out they got before risk tiering existed
+#: (VOYN-W0-AICC-REVIEW-RISK-TIER-REM).
+#:
+#: This is a REDUNDANCY budget, not a coverage one, and the distinction is
+#: the whole safety argument. Every byte of the diff is still reviewed, still
+#: inside the same envelope with the same hashes, still under the same
+#: `VERDICT:`/`HEAD_SHA:` contract, and the marker still needs an ACCEPT on
+#: the exact head from the independent acceptance App. What a LOW diff loses
+#: is being read by three model runs instead of one -- which is worth having
+#: for a schema change and is not worth 3x the queue latency for a typo fix
+#: in CHANGELOG.md. A diff that does not fit even this budget falls straight
+#: back to ordinary chunking; the budget bounds the fast path, it is not an
+#: escape from it.
+#:
+#: Kept to 3x, which is 48 KB -- below the 60 KB single-prompt budget this
+#: pipeline actually ran on until 1bf44670 lowered it to 16 KB, so every
+#: executor in the review cascade has demonstrably handled a review prompt
+#: this size. Nothing downstream caps it either: the prompt travels as a
+#: jsonb payload field and lands in an unbounded `text` column.
+_LOW_RISK_MAX_REVIEW_PROMPT_BYTES = 3 * _MAX_REVIEW_PROMPT_BYTES
+
 _MAX_REVIEW_DIFF_BYTES = 8 * 1024 * 1024
 
 _PR_URL = re.compile(r"^https://github\.com/([^/]+)/([^/]+)/pull/(\d+)$")
@@ -677,7 +710,12 @@ _PR_URL = re.compile(r"^https://github\.com/([^/]+)/([^/]+)/pull/(\d+)$")
 # incrementing this constant, forcing every task to be re-reviewed under the
 # new contract rather than silently reusing a verdict given for an older,
 # looser policy.
-_REVIEW_POLICY_VERSION = "v8"
+_REVIEW_POLICY_VERSION = "v9"
+# v8 -> v9: the review input envelope gained `risk_class`, so a v8 verdict was
+# given against a prompt whose envelope this code no longer produces
+# (VOYN-W0-AICC-REVIEW-RISK-TIER-REM). Bumping re-reviews every open head
+# under the current contract; it also gives the before/after latency
+# measurement a clean policy boundary to split on.
 
 _MODEL_ONLY_REVIEW_EXECUTORS = frozenset(
     {"copilot", "claude", "codex", "openai_http"}
@@ -763,6 +801,409 @@ def _review_key(task_id: str, pr_url: str, snapshot: _PRSnapshot) -> str | None:
             f"base:{snapshot.base}:diff:{snapshot.digest}")
 
 
+# -- Part 2c: deterministic risk class for a PR diff -----------------------
+#
+# VOYN-W0-AICC-REVIEW-RISK-TIER-REM.
+#
+# Why this exists
+# ---------------
+# Independent review is the throughput bottleneck of the autonomous loop: CI
+# runs in ~5.5 minutes while a verdict costs one (or, for a diff over the
+# prompt byte budget, N) model runs through the queue. `review_merge` splits
+# an oversized diff into N deterministic chunks and posts the ACCEPT marker
+# only after every chunk in the manifest independently ACCEPTs the same head.
+# That fan-out is the right default and this section does not touch it.
+#
+# What it does do is name ONE narrow class of diff -- pure documentation
+# prose -- for which `_review_chunks` is allowed a larger single-prompt byte
+# budget, so a three-paragraph README edit costs one review run instead of
+# three. The whole diff is still reviewed byte-for-byte; the only thing that
+# changes is how many prompts those bytes are spread across.
+#
+# (It lives here rather than in its own `command_center/orchestrator/`
+# module because the AIOS boundary gate freezes that package's inventory:
+# any new file under an `orchestrator` path segment classifies as a new
+# orchestration engine and fails `test_engine_inventory_matches_frozen_
+# baseline`. Growing the baseline to make room for a review-throughput
+# change would be exactly the drift that gate exists to stop, so the code
+# goes where the baseline already accounts for it.)
+#
+# What this deliberately does NOT call low risk
+# ---------------------------------------------
+# An earlier revision of this change (PR #707, rejected by adversarial review
+# at fb0bf6e4) also granted the reduced-redundancy budget to *test-only*
+# diffs, reasoning by analogy from `scripts/ci/test_impact/select_tests.py`'s
+# TEST_ROOT. That was wrong, and the rejection said exactly why: a test-only
+# diff is the canonical shape of "a test that passes on broken code".
+# Weakening an assertion, deleting a case, or narrowing a check requires
+# touching nothing but `tests/`, and the multi-chunk independent-ACCEPT
+# fan-out is part of what makes that expensive to sneak through. So:
+#
+# - Anything under a test root, or any file whose basename looks like a test,
+#   is NEVER low risk -- including a `.md` fixture that happens to live there.
+# - `prompts/*.md` and `.claude/` are markdown, but they are *control text*
+#   read by the agents themselves; a weakened `prompts/review.md` is a
+#   weakened gate, not a doc edit. Never low risk.
+# - `.github/` is CI. Never low risk, whatever the extension.
+# - Documentation is recognised by an allow-list of LOCATIONS, not by file
+#   extension, because `projects/*.md`, `context/*.md`, `roadmap/**/*.md` and
+#   `docs/adr/*.md` are all read by code or asserted on by a gate in this very
+#   repository. See `_is_documentation_path`.
+# - Dependency manifests (`requirements*.txt`, `*.lock`) are not prose even
+#   though one of them is a `.txt`: they are the supply chain.
+#
+# And the classifier is fail-safe by construction: every path that is not
+# affirmatively recognised as documentation, and every diff the parser
+# cannot account for *completely*, comes back non-low. Being wrong in that
+# direction costs a redundant review cycle; being wrong in the other
+# direction costs a gate.
+#
+# The strict parser
+# -----------------
+# `_diff_changed_paths` is a full-grammar walk of git's unified diff output,
+# not a line-wise regex scan, because a regex scan of `^--- ` / `^+++ ` is
+# attacker-controllable: a removed line whose content starts with `-- a/x`
+# renders as `--- a/x` at column 0, and an added line starting `++ b/x`
+# renders as `+++ b/x`. Tracking hunk line counts is what makes the
+# difference between reading the file headers and reading the diff *content*
+# that claims to be file headers. Any byte the grammar does not account for
+# makes the whole parse fail (None), which the caller reads as non-low.
+
+
+#: Pure documentation prose. The ONLY class `review_merge` treats specially.
+_RISK_LOW = "low"
+#: The default. Reviewed exactly as it was before risk tiering existed.
+_RISK_STANDARD = "standard"
+#: A path on the deny-list below (auth/schema/migrations/CI/release/
+#: security/control text). Also reviewed exactly as before -- HIGH and
+#: STANDARD are behaviourally identical in `review_merge` today. The class
+#: is split out so the deny-list that blocks LOW is explicit, named and
+#: testable rather than buried in a negation, and so the recorded
+#: provenance says *which* rule kept a diff off the fast path. The tier
+#: therefore acts strictly narrower than it reads: only _RISK_LOW changes
+#: any behaviour anywhere.
+_RISK_HIGH = "high"
+
+
+#: Substring match against the whole lowercased path, NOT a word match.
+#: Deliberately broad, and the over-matches are the point rather than an
+#: oversight: a false positive costs one redundant review cycle, a false
+#: negative costs review depth on a security-relevant file. Concretely,
+#: `sign` also catches `design` and `signal`, `lock` also catches
+#: `blocking`, and `key` also catches `monkeypatch` -- so `docs/design.md`
+#: and `docs/blocking.md` get the ordinary budget. That is the correct
+#: trade at this asymmetry, but it is a real cost and it is stated here so
+#: nobody reads the tier as covering more documentation than it does.
+_HIGH_RISK_KEYWORDS: tuple[str, ...] = (
+    "acl", "auth", "captcha", "cert", "constraint", "credential", "crypt",
+    "depend", "gate", "identity", "jwt", "key", "lock", "login", "merge",
+    "migration", "oauth", "passwd", "password", "permission", "privile",
+    "release", "requirement", "review", "schema", "secret", "security",
+    "session", "sign", "sudo", "token", "vault", "verdict", "verify",
+)
+
+#: Prefix match against the whole path. CI, deploy, packaging, database
+#: schema, and the agent-facing control text under `prompts/` and
+#: `.claude/` -- a markdown file in any of these is policy, not prose.
+_HIGH_RISK_PREFIXES: tuple[str, ...] = (
+    ".claude/", ".github/", ".gitlab/", "ci/", "command_center/db/",
+    "deploy/", "infra/", "ops/", "packaging/", "prompts/", "scripts/ci/",
+    "secrets/", "templates/",
+)
+
+#: Exact basenames that configure the build, the toolchain, or who may
+#: approve what. None of these are documentation regardless of extension.
+_HIGH_RISK_BASENAMES: frozenset[str] = frozenset({
+    # Build, toolchain, and who-may-approve-what.
+    "codeowners", "dockerfile", "makefile", "pyproject.toml",
+    "renovate.json", "setup.cfg", "setup.py", "tox.ini",
+    # Agent instruction files. Markdown, and read as control text.
+    ".cursorrules", "agents.md", "claude.md", "copilot-instructions.md",
+})
+
+#: Test roots. A diff touching any of these is never low risk -- see the
+#: section comment above for the rejection that put this rule here.
+_TEST_PREFIXES: tuple[str, ...] = ("test/", "testing/", "tests/")
+_TEST_SEGMENTS: tuple[str, ...] = ("/test/", "/tests/", "/testing/")
+
+#: Documentation is recognised by an ALLOW-LIST of locations, not by
+#: extension. Extension alone was the earlier design and it is wrong in this
+#: repository: `projects/AICC.md` and `context/*_CONTEXT.md` are loaded as
+#: agent context by `project_config.py`, `roadmap/**/*.md` is parsed into
+#: lanes by `portfolio_models.py`, `docs/adr/0011-*.md` has its CONTENT
+#: asserted by an architecture fitness test, and `prompts/*.md` is the review
+#: policy itself. Markdown in this tree is as often machine-read policy as it
+#: is prose. An allow-list fails the safe way when someone adds the next one.
+_DOC_SUFFIXES: tuple[str, ...] = (".md", ".markdown", ".rst", ".txt", ".adoc")
+
+#: The documentation tree. `scripts/ci/test_impact/select_tests.py` already
+#: treats this prefix as docs-only for test selection.
+_DOC_ROOT = "docs/"
+
+#: ...except architecture decision records, whose text is read and asserted
+#: on by `tests/architecture/test_governed_autonomy_chain_of_responsibility.py`.
+#: An ADR edit can change what a governance gate proves.
+_DOC_ROOT_EXCLUDED: tuple[str, ...] = (_DOC_ROOT + "adr/",)
+
+#: Repo-root prose files, matched on the basename stem so `README`,
+#: `README.md` and `readme.rst` all qualify. Deliberately short: a root
+#: markdown file this does not name (`ARCHITECTURE.md`, `ROADMAP_STATE.md`,
+#: `INBOX.md`, `CLAUDE.md`) gets the ordinary review budget, which is the
+#: right answer for anything that might be read by something.
+_ROOT_PROSE_STEMS: frozenset[str] = frozenset({
+    "authors", "changelog", "changes", "contributing", "contributors",
+    "license", "notice", "readme",
+})
+
+_HUNK_HEADER = re.compile(r"^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@")
+
+#: Extended-header lines that carry no path and no mode. Anything outside
+#: this set, the mode lines, the path lines, and the hunks fails the parse.
+_IGNORED_HEADER_PREFIXES: tuple[str, ...] = (
+    "dissimilarity index ", "similarity index ",
+)
+
+_PATH_HEADER_PREFIXES: tuple[str, ...] = (
+    "copy from ", "copy to ", "rename from ", "rename to ",
+)
+
+#: The only file mode a low-risk diff may mention. A doc that gains the
+#: executable bit (100755), becomes a symlink (120000), or becomes a
+#: submodule pointer (160000) is not a prose edit.
+_REGULAR_FILE_MODE = "100644"
+
+
+@dataclass(frozen=True, slots=True)
+class _DiffFile:
+    """One `diff --git` section: every path it names (both sides of a
+    rename, so a rename *out of* a code tree cannot hide behind its
+    destination) and every file mode it mentions."""
+
+    paths: frozenset[str]
+    modes: frozenset[str]
+
+
+def _unprefixed(value: str) -> str | None:
+    """Strip git's `a/` / `b/` prefix from a `---`/`+++` operand.
+
+    Returns None for a quoted path (`"a/p\\303\\244th"`, emitted when the
+    path needs C-quoting) rather than attempting to unquote it: refusing to
+    classify is the fail-safe answer and an unquoted ASCII path is the only
+    shape the classifier needs to recognise."""
+    if value == "/dev/null":
+        return value
+    if value.startswith('"') or not value.startswith(("a/", "b/")):
+        return None
+    return value[2:]
+
+
+def _paths_from_diff_git(rest: str) -> frozenset[str] | None:
+    """Both operands of `diff --git a/<p> b/<p>`.
+
+    Only used for a section that names no path any other way (a pure mode
+    change). The header is genuinely ambiguous when an unquoted path
+    contains a space, so this accepts only the unambiguous cases: exactly
+    one ` b/` split point, or a split whose two sides agree."""
+    if rest.startswith('"'):
+        return None
+    splits = [
+        (rest[:index], rest[index + 1:])
+        for index, _ in enumerate(rest)
+        if rest.startswith(" b/", index)
+    ]
+    if not splits:
+        return None
+    if len(splits) > 1:
+        splits = [
+            (left, right)
+            for left, right in splits
+            if left[2:] == right[2:] and left.startswith("a/")
+        ]
+        if len(splits) != 1:
+            return None
+    left, right = splits[0]
+    if not left.startswith("a/") or not right.startswith("b/"):
+        return None
+    return frozenset({left[2:], right[2:]})
+
+
+def _mode_from(line: str, prefix: str) -> str:
+    return line[len(prefix):].strip()
+
+
+def _diff_changed_paths(diff: str) -> tuple[_DiffFile, ...] | None:
+    """Every file section of a unified git diff, or None if `diff` is not
+    one this parser accounts for completely.
+
+    None is not "no files changed" -- it is "this parser will not vouch for
+    what changed", which every caller must read as non-low risk. It is
+    returned for: an empty diff, a binary patch, a line before the first
+    `diff --git`, an unrecognised extended header, a quoted path, a hunk
+    header this does not match, and a hunk whose body line counts do not
+    add up to the counts its own `@@` header declared."""
+    if not diff:
+        return None
+    lines = diff.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    total = len(lines)
+    index = 0
+    files: list[_DiffFile] = []
+    while index < total:
+        if not lines[index].startswith("diff --git "):
+            return None
+        header_paths = _paths_from_diff_git(lines[index][len("diff --git "):])
+        index += 1
+        paths: set[str] = set()
+        modes: set[str] = set()
+        while (
+            index < total
+            and not lines[index].startswith("@@")
+            and not lines[index].startswith("diff --git ")
+        ):
+            line = lines[index]
+            if line.startswith(("old mode ", "new mode ")):
+                modes.add(_mode_from(line, "old mode ") if line[0] == "o"
+                          else _mode_from(line, "new mode "))
+            elif line.startswith("new file mode "):
+                modes.add(_mode_from(line, "new file mode "))
+            elif line.startswith("deleted file mode "):
+                modes.add(_mode_from(line, "deleted file mode "))
+            elif line.startswith("index "):
+                parts = line.split(" ")
+                # `index <old>..<new>[ <mode>]` -- the mode is present only
+                # when it is unchanged, in which case it still has to pass
+                # the regular-file check below.
+                if len(parts) == 3:
+                    modes.add(parts[2])
+                elif len(parts) != 2:
+                    return None
+            elif line.startswith(("--- ", "+++ ")):
+                path = _unprefixed(line[4:])
+                if path is None:
+                    return None
+                if path != "/dev/null":
+                    paths.add(path)
+            elif line.startswith(_PATH_HEADER_PREFIXES):
+                paths.add(line.split(" ", 2)[2])
+            elif line.startswith(_IGNORED_HEADER_PREFIXES):
+                pass
+            else:
+                # "Binary files ... differ", "GIT binary patch", a blank
+                # separator, or anything this grammar has never seen.
+                return None
+            index += 1
+        while index < total and lines[index].startswith("@@"):
+            match = _HUNK_HEADER.match(lines[index])
+            if match is None:
+                return None
+            old_left = int(match.group(1)) if match.group(1) is not None else 1
+            new_left = int(match.group(2)) if match.group(2) is not None else 1
+            index += 1
+            while (old_left or new_left) and index < total:
+                body = lines[index]
+                if body.startswith("\\"):
+                    pass  # "\ No newline at end of file"
+                elif body.startswith(" ") or body == "":
+                    old_left -= 1
+                    new_left -= 1
+                elif body.startswith("-"):
+                    old_left -= 1
+                elif body.startswith("+"):
+                    new_left -= 1
+                else:
+                    return None
+                if old_left < 0 or new_left < 0:
+                    return None
+                index += 1
+            if old_left or new_left:
+                return None
+            while index < total and lines[index].startswith("\\"):
+                index += 1
+        if not paths:
+            # No `---`/`+++` and no rename line. The only real shape that
+            # reaches here is a mode-only change, which always carries an
+            # `old mode`/`new mode` pair -- so a bare `diff --git` line with
+            # neither a path line nor a mode line is a truncated section,
+            # not a file this parser may vouch for.
+            if header_paths is None or not modes:
+                return None
+            paths = set(header_paths)
+        files.append(_DiffFile(frozenset(paths), frozenset(modes)))
+    return tuple(files) if files else None
+
+
+def _is_test_path(path: str) -> bool:
+    lowered = path.lower()
+    basename = lowered.rsplit("/", 1)[-1]
+    return (
+        lowered.startswith(_TEST_PREFIXES)
+        or any(segment in lowered for segment in _TEST_SEGMENTS)
+        or basename.startswith("test_")
+        or basename.startswith("conftest.")
+        or "_test." in basename
+    )
+
+
+def _is_high_risk_path(path: str) -> bool:
+    lowered = path.lower()
+    basename = lowered.rsplit("/", 1)[-1]
+    return (
+        lowered.startswith(_HIGH_RISK_PREFIXES)
+        or basename in _HIGH_RISK_BASENAMES
+        or any(keyword in lowered for keyword in _HIGH_RISK_KEYWORDS)
+    )
+
+
+def _is_documentation_path(path: str) -> bool:
+    """True only for prose in an allow-listed location: a
+    documentation-suffixed file under `docs/` (but not `docs/adr/`), or a
+    repo-root file whose stem is conventional prose. A markdown file
+    ANYWHERE else -- `projects/`, `context/`, `roadmap/`, a package
+    directory, an unnamed root file -- is False, because in this repository
+    that is as likely to be machine-read policy as it is documentation."""
+    if not path or path.startswith("/") or ".." in path.split("/"):
+        return False
+    lowered = path.lower()
+    basename = lowered.rsplit("/", 1)[-1]
+    has_doc_suffix = basename.endswith(_DOC_SUFFIXES)
+    if lowered.startswith(_DOC_ROOT):
+        return has_doc_suffix and not lowered.startswith(_DOC_ROOT_EXCLUDED)
+    if "/" in lowered:
+        return False
+    if "." in basename and not has_doc_suffix:
+        return False
+    return basename.split(".", 1)[0] in _ROOT_PROSE_STEMS
+
+
+def _review_pr_risk(diff: str) -> str:
+    """_RISK_LOW / _RISK_HIGH / _RISK_STANDARD for a unified diff.
+
+    Deterministic and pure: same bytes in, same class out, no clock, no
+    filesystem, no network. _RISK_LOW is returned only when the parse
+    succeeded, the diff changed at least one file, no file section
+    mentioned a mode other than a regular file, and EVERY path named by
+    EVERY section is documentation prose that is neither high risk nor
+    under a test root."""
+    files = _diff_changed_paths(diff)
+    if files is None:
+        return _RISK_STANDARD
+    paths = sorted({path for entry in files for path in entry.paths})
+    if any(_is_high_risk_path(path) for path in paths):
+        return _RISK_HIGH
+    if any(_is_test_path(path) for path in paths):
+        return _RISK_STANDARD
+    if any(
+        mode != _REGULAR_FILE_MODE
+        for entry in files
+        for mode in entry.modes
+    ):
+        return _RISK_STANDARD
+    if all(_is_documentation_path(path) for path in paths):
+        return _RISK_LOW
+    return _RISK_STANDARD
+
+
 @dataclass(frozen=True, slots=True)
 class _DiffChunk:
     index: int
@@ -770,13 +1211,32 @@ class _DiffChunk:
     text: str
     content_hash: str
     manifest_hash: str
+    #: The risk class of the WHOLE diff this chunk came from, carried on the
+    #: chunk so every site that renders or size-checks a prompt reaches the
+    #: same budget without re-deriving it from a snapshot it may not have.
+    #: Defaults to RISK_STANDARD: a chunk built by hand (a test fixture, the
+    #: sizing probe in `_review_chunks`) gets the unchanged budget, never the
+    #: fast-path one.
+    risk: str = _RISK_STANDARD
 
 
-def _make_diff_chunks(raw_chunks: list[str]) -> tuple[_DiffChunk, ...]:
+def _review_prompt_budget_bytes(risk: str) -> int:
+    """The single-prompt byte budget for `risk`. RISK_LOW is the only class
+    that is not `_MAX_REVIEW_PROMPT_BYTES`; anything unrecognised also is
+    not, so a future class added to `review_risk` cannot widen this budget
+    by accident."""
+    if risk == _RISK_LOW:
+        return _LOW_RISK_MAX_REVIEW_PROMPT_BYTES
+    return _MAX_REVIEW_PROMPT_BYTES
+
+
+def _make_diff_chunks(
+    raw_chunks: list[str], risk: str = _RISK_STANDARD
+) -> tuple[_DiffChunk, ...]:
     hashes = [hashlib.sha256(chunk.encode("utf-8")).hexdigest() for chunk in raw_chunks]
     manifest_hash = hashlib.sha256("\n".join(hashes).encode()).hexdigest()
     return tuple(
-        _DiffChunk(index, len(raw_chunks), text, hashes[index], manifest_hash)
+        _DiffChunk(index, len(raw_chunks), text, hashes[index], manifest_hash, risk)
         for index, text in enumerate(raw_chunks)
     )
 
@@ -807,6 +1267,11 @@ def _review_input_envelope(
         "head_sha": snapshot.head,
         "diff_sha256": snapshot.digest,
         "scope": "complete_diff" if chunk.count == 1 else "partial_chunk",
+        # Provenance for the reviewer and for the audit trail: which tier
+        # decided how many prompts this diff was spread across. It does not
+        # change what the reviewer is asked to do -- the verdict contract is
+        # identical for every class.
+        "risk_class": chunk.risk,
         "chunk": {
             "index": chunk.index,
             "count": chunk.count,
@@ -1084,10 +1549,20 @@ def _split_unit_to_fit(unit: str, fits: Any) -> list[str]:
 def _review_chunks(
     snapshot: _PRSnapshot, task_id: str, pr_url: str
 ) -> tuple[_DiffChunk, ...]:
+    """The ordered chunk manifest for this head.
+
+    One chunk when the whole diff fits the budget for its risk class, else
+    the same deterministic split this function has always produced. The risk
+    class is derived once, from `snapshot.text` alone, and carried on every
+    chunk: `review_once`, `reconcile_review_once` and `_enqueue_review_refresh`
+    all size-check against `chunk.risk`, so no caller can enqueue a prompt
+    this function would not have built."""
     diff = snapshot.text
-    whole = _make_diff_chunks([diff])
+    risk = _review_pr_risk(diff)
+    budget = _review_prompt_budget_bytes(risk)
+    whole = _make_diff_chunks([diff], risk)
     if _prompt_size_bytes(_render_review_prompt(task_id, pr_url, snapshot, whole[0])) <= (
-        _MAX_REVIEW_PROMPT_BYTES
+        budget
     ):
         return whole
 
@@ -1099,10 +1574,11 @@ def _review_chunks(
             text=text,
             content_hash=content_hash,
             manifest_hash="f" * 64,
+            risk=risk,
         )
         return _prompt_size_bytes(
             _render_review_prompt(task_id, pr_url, snapshot, candidate)
-        ) <= _MAX_REVIEW_PROMPT_BYTES
+        ) <= budget
 
     if not fits(""):
         raise ValueError("review prompt wrapper exceeds byte budget")
@@ -1122,10 +1598,10 @@ def _review_chunks(
         raw_chunks.append(current)
     if "".join(raw_chunks) != diff:
         raise RuntimeError("review prompt chunking lost diff content")
-    chunks = _make_diff_chunks(raw_chunks)
+    chunks = _make_diff_chunks(raw_chunks, risk)
     if len(chunks) < 2 or any(
         _prompt_size_bytes(_render_review_prompt(task_id, pr_url, snapshot, chunk))
-        > _MAX_REVIEW_PROMPT_BYTES
+        > budget
         for chunk in chunks
     ):
         raise RuntimeError("review prompt byte budget invariant violated")
@@ -1530,7 +2006,7 @@ def _review_once(
         prepared: list[tuple[str, dict[str, Any]]] = []
         for chunk in chunks:
             prompt = _render_review_prompt(task_id, pr_url, snapshot, chunk)
-            if _prompt_size_bytes(prompt) > _MAX_REVIEW_PROMPT_BYTES:
+            if _prompt_size_bytes(prompt) > _review_prompt_budget_bytes(chunk.risk):
                 prepared = []
                 break
             payload = {
@@ -1541,6 +2017,12 @@ def _review_once(
                 "timeout_seconds": cfg.review_timeout,
                 "untrusted": True,
                 "cascade": cascade,
+                # Provenance only, like `repository_id` on the work item: no
+                # gate, cascade, or verdict rule in this file or the worker
+                # reads it. It is here so the latency measurement can split
+                # cycles by tier without re-fetching and re-classifying every
+                # diff after the fact.
+                "review_risk": chunk.risk,
             }
             if chunk.count == 1:
                 prepared.append((key, payload))
@@ -1671,7 +2153,7 @@ def reconcile_review_once(
             if retry_key is None:
                 continue
             prompt = _render_review_prompt(current_task_id, pr_url, snapshot, chunk)
-            if _prompt_size_bytes(prompt) > _MAX_REVIEW_PROMPT_BYTES:
+            if _prompt_size_bytes(prompt) > _review_prompt_budget_bytes(chunk.risk):
                 report.skipped.append((current_task_id, "review_prompt_budget_invalid"))
                 continue
             refusing_executor = _latest_attempt_executor(
@@ -1684,6 +2166,7 @@ def reconcile_review_once(
                 "task_type": "independent_review", "prompt": prompt,
                 "timeout_seconds": cfg.review_timeout, "untrusted": True,
                 "cascade": retry_cascade,
+                "review_risk": chunk.risk,  # provenance only -- see review_once
             }
             if chunk.count > 1:
                 payload["review_chunk"] = {
@@ -3480,6 +3963,7 @@ def _enqueue_review_refresh(
             "timeout_seconds": cfg.review_timeout,
             "untrusted": True,
             "cascade": cascade,
+            "review_risk": chunk.risk,  # provenance only -- see review_once
         }
         review_key = key
         if chunk.count != 1:
@@ -4860,3 +5344,237 @@ def _pr_window_details(
     merged = dict(pr)
     merged.update(details)
     return merged
+
+
+# -- Part 5: median / p95 verdict latency ----------------------------------
+#
+# VOYN-W0-AICC-REVIEW-RISK-TIER-REM.
+#
+# The acceptance criterion for risk-tiered review is "median/p95 verdict time
+# measured before/after", so the measurement has to be a thing the repo owns
+# rather than a number somebody eyeballed once. This section is the pure
+# half: it turns queue rows into per-review-cycle latencies and summarises
+# them.
+# `scripts/review_verdict_latency.py` is the thin I/O half that reads the rows.
+#
+# What one latency is
+# -------------------
+# A *review cycle* is one (task, PR, exact head sha, base, diff digest, review
+# policy version) -- the identity `_review_key` above builds. An
+# oversized diff fans that cycle out into N chunk work items, each with its own
+# `:chunk:NNNN:<hash>` suffix, and a malformed terminal result gets a fresh
+# `:retry:N` identity. All of those belong to the SAME cycle: the PR does not
+# have a verdict until the last of them lands, so the latency of the cycle is
+#
+#     max(result timestamp over its landed items)
+#       - min(enqueue timestamp over all its items)
+#
+# which is exactly what the marker publisher waits for.
+#
+# What counts as landed -- and why the `succeeded` check is here
+# --------------------------------------------------------------
+# A previous revision of this code (PR #707, rejected at fb0bf6e4)
+# documented that a chunk counts only when an attempt reached
+# `work_item.state = 'succeeded'`, while neither it nor its SQL looked at
+# `state` at all: completion was inferred from a non-null `work_result` row.
+# The rejection was right that a docstring and its code must not disagree
+# about a gate, so the check now exists in both places. `require_succeeded`
+# is enforced HERE, on the rows, so the guarantee holds no matter what query
+# produced them; `_fetch_rows` in the script also filters in SQL, to avoid
+# dragging rows across the wire that this would drop anyway. Neither is
+# load-bearing alone.
+#
+# A cycle is reported only when EVERY distinct chunk identity observed for it
+# has at least one landed item. A cycle with an unfinished chunk is still in
+# flight and is dropped (counted in `VerdictLatencySummary.in_flight`).
+#
+# What this cannot see, stated plainly
+# ------------------------------------
+# The set of chunks a cycle *should* have is not recoverable from the queue
+# keys -- the key carries a chunk index, not the manifest count. So "every
+# distinct chunk identity observed" means every chunk this query returned. If
+# a row set were truncated mid-cycle, a cycle could look complete while a
+# chunk was missing, and its latency would read short. That is why
+# `window_start` exists and why the script always passes it: a cycle whose
+# earliest enqueue predates the window may have had earlier chunks outside it,
+# so it is dropped as truncated (counted in
+# `VerdictLatencySummary.truncated`) rather than measured. Every drop is
+# counted and printed; nothing is silently discarded.
+
+
+#: `work_item.state` for an item whose worker completed and wrote a result.
+#: The queue has no resting 'failed' state (see 0002_queue_claim.up.sql): an
+#: item is 'ready', 'claimed', 'succeeded' or 'dead'.
+_SUCCEEDED = "succeeded"
+
+_REVIEW_KEY_PREFIX = "review:"
+_RETRY_SUFFIX = re.compile(r":retry:[0-9]+\Z")
+_CHUNK_SUFFIX = re.compile(r":chunk:([0-9]{4}):[0-9a-f]{64}\Z")
+
+#: The chunk identity of a cycle that was never chunked. Cannot collide with
+#: a real chunk id, which is always four digits.
+_UNCHUNKED = "single"
+
+
+@dataclass(frozen=True, slots=True)
+class VerdictRow:
+    """One review work item: its queue identity, its terminal state, when it
+    was enqueued, and when its result was written (None if never)."""
+
+    idempotency_key: str
+    state: str
+    enqueued_at: datetime
+    result_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class VerdictLatencySummary:
+    """Counts first, statistics second -- so a summary drawn from four
+    cycles cannot be mistaken for one drawn from four hundred."""
+
+    cycles: int
+    #: Cycles dropped because at least one of their chunks had not landed.
+    in_flight: int
+    #: Cycles dropped because they may have begun before the query window.
+    truncated: int
+    #: Rows ignored because their key is not a review-cycle key.
+    foreign_rows: int
+    median_seconds: float | None
+    p95_seconds: float | None
+
+    def render(self) -> str:
+        if self.median_seconds is None or self.p95_seconds is None:
+            measured = "median n/a  p95 n/a"
+        else:
+            measured = (
+                f"median {self.median_seconds:8.1f}s  "
+                f"p95 {self.p95_seconds:8.1f}s"
+            )
+        return (
+            f"cycles {self.cycles:5d}  {measured}  "
+            f"(dropped: {self.in_flight} in-flight, "
+            f"{self.truncated} truncated, {self.foreign_rows} foreign rows)"
+        )
+
+
+def review_cycle_and_chunk(idempotency_key: str) -> tuple[str, str] | None:
+    """Split a review work item's key into (cycle identity, chunk identity).
+
+    Returns None for a key that is not a review-cycle key. Both suffixes are
+    anchored at the end and stripped in the order they are appended
+    (`:chunk:` first by `_chunk_review_key`, then `:retry:` by
+    `_next_retry_key`), so the cycle identity is what `_review_key` built."""
+    if not idempotency_key.startswith(_REVIEW_KEY_PREFIX):
+        return None
+    key = _RETRY_SUFFIX.sub("", idempotency_key)
+    match = _CHUNK_SUFFIX.search(key)
+    if match is None:
+        return key, _UNCHUNKED
+    return key[: match.start()], match.group(1)
+
+
+def percentile(values: list[float], fraction: float) -> float:
+    """The `fraction` quantile by linear interpolation between the two
+    nearest ranks -- the same definition as numpy's default `linear`
+    method, so a spot check against numpy agrees. `values` must be
+    non-empty; `fraction` is clamped to [0, 1]."""
+    if not values:
+        raise ValueError("percentile of an empty sequence")
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    fraction = min(1.0, max(0.0, fraction))
+    position = fraction * (len(ordered) - 1)
+    lower = int(position)
+    if lower >= len(ordered) - 1:
+        return ordered[-1]
+    weight = position - lower
+    return ordered[lower] + (ordered[lower + 1] - ordered[lower]) * weight
+
+
+def median_and_p95(values: list[float]) -> tuple[float, float] | None:
+    """(median, p95), or None for no values at all."""
+    if not values:
+        return None
+    return percentile(values, 0.5), percentile(values, 0.95)
+
+
+def review_verdict_latencies(
+    rows: list[VerdictRow],
+    *,
+    window_start: datetime | None = None,
+    require_succeeded: bool = True,
+) -> tuple[list[float], int, int, int]:
+    """Seconds-to-verdict for every fully landed review cycle in `rows`.
+
+    Returns (latencies, in_flight, truncated, foreign_rows). See the module
+    docstring for what "fully landed" can and cannot mean here.
+
+    A row counts as landed only when it has a result timestamp AND, unless
+    `require_succeeded` is False, `state == 'succeeded'`. `require_succeeded`
+    is a parameter rather than a constant so a caller diagnosing a query can
+    deliberately widen it and see the difference; the default is the strict
+    reading and both shipped call sites use it."""
+    grouped: dict[str, dict[str, list[VerdictRow]]] = {}
+    foreign_rows = 0
+    for row in rows:
+        split = review_cycle_and_chunk(row.idempotency_key)
+        if split is None:
+            foreign_rows += 1
+            continue
+        cycle, chunk = split
+        grouped.setdefault(cycle, {}).setdefault(chunk, []).append(row)
+
+    latencies: list[float] = []
+    in_flight = 0
+    truncated = 0
+    for chunks in grouped.values():
+        every_row = [row for group in chunks.values() for row in group]
+        first_enqueue = min(row.enqueued_at for row in every_row)
+        if window_start is not None and first_enqueue < window_start:
+            truncated += 1
+            continue
+        landed: list[datetime] = []
+        complete = True
+        for group in chunks.values():
+            results = [
+                row.result_at
+                for row in group
+                if row.result_at is not None
+                and (not require_succeeded or row.state == _SUCCEEDED)
+            ]
+            if not results:
+                complete = False
+                break
+            landed.append(max(results))
+        if not complete:
+            in_flight += 1
+            continue
+        seconds = (max(landed) - first_enqueue).total_seconds()
+        # A clock skew or a backdated row must not enter the distribution as
+        # a negative latency; it is not an in-flight cycle either.
+        if seconds < 0:
+            truncated += 1
+            continue
+        latencies.append(seconds)
+    return latencies, in_flight, truncated, foreign_rows
+
+
+def summarize_verdict_latencies(
+    rows: list[VerdictRow],
+    *,
+    window_start: datetime | None = None,
+    require_succeeded: bool = True,
+) -> VerdictLatencySummary:
+    latencies, in_flight, truncated, foreign_rows = review_verdict_latencies(
+        rows, window_start=window_start, require_succeeded=require_succeeded
+    )
+    stats = median_and_p95(latencies)
+    return VerdictLatencySummary(
+        cycles=len(latencies),
+        in_flight=in_flight,
+        truncated=truncated,
+        foreign_rows=foreign_rows,
+        median_seconds=None if stats is None else stats[0],
+        p95_seconds=None if stats is None else stats[1],
+    )
