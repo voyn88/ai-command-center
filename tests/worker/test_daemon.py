@@ -934,3 +934,54 @@ def test_permanent_fleet_contention_still_terminates_in_the_dlq() -> None:
     # infra_monitor classifies the DLQ row by its reason: a capacity outage
     # that outlasts the wait budget must still land in the quota class.
     assert "quota" in store.dead_reason
+
+
+def test_a_host_that_cannot_provide_an_isolated_clone_no_longer_kills_the_item() -> None:
+    """The consequence the monitor actually counts, for the one refusal that
+    reached no budget at all.
+
+    Under principal isolation every read-only run gets a throwaway detached
+    clone (`handlers._read_only_isolated_checkout`). A subset of the ways a
+    host can fail to provide one -- the principal workspace-root config
+    absent or no longer immutable root-owned, git refusing the source clone's
+    ownership, the bound clone simply not there -- was classified *permanent*
+    and refused `retryable=False`. The two halves of this test are the same
+    host fact reported under the old classification and the new one, and the
+    difference is not how much budget it spends but whether the item survives
+    at all: `queue_fail` dead-letters a non-retryable report unconditionally,
+    so the item died on its FIRST delivery, having run nothing. Reviews are
+    dispatched continuously, so one host in that state filled the DLQ as fast
+    as it could claim -- the `dead_letter_growth` control-01:queue measured.
+    """
+    reason = (
+        "isolated workspace root is unavailable: principal workspace-root "
+        "config is not immutable root-owned"
+    )
+
+    old = QueueModel({"kind": "agent_run"}, max_attempts=2, delivery_cap=5)
+    _drain(
+        old,
+        {
+            "agent_run": lambda payload, lease_lost, attempt_no=1: HandlerOutcome(
+                ok=False, reason=reason, retryable=False
+            )
+        },
+    )
+    assert old.deliveries == 1, "one delivery was all it took"
+    assert old.state == "dead"
+    assert old.dead_reason == f"non_retryable: {reason}"
+    assert old.attempt_count == 1, "and the item was charged for it"
+
+    new = QueueModel({"kind": "agent_run"}, max_attempts=2, delivery_cap=5)
+    _drain(
+        new,
+        {
+            "agent_run": lambda payload, lease_lost, attempt_no=1: HandlerOutcome(
+                ok=False, reason=reason, retryable=True, no_fault=True
+            )
+        },
+    )
+    assert new.state == "ready", new.dead_reason
+    assert new.dead_reason is None
+    assert new.attempt_count == 0, "both model attempts intact for a healthier lane"
+    assert new.lease_wait_count == new.deliveries == 5

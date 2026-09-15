@@ -38,6 +38,11 @@ functional application milestones of `app.py`.
   exit that actually honours that intent: `no_fault` does not spend the
   cascade budget at all, while `retryable=False` skipped it by killing the
   item.
+- `tests/worker/test_daemon.py`:
+  `test_a_host_that_cannot_provide_an_isolated_clone_no_longer_kills_the_item`
+  drives both classifications of the same host fact through the queue model
+  and pins the consequence the monitor counts — dead on delivery one under
+  `non_retryable:`, versus still `ready` with both model attempts intact.
 
 ### Fixed — a lost worker no longer dead-letters the work it was holding (`VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH`)
 - `command_center/db/sql/0027_queue_reap_lease_lapse_refunds.up.sql`:
