@@ -8,6 +8,30 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Added — the pre-dispatch reuse gate (`VOYN-W0-AICC-DISPATCH-REUSE-GATE`)
+
+- The planner now asks, before dispatching any remediation task (`-REM`,
+  `-RETRY`, or a recorded `backlog_task_remediation` lineage), whether the
+  parent's acceptance is already satisfied on the default branch — a merged
+  pull request naming the parent in its commit title, or every symbol the
+  parent's acceptance names already defined there by a commit younger than
+  the task. When it is, the task is closed as superseded with the merged
+  pull request and sha as its evidence (`backlog_close_superseded`,
+  migration 0025) instead of dispatching a run that would re-implement
+  merged work. Live case, 2026-09-06: a `-REM` run re-implemented
+  `checkpoint_dirty_task_workspace` that PR 624 had already merged; the
+  colliding definitions failed CI with TypeErrors on main.
+- The gate only ever prevents *provable* duplicates: a repository this host
+  cannot read, a checkout without the merge yet, a body naming no symbols
+  (or too many), or a commit with no pull-request number all abstain and
+  dispatch exactly as before.
+- Telemetry: `PlanReport.prevented_duplicate_dispatches` (and a `SUPERSEDED`
+  line per task) in the tick's own output, with the durable per-task count
+  in `backlog_event` under the `close_superseded` event.
+- `python -m command_center.db backlog-plan` takes `--repo-path` (default
+  `.`, the planner unit's WorkingDirectory); an empty value turns the gate
+  off.
+
 ### Added — the one-button audit, wired into the web UI (`VOYN-W0-APP-CONTROL-S4`)
 
 - `web/src/screens/Tasks.tsx`: an `AuditLauncher` panel above the task list —
