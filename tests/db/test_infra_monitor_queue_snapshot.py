@@ -112,9 +112,9 @@ def monitor(admin_conn, psycopg, test_dsn, role_passwords):
 
         return factory
 
-    def measure() -> infra_monitor.QueueSnapshot:
+    def measure(queue: str = QUEUE) -> infra_monitor.QueueSnapshot:
         with psycopg.connect(app_dsn, autocommit=True) as conn, conn.cursor() as cur:
-            cur.execute(infra_monitor._QUEUE_SNAPSHOT_SQL)
+            cur.execute(infra_monitor._QUEUE_SNAPSHOT_SQL, (queue, queue))
             return infra_monitor.snapshot_from_row(cur.fetchone())
 
     def age(statement: str, params: tuple = ()) -> None:
@@ -455,5 +455,135 @@ def test_a_queue_no_lane_has_ever_claimed_from_has_no_fleet_clock(monitor) -> No
     report = infra_monitor.evaluate(
         {}, snapshot, minimum_active_workers=0, max_stalled_seconds=MAX_STALLED,
         prometheus_ready=True,
+    )
+    assert "queue_stalled" in report.failures
+
+
+# ---------------------------------------------------------------------------
+# THE FOURTH REGRESSION (monitor_finding #2766): one fleet, one queue.
+#
+# `queue_claim(p_queue, ...)` serves exactly the queue it is given, and the
+# lanes give it exactly one (`WorkerConfig.queue`). The statement measured
+# every queue in the table and was judged against that single fleet's
+# `--claim-capacity`, which is wrong in both directions -- and the two below
+# are those directions, taken through the protocol rather than hand-INSERTed.
+# ---------------------------------------------------------------------------
+
+
+def test_another_queues_ready_work_is_not_this_fleets_stall(monitor) -> None:
+    """An item on a queue no lane claims from must not redden this probe.
+
+    This is the shape with no way out: `queue_claim('execution', ...)` will
+    never look at a `staging` row, so no amount of healthy fleet behaviour can
+    retire the finding it used to open. A `queue_stalled` that the fleet
+    cannot clear by working is a task the planner mints forever.
+    """
+    measure, app, _worker, age = monitor
+    app.enqueue("staging", idempotency_key="foreign-1", payload={"kind": "agent_run"})
+    age(
+        "UPDATE work_item SET created_at = now() - interval '4 hours',"
+        " updated_at = now() - interval '4 hours',"
+        " available_at = now() - interval '4 hours'"
+    )
+
+    snapshot = measure()
+    assert snapshot.ready_due == 0
+    assert snapshot.ready_due_age_seconds is None
+
+    report = infra_monitor.evaluate(
+        {}, snapshot, minimum_active_workers=0, max_stalled_seconds=MAX_STALLED,
+        prometheus_ready=True, claim_capacity=2,
+    )
+    assert report.failures == ()
+
+    # And it is measured -- by the probe that names it.
+    staging = measure("staging")
+    assert staging.ready_due == 1
+    assert staging.ready_due_age_seconds > MAX_STALLED
+
+
+def test_another_queues_claims_never_excuse_this_queues_stall(monitor) -> None:
+    """The fail-OPEN half, which is the serious one.
+
+    Capacity is the question "was a lane free to take this?", and a lane busy
+    on ANOTHER queue was never a lane that could have taken this. Two attended
+    claims on `staging` used to fill `execution`'s capacity of 2, making
+    `spare_capacity` false and excusing a four-hour-old unclaimed item as
+    backpressure behind a fleet that was not serving it at all. A fail-closed
+    monitor silent through a real stall is the one outcome it exists to
+    prevent.
+    """
+    measure, app, worker, age = monitor
+    for i in range(2):
+        app.enqueue("staging", idempotency_key=f"foreign-{i}", payload={"kind": "run"})
+    for _ in range(2):
+        claimed = worker.claim("staging", visibility_seconds=300)
+        assert isinstance(claimed, ClaimedWork), claimed
+
+    # The real work: due for four hours on the queue the lanes do serve, with
+    # no claim against it and no lane that has ever moved on its behalf.
+    app.enqueue(QUEUE, idempotency_key="starved", payload={"kind": "agent_run"})
+    age(
+        "UPDATE work_item SET created_at = now() - interval '4 hours',"
+        " updated_at = now() - interval '4 hours',"
+        " available_at = now() - interval '4 hours'"
+        " WHERE queue = %s",
+        (QUEUE,),
+    )
+
+    snapshot = measure()
+    assert snapshot.attended_claims == 0, "another queue's lanes are not this fleet's"
+    assert snapshot.ready_due == 1
+    assert snapshot.fleet_idle_seconds is None, (
+        "no lane has ever taken or returned an item of THIS queue"
+    )
+
+    report = infra_monitor.evaluate(
+        {}, snapshot, minimum_active_workers=0, max_stalled_seconds=MAX_STALLED,
+        prometheus_ready=True, claim_capacity=2,
+    )
+    assert "queue_stalled" in report.failures
+
+
+def test_another_queues_attempts_do_not_wind_this_queues_fleet_clock(monitor) -> None:
+    """The bound added for #2471 is scoped too.
+
+    `fleet_idle_seconds` answers "have the lanes serving this queue moved?".
+    An attempt taken this second on `staging` is another fleet's lane doing
+    another fleet's work; if it reset this clock, `evaluate` would take
+    `min(due_age, ~0)` and excuse an `execution` stall of any age on the
+    strength of progress somewhere else -- reintroducing the fail-open above
+    through the fix for the one before it.
+    """
+    measure, app, worker, age = monitor
+    # This queue HAS a fleet history, so the clock is a number rather than
+    # NULL: one item claimed and completed, then aged well past the window.
+    app.enqueue(QUEUE, idempotency_key="done", payload={"kind": "agent_run"})
+    finished = _claim(worker)
+    assert worker.complete(finished, {"ok": True})
+    app.enqueue(QUEUE, idempotency_key="waiting", payload={"kind": "agent_run"})
+    age(
+        "UPDATE work_item SET created_at = created_at - interval '4 hours',"
+        " updated_at = updated_at - interval '4 hours',"
+        " available_at = available_at - interval '4 hours'"
+    )
+    age(
+        "UPDATE work_attempt SET created_at = created_at - interval '4 hours',"
+        " updated_at = updated_at - interval '4 hours',"
+        " visible_until = visible_until - interval '4 hours',"
+        " heartbeat_at = heartbeat_at - interval '4 hours'"
+    )
+
+    # Now another queue's lane takes an item, right now.
+    app.enqueue("staging", idempotency_key="foreign-now", payload={"kind": "run"})
+    claimed = worker.claim("staging", visibility_seconds=300)
+    assert isinstance(claimed, ClaimedWork), claimed
+
+    snapshot = measure()
+    assert snapshot.fleet_idle_seconds > MAX_STALLED, snapshot.fleet_idle_seconds
+
+    report = infra_monitor.evaluate(
+        {}, snapshot, minimum_active_workers=0, max_stalled_seconds=MAX_STALLED,
+        prometheus_ready=True, claim_capacity=2,
     )
     assert "queue_stalled" in report.failures

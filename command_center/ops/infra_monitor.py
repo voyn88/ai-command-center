@@ -59,6 +59,30 @@ FINDING_SOURCE_ENV = "AICC_MONITOR_FINDING_SOURCE"
 # it against the daemon's own constant.
 CLAIM_POLL_CEILING_SECONDS = 30.0
 
+# WHICH QUEUE THIS PROBE MEASURES. `work_item.queue` is a real dimension --
+# `queue_enqueue` writes it, UNIQUE(queue, idempotency_key) keys on it, and
+# `queue_claim(p_queue, ...)` SERVES EXACTLY ONE OF THEM -- so a measurement
+# that spans queues is judged against a fleet that does not serve them all.
+# The default is the queue the worker lanes actually claim from
+# (`WorkerConfig.queue`), and
+# `test_the_probes_queue_default_matches_the_daemons_own` pins the two
+# together so they cannot drift.
+#
+# It is a NAMED CONSTANT here rather than an import of `WorkerConfig` because
+# this module runs on the CONTROL host: `voyn-queue-monitor.service` execs it
+# out of the control-plane checkout, and importing the worker package to read
+# one string would make the probe depend on code that host does not otherwise
+# need. `DEFAULT_CLAIM_CAPACITY` is pinned to `deploy/aicc/worker-lanes` the
+# same way and for the same reason.
+#
+# A fleet that runs a SECOND queue gets a second probe with its own
+# `--queue`, its own `--claim-capacity` and its own finding source -- not this
+# one widened. Every threshold on this probe's ExecStart is already a fact
+# about one queue's fleet (how many lanes claim from it, how long one of its
+# attempts may run), and there is no honest way to judge two fleets by one
+# set of them.
+DEFAULT_QUEUE = "execution"
+
 
 @dataclass(frozen=True, slots=True)
 class QueueSnapshot:
@@ -197,6 +221,28 @@ def discover_worker_units() -> dict[str, str]:
 # with a free lane and calls the fleet's own backpressure a stall. The last
 # column below is what bounds it: the fleet's own clock, so that "ignored"
 # cannot outlast "there was somebody ignoring it".
+#
+# ALL OF IT IS SCOPED TO ONE QUEUE (monitor_finding #2766)
+# ---------------------------------------------------------------------------
+# Every class above is a statement about A FLEET: "claimable by a free lane",
+# "no lane is holding it", "lanes doing their job". `queue_claim(p_queue, ...)`
+# takes the queue as its first argument and will not look outside it, and the
+# lanes pass exactly one (`WorkerConfig.queue`). So the rows of another queue
+# are not this fleet's business in either direction, and until this filter
+# existed the probe got both directions wrong:
+#
+#   * A due `ready` row on any other queue was counted as work this fleet was
+#     ignoring. No lane can ever claim it, so no fleet action could ever make
+#     the probe green again -- an `open` `queue_stalled` finding, and the task
+#     the planner mints from it, with no reachable exit. "The monitor clears
+#     the finding when it measures healthy" was not a promise the measurement
+#     could keep.
+#   * Worse, and in the fail-OPEN direction a fail-closed monitor must never
+#     have: claims on another queue counted toward THIS queue's
+#     `--claim-capacity`. Two attended claims anywhere in the table made
+#     `attended_claims == 2`, `spare_capacity` false, and a genuine hours-old
+#     stall on `execution` was excused as backpressure behind a fleet that was
+#     not working on it at all.
 _QUEUE_SNAPSHOT_SQL = """
     WITH pending AS (
         SELECT
@@ -215,6 +261,9 @@ _QUEUE_SNAPSHOT_SQL = """
             coalesce(a.visible_until, w.updated_at) AS leaseless_since
           FROM work_item w
           LEFT JOIN work_attempt_public a ON a.attempt_id = w.current_attempt_id
+         -- ONE QUEUE, because one fleet serves one queue. See the note above
+         -- the parameter in `read_queue_snapshot`.
+         WHERE w.queue = %s
     ), classified AS (
         SELECT *, (state = 'claimed' AND NOT attended) AS lapsed_claim
           FROM pending
@@ -270,10 +319,19 @@ _QUEUE_SNAPSHOT_SQL = """
         -- for a queue nothing has ever claimed: `evaluate` then bounds
         -- nothing, and a ready item nobody has ever picked up is timed from
         -- its own due age alone.
+        --
+        -- SCOPED TO THIS QUEUE TOO, and that is not symmetry for its own
+        -- sake: this column exists to say whether the lanes that serve THE
+        -- MEASURED QUEUE are moving. An attempt on another queue's item is
+        -- another fleet's lane doing another fleet's work; letting it wind
+        -- this clock forward would excuse a stall here on the strength of
+        -- progress somewhere else.
         (SELECT extract(epoch FROM (now() - max(
                     CASE WHEN a.state = 'active' THEN a.created_at
                          ELSE a.updated_at END)))
-           FROM work_attempt_public a)
+           FROM work_attempt_public a
+           JOIN work_item wq ON wq.work_item_id = a.work_item_id
+          WHERE wq.queue = %s)
     FROM classified
 """
 
@@ -326,14 +384,18 @@ def snapshot_from_row(row: tuple[Any, ...]) -> QueueSnapshot:
     )
 
 
-def read_queue_snapshot() -> QueueSnapshot:
+def read_queue_snapshot(queue: str = DEFAULT_QUEUE) -> QueueSnapshot:
+    """Measure one queue -- the one whose fleet this probe's thresholds
+    describe. ``queue`` is bound twice because the statement asks two
+    questions of it: which work is pending, and whether the lanes serving that
+    work have moved."""
     from command_center.db import pool
     from command_center.db.config import load_config
 
     pool.open_pool(load_config())
     try:
         with pool.connection() as conn, conn.cursor() as cur:
-            cur.execute(_QUEUE_SNAPSHOT_SQL)
+            cur.execute(_QUEUE_SNAPSHOT_SQL, (queue, queue))
             row = cur.fetchone()
     finally:
         pool.close_pool()
@@ -536,6 +598,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=0,
         help="Maximum dead-lettered items allowed in the trailing hour.",
     )
+    parser.add_argument(
+        "--queue",
+        default=DEFAULT_QUEUE,
+        help=(
+            "Which queue to measure. Defaults to the one the worker lanes "
+            "claim from. Every other threshold here describes THAT queue's "
+            "fleet, so a second queue needs a second probe (its own "
+            "--claim-capacity and its own --record-findings source) rather "
+            "than this one widened."
+        ),
+    )
     parser.add_argument("--prometheus-url", required=True)
     parser.add_argument(
         "--skip-workers",
@@ -640,7 +713,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         workers = {} if args.skip_workers else discover_worker_units()
-        queue = None if args.skip_queue else read_queue_snapshot()
+        queue = None if args.skip_queue else read_queue_snapshot(args.queue)
         metrics_ready = prometheus_is_ready(args.prometheus_url)
         report = evaluate(
             workers,

@@ -32,6 +32,17 @@
 # was free); --max-claim-seconds and the lapsed-claim clock still fire, and
 # that direction is deliberate: a red tick mints a task, so this probe must not
 # cry wolf at a healthy fleet.
+#
+# --queue is not passed and does not need to be: it defaults to the queue the
+# worker lanes claim from, which is the only queue this host's fleet serves.
+# It exists because the measurement is now scoped to ONE queue (monitor_finding
+# #2766). `queue_claim` takes the queue as an argument and will not look
+# outside it, so spanning queues was wrong in both directions -- a ready row on
+# a queue no lane claims from was an unclearable `queue_stalled`, and claims on
+# such a queue filled THIS queue's --claim-capacity and excused a real stall.
+# Every threshold on the ExecStart line below is a fact about one queue's
+# fleet, so a second queue gets a SECOND unit with its own --queue,
+# --claim-capacity and AICC_MONITOR_FINDING_SOURCE -- never this one widened.
 [Unit]
 Description=VOYN durable queue fail-closed monitor
 After=network-online.target tailscaled.service postgresql.service prometheus.service

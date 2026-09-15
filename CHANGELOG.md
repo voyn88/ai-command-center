@@ -9,6 +9,43 @@ functional application milestones of `app.py`.
 ## [Unreleased]
 
 ### Fixed — the queue monitor called a working fleet stalled (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
+- The measurement spanned EVERY queue while the verdict knew exactly one fleet
+  (`monitor_finding` #2766). `work_item.queue` is a real dimension —
+  `queue_enqueue` writes it, `UNIQUE (queue, idempotency_key)` keys on it, and
+  `queue_claim(p_queue, ...)` serves exactly the one queue it is given, which
+  the lanes pass as `WorkerConfig.queue`. `_QUEUE_SNAPSHOT_SQL` filtered on
+  none of it, so every class it reports — "claimable by a free lane", "no lane
+  is holding it", "lanes doing their job" — was computed over rows belonging to
+  fleets that do not exist, and then judged against `--claim-capacity`. Both
+  directions were wrong, and the second is the one a fail-closed monitor must
+  never get wrong:
+  - A due `ready` row on any other queue counted as work this fleet was
+    ignoring. No lane can ever claim it, so no amount of healthy fleet
+    behaviour could retire the finding — an `open` `queue_stalled`, and the
+    task the planner mints from it, with no reachable exit. "The monitor clears
+    the finding when it measures healthy" was not a promise the measurement
+    could keep.
+  - FAIL-OPEN: claims on another queue counted toward this queue's capacity.
+    Two attended claims anywhere in the table made `attended_claims == 2`,
+    `spare_capacity` false, and a genuine hours-old unclaimed item on
+    `execution` was excused as backpressure behind a fleet that was not serving
+    it at all — the probe silent through exactly the stall it exists to catch.
+  The statement now binds the queue name twice: once to the pending work, and
+  once to the `fleet_idle_seconds` subquery added for #2471 — an attempt on
+  another queue's item is another fleet's lane, and letting it wind this clock
+  forward would excuse a stall of any age here through `min(due_age,
+  fleet_idle)`, reintroducing the fail-open through the fix for the one before
+  it. `--queue` defaults to the lanes' own queue, pinned to `WorkerConfig` by
+  `test_the_probes_queue_default_matches_the_daemons_own` the way capacity is
+  pinned to `deploy/aicc/worker-lanes`; the deployed `voyn-queue-monitor
+  .service` therefore needs no new flag. A fleet running a second queue gets a
+  second probe with its own capacity and finding source, because every
+  threshold on that ExecStart line is already a fact about one queue's fleet.
+  Regressions in both layers, all mutation-checked: at `evaluate`/`main` the
+  default, the flag's path into the statement's parameters, and that the name
+  is bound to BOTH questions; and against a real PostgreSQL server the foreign
+  ready row, the foreign claims that must not excuse a stall, and the foreign
+  attempt that must not wind the fleet clock.
 - The capacity test gated the COMPARISON and left the CLOCK running
   (`monitor_finding` #2471). A due `ready` item's age is time since it became
   due, and the queue is designed to hold work no lane can attend yet, so that

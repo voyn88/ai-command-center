@@ -366,7 +366,7 @@ def test_main_skip_workers_reads_queue_without_inspecting_systemd(
         "discover_worker_units",
         lambda: (_ for _ in ()).throw(AssertionError("workers must stay unread")),
     )
-    monkeypatch.setattr(infra_monitor, "read_queue_snapshot", lambda: queue)
+    monkeypatch.setattr(infra_monitor, "read_queue_snapshot", lambda _queue: queue)
     monkeypatch.setattr(infra_monitor, "prometheus_is_ready", lambda _url: True)
 
     result = infra_monitor.main(
@@ -884,7 +884,7 @@ def test_claim_capacity_is_configurable_and_reaches_the_verdict(
         attended_claims=2,
         live_claim_age_seconds=3600,
     )
-    monkeypatch.setattr(infra_monitor, "read_queue_snapshot", lambda: queue)
+    monkeypatch.setattr(infra_monitor, "read_queue_snapshot", lambda _queue: queue)
     monkeypatch.setattr(infra_monitor, "prometheus_is_ready", lambda _url: True)
 
     argv = [
@@ -1063,3 +1063,106 @@ def test_the_fleet_clock_reads_claims_and_releases_but_not_heartbeats() -> None:
         "CASE WHEN a.state = 'active' THEN a.created_at\n"
         "                         ELSE a.updated_at END" in sql
     )
+
+
+# ---------------------------------------------------------------------------
+# VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED, the fourth half (monitor_finding
+# #2766): the measurement spanned every queue, the verdict knew one fleet.
+# ---------------------------------------------------------------------------
+
+
+def test_the_probes_queue_default_matches_the_daemons_own() -> None:
+    """Capacity is pinned to the lane registry; the queue is pinned to the
+    lanes' own config, and for the same reason. `queue_claim` serves exactly
+    the queue it is given and the daemon gives it exactly this one, so a
+    default that drifted from it would leave the probe measuring work no lane
+    claims -- a `queue_stalled` finding with no way for the fleet to clear it.
+
+    Imported here rather than in `infra_monitor` on purpose: the probe runs
+    from the control host's checkout and must not need the worker package to
+    read one string. This test is the seam that keeps the copy honest.
+    """
+    from command_center.worker.daemon import WorkerConfig
+
+    assert infra_monitor.DEFAULT_QUEUE == WorkerConfig().queue
+
+
+def test_the_queue_flag_reaches_the_measurement(monkeypatch, capsys) -> None:
+    """The name has to travel from argv into the statement's parameter, not
+    just into the namespace: the snapshot is the only thing that knows which
+    rows it read, so a flag that stopped at `args` would measure `execution`
+    while reporting under another queue's source."""
+    asked: list[str] = []
+
+    def _read(queue: str):
+        asked.append(queue)
+        return QueueSnapshot(0, 0, 1, 0, 1.0)
+
+    monkeypatch.setattr(infra_monitor, "read_queue_snapshot", _read)
+    monkeypatch.setattr(infra_monitor, "prometheus_is_ready", lambda _url: True)
+
+    argv = [
+        "--skip-workers",
+        "--minimum-active-workers",
+        "0",
+        "--prometheus-url",
+        "http://metrics/ready",
+    ]
+
+    assert infra_monitor.main(argv) == 0
+    assert asked == [infra_monitor.DEFAULT_QUEUE]
+
+    assert infra_monitor.main([*argv, "--queue", "staging"]) == 0
+    assert asked == [infra_monitor.DEFAULT_QUEUE, "staging"]
+    capsys.readouterr()
+
+
+def test_the_statement_binds_the_queue_to_both_of_its_questions(monkeypatch) -> None:
+    """Two placeholders, and `read_queue_snapshot` binds the same name to
+    both. One filters the pending work; the other filters the attempts that
+    say whether the lanes serving that work have moved. Binding only the
+    first would let another queue's lane wind this queue's fleet clock
+    forward, and `evaluate` takes `min(due_age, fleet_idle)` -- so a stall of
+    any age here would be excused by progress somewhere else.
+    """
+    assert infra_monitor._QUEUE_SNAPSHOT_SQL.count("%s") == 2
+
+    bound: list[tuple] = []
+
+    class _Cur:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, statement, params=None): bound.append((statement, params))
+        def fetchone(self):
+            return (0, 0, 0, 0, None, 0, 0, 0, 0, None, 0, None, 0, None, None)
+
+    class _Conn:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def cursor(self): return _Cur()
+
+    class _Pool:
+        @staticmethod
+        def open_pool(cfg): pass
+        @staticmethod
+        def connection(): return _Conn()
+        @staticmethod
+        def close_pool(): pass
+
+    # The same shape as `recorded_statements`, and for the same reason: the
+    # REAL `command_center.db` is replaced along with its submodules, so
+    # `from command_center.db import pool` cannot bind this stub onto the
+    # genuine package and leak it into every later test in the session.
+    import sys
+    import types
+    fake_db = types.ModuleType("command_center.db")
+    fake_db.pool = _Pool
+    fake_cfg = types.ModuleType("command_center.db.config")
+    fake_cfg.load_config = lambda: {}
+    monkeypatch.setitem(sys.modules, "command_center.db", fake_db)
+    monkeypatch.setitem(sys.modules, "command_center.db.pool", _Pool)
+    monkeypatch.setitem(sys.modules, "command_center.db.config", fake_cfg)
+
+    infra_monitor.read_queue_snapshot("staging")
+
+    assert bound == [(infra_monitor._QUEUE_SNAPSHOT_SQL, ("staging", "staging"))]
