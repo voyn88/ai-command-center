@@ -2566,7 +2566,13 @@ def _commit_on_pr_ref(source, number: int, filename: str) -> str:
     the layout the host source mirror produces for review heads."""
     (source / filename).write_text(f"{filename}\n")
     assert _git("-C", str(source), "add", filename).returncode == 0
-    assert _git("-C", str(source), "commit", "-q", "-m", filename).returncode == 0
+    assert (
+        _git(
+            "-C", str(source), "-c", "user.email=t@t", "-c", "user.name=t",
+            "commit", "-q", "-m", filename,
+        ).returncode
+        == 0
+    )
     sha = _git("-C", str(source), "rev-parse", "HEAD").stdout.strip()
     assert (
         _git(
@@ -2622,7 +2628,13 @@ def test_read_only_isolated_checkout_packs_refs_after_a_wholesale_pr_fetch(
     assert _git("-C", str(source), "checkout", "-q", older).returncode == 0
     (source / "eight.txt").write_text("eight\n")
     assert _git("-C", str(source), "add", "eight.txt").returncode == 0
-    assert _git("-C", str(source), "commit", "-q", "-m", "newer").returncode == 0
+    assert (
+        _git(
+            "-C", str(source), "-c", "user.email=t@t", "-c", "user.name=t",
+            "commit", "-q", "-m", "newer",
+        ).returncode
+        == 0
+    )
     newer = _git("-C", str(source), "rev-parse", "HEAD").stdout.strip()
     assert (
         _git("-C", str(source), "update-ref", "refs/remotes/origin/pr/7/head", newer)
