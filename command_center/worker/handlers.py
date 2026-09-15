@@ -49,13 +49,23 @@ The line is drawn at *what the refusal is evidence of*, and only these are
   cannot offer, a provider/auth/quota refusal, a Codex sandbox that would
   not start, a repository this host cannot see;
 - workspace the fleet owes the run: an isolated root, clone or worktree it
-  failed to provide.
+  failed to provide -- *every* way it can fail to provide one. A read-only
+  run's isolated clone classified the subset it called permanent (a missing
+  principal workspace root, git refusing the source's ownership, a bound
+  clone that is not there) as NON-retryable instead, which is not a budget
+  at all: it dead-letters the item on its first delivery. So a host halfway
+  through its isolation rollout killed every read-only item it claimed,
+  having run nothing, while the mutating path refunded the identical
+  ``principal_workspace_root()`` failure as ``no_fault``. "Permanent" meant
+  permanent ON THAT HOST, and the queue is fleet-wide.
 
 A run that *executed* and failed, an agent that produced nothing, a
 publish that pushed badly, a checkpoint that could not authenticate the
 committed prefix, and every payload defect all stay on ``max_attempts``:
 each is evidence about this item, and refunding them would retry a real
-failure against a budget nothing spends down.
+failure against a budget nothing spends down. ``retryable=False`` is
+narrower still and is reserved for exactly that last group -- a defect in
+the payload's own data, which no host and no later moment can repair.
 
 Result rows are bounded: stdout/stderr travel as tails, because a jsonb
 column is a coordination record, not a log store -- the full transcript
@@ -70,7 +80,9 @@ import re
 import shutil
 import threading
 import uuid
+from collections.abc import Callable
 from contextlib import ExitStack
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -189,17 +201,10 @@ def _review_head_checkout(
 # Seam for tests; the real removal is shutil's.
 _rmtree = shutil.rmtree
 
-_PERMANENT_CLONE_FAILURES = (
-    "dubious ownership",
-    "not a git repository",
-    "does not exist",
-    "No such file or directory",
-)
-
 
 def _read_only_isolated_checkout(
     repository: Path, pin_sha: str | None = None
-) -> tuple[Path | None, str | None, bool]:
+) -> tuple[Path | None, str | None]:
     """A throwaway DETACHED clone of ``repository`` under the principal
     workspace root, for a read-only run under principal isolation.
 
@@ -233,22 +238,41 @@ def _read_only_isolated_checkout(
     has no credential to fetch ``refs/pull/<n>/head`` -- and its absence is a
     retryable condition: the source mirror catches up between deliveries.
 
-    Returns ``(path, None, False)`` on success, or ``(None, reason,
-    retryable)``: a missing root, a source git refuses (ownership, not a
-    repository, absent) are permanent -- another delivery cannot cure them
-    -- everything else is retryable.
+    Returns ``(path, None)`` on success or ``(None, reason)``, and EVERY
+    reason it can return is a fact about THIS HOST -- the principal
+    workspace-root config, the bound source clone, git's ownership trust,
+    a clone that could not complete, a checkout that did not land where it
+    was asked to. None of them is evidence about the payload, so the caller
+    charges all of them to the queue's bounded fleet budget
+    (VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH).
+
+    There used to be a third element, `retryable`, false for a
+    ``_PERMANENT_CLONE_FAILURES`` marker ("dubious ownership", "not a git
+    repository", "does not exist", "No such file or directory") and for an
+    unavailable root. It made the caller refuse the item as NON-RETRYABLE,
+    which dead-letters it on its first delivery -- so a host whose isolation
+    deployment was incomplete killed every read-only item it claimed
+    outright, having never run anything, while the mutating path refunded
+    the identical `principal_workspace_root()` failure twenty lines below as
+    `no_fault`. "Permanent" was only ever permanent ON THIS HOST: the queue
+    is fleet-wide, the refund leaves the item `ready`, and a sibling lane
+    with a complete deployment claims it next -- the same conclusion
+    `validate_repository`'s refusal in `_run_agent` already draws for a
+    repository this host cannot see. The distinction is therefore gone
+    rather than re-mapped: it had no consequence left to carry, and git's
+    own message travels in the reason, which says why a lane refused far
+    more precisely than a derived flag did.
     """
     try:
         root = agent_runner.principal_workspace_root()
     except (OSError, agent_runner.RunnerError) as exc:
-        return None, f"isolated workspace root is unavailable: {exc}", False
+        return None, f"isolated workspace root is unavailable: {exc}"
     if not repository.is_dir():
-        return None, f"read-only isolated checkout source is absent: {repository}", False
+        return None, f"read-only isolated checkout source is absent: {repository}"
     source_head = agent_runner._run_git(["rev-parse", "HEAD"], repository)
     if source_head is None or source_head.returncode != 0 or not source_head.stdout.strip():
         detail = source_head.stderr.strip() if source_head is not None else "git unavailable"
-        permanent = any(marker in detail for marker in _PERMANENT_CLONE_FAILURES)
-        return None, f"read-only isolated checkout source is unreadable: {detail[-300:]}", not permanent
+        return None, f"read-only isolated checkout source is unreadable: {detail[-300:]}"
     sha = source_head.stdout.strip()
     if pin_sha is not None:
         present = agent_runner._run_git(["cat-file", "-e", f"{pin_sha}^{{commit}}"], repository)
@@ -257,7 +281,6 @@ def _read_only_isolated_checkout(
                 None,
                 f"review_head {pin_sha} is not in the bound clone yet "
                 "(the lane cannot fetch; the source mirror catches up)",
-                True,
             )
         sha = pin_sha
     target = root / f"ro-{repository.name}-{uuid.uuid4().hex[:12]}"
@@ -271,12 +294,7 @@ def _read_only_isolated_checkout(
         if result is None or result.returncode != 0:
             detail = result.stderr.strip() if result is not None else "git unavailable"
             _remove_read_only_isolated_checkout(target)
-            permanent = any(marker in detail for marker in _PERMANENT_CLONE_FAILURES)
-            return (
-                None,
-                f"read-only isolated checkout {argv[0]} failed: {detail[-300:]}",
-                not permanent,
-            )
+            return None, f"read-only isolated checkout {argv[0]} failed: {detail[-300:]}"
     at = agent_runner._run_git(["rev-parse", "HEAD"], target)
     attached = agent_runner._run_git(["symbolic-ref", "--quiet", "HEAD"], target)
     if (
@@ -291,9 +309,8 @@ def _read_only_isolated_checkout(
             None,
             f"read-only isolated checkout verification failed: HEAD is {observed}"
             f" (expected detached {sha})",
-            True,
         )
-    return target, None, False
+    return target, None
 
 
 def _remove_read_only_isolated_checkout(target: Path) -> None:
@@ -621,6 +638,7 @@ def _run_agent(
                     ),
                     retryable=False,
                 )
+            remove_checkout: Callable[[Path], None]
             if agent_runner.principal_isolation_required():
                 # Under isolation the pinned checkout is the same detached
                 # clone a plain read-only run gets, detached at the exact PR
@@ -628,36 +646,36 @@ def _run_agent(
                 # write into the read-only bound clone and a fetch has no
                 # credential (VOYN-W0-AICC-READ-ONLY-RUNS-NEED-AN-ISOLATED-
                 # WORKSPACE-REM-REM).
-                checkout, failure, retryable = _read_only_isolated_checkout(
+                checkout, failure = _read_only_isolated_checkout(
                     repository, pin_sha=request.review_head_sha
                 )
-                if checkout is None:
-                    # The workspace is what the fleet owes the run; failing
-                    # to provide one is `no_fault` whenever it is retryable
-                    # at all (a permanent source defect keeps the ordinary
-                    # budget, which is what `retryable=False` already says).
-                    return HandlerOutcome(
-                        ok=False,
-                        reason=failure or "?",
-                        retryable=retryable,
-                        no_fault=retryable,
-                    )
-                stack.callback(_remove_read_only_isolated_checkout, checkout)
-                run_repository = checkout
+                remove_checkout = _remove_read_only_isolated_checkout
             else:
                 checkout, failure = _review_head_checkout(
                     repository,
                     request.review_head_pr_number or "",
                     request.review_head_sha,
                 )
+                remove_checkout = partial(_remove_review_head_checkout, repository)
             if checkout is None:
-                # Fetch/worktree trouble is repository or network state a
-                # later delivery (or another host) can genuinely cure --
-                # `no_fault` for the same reason as the isolated clone above.
+                # ONE refusal for both helpers, because they refuse the same
+                # thing: a fetch that could not reach the head, a clone the
+                # isolation deployment could not provide, git refusing the
+                # source's ownership -- repository, network or host state a
+                # later delivery (or another lane) can genuinely cure, and
+                # never evidence about the payload. So `no_fault`: refund the
+                # attempt, spend the queue's own bounded fleet budget.
+                #
+                # The isolated branch used to take a separate exit here for
+                # the subset `_read_only_isolated_checkout` called permanent,
+                # and that exit was NON-retryable -- an immediate dead letter
+                # on the item's first delivery, for a host whose principal
+                # workspace root the mutating path below refunds as
+                # `no_fault` (VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH).
                 return HandlerOutcome(
                     ok=False, reason=failure or "?", retryable=True, no_fault=True
                 )
-            stack.callback(_remove_review_head_checkout, repository, checkout)
+            stack.callback(remove_checkout, checkout)
             run_repository = checkout
         if (
             task_type not in agent_runner.MUTATING_TASK_TYPES
@@ -668,13 +686,15 @@ def _run_agent(
             # read-only run under isolation gets its own detached clone
             # inside the principal root -- see the helper for why the
             # shared clone cannot be handed to the launcher.
-            checkout, failure, retryable = _read_only_isolated_checkout(repository)
+            checkout, failure = _read_only_isolated_checkout(repository)
             if checkout is None:
+                # `no_fault` for every reason the helper can give: each one
+                # is this host's filesystem or git state, and the identical
+                # `principal_workspace_root()` failure is already refunded a
+                # few lines below for a MUTATING task
+                # (VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH).
                 return HandlerOutcome(
-                    ok=False,
-                    reason=failure or "?",
-                    retryable=retryable,
-                    no_fault=retryable,
+                    ok=False, reason=failure or "?", retryable=True, no_fault=True
                 )
             stack.callback(_remove_read_only_isolated_checkout, checkout)
             run_repository = checkout

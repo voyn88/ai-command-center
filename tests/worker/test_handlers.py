@@ -1843,7 +1843,7 @@ def test_read_only_run_under_isolation_uses_a_detached_clone_in_the_principal_ro
 
     def fake_checkout(repository):
         asked.append(repository)
-        return clone, None, False
+        return clone, None
 
     monkeypatch.setattr(handlers_module, "_read_only_isolated_checkout", fake_checkout)
     monkeypatch.setattr(
@@ -1872,29 +1872,38 @@ def test_read_only_run_outside_isolation_keeps_the_shared_clone(handler, monkeyp
     assert runs[0]["repository_path"] == tmp_path
 
 
-def test_read_only_isolated_checkout_failure_is_retryable(handler, monkeypatch) -> None:
+def test_read_only_isolated_checkout_failure_is_a_no_fault_refusal(handler, monkeypatch) -> None:
+    """Every reason the helper can give is this host's filesystem or git
+    state, so all of them refund the attempt and spend the queue's bounded
+    fleet budget instead of the item's `max_attempts`.
+
+    The second case used to assert the opposite -- "a permanent cause must
+    not spin the cascade", `retryable=False`. That kept the cascade intact
+    by killing the item instead: a non-retryable refusal dead-letters on the
+    first delivery (VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH). `no_fault`
+    is the exit that actually honours the original intent -- it does not
+    spend the cascade budget at all."""
     from command_center import agent_runner
     from command_center.worker import handlers as handlers_module
 
     run_agent, runs = handler
     monkeypatch.setattr(agent_runner, "principal_isolation_required", lambda: True)
     monkeypatch.setattr(agent_runner, "principal_executor_preflight", lambda executor: (True, "ok"))
-    monkeypatch.setattr(
-        handlers_module,
-        "_read_only_isolated_checkout",
-        lambda repository: (None, "read-only isolated checkout clone failed: boom", True),
-    )
-    outcome = run_agent(_payload(task_type="review", untrusted=True), _event())
-    assert not outcome.ok and outcome.retryable
-    assert "read-only isolated checkout clone failed" in outcome.reason
-    assert runs == []
-    monkeypatch.setattr(
-        handlers_module,
-        "_read_only_isolated_checkout",
-        lambda repository: (None, "isolated workspace root is unavailable: gone", False),
-    )
-    outcome = run_agent(_payload(task_type="review", untrusted=True), _event())
-    assert not outcome.ok and not outcome.retryable, "a permanent cause must not spin the cascade"
+    for failure in (
+        "read-only isolated checkout clone failed: boom",
+        "isolated workspace root is unavailable: gone",
+        "read-only isolated checkout source is unreadable: detected dubious ownership",
+    ):
+        monkeypatch.setattr(
+            handlers_module,
+            "_read_only_isolated_checkout",
+            lambda repository, _failure=failure: (None, _failure),
+        )
+        outcome = run_agent(_payload(task_type="review", untrusted=True), _event())
+        assert not outcome.ok and outcome.retryable, failure
+        assert outcome.no_fault is True, failure
+        assert failure in outcome.reason
+        assert runs == []
 
 
 def _git_repo_with_one_commit(path: Path) -> str:
@@ -1924,8 +1933,8 @@ def test_read_only_isolated_checkout_is_a_detached_clone_without_origin_at_the_s
     root = tmp_path / "root"
     root.mkdir()
     monkeypatch.setattr(agent_runner, "principal_workspace_root", lambda: root)
-    target, failure, retryable = handlers_module._read_only_isolated_checkout(source)
-    assert (failure, retryable) == (None, False) and target is not None
+    target, failure = handlers_module._read_only_isolated_checkout(source)
+    assert failure is None and target is not None
     assert target.parent == root and target.name.startswith("ro-source-")
     assert _git("-C", str(target), "rev-parse", "HEAD").stdout.strip() == head
     assert _git("-C", str(target), "symbolic-ref", "-q", "HEAD").returncode != 0, "HEAD must be detached"
@@ -1945,18 +1954,18 @@ def test_read_only_isolated_checkout_works_from_a_source_on_a_detached_head(tmp_
     root = tmp_path / "root"
     root.mkdir()
     monkeypatch.setattr(agent_runner, "principal_workspace_root", lambda: root)
-    target, failure, _ = handlers_module._read_only_isolated_checkout(source)
+    target, failure = handlers_module._read_only_isolated_checkout(source)
     assert failure is None and target is not None
     assert _git("-C", str(target), "rev-parse", "HEAD").stdout.strip() == head
     handlers_module._remove_read_only_isolated_checkout(target)
 
 
-def test_read_only_isolated_checkout_source_git_refuses_is_permanent_and_leaves_nothing(
+def test_read_only_isolated_checkout_says_why_it_refused_and_leaves_nothing(
     tmp_path, monkeypatch
 ) -> None:
     """The real failure branches, not a monkeypatched helper: a source git
-    cannot read is a permanent condition (no retry loop) and no clone is
-    left behind under the root."""
+    cannot read, and an unavailable principal root, each refuse with a
+    reason and leave no clone behind under the root."""
     from command_center import agent_runner
     from command_center.worker import handlers as handlers_module
 
@@ -1964,15 +1973,15 @@ def test_read_only_isolated_checkout_source_git_refuses_is_permanent_and_leaves_
     root.mkdir()
     monkeypatch.setattr(agent_runner, "principal_workspace_root", lambda: root)
     missing = tmp_path / "missing-source"
-    target, failure, retryable = handlers_module._read_only_isolated_checkout(missing)
-    assert target is None and failure and retryable is False
+    target, failure = handlers_module._read_only_isolated_checkout(missing)
+    assert target is None and failure
     assert list(root.iterdir()) == []
     monkeypatch.setattr(
         agent_runner, "principal_workspace_root",
         lambda: (_ for _ in ()).throw(agent_runner.RunnerError("no root")),
     )
-    target, failure, retryable = handlers_module._read_only_isolated_checkout(tmp_path)
-    assert target is None and "root is unavailable" in failure and retryable is False
+    target, failure = handlers_module._read_only_isolated_checkout(tmp_path)
+    assert target is None and "root is unavailable" in failure
 
 
 def test_remove_read_only_isolated_checkout_reports_a_leak_instead_of_hiding_it(
@@ -2016,7 +2025,7 @@ def test_review_head_pin_under_isolation_runs_in_a_clone_detached_at_the_pin(
     removed: list[Path] = []
     monkeypatch.setattr(
         handlers_module, "_read_only_isolated_checkout",
-        lambda repository, pin_sha=None: (asked.append((repository, pin_sha)), (clone, None, False))[1],
+        lambda repository, pin_sha=None: (asked.append((repository, pin_sha)), (clone, None))[1],
     )
     monkeypatch.setattr(
         handlers_module, "_remove_read_only_isolated_checkout", lambda target: removed.append(target)
@@ -2047,14 +2056,14 @@ def test_read_only_isolated_checkout_pins_to_the_requested_sha_or_waits_for_it(t
     root = tmp_path / "root"
     root.mkdir()
     monkeypatch.setattr(agent_runner, "principal_workspace_root", lambda: root)
-    target, failure, _ = handlers_module._read_only_isolated_checkout(source, pin_sha=first)
+    target, failure = handlers_module._read_only_isolated_checkout(source, pin_sha=first)
     assert failure is None and target is not None
     assert _git("-C", str(target), "rev-parse", "HEAD").stdout.strip() == first
     assert _git("-C", str(target), "symbolic-ref", "-q", "HEAD").returncode != 0
     handlers_module._remove_read_only_isolated_checkout(target)
     missing = "c" * 40
-    target, failure, retryable = handlers_module._read_only_isolated_checkout(source, pin_sha=missing)
-    assert target is None and retryable is True and "not in the bound clone yet" in failure
+    target, failure = handlers_module._read_only_isolated_checkout(source, pin_sha=missing)
+    assert target is None and "not in the bound clone yet" in failure
     assert list(root.iterdir()) == []
 
 
@@ -2276,6 +2285,61 @@ def test_a_run_that_executed_and_failed_is_never_no_fault(handler, monkeypatch) 
     published = run_agent(_payload(task_type="implementation"), _event(), 1)
     assert not published.ok and published.retryable
     assert published.no_fault is False
+
+
+def test_an_incomplete_isolation_deployment_is_no_fault_for_read_only_and_mutating_alike(
+    handler, monkeypatch
+) -> None:
+    """The finding this commit closes, pinned as the SYMMETRY it broke.
+
+    `principal_workspace_root()` reads the one root-owned config file the
+    privileged broker shares with the lane, and it raises when that
+    deployment is incomplete -- the file absent or no longer immutable
+    root-owned, the root itself gone after a reboot. One host fact, reached
+    by both dispatch paths within twenty lines of each other, and they
+    disagreed: the MUTATING path returned `no_fault` (refund the attempt,
+    spend the queue's bounded fleet budget), while the READ-ONLY path took
+    `_read_only_isolated_checkout`'s `permanent` exit and returned
+    `retryable=False` -- which is not a budget but an immediate dead letter,
+    on the item's FIRST delivery, having run nothing.
+
+    Reviews are the read-only half of the fleet's work and are dispatched
+    continuously, so one host in that state dead-lettered every item it
+    claimed as fast as it could claim them, and control-01:queue measured
+    the arrivals as `dead_letter_growth`. "Permanent" was permanent on THAT
+    host; the queue is fleet-wide, and a refunded item stays `ready` for a
+    lane whose deployment is complete.
+
+    Neither monkeypatches the helper: the real `_read_only_isolated_checkout`
+    runs and fails on the real raise."""
+    run_agent, runs = handler
+    monkeypatch.setattr(agent_runner, "principal_isolation_required", lambda: True)
+    monkeypatch.setattr(
+        agent_runner, "principal_executor_preflight", lambda executor: (True, "ok")
+    )
+    monkeypatch.setattr(
+        agent_runner,
+        "principal_workspace_root",
+        lambda: (_ for _ in ()).throw(
+            agent_runner.RunnerError("principal workspace-root config is not immutable root-owned")
+        ),
+    )
+
+    read_only = run_agent(_payload(task_type="review"), _event(), 1)
+    assert not read_only.ok
+    assert read_only.retryable is True, "an immediate dead letter for a host fact"
+    assert read_only.no_fault is True
+    assert "root is unavailable" in read_only.reason
+
+    mutating = run_agent(_payload(task_type="implementation"), _event(), 1)
+    assert not mutating.ok
+    assert (mutating.retryable, mutating.no_fault) == (
+        read_only.retryable,
+        read_only.no_fault,
+    ), "one host fact, one verdict"
+    assert "isolated workspace root unavailable" in mutating.reason
+
+    assert runs == [], "nothing ran, so nothing may be charged to the item"
 
 
 def test_a_payload_defect_is_neither_retryable_nor_no_fault(handler) -> None:

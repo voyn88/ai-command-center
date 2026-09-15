@@ -8,6 +8,37 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Fixed — an incomplete isolation deployment no longer dead-letters every read-only run on its first delivery (`VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH`)
+- `command_center/worker/handlers.py`: `_read_only_isolated_checkout` used to
+  classify a subset of its failures as *permanent* — a missing/not-root-owned
+  principal workspace root, git refusing the source clone's ownership, a bound
+  clone that is not there — and the caller turned that into
+  `retryable=False`, which is not a budget but an immediate dead letter on the
+  item's first delivery. Every failure the helper can return is in fact a fact
+  about THIS HOST, and the mutating dispatch path already refunded the
+  identical `principal_workspace_root()` failure as `no_fault` twenty lines
+  away. So a worker halfway through its isolation rollout dead-lettered every
+  read-only item it claimed, having run nothing — the reviews are the
+  continuously-dispatched half of the fleet's work — and `control-01:queue`
+  measured the arrivals as `dead_letter_growth`. The helper now returns
+  `(path, reason)` with no permanence flag (it had no consequence left to
+  carry: "permanent" meant permanent on that host, and the queue is
+  fleet-wide), both dispatch paths refuse with `retryable=True,
+  no_fault=True`, and the pinned checkout's refusal is now the same single
+  call site as the non-isolated one it already shared everything else with.
+  A genuinely fleet-wide breakage still terminates in the DLQ, bounded by the
+  same `lease_wait_count` budget (20 waits, ~1h of capped backoff) as every
+  other capacity outage, instead of instantly.
+- `tests/worker/test_handlers.py`:
+  `test_an_incomplete_isolation_deployment_is_no_fault_for_read_only_and_mutating_alike`
+  pins the broken symmetry itself — one raise from the real
+  `principal_workspace_root()`, the real helper, and the read-only and
+  mutating paths made to agree on the verdict. The test that asserted the old
+  behaviour ("a permanent cause must not spin the cascade") now asserts the
+  exit that actually honours that intent: `no_fault` does not spend the
+  cascade budget at all, while `retryable=False` skipped it by killing the
+  item.
+
 ### Fixed — a lost worker no longer dead-letters the work it was holding (`VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH`)
 - `command_center/db/sql/0027_queue_reap_lease_lapse_refunds.up.sql`:
   `queue_reap()` refunds the attempt the lapsed delivery spent and counts the
