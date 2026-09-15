@@ -8,6 +8,63 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Fixed — a comment-only edit to migration 0022 was blocking every queue fix from reaching control-01 (`VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH`)
+- `command_center/db/sql/0022_queue_fail_lease_wait.up.sql`: restored
+  byte-for-byte to what shipped. The file's header cites itself as `0020` —
+  a real typo, and one that must stay. `schema_migration` records the
+  SHA-256 of each up-file as it was applied, and
+  `MigrationRunner.upgrade` verifies **every** recorded checksum before it
+  applies **any** pending migration, so correcting that character does not
+  correct 0022: on every database that already applied it — control-01's
+  among them — `python -m command_center.db upgrade` raises
+  `MigrationChecksumMismatch` and applies nothing, which means migrations
+  0024–0027 (the rest of this very fix) never land, and `self-deploy
+  --migrate` then rolls the checkout back, so the branch's Python-side
+  changes do not take effect either. Verified here by computing both
+  digests: recorded `633f0e94…`, file `509bdb47…`. The branch's own test
+  suite was green throughout — the authority that refuses lives in a
+  migrated database, and nothing in CI has one.
+- `command_center/db/sql/released.lock.json` (new) +
+  `migrations.verify_released_checksums()` / `released_lock()` /
+  `render_released_lock()`: the same verdict, reachable without a database.
+  `up` is literally `Migration.checksum` — the value the ledger holds — so
+  this is not a second authority, it is the ledger's authority moved to
+  where the edit is made. A new migration must be recorded before it ships
+  (otherwise the guard would only ever cover what it was created with), and
+  a recorded one cannot be deleted, because a database that applied it still
+  names it. It cannot stop someone who edits a file and re-locks it in the
+  same commit, and is not meant to: the failure mode was tidying a comment
+  without knowing the ledger existed, and a diff reading
+  `-"633f0e94…" +"509bdb47…"` cannot be misread that way. Digests are written
+  `sha256:<hex>`: the prefix names the algorithm, and it also keeps
+  detect-secrets from reading 54 bare hex runs as credentials — unprefixed,
+  every future migration would fail the security gate's "baseline changed"
+  check until someone re-ran the scanner.
+- `python -m command_center.db migration-lock [--write]`: the check, and the
+  regeneration the note in the lock points at. Handled before `load_config()`
+  — it needs no DSN, so it answers on a laptop rather than only on the host
+  that is already broken. A missing or malformed lock is itself reported as a
+  `MigrationError`, so the command whose purpose is to replace a traceback
+  with a verdict has no path of its own that prints one — and since deleting
+  the file that is refusing is the obvious wrong move, that message says why
+  `--write` is not the repair (it would re-record the very edit that is
+  blocking the deploy).
+- `command_center/db/cli.py`: `upgrade` reports a `MigrationError` as
+  `migration refused: <verdict>` and exits 2, instead of letting it raise.
+  `command_center/deployment/self_deploy.py`: the failed-migration step
+  reports the **last** non-empty line of the subprocess output
+  (`_verdict_line`), not the first 130 characters. Together these are why
+  this stayed undiagnosed across every deploy tick: the report contained
+  `Traceback (most recent call last): File "/usr/lib/python3.12/runpy.py"…`,
+  and an edited-since migration is precisely the failure that never clears
+  by itself, so every tick re-reported the same unreadable header.
+- Tests: `tests/db/test_migration_set.py` pins the whole set against the lock
+  (reintroducing the exact 0022 edit turns it red with both checksums in the
+  diff), plus the edited / unrecorded / deleted / regeneration-is-a-no-op
+  cases; `tests/db/test_cli_queue.py` pins the two CLI exits;
+  `tests/orchestrator/test_self_deploy.py` pins a real traceback reduced to
+  its verdict in the deploy report.
+
 ### Fixed — an incomplete isolation deployment no longer dead-letters every read-only run on its first delivery (`VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH`)
 - `command_center/worker/handlers.py`: `_read_only_isolated_checkout` used to
   classify a subset of its failures as *permanent* — a missing/not-root-owned

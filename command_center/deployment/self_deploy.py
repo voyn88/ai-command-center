@@ -112,6 +112,22 @@ def _systemctl(args: list[str], timeout: int) -> subprocess.CompletedProcess[str
     return _run_bounded(["sudo", "-n", "systemctl", *args], timeout)
 
 
+def _verdict_line(output: str, limit: int = 130) -> str:
+    """The LAST non-empty line of a failed step's output, not the first.
+
+    A bounded report field has to choose which end of the output to keep, and
+    for a Python subprocess the answer is never the first: the head of a
+    traceback is `Traceback (most recent call last):` and an interpreter path,
+    while the verdict -- the exception's own message -- is the last line. The
+    migration step reported the head, so the operator saw a truncated runpy
+    frame instead of "migration 0022 was modified after it was applied", and
+    every queue fix behind it stayed unapplied across every tick
+    (VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH).
+    """
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    return lines[-1][:limit] if lines else ""
+
+
 def _run_migrations(repo_path: str, timeout: int) -> subprocess.CompletedProcess[str]:
     # cwd=repo_path is load-bearing (review of f794b3e): the runtime package
     # is imported from the checkout, not installed into the venv -- without
@@ -281,7 +297,7 @@ def self_deploy_once(
             # implying a pristine database (review of 8d1f967, medium).
             return rollback(
                 "migrations_failed_database_may_hold_partial_migrations: "
-                f"{(migrated.stderr or migrated.stdout).strip()[:130]}",
+                f"{_verdict_line(migrated.stderr or migrated.stdout)}",
                 services_touched=False,
             )
         # `db upgrade` runs the pending migrations AND unconditionally

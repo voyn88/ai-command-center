@@ -118,3 +118,70 @@ def test_backlog_review_enqueues_ahead_of_implementation_dispatch() -> None:
         "priority": 100,
     }]
     assert calls[0]["priority"] > 0
+
+
+def test_migration_lock_checks_without_a_database(capsys) -> None:
+    """The one migration command that runs where the edit is made. It is
+    deliberately handled before `load_config()`: a laptop with no DSN must
+    still get the verdict, or the guard is only reachable from the host that
+    is already broken (VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH)."""
+    from command_center.db import migrations
+    from command_center.db.cli import main
+
+    assert main(["migration-lock"]) == 0
+    assert f"{len(migrations.discover())} migrations unchanged" in capsys.readouterr().out
+
+
+def test_migration_lock_reports_an_edited_file_as_a_refusal(
+    capsys, monkeypatch, tmp_path
+) -> None:
+    """Exit 2 and a message, never a traceback: this command exists to be
+    read."""
+    from command_center.db import migrations
+    from command_center.db.cli import main
+
+    def refuse(sql_dir=None):
+        raise migrations.MigrationError("0022_queue_fail_lease_wait.up.sql changed")
+
+    monkeypatch.setattr(migrations, "verify_released_checksums", refuse)
+    assert main(["migration-lock"]) == 2
+    assert "migration lock: 0022_queue_fail_lease_wait.up.sql changed" in (
+        capsys.readouterr().err
+    )
+
+
+def test_upgrade_reports_a_refusing_ledger_as_a_message(capsys, monkeypatch) -> None:
+    """`self-deploy --migrate` runs this as a subprocess and puts a bounded
+    slice of its stderr in the deploy report. An uncaught `MigrationError`
+    made that slice a traceback header, so the one failure that never clears
+    by itself -- an already-applied file edited since -- was also the one the
+    operator could not read (VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH)."""
+    from contextlib import nullcontext
+
+    from command_center.db import cli, migrations
+
+    monkeypatch.setattr(cli, "load_config", lambda: _StubConfig())
+    monkeypatch.setattr(cli.pool, "open_pool", lambda config: None)
+    monkeypatch.setattr(cli.pool, "close_pool", lambda: None)
+    monkeypatch.setattr(cli.pool, "connection", lambda: nullcontext(object()))
+
+    def refuse(conn, **kwargs):
+        raise migrations.MigrationError(
+            "migration 0022_queue_fail_lease_wait was modified after it was applied"
+        )
+
+    monkeypatch.setattr(cli.migrations, "upgrade", refuse)
+
+    assert cli.main(["upgrade"]) == 2
+    captured = capsys.readouterr()
+    assert captured.err.splitlines() == [
+        "migration refused: migration 0022_queue_fail_lease_wait was modified "
+        "after it was applied"
+    ]
+    # The grant re-assertion must not run behind a refused migration.
+    assert "table grants" not in captured.out
+
+
+class _StubConfig:
+    def redacted(self) -> str:
+        return "postgresql://stub"

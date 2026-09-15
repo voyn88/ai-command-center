@@ -414,3 +414,40 @@ def test_failed_dispatch_smoke_after_migration_rolls_back_before_restart(pair, c
     assert _git(clone, "rev-parse", "HEAD") == first
     assert "database_upgrade_ran_not_rolled_back" in report.steps
     assert "dispatch_smoke_passed" not in report.steps
+
+
+def test_a_failed_migration_reports_its_verdict_not_the_traceback_header(
+    pair, calls, tmp_path, monkeypatch
+):
+    """VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH: the report field is
+    bounded, so it has to choose an end of the output to keep -- and it kept
+    the head, which for a Python subprocess is `Traceback (most recent call
+    last):` and an interpreter path. The one migration failure that can
+    persist across every tick (an edited already-applied file: the ledger
+    refuses forever, not transiently) is therefore the one the operator could
+    not read, and four queue migrations sat unapplied behind it while
+    control-01 went on measuring dead_letter_growth."""
+    origin, clone, first = pair
+    _commit(origin, "advance with migration")
+    verdict = (
+        "aios_db.errors.MigrationChecksumMismatch: migration "
+        "0022_queue_fail_lease_wait was modified after it was applied"
+    )
+    monkeypatch.setattr(
+        self_deploy, "_run_migrations",
+        lambda repo_path, timeout: subprocess.CompletedProcess(
+            [], 1, "",
+            "Traceback (most recent call last):\n"
+            '  File "/usr/lib/python3.12/runpy.py", line 198, in '
+            "_run_module_as_main\n"
+            "    return _run_code(code, main_globals, None,\n"
+            f"{verdict}\n",
+        ),
+    )
+    cfg = _cfg(tmp_path, services=("voyn-aicc-worker.service",), migrate=True)
+    report = self_deploy_once(str(clone), cfg)
+
+    assert report.outcome == "rolled_back"
+    assert "was modified after it was applied" in report.detail
+    assert "Traceback" not in report.detail
+    assert _git(clone, "rev-parse", "HEAD") == first
