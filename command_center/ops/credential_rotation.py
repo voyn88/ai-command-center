@@ -135,10 +135,28 @@ class Systemd(Protocol):
     def restart(self, unit: str, timeout: float) -> None: ...
 
 
+@dataclass(frozen=True, slots=True)
+class CredentialExpiry:
+    """Server-authoritative lifetime of the credential the rotator holds.
+
+    ``remaining`` is seconds until the ledger stops accepting WORK on it.
+    ``renewable`` is seconds until ``enroll_rotate_self`` stops accepting it
+    for renewal: the ledger expiry plus the self-renewal grace for a worker
+    host (0029). Both are measured against the database clock. An expired
+    credential inside the grace reports a negative ``remaining`` and a
+    positive ``renewable`` -- exactly the state a rotator must recover from on
+    its own (live 2026-09-15: it refused itself for five hours instead).
+    """
+
+    expires: datetime
+    remaining: float
+    renewable: float
+
+
 class CredentialAuthority(Protocol):
     def probe(self, config: PostgresConfig) -> None: ...
 
-    def current_expiry(self, config: PostgresConfig) -> tuple[datetime, float]: ...
+    def current_expiry(self, config: PostgresConfig) -> CredentialExpiry: ...
 
     def rotate(
         self, config: PostgresConfig, new_secret: str, verifier: str
@@ -721,26 +739,36 @@ class PsycopgCredentialAuthority:
         if row != (1,):
             raise RotationError("credential auth probe returned an unexpected result")
 
-    def current_expiry(self, config: PostgresConfig) -> tuple[datetime, float]:
+    def current_expiry(self, config: PostgresConfig) -> CredentialExpiry:
+        # Asked "for renewal": an expired credential inside the self-renewal
+        # grace is still answered (0029), with the instant renewal stops being
+        # possible. The one-argument form would refuse it -- which is exactly
+        # how the rotator locked itself out live 2026-09-15.
         with self._connect(config) as connection, connection.cursor() as cursor:
             cursor.execute(
-                "SELECT * FROM identity_current_credential(%s)", (config.password,)
+                "SELECT * FROM identity_current_credential(%s, true)",
+                (config.password,),
             )
             row = cursor.fetchone()
-        if not row or len(row) != 3:
+        if not row or len(row) != 4:
             raise RotationError(
                 "credential expiry authority returned an invalid result"
             )
-        expiry, server_now, refusal = row
+        expiry, server_now, refusal, renewable_until = row
         if refusal is not None:
             raise RotationError(f"credential expiry refused: {refusal}")
-        if not isinstance(expiry, datetime) or not isinstance(server_now, datetime):
+        stamps = (expiry, server_now, renewable_until)
+        if not all(isinstance(stamp, datetime) for stamp in stamps):
             raise RotationError(
                 "credential expiry authority returned invalid timestamps"
             )
-        if expiry.tzinfo is None or server_now.tzinfo is None:
+        if any(stamp.tzinfo is None for stamp in stamps):
             raise RotationError("credential expiry authority returned naive timestamps")
-        return expiry, (expiry - server_now).total_seconds()
+        return CredentialExpiry(
+            expiry,
+            (expiry - server_now).total_seconds(),
+            (renewable_until - server_now).total_seconds(),
+        )
 
     def rotate(self, config: PostgresConfig, new_secret: str, verifier: str) -> object:
         with self._connect(config) as connection, connection.cursor() as cursor:
@@ -879,19 +907,39 @@ class RotationController:
         return authority_timeout_seconds(config)
 
     def _load_credential_deadline(
-        self, config: PostgresConfig, description: str
+        self, config: PostgresConfig, description: str, *, renewal: bool
     ) -> tuple[datetime, float]:
-        expiry, remaining = self.authority.current_expiry(config)
-        self._set_credential_deadline(expiry, remaining, description)
-        return expiry, remaining
+        proof = self.authority.current_expiry(config)
+        self._set_credential_deadline(proof, description, renewal=renewal)
+        return proof.expires, proof.remaining
 
     def _set_credential_deadline(
-        self, expiry: datetime, remaining: float, description: str
+        self, proof: CredentialExpiry, description: str, *, renewal: bool
     ) -> None:
-        if expiry.tzinfo is None or not math.isfinite(remaining):
+        """Bound every later operation by the credential's usable lifetime.
+
+        ``renewal=True`` is the pre-mutation phase: the only thing the current
+        credential must still be able to do is call ``enroll_rotate_self``, so
+        the bound is the RENEWAL deadline -- which, for an expired credential
+        inside the grace, is the only positive one. ``renewal=False`` is
+        every phase in which lanes must be able to WORK on the credential
+        (activation on a new one, resume on a recovered one): the bound is
+        the ledger expiry, exactly as before 0029.
+        """
+        expiry, remaining, renewable = proof.expires, proof.remaining, proof.renewable
+        if (
+            expiry.tzinfo is None
+            or not math.isfinite(remaining)
+            or not math.isfinite(renewable)
+        ):
             raise RotationError(f"{description} returned an invalid expiry")
-        usable = remaining - CREDENTIAL_SAFETY_MARGIN_SECONDS
+        bound = renewable if renewal else remaining
+        usable = bound - CREDENTIAL_SAFETY_MARGIN_SECONDS
         if usable <= 0:
+            if renewal:
+                raise RotationError(
+                    f"{description} can no longer be renewed inside the safety margin"
+                )
             raise RotationError(f"{description} expires inside the safety margin")
         observed_monotonic = self.monotonic()
         self._credential_deadline = observed_monotonic + usable
@@ -902,6 +950,8 @@ class RotationController:
             description=description,
             expires=expiry.isoformat(),
             remaining=remaining,
+            renewable=renewable,
+            bound="renewal" if renewal else "work",
         )
 
     def _refresh_rotatable_units(self) -> tuple[str, ...]:
@@ -1448,10 +1498,10 @@ class RotationController:
         # deciding that neither credential is usable.
         self._wait_tunnel()
         self._refresh_rotatable_units()
-        working: list[tuple[Path, PostgresConfig, datetime, float]] = []
+        working: list[tuple[Path, PostgresConfig, CredentialExpiry]] = []
         for path, config in self._recovery_candidates(phase):
             try:
-                expiry, remaining = self.authority.current_expiry(config)
+                proof = self.authority.current_expiry(config)
             except Exception as error:  # noqa: BLE001 - ambiguity must be audited
                 self.audit.emit(
                     "rotation_recovery_candidate_refused",
@@ -1461,13 +1511,13 @@ class RotationController:
                     error=str(error),
                 )
                 continue
-            working.append((path, config, expiry, remaining))
+            working.append((path, config, proof))
         if len(working) != 1:
             raise RotationError(
                 "interrupted rotation has no unique working credential candidate"
             )
 
-        source, config, expiry, remaining = working[0]
+        source, config, proof = working[0]
         if source != self.config.env_file:
             PreparedCredentialFile(
                 target=self.config.env_file, temporary=source
@@ -1483,7 +1533,7 @@ class RotationController:
                 pass
             self.audit.emit("rotation_recovery_stale_credential_removed")
         self._set_credential_deadline(
-            expiry, remaining, "interrupted rotation credential"
+            proof, "interrupted rotation credential", renewal=False
         )
         self._restart_fallback_allowed = False
         failures = self._resume_lanes(config)
@@ -1540,7 +1590,7 @@ class RotationController:
         )
         authority_timeout = self._authority_timeout(current)
         _, current_remaining = self._load_credential_deadline(
-            current, "current credential"
+            current, "current credential", renewal=True
         )
         minimum_rotation_threshold = (
             self._retry_lifetime_budget(current) + CREDENTIAL_SAFETY_MARGIN_SECONDS
@@ -1591,7 +1641,7 @@ class RotationController:
         # Worker readiness may legitimately consume most of its bounded wait.
         # Refresh the server-clock proof immediately before the mutation.
         _, current_remaining = self._load_credential_deadline(
-            current, "pre-mutation current credential"
+            current, "pre-mutation current credential", renewal=True
         )
         self._require_current_attempt_budget(
             current,
@@ -1678,7 +1728,7 @@ class RotationController:
                     "committed credential file does not contain new secret"
                 )
             expiry, remaining = self._load_credential_deadline(
-                new_config, "new credential"
+                new_config, "new credential", renewal=False
             )
             if remaining < safe_post_rotation:
                 # Deliberately NOT a resume path (reviewed on 17ca910 and
