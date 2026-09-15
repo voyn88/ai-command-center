@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from command_center import agent_runner, workspace_provisioning
+from command_center import agent_runner, authority_preflight, workspace_provisioning
 from command_center.orchestrator.publish import PublishResult
 from command_center.worker.handlers import build_handlers
 from command_center.worker.payloads import PayloadError, parse_agent_run
@@ -2656,3 +2656,194 @@ def test_read_only_isolated_checkout_packs_refs_after_a_wholesale_pr_fetch(
     loose_dirs = [p for p in loose.iterdir() if p.is_dir()] if loose.exists() else []
     assert loose_dirs == [], loose_dirs
     handlers_module._remove_read_only_isolated_checkout(target)
+
+
+# ---------------------------------------------------------------------------
+# VOYN-W0-AICC-PRIVILEGED-TASK-ROUTED-TO-UNPRIVILEGED-EXECUTOR
+#
+# 2026-08-30, restored queue: 8 of 13 returns to the pool were
+# `cascade_exhausted: task_status_failed`, and at least one was an agent
+# honestly running `sudo /usr/bin/true` and `sudo -u postgres psql` in its
+# task clone, being told `a password is required`, and failing -- three
+# times, once per cascade link. The worker principal is unprivileged BY
+# DESIGN (ADR-0010). These pin the gate that refuses such a dispatch before
+# a model is ever launched.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def unprivileged_worker(monkeypatch):
+    """The fleet's actual posture: the deployment declares no authority, so
+    the worker holds none."""
+    monkeypatch.delenv(authority_preflight.GRANT_ENV_VAR, raising=False)
+
+
+def test_a_declared_authority_the_worker_lacks_is_refused_with_zero_model_calls(
+    handler, unprivileged_worker
+) -> None:
+    """The whole point: the incident cost three model runs to discover a fact
+    that is decidable from data. It must now cost none."""
+    run_agent, runs = handler
+    outcome = run_agent(
+        _payload(required_authorities=["root", "postgres_role"]), _event(), 1
+    )
+    assert not outcome.ok
+    assert runs == [], "no model may be launched for an authority mismatch"
+    assert outcome.reason.startswith("authority_unavailable:")
+    assert "root" in outcome.reason and "postgres_role" in outcome.reason
+
+
+def test_an_authority_refusal_is_non_retryable(handler, unprivileged_worker) -> None:
+    """Redelivery cannot hand this principal a sudoers entry it is designed
+    never to have, so every further attempt reproduces the identical refusal
+    on the way to the same dead letter -- which is exactly the three-attempt
+    burn measured on the restored queue. Same reasoning `daemon._dispatch`
+    already applies to an unknown payload kind."""
+    run_agent, _ = handler
+    outcome = run_agent(_payload(required_authorities=["root"]), _event(), 1)
+    assert outcome.retryable is False
+    # Not an infra wait either: the substrate is healthy, this is a routing
+    # fact, and refunding the attempt would re-deliver it forever.
+    assert outcome.infra_wait is False and outcome.lease_wait is False
+
+
+def test_the_authority_gate_runs_before_any_other_work(
+    handler, unprivileged_worker, monkeypatch
+) -> None:
+    """Placed first on purpose: no repository validation, no executor
+    preflight, no worktree provisioning. Anything else running first would be
+    work spent on a dispatch that cannot succeed."""
+    run_agent, runs = handler
+
+    def must_not_run(*args, **kwargs):
+        raise AssertionError("validated the repository for a blocked dispatch")
+
+    monkeypatch.setattr(agent_runner, "validate_repository", must_not_run)
+    monkeypatch.setattr(agent_runner, "claude_cli_preflight", must_not_run)
+    outcome = run_agent(_payload(required_authorities=["root"]), _event(), 1)
+    assert not outcome.ok and runs == []
+
+
+def test_a_task_declaring_nothing_is_unchanged(handler, unprivileged_worker) -> None:
+    """Every task that existed before this gate declares nothing, probes
+    nothing and behaves byte-for-byte as it did."""
+    run_agent, runs = handler
+    outcome = run_agent(_payload(), _event(), 1)
+    assert outcome.ok and len(runs) == 1
+
+
+def test_a_held_authority_lets_the_dispatch_through(handler, monkeypatch) -> None:
+    """The gate blocks a MISMATCH, not a declaration: a worker that actually
+    holds what the task asked for runs it normally. This is the
+    route-to-an-executor-that-has-it half of the acceptance."""
+    run_agent, runs = handler
+    monkeypatch.setenv(
+        authority_preflight.GRANT_ENV_VAR, "external_credential"
+    )
+    outcome = run_agent(
+        _payload(required_authorities=["external_credential"]), _event(), 1
+    )
+    assert outcome.ok and len(runs) == 1
+
+
+def test_a_partially_held_grant_still_blocks(handler, monkeypatch) -> None:
+    run_agent, runs = handler
+    monkeypatch.setenv(
+        authority_preflight.GRANT_ENV_VAR, "external_credential"
+    )
+    outcome = run_agent(
+        _payload(required_authorities=["external_credential", "root"]),
+        _event(),
+        1,
+    )
+    assert not outcome.ok and runs == []
+    assert "root" in outcome.reason
+
+
+def test_a_malformed_authority_declaration_is_a_non_retryable_payload_defect() -> None:
+    """Never defaulted to "needs nothing": that would dispatch a privileged
+    task to an unprivileged executor while the author believed they had
+    constrained it -- the incident, with a false audit trail on top."""
+    for bad in (["kubernetes_admin"], "root", {"root": True}, [7]):
+        error = parse_agent_run(_payload(required_authorities=bad))
+        assert isinstance(error, PayloadError), bad
+        assert error.retryable is False, error.reason
+
+
+def test_the_declaration_is_canonicalized_onto_the_request() -> None:
+    request = parse_agent_run(
+        _payload(required_authorities=["postgres_role", "ROOT", "root"])
+    )
+    assert request.required_authorities == ("root", "postgres_role")
+
+
+def test_a_run_that_reports_an_authority_wall_surfaces_it_in_the_result(
+    handler, monkeypatch
+) -> None:
+    """The discovery half: an UNDECLARED requirement becomes declared after
+    exactly one run (ingest records it and parks for the owner) instead of
+    being rediscovered by every remaining cascade link."""
+    run_agent, _ = handler
+
+    def reports_authority(**kwargs):
+        return agent_runner.RunResult(
+            status="completed",
+            exit_code=0,
+            stdout=json.dumps(
+                {
+                    "result": "Cannot proceed: this needs a host postgres role.\n"
+                    "REQUIRES_AUTHORITY: postgres_role"
+                }
+            ),
+            stderr="",
+            duration_seconds=1.0,
+            started_at="2026-08-30T12:00:00+00:00",
+            completed_at="2026-08-30T12:00:01+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", reports_authority)
+    outcome = run_agent(_payload(), _event(), 1)
+    assert outcome.result["required_authorities"] == ["postgres_role"]
+
+
+def test_an_ordinary_run_reports_no_authority_requirement(handler) -> None:
+    """The field is always present and always a list, so the ingest SQL can
+    read it unconditionally; an ordinary run leaves it empty."""
+    run_agent, _ = handler
+    outcome = run_agent(_payload(), _event(), 1)
+    assert outcome.result["required_authorities"] == []
+
+
+def test_prose_about_privileged_commands_never_becomes_a_requirement(
+    handler, monkeypatch
+) -> None:
+    """The regression pin for three rejected prompt-scanning designs, at the
+    handler seam: a run whose own report *discusses* sudo -- including the
+    exact bodies that defeated the verb allow-list, the context-free
+    `-u postgres` match and the guard-window scan -- declares nothing. Only
+    the anchored trailer declares."""
+    run_agent, _ = handler
+
+    def chatty(**kwargs):
+        return agent_runner.RunResult(
+            status="completed",
+            exit_code=0,
+            stdout=json.dumps(
+                {
+                    "result": "Added a test ensuring `sudo rm` is rejected.\n"
+                    "Documented why users must not run `sudo apt`.\n"
+                    "Updated the connection string, then noted "
+                    "`sudo systemctl restart postgres` in the runbook.\n"
+                    "This does not require root access.\n"
+                    "Verified `docker run -u postgres` needs no host role.\n"
+                }
+            ),
+            stderr="",
+            duration_seconds=1.0,
+            started_at="2026-08-30T12:00:00+00:00",
+            completed_at="2026-08-30T12:00:01+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", chatty)
+    outcome = run_agent(_payload(), _event(), 1)
+    assert outcome.result["required_authorities"] == []

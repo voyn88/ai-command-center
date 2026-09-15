@@ -45,7 +45,12 @@ from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
-from command_center import agent_runner, project_config, workspace_provisioning
+from command_center import (
+    agent_runner,
+    authority_preflight,
+    project_config,
+    workspace_provisioning,
+)
 from command_center.ops.source_clone_refresh import refresh_source_clone
 from command_center.orchestrator.publish import PublishConfig, publish_run
 from command_center.worker import writer_lease
@@ -466,12 +471,23 @@ _PR_URL = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/pull/\d+")
 _HEAD_SHA_TRAILER = re.compile(r"^HEAD_SHA:\s*([0-9a-f]{7,40})\s*$", re.MULTILINE)
 
 
-def _machine_outcome(result_text: str) -> dict[str, str | None]:
+def _machine_outcome(result_text: str) -> dict[str, Any]:
     pr_match = _PR_URL.search(result_text)
     sha_match = _HEAD_SHA_TRAILER.search(result_text)
     return {
         "pr_url": pr_match.group(0) if pr_match else None,
         "head_sha": sha_match.group(1) if sha_match else None,
+        # VOYN-W0-AICC-PRIVILEGED-TASK-ROUTED-TO-UNPRIVILEGED-EXECUTOR: the
+        # third machine trailer, on the same terms as the two above -- an
+        # executor that hit an authority wall says so in one anchored line
+        # instead of leaving the control plane to infer it from a failure
+        # message. Ingest records the declaration on the task and parks it
+        # for the owner, so the requirement is learned once rather than
+        # rediscovered by every remaining cascade link. Absent is the
+        # historical behaviour: an empty list changes no decision.
+        "required_authorities": list(
+            authority_preflight.declared_by_run(result_text)
+        ),
     }
 
 
@@ -544,6 +560,41 @@ def _run_agent(
         return HandlerOutcome(
             ok=False, reason=request.reason, retryable=request.retryable
         )
+
+    # VOYN-W0-AICC-PRIVILEGED-TASK-ROUTED-TO-UNPRIVILEGED-EXECUTOR: the
+    # authority gate, first thing after the payload parses and before every
+    # other kind of work -- repository validation, executor preflight,
+    # worktree provisioning, and above all the model launch. A task that
+    # declares authority this executor does not hold is refused here having
+    # spent exactly zero model calls and zero worktree churn.
+    #
+    # Non-retryable, for the same reason `daemon._dispatch` gives for an
+    # unknown payload kind: redelivery cannot hand this principal a sudoers
+    # entry it is designed not to have (ADR-0010), so every further attempt
+    # reproduces this identical refusal on the way to the same dead letter.
+    # That is precisely what the incident measured -- one mismatch, three
+    # burned attempts, `cascade_exhausted: task_status_failed`. The reason
+    # string is machine-classified (`authority_unavailable:`), so the
+    # backlog parks it for the owner instead of re-opening it into the same
+    # loop (0025_backlog_required_authority), and it is counted
+    # separately from the `task_status_failed` population it used to hide
+    # inside.
+    #
+    # Nothing is probed when nothing is declared, so a task without the
+    # field behaves byte-for-byte as it did before this gate existed.
+    if request.required_authorities:
+        authority = authority_preflight.preflight(request.required_authorities)
+        if not authority.ok:
+            # The reason string carries the whole verdict on purpose:
+            # `daemon._execute` persists `result` only for an outcome that
+            # is `ok`, so a failure's structured fields would be dropped on
+            # the floor. `AuthorityDecision.reason` is assembled from sorted
+            # sets in `AUTHORITY_ORDER`, never interpolated prose, so it is
+            # exactly as machine-classifiable as a jsonb field would be --
+            # which is what `backlog_return_to_pool` matches on.
+            return HandlerOutcome(
+                ok=False, reason=authority.reason, retryable=False
+            )
 
     link = _cascade_link(request, attempt_no)
     cascade_step = (
