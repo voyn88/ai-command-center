@@ -14,7 +14,8 @@ import os
 import subprocess
 import time
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -150,6 +151,37 @@ class DeployLagSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class RotationHealthSnapshot:
+    """Whether the worker credential rotator has recently proved it can renew.
+
+    worker-01 2026-09-15 04:49 .. 10:33: rotation failed 164 times in a row
+    (a readiness refusal, then the credential it authenticates with expired)
+    and the lanes died at 06:17 when their pooled connections went. Nothing
+    raised a finding: the rotation unit is a oneshot, so it is never "failed"
+    long enough for unit health, and the lanes' own crash loop looked like
+    residue. The rotator's audit journal IS the heartbeat: every healthy run
+    writes `credential_expiry_proved` (the credential still authenticates)
+    and a due run writes `rotation_succeeded`. A heartbeat older than
+    `max_age_seconds` -- set below the credential TTL, so the finding fires
+    while the credential can still renew itself -- is a stalled rotation.
+    """
+
+    audit_file: str
+    last_healthy_at: datetime | None
+    age_seconds: float | None
+    max_age_seconds: float
+    error: str | None = None
+
+    @property
+    def stalled(self) -> bool:
+        if self.error is not None:
+            return False
+        if self.last_healthy_at is None or self.age_seconds is None:
+            return True
+        return self.age_seconds > self.max_age_seconds
+
+
+@dataclass(frozen=True, slots=True)
 class MonitorReport:
     ok: bool
     active_workers: int
@@ -161,6 +193,7 @@ class MonitorReport:
     source_clone: SourceCloneSnapshot | None = None
     unit_health: UnitHealthSnapshot | None = None
     deploy_lag: DeployLagSnapshot | None = None
+    rotation_health: RotationHealthSnapshot | None = None
 
 
 def parse_worker_units(output: str) -> dict[str, str]:
@@ -771,6 +804,71 @@ def prometheus_is_ready(url: str) -> bool:
             connection.close()
 
 
+_ROTATION_HEALTHY_EVENTS = frozenset({"credential_expiry_proved", "rotation_succeeded"})
+_ROTATION_AUDIT_TAIL_BYTES = 256 * 1024
+
+
+def read_rotation_health_snapshot(
+    audit_file: str | Path, *, max_age_seconds: float, now: datetime | None = None
+) -> RotationHealthSnapshot:
+    """The age of the rotator's last healthy audit event (see the snapshot).
+
+    Reads only the tail of the journal: it is append-only and the heartbeat
+    is always near the end. A missing or unreadable journal is a probe
+    failure (reported as such, never as health); a journal with no healthy
+    event in its tail is a stall (the rotator has run, and never proved the
+    credential in that window)."""
+    path = Path(audit_file)
+    moment = now or datetime.now(UTC)
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(size - _ROTATION_AUDIT_TAIL_BYTES, 0))
+            tail = handle.read().decode("utf-8", errors="replace")
+    except OSError as error:
+        return RotationHealthSnapshot(
+            audit_file=str(path), last_healthy_at=None, age_seconds=None,
+            max_age_seconds=float(max_age_seconds), error=f"{type(error).__name__}: {error}",
+        )
+    last: datetime | None = None
+    for raw in reversed(tail.splitlines()):
+        line = raw.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("event") not in _ROTATION_HEALTHY_EVENTS:
+            continue
+        stamp = _parse_audit_timestamp(str(event.get("ts") or ""))
+        if stamp is not None:
+            last = stamp
+            break
+    age = (moment - last).total_seconds() if last is not None else None
+    return RotationHealthSnapshot(
+        audit_file=str(path), last_healthy_at=last,
+        age_seconds=(max(age, 0.0) if age is not None else None),
+        max_age_seconds=float(max_age_seconds),
+    )
+
+
+def _parse_audit_timestamp(value: str) -> datetime | None:
+    text = value.strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed
+
+
 def evaluate(
     worker_states: dict[str, str],
     queue: QueueSnapshot | None,
@@ -783,6 +881,7 @@ def evaluate(
     source_clone: SourceCloneSnapshot | None = None,
     unit_health: UnitHealthSnapshot | None = None,
     deploy_lag: DeployLagSnapshot | None = None,
+    rotation_health: RotationHealthSnapshot | None = None,
 ) -> MonitorReport:
     active_workers = sum(state == "active" for state in worker_states.values())
     failures: list[str] = []
@@ -875,6 +974,18 @@ def evaluate(
                 f"_{int(deploy_lag.lag_seconds or 0)}s>{int(deploy_lag.grace_seconds)}s"
             )
 
+    if rotation_health is not None:
+        if rotation_health.error is not None:
+            failures.append(f"rotation_probe_failed:{rotation_health.error}")
+        elif rotation_health.stalled:
+            age = (
+                f"{int(rotation_health.age_seconds)}s"
+                if rotation_health.age_seconds is not None
+                else "never"
+            )
+            failures.append(
+                f"credential_rotation_stalled:{age}>{int(rotation_health.max_age_seconds)}s"
+            )
     return MonitorReport(
         ok=not failures,
         active_workers=active_workers,
@@ -886,6 +997,7 @@ def evaluate(
         source_clone=source_clone,
         unit_health=unit_health,
         deploy_lag=deploy_lag,
+        rotation_health=rotation_health,
     )
 
 
@@ -998,6 +1110,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--deploy-lag-branch", default="main")
     parser.add_argument(
+        "--rotation-audit-file",
+        default=None,
+        help="Path of the credential rotator's audit journal (audit.jsonl); "
+        "when given, a heartbeat older than --rotation-max-age-seconds is a "
+        "credential_rotation_stalled finding.",
+    )
+    parser.add_argument(
+        "--rotation-max-age-seconds",
+        type=float,
+        default=2700.0,
+        help="Oldest acceptable rotator heartbeat (default 2700 s: the 25-minute "
+        "cadence plus one retry window, well inside the 1-hour credential TTL).",
+    )
+    parser.add_argument(
         "--deploy-lag-grace-seconds",
         type=float,
         default=2700.0,
@@ -1055,6 +1181,10 @@ def _json_report(report: MonitorReport) -> dict[str, Any]:
     if report.deploy_lag is not None:
         # `asdict` serialises fields only; the verdict is a property.
         payload["deploy_lag"]["lagging"] = report.deploy_lag.lagging
+    if report.rotation_health is not None:
+        payload["rotation_health"]["stalled"] = report.rotation_health.stalled
+        last = report.rotation_health.last_healthy_at
+        payload["rotation_health"]["last_healthy_at"] = last.isoformat() if last else None
     return payload
 
 
@@ -1093,6 +1223,13 @@ def main(argv: list[str] | None = None) -> int:
             if args.deploy_lag_repo
             else None
         )
+        rotation_health = (
+            read_rotation_health_snapshot(
+                args.rotation_audit_file, max_age_seconds=args.rotation_max_age_seconds
+            )
+            if args.rotation_audit_file
+            else None
+        )
         report = evaluate(
             workers,
             queue,
@@ -1104,6 +1241,7 @@ def main(argv: list[str] | None = None) -> int:
             source_clone=source_clone,
             unit_health=unit_health,
             deploy_lag=deploy_lag,
+            rotation_health=rotation_health,
         )
     except Exception as exc:  # noqa: BLE001 - the monitor itself must fail closed
         print(json.dumps({"ok": False, "failures": [f"monitor_error:{exc}"]}))
