@@ -131,3 +131,86 @@ This is a fail-closed deployment gate. Do not set
 9. Drain and roll every remaining discovered lane, one at a time, only after the previous lane stays ready. Record
    exact deployed SHA and unit hashes. Roll back the unit/code to the previous
    merged SHA if any boundary or readiness check fails; do not disable isolation.
+
+## Declaring a file absent (desired-absent targets)
+
+The installer's generations describe files that must exist. A path that must
+*not* exist is declared in `DESIRED_ABSENT_TARGETS`
+(`ops/aicc_install_transaction.py`) and removed by whichever generation
+installs next — worker or control, one `prepare`/`apply`/`commit`, the same
+rollback boundary as every install beside it. Nothing about `voynadmin`'s
+rights changes: the removal runs as root inside the transaction, from
+repository state that was reviewed, which is the point. `NOPASSWD` covers
+only `systemctl` and `apt-get`, so an operator cannot `rm` these paths at
+all — and should not be able to.
+
+What the transaction guarantees for a declared-absent path:
+
+* **Snapshot first.** The target's bytes, mode and owner — or, for a symlink,
+  its literal text — go into the generation WAL before anything is touched.
+* **Atomic removal.** The object is renamed into an unpredictable quarantine
+  entry under a pinned parent descriptor, proven against the snapshot there,
+  and only then unlinked. There is no window in which a pathname is resolved
+  twice.
+* **Byte-for-byte rollback.** Any failure later in the same generation puts
+  the object back exactly as it was — a symlink comes back as a symlink, with
+  the same target. A crash between the quarantine rename and the unlink is
+  reclaimed by `recover` (the original inode, not a copy).
+* **One exact path.** Globs, braces, `..`, `.`, empty components and control
+  characters are refused before the generation is staged, exactly as they are
+  for sudoers, unit and repository rules.
+* **Already absent is a no-op**, not a refusal: a converged host removes
+  nothing.
+
+### Adding a target
+
+Each entry carries a *staleness proof*, because reversible is not the same as
+safe — destroying the unit file underneath a loaded unit would break the host
+and then correctly restore it only if something else also failed. The proof
+this build checks is `dangling-symlink`: the path is a symlink whose target
+does not exist, so it cannot be backing a loaded unit (`systemctl` reports
+such a fragment as `not-found`). It is evaluated against the live host twice:
+before the generation is staged, and again immediately before `apply` mutates
+anything. Record the evidence in the entry itself.
+
+### If an install refuses
+
+```
+declared-absent symlink resolves and may back a loaded unit: <path> -> <target>
+declared-absent target is not the dangling symlink it was declared as: <path>
+```
+
+Both are fail-closed refusals that destroy nothing, and both mean the same
+thing: the path is no longer the inert leftover somebody proved stale, so the
+installer will not touch it and will not proceed around it. Find out what
+created the object. Either the declaration is now wrong (remove the entry) or
+the host is, and either answer is a reviewed change, not a `rm`.
+
+### The first target
+
+`/etc/systemd/system/aicc-systemd-voyn-aicc-self-deploy.service`: a symlink
+whose target does not exist, `is-enabled` = `not-found`, referenced by no
+unit, drop-in or timer, and a name this repository has never installed (the
+real one is `voyn-aicc-self-deploy.service`). It could not be deleted on
+2026-08-30 — `sudo rm` asked for a password — which is what made the gap
+concrete.
+
+It is removed by the next principal-isolation install on that host: the
+root-owned exact-SHA bootstrap of step 5
+(`/usr/local/sbin/voyn-aicc-bootstrap --expected-sha <merged-main-sha>`),
+which is what runs `deploy/install-agent-principal-isolation.sh`. The
+per-host self-deploy tick does not run the installer, so merging this change
+alone does not delete anything. Confirm the contract around that install:
+
+```sh
+# Before: the dangling link, and the proof it backs nothing.
+ls -l /etc/systemd/system/aicc-systemd-voyn-aicc-self-deploy.service
+systemctl is-enabled aicc-systemd-voyn-aicc-self-deploy.service   # not-found
+
+# After the install commits (the installer runs `systemctl daemon-reload`
+# between apply and commit):
+test ! -e /etc/systemd/system/aicc-systemd-voyn-aicc-self-deploy.service \
+  && echo REMOVED
+systemctl is-enabled voyn-aicc-self-deploy.timer                  # untouched
+systemctl list-units --failed
+```

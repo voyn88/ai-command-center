@@ -1236,18 +1236,20 @@ def _purged_directories(profile, tmp_path):
 def test_worker_profile_is_unchanged_and_is_the_default(tmp_path):
     """An existing caller that knows nothing about profiles must install
     exactly what it always installed."""
-    tx, explicit = _specs("worker", tmp_path)
-    default = {
-        spec.target
-        for spec in tx.default_specs(
-            Path(__file__).parents[2],
-            authority_env=tmp_path / "authority.env",
-            claude_auth=tmp_path / "claude.json",
-            codex_auth=tmp_path / "codex.json",
-            resolve_identities=False,
-        )
-    }
-    assert explicit == default
+    tx, explicit_specs = _profile_specs("worker", tmp_path)
+    default_specs = tx.default_specs(
+        Path(__file__).parents[2],
+        authority_env=tmp_path / "authority.env",
+        claude_auth=tmp_path / "claude.json",
+        codex_auth=tmp_path / "codex.json",
+        resolve_identities=False,
+    )
+
+    # Whole specs, not just target names: a removal spec also names a target,
+    # so comparing name sets would call an install and a purge of the same
+    # path "unchanged".
+    assert explicit_specs == default_specs
+    explicit = {spec.target for spec in explicit_specs if not spec.remove}
     assert tx.WORKER_ONLY_TARGETS <= explicit
 
 
@@ -1281,8 +1283,15 @@ def test_control_profile_purges_exactly_what_it_drops(tmp_path):
     stays live without the paired removal."""
     tx, _control = _specs("control", tmp_path)
 
-    assert _purged("control", tmp_path) == tx.WORKER_ONLY_TARGETS
-    assert _purged("worker", tmp_path) == set()
+    # `DESIRED_ABSENT_TARGETS` is not a profile drop: those paths belong to
+    # no profile, are declared absent on every host, and ride whichever
+    # generation installs next -- which is why the worker profile carries
+    # them and nothing else.
+    declared_absent = {declared.target for declared in tx.DESIRED_ABSENT_TARGETS}
+    assert not declared_absent & tx.WORKER_ONLY_TARGETS
+
+    assert _purged("control", tmp_path) == tx.WORKER_ONLY_TARGETS | declared_absent
+    assert _purged("worker", tmp_path) == declared_absent
     assert _purged_directories("worker", tmp_path) == []
 
 
@@ -1305,9 +1314,11 @@ def test_control_purges_the_worker_only_directories_child_before_parent(tmp_path
                 f"{other} is removed after its own parent {directory}"
             )
     ordered = [spec.target for spec in specs if spec.remove]
-    assert ordered[: len(ordered) - len(directories)] == sorted(
-        tx.WORKER_ONLY_TARGETS
-    ), "a directory is removed before the files this generation takes out of it"
+    files = ordered[: len(ordered) - len(directories)]
+    declared_absent = [declared.target for declared in tx.DESIRED_ABSENT_TARGETS]
+    assert files == sorted(tx.WORKER_ONLY_TARGETS) + declared_absent, (
+        "a directory is removed before the files this generation takes out of it"
+    )
 
     # Operator data created by the agent layer is not an artefact of it.
     for kept in ("/srv/aicc-workspaces", "/srv/aicc-quarantine"):
