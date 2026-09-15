@@ -16,6 +16,7 @@ home tree and every publisher authority path remain inaccessible.
 from __future__ import annotations
 
 import base64
+import errno
 import fcntl
 import grp
 import hashlib
@@ -831,7 +832,14 @@ def _prepare_workspace_permissions(
                     raise LaunchRefused("workspace nesting exceeds supported depth")
                 os.fchown(directory_fd, owner_uid, workspace_gid)
                 os.fchmod(directory_fd, 0o2770)
-                with os.scandir(os.dup(directory_fd)) as entries:
+                # scandir(fd) dups the descriptor it is handed and closes only
+                # that private copy; wrapping the argument in os.dup() leaked one
+                # descriptor per directory visited, so any workspace with more
+                # directories than the soft RLIMIT_NOFILE (a .venv with
+                # PySide6/Qt: ~21k entries, worker-01 2026-09-15) hit EMFILE and
+                # every open() failure was reported as "entry changed while
+                # opening" -- misread for days as a write race.
+                with os.scandir(directory_fd) as entries:
                     snapshot = list(entries)
                 for entry in snapshot:
                     before = entry.stat(follow_symlinks=False)
@@ -854,6 +862,11 @@ def _prepare_workspace_permissions(
                     try:
                         child_fd = os.open(entry.name, flags, dir_fd=directory_fd)
                     except OSError as exc:
+                        if exc.errno in (errno.EMFILE, errno.ENFILE):
+                            raise LaunchRefused(
+                                "launcher ran out of file descriptors while "
+                                f"walking the workspace at {child_relative}"
+                            ) from exc
                         raise LaunchRefused(
                             f"workspace entry changed while opening: {child_relative}"
                         ) from exc
