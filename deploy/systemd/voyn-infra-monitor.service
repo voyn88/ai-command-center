@@ -15,6 +15,19 @@ Environment=AICC_SOURCE_CLONE_REPO=.
 # layout, so gh does not try to rewrite it); 127.0.0.1:8089 is the CRM production API
 # (`scripts/auto_deploy_poll.sh:production_version_url`) and needs no credential.
 Environment=GH_CONFIG_DIR=/var/lib/aicc/github/gh
+# `--crash-loop-restarts 5` below counts the restarts a unit GAINS inside
+# --crash-loop-window-seconds (one hour by default), not its lifetime NRestarts:
+# a loop is a rate, and a total can only ever grow (VOYN-MON-WORKER-01-INFRA-
+# CRASH-LOOP). Comparing across ticks needs one file that outlives the tick,
+# and $STATE_DIRECTORY is the only writable path the ProtectSystem=strict
+# envelope below leaves -- so this line is what switches the probe on at all:
+# without it --unit-health refuses to start rather than measure nothing.
+# (It is a StateDirectory= and not a flag on the line below because that line
+# names an absolute home path, which a public repository cannot restate in an
+# added line -- scripts/ci/prepush/leak_guard.sh -- so unit-level knobs go in
+# their own directive, exactly as the queue monitor's probe does.)
+StateDirectory=voyn-infra-monitor
+StateDirectoryMode=0750
 ExecStart=/home/voynadmin/aicc-preprod/repo/.venv/bin/python -m command_center.ops.infra_monitor --minimum-active-workers 4 --skip-queue --prometheus-url http://100.114.209.119:9090/-/ready --unit-health --crash-loop-restarts 5 --deploy-lag-repo voyn88/voyn-logistics-crm --deploy-lag-branch main --deploy-lag-version-url http://127.0.0.1:8089/version
 NoNewPrivileges=true
 PrivateTmp=true
