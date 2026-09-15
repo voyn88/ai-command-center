@@ -100,7 +100,10 @@ def _test_repo_routes(monkeypatch, request):
     import json
 
     repos = ["repo-d2","repo-ga","repo-gb","repo-gc","repo-in","repo-nm",
-             "repo-one","repo-p1","repo-p3","repo-pk","repo-shared","repo-tt"]
+             "repo-one","repo-p1","repo-p3","repo-pk","repo-shared","repo-tt",
+             # The authority preflight/gate tests (VOYN-W0-AICC-PRIVILEGED-
+             # TASK-ROUTED-TO-UNPRIVILEGED-EXECUTOR).
+             "repo-pc","repo-pd","repo-wg","repo-wr","repo-wp"]
     monkeypatch.setenv(
         "AICC_PLANNER_REPO_ROUTES",
         json.dumps({r: ["AICC", f"/srv/{r}"] for r in repos}),
@@ -936,6 +939,7 @@ def test_plan_once_blocks_a_task_that_requires_authority_the_fleet_lacks(rig) ->
     assert store.upsert_task(
         _task(
             "VOYN-W0-PC",
+            repo="repo-pc",
             title="control plane resilience",
             body=(
                 "Verify resilience: run `sudo /usr/bin/true` and "
@@ -943,7 +947,9 @@ def test_plan_once_blocks_a_task_that_requires_authority_the_fleet_lacks(rig) ->
             ),
         )
     )[0]
-    assert store.upsert_task(_task("VOYN-W0-PD", body="Fix the bug and add tests."))[0]
+    assert store.upsert_task(
+        _task("VOYN-W0-PD", repo="repo-pd", body="Fix the bug and add tests.")
+    )[0]
 
     report = plan_once(app_factory, PlanLimits(wip_limit=4))
     assert not report.planner_busy
@@ -972,3 +978,111 @@ def test_plan_once_blocks_a_task_that_requires_authority_the_fleet_lacks(rig) ->
     report2 = plan_once(app_factory, PlanLimits(wip_limit=4))
     assert "VOYN-W0-PC" not in [task_id for task_id, _ in report2.resumed]
     assert store.get_task("VOYN-W0-PC")["status"] == "DEFER_TO_USER"
+
+
+# ---------------------------------------------------------------------------
+# An authority failure that reaches the queue AFTER dispatch (0018).
+#
+# The planner's preflight is the main gate, but a requirement can be added to
+# a task after it was dispatched, a payload can be enqueued directly, or a
+# host that was supposed to grant the privilege can turn out not to. All
+# three end at the worker's entry gate, whose refusal reaches the store
+# WRAPPED by ingest as `cascade_exhausted: <dead_reason>` -- the shape 0012
+# reads as technical and 0014's reconcile resumes.
+# ---------------------------------------------------------------------------
+
+
+_GATE_REASON = "cascade_exhausted: requires_privileged_authority: root"
+
+
+def test_an_authority_return_parks_for_the_owner_on_the_first_occurrence(rig) -> None:
+    """Not OPEN, not "technical", and not on the second try: no retry can
+    grant a privilege, so the first one is already the last."""
+    app_factory, store, _worker = rig
+    assert store.upsert_task(_task("VOYN-W0-WG", repo="repo-wg"))[0]
+    assert _dispatch(app_factory, "VOYN-W0-WG")[0]
+
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT ok, reason FROM backlog_return_to_pool(%s, %s)",
+                ("VOYN-W0-WG", _GATE_REASON),
+            )
+            assert cur.fetchone() == (True, "DEFER_TO_USER")
+            cur.execute(
+                "SELECT detail FROM backlog_event WHERE task_id = %s "
+                "AND event = 'return_to_pool' AND outcome = 'granted' "
+                "ORDER BY event_id DESC LIMIT 1",
+                ("VOYN-W0-WG",),
+            )
+            detail = cur.fetchone()[0]
+    assert detail["authority"] is True
+    assert detail["technical"] is False, "a missing privilege is not an operational retry"
+    assert detail["prior_returns"] == 0
+    assert store.get_task("VOYN-W0-WG")["status"] == "DEFER_TO_USER"
+
+
+def test_an_authority_park_is_never_auto_resumed(rig) -> None:
+    """The reason matches `cascade_exhausted:%`, which is exactly what makes
+    it dangerous: the prefix describes HOW the failure surfaced, the token
+    describes WHY, and only the why decides whether a retry could help."""
+    app_factory, store, _worker = rig
+    assert store.upsert_task(_task("VOYN-W0-WR", repo="repo-wr"))[0]
+    assert _dispatch(app_factory, "VOYN-W0-WR")[0]
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT ok FROM backlog_return_to_pool(%s, %s)",
+                ("VOYN-W0-WR", _GATE_REASON),
+            )
+            assert cur.fetchone()[0]
+
+    ok, reason, _revision = store.resume_deferred("VOYN-W0-WR")
+    assert (ok, reason) == (False, "requires_authority_park")
+    assert store.get_task("VOYN-W0-WR")["status"] == "DEFER_TO_USER"
+
+    # ...and the planner's own candidate filter does not even offer it, so it
+    # is not re-attempted (or audit-spammed) on every tick.
+    report = plan_once(app_factory, PlanLimits(wip_limit=4))
+    assert "VOYN-W0-WR" not in [task_id for task_id, _ in report.resumed]
+    assert store.get_task("VOYN-W0-WR")["status"] == "DEFER_TO_USER"
+
+
+def test_the_authority_predicate_sees_through_the_wrapper(rig) -> None:
+    app_factory, _store, _worker = rig
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            for reason, expected in (
+                ("requires_privileged_authority: root", True),
+                (_GATE_REASON, True),
+                ("cascade_exhausted: task_status_failed", False),
+                ("cascade_exhausted: no_pr_published", False),
+                (None, False),
+            ):
+                cur.execute(
+                    "SELECT backlog_reason_requires_authority(%s)", (reason,)
+                )
+                assert cur.fetchone()[0] is expected, reason
+
+
+def test_a_dispatched_payload_states_its_capability_contract(rig) -> None:
+    """Acceptance 1: the requirement travels IN the payload, so the worker
+    can check it against its own host before spending a model call."""
+    app_factory, store, _worker = rig
+    assert store.upsert_task(
+        _task("VOYN-W0-WP", repo="repo-wp", body="Fix the parser and add tests.")
+    )[0]
+
+    report = plan_once(app_factory, PlanLimits(wip_limit=4))
+    assert "VOYN-W0-WP" in [task_id for task_id, _ in report.dispatched]
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT payload FROM work_item WHERE task_id = %s "
+                "ORDER BY created_at DESC LIMIT 1",
+                ("VOYN-W0-WP",),
+            )
+            payload = cur.fetchone()[0]
+    # Explicitly empty, not absent: "requires nothing" is a statement.
+    assert payload["required_authority"] == []
+    assert payload["suspected_authority"] == []

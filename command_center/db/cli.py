@@ -133,6 +133,25 @@ def build_parser() -> argparse.ArgumentParser:
         "marker and checks are green, closing the task DONE "
         "(aicc-backlog-merge.timer). Needs --repo-path.",
     ).add_argument("--repo-path", default=".", help="Local clone for gh calls.")
+    audit = sub.add_parser(
+        "backlog-failure-audit",
+        help="Report-only classification of every parked/returned task "
+        "(VOYN-W0-AICC-PRIVILEGED-TASK-ROUTED-TO-UNPRIVILEGED-EXECUTOR): why "
+        "did it come back, and what share of `task_status_failed` was a "
+        "privilege no executor holds. Never changes a task's status.",
+    )
+    audit.add_argument(
+        "--hours",
+        type=float,
+        default=24.0,
+        help="Window to classify, in hours back from now (default 24).",
+    )
+    audit.add_argument(
+        "--detail",
+        action="store_true",
+        help="Print one classified line per park, not just the totals.",
+    )
+
     sub.add_parser(
         "backlog-merge-reconcile",
         help="Report-only audit (VOYN-W0-AICC-MERGE-DONE-BEFORE-TARGET-"
@@ -369,6 +388,60 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"NO-REPO   {task_id}: {reason}")
                 for task_id, reason in report.blocked_authority:
                     print(f"BLOCKED   {task_id}: {reason}")
+                return 0
+
+            if args.command == "backlog-failure-audit":
+                from command_center.orchestrator import failure_classes
+
+                # Every granted return_to_pool (0012/0018 wrote the reason)
+                # and every authority park the planner made before dispatch
+                # (0017 audits those as `authority_preflight`), joined to the
+                # task text the classification needs. The task's payload is
+                # read from its latest work item, so a park dispatched with
+                # the capability contract is attributed by that contract
+                # rather than by re-reading its prose.
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT e.task_id, e.reason, t.title, t.body, "
+                        "       i.payload -> 'required_authority' "
+                        "  FROM backlog_event e "
+                        "  JOIN backlog_task t ON t.task_id = e.task_id "
+                        "  LEFT JOIN LATERAL ("
+                        "       SELECT w.payload FROM work_item w "
+                        "        WHERE w.task_id = e.task_id "
+                        "          AND w.created_at <= e.created_at "
+                        "        ORDER BY w.created_at DESC LIMIT 1) i ON true "
+                        " WHERE e.outcome = 'granted' "
+                        "   AND e.event IN ('return_to_pool', 'authority_preflight') "
+                        "   AND e.created_at >= now() - make_interval(secs => %s) "
+                        " ORDER BY e.event_id",
+                        (max(args.hours, 0.0) * 3600.0,),
+                    )
+                    parks = [
+                        {
+                            "task_id": task_id,
+                            "reason": reason,
+                            "title": title,
+                            "body": body,
+                            "required_authority": required,
+                        }
+                        for task_id, reason, title, body, required in cur.fetchall()
+                    ]
+
+                counts, rows = failure_classes.summarize(parks)
+                if args.detail:
+                    for task_id, failure_class, evidence in rows:
+                        print(f"{failure_class:24} {task_id}: {evidence}")
+                for failure_class, count in sorted(counts.by_class.items()):
+                    print(f"{failure_class:24} {count}")
+                print(f"{'TOTAL':24} {counts.total} park(s) in {args.hours}h")
+                # The acceptance bar, printed with its denominator: an empty
+                # window is not evidence of success.
+                print(
+                    f"{'task_status_failed':24} {counts.task_status_failed} "
+                    f"({counts.task_status_failed_authority} from missing "
+                    f"authority = {counts.authority_share:.0%})"
+                )
                 return 0
 
             if args.command == "backlog-review":

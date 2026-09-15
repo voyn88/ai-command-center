@@ -50,13 +50,20 @@ credential. Two ways a task states one:
   section comment above `_SUDO_COMMAND` for why the two error directions are
   deliberately not symmetric.
 
-`FLEET_GRANTED_AUTHORITY` is what this fleet actually grants today: nothing.
-Every worker is the same unprivileged, sandboxed task-clone executor: that is
-enforced by design and re-provable independently of this module (12h of
-worker logs, zero sandbox denials). If a privileged worker lane is ever
-added, its granted authority extends this set and satisfied tasks flow
-through normally — this module never needs to change for that, only its
-constant does.
+`EXECUTOR_AUTHORITY` is what each executor grants today: nothing, all three.
+Every worker is the same unprivileged, sandboxed task-clone executor — that
+is enforced by design and re-provable independently of this module (12h of
+worker logs, zero sandbox denials), and it is why the cascade could never
+rescue the incident: claude/codex/copilot are three ACCOUNTS, not three
+privilege levels. Adding a privileged lane is one entry in that table; tasks
+requiring it then route to it (`capable_executors`) and flow through
+normally, with no change to this module's logic.
+
+A decision is `ok` when SOME ONE executor grants ALL of the requirement —
+not when the fleet grants each tag somewhere. One task runs on one executor,
+so a requirement split across two lanes is unservable and says so
+(`no_single_executor_grants: ...`) rather than passing a filter that would
+leave the cascade empty.
 
 Pure functions only — no I/O, no subprocess, no database. Trivially unit
 testable and safe to import from any layer (leaf module; imports nothing
