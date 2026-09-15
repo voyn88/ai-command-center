@@ -9,6 +9,43 @@ functional application milestones of `app.py`.
 ## [Unreleased]
 
 ### Fixed — the queue monitor called a working fleet stalled (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
+- The capacity test gated the COMPARISON and left the CLOCK running
+  (`monitor_finding` #2471). A due `ready` item's age is time since it became
+  due, and the queue is designed to hold work no lane can attend yet, so that
+  age climbs for hours while the fleet is legitimately full and invisible
+  behind `attended_claims == claim_capacity`. The moment occupancy drops the
+  same hours-old number is measured against 900s — and occupancy drops at
+  every attempt boundary (`queue_complete` commits before the daemon's next
+  claim), at every lane restart the 5-minute self-deploy tick issues, and at
+  every drain. With the probe sampling every two minutes, `control-01:queue`
+  goes red against lanes doing exactly their job, mints a task, and clears on
+  the next tick — a monitor that cannot stay green for 24h on a healthy fleet.
+  The stall clock is now bounded by how long the FLEET has been standing
+  still: an item is only being ignored while there is somebody to ignore it.
+  `_QUEUE_SNAPSHOT_SQL` reports `fleet_idle_seconds` — time since any lane took
+  an item (`work_attempt.created_at`) or handed one back (an attempt leaving
+  `active`) — and `evaluate` takes the lesser of that and the due age.
+  Heartbeats are deliberately excluded: `queue_heartbeat` writes
+  `updated_at = now()` on a row that stays `active`, and a clock a stalled
+  fleet could wind forward by beating would excuse every stall there is. A
+  lapsed claim is not bounded by it either — a neighbouring lane claiming away
+  beside a zombie says nothing about the zombie — and `None` (no attempt has
+  ever been made) bounds nothing, so a fleet that never started still fails
+  closed. Regressions in both layers: the attempt boundary, the fleet that has
+  not moved all window, the unmeasurable clock and the lapsed claim at
+  `evaluate`; and against a real server, the boundary driven through
+  `queue_complete`, a heartbeat that must not wind the clock, and an empty
+  `work_attempt`.
+- `tests/db/test_postgres_integration.py`: `test_execute_grants_match_the
+  _declared_protocol_steps` resolved declared signatures to catalog functions
+  by name prefix, so 0024's `monitor_clear_finding(text, text[])` — this
+  schema's first overload — made it call both declared forms ambiguous and
+  both granted overloads surplus on an exactly compliant database. It failed
+  on a correct schema rather than catching an incorrect one, which would have
+  held the whole branch out of CI. It now keys on name and arity via
+  `roles._function_key` against `pg_proc.pronargs`, the same way
+  `render_table_grants` and `test_grant_compliance` were taught to in the same
+  migration.
 - `command_center/ops/infra_monitor.py`: the stall clock was
   `now() - min(work_item.updated_at)` over every ready or claimed row. For a
   claimed row that timestamp is the moment it was CLAIMED — `queue_heartbeat`

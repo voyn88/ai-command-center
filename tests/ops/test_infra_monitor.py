@@ -924,3 +924,142 @@ def test_a_capacity_of_zero_cannot_excuse_every_unclaimed_item() -> None:
     )
 
     assert report.failures == ("queue_stalled",)
+
+
+# ---------------------------------------------------------------------------
+# VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED, the third half (monitor_finding
+# #2471).
+#
+# Capacity gated the COMPARISON and left the CLOCK running. The queue is meant
+# to hold work no lane can attend yet, so the surplus row's due age climbs for
+# hours while the fleet is legitimately full -- and the instant occupancy drops
+# below capacity that hours-old number is measured against 900s. Occupancy
+# drops at every attempt boundary (the daemon's loop claims again immediately,
+# but `queue_complete` commits first), at every lane restart the 5-minute
+# self-deploy tick issues, and at every drain. The probe samples every two
+# minutes.
+#
+# So the stall clock is bounded by how long the FLEET has been standing still:
+# an item is only being ignored while there is somebody to ignore it.
+
+
+def _backpressure(**kw):
+    """Two lanes, a third dispatched item ready and due for an hour behind
+    them -- `PlanLimits.wip_limit` (4) against 2 lanes, the shape the queue is
+    designed to hold."""
+    from command_center.ops.infra_monitor import QueueSnapshot
+
+    base = dict(
+        ready=1,
+        claimed=2,
+        succeeded=100,
+        dead=0,
+        success_age_seconds=4000,
+        recent_succeeded=1,
+        ready_due=1,
+        ready_due_age_seconds=3600,
+        attended_claims=2,
+        live_claim_age_seconds=3600,
+    )
+    base.update(kw)
+    return QueueSnapshot(**base)
+
+
+def test_the_instant_a_lane_frees_is_not_a_stall_that_was_hours_old() -> None:
+    """THE REGRESSION. One of the two lanes has just committed its result, so
+    the fleet is momentarily one claim below capacity while the item it is
+    about to take has been due for an hour. Before the fleet clock, every
+    attempt boundary on a healthy fleet was a `queue_stalled` tick waiting for
+    the 2-minute timer to land on it."""
+    report = evaluate(
+        {"voyn-aicc-worker@1.service": "active", "voyn-aicc-worker@2.service": "active"},
+        _backpressure(
+            claimed=1,
+            attended_claims=1,
+            # The completion itself is the fleet event: a lane handed work
+            # back a moment ago, so nothing here has been ignored for an hour.
+            fleet_idle_seconds=0.4,
+        ),
+        minimum_active_workers=2,
+        max_stalled_seconds=900,
+        prometheus_ready=True,
+        claim_capacity=2,
+    )
+
+    assert report.ok, report.failures
+
+
+def test_a_lane_that_has_not_moved_for_the_whole_window_is_still_a_stall() -> None:
+    """The bound is not an excuse. The same free lane, but the fleet has taken
+    nothing and handed nothing back for the whole stall window: there is no
+    claim in flight to explain the wait, and the clock runs in full."""
+    report = evaluate(
+        {"voyn-aicc-worker@1.service": "active", "voyn-aicc-worker@2.service": "active"},
+        _backpressure(claimed=1, attended_claims=1, fleet_idle_seconds=3600),
+        minimum_active_workers=2,
+        max_stalled_seconds=900,
+        prometheus_ready=True,
+        claim_capacity=2,
+    )
+
+    assert report.failures == ("queue_stalled",)
+
+
+def test_an_unmeasurable_fleet_clock_excuses_nothing() -> None:
+    """A queue no lane has ever claimed from has no fleet clock at all --
+    `max()` over an empty `work_attempt` is NULL. That is the shape of a fleet
+    that never started, so the due age stands on its own and the probe fails
+    closed rather than treating "no evidence" as "serving"."""
+    report = evaluate(
+        {},
+        _backpressure(
+            claimed=0,
+            attended_claims=0,
+            live_claim_age_seconds=None,
+            fleet_idle_seconds=None,
+        ),
+        minimum_active_workers=0,
+        max_stalled_seconds=900,
+        prometheus_ready=True,
+        claim_capacity=2,
+    )
+
+    assert report.failures == ("queue_stalled",)
+
+
+def test_a_busy_fleet_clock_never_excuses_a_lapsed_claim() -> None:
+    """The bound answers "was anybody free to take this?", which only
+    UNCLAIMED work asks. A claim whose lease lapsed is held by nobody, and a
+    neighbouring lane claiming away beside it says nothing about it -- only
+    the reaper does. So the lapse keeps its own clock at any fleet activity,
+    exactly as it keeps it at any capacity."""
+    report = evaluate(
+        {"voyn-aicc-worker@1.service": "active", "voyn-aicc-worker@2.service": "active"},
+        _backpressure(
+            claimed=3,
+            lapsed_claims=1,
+            lapsed_claim_age_seconds=1200,
+            fleet_idle_seconds=1.0,
+        ),
+        minimum_active_workers=2,
+        max_stalled_seconds=900,
+        prometheus_ready=True,
+        claim_capacity=2,
+    )
+
+    assert report.failures == ("queue_stalled",)
+
+
+def test_the_fleet_clock_reads_claims_and_releases_but_not_heartbeats() -> None:
+    """The measurement's honesty is in the CASE. `queue_heartbeat` writes
+    `updated_at = now()` on a row that stays 'active', so reading `updated_at`
+    unconditionally would make one lane renewing one lease look like a fleet
+    claiming continuously -- and that would excuse every stall there is.
+    `tests/db/test_infra_monitor_queue_snapshot.py` proves the behaviour
+    against a real server; this keeps the expression from being flattened in a
+    checkout with no PostgreSQL to hand."""
+    sql = infra_monitor._QUEUE_SNAPSHOT_SQL
+    assert (
+        "CASE WHEN a.state = 'active' THEN a.created_at\n"
+        "                         ELSE a.updated_at END" in sql
+    )

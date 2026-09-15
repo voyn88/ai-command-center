@@ -95,6 +95,13 @@ class QueueSnapshot:
     #: Age of the oldest claim under a live lease. Bounded by
     #: ``--max-claim-seconds``, never by ``--max-stalled-seconds``.
     live_claim_age_seconds: float | None = None
+    #: How long since the fleet last CHANGED what it was holding -- took an
+    #: item (a claim) or gave one back (an attempt leaving ``active``). It is
+    #: the only thing in this snapshot that measures the LANES rather than the
+    #: work, and ``evaluate`` uses it to bound how long due ready work can be
+    #: said to have been ignored. ``None`` when the queue has no attempts at
+    #: all: no evidence either way, so it bounds nothing.
+    fleet_idle_seconds: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,10 +151,11 @@ def discover_worker_units() -> dict[str, str]:
 #
 # WHAT THIS STATEMENT DOES AND DOES NOT DECIDE
 # ---------------------------------------------------------------------------
-# It sorts pending work into three DISJOINT classes and times each one. It
-# does not decide which of them is stalled: that needs the fleet's claim
-# capacity, which lives in `evaluate` because the database cannot know how
-# many worker lanes are running.
+# It sorts pending work into three DISJOINT classes and times each one, and
+# separately times the FLEET -- how long since any lane took an item or gave
+# one back. It does not decide which of them is stalled: that needs the
+# fleet's claim capacity, which lives in `evaluate` because the database
+# cannot know how many worker lanes are running.
 #
 #   * READY AND DUE (`available_at <= now()`) -- claimable this second by any
 #     free lane; `queue_claim` takes the oldest such row with no repository or
@@ -181,6 +189,14 @@ def discover_worker_units() -> dict[str, str]:
 # surplus row sits ready and due for a whole attempt. Hence the counts below
 # and the capacity comparison in `evaluate`: a due ready item is a stall only
 # when a lane was free to take it.
+#
+# And neither was THAT sufficient, because capacity gates the comparison while
+# the ready row's clock keeps running underneath it (monitor_finding #2471).
+# By the time a lane frees, the item it is about to claim has been due for
+# hours, and for the moment before that claim commits the probe sees due work
+# with a free lane and calls the fleet's own backpressure a stall. The last
+# column below is what bounds it: the fleet's own clock, so that "ignored"
+# cannot outlast "there was somebody ignoring it".
 _QUEUE_SNAPSHOT_SQL = """
     WITH pending AS (
         SELECT
@@ -235,7 +251,29 @@ _QUEUE_SNAPSHOT_SQL = """
         count(*) FILTER (WHERE attended),
         extract(epoch FROM (
             now() - min(updated_at) FILTER (WHERE attended)
-        ))
+        )),
+        -- HOW LONG SINCE THE FLEET LAST MOVED. Occupancy changes at exactly
+        -- two events, and `work_attempt` timestamps both: a claim (the row is
+        -- inserted with `created_at = now()`, state 'active') and an attempt
+        -- leaving 'active' -- completed, failed, or expired by the reaper --
+        -- which stamps `updated_at = now()`. So the most recent of those two
+        -- is the last moment the fleet took work or gave it back.
+        --
+        -- HEARTBEATS ARE DELIBERATELY EXCLUDED, and the CASE is what excludes
+        -- them: `queue_heartbeat` also writes `updated_at = now()`, but on a
+        -- row that is still 'active'. A renewed lease says a lane is alive,
+        -- not that it was free to take anything, so reading `updated_at` for
+        -- an active attempt would make a single heartbeating lane look like a
+        -- fleet claiming continuously.
+        --
+        -- NULL when no attempt has ever been made, which is the honest answer
+        -- for a queue nothing has ever claimed: `evaluate` then bounds
+        -- nothing, and a ready item nobody has ever picked up is timed from
+        -- its own due age alone.
+        (SELECT extract(epoch FROM (now() - max(
+                    CASE WHEN a.state = 'active' THEN a.created_at
+                         ELSE a.updated_at END)))
+           FROM work_attempt_public a)
     FROM classified
 """
 
@@ -263,6 +301,7 @@ def snapshot_from_row(row: tuple[Any, ...]) -> QueueSnapshot:
         lapsed_claim_age,
         attended_claims,
         live_claim_age,
+        fleet_idle,
     ) = row
 
     def seconds(value: Any) -> float | None:
@@ -283,6 +322,7 @@ def snapshot_from_row(row: tuple[Any, ...]) -> QueueSnapshot:
         lapsed_claim_age_seconds=seconds(lapsed_claim_age),
         attended_claims=int(attended_claims),
         live_claim_age_seconds=seconds(live_claim_age),
+        fleet_idle_seconds=seconds(fleet_idle),
     )
 
 
@@ -360,12 +400,48 @@ def evaluate(
         # 0 would otherwise mean "no lane can ever claim", which would excuse
         # every unclaimed item forever.
         spare_capacity = queue.attended_claims < max(claim_capacity, 1)
+        # HOW LONG THE DUE READY WORK HAS ACTUALLY BEEN IGNORED, which is not
+        # how long it has been due. The capacity test above gates the
+        # COMPARISON but not the CLOCK, and the queue is designed to hold work
+        # no lane can attend yet, so that clock runs for hours while the fleet
+        # is legitimately full. The moment occupancy drops -- the instant
+        # between one attempt committing its result and the next claim, a lane
+        # restarting under a self-deploy tick (every 5 minutes), a drain
+        # finishing -- the same hours-old number is compared against 900s and
+        # the probe reports a stall that was never true. The timer samples
+        # every two minutes, so this is not a race that might happen: it is
+        # the `queue_stalled` this fleet mints over and over at an attempt
+        # boundary, against lanes that are doing exactly their job.
+        #
+        # An item is only being ignored while there is somebody to ignore it,
+        # so the wait is bounded by how long THE FLEET has been standing
+        # still. A fleet that took or handed back an item a second ago is
+        # serving this queue, and `queue_claim` hands out the oldest due row
+        # first, so the item being timed is next in line -- it is behind
+        # capacity, not behind a broken lane. A fleet that has not moved at
+        # all for the whole stall window has no such answer, and the clock
+        # runs in full.
+        #
+        # WHAT THIS GIVES UP: a lane claiming a steady stream of work that
+        # OUTRANKS the waiting item (`queue_claim` orders by priority first,
+        # and `_review_enqueue` uses 100 against `backlog_dispatch`'s 0) keeps
+        # the fleet clock fresh while the low-priority item waits. That is
+        # priority starvation -- the queue serving its own policy -- and it
+        # wants its own failure code, not a `queue_stalled` task that sends
+        # the fleet looking for a stopped lane.
+        ready_due_starved = queue.ready_due_age_seconds
+        if ready_due_starved is not None and queue.fleet_idle_seconds is not None:
+            ready_due_starved = min(ready_due_starved, queue.fleet_idle_seconds)
         # STARVED = pending work nobody is accountable for AND nobody is
         # merely too busy for. A lapsed claim is starved at any capacity: no
-        # lane is holding it, so no lane being free is irrelevant to it.
+        # lane is holding it, so no lane being free is irrelevant to it -- and
+        # for the same reason the fleet clock does not bound it either. A
+        # neighbouring lane claiming away beside a zombie says nothing about
+        # the zombie; only the reaper does, and the lapse age is what measures
+        # whether `aicc-queue-reaper.timer` (every minute) is still recovering.
         starved_ages = [queue.lapsed_claim_age_seconds]
         if spare_capacity:
-            starved_ages.append(queue.ready_due_age_seconds)
+            starved_ages.append(ready_due_starved)
         measured = [age for age in starved_ages if age is not None]
         # The oldest starved item, or None when nothing is starved. Counts are
         # not consulted: each age comes from the same filter as its count and

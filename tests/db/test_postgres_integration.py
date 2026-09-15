@@ -407,22 +407,41 @@ def test_execute_grants_match_the_declared_protocol_steps(
     `role_table_grants` does not report `EXECUTE`, so the matrix test above is
     blind to exactly the grants that carry the claim protocol: every function
     could be granted to everyone and it would still pass.
+
+    Declared signatures resolve to catalog functions by NAME AND ARITY
+    (`roles._function_key` against `pg_proc.pronargs`), never by name alone.
+    0024's `monitor_clear_finding(text, text[])` is this schema's first
+    overload, and a name-prefix match calls both declared forms ambiguous and
+    both granted overloads surplus on a schema that is exactly compliant --
+    this test failed on a correct database rather than catching an incorrect
+    one. `tests/db/test_grant_compliance.py` and `roles.render_table_grants`
+    key the same way, and they have to: a resolver that disagrees with the one
+    rendering the GRANT either skips a grant silently (an outage the next
+    deploy inherits) or emits one for a function that does not exist, which
+    aborts the whole matrix -- it is applied in a single transaction.
     """
     _provision(admin_conn, psycopg, test_dsn, role_passwords)
 
     with admin_conn.cursor() as cur:
         cur.execute(
-            "SELECT p.proname || '(' || pg_get_function_arguments(p.oid) || ')' "
+            "SELECT p.proname || '(' || pg_get_function_arguments(p.oid) || ')', "
+            "       p.proname, p.pronargs "
             "FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
             "WHERE n.nspname = 'public'"
         )
-        all_functions = [row[0] for row in cur.fetchall()]
+        catalog = cur.fetchall()
+    all_functions = [rendered for rendered, _name, _arity in catalog]
+    # Arity comes from `pronargs` rather than from counting commas in the
+    # rendered argument list: a default expression may contain one
+    # (`DEFAULT '{}'::jsonb` does not, but nothing stops the next one).
+    by_key: dict[str, list[str]] = {}
+    for rendered, name, arity in catalog:
+        by_key.setdefault(f"{name}/{arity}", []).append(rendered)
 
     for role in (roles.APP_ROLE, roles.WORKER_ROLE):
         expected = set()
         for signature in roles.FUNCTION_PRIVILEGES.get(role, ()):
-            name = signature.split("(")[0]
-            matches = [f for f in all_functions if f.startswith(f"{name}(")]
+            matches = by_key.get(roles._function_key(signature), [])
             assert len(matches) == 1, f"{signature} does not identify one function"
             expected.add(matches[0])
 

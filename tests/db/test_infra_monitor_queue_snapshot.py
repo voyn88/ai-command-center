@@ -307,6 +307,11 @@ def test_due_work_behind_a_full_fleet_is_queued_not_stalled(monitor) -> None:
         "UPDATE work_item SET updated_at = now() - interval '1 hour', "
         "available_at = now() - interval '1 hour' WHERE state = 'ready'"
     )
+    # Both lanes took their work an hour ago, which is what makes the third
+    # lane's idleness an hour long in the `claim_capacity=3` reading below.
+    # Without this the claims are seconds old and the fleet clock -- rightly
+    # -- says nothing has been ignored for any length of time at all.
+    age("UPDATE work_attempt SET created_at = now() - interval '1 hour'")
 
     snapshot = measure()
     assert (snapshot.attended_claims, snapshot.lapsed_claims) == (2, 0)
@@ -341,3 +346,114 @@ def test_the_monitor_reads_the_lease_through_the_redacted_view(monitor) -> None:
     assert roles.VIEW_PRIVILEGES[roles.APP_ROLE]["work_attempt_public"] == frozenset(
         {"SELECT"}
     )
+
+
+def test_the_boundary_between_two_attempts_is_not_an_hour_old_stall(monitor) -> None:
+    """THE THIRD REGRESSION (monitor_finding #2471), against the server that
+    produces the shape.
+
+    The fleet is full and an item has been due for an hour behind it --
+    legitimate backpressure, green while both leases are live. Then one lane
+    commits its result. For the moment before its next claim commits, the
+    probe sees a free lane and an hour-old due item, and capacity no longer
+    excuses it: that is the boundary every attempt ends at, sampled by a
+    2-minute timer.
+
+    The fleet clock is what closes it. `queue_complete` moved an attempt out
+    of 'active' a moment ago, so the fleet handed work back a moment ago, and
+    nothing here has been ignored for an hour."""
+    measure, app, worker, age = monitor
+    claims = []
+    for key in ("lane-one", "lane-two"):
+        app.enqueue(QUEUE, idempotency_key=key, payload={"kind": "agent_run"})
+        claims.append(_claim(worker))
+    app.enqueue(QUEUE, idempotency_key="queued", payload={"kind": "agent_run"})
+    age(
+        "UPDATE work_item SET updated_at = now() - interval '1 hour', "
+        "available_at = now() - interval '1 hour' WHERE state = 'ready'"
+    )
+    age("UPDATE work_attempt SET created_at = now() - interval '1 hour'")
+
+    full_fleet = measure()
+    assert (full_fleet.attended_claims, full_fleet.ready_due) == (2, 1)
+    assert full_fleet.ready_due_age_seconds > MAX_STALLED
+    assert infra_monitor.evaluate(
+        {}, full_fleet, minimum_active_workers=0, max_stalled_seconds=MAX_STALLED,
+        prometheus_ready=True, claim_capacity=2,
+    ).ok
+
+    # The lane finishes. Its loop claims again immediately, but the result
+    # commits first -- and this is that instant.
+    assert worker.complete(claims[0], {"ok": True}) is True
+
+    boundary = measure()
+    assert boundary.attended_claims == 1
+    # The item has still been due for an hour: the clock the old check read
+    # is unchanged, and on its own it is still far past the window.
+    assert boundary.ready_due_age_seconds > MAX_STALLED
+    # What changed is that the fleet moved, and it moved just now.
+    assert boundary.fleet_idle_seconds is not None
+    assert boundary.fleet_idle_seconds < 60
+
+    report = infra_monitor.evaluate(
+        {}, boundary, minimum_active_workers=0, max_stalled_seconds=MAX_STALLED,
+        prometheus_ready=True, claim_capacity=2,
+    )
+    assert report.ok, report.failures
+
+
+def test_a_heartbeat_is_not_the_fleet_taking_work(monitor) -> None:
+    """The fleet clock must not be renewable by the lane it is measuring.
+    `queue_heartbeat` writes `updated_at = now()` on an attempt that stays
+    'active', so a statement reading `updated_at` unconditionally would let
+    one lane renewing one lease report a fleet claiming continuously -- and a
+    clock a stalled fleet can wind forward excuses every stall there is.
+
+    Here one lane has held its claim for an hour and beats right now, while a
+    second item has been due for an hour with a lane free. The fleet has taken
+    nothing and handed nothing back in that hour, and the probe says so."""
+    measure, app, worker, age = monitor
+    app.enqueue(QUEUE, idempotency_key="long-run", payload={"kind": "agent_run"})
+    claimed = _claim(worker)
+    app.enqueue(QUEUE, idempotency_key="ignored", payload={"kind": "agent_run"})
+    age(
+        "UPDATE work_item SET updated_at = now() - interval '1 hour', "
+        "available_at = now() - interval '1 hour' WHERE state = 'ready'"
+    )
+    age("UPDATE work_attempt SET created_at = now() - interval '1 hour'")
+    assert worker.heartbeat(claimed) is True
+
+    snapshot = measure()
+    assert (snapshot.attended_claims, snapshot.ready_due) == (1, 1)
+    assert snapshot.fleet_idle_seconds is not None
+    # An hour, not the fraction of a second since the heartbeat.
+    assert snapshot.fleet_idle_seconds > MAX_STALLED
+
+    report = infra_monitor.evaluate(
+        {}, snapshot, minimum_active_workers=0, max_stalled_seconds=MAX_STALLED,
+        prometheus_ready=True, claim_capacity=2,
+    )
+    assert "queue_stalled" in report.failures
+
+
+def test_a_queue_no_lane_has_ever_claimed_from_has_no_fleet_clock(monitor) -> None:
+    """`max()` over an empty `work_attempt` is NULL, and that is the honest
+    answer for a fleet that never started: no lane has ever demonstrated it
+    could take anything. `evaluate` then bounds nothing, so the ready item is
+    timed from its own due age and
+    `test_a_ready_item_nobody_claims_is_still_a_stall` keeps its verdict."""
+    measure, app, _worker, age = monitor
+    app.enqueue(QUEUE, idempotency_key="never-claimed", payload={"kind": "agent_run"})
+    age(
+        "UPDATE work_item SET updated_at = now() - interval '30 minutes', "
+        "available_at = now() - interval '30 minutes'"
+    )
+
+    snapshot = measure()
+    assert snapshot.fleet_idle_seconds is None
+
+    report = infra_monitor.evaluate(
+        {}, snapshot, minimum_active_workers=0, max_stalled_seconds=MAX_STALLED,
+        prometheus_ready=True,
+    )
+    assert "queue_stalled" in report.failures
