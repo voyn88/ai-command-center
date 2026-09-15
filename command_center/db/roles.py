@@ -578,6 +578,11 @@ _APP_BACKLOG_FUNCTIONS = (
     # evidence (0018); the pr-evidence check is the gate, so granting it
     # does not grant a generic READY_TO_REVIEW unstick.
     "backlog_recover_stuck_ready_to_review(text)",
+    # OPEN -> DONE for a remediation task whose parent's work is already
+    # merged (0025, VOYN-W0-AICC-DISPATCH-REUSE-GATE). The remediation
+    # lineage and the OPEN-only rule are the gate, so granting it does not
+    # grant a generic "close any task".
+    "backlog_close_superseded(text, text, text, text, text)",
     # The persisted scan cursor for the tick windows (0015): returns this
     # tick's offset and advances atomically per invocation.
     "backlog_scan_claim(text, text, text)",
