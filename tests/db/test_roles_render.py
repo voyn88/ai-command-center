@@ -299,6 +299,9 @@ def test_the_control_plane_cannot_claim() -> None:
         # scan cursor for the tick windows.
         "backlog_scan_claim",
         "backlog_triage",
+        # VOYN-W0-AICC-BGE-M3-DEDUP-SCAN (0025): the same 'duplicate' decision
+        # one state over — OPEN -> DECIDED, with the canonical task named.
+        "backlog_mark_duplicate",
         # 0021: read-only deploy preflight with dispatch's privileges; the
         # task-class setter (split children, monitor tasks); and the
         # monitor-finding pair the control-host probe uses.
