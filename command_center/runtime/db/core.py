@@ -650,8 +650,10 @@ def resolve_timestamp_zone(db_path: Path) -> tuple[str | None, str]:
     `"process-local"`).
 
     `AICC_RUNTIME_TZ` wins so an operator can state the truth for a database
-    stamped on the wrong machine; an unusable value raises rather than falling
-    back, because a wrong zone here silently changes which rows get deleted.
+    stamped on the wrong machine — or declare `UTC` to retire the legacy
+    reading entirely once the file holds no pre-switchover rows (see
+    `retention_cutoff`). An unusable value raises rather than falling back,
+    because a wrong zone here silently changes which rows get deleted.
 
     A `"UTC"` answer means the file has no pre-UTC rows at all. Any other zone
     means it has some, and says how to read them; rows written after the
@@ -730,6 +732,15 @@ def retention_cutoff(db_path: Path, *, retention_days: int) -> tuple[str, str, s
     that offset *longer* than the configured window. A file stamped `"UTC"`
     (anything this code created) has one candidate in effect and gets the
     window exactly.
+
+    That cost does not expire on its own — the ledger records which zone the
+    legacy rows are on, never when the last one was written, so the second
+    candidate keeps being rendered long after they have aged out. An operator
+    who knows the file holds no pre-switchover rows any more retires the legacy
+    reading with `AICC_RUNTIME_TZ=UTC`, which makes both candidates the same
+    string and restores the exact window. It is deliberately their call and not
+    an inference: the wrong guess here deletes rows early and irreversibly,
+    which is the whole reason this function is conservative by default.
 
     With no declared zone at all (a database that predates migration 24 and has
     not been migrated since) the process clock is the only guess available for

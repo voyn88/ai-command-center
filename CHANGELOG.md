@@ -59,7 +59,12 @@ functional application milestones of `app.py`.
   that offset. A file this code created is stamped `"UTC"` and gets the window
   exactly; `migrate()` stamps the host's local zone for a file that already had
   a schema, precisely so its legacy rows stay readable. A retention report
-  names the clock that judged the rows (`utc-floor` when UTC's bound won).
+  names the clock that judged the rows (`utc-floor` when UTC's bound won). The
+  ledger records *which* zone the legacy rows are on, never when the last one
+  was written, so the second candidate does not retire itself: an operator who
+  knows the file holds no pre-switchover rows any more sets
+  `AICC_RUNTIME_TZ=UTC` to restore the exact window. Deliberately their call —
+  guessing it deletes rows early and irreversibly.
 
 ### Fixed — Control ticks have their own GitHub quota (`VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS`)
 - `command_center/orchestrator/gh_access.py`: every `gh` call the review,
