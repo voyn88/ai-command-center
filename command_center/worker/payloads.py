@@ -22,6 +22,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from command_center.agent_runner import MAX_TIMEOUT_SECONDS, MIN_TIMEOUT_SECONDS
+from command_center.authority_preflight import (
+    AuthorityDeclarationError,
+    normalize_authorities,
+)
 
 __all__ = ["AgentRunRequest", "PayloadError", "parse_agent_run"]
 
@@ -84,6 +88,15 @@ class AgentRunRequest:
     #: handler); absent keeps the historical behaviour byte-for-byte.
     review_head_pr_number: str | None = None
     review_head_sha: str | None = None
+    #: VOYN-W0-AICC-PRIVILEGED-TASK-ROUTED-TO-UNPRIVILEGED-EXECUTOR: the
+    #: authority this task needs beyond an ordinary unprivileged workspace
+    #: (root, a PostgreSQL session as a host role, an off-host credential),
+    #: DECLARED by the backlog record rather than guessed from the prompt --
+    #: see `command_center.authority_preflight` for why guessing was tried
+    #: three times and rejected three times. Empty is the historical
+    #: behaviour byte-for-byte: nothing declared, nothing probed, nothing
+    #: blocked.
+    required_authorities: tuple[str, ...] = ()
 
 
 def _string(payload: dict[str, Any], key: str) -> str | None:
@@ -170,6 +183,18 @@ def parse_agent_run(payload: dict[str, Any]) -> AgentRunRequest | PayloadError:
             reason=("backlog_task_id must use the canonical VOYN-... identifier format")
         )
 
+    # The authority declaration. A malformed one is a payload defect, not a
+    # default: silently treating it as "needs nothing" would dispatch a
+    # privileged task to an unprivileged executor while the author believed
+    # they had constrained it -- the incident itself, with a false audit
+    # trail on top. Non-retryable, like every other payload defect here.
+    try:
+        required_authorities = normalize_authorities(
+            payload.get("required_authorities")
+        )
+    except AuthorityDeclarationError as exc:
+        return PayloadError(reason=str(exc))
+
     # VOYN-W0-AICC-REVIEW-AUTO-ACCEPT: the head-pinned checkout request.
     # Absent is the historical behaviour; present but malformed is a payload
     # defect (non-retryable -- redelivery re-reads the same broken pin).
@@ -206,4 +231,5 @@ def parse_agent_run(payload: dict[str, Any]) -> AgentRunRequest | PayloadError:
         backlog_task_id=backlog_task_id,
         review_head_pr_number=review_head_pr_number,
         review_head_sha=review_head_sha,
+        required_authorities=required_authorities,
     )

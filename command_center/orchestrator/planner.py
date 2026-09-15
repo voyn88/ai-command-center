@@ -221,6 +221,7 @@ def _payload_for(
             "untrusted": False,
             "cascade": cascade,
             "backlog_task_id": task["task_id"],
+            "required_authorities": list(task.get("required_authorities") or ()),
             "mode": "split",
         }
         return payload, len(cascade)
@@ -244,7 +245,21 @@ def _payload_for(
         "after you exit.\n"
         "End your final message with a line of exactly this form so the "
         "orchestrator can record the evidence:\n"
-        "HEAD_SHA: <the branch head commit sha>"
+        "HEAD_SHA: <the branch head commit sha>\n"
+        # VOYN-W0-AICC-PRIVILEGED-TASK-ROUTED-TO-UNPRIVILEGED-EXECUTOR: the
+        # discovery half of the authority contract. The worker principal is
+        # unprivileged by design (ADR-0010), so an agent that needs root or a
+        # host PostgreSQL role cannot get it by trying harder -- and trying
+        # burned three cascade attempts per task on the restored queue
+        # (2026-08-30). Reporting it instead parks the task for the owner
+        # once, with the requirement recorded, so no later attempt repeats
+        # the discovery. Asked for as a strict one-line trailer with a closed
+        # vocabulary, exactly like HEAD_SHA above.
+        "If -- and only if -- the work genuinely cannot proceed without "
+        "authority this executor does not have, stop rather than retrying, "
+        "and end your final message with a line of exactly this form:\n"
+        "REQUIRES_AUTHORITY: <comma-separated, from: root, postgres_role, "
+        "external_credential>"
     ).strip()
     payload = {
         "kind": "agent_run",
@@ -257,6 +272,13 @@ def _payload_for(
         "untrusted": False,
         "cascade": cascade,
         "backlog_task_id": task["task_id"],
+        # VOYN-W0-AICC-PRIVILEGED-TASK-ROUTED-TO-UNPRIVILEGED-EXECUTOR: what
+        # this task needs beyond an unprivileged workspace, declared by the
+        # backlog record. The worker checks it against what it actually holds
+        # BEFORE launching a model (`worker.handlers._run_agent`), so a
+        # mismatch costs zero model calls and zero cascade attempts instead
+        # of the three it used to.
+        "required_authorities": list(task.get("required_authorities") or ()),
     }
     return payload, len(cascade)
 
@@ -429,11 +451,12 @@ class Planner:
 
             candidates = self._rows(
                 "SELECT task_id, wave, priority, title, body, repo, dispatchable, "
-                "       task_class "
+                "       task_class, required_authorities "
                 "FROM backlog_eligible"
             )
             for (
                 task_id, wave, priority, title, body, repo, dispatchable, task_class,
+                required_authorities,
             ) in candidates:
                 if len(report.dispatched) >= limits.max_dispatches_per_tick:
                     break
@@ -449,6 +472,12 @@ class Planner:
                     "title": title,
                     "body": body,
                     "repo": repo,
+                    # VOYN-W0-AICC-PRIVILEGED-TASK-ROUTED-TO-UNPRIVILEGED-
+                    # EXECUTOR: the declaration travels with the dispatch so
+                    # the worker can refuse before launching a model. `text[]`
+                    # arrives as a list; a pre-0025 row (or a driver that
+                    # hands back NULL) means "declares nothing".
+                    "required_authorities": list(required_authorities or ()),
                 }
                 if not dispatchable:
                     report.undispatchable.append((task_id, "no_repo"))
