@@ -608,6 +608,12 @@ _APP_BACKLOG_FUNCTIONS = (
 _WORKER_ENROLMENT_FUNCTIONS = (
     "identity_assert(text)",
     "identity_current_credential(text)",
+    # 0029: the same expiry question, answered for an expired credential inside
+    # the self-renewal grace too, with the instant renewal stops being possible.
+    # The grace itself (`enroll_self_grace()`) and the graced assert are not
+    # granted: the worker reaches them only through this SECURITY DEFINER
+    # function and `enroll_rotate_self`, so it cannot choose the window.
+    "identity_current_credential(text, boolean)",
     "enroll_rotate_self(text, text, text)",
 )
 
