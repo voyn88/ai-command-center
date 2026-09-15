@@ -169,6 +169,14 @@ class LoopReport:
     #: Fresh, bounded identities dispatched to replace succeeded review runs
     #: whose final result cannot be parsed for the current PR head.
     retried: list[tuple[str, str]] = field(default_factory=list)
+    #: (task_id, named_reason) -- this review cycle can no longer reach a
+    #: verdict on its own and no later tick will change that. Deliberately
+    #: NOT `skipped`: a skip means "come back next tick", and the live
+    #: 2026-09-06/07 stall (VOYN-W0-AICC-VERDICT-AGGREGATION-STALLS) was
+    #: invisible for two days precisely because a permanent dead end and an
+    #: ordinary wait printed the same line. Entries here are the "named
+    #: failure is recorded" half of this loop's contract.
+    stalled: list[tuple[str, str]] = field(default_factory=list)
     #: What this tick spent at GitHub and under which identity -- see
     #: `gh_access.GhQuota`. None when the report was built outside a tick
     #: scope (a unit test constructing one by hand).
@@ -1182,20 +1190,53 @@ def _latest_attempt(
     return max(candidates, key=lambda item: item[0]) if candidates else None
 
 
-def _next_retry_key(
+#: What the newest attempt under a review identity means for this tick.
+#: `_attempt_status` is the ONE place that classifies it, so the reconciler
+#: (which mints retries) and the publisher (which reports why no verdict
+#: exists) can never disagree about whether an identity still has a path
+#: forward -- the disagreement that let a permanently stuck review look
+#: identical to a still-running one.
+_ATTEMPT_VALID = "valid"          #: a verdict for the expected head exists
+_ATTEMPT_PENDING = "pending"      #: still queued/claimed; the queue will finish it
+_ATTEMPT_RETRYABLE = "retryable"  #: terminal but malformed, attempt budget remains
+_ATTEMPT_EXHAUSTED = "exhausted"  #: terminal, malformed, attempt budget spent
+_ATTEMPT_DEAD = "dead"            #: dead-lettered; the queue will never redeliver it
+
+#: Statuses no further tick can change. An identity in one of these will
+#: never produce a verdict, so reporting it as "waiting" is a lie that
+#: reads, tick after tick, exactly like healthy progress.
+_TERMINAL_ATTEMPT_STATUSES = frozenset({_ATTEMPT_EXHAUSTED, _ATTEMPT_DEAD})
+
+
+def _attempt_status(
     factory: Any, task_id: str, base_key: str, expected_head: str
-) -> str | None:
+) -> tuple[int, str] | None:
+    """``(attempt, status)`` for the newest attempt under ``base_key``, or
+    None when no attempt exists at all. See `_ATTEMPT_VALID` and friends."""
     latest = _latest_attempt(factory, task_id, base_key)
     if latest is None:
         return None
     attempt, state, payload_value = latest
-    if state != "succeeded" or attempt >= _MAX_RESULT_RETRY_ATTEMPTS:
-        return None
+    if state == "dead":
+        return attempt, _ATTEMPT_DEAD
+    if state != "succeeded":
+        return attempt, _ATTEMPT_PENDING
     result = _json_object(payload_value)
     parsed = _parse_verdict((result or {}).get("result_text") or "")
     if parsed is not None and parsed[1] == expected_head:
+        return attempt, _ATTEMPT_VALID
+    if attempt >= _MAX_RESULT_RETRY_ATTEMPTS:
+        return attempt, _ATTEMPT_EXHAUSTED
+    return attempt, _ATTEMPT_RETRYABLE
+
+
+def _next_retry_key(
+    factory: Any, task_id: str, base_key: str, expected_head: str
+) -> str | None:
+    status = _attempt_status(factory, task_id, base_key, expected_head)
+    if status is None or status[1] != _ATTEMPT_RETRYABLE:
         return None
-    return f"{base_key}:retry:{attempt + 1}"
+    return f"{base_key}:retry:{status[0] + 1}"
 
 
 def _latest_attempt_executor(factory: Any, task_id: str, base_key: str) -> str | None:
@@ -1243,6 +1284,49 @@ def _failover_cascade(
     return preferred + deprioritized
 
 
+def _merge_base_sha(
+    repo_path: str, owner: str, repo: str, base_ref_sha: str, head_sha: str
+) -> str | None:
+    """The merge base of the PR's base branch and its head -- the commit the
+    PR is actually diffed against.
+
+    `pulls/{n}` reports `base.sha` as the base BRANCH TIP, which moves every
+    time anything unrelated merges to main. The three-dot `compare` endpoint
+    already diffs against the merge base internally, so that mobility never
+    showed up in the diff text -- but `_review_key` embeds `snapshot.base`,
+    and every chunk's `review_chunk.base_sha` metadata records it too. So on
+    a busy repo the SAME review cycle got a new identity on every tick: the
+    chunk runs that had already succeeded were filed under the previous
+    tip's key prefix, `_chunk_review_rows` looked under the new prefix and
+    found nothing, and `publish_review_verdicts` reported
+    `no_review_result_yet` (or, once chunks did land, aggregated them
+    against a base sha their metadata no longer matched) while `review_once`
+    enqueued the whole review again under the newest prefix. That is the
+    live 2026-09-06/07 stall on PR 649 -- every chunk review succeeded, none
+    of them ever aggregated, and the acceptance marker only posted by hand.
+
+    The merge base does not move while the PR's head does not move, so the
+    review identity is stable for as long as the thing being reviewed is.
+    Costs one extra `gh api` round-trip per PR snapshot; `per_page=1` keeps
+    the response body small (the `files`/`commits` arrays this never reads
+    are what make a compare response large), and `merge_base_commit` is
+    top-level, so it is present regardless of pagination.
+
+    Returns None -- which fails the whole snapshot closed -- if the probe
+    fails or reports anything but a 40-hex sha."""
+    probe = _gh(
+        ["api", f"repos/{owner}/{repo}/compare/{base_ref_sha}...{head_sha}?per_page=1"],
+        repo_path,
+    )
+    if probe.returncode != 0:
+        return None
+    try:
+        sha = json.loads(probe.stdout or "{}")["merge_base_commit"]["sha"]
+    except (KeyError, TypeError, AttributeError, json.JSONDecodeError):
+        return None
+    return sha if isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}", sha) else None
+
+
 def _pr_diff_and_head(
     repo_path: str, pr_url: str, pull: dict[str, Any] | None = None
 ) -> _PRSnapshot | None:
@@ -1256,6 +1340,11 @@ def _pr_diff_and_head(
     `--repo` argument and read PRs from other, unrelated repositories with no
     shell-escape needed at all -- a risk that scoping the Bash pattern more
     tightly cannot close, but never granting Bash to begin with does.
+    The snapshot's ``base`` is the MERGE BASE of the PR, not the base
+    branch's current tip: see `_merge_base_sha` for why that distinction is
+    the difference between a review identity that survives an unrelated
+    merge to main and one that does not.
+
     Returns None on any malformed or cross-repository response."""
     parsed = _owner_repo_number_from_pr_url(pr_url)
     if parsed is None:
@@ -1268,14 +1357,17 @@ def _pr_diff_and_head(
         else:
             data = pull
         base, head = data["base"], data["head"]
-        base_sha, head_sha = base["sha"], head["sha"]
+        base_ref_sha, head_sha = base["sha"], head["sha"]
         same_repo = base["repo"]["full_name"].casefold() == f"{owner}/{repo}".casefold()
         stats = tuple(data[name] for name in ("changed_files", "additions", "deletions"))
     except (KeyError, TypeError, AttributeError, json.JSONDecodeError):
         return None
-    if (not same_repo or not re.fullmatch(r"[0-9a-f]{40}", base_sha)
+    if (not same_repo or not re.fullmatch(r"[0-9a-f]{40}", base_ref_sha)
             or not re.fullmatch(r"[0-9a-f]{40}", head_sha)
             or not all(type(value) is int and value >= 0 for value in stats)):
+        return None
+    base_sha = _merge_base_sha(repo_path, owner, repo, base_ref_sha, head_sha)
+    if base_sha is None:
         return None
     diff = _gh(["api", f"repos/{owner}/{repo}/compare/{base_sha}...{head_sha}",
                 "-H", "Accept: application/vnd.github.v3.diff"], repo_path)
@@ -1656,6 +1748,12 @@ def reconcile_review_once(
             continue
         project_id, repository_path = route
         retries_before = actions
+        # Chunks with no path forward, named by the same vocabulary
+        # `_aggregate_chunk_verdict` reports them under. This tick is where
+        # exhaustion becomes knowable -- it is the thing that decides not to
+        # mint another attempt -- so it is where saying so costs nothing.
+        dead_chunks: list[int] = []
+        exhausted_chunks: list[int] = []
         for chunk in chunks:
             if actions >= cfg.max_per_tick:
                 break
@@ -1665,11 +1763,16 @@ def reconcile_review_once(
             if base_key is None:
                 report.skipped.append((current_task_id, "review_chunk_key_invalid"))
                 continue
-            retry_key = _next_retry_key(
+            status = _attempt_status(
                 factory, current_task_id, base_key, snapshot.head
             )
-            if retry_key is None:
+            if status is None or status[1] != _ATTEMPT_RETRYABLE:
+                if status is not None and status[1] == _ATTEMPT_DEAD:
+                    dead_chunks.append(chunk.index)
+                elif status is not None and status[1] == _ATTEMPT_EXHAUSTED:
+                    exhausted_chunks.append(chunk.index)
                 continue
+            retry_key = f"{base_key}:retry:{status[0] + 1}"
             prompt = _render_review_prompt(current_task_id, pr_url, snapshot, chunk)
             if _prompt_size_bytes(prompt) > _MAX_REVIEW_PROMPT_BYTES:
                 report.skipped.append((current_task_id, "review_prompt_budget_invalid"))
@@ -1697,7 +1800,15 @@ def reconcile_review_once(
             enqueue(cfg.queue, retry_key, payload, current_task_id, len(retry_cascade))
             report.retried.append((current_task_id, retry_key))
             actions += 1
-        if actions == retries_before:
+        if dead_chunks:
+            report.stalled.append(
+                (current_task_id, f"review_chunk_dead:{dead_chunks}")
+            )
+        elif exhausted_chunks:
+            report.stalled.append(
+                (current_task_id, f"review_chunk_retries_exhausted:{exhausted_chunks}")
+            )
+        elif actions == retries_before:
             report.skipped.append(
                 (current_task_id, "no_malformed_review_result_eligible_for_retry")
             )
@@ -1779,20 +1890,27 @@ def _chunk_review_rows(
         "ORDER BY i.idempotency_key",
         (task_id, prefix, prefix),
     )
+    # Each selected row carries its own attempt number as a fifth element.
+    # `_aggregate_chunk_verdict` needs it to tell "this chunk has not
+    # produced a verdict YET" from "this chunk has spent its whole retry
+    # budget and never will" -- and the row it is reading is already either
+    # the first valid attempt (in which case the number is moot) or the
+    # newest one (in which case it is exactly the attempt the reconciler
+    # would try to advance), so no second query is needed to find out.
     newest: dict[str, tuple[int, tuple[Any, ...]]] = {}
     first_valid: dict[str, tuple[int, tuple[Any, ...]]] = {}
     for row in rows:
         base_key, attempt = _retry_attempt(row[0])
         current = newest.get(base_key)
         if current is None or attempt > current[0]:
-            newest[base_key] = (attempt, (base_key, *row[1:]))
+            newest[base_key] = (attempt, (base_key, *row[1:], attempt))
         result = _json_object(row[3])
         parsed = _parse_verdict((result or {}).get("result_text") or "")
         valid = first_valid.get(base_key)
         if parsed is not None and parsed[1] == snapshot.head and (
             valid is None or attempt < valid[0]
         ):
-            first_valid[base_key] = (attempt, (base_key, *row[1:]))
+            first_valid[base_key] = (attempt, (base_key, *row[1:], attempt))
     selected = {
         base_key: first_valid.get(base_key, newest[base_key])
         for base_key in newest
@@ -1800,13 +1918,48 @@ def _chunk_review_rows(
     return prefix, [selected[key][1] for key in sorted(selected)]
 
 
+#: `_aggregate_chunk_verdict`'s verdict for "no further tick can change
+#: this, and it is not a verdict" -- a chunk that spent its retry budget or
+#: was dead-lettered. Distinct from "WAIT" on purpose: WAIT means come back
+#: next tick, and a caller that cannot tell the two apart re-enqueues a
+#: review that can never conclude, forever, reporting nothing an operator
+#: would read as a failure (VOYN-W0-AICC-VERDICT-AGGREGATION-STALLS).
+_VERDICT_STALLED = "STALLED"
+
+
 def _aggregate_chunk_verdict(
     rows: list[tuple[Any, ...]], snapshot: _PRSnapshot, prefix: str
 ) -> tuple[str, str]:
-    indexed: dict[int, tuple[str, str, dict[str, Any] | None, str]] = {}
+    """Fold per-chunk review results into one verdict for the PR.
+
+    Returns ``(verdict, text)`` where verdict is ACCEPT, REJECT, WAIT, or
+    `_VERDICT_STALLED`. Pure and total: the same rows and snapshot always
+    produce the same answer, so a caller may re-run it every tick and a
+    retried tick can never post a different marker than the one before it.
+
+    Precedence, in order:
+
+    1. a structurally invalid/inconsistent manifest -> WAIT (fail closed;
+       nothing here is trustworthy enough to act on);
+    2. a decisive REJECT from ANY chunk whose verdict matches the current
+       head -> REJECT. This outranks every stuck-chunk signal below: a
+       REJECT is already the fail-closed answer, and an unrelated chunk
+       having exhausted its retries is no reason to discard it. Ordering
+       these the other way round turned "one chunk rejected, one chunk gave
+       up" into a WAIT that, because the exhausted chunk's attempt count
+       can never rise again, never resolved -- a fresh instance of the very
+       stall this function was being fixed for (review of PR 792);
+    3. a chunk that can never produce a verdict -> `_VERDICT_STALLED` with
+       the offending indices named, so the tick records a failure instead
+       of skipping quietly;
+    4. chunks still missing or still running -> WAIT;
+    5. every chunk present, verified against the manifest and the diff
+       hash, and unanimously accepting -> ACCEPT.
+    """
+    indexed: dict[int, tuple[str, str, dict[str, Any] | None, str, int]] = {}
     expected_count: int | None = None
     expected_manifest: str | None = None
-    for key, state, payload_value, result_value in rows:
+    for key, state, payload_value, result_value, attempt in rows:
         payload = _json_object(payload_value)
         metadata = payload.get("review_chunk") if payload else None
         if not isinstance(metadata, dict) or metadata.get("version") != 3:
@@ -1846,7 +1999,10 @@ def _aggregate_chunk_verdict(
         content = envelope.get("content") if envelope else None
         if not isinstance(content, dict) or not isinstance(content.get("text"), str):
             return "WAIT", "review_chunk_manifest_invalid"
-        indexed[index] = (str(state), content_hash, _json_object(result_value), content["text"])
+        indexed[index] = (
+            str(state), content_hash, _json_object(result_value), content["text"],
+            attempt,
+        )
 
     if expected_count is None:
         return "WAIT", "review_chunks_missing"
@@ -1861,24 +2017,42 @@ def _aggregate_chunk_verdict(
 
     rejections: list[str] = []
     waiting_reason = ""
+    dead: list[int] = []
+    exhausted: list[int] = []
     for index in sorted(indexed):
-        state, _content_hash, result, _text = indexed[index]
+        state, _content_hash, result, _text, attempt = indexed[index]
         if state != "succeeded" or result is None:
+            if state == "dead":
+                # The queue exhausted this item's dispatch attempts and will
+                # never redeliver it, so "not succeeded yet" is false: it is
+                # never going to succeed under this identity.
+                dead.append(index)
             waiting_reason = waiting_reason or f"review_chunk_not_succeeded:{index}:{state}"
             continue
         text = result.get("result_text") or ""
         parsed = _parse_verdict(text)
         if parsed is None:
             waiting_reason = waiting_reason or f"review_chunk_verdict_missing:{index}"
-            continue
-        verdict, sha = parsed
-        if sha != snapshot.head:
+        elif parsed[1] != snapshot.head:
             waiting_reason = waiting_reason or f"review_chunk_head_sha_mismatch:{index}"
-            continue
-        if verdict == "REJECT":
+        elif parsed[0] == "REJECT":
             rejections.append(f"Chunk {index + 1}/{expected_count}:\n{text}")
+            continue
+        else:
+            continue
+        # Reached only when this chunk succeeded without a usable verdict:
+        # `reconcile_review_once` mints at most `_MAX_RESULT_RETRY_ATTEMPTS`
+        # fresh identities for that, and this is the attempt it would try to
+        # advance. Past the budget there is no attempt left to wait for.
+        if attempt >= _MAX_RESULT_RETRY_ATTEMPTS:
+            exhausted.append(index)
     if rejections:
+        # Step 2 above: decisive, and deliberately ahead of `dead`/`exhausted`.
         return "REJECT", "\n\n".join(rejections)
+    if dead:
+        return _VERDICT_STALLED, f"review_chunk_dead:{dead}"
+    if exhausted:
+        return _VERDICT_STALLED, f"review_chunk_retries_exhausted:{exhausted}"
     if not complete:
         missing = sorted(set(range(expected_count)) - set(indexed))
         return "WAIT", f"review_chunks_missing:{missing}"
@@ -2532,6 +2706,31 @@ def _post_auto_accept_audit(
     return posted.returncode == 0, True
 
 
+def _record_wait_or_stall(
+    report: LoopReport,
+    factory: Any,
+    task_id: str,
+    base_key: str,
+    expected_head: str,
+    reason: str,
+) -> None:
+    """Record ``reason`` against ``task_id`` as a wait or, when the single
+    (unchunked) review identity behind it can never produce a verdict, as a
+    named stall.
+
+    The unchunked path's counterpart to `_aggregate_chunk_verdict`'s
+    `_VERDICT_STALLED`: `no_review_result_yet` is an honest line on tick one
+    and a lie on tick five hundred, and only the attempt's status tells the
+    two apart. Costs one local query per reported task -- deliberately paid
+    only on the way to reporting, and invisible next to the `gh` round-trips
+    the same iteration already spent."""
+    status = _attempt_status(factory, task_id, base_key, expected_head)
+    if status is not None and status[1] in _TERMINAL_ATTEMPT_STATUSES:
+        report.stalled.append((task_id, f"review_result_{status[1]}:{reason}"))
+    else:
+        report.skipped.append((task_id, reason))
+
+
 def publish_review_verdicts(
     factory: Any,
     repo_path: str,
@@ -2631,6 +2830,9 @@ def publish_review_verdicts(
             verdict, text = _aggregate_chunk_verdict(
                 chunk_rows, snapshot, prefix or ""
             )
+            if verdict == _VERDICT_STALLED:
+                report.stalled.append((task_id, text))
+                continue
             if verdict == "WAIT":
                 report.skipped.append((task_id, text))
                 continue
@@ -2638,12 +2840,18 @@ def publish_review_verdicts(
         else:
             result = _latest_review_result(factory, task_id, key)
             if result is None:
-                report.skipped.append((task_id, "no_review_result_yet"))
+                _record_wait_or_stall(
+                    report, factory, task_id, key, current_head,
+                    "no_review_result_yet",
+                )
                 continue
             text = result.get("result_text") or ""
             parsed = _parse_verdict(text)
             if parsed is None:
-                report.skipped.append((task_id, "verdict_or_head_sha_missing_in_review_result"))
+                _record_wait_or_stall(
+                    report, factory, task_id, key, current_head,
+                    "verdict_or_head_sha_missing_in_review_result",
+                )
                 continue
             verdict, sha = parsed
             if sha != current_head:
@@ -2652,8 +2860,9 @@ def publish_review_verdicts(
                 # HEAD_SHA line rather than a stale-evidence race -- fail closed
                 # either way, never post a marker whose sha doesn't match what
                 # the agent said it reviewed.
-                report.skipped.append(
-                    (task_id, f"verdict_head_sha_mismatch: verdict says {sha}, head is {current_head}")
+                _record_wait_or_stall(
+                    report, factory, task_id, key, current_head,
+                    f"verdict_head_sha_mismatch: verdict says {sha}, head is {current_head}",
                 )
                 continue
         override_audit: tuple[str, str, str] | None = None
