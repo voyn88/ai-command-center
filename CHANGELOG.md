@@ -8,6 +8,47 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Added — The master backlog is rendered from the store (`VOYN-W0-BACKLOG-ORCHESTRATOR` BO-S4)
+- `command_center/db/backlog_projection.py` + `aicc-db backlog-project
+  --output <path>`: `VOYN_TASKS_BACKLOG.md` is now GENERATED from
+  `backlog_task` instead of only feeding it. Until now the import direction
+  existed alone, so every status the machine moved (planner dispatch, review
+  verdicts, merges) was invisible in the file its owner reads.
+- The projection and the importer are inverses, and that is the property
+  under test rather than a claim in a docstring: re-importing a rendered
+  file reports `changed == 0` against real PostgreSQL
+  (`test_export_then_reimport_is_a_fixed_point`), so a render can never
+  rewrite the store it came from. It holds for arbitrary `title`, `body` and
+  `repo` — record-shaped body lines, blank lines, edge whitespace,
+  `str.splitlines` boundaries and lone backslashes are carried by an escape
+  the parser owns; a value outside migration 0005's CHECK vocabularies is
+  refused (`UnrenderableTask`) rather than rendered into something that
+  reads back as a different record.
+- Stored `kind` and `repo` are written explicitly into a
+  `<!-- voyn:machine ... -->` comment under each record. Both were
+  previously RE-DERIVED on import — `kind` from the id's `-G<n>` suffix,
+  `repo` from the id's family or a `Target repo` body hint — and a
+  projection that leaned on those heuristics silently overwrote every row
+  whose stored value disagreed with the guess.
+- `command_center/projection_writer.py` now fsyncs the temp file before the
+  rename and the directory after it: `os.replace` alone protects a
+  concurrent reader, not a crash.
+- The rendered file serves BOTH readers of the master file: section 0B's
+  `VOYN_RECOMMENDATION` lines (what `backlog_client.parse_recommendations`
+  and the console's Master Backlog panel parse out of `AICC_MASTER_BACKLOG`)
+  and the `- **VOYN-…** |` records the importer reads. Rendering only the
+  latter over the path the panel reads would have blinded the panel.
+- Not wired to a schedule here: the master file lives on the owner's machine
+  and not on control-01 (the reason `ops/aicc_backlog_publish.py` pushes
+  rather than pulls), so where and how often it is rendered is an operator
+  decision, not one this change takes.
+- The two-way migration window has a recorded end date
+  (`TWO_WAY_WINDOW_ENDS`, 2026-12-01). Past it `backlog-import` says on
+  every run that it is the direction scheduled for removal; it does not
+  refuse, because stopping the only command that feeds the store on a
+  calendar date is an outage, not a migration.
+
+
 ### Fixed — Control ticks have their own GitHub quota (`VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS`)
 - `command_center/orchestrator/gh_access.py`: every `gh` call the review,
   merge and PR-window ticks make now runs under the `voyn-aicc-fleet` App's
