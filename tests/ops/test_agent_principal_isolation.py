@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import stat
 import struct
 import subprocess
@@ -1205,3 +1206,193 @@ def test_the_agent_layer_is_only_enabled_for_the_worker_profile():
         # The guard must still be open where the line sits: no `fi` may close
         # it between the two, or the line runs unconditionally after all.
         assert "\nfi\n" not in before[before.rindex(guard):]
+
+
+# ---------------------------------------------------------------------------
+# The control profile must not create what its own preflight refuses. The
+# first live control install did exactly that: `systemd-tmpfiles --create` was
+# applied straight from the repository, unconditionally, so it made
+# /var/lib/aicc-agent -- the first artefact the preflight above names -- and
+# the next control install on that host failed on evidence the previous one
+# had manufactured.
+# ---------------------------------------------------------------------------
+
+
+#: Repository configs the installer applies directly instead of through the
+#: transaction, and the target each one's content would be installed to.
+_DIRECT_CONFIG_APPLICATIONS = (
+    (
+        'systemd-sysusers "$repo_root/deploy/sysusers.d/aicc-agent.conf"',
+        "/usr/lib/sysusers.d/aicc-agent.conf",
+    ),
+    (
+        'systemd-tmpfiles --create "$repo_root/deploy/tmpfiles.d/aicc-agent.conf"',
+        "/usr/lib/tmpfiles.d/aicc-agent.conf",
+    ),
+    (
+        'systemd-sysusers "$repo_root/deploy/sysusers.d/aicc-control.conf"',
+        "/usr/lib/sysusers.d/aicc-control.conf",
+    ),
+)
+
+
+def _sits_behind(line: str, guard: str, text: str) -> bool:
+    """Is `line` inside a still-open `guard` branch?
+
+    Every profile guard in the installer starts at column 0, so a `fi`, `elif`
+    or `else` there closes the branch: a line after one of those runs under a
+    different condition than the guard, or under none at all.
+    """
+    assert line in text, f"{line} is not in the installer at all"
+    before = text[: text.rindex(line)]
+    if guard not in before:
+        return False
+    between = before[before.rindex(guard):]
+    return not any(close in between for close in ("\nfi\n", "\nelif ", "\nelse\n"))
+
+
+def test_control_profile_does_not_create_the_artefact_it_refuses():
+    """/var/lib/aicc-agent is refused by the control preflight and created by
+    the agent tmpfiles config. Applying that config unconditionally made the
+    first control install produce the proof the second one dies on."""
+    text = _installer_text()
+    tmpfiles = (
+        Path(__file__).parents[2] / "deploy" / "tmpfiles.d" / "aicc-agent.conf"
+    ).read_text(encoding="utf-8")
+
+    # The premise: this is the config that makes the refused artefact.
+    assert "/var/lib/aicc-agent" in tmpfiles
+    assert "control profile refuses: worker artefacts present:" in text
+
+    for line in (
+        'systemd-tmpfiles --create "$repo_root/deploy/tmpfiles.d/aicc-agent.conf"',
+        'systemd-sysusers "$repo_root/deploy/sysusers.d/aicc-agent.conf"',
+    ):
+        assert _sits_behind(line, 'if [ "$install_profile" = "worker" ]; then', text), (
+            f"{line} runs on a control host and creates the agent layer"
+        )
+
+
+def test_every_directly_applied_worker_config_is_profile_guarded(tmp_path):
+    """Standing test, not a patch for two known lines: the transaction can
+    exclude a target from the control set, but a config applied straight from
+    the repository bypasses that exclusion entirely. Any config whose content
+    belongs to a worker-only target must be guarded, so a fourth such
+    application cannot be added silently."""
+    tx, _targets = _specs("worker", tmp_path)
+    text = _installer_text()
+    worker_guard = 'if [ "$install_profile" = "worker" ]; then'
+
+    applied = re.findall(
+        r"^\s*(systemd-(?:sysusers|tmpfiles)[^\n]*\$repo_root[^\n]*)$",
+        text,
+        re.MULTILINE,
+    )
+    assert {line for line, _ in _DIRECT_CONFIG_APPLICATIONS} == set(applied), (
+        "a directly applied config was added or renamed without classifying it"
+    )
+    for line, target in _DIRECT_CONFIG_APPLICATIONS:
+        if target in tx.WORKER_ONLY_TARGETS:
+            assert _sits_behind(line, worker_guard, text), (
+                f"{line} installs worker-only content on every profile"
+            )
+        else:
+            assert not _sits_behind(line, worker_guard, text), (
+                f"{line} is profile-independent content locked to the worker"
+            )
+
+
+def test_control_identities_are_the_publisher_group_and_not_the_agent(tmp_path):
+    """A control host must get the group its own file set names and nothing
+    that belongs to the agent layer."""
+    text = _installer_text()
+    control = (
+        Path(__file__).parents[2] / "deploy" / "sysusers.d" / "aicc-control.conf"
+    ).read_text(encoding="utf-8")
+    _tx, targets = _specs("control", tmp_path)
+
+    assert "/etc/aicc/workspace-authority.env" in targets
+    assert "g aicc-publisher -" in control
+    directives = [
+        stripped
+        for stripped in (raw.strip() for raw in control.splitlines())
+        if stripped and not stripped.startswith("#")
+    ]
+    assert directives == ["g aicc-publisher -"]
+    assert _sits_behind(
+        'systemd-sysusers "$repo_root/deploy/sysusers.d/aicc-control.conf"',
+        'elif [ "$install_profile" = "control" ]; then',
+        text,
+    )
+
+
+def test_control_profile_does_not_need_the_agent_identity_to_exist(monkeypatch):
+    """The install resolves identities for real in prepare(). A fresh control
+    host has no `aicc-agent` group -- correctly -- so demanding the lookup
+    there would replace the credential failure with a bare KeyError."""
+    root = Path(__file__).parents[2]
+    monkeypatch.syspath_prepend(str(root / "ops"))
+    import aicc_install_transaction as tx
+
+    def only_publisher(name):
+        if name == "aicc-publisher":
+            return SimpleNamespace(gr_gid=4242)
+        raise KeyError(f"getgrnam(): name not found: {name}")
+
+    monkeypatch.setattr(tx.grp, "getgrnam", only_publisher)
+    specs = tx.default_specs(
+        root,
+        authority_env=root / "x-authority.env",
+        claude_auth=root / "x-claude.json",
+        codex_auth=root / "x-codex.json",
+        profile="control",
+    )
+
+    authority = [
+        spec for spec in specs if spec.target == "/etc/aicc/workspace-authority.env"
+    ]
+    assert [spec.gid for spec in authority] == [4242]
+    # The worker profile still requires it: the agent principal owns
+    # /etc/aicc/agent.env there, and guessing a gid would hand the agent's
+    # environment to whatever group id happened to be free.
+    with pytest.raises(KeyError, match="aicc-agent"):
+        tx.default_specs(
+            root,
+            authority_env=root / "x-authority.env",
+            claude_auth=root / "x-claude.json",
+            codex_auth=root / "x-codex.json",
+            profile="worker",
+        )
+
+
+def test_the_recovery_barrier_is_profile_independent_and_stays_unguarded():
+    """Do not "fix" the two unguarded `systemctl start
+    aicc-principal-recovery.service` calls by putting them behind the worker
+    guard. The unit that starts is emitted by the boot generator, whose anchor
+    is installed on every profile, into the early generator directory -- which
+    outranks /etc/systemd/system, so the worker-only file there is shadowed
+    even where it exists. Guarding the starts would drop the barrier on the
+    control plane for a failure that cannot happen."""
+    text = _installer_text()
+    generator = (
+        Path(__file__).parents[2] / "ops" / "aicc_principal_recovery_generator.py"
+    ).read_text(encoding="utf-8")
+
+    guard = 'if [ "$install_profile" = "worker" ]; then'
+
+    # The anchor install and the WAL resolution are profile-independent.
+    for line in (
+        "\n  run_transaction recovery-anchor-install\n",
+        "\n  run_transaction recover\n",
+    ):
+        assert not _sits_behind(line, guard, text)
+    # ... and the anchor is what emits the unit those starts resolve to.
+    assert 'RECOVERY_UNIT = "aicc-principal-recovery.service"' in generator
+    assert "unit = early_dir / RECOVERY_UNIT" in generator
+
+    start = "systemctl start aicc-principal-recovery.service"
+    segments = text.split(start)
+    assert len(segments) - 1 == 2, "install path and uninstall resume"
+    for index, before in enumerate(segments[:-1]):
+        open_guard = guard in before and "\nfi\n" not in before[before.rindex(guard):]
+        assert not open_guard, f"recovery barrier start #{index + 1} was guarded"

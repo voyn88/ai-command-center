@@ -399,8 +399,30 @@ trap rollback EXIT HUP INT TERM
 
 # Identity and directory creation are additive/idempotent prerequisites. Every
 # other replaceable file belongs to the versioned transaction below.
-systemd-sysusers "$repo_root/deploy/sysusers.d/aicc-agent.conf"
-systemd-tmpfiles --create "$repo_root/deploy/tmpfiles.d/aicc-agent.conf"
+#
+# Both agent configs are applied straight from the repository rather than
+# through the transaction, so excluding their installed targets from the
+# control file set never reached them: `--create` on the agent tmpfiles config
+# makes /var/lib/aicc-agent, which is the first artefact the control preflight
+# above refuses. A control install therefore manufactured the exact evidence
+# the NEXT control install would fail on -- it was not idempotent. Same
+# boundary for sysusers: the untrusted agent principal has no business
+# existing on a host that runs no agents.
+#
+# The control plane gets the one identity its own file set names:
+# /etc/aicc/workspace-authority.env is installed 0640 root:aicc-publisher on
+# every profile, so that group must exist before prepare() resolves it.
+if [ "$install_profile" = "worker" ]; then
+  systemd-sysusers "$repo_root/deploy/sysusers.d/aicc-agent.conf"
+  systemd-tmpfiles --create "$repo_root/deploy/tmpfiles.d/aicc-agent.conf"
+elif [ "$install_profile" = "control" ]; then
+  systemd-sysusers "$repo_root/deploy/sysusers.d/aicc-control.conf"
+else
+  # Unreachable while the validation above admits exactly two profiles; a
+  # third one must state its prerequisites here rather than inherit silence.
+  echo "no prerequisite identities defined for profile: $install_profile" >&2
+  exit 1
+fi
 run_transaction prepare
 transaction_active=1
 run_transaction apply

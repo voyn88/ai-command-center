@@ -2514,7 +2514,17 @@ def default_specs(
     if profile not in PROFILES:
         raise ValueError(f"unknown installation profile: {profile!r}")
     root_uid, root_gid = 0, 0
-    agent_gid = grp.getgrnam("aicc-agent").gr_gid if resolve_identities else 0
+    # The agent principal is resolved for the profile that installs agent
+    # files and for no other. `/etc/aicc/agent.env` is the only spec that
+    # names it and it is worker-only, so requiring the lookup everywhere would
+    # make a control install depend on the very identity the profile exists to
+    # keep off the host -- a fresh control host has no `aicc-agent` group and
+    # would fail in prepare() with a bare KeyError.
+    agent_gid = (
+        grp.getgrnam("aicc-agent").gr_gid
+        if resolve_identities and profile == "worker"
+        else 0
+    )
     publisher_gid = grp.getgrnam("aicc-publisher").gr_gid if resolve_identities else 0
     specs = (
         # The recovery generator is a permanent bootstrap anchor installed
