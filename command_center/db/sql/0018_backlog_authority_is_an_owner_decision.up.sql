@@ -42,7 +42,7 @@
 -- offset again.
 CREATE FUNCTION backlog_reason_requires_authority(p_reason text)
     RETURNS boolean
-    LANGUAGE sql IMMUTABLE PARALLEL SAFE SET search_path = pg_catalog, public AS $$
+    LANGUAGE sql IMMUTABLE SET search_path = pg_catalog, public AS $$
     SELECT coalesce(p_reason ~ '(^|[^a-z_])requires_privileged_authority:', false)
 $$;
 
