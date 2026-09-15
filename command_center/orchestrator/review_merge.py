@@ -4040,6 +4040,12 @@ class PrWindowConfig:
     #: scan_cap`/`max_active_reviews`) are never handed a larger live set
     #: than they can examine.
     max_active: int = 5
+    #: How long a hand-set `queue-active` may hold a slot for a PR the window
+    #: would otherwise block for a REMEDIABLE reason (stale checks, no fresh
+    #: accept marker): the ticks rerun checks and re-review only inside the
+    #: window, so the override exists to give an old PR that chance -- and
+    #: expires so a PR whose checks stay red cannot hold a slot forever.
+    queue_active_ttl_seconds: int = 6 * 3600
     #: Page size for the open-PR listing, requested in ascending-created
     #: order (see `reconcile_pr_window`), so a repo with more open PRs than
     #: one page still keeps the OLDEST ones in view -- the ones FIFO
@@ -4370,12 +4376,98 @@ def _remove_pr_window_labels(
     read gates. For those PRs the reconciler should clean stale contradictions
     without adding another window label and creating an avoidable label event.
     """
+    window_labels = {cfg.label_active, cfg.label_waiting, cfg.label_blocked}
+    return _remove_labels(repo_path, pr, window_labels & remove)
+
+
+def _remove_queue_labels(
+    repo_path: str, pr: dict[str, Any], remove: set[str]
+) -> bool:
+    """Remove a queue-owned label the window has proven stale.
+
+    `queue-active` is an operator's priority signal, not a bypass: it puts a
+    PR first in line, and the window still asks `_window_block_reason` before
+    giving it a slot. When the answer is a block, the label has nothing left
+    to say -- keeping it would let the PR hold a slot on every tick (live
+    2026-09-15: five hand-labelled PRs from 2026-09-06 with red checks held all
+    five slots for nine hours while fourteen eligible PRs waited). The reason is
+    printed with the BLOCKED line, so the operator sees why the label went.
+    """
+    queue_labels = {_QUEUE_ACTIVE_LABEL, _QUEUE_WAITING_REVIEW_LABEL}
+    return _remove_labels(repo_path, pr, queue_labels & remove)
+
+
+#: Block reasons the in-window ticks can remediate (rerun / re-review); a
+#: `queue-active` override keeps its slot for these until it expires. Merge
+#: conflicts and independent rejections are not remediable by any tick.
+_QUEUE_ACTIVE_OVERRIDABLE_REASONS = frozenset(
+    {"checks_missing", "checks_stale", "stale_exact_head_acceptance"}
+)
+
+
+def _queue_active_label_age_seconds(
+    repo_path: str, pr: dict[str, Any], *, now: float
+) -> float | None:
+    """Seconds since `queue-active` was last put on the PR, or None if the
+    events could not be read (the caller fails open: the override holds)."""
+    parsed = _owner_repo_number_from_pr_url(str(pr.get("url") or ""))
+    if parsed is None:
+        return None
+    owner, repo, number = parsed
+    result = _gh(
+        [
+            "api",
+            f"repos/{owner}/{repo}/issues/{number}/events?per_page=100",
+            "--paginate",
+            "--jq",
+            '.[] | select(.event == "labeled" and .label.name == "'
+            + _QUEUE_ACTIVE_LABEL
+            + '") | .created_at',
+        ],
+        repo_path,
+    )
+    if result.returncode != 0:
+        return None
+    stamps = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+    if not stamps:
+        return None
+    labelled_at = _parse_iso8601_seconds(stamps[-1])
+    if labelled_at is None:
+        return None
+    return max(now - labelled_at, 0.0)
+
+
+def _queue_active_override_holds(
+    repo_path: str, pr: dict[str, Any], cfg: PrWindowConfig, reason: str, *, now: float
+) -> bool:
+    """Whether a blocked `queue-active` PR keeps its slot this tick."""
+    if reason not in _QUEUE_ACTIVE_OVERRIDABLE_REASONS:
+        return False
+    age = _queue_active_label_age_seconds(repo_path, pr, now=now)
+    return age is None or age <= cfg.queue_active_ttl_seconds
+
+
+def _hold_queue_waiting(
+    repo_path: str,
+    pr: dict[str, Any],
+    cfg: PrWindowConfig,
+    report: PrWindowReport,
+    number: int,
+    head: str,
+) -> None:
+    """A queue-waiting PR that cannot be promoted this tick keeps its queue
+    label and loses only contradictory window labels (#935)."""
+    report.waiting.append((number, head))
+    _remove_pr_window_labels(repo_path, pr, cfg, {cfg.label_active, cfg.label_blocked})
+
+
+def _remove_labels(repo_path: str, pr: dict[str, Any], names: set[str]) -> bool:
+    """Delete `names` from the PR, only those it currently carries, via REST."""
     parsed = _owner_repo_number_from_pr_url(str(pr.get("url") or ""))
     if parsed is None:
         return False
     owner, repo, number = parsed
-    window_labels = {cfg.label_active, cfg.label_waiting, cfg.label_blocked}
-    current = _pr_window_labels(pr) & window_labels & remove
+    current = _pr_window_labels(pr) & names
     if not current:
         return True
     issues = f"repos/{owner}/{repo}/issues/{number}/labels"
@@ -4458,19 +4550,16 @@ def _reconcile_pr_window(
         )
         window_full = selected >= cfg.max_active
         needs_merge_state = active_now or not window_full
-        if queue_active_now:
-            selected += 1
-            report.active.append((number, head))
-            _remove_pr_window_labels(
-                repo_path, pr, cfg, {cfg.label_waiting, cfg.label_blocked}
-            )
-            continue
-        if queue_waiting_now:
-            report.waiting.append((number, head))
-            _remove_pr_window_labels(
-                repo_path, pr, cfg, {cfg.label_active, cfg.label_blocked}
-            )
-            continue
+        # `queue-active` sorts first (`_pr_window_order_key`) but earns its
+        # slot below like every other candidate: eligibility is decided by
+        # `_window_block_reason`, never by a label. A blocked queue-active PR
+        # loses the label, so it cannot hold a slot tick after tick.
+        # `queue-waiting-review` is likewise a queue marker, not a verdict:
+        # the PR is evaluated below and promoted into a free slot when it
+        # is eligible (live 2026-09-15: 149 hand-labelled PRs were mirrored
+        # WAITING tick after tick and never entered the window). When it
+        # cannot be judged or is blocked it stays WAITING with the queue
+        # label and only contradictory window labels shed (#935).
         # A cache hit costs no API call, so it costs no detail budget
         # either: the budget exists to bound this tick's GitHub traffic, and
         # a PR whose head has not moved since the last tick generates none.
@@ -4490,6 +4579,19 @@ def _reconcile_pr_window(
             # blocked, nothing) stays. Writing `waiting` here demoted an
             # active PR on no real change whenever the active set outgrew
             # the budget (review of 5dec6322). Re-examined on a later tick.
+            if queue_active_now:
+                # Quota isolation: with no detail budget left the queue
+                # signal stands on its own -- keep the slot and shed only
+                # the contradictory window labels, spending no read.
+                selected += 1
+                report.active.append((number, head))
+                _remove_pr_window_labels(
+                    repo_path, pr, cfg, {cfg.label_waiting, cfg.label_blocked}
+                )
+                continue
+            if queue_waiting_now:
+                _hold_queue_waiting(repo_path, pr, cfg, report, number, head)
+                continue
             report.unchecked.append((number, head))
             continue
         if detailed is None:
@@ -4504,6 +4606,18 @@ def _reconcile_pr_window(
             # reported unreadable for this tick (review of d16dc0e4: stamping
             # `waiting` here could demote an active or blocked PR on a
             # transient GitHub error). Re-examined next tick.
+            if queue_active_now:
+                # An unreadable PR cannot be judged; the operator's signal
+                # holds until it can (fail open, as for the label's age).
+                selected += 1
+                report.active.append((number, head))
+                _remove_pr_window_labels(
+                    repo_path, pr, cfg, {cfg.label_waiting, cfg.label_blocked}
+                )
+                continue
+            if queue_waiting_now:
+                _hold_queue_waiting(repo_path, pr, cfg, report, number, head)
+                continue
             report.unreadable.append((number, head))
             continue
         age_seconds, fell_back = _pr_age_seconds(repo_path, detailed, now=now)
@@ -4565,15 +4679,43 @@ def _reconcile_pr_window(
             detailed["mergeStateStatus"] = merge_state
             reason = _window_block_reason(detailed, cfg, age_seconds=age_seconds)
         if reason is not None:
+            if queue_active_now and _queue_active_override_holds(
+                repo_path, pr, cfg, reason, now=now
+            ):
+                # The operator's override is still fresh and the reason is
+                # one the ticks can fix from inside the window: keep the
+                # slot (as #935 shed only the contradictory labels).
+                selected += 1
+                report.active.append((number, head))
+                _remove_pr_window_labels(
+                    repo_path, pr, cfg, {cfg.label_waiting, cfg.label_blocked}
+                )
+                continue
+            if queue_waiting_now:
+                _hold_queue_waiting(repo_path, pr, cfg, report, number, head)
+                continue
             report.blocked.append((number, reason))
             _set_pr_window_labels(repo_path, detailed, cfg, cfg.label_blocked)
+            if queue_active_now:
+                _remove_queue_labels(repo_path, pr, {_QUEUE_ACTIVE_LABEL})
             continue
         if window_full:
+            if queue_active_now or queue_waiting_now:
+                _hold_queue_waiting(repo_path, pr, cfg, report, number, head)
+                continue
             report.waiting.append((number, head))
             _set_pr_window_labels(repo_path, detailed, cfg, cfg.label_waiting)
             continue
         selected += 1
         report.active.append((number, head))
+        if queue_active_now:
+            _remove_pr_window_labels(
+                repo_path, pr, cfg, {cfg.label_waiting, cfg.label_blocked}
+            )
+            continue
+        if queue_waiting_now:
+            # Promoted: the queue marker is fulfilled, the window owns it now.
+            _remove_queue_labels(repo_path, pr, {_QUEUE_WAITING_REVIEW_LABEL})
         _set_pr_window_labels(repo_path, detailed, cfg, cfg.label_active)
 
 
