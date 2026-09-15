@@ -32,6 +32,20 @@ def test_backlog_review_can_target_one_exact_task() -> None:
     assert build_parser().parse_args(["backlog-review"]).task_id is None
 
 
+def test_backlog_import_reconciles_by_default_and_backfills_only_on_request() -> None:
+    """The backfill is the operator's lever for rows whose provenance stamp
+    predates 0025's atomic insert-and-stamp. Off unless asked for: a normal
+    reconciling import must not start writing migration stamps for rows it
+    found already there."""
+    args = build_parser().parse_args(["backlog-import", "VOYN_TASKS_BACKLOG.md"])
+    assert args.command == "backlog-import"
+    assert args.backfill_provenance is False and args.parse_only is False
+    asked = build_parser().parse_args(
+        ["backlog-import", "VOYN_TASKS_BACKLOG.md", "--backfill-provenance"]
+    )
+    assert asked.backfill_provenance is True
+
+
 def test_queue_dlq_defaults_to_every_queue_fifty_rows() -> None:
     args = build_parser().parse_args(["queue-dlq"])
     assert args.command == "queue-dlq"
