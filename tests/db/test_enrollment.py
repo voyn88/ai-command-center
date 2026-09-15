@@ -777,6 +777,182 @@ def test_a_revoked_host_can_no_longer_authenticate_to_postgresql(
 # ---------------------------------------------------------------------------
 
 
+def _expire_credential(admin_conn, secret: str, *, ago: str) -> str:
+    """Move a credential's ledger expiry `ago` into the past (issued_at with
+    it, for the TTL check) and return its credential_id."""
+    secret_hash = hashlib.sha256(secret.encode("utf-8")).hexdigest()
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "UPDATE principal_credential "
+            "SET issued_at = now() - %s::interval - interval '1 hour', "
+            "    expires_at = now() - %s::interval "
+            "WHERE secret_hash = %s RETURNING credential_id",
+            (ago, ago, secret_hash),
+        )
+        rows = cur.fetchall()
+    assert len(rows) == 1, rows
+    return rows[0][0]
+
+
+def _rotate_over_fresh_connection(psycopg, test_dsn, role: str, old_secret: str):
+    """What the rotator does after its pool is gone: a NEW connection with the
+    expired secret, then enroll_rotate_self over it."""
+    new_secret, new_hash = _secret()
+    with (
+        psycopg.connect(_as_role(test_dsn, role, old_secret), autocommit=True) as fresh,
+        fresh.cursor() as cur,
+    ):
+        cur.execute(
+            "SELECT * FROM enroll_rotate_self(%s, %s, %s)",
+            (old_secret, new_hash, _scram_verifier(new_secret)),
+        )
+        return cur.fetchone(), new_secret
+
+
+def _principal_events(admin_conn, principal_id: str, event_type: str, outcome: str):
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "SELECT reason, metadata_json FROM principal_event "
+            "WHERE principal_id = %s AND event_type = %s AND outcome = %s ORDER BY seq",
+            (principal_id, event_type, outcome),
+        )
+        return cur.fetchall()
+
+
+def test_an_expired_credential_renews_itself_over_a_fresh_connection_within_grace(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """VOYN-W0-AICC-CREDENTIAL-ROTATION-DEADLOCKS-AFTER-EXPIRY (0029).
+
+    Live 2026-09-15 the rotator's pool was gone by the time it retried, so the
+    only path that matters is a NEW connection with the expired secret. Within
+    the grace it may rotate -- and nothing else: `identity_assert` still refuses
+    it for work, and the graced pass is a `granted` event, not a denial.
+    """
+    with _cluster(admin_conn, psycopg, test_dsn, role_passwords):
+        with psycopg.connect(
+            _dsn_for(test_dsn, roles.APP_ROLE, role_passwords), autocommit=True
+        ) as app:
+            row, old_secret = _enrol(app, _unique())
+        _expire_credential(admin_conn, old_secret, ago="1 minute")
+        with (
+            psycopg.connect(_as_role(test_dsn, row[1], old_secret), autocommit=True) as c,
+            c.cursor() as cur,
+        ):
+            cur.execute("SELECT ok, reason FROM identity_assert(%s)", (old_secret,))
+            assert cur.fetchone() == (False, "credential_expired"), "work is refused"
+        rotated, new_secret = _rotate_over_fresh_connection(psycopg, test_dsn, row[1], old_secret)
+        assert rotated[1] is None, rotated
+        with (
+            psycopg.connect(_as_role(test_dsn, row[1], new_secret), autocommit=True) as c,
+            c.cursor() as cur,
+        ):
+            cur.execute("SELECT ok, reason FROM identity_assert(%s)", (new_secret,))
+            assert cur.fetchone() == (True, None)
+            cur.execute("SELECT ok, reason FROM identity_assert(%s)", (old_secret,))
+            assert cur.fetchone() == (False, "credential_revoked")
+        granted = _principal_events(admin_conn, row[0], "rotate", "granted")
+        assert [g[1].get("expired_grace") for g in granted] == [True]
+        assert [e[0] for e in _principal_events(admin_conn, row[0], "assert", "granted")] == ["expired_grace"]
+        denials = [e for e in _principal_events(admin_conn, row[0], "assert", "rejected") if e[0] == "credential_expired"]
+        assert len(denials) == 1, "only the explicit work assert above was denied; the graced rotation was not"
+
+
+def test_an_expired_credential_past_the_grace_is_refused(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    with _cluster(admin_conn, psycopg, test_dsn, role_passwords):
+        with psycopg.connect(
+            _dsn_for(test_dsn, roles.APP_ROLE, role_passwords), autocommit=True
+        ) as app:
+            row, old_secret = _enrol(app, _unique())
+        _expire_credential(admin_conn, old_secret, ago="121 minutes")
+        rotated, _ = _rotate_over_fresh_connection(psycopg, test_dsn, row[1], old_secret)
+        assert rotated == (None, "credential_expired")
+
+
+@pytest.mark.parametrize(
+    ("prepare", "expected"),
+    [
+        (
+            (
+                "UPDATE principal_credential SET revoked_at = now(), revoke_reason = 'test' "
+                "WHERE principal_id = %s"
+            ),
+            "credential_revoked",
+        ),
+        ("UPDATE principal SET state = 'suspended' WHERE principal_id = %s", "principal_inactive"),
+        ("UPDATE principal SET expected_cidr = '10.99.0.0/24' WHERE principal_id = %s", "addr_mismatch"),
+    ],
+    ids=["revoked", "suspended", "out-of-cidr"],
+)
+def test_every_other_guard_still_applies_to_an_expired_credential_within_grace(
+    admin_conn, psycopg, test_dsn, role_passwords, prepare, expected
+):
+    """Deleting any guard from the graced path must fail one of these."""
+    with _cluster(admin_conn, psycopg, test_dsn, role_passwords):
+        with psycopg.connect(
+            _dsn_for(test_dsn, roles.APP_ROLE, role_passwords), autocommit=True
+        ) as app:
+            row, old_secret = _enrol(app, _unique())
+        _expire_credential(admin_conn, old_secret, ago="1 minute")
+        with admin_conn.cursor() as cur:
+            cur.execute(prepare, (row[0],))
+        rotated, _ = _rotate_over_fresh_connection(psycopg, test_dsn, row[1], old_secret)
+        assert rotated == (None, expected)
+
+
+def test_a_credential_issued_under_grace_gets_no_second_grace(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """One hop: a stolen expired secret cannot chain successors forever."""
+    with _cluster(admin_conn, psycopg, test_dsn, role_passwords):
+        with psycopg.connect(
+            _dsn_for(test_dsn, roles.APP_ROLE, role_passwords), autocommit=True
+        ) as app:
+            row, first = _enrol(app, _unique())
+        _expire_credential(admin_conn, first, ago="1 minute")
+        rotated, second = _rotate_over_fresh_connection(psycopg, test_dsn, row[1], first)
+        assert rotated[1] is None, rotated
+        _expire_credential(admin_conn, second, ago="1 minute")
+        rotated, _ = _rotate_over_fresh_connection(psycopg, test_dsn, row[1], second)
+        assert rotated == (None, "credential_expired")
+        # A successor issued by an ORDINARY (unexpired) rotation is graced again:
+        # the hop limit counts graced issuances, not rotations.
+        _expire_credential(admin_conn, second, ago="-30 minutes")  # valid again
+        rotated, third = _rotate_over_fresh_connection(psycopg, test_dsn, row[1], second)
+        assert rotated[1] is None, rotated
+        _expire_credential(admin_conn, third, ago="1 minute")
+        rotated, _ = _rotate_over_fresh_connection(psycopg, test_dsn, row[1], third)
+        assert rotated[1] is None, "an ordinary successor may still use the grace once"
+        graced = [g[1].get("expired_grace") for g in _principal_events(admin_conn, row[0], "rotate", "granted")]
+        assert graced == [True, False, True]
+
+
+def test_the_role_may_log_in_for_the_grace_after_the_ledger_expiry(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """0003 set rolvaliduntil to the ledger expiry, which made any SQL-side
+    grace unreachable for a fresh connection (review of #977)."""
+    with _cluster(admin_conn, psycopg, test_dsn, role_passwords):
+        with psycopg.connect(
+            _dsn_for(test_dsn, roles.APP_ROLE, role_passwords), autocommit=True
+        ) as app:
+            _row, secret = _enrol(app, _unique())
+        secret_hash = hashlib.sha256(secret.encode("utf-8")).hexdigest()
+        with admin_conn.cursor() as cur:
+            cur.execute(
+                "SELECT r.rolvaliduntil - c.expires_at FROM principal_credential c "
+                "JOIN principal p ON p.principal_id = c.principal_id "
+                "JOIN pg_roles r ON r.rolname = p.db_role WHERE c.secret_hash = %s",
+                (secret_hash,),
+            )
+            (gap,) = cur.fetchone()
+            cur.execute("SELECT enroll_self_grace()")
+            (grace,) = cur.fetchone()
+        assert gap == grace
+
+
 def test_a_host_rotates_its_own_secret_without_an_availability_gap(
     admin_conn, psycopg, test_dsn, role_passwords
 ):
