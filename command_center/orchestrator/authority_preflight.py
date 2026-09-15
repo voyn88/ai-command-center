@@ -41,10 +41,14 @@ credential. Two ways a task states one:
 - **Detected** — a narrow, deterministic regex safety net (no LLM call, same
   discipline as `command_center.capabilities.prompt_requires_write`) for the
   concrete shapes already proven to fail: an actual `sudo` invocation, or a
-  `-u postgres` / `-U postgres` / `su postgres` role switch. Deliberately
-  narrow: it must never fire on prose that merely *discusses* sudo or
-  PostgreSQL (this very docstring, for instance) — only on what reads as a
-  command.
+  `-u postgres` / `-U postgres` / `su postgres` role switch. Narrow in two
+  dimensions: the command shape must be unmistakable, AND it must stand in
+  *instruction position* — the task ordering its executor to run it. A
+  command the task merely QUOTES (every incident report in this backlog
+  quotes the command that failed, this docstring included) is a
+  `suspected_authority` mention: reported and carried, never a park. See the
+  section comment above `_SUDO_COMMAND` for why the two error directions are
+  deliberately not symmetric.
 
 `FLEET_GRANTED_AUTHORITY` is what this fleet actually grants today: nothing.
 Every worker is the same unprivileged, sandboxed task-clone executor: that is
@@ -75,6 +79,7 @@ __all__ = [
     "format_authority",
     "park_reason",
     "required_authority",
+    "suspected_authority",
 ]
 
 # --------------------------------------------------------------------------
@@ -143,6 +148,35 @@ def declared_authority(text: str) -> frozenset[str]:
 # --------------------------------------------------------------------------
 # Detected authority — the narrow command-shaped regex safety net.
 # --------------------------------------------------------------------------
+#
+# Position matters more than the command (VOYN-W0-AICC-PRIVILEGED-TASK-ROUTED-
+# TO-UNPRIVILEGED-EXECUTOR, second finding). The first cut of this module
+# fired on the command SHAPE anywhere in the text, and that misfires on the
+# dominant shape in this backlog: an incident report that QUOTES the failing
+# command as evidence. Measured on this very task's own body -- "агент ...
+# честно пробовал `sudo /usr/bin/true` и `sudo -u postgres /usr/bin/psql -c
+# 'select 1'`, получил `a password is required`" -- the shape-only detector
+# returned {root, postgres_role:postgres} and would have parked the repair
+# task for the bug it repairs. The park is terminal by design (its reason is
+# deliberately outside the `cascade_exhausted:%` vocabulary 0014 auto-resumes),
+# so a false positive is not a retry -- it is a task that stops forever until
+# an owner notices.
+#
+# The two error directions are therefore NOT symmetric, and the module fails
+# toward the cheap one:
+#
+#   false negative -> the task dispatches and (at worst) costs one cascade,
+#                     and `classify.py` attributes that failure to authority
+#                     so it is never looped again;
+#   false positive -> a perfectly executable task is parked, silently, until
+#                     a human intervenes.
+#
+# So a DETECTED command parks only when it stands in *instruction position* --
+# the task telling its executor to run it. Everything else the detector
+# recognizes is downgraded to a SUSPICION: reported, carried in the payload,
+# used to classify a later failure, but never a park on its own. The precise,
+# author-stated `Requires-Authority:` field remains the primary surface, and
+# it parks unconditionally.
 
 # An actual `sudo` invocation, not merely the word "sudo" in prose (e.g. this
 # module's own docstring). Matched only when what follows unambiguously reads
@@ -160,26 +194,108 @@ _SUDO_COMMAND = re.compile(
 # An explicit request for elevated access, stated in prose rather than a
 # command — the declared-field convention is preferred, but a plain sentence
 # saying so must still be caught (fail closed on ambiguity, never lower the
-# requirement).
-_ROOT_PROSE = re.compile(r"\brequires?\s+(?:root|elevated|superuser)\s+(?:access|privileges?|permissions?)\b", re.I)
+# requirement). Position-exempt: this is a statement OF the requirement, not
+# a command whose surroundings decide whether it is being ordered or quoted.
+_ROOT_PROSE = re.compile(
+    r"\brequires?\s+(?:root|elevated|superuser)\s+(?:access|privileges?|permissions?)\b",
+    re.I,
+)
 # A PostgreSQL role switch shaped like an actual command: `-u postgres`,
 # `-U postgres`, or `su [-] postgres`.
 _POSTGRES_ROLE_COMMAND = re.compile(r"(?:-[uU]\s+postgres\b)|(?:\bsu\s+(?:-\s+)?postgres\b)")
 
+# --- instruction position -------------------------------------------------
+
+# Markup that can lead a line without making it prose: a list bullet, an
+# ordered-list marker, a code fence, a quote/backtick, a shell prompt. A
+# command whose line carries NOTHING else is the task showing a command to
+# run, not a sentence talking about one.
+#
+# `>` (blockquote) is deliberately absent: a blockquote is a quotation by
+# definition, which is the narrative case, not the instruction case.
+_LEAD_MARKUP = re.compile(r"^(?:\s+|[-*+]\s*|\d+[.)]\s*|`{1,3}[\w.-]*\s*|['\"]+\s*|[$#][ \t]+)")
+
+# The prefix is itself the head of a shell command line — the authority
+# pattern matched one of its ARGUMENTS rather than its first word
+# (`psql -U postgres ...` matches at `-U postgres`, five characters in). Only
+# a known invocation word or an absolute path opens such a prefix, so English
+# or Russian narrative ("the agent ran ", "агент пробовал ") never qualifies.
+_COMMAND_PREFIX = re.compile(
+    r"^(?:/\S+|(?:sudo|su|env|doas|psql|pg_dump|pg_restore|pg_ctl|pg_isready|"
+    r"createdb|dropdb|createuser|dropuser|vacuumdb|reindexdb|systemctl|service|"
+    r"docker|podman|bash|sh|zsh|ssh|make)\b)"
+    r"(?:\s+[\x21-\x7e]+)*\s*$"
+)
+
+# An imperative directive immediately before the command: "run `sudo ...`".
+# Anchored to a CLAUSE start (line start, or after `.`/`:`/`;`/`!`/`?`/`)`)
+# so that narrative "the agent tried to run `sudo ...`" -- where the verb sits
+# mid-clause after "to" -- does not match. Only bare imperatives are listed:
+# third-person ("runs"), past ("ran", "executed") and infinitive ("выполнить")
+# forms are how a postmortem NARRATES, and are excluded on purpose.
+_IMPERATIVE_LEAD = re.compile(
+    r"(?:^|[.:;!?)\]]\s*)\s*(?:then\s+|please\s+)?"
+    r"(?:run|execute|invoke|launch|запусти(?:те)?|выполни(?:те)?)\b"
+    r"[^.!?\n]{0,40}$",
+    re.I,
+)
+
+
+def _in_instruction_position(text: str, start: int) -> bool:
+    """Does the command match at `start` read as an ORDER to the executor,
+    rather than a quotation of one? Judged only from what precedes it on its
+    own line — the line is the unit a task author writes in."""
+    prefix = text[text.rfind("\n", 0, start) + 1 : start]
+    stripped = prefix
+    while True:
+        lead = _LEAD_MARKUP.match(stripped)
+        if lead is None or not lead.group(0):
+            break
+        stripped = stripped[lead.end() :]
+    if not stripped:
+        return True  # the command stands alone on its line
+    if _COMMAND_PREFIX.match(stripped):
+        return True  # the match is an argument of a command that stands alone
+    return _IMPERATIVE_LEAD.search(prefix) is not None
+
+
+def _command_authority(text: str) -> tuple[frozenset[str], frozenset[str]]:
+    """`(instruction, narrative)` — the authority tags this text ORDERS, and
+    the ones it merely mentions in a command shape somewhere."""
+    instruction: set[str] = set()
+    narrative: set[str] = set()
+    for pattern, tag in (
+        (_SUDO_COMMAND, AUTHORITY_ROOT),
+        (_POSTGRES_ROLE_COMMAND, POSTGRES_ROLE_PREFIX + "postgres"),
+    ):
+        for match in pattern.finditer(text):
+            if _in_instruction_position(text, match.start()):
+                instruction.add(tag)
+            else:
+                narrative.add(tag)
+    if _ROOT_PROSE.search(text):
+        instruction.add(AUTHORITY_ROOT)
+    return frozenset(instruction), frozenset(narrative - instruction)
+
 
 def detected_authority(text: str) -> frozenset[str]:
-    """Authority tags from concrete privileged-command shapes in `text`
-    (no declared field required). Deliberately narrow — see module docstring."""
-    tags: set[str] = set()
-    if _SUDO_COMMAND.search(text) or _ROOT_PROSE.search(text):
-        tags.add(AUTHORITY_ROOT)
-    if _POSTGRES_ROLE_COMMAND.search(text):
-        tags.add(POSTGRES_ROLE_PREFIX + "postgres")
-    return frozenset(tags)
+    """Authority tags `text` ORDERS its executor to exercise (no declared
+    field required). Deliberately narrow, and deliberately position-aware —
+    see the section comment above: a command that is merely quoted as
+    evidence is `suspected_authority`, not this."""
+    return _command_authority(text)[0]
+
+
+def suspected_authority(text: str) -> frozenset[str]:
+    """Authority tags `text` mentions in a command shape but does not order.
+    Never parks a task on its own — it travels in the dispatched payload and
+    classifies a later failure, so a genuine requirement stated only in
+    narrative costs one cascade instead of looping forever."""
+    return _command_authority(text)[1]
 
 
 def required_authority(title: str | None, body: str | None) -> frozenset[str]:
-    """Every authority tag `title`/`body` declares or plainly demands."""
+    """Every authority tag `title`/`body` declares or plainly orders."""
     text = f"{title or ''}\n{body or ''}"
     return declared_authority(text) | detected_authority(text)
 
@@ -204,6 +320,11 @@ class AuthorityDecision:
     missing: frozenset[str]
     declared: frozenset[str]
     detected: frozenset[str]
+    #: Command-shaped mentions that are NOT orders (a postmortem quoting the
+    #: command that failed). Never part of `required`, so never a park —
+    #: carried so the dispatched payload can state it and `classify` can
+    #: attribute a later failure to authority instead of looping it.
+    suspected: frozenset[str]
     ok: bool
     reason: str | None  # machine-readable park reason, or None when ok
 
@@ -213,7 +334,7 @@ def decide(title: str | None, body: str | None) -> AuthorityDecision:
     `FLEET_GRANTED_AUTHORITY`. Total: never raises, always answers."""
     text = f"{title or ''}\n{body or ''}"
     declared = declared_authority(text)
-    detected = detected_authority(text)
+    detected, suspected = _command_authority(text)
     required = declared | detected
     granted = FLEET_GRANTED_AUTHORITY
     missing = required - granted
@@ -225,6 +346,7 @@ def decide(title: str | None, body: str | None) -> AuthorityDecision:
         missing=missing,
         declared=declared,
         detected=detected,
+        suspected=frozenset(suspected - required),
         ok=ok,
         reason=reason,
     )

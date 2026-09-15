@@ -182,3 +182,121 @@ def test_park_reason_is_deterministic_and_sorted():
 
 def test_format_authority_empty_set():
     assert ap.format_authority(frozenset()) == "(none)"
+
+
+# --------------------------------------------------------------------------
+# Instruction position vs quotation (VOYN-W0-AICC-PRIVILEGED-TASK-ROUTED-TO-
+# UNPRIVILEGED-EXECUTOR, second finding).
+#
+# The first cut of the detector fired on the command SHAPE anywhere in the
+# text. Every task in this backlog is an incident report that QUOTES the
+# command that failed, so that detector parked repair tasks -- terminally,
+# since a requires-authority park is deliberately outside the
+# `cascade_exhausted:%` vocabulary the 0014 reconcile auto-resumes.
+# --------------------------------------------------------------------------
+
+
+#: This task's own body, verbatim (the live 2026-08-30 incident report). It
+#: requires no privilege whatsoever -- its work is Python and SQL -- and the
+#: shape-only detector returned {root, postgres_role:postgres} for it.
+_THIS_TASKS_OWN_BODY = (
+    "AICC Platform / Delivery Cost | **Найдено живьём 2026-08-30 (Claude), "
+    "измерено на восстановленной очереди.** За 90 минут после восстановления "
+    "диспетчеризации: 32 `dispatch`, из них 13 `return_to_pool` (~40%). "
+    "Крупнейшая группа — 8 × `cascade_exhausted: task_status_failed`. Разбор "
+    "одной (`VOYN-W0-AICC-CONTROL-PLANE-RESILIENCE`) по журналу воркера: агент "
+    "в своём task-клоне честно пробовал `sudo /usr/bin/true` и "
+    "`sudo -u postgres /usr/bin/psql -c 'select 1'`, получил "
+    "`a password is required` и завершился неуспехом."
+)
+
+
+def test_quoted_incident_evidence_does_not_park_this_very_task():
+    """The regression anchor: the task that fixes the bug must survive its
+    own fix. Quoted evidence is a suspicion, never a requirement."""
+    decision = ap.decide(
+        "VOYN-W0-AICC-PRIVILEGED-TASK-ROUTED-TO-UNPRIVILEGED-EXECUTOR",
+        _THIS_TASKS_OWN_BODY,
+    )
+    assert decision.ok, "an incident report quoting `sudo` must not be parked"
+    assert decision.required == frozenset()
+    assert decision.reason is None
+    # Not silently dropped, either: it is visible as a suspicion.
+    assert decision.suspected == frozenset(
+        {ap.AUTHORITY_ROOT, ap.POSTGRES_ROLE_PREFIX + "postgres"}
+    )
+
+
+def test_english_narrative_of_an_attempt_is_not_an_order():
+    """`tried to run` is a postmortem narrating, not a task ordering: the
+    verb sits mid-clause after `to`, never at a clause start."""
+    body = "The agent tried to run `sudo /usr/bin/true` and was refused."
+    assert ap.detected_authority(body) == frozenset()
+    assert ap.suspected_authority(body) == frozenset({ap.AUTHORITY_ROOT})
+
+
+def test_blockquoted_worker_log_is_a_quotation_not_an_order():
+    body = "The worker log shows:\n> sudo -u postgres psql -c 'select 1'\n"
+    assert ap.detected_authority(body) == frozenset()
+    # `>` is a quotation marker, so BOTH tags the line carries stay suspicions.
+    assert ap.suspected_authority(body) == frozenset(
+        {ap.AUTHORITY_ROOT, ap.POSTGRES_ROLE_PREFIX + "postgres"}
+    )
+
+
+def test_imperative_at_a_clause_start_is_an_order():
+    for body in (
+        "Verify resilience: run `sudo /usr/bin/true` to confirm access.",
+        "Run `sudo systemctl restart aicc-worker`.",
+        "Fix the unit. Then execute `sudo systemctl daemon-reload`.",
+    ):
+        assert ap.detected_authority(body) == frozenset({ap.AUTHORITY_ROOT}), body
+
+
+def test_russian_imperative_is_an_order_but_past_tense_is_not():
+    assert ap.detected_authority("Выполните `sudo systemctl restart aicc`.") == frozenset(
+        {ap.AUTHORITY_ROOT}
+    )
+    assert ap.detected_authority("Агент выполнял `sudo systemctl restart aicc`.") == frozenset()
+
+
+def test_a_command_alone_on_its_line_is_an_order():
+    """A fenced block, a bullet, or a shell prompt: the line carries the
+    command and nothing else, so the task is showing what to run."""
+    for body in (
+        "Steps:\n```sh\nsudo apt-get install -y ripgrep\n```",
+        "Steps:\n- sudo systemctl restart aicc-worker\n",
+        "Steps:\n$ sudo -u postgres psql -c 'select 1'\n",
+        "Steps:\n    sudo chown aicc /srv/aicc\n",
+    ):
+        assert ap.detected_authority(body), body
+
+
+def test_suspicion_never_enters_required_or_missing():
+    decision = ap.decide("t", _THIS_TASKS_OWN_BODY)
+    assert decision.missing == frozenset()
+    assert not decision.suspected & decision.required
+
+
+def test_declared_field_parks_even_when_only_quoted_evidence_surrounds_it():
+    """Declaration is authoritative and position-exempt: an author who says
+    `Requires-Authority: root` is stating a fact about the work, not quoting."""
+    decision = ap.decide("t", _THIS_TASKS_OWN_BODY + "\nRequires-Authority: root")
+    assert not decision.ok
+    assert decision.missing == frozenset({ap.AUTHORITY_ROOT})
+    # The postgres mention stays a suspicion — declaring root does not
+    # silently promote every quoted command in the same body.
+    assert decision.suspected == frozenset({ap.POSTGRES_ROLE_PREFIX + "postgres"})
+
+
+def test_a_match_inside_a_standalone_command_line_is_an_order():
+    """`psql -U postgres ...` matches at its ARGUMENT, five characters into
+    the line — the anchor is the command head, not the match offset."""
+    assert ap.detected_authority("psql -U postgres -c 'select 1'") == frozenset(
+        {ap.POSTGRES_ROLE_PREFIX + "postgres"}
+    )
+    # ...but the same argument reached through prose is not an order.
+    assert ap.detected_authority("The log shows psql -U postgres failing.") == frozenset()
+    assert ap.suspected_authority("The log shows psql -U postgres failing.") == frozenset(
+        {ap.POSTGRES_ROLE_PREFIX + "postgres"}
+    )
