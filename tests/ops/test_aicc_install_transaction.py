@@ -3499,7 +3499,12 @@ def test_the_whole_control_generation_validates_as_one_spec_set(tmp_path):
     assert len(validated) == len(specs)
     assert {
         spec.target for spec in specs if spec.remove and not spec.directory
-    } == module.WORKER_ONLY_TARGETS
+    } == module.WORKER_ONLY_TARGETS | {
+        # Profile-independent: declared absent on every host, carried by
+        # whichever generation installs next.
+        declared.target
+        for declared in module.DESIRED_ABSENT_TARGETS
+    }
     assert [spec.target for spec in specs if spec.remove and spec.directory] == list(
         module.WORKER_ONLY_DIRECTORIES
     )
@@ -6242,3 +6247,469 @@ def test_generator_dispatches_an_orphaned_membership_journal_to_the_live_capsule
 
     assert called[0][1][1] == str(recovery)
     assert called[0][1][2] == "recover-boot"
+
+
+# ---------------------------------------------------------------------------
+# Desired-absent: declaring that a path must NOT exist
+# (VOYN-W0-AICC-TRANSACTION-DESIRED-ABSENT).
+#
+# The removal machinery above was built for one purpose -- the control
+# profile taking worker artefacts away in the generation that replaces them.
+# What the fleet also needs, and what the independent review demanded before
+# a broad `NOPASSWD` sudoers rule could be narrowed transactionally, is the
+# ability to say "this exact path must not exist on any host" as repository
+# state: snapshotted into the WAL, removed atomically, restored byte-for-byte
+# if anything fails, and addressed by one literal path rather than a glob.
+#
+# The first real target is the dangling
+# /etc/systemd/system/aicc-systemd-voyn-aicc-self-deploy.service that nobody
+# could delete on 2026-08-30 -- `sudo rm` asked for a password because
+# voynadmin's NOPASSWD covers only systemctl and apt-get, and the installer,
+# which does run as root, had no way to be told the file must go.
+# ---------------------------------------------------------------------------
+
+
+STALE_SELF_DEPLOY_UNIT = (
+    "/etc/systemd/system/aicc-systemd-voyn-aicc-self-deploy.service"
+)
+
+
+def _declared(module, target: str):
+    return next(
+        declared
+        for declared in module.DESIRED_ABSENT_TARGETS
+        if declared.target == target
+    )
+
+
+def _dangling_unit(root: Path, target: str = STALE_SELF_DEPLOY_UNIT) -> Path:
+    """The live shape: a unit symlink whose target does not exist."""
+    link = root / target.lstrip("/")
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(root / "opt/aicc/gone/voyn-aicc-self-deploy.service")
+    return link
+
+
+def test_the_first_declared_absent_target_is_the_dangling_self_deploy_symlink():
+    """The minimum contract check on a real host, named in the repository so
+    the removal is reviewed code rather than an operator's `rm`."""
+    module = _module()
+
+    declared = _declared(module, STALE_SELF_DEPLOY_UNIT)
+
+    assert declared.proof == module.DANGLING_SYMLINK_PROOF
+    # The evidence that made it safe to destroy travels with the declaration.
+    assert "not-found" in declared.evidence
+    assert "2026-08-30" in declared.evidence
+    # It is emphatically NOT the self-deploy unit the fleet runs. That one is
+    # `voyn-aicc-self-deploy.service`, it is committed under deploy/systemd,
+    # and the condemned name is a mangled `aicc-systemd-` prefix of it that
+    # nothing in this repository has ever written.
+    real = Path(__file__).parents[2] / "deploy/systemd/voyn-aicc-self-deploy.service"
+    assert real.is_file()
+    assert Path(declared.target).name != real.name
+    assert declared.target not in {
+        f"/etc/systemd/system/{unit}" for unit in module.CONTROL_ONLY_UNITS
+    }
+
+
+@pytest.mark.parametrize("profile", ("worker", "control"))
+def test_every_profile_carries_the_declared_absent_removals(profile, tmp_path):
+    """A path declared absent is absent on every host: whichever profile
+    installs next takes it away, in its own generation."""
+    module = _module()
+    authority = tmp_path / "authority.env"
+    authority.write_text("AICC_WORKSPACE_ROOTS=./tmp\n", encoding="utf-8")
+
+    specs = module.default_specs(
+        Path(__file__).parents[2],
+        authority_env=authority,
+        claude_auth=tmp_path / "absent-claude.json",
+        codex_auth=tmp_path / "absent-codex.json",
+        resolve_identities=False,
+        profile=profile,
+    )
+
+    removals = {spec.target for spec in specs if spec.remove}
+    installs = {spec.target for spec in specs if not spec.remove}
+    for declared in module.DESIRED_ABSENT_TARGETS:
+        assert declared.target in removals
+        # Declaring a path absent and installing it in the same generation
+        # would be two contradictory statements about one target.
+        assert declared.target not in installs
+
+
+def test_a_declared_absent_symlink_is_removed_and_rolled_back_byte_for_byte(
+    tmp_path,
+):
+    """The whole contract in one generation: the dangling unit link is
+    snapshotted, destroyed atomically with the install beside it, and put
+    back exactly as it was -- a symlink, with the same literal target -- when
+    a later record fails."""
+    module = _module()
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    link = _dangling_unit(root)
+    assert not link.exists() and link.is_symlink(), "the fixture must be dangling"
+    literal = os.readlink(link)
+    source = tmp_path / "installed"
+    source.write_bytes(b"installed-file")
+    transaction = module.FileTransaction(root, state)
+
+    transaction.prepare(
+        module.absent_specs() + (_spec(module, source, "/etc/installed-file"),)
+    )
+    transaction.apply()
+
+    assert not os.path.lexists(link), "the dangling unit link is gone"
+    assert (root / "etc/installed-file").read_bytes() == b"installed-file"
+
+    transaction.recover()
+
+    assert link.is_symlink(), "rollback must put the LINK back, not a file"
+    assert os.readlink(link) == literal
+    assert not (root / "etc/installed-file").exists()
+    assert not transaction.pending.exists()
+    assert not list(state.glob("generation-*"))
+
+
+def test_a_declared_absent_target_that_is_already_absent_is_a_noop(tmp_path):
+    """Idempotence: a converged host removes nothing and must not refuse, and
+    must not invent the target in order to delete it."""
+    module = _module()
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    (root / "etc/systemd/system").mkdir(parents=True)
+    source = tmp_path / "installed"
+    source.write_bytes(b"installed-file")
+    transaction = module.FileTransaction(root, state)
+    specs = module.absent_specs() + (_spec(module, source, "/etc/installed-file"),)
+
+    transaction.install(specs)
+    transaction.install(specs)
+
+    assert not os.path.lexists(root / STALE_SELF_DEPLOY_UNIT.lstrip("/"))
+    assert (root / "etc/installed-file").read_bytes() == b"installed-file"
+    assert not transaction.pending.exists()
+
+
+def test_a_purge_target_swapped_for_a_symlink_after_prepare_is_refused(tmp_path):
+    """The classic swap: a regular file this generation snapshotted becomes a
+    symlink to something else before apply() reaches it. Following it would
+    have root destroy a file the transaction never examined and could not put
+    back, so the generation fails closed with both objects intact."""
+    module = _module()
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    target = root / "etc/systemd/system/stale.service"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"[Unit]\n")
+    elsewhere = root / "etc/shadow-ish"
+    elsewhere.write_bytes(b"do-not-touch")
+    transaction = module.FileTransaction(root, state)
+    transaction.prepare(
+        (module.removal_spec("/etc/systemd/system/stale.service"),)
+    )
+    target.unlink()
+    target.symlink_to(elsewhere)
+
+    with pytest.raises(RuntimeError, match="shape changed before removal"):
+        transaction.apply()
+
+    assert target.is_symlink(), "the swapped-in link is not ours to remove"
+    assert elsewhere.read_bytes() == b"do-not-touch"
+
+    # And the refusal is recoverable: the generation is unwound, the link the
+    # attacker left is still there, and nothing was destroyed.
+    with pytest.raises(RuntimeError, match="shape changed before restore"):
+        transaction.recover()
+    assert elsewhere.read_bytes() == b"do-not-touch"
+
+
+def test_a_crash_between_the_wal_write_and_the_removal_is_recovered(tmp_path):
+    """The WAL is written before the removal, so the crash window that
+    matters is the one where the intent is durable and the target is still
+    there. Recovery must leave the target exactly as it was -- content, mode,
+    owner -- and take the generation with it."""
+    module = _module()
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    target = root / "etc/systemd/system/stale.service"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"[Unit]\nDescription=stale\n")
+    target.chmod(0o644)
+    transaction = module.FileTransaction(root, state)
+    manifest = transaction.prepare(
+        (module.removal_spec("/etc/systemd/system/stale.service"),)
+    )
+
+    # Durable intent to remove, and then the process dies before the unlink.
+    transaction._write_journal(manifest, "APPLYING", 0)
+
+    module.FileTransaction(root, state).recover()
+
+    assert target.read_bytes() == b"[Unit]\nDescription=stale\n"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o644
+    assert not (state / "pending.json").exists()
+    assert not list(state.glob("generation-*"))
+
+
+def test_a_crash_between_the_quarantine_rename_and_the_unlink_is_recovered(
+    monkeypatch, tmp_path
+):
+    """The narrower crash window inside the removal itself. The purge renames
+    its target into a quarantine entry and only then destroys it; dying in
+    between leaves the target's name free and its bytes alive under a name
+    nothing reads -- neither the old state nor the new one, and for a
+    credential a secret that outlives the rollback that claimed to restore
+    it. Recovery reclaims the object and leaves no copy behind."""
+    module = _module()
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    target = root / "var/lib/aicc-agent/claude/.claude/.credentials.json"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(CLAUDE_BYTES)
+    target.chmod(0o600)
+    transaction = module.FileTransaction(root, state)
+    manifest = transaction.prepare((module.removal_spec(CLAUDE_CREDENTIAL),))
+    real_rename = module._rename_noreplace
+
+    def rename_then_die(*args, **kwargs):
+        real_rename(*args, **kwargs)
+        raise KeyboardInterrupt("SIGKILL-shaped death after the quarantine rename")
+
+    monkeypatch.setattr(module, "_rename_noreplace", rename_then_die)
+    transaction._write_journal(manifest, "APPLYING", 0)
+    with pytest.raises(KeyboardInterrupt):
+        transaction._apply_removal(
+            module._generation_records(
+                json.loads(manifest.read_text(encoding="utf-8"))
+            )[0]
+        )
+    assert not os.path.lexists(target), "the crash is not being simulated"
+    assert _byte_search(root, CLAUDE_BYTES), "the quarantined secret is still there"
+    monkeypatch.setattr(module, "_rename_noreplace", real_rename)
+
+    module.FileTransaction(root, state).recover()
+
+    assert target.read_bytes() == CLAUDE_BYTES
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+    assert [path.name for path in _byte_search(root, CLAUDE_BYTES)] == [
+        ".credentials.json"
+    ], "no quarantined copy of the secret may survive the rollback"
+    assert not list(state.glob("generation-*"))
+
+
+def test_a_quarantine_entry_that_is_not_ours_is_left_exactly_where_it_is(tmp_path):
+    """Reclaiming is authorised by the snapshot, not by the name. A file that
+    merely looks like a quarantine entry belongs to whoever made it."""
+    module = _module()
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    target = root / "etc/systemd/system/stale.service"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"[Unit]\n")
+    impostor = target.parent / ".stale.service.aicc-purge-0123456789abcdef"
+    impostor.write_bytes(b"someone-elses-file")
+    transaction = module.FileTransaction(root, state)
+    manifest = transaction.prepare(
+        (module.removal_spec("/etc/systemd/system/stale.service"),)
+    )
+    transaction._write_journal(manifest, "APPLYING", 0)
+
+    module.FileTransaction(root, state).recover()
+
+    assert target.read_bytes() == b"[Unit]\n"
+    assert impostor.read_bytes() == b"someone-elses-file"
+
+
+# ---------------------------------------------------------------------------
+# One exact path, never a pattern.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "target",
+    (
+        "/etc/systemd/system/*.service",
+        "/etc/systemd/system/aicc-?.service",
+        "/etc/systemd/system/[a-z].service",
+        "/etc/systemd/system/{a,b}.service",
+    ),
+)
+def test_a_glob_removal_target_is_refused_before_anything_is_touched(
+    target, tmp_path
+):
+    """A pattern names whatever happens to be on disk when something expands
+    it -- the one set this transaction never snapshotted and could not put
+    back. Refused for removals the same way it is refused for sudoers,
+    systemd units and repositories."""
+    module = _module()
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    units = root / "etc/systemd/system"
+    units.mkdir(parents=True)
+    for name in ("aicc-a.service", "aicc-b.service"):
+        (units / name).write_bytes(b"[Unit]\n")
+    transaction = module.FileTransaction(root, state)
+
+    with pytest.raises(ValueError, match="pattern, not an exact path"):
+        transaction.prepare((module.removal_spec(target),))
+
+    assert sorted(path.name for path in units.iterdir()) == [
+        "aicc-a.service",
+        "aicc-b.service",
+    ]
+    assert not state.exists() or not list(state.glob("generation-*"))
+
+
+@pytest.mark.parametrize(
+    "target",
+    (
+        "/etc/aicc/./agent.env",
+        "/etc/aicc//agent.env",
+        "/etc/aicc/agent.env/",
+        "/etc/aicc/../../root/.ssh/authorized_keys",
+        "etc/aicc/agent.env",
+        "/etc/aicc/agent\n.env",
+    ),
+)
+def test_a_non_literal_removal_target_is_refused(target, tmp_path):
+    """Two spellings of one path are two targets to the duplicate check and
+    one object to the kernel, and a `..` is not a path at all."""
+    module = _module()
+    transaction = module.FileTransaction(tmp_path / "root", tmp_path / "state")
+
+    with pytest.raises(ValueError):
+        transaction.prepare((module.removal_spec(target),))
+
+
+def test_a_glob_target_in_a_tampered_manifest_is_refused_at_apply(tmp_path):
+    """The rule lives in `_target`, the single chokepoint every mutation
+    resolves through, so a manifest edited between prepare and apply is held
+    to it too -- not only a spec list."""
+    module = _module()
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    units = root / "etc/systemd/system"
+    units.mkdir(parents=True)
+    (units / "stale.service").write_bytes(b"[Unit]\n")
+    transaction = module.FileTransaction(root, state)
+    manifest = transaction.prepare(
+        (module.removal_spec("/etc/systemd/system/stale.service"),)
+    )
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload["records"][0]["target"] = "/etc/systemd/system/*.service"
+    manifest.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="pattern, not an exact path"):
+        transaction.apply()
+
+    assert (units / "stale.service").read_bytes() == b"[Unit]\n"
+
+
+# ---------------------------------------------------------------------------
+# Staleness proof: reversible is not the same as safe.
+# ---------------------------------------------------------------------------
+
+
+def test_the_declared_absent_preflight_accepts_a_dangling_link_and_an_absent_path(
+    tmp_path,
+):
+    module = _module()
+    root = tmp_path / "root"
+    transaction = module.FileTransaction(root, tmp_path / "state")
+    (root / "etc/systemd/system").mkdir(parents=True)
+
+    transaction.assert_declared_absent_stale()  # nothing there at all
+
+    _dangling_unit(root)
+
+    transaction.assert_declared_absent_stale()
+
+
+def test_the_declared_absent_preflight_refuses_a_link_that_now_resolves(tmp_path):
+    """`dangling-symlink` is the proof that destroying the link cannot take a
+    loaded unit's fragment away. The moment the link resolves, that proof is
+    gone -- and the snapshot comparison would not notice, because the link
+    itself is unchanged."""
+    module = _module()
+    root = tmp_path / "root"
+    transaction = module.FileTransaction(root, tmp_path / "state")
+    link = _dangling_unit(root)
+    resolved = Path(os.readlink(link))
+    resolved.parent.mkdir(parents=True)
+    resolved.write_bytes(b"[Unit]\nDescription=live again\n")
+
+    with pytest.raises(RuntimeError, match="resolves and may back a loaded unit"):
+        transaction.assert_declared_absent_stale()
+
+    assert link.is_symlink(), "a refused preflight destroys nothing"
+
+
+def test_the_declared_absent_preflight_refuses_a_regular_file(tmp_path):
+    """A real file at a path declared absent as a dangling link is not the
+    object anybody proved stale."""
+    module = _module()
+    root = tmp_path / "root"
+    transaction = module.FileTransaction(root, tmp_path / "state")
+    path = root / STALE_SELF_DEPLOY_UNIT.lstrip("/")
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"[Unit]\n")
+
+    with pytest.raises(RuntimeError, match="not the dangling symlink"):
+        transaction.assert_declared_absent_stale()
+
+    assert path.read_bytes() == b"[Unit]\n"
+
+
+def test_an_unknown_staleness_proof_is_refused_rather_than_removed_unproven(
+    tmp_path,
+):
+    module = _module()
+    transaction = module.FileTransaction(tmp_path / "root", tmp_path / "state")
+    declared = module.AbsentTarget(
+        target="/etc/systemd/system/whatever.service",
+        proof="somebody-said-so",
+        evidence="",
+    )
+
+    with pytest.raises(RuntimeError, match="unknown staleness proof"):
+        transaction.assert_declared_absent_stale((declared,))
+
+
+@pytest.mark.parametrize("action", ("validate", "prepare", "apply", "install"))
+def test_every_mutating_cli_action_proves_the_declared_absent_targets_stale(
+    action, tmp_path
+):
+    """Both ends of the generation: staging one against an unaccounted-for
+    host and applying one whose declared path went live between prepare and
+    apply are refused alike. Recovery is deliberately not on this list -- a
+    rollback exists to put that very link back."""
+    module = _module()
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    link = _dangling_unit(root)
+    resolved = Path(os.readlink(link))
+    resolved.parent.mkdir(parents=True)
+    resolved.write_bytes(b"[Unit]\n")
+    args = SimpleNamespace(
+        action=action,
+        state_dir=state,
+        repo_root=Path(__file__).parents[2],
+        root=root,
+        profile="worker",
+        authority_env=tmp_path / "authority.env",
+        claude_auth=tmp_path / "claude.json",
+        codex_auth=tmp_path / "codex.json",
+    )
+    args.authority_env.write_text("AICC_WORKSPACE_ROOTS=./tmp\n", encoding="utf-8")
+    args.claude_auth.write_bytes(b"{}")
+    args.codex_auth.write_bytes(b"{}")
+
+    with pytest.raises(RuntimeError, match="resolves and may back a loaded unit"):
+        module._dispatch(args, argparse.ArgumentParser())
+
+    assert link.is_symlink()
+    assert not (state / "pending.json").exists()

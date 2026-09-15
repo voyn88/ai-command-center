@@ -8,6 +8,43 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Added — The installer can declare a file absent (`VOYN-W0-AICC-TRANSACTION-DESIRED-ABSENT`)
+- `ops/aicc_install_transaction.py`: `DESIRED_ABSENT_TARGETS` is the
+  desired-absent half of the transaction contract -- exact paths this build
+  asserts must not exist on any host, removed by whichever generation
+  installs next (`absent_specs()` rides both the worker and the control spec
+  list). The removal is an ordinary record: the target's bytes, mode, owner
+  and, for a symlink, its literal text are snapshotted into the generation
+  WAL before anything is touched; the destruction is atomic; and any later
+  failure in the same generation puts the object back byte-for-byte, under
+  one rollback boundary with everything else the generation did. A host that
+  does not have the path removes nothing.
+- The first declared target is the dangling
+  `/etc/systemd/system/aicc-systemd-voyn-aicc-self-deploy.service` -- the
+  symlink that could not be deleted at all on 2026-08-30, because
+  `voynadmin`'s `NOPASSWD` covers `systemctl` and `apt-get` and `rm` asked
+  for a password nobody has. It is removed as root by the transaction, from
+  repository state that was reviewed, and `voynadmin`'s rights are not
+  widened. Each declaration carries its staleness proof: `dangling-symlink`
+  (the link resolves to nothing, so it cannot be backing a loaded unit) is
+  checked against the live host before the generation is staged and again
+  immediately before it mutates anything, because a snapshot comparison
+  proves the object is unchanged and not that it is still inert.
+- Removal targets are one exact, literal path or nothing. `_target()` -- the
+  single chokepoint every mutation resolves through, spec lists and
+  generation manifests alike -- now refuses glob and brace metacharacters,
+  `..`, `.`, empty components and control characters, the same prohibition
+  the sudoers, systemd-unit and repository rules already carry: a pattern
+  names whatever is on disk when something expands it, which is precisely
+  the set the transaction never snapshotted and could not put back.
+- A purge that died between the quarantine rename and the unlink is now
+  reclaimed by rollback: the original object goes back under its own name
+  (or, if the name is already back, the leftover duplicate is destroyed),
+  and only an entry that still matches the record's snapshot exactly is
+  touched. Before this, that crash window left a target reading as absent
+  while its bytes -- a credential's bytes, for a sensitive record -- were
+  still on disk under a quarantine name nothing reads.
+
 ### Fixed — Control ticks have their own GitHub quota (`VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS`)
 - `command_center/orchestrator/gh_access.py`: every `gh` call the review,
   merge and PR-window ticks make now runs under the `voyn-aicc-fleet` App's
