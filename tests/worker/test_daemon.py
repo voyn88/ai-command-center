@@ -744,3 +744,107 @@ def test_the_daemon_speaks_real_sd_notify_datagrams(monkeypatch) -> None:
     assert any(
         frame == b"WATCHDOG=1" or frame.startswith(b"WATCHDOG=1\n") for frame in frames
     )
+
+
+def test_a_raising_claim_does_not_kill_the_lane(caplog) -> None:
+    """THE AMPLIFIER (VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED).
+
+    `claim()` is the one protocol call the loop makes on EVERY iteration, and
+    it was the only one with no guard around it -- while a raising report
+    write, a raising handler and a non-object payload had each been closed
+    after the same failure. It is the worst place to lack one: the exception
+    fires before any item is in hand, so it does not cost one attempt, it
+    costs every attempt. It leaves `run_forever`, the lane exits, systemd
+    restarts it, and the next claim raises on the same row.
+
+    That is how monitor_finding #2840 became a fleet-wide outage rather than
+    one stuck item: a refunded lease wait left `attempt_no` taken, so
+    `queue_claim` raised a unique violation -- on the OLDEST DUE ROW, which
+    every lane selects first. Migration 0025 removed that cause; this removes
+    the amplifier, which is the half the monitor actually measures. Lanes that
+    are up but claiming nothing stop the fleet clock, and `control-01:queue`
+    reports `queue_stalled` with no exit reachable by fleet action, because
+    restarting a crash-looping lane only restarts the crash.
+
+    The second claim is the assertion: it can only happen if the first one's
+    exception did not leave the loop.
+    """
+    import logging
+
+    store = ScriptedStore([_work({"kind": "echo"}, attempt_id="wat-2")])
+    raised: list[str] = []
+    real_claim = store.claim
+
+    def raising_claim(queue, *, visibility_seconds):
+        if not raised:
+            raised.append(queue)
+            # What a head-of-line poisoned row actually raised.
+            raise RuntimeError(
+                'duplicate key value violates unique constraint '
+                '"idx_work_attempt_item_no"'
+            )
+        return real_claim(queue, visibility_seconds=visibility_seconds)
+
+    store.claim = raising_claim  # type: ignore[method-assign]
+    daemon = WorkerDaemon(
+        store,
+        {"echo": lambda p, e, a=1: HandlerOutcome(ok=True, result={})},
+        WorkerConfig(visibility_seconds=3),
+    )
+
+    # `_run_until_idle` stops on the FIRST sleep, and the backoff after a
+    # raising claim is a sleep -- so it would end the run before proving
+    # anything. Stop on the second instead: one for the backoff, and the
+    # daemon must reach a claim in between.
+    sleeps: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        if len(sleeps) >= 2:
+            daemon.request_stop()
+
+    daemon._sleep = sleep  # type: ignore[method-assign]
+    with caplog.at_level(logging.ERROR):
+        daemon.run_forever()  # must return normally, not raise
+
+    # The lane survived and went back to claiming: the item behind the
+    # poisoned row was served, which is the whole point.
+    assert raised == ["execution"]
+    assert ("complete", "wat-2", {}) in store.calls
+    assert any("claim raised" in r.message for r in caplog.records)
+    # Backed off rather than spun: the same interval every other unclaimable
+    # answer uses, because none of them is cured by asking again faster.
+    assert sleeps[0] == WorkerConfig().idle_max_seconds
+
+
+def test_a_raising_claim_does_not_hold_the_drain_gate_through_its_backoff() -> None:
+    """The backoff must sit OUTSIDE `_claim_gate_lock`. The drain coordinator
+    takes that same lock to emit the `aicc-drained` ACK the credential rotator
+    waits on, so sleeping under it would stall a rotation behind a database
+    fault that has nothing to do with it -- trading a dead lane for a wedged
+    one.
+
+    Measured by taking the lock from the sleep itself: if the loop still held
+    it, this could not acquire it.
+    """
+    store = ScriptedStore([])
+
+    def always_raising_claim(queue, *, visibility_seconds):
+        raise ConnectionError("server closed the connection unexpectedly")
+
+    store.claim = always_raising_claim  # type: ignore[method-assign]
+    daemon = WorkerDaemon(store, {}, WorkerConfig(visibility_seconds=3))
+
+    gate_was_free: list[bool] = []
+
+    def sleep(_seconds: float) -> None:
+        acquired = daemon._claim_gate_lock.acquire(blocking=False)
+        gate_was_free.append(acquired)
+        if acquired:
+            daemon._claim_gate_lock.release()
+        daemon.request_stop()
+
+    daemon._sleep = sleep  # type: ignore[method-assign]
+    daemon.run_forever()
+
+    assert gate_was_free == [True], "the claim gate stayed locked through the backoff"

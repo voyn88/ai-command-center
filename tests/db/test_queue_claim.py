@@ -185,6 +185,15 @@ def _item(admin_conn, item_id: str) -> tuple:
         return cur.fetchone()
 
 
+def _lease_waits(admin_conn, item_id: str) -> int:
+    """0022's second budget, which `_item` predates."""
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "SELECT lease_wait_count FROM work_item WHERE work_item_id = %s", (item_id,)
+        )
+        return cur.fetchone()[0]
+
+
 def _events(admin_conn, item_id: str) -> list[tuple]:
     with admin_conn.cursor() as cur:
         cur.execute(
@@ -1353,6 +1362,91 @@ def test_one_lease_wait_does_not_wedge_the_queue_behind_it(
     assert sorted(served) == sorted([poisoned, *behind])
     for item_id in (poisoned, *behind):
         assert _item(admin_conn, item_id)[0] == "succeeded"
+
+
+def test_a_redrive_restores_the_lease_wait_budget_it_died_on(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """THE DLQ'S EXIT, for the dead-letter class 0022 created
+    (VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED, migration 0026).
+
+    `queue_redrive` was written when an item had ONE budget, and it widens that
+    one. 0022 gave `work_item` a SECOND budget and a second way to die --
+    `lease_wait_count` against the caller's `p_max_lease_waits`, dead-lettering
+    as `lease_wait_exhausted` -- and did not tell the redrive, the same
+    omission 0025 fixed in `queue_claim`.
+
+    So the exit reported success and did nothing: it returned true, audited
+    'granted', moved the row to `ready`, and widened the one budget the item
+    was not dying of. The count stayed at the cap, so the very next writer
+    -lease refusal -- the exact condition that dead-lettered it, and the one
+    most likely to still be true moments later -- killed it again. The work
+    stranded that way is FINISHED work: `lease_unavailable` names no fault in
+    it, only that a sibling lane held the repository's writer lease.
+
+    The assertion is the SECOND refusal after the redrive. One is not enough:
+    with the budget unrestored the first refusal already dead-letters, so a
+    test that stopped at one would pass against the broken function.
+    """
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
+    with psycopg.connect(app_dsn, autocommit=True) as app:
+        item_id = _enqueue(app, "redrive-lease-wait", max_attempts=3, backoff_seconds=0)
+
+    cap = 2  # `p_max_lease_waits`; 20 in the deployed worker, same shape.
+
+    def lease_wait(worker) -> str:
+        token, token_hash = _token()
+        got = _claim(worker, token_hash)
+        assert got[0] is True, got
+        return _call(
+            worker,
+            "SELECT ok, reason FROM queue_fail_lease_wait(%s, %s, %s, %s)",
+            (got[3], token, "lease_unavailable", cap),
+        )[1]
+
+    with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
+        with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+            for _ in range(cap):
+                assert lease_wait(worker) == "lease_wait_requeued"
+            assert lease_wait(worker) == "lease_wait_dead_lettered"
+
+        state, _count, max_attempts, _cur, _res, dead_reason = _item(admin_conn, item_id)
+        assert state == "dead"
+        assert dead_reason.startswith("lease_wait_exhausted: ")
+        assert _lease_waits(admin_conn, item_id) == cap
+
+        with psycopg.connect(app_dsn, autocommit=True) as app:
+            assert _call(app, "SELECT queue_redrive(%s, 2)", (item_id,))[0] is True
+
+        after = _item(admin_conn, item_id)
+        assert after[0] == "ready" and after[5] is None
+        assert after[2] == max_attempts + 2, "the attempt budget is still widened"
+        assert after[1] == 1, "the attempt history is still not reset"
+        assert _lease_waits(admin_conn, item_id) == 0, "the budget it died on is restored"
+
+        # The redrive is worth what it survives. Contention is still there:
+        # the item must ride the WHOLE budget again, not die on the next one.
+        with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+            for _ in range(cap):
+                assert lease_wait(worker) == "lease_wait_requeued", (
+                    "redriven work died on a budget the redrive should have restored"
+                )
+            assert _item(admin_conn, item_id)[0] == "ready"
+            # And the bound still terminates -- restoring is not removing.
+            assert lease_wait(worker) == "lease_wait_dead_lettered"
+            assert _item(admin_conn, item_id)[0] == "dead"
+
+    # The previous count is on the audit, so a redrive loop stays as visible as
+    # the `max_attempts` widening it sits beside.
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "SELECT detail ->> 'previous_lease_wait_count' FROM work_event "
+            "WHERE work_item_id = %s AND event = 'redrive' AND outcome = 'granted' "
+            "ORDER BY seq DESC LIMIT 1",
+            (item_id,),
+        )
+        assert cur.fetchone()[0] == str(cap)
 
 
 def test_the_attempt_number_climbs_across_repeated_lease_waits(

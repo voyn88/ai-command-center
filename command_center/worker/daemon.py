@@ -249,16 +249,65 @@ class WorkerDaemon:
                 if draining:
                     self._sleep(min(self._config.idle_min_seconds, cap))
                     continue
+                claim_raised = False
                 with self._claim_gate_lock:
                     if self._drain.is_set() or self._drain_closed.is_set():
                         continue
                     # STATUS travels with every claim-path ping so a status
                     # written by a dying drain cycle can never stick.
                     self._notify("WATCHDOG=1\nSTATUS=aicc-ready")
-                    claimed = self._store.claim(
-                        self._config.queue,
-                        visibility_seconds=self._config.visibility_seconds,
-                    )
+                    try:
+                        claimed = self._store.claim(
+                            self._config.queue,
+                            visibility_seconds=self._config.visibility_seconds,
+                        )
+                    except Exception:
+                        # THE ONE CALL ON EVERY ITERATION, AND THE ONLY ONE
+                        # THAT WAS UNGUARDED. `_execute` already catches a
+                        # raising report write, `_dispatch` a raising handler,
+                        # and a non-object payload dead-letters -- each closed
+                        # after the same failure, each for the same reason: one
+                        # item's fault must not take the lane down with it.
+                        # claim() had no such guard, and it is the worst place
+                        # to lack one. It runs before any item is in hand, so
+                        # the cost is not one attempt but EVERY attempt: the
+                        # exception leaves run_forever, the lane exits, systemd
+                        # restarts it, and it raises again on the same claim.
+                        # The lane crash-loops and claims nothing.
+                        #
+                        # That is how a single poisoned row became a fleet-wide
+                        # outage (monitor_finding #2840: a refunded lease wait
+                        # left `attempt_no` taken, so `queue_claim` raised a
+                        # unique violation on the OLDEST DUE ROW -- head-of-
+                        # line, so every lane selected it and died). Migration
+                        # 0025 removed that cause. It did not remove the
+                        # amplifier, and the amplifier is what the monitor
+                        # measures: lanes that are up but claiming nothing stop
+                        # the fleet clock, and `control-01:queue` reports
+                        # `queue_stalled` with no exit reachable by fleet
+                        # action, because restarting a lane only restarts the
+                        # crash. Any next cause -- a dropped connection, a
+                        # PostgreSQL restart, a future migration's refusal that
+                        # raises instead of returning -- does it again.
+                        #
+                        # So the claim path degrades the way the report path
+                        # already does: log it, back off, keep claiming. A
+                        # transient fault costs one poll; a permanent one
+                        # leaves a lane that is UP and visibly claiming
+                        # nothing, which the queue probe still catches on the
+                        # fleet-idle clock. Neither ends with the lane dead.
+                        logger.exception(
+                            "claim raised; the lane stays up and retries after "
+                            "a backoff"
+                        )
+                        claim_raised = True
+                # Deliberately OUTSIDE the gate lock. The drain coordinator
+                # takes that lock to emit the `aicc-drained` ACK the credential
+                # rotator waits on, so sleeping under it would stall a rotation
+                # behind a database fault that has nothing to do with it.
+                if claim_raised:
+                    self._sleep(min(self._config.idle_max_seconds, cap))
+                    continue
                 if isinstance(claimed, QueueRefusal):
                     if claimed.reason == "no_work":
                         self._sleep(min(idle + random.uniform(0, idle), cap))

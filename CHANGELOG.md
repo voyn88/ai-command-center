@@ -8,6 +8,102 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Fixed — a claim that raises must not take the lane with it (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
+- `control-01:queue` reported `queue_stalled` again (`monitor_finding` #2873).
+  It is the same measurement as #2840 in the entry below, whose root cause —
+  a refunded lease wait leaving `attempt_no` taken, so `queue_claim` raised a
+  unique violation on the oldest due row — migration 0025 removed; that fix is
+  on this branch and not yet deployed, so the probe kept recording against the
+  fleet still running the old function. What follows are the two defects found
+  while VERIFYING that fix, both proven and both still open: the amplifier that
+  made one raising claim a fleet-wide outage rather than one stuck item, and a
+  recovery path that had gone quietly dead.
+- Neither of these is the cause of the stall — 0025 is. This one is why the
+  cause was not survivable.
+- `self._store.claim(...)` was the one protocol call `run_forever` makes on
+  EVERY iteration and the only one with no guard around it. Its three siblings
+  had each been closed after the same failure: a raising report write
+  (`_execute`, "it would propagate out of `run_forever`'s loop and kill the
+  whole daemon over the one attempt it was reporting"), a raising handler
+  (`_dispatch`), and a non-object payload. The claim was the worst place to
+  leave open, because it fires BEFORE any item is in hand — so the cost is not
+  one attempt but every attempt. The exception leaves the loop, the lane
+  exits, systemd restarts it, and the next claim raises on the same row.
+  `queue_claim` takes the OLDEST DUE ROW, so every lane selects it and dies:
+  the lane crash-loops and claims nothing.
+- That is the state the probe reads as a stall, and reads correctly. Lanes
+  that are up but claiming nothing stop the fleet clock
+  (`fleet_idle_seconds`), due ready work is attended by nobody, and
+  `queue_stalled` opens with no exit reachable by fleet action — restarting a
+  crash-looping lane only restarts the crash. Migration 0025 removed one
+  cause; any next one does it again, and a dropped connection or a PostgreSQL
+  restart is enough.
+- The claim path now degrades the way the report path already does: log it,
+  back off `idle_max_seconds` — the same interval every other unclaimable
+  answer uses, because none of them is cured by asking again faster — and keep
+  claiming. The backoff sits OUTSIDE `_claim_gate_lock` on purpose: the drain
+  coordinator takes that lock to emit the `aicc-drained` ACK the credential
+  rotator waits on, so sleeping under it would trade a dead lane for a wedged
+  one. A transient fault now costs one poll; a permanent one leaves a lane
+  that is up and visibly claiming nothing, which the queue probe still catches
+  on the fleet-idle clock. Neither ends with the lane dead.
+- Two regressions, both mutation-checked (both fail at the previous commit,
+  where the exception propagates straight out of `run_forever`): a claim that
+  raises the real unique-violation text, after which the lane must claim and
+  complete the item behind it; and the gate lock proved free from inside the
+  backoff itself.
+- MEASURED, including what it does NOT buy. Driven against a real PostgreSQL
+  16 server as the deployed fleet (2 lanes, 40-minute attempts, a 4-deep
+  backlog, writer-lease contention, retries, lane deaths, the reaper on its
+  1-minute timer, sampled every 2 minutes as the timer samples): 24 simulated
+  hours in which every claim raises from hour 6 gives 530 `queue_stalled`
+  samples, the first 22 minutes after the fault — the #2873 signature, and the
+  mechanism by which a claim fault becomes this finding at all. Against an
+  INTERMITTENT fault (30% of claims for 12 hours) the guarded and the
+  crash-looping fleet both stay green, because two lanes on 40-minute attempts
+  absorb a restart cycle; the guard is worth a poll instead of `RestartSec=10s`
+  plus a cold start there, not a change of verdict. And a deterministically
+  poisoned row stalls the queue either way — that is the cause, and removing it
+  is 0025's job, not this one's.
+
+### Fixed — the dead-letter queue had no exit for the class 0022 created (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
+- `queue_redrive` is "the DLQ's exit", written when a `work_item` had ONE
+  budget: it widens `max_attempts` explicitly so each widening is a recorded
+  act rather than a silent reset. 0022 gave the item a SECOND budget and a
+  second way to die — `lease_wait_count` against the caller's
+  `p_max_lease_waits`, dead-lettering as `lease_wait_exhausted` — and did not
+  tell the redrive. The same omission 0025 fixed in `queue_claim`, in the same
+  family, from the same migration.
+- So for the items it most needed to recover, the exit REPORTED SUCCESS AND
+  DID NOTHING. Measured against a real PostgreSQL 16 server (cap 2 for
+  brevity): three lease refusals dead-letter the item with
+  `lease_wait_count = 2`; `queue_redrive(item, 3)` returns true, audits
+  `granted`, moves it to `ready` and widens `max_attempts` 3 → 6; one further
+  refusal dead-letters it again. The count was still at the cap, so the very
+  next writer-lease refusal — the exact condition that dead-lettered it, and
+  the one most likely to still be true moments later — killed it, and the
+  widened attempt budget was never touched because the item never died of it.
+- The work stranded that way is FINISHED work: `lease_unavailable` names no
+  fault in it, only that a sibling lane held the repository's writer lease,
+  which is why 0022 exists at all. `backlog_dispatch` bounds concurrency by
+  per-repository writer leases across three repositories with two lanes, so
+  sustained contention is a state this fleet produces by design.
+- Migration 0026 restores BOTH budgets on redrive, unconditionally: an item
+  dead-lettered on `max_attempts` can carry a nearly spent `lease_wait_count`
+  from earlier contention, and redriving it into a handful of refusals before
+  the widened attempts are ever tried is the same defect wearing a different
+  `dead_reason`. It does not weaken the rule it sits under — `lease_wait_count`
+  counts contention against one delivery, not a property of the work; every
+  redrive is audited, and the previous count now travels in that audit beside
+  the previous `dead_reason`, so a redrive loop stays as visible as the
+  `max_attempts` widening beside it. The attempt HISTORY is still not reset:
+  `work_attempt` is untouched and 0025 still numbers the next delivery from it.
+- The regression asserts the SECOND refusal after a redrive, not the first —
+  with the budget unrestored the first already dead-letters, so a test that
+  stopped at one would pass against the broken function. It also proves the
+  bound still terminates: restoring a budget is not removing it.
+
+
 ### Fixed — one writer-lease refusal stopped the whole queue (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
 - `control-01:queue` reported `queue_stalled` again (`monitor_finding` #2840),
   and this time the probe was right: the queue really had stopped. Every
