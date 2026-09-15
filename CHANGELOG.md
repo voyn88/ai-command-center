@@ -8,6 +8,33 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Fixed — a refusal is data, not an exception (`VOYN-W0-AICC-AUDIT-ROLLBACK-CLASS`)
+
+- Migration `0025_refusals_return_instead_of_raising`: every remaining
+  function in the schema that can write an audit row now RETURNS its refusal
+  instead of raising it. Measured, two probes apart only in how the refusal is
+  reported: audit rows after a refusal that `RAISE`s — 0; after one that
+  `RETURN`s — 1. The exception aborts the transaction the refusal was recorded
+  in, so a denial erased its own record — for `backlog_ingest_results`, one
+  poisoned row erased the whole tick's audit. `backlog_dispatch`,
+  `backlog_ingest_results`, `backlog_split_task` and `backlog_set_task_class`
+  are converted; `identity_assert` already worked this way.
+- `backlog_dispatch` now transitions the task BEFORE enqueuing the work item,
+  so a refused transition has nothing to un-enqueue, and compensates its
+  repository lease through the new `_backlog_lease_release_if_idle`, which
+  releases only when no OTHER task in that repository is still in flight and
+  decides that under the lease row's own lock. `backlog_ingest_results` uses
+  the same release: the previous unconditional one handed a running task's
+  repository to a second writer.
+- `tests/architecture/test_refusal_audit_survives_fitness.py` computes the
+  audit-writing closure from the migration set — audit tables are the ones
+  named `*_event`, writers are the functions that insert into them, the
+  closure is everything that can reach a writer — and fails on any member that
+  can raise. `tests/db/test_refusal_audit_survives.py` asserts the surviving
+  denial row in each of the three layers that writes one (`principal_event`,
+  `work_event`, `backlog_event`) and pins the static model to the deployed
+  catalogue.
+
 ### Added — the one-button audit, wired into the web UI (`VOYN-W0-APP-CONTROL-S4`)
 
 - `web/src/screens/Tasks.tsx`: an `AuditLauncher` panel above the task list —
