@@ -185,3 +185,47 @@ def test_upgrade_reports_a_refusing_ledger_as_a_message(capsys, monkeypatch) -> 
 class _StubConfig:
     def redacted(self) -> str:
         return "postgresql://stub"
+
+
+def test_the_database_cli_is_not_a_persistence_engine() -> None:
+    """`command_center/db/cli.py` must persist nothing.
+
+    The AIOS boundary gate (docs/AIOS_BOUNDARY.md, ADR-0008/ADR-0015) reads a
+    durable filesystem write inside a package named `db` as a persistence
+    engine -- "a JSON store is a persistence engine even with no driver
+    anywhere in it" -- and freezes the file against growth by recording it in
+    `AIOS_BOUNDARY_BASELINE.json`. Adding `migration-lock --write` to this CLI
+    did exactly that and turned
+    `test_engine_inventory_matches_frozen_baseline` red
+    (VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH).
+
+    Regenerating the lock is developer maintenance, so it moved to
+    `scripts/migration_lock.py --write` -- the boundary doc's own preferred
+    remedy, moving the module rather than growing the frozen inventory. This
+    test states the property directly, because the baseline gate reports it as
+    generic drift and the next person to reach for a convenient `write_text`
+    here would read that as an unrelated failure.
+    """
+    import ast
+
+    from tests.architecture import aios_boundary as boundary
+
+    source = (boundary.REPO_ROOT / "command_center/db/cli.py").read_text(
+        encoding="utf-8"
+    )
+    assert not boundary._persists_data(ast.parse(source))
+    assert boundary.classify_engine_categories(
+        "command_center/db/cli.py", ast.parse(source)
+    ) == set()
+
+
+def test_the_database_cli_does_not_offer_to_rewrite_the_lock(capsys) -> None:
+    """`--write` is gone from this command, not merely unused: argparse has to
+    refuse it, or the write comes back the first time someone copies the old
+    invocation out of a commit message."""
+    from command_center.db.cli import main
+
+    with pytest.raises(SystemExit) as exit_code:
+        main(["migration-lock", "--write"])
+    assert exit_code.value.code == 2
+    assert "unrecognized arguments: --write" in capsys.readouterr().err

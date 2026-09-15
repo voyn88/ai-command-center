@@ -68,17 +68,19 @@ def build_parser() -> argparse.ArgumentParser:
         "upgrade",
         help="Apply pending migrations and re-assert table grants (as the migrator).",
     )
-    lock = sub.add_parser(
-        "migration-lock",
-        help="Check (or rewrite) the recorded checksum of every migration file.",
-    )
     # No database, so it is the one migration command a developer can run on a
     # laptop -- which is where the edit that needs catching is made.
-    lock.add_argument(
-        "--write",
-        action="store_true",
-        help="Rewrite released.lock.json for the current set (use after ADDING "
-        "a migration; changing an existing entry blocks deploys).",
+    #
+    # Check only. Regeneration is `python scripts/migration_lock.py --write`:
+    # a durable write inside a package named `db` is what
+    # tests/architecture/aios_boundary.py reads as a persistence engine
+    # (docs/AIOS_BOUNDARY.md), and the control plane's database CLI is not
+    # one. Verifying persists nothing, so it belongs here, reachable from a
+    # deploy.
+    sub.add_parser(
+        "migration-lock",
+        help="Check the recorded checksum of every migration file "
+        "(regenerate with scripts/migration_lock.py --write).",
     )
 
     # The queue's recovery surface (SRV-06). These run as `aicc_app` — the
@@ -278,11 +280,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "migration-lock":
         # No database and no configuration: the lock is a property of the
         # files, and this must answer on a laptop with no DSN at all.
-        if args.write:
-            rendered = migrations.render_released_lock()
-            migrations.RELEASED_LOCK_PATH.write_text(rendered, encoding="utf-8")
-            print(f"wrote {migrations.RELEASED_LOCK_PATH}")
-            return 0
         try:
             migrations.verify_released_checksums()
         except migrations.MigrationError as exc:

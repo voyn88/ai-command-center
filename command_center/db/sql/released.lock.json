@@ -141,5 +141,5 @@
       "up": "sha256:1ff25169104250d8e67504d6833188c9556d203808939d63bb3dd45646fef7e7"
     }
   },
-  "note": "SHA-256 of every migration file, recorded when the migration shipped. `up` is the value the database's own schema_migration ledger holds; MigrationRunner.upgrade verifies it BEFORE applying anything pending, so editing an already-applied migration does not correct that migration -- it stops the deploy from applying every LATER one. Changing an entry below is a deliberate act with a live consequence, not bookkeeping. After ADDING a migration, regenerate with: python -m command_center.db migration-lock --write"
+  "note": "SHA-256 of every migration file, recorded when the migration shipped. `up` is the value the database's own schema_migration ledger holds; MigrationRunner.upgrade verifies it BEFORE applying anything pending, so editing an already-applied migration does not correct that migration -- it stops the deploy from applying every LATER one. Changing an entry below is a deliberate act with a live consequence, not bookkeeping. Check it with: python -m command_center.db migration-lock. After ADDING a migration, regenerate with: python scripts/migration_lock.py --write"
 }

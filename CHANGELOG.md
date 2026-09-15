@@ -8,6 +8,39 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Fixed — the migration-lock guard was itself failing the AIOS boundary gate (`VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH`)
+- `scripts/migration_lock.py` (new) takes over `--write`;
+  `python -m command_center.db migration-lock` is now the check only. The
+  guard that stops an edited migration from blocking a deploy had put a
+  `Path.write_text` inside `command_center/db/cli.py`, and a durable
+  filesystem write in a package named `db` is exactly the signature
+  `tests/architecture/aios_boundary.py` reads as a persistence engine
+  ("a JSON store is a persistence engine even with no driver anywhere in
+  it"). `test_engine_inventory_matches_frozen_baseline` went red with
+  `NEW ENGINE MODULE: command_center/db/cli.py matches frozen categories
+  ['memory']` — a required CI gate, so the whole queue fix was unmergeable.
+- Why moved rather than baselined. Adding the entry would have recorded the
+  control plane's operational database CLI as a frozen persistence engine
+  and frozen it against growth, on the strength of a developer maintenance
+  command. docs/AIOS_BOUNDARY.md's procedure for a detector false positive
+  says to prefer moving the module over adding a baseline entry, and
+  regenerating a checked-in artifact is developer maintenance — the same
+  shape as `python -m tests.architecture.aios_boundary --write-baseline`.
+  `AIOS_BOUNDARY_BASELINE.json` is unchanged, and the check stays where a
+  deploy can reach it, persisting nothing.
+- The lock's `note` (rendered from `migrations._LOCK_NOTE`, so it cannot
+  drift from the code) now names both commands. Only that line of
+  `released.lock.json` changed; no recorded checksum moved.
+- Tests: `tests/db/test_cli_queue.py` states the property directly rather
+  than leaving it to the baseline gate's generic drift line —
+  `test_the_database_cli_is_not_a_persistence_engine` asserts the scanner's
+  own `_persists_data` is false for `db/cli.py`, and
+  `test_the_database_cli_does_not_offer_to_rewrite_the_lock` pins that
+  argparse *refuses* `--write` so the old invocation cannot be copied back
+  out of a commit message. `tests/db/test_migration_set.py` covers the
+  script's write and check paths and that the note names a command that
+  exists. Reintroducing the write turns all three red plus the boundary gate.
+
 ### Fixed — a capacity outage no longer converts the whole backlog into dead letters (`VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH`)
 - `command_center/db/sql/0028_queue_wait_budget_needs_a_serving_fleet.up.sql`:
   the no-fault wait budget (`lease_wait_count`, 20 waits) is spent only while
@@ -113,8 +146,8 @@ functional application milestones of `app.py`.
   detect-secrets from reading 54 bare hex runs as credentials — unprefixed,
   every future migration would fail the security gate's "baseline changed"
   check until someone re-ran the scanner.
-- `python -m command_center.db migration-lock [--write]`: the check, and the
-  regeneration the note in the lock points at. Handled before `load_config()`
+- `python -m command_center.db migration-lock`: the check. Handled before
+  `load_config()`
   — it needs no DSN, so it answers on a laptop rather than only on the host
   that is already broken. A missing or malformed lock is itself reported as a
   `MigrationError`, so the command whose purpose is to replace a traceback

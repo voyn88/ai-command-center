@@ -152,8 +152,9 @@ _LOCK_NOTE = (
     "editing an already-applied migration does not correct that migration -- "
     "it stops the deploy from applying every LATER one. Changing an entry "
     "below is a deliberate act with a live consequence, not bookkeeping. "
+    "Check it with: python -m command_center.db migration-lock. "
     "After ADDING a migration, regenerate with: "
-    "python -m command_center.db migration-lock --write"
+    "python scripts/migration_lock.py --write"
 )
 
 

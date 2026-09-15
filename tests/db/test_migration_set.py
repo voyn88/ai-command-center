@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from command_center.db import migrations
@@ -213,3 +215,58 @@ def test_an_unreadable_lock_is_a_verdict_not_a_traceback(monkeypatch, tmp_path) 
     monkeypatch.setattr(migrations, "RELEASED_LOCK_PATH", malformed)
     with pytest.raises(migrations.MigrationError, match="not readable as a migration lock"):
         migrations.released_lock()
+
+
+def test_the_lock_names_the_command_that_regenerates_it() -> None:
+    """The note is the only instruction a reader gets at the moment they are
+    staring at a refusal, so it has to name a command that exists. It moved
+    once already (`python -m command_center.db migration-lock --write` ->
+    `scripts/migration_lock.py --write`), and a note pointing at a removed
+    flag would send the reader to an argparse error instead of the repair."""
+    note = json.loads(
+        migrations.RELEASED_LOCK_PATH.read_text(encoding="utf-8")
+    )["note"]
+    assert "python scripts/migration_lock.py --write" in note
+    assert "python -m command_center.db migration-lock" in note
+    assert "command_center.db migration-lock --write" not in note
+
+
+def test_the_regeneration_script_writes_exactly_what_render_produces(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """`--write` is `render_released_lock()` and a write, nothing else.
+
+    Regeneration lives in `scripts/` rather than on `python -m
+    command_center.db` because a durable write inside a package named `db` is
+    precisely the persistence-engine signature the AIOS boundary gate reads
+    (docs/AIOS_BOUNDARY.md); see `test_the_database_cli_is_not_a_persistence_
+    engine` in tests/db/test_cli_queue.py.
+    """
+    from scripts.migration_lock import main as lock_main
+
+    destination = tmp_path / "released.lock.json"
+    monkeypatch.setattr(migrations, "RELEASED_LOCK_PATH", destination)
+
+    assert lock_main(["--write"]) == 0
+    assert destination.read_text(encoding="utf-8") == migrations.render_released_lock()
+    assert str(destination) in capsys.readouterr().out
+
+
+def test_the_regeneration_script_reports_drift_as_a_verdict(
+    monkeypatch, capsys
+) -> None:
+    """Without `--write` the script is the same check the CLI runs, and it
+    obeys the same rule: exit 2 and a readable message, never a traceback."""
+    from scripts.migration_lock import main as lock_main
+
+    assert lock_main([]) == 0
+    assert f"{len(migrations.discover())} migrations unchanged" in capsys.readouterr().out
+
+    def refuse(sql_dir=None):
+        raise migrations.MigrationError("0022_queue_fail_lease_wait.up.sql changed")
+
+    monkeypatch.setattr(migrations, "verify_released_checksums", refuse)
+    assert lock_main([]) == 2
+    assert "migration lock: 0022_queue_fail_lease_wait.up.sql changed" in (
+        capsys.readouterr().err
+    )
