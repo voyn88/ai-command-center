@@ -1396,3 +1396,185 @@ def test_the_recovery_barrier_is_profile_independent_and_stays_unguarded():
     for index, before in enumerate(segments[:-1]):
         open_guard = guard in before and "\nfi\n" not in before[before.rindex(guard):]
         assert not open_guard, f"recovery barrier start #{index + 1} was guarded"
+
+
+# ---------------------------------------------------------------------------
+# The control preflight must refuse the agent layer without refusing the inert
+# skeleton. Refusing /var/lib/aicc-agent on existence deadlocked the very
+# remedy the refusal prescribes: the agent tmpfiles config makes that
+# directory, `restore()` unlinks only installed file targets, and no uninstall
+# path removes a directory -- so worker -> uninstall -> control install was
+# impossible on any host, and the control install that predated the tmpfiles
+# guard created the directory itself and locked out its own retry.
+# ---------------------------------------------------------------------------
+
+
+def _shell_function(name: str) -> str:
+    """The named shell function, lifted verbatim out of the installer.
+
+    The installer refuses to run anywhere but as root on a real host, so these
+    predicates are exercised as the shell actually parses them. A text
+    assertion cannot tell an empty skeleton from a credential file, which is
+    the entire distinction under test.
+    """
+    text = _installer_text()
+    start = text.index(f"\n{name}() {{\n") + 1
+    return text[start : text.index("\n}\n", start) + len("\n}\n")]
+
+
+def _holds_state(tmp_path: Path, target: Path) -> bool:
+    script = tmp_path / "predicate.sh"
+    script.write_text(
+        _shell_function("path_present") + _shell_function("agent_tree_holds_state"),
+        encoding="utf-8",
+    )
+    done = subprocess.run(
+        [
+            "sh",
+            "-eu",
+            "-c",
+            '. "$1"; agent_tree_holds_state "$2"',
+            "_",
+            str(script),
+            str(target),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert done.returncode in (0, 1), f"predicate errored: {done.stderr}"
+    return done.returncode == 0
+
+
+def _agent_tmpfiles_dirs() -> tuple[str, ...]:
+    """The directories the agent tmpfiles config declares under the tree."""
+    conf = (
+        Path(__file__).parents[2] / "deploy" / "tmpfiles.d" / "aicc-agent.conf"
+    ).read_text(encoding="utf-8")
+    return tuple(
+        fields[1]
+        for fields in (raw.split() for raw in conf.splitlines())
+        if len(fields) >= 2
+        and fields[0] == "d"
+        and fields[1].startswith("/var/lib/aicc-agent")
+    )
+
+
+def test_agent_state_predicate_tells_credentials_from_an_empty_skeleton(tmp_path):
+    """Executed, not text-matched: an empty root-owned skeleton holds no
+    secret, while anything that is not a plain directory -- at any depth -- is
+    agent state. Symlinks count wherever they sit, because `-d` follows them
+    and a tree standing in for another is never the skeleton tmpfiles made."""
+    root = tmp_path / "tree"
+
+    assert not _holds_state(tmp_path, root / "absent")
+    root.mkdir()
+    assert not _holds_state(tmp_path, root)
+    (root / "claude" / ".claude").mkdir(parents=True)
+    assert not _holds_state(tmp_path, root), "nested empty directories are not state"
+
+    credential = root / "claude" / ".claude" / ".credentials.json"
+    credential.write_text("{}", encoding="utf-8")
+    assert _holds_state(tmp_path, root), "a credential file at depth is state"
+    credential.unlink()
+    assert not _holds_state(tmp_path, root)
+
+    # A symlink is state whatever it points at -- a link into the operator's
+    # home would otherwise smuggle the whole credential store past this check.
+    # The tree-level case is covered twice over (the `-L` guard, and `find`
+    # being given neither -L nor -H), so dropping either mechanism alone still
+    # refuses it; what this pins is that they are not both lost.
+    link = root / "claude" / ".claude" / "link"
+    link.symlink_to("/home/voynadmin/.claude")
+    assert _holds_state(tmp_path, root), "a symlink inside the tree is state"
+    link.unlink()
+    assert not _holds_state(tmp_path, root)
+
+    swapped = tmp_path / "swapped"
+    swapped.symlink_to(root, target_is_directory=True)
+    assert _holds_state(tmp_path, swapped), "the tree replaced by a symlink is state"
+
+    plain = tmp_path / "plain"
+    plain.write_text("", encoding="utf-8")
+    assert _holds_state(tmp_path, plain), "a non-directory at that path is state"
+
+
+def test_uninstalling_the_worker_leaves_a_tree_a_control_install_accepts(tmp_path):
+    """The crux. The skeleton the installer itself creates must not be refused,
+    the credentials in it must be, and removing exactly what the worker
+    uninstall removes must be enough -- otherwise the refusal prescribes a
+    remedy that cannot satisfy it and the host is locked out for good."""
+    tx, _targets = _specs("worker", tmp_path)
+    host = tmp_path / "host"
+
+    declared = _agent_tmpfiles_dirs()
+    assert "/var/lib/aicc-agent" in declared, "premise: tmpfiles makes the tree"
+    for directory in declared:
+        (host / Path(directory).relative_to("/")).mkdir(parents=True, exist_ok=True)
+    tree = host / "var/lib/aicc-agent"
+    assert not _holds_state(tmp_path, tree), (
+        "the skeleton this installer creates would refuse the next control install"
+    )
+
+    # The agent layer under that tree is files, and every one of them is a
+    # worker-only target -- so the worker uninstall unlinks each.
+    credentials = sorted(
+        target
+        for target in tx.WORKER_ONLY_TARGETS
+        if target.startswith("/var/lib/aicc-agent/")
+    )
+    assert credentials, "premise: the agent layer under the tree is installed files"
+    for target in credentials:
+        path = host / Path(target).relative_to("/")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}", encoding="utf-8")
+    assert _holds_state(tmp_path, tree), "a host holding agent credentials must be refused"
+
+    for target in credentials:
+        (host / Path(target).relative_to("/")).unlink()
+    assert not _holds_state(tmp_path, tree), (
+        "after the worker uninstall unlinks its own targets a control install "
+        "must become possible"
+    )
+
+
+def _preflight_candidates() -> tuple[str, ...]:
+    """The paths the control preflight refuses on existence alone."""
+    text = _installer_text()
+    block = text[text.index('if [ "$install_profile" = "control" ]; then') :]
+    listing = block[block.index("for candidate in") : block.index("\n  do\n")]
+    return tuple(field for field in listing.split() if field.startswith("/"))
+
+
+def test_the_control_preflight_only_names_what_its_own_remedy_removes(tmp_path):
+    """Standing invariant, and the one that keeps the deadlock from returning.
+    The refusal tells the operator to uninstall the worker profile, so every
+    path it refuses on existence must be a path that uninstall removes. A
+    directory made outside the transaction is removed by nothing, so it may be
+    refused only on the state it holds."""
+    tx, worker_targets = _specs("worker", tmp_path)
+    text = _installer_text()
+    control_guard = 'if [ "$install_profile" = "control" ]; then'
+
+    assert "uninstall the worker profile first" in text
+    candidates = _preflight_candidates()
+    assert candidates, "the existence-based refusal list was not found"
+    for candidate in candidates:
+        assert candidate in tx.WORKER_ONLY_TARGETS, (
+            f"{candidate} is refused on existence, but it is not a worker-only "
+            "target, so the uninstall this refusal prescribes never removes it"
+        )
+        assert candidate in worker_targets
+
+    # The tree itself is installed by no profile and removed by no uninstall,
+    # so it must not be in that list at any point in the future either.
+    assert "/var/lib/aicc-agent" not in candidates
+    assert "/var/lib/aicc-agent" not in worker_targets
+    assert "/var/lib/aicc-agent" not in tx.WORKER_ONLY_TARGETS
+    assert _sits_behind(
+        "if agent_tree_holds_state /var/lib/aicc-agent; then", control_guard, text
+    ), "the agent tree is not consulted by the control preflight at all"
+    # ...and it is still named in the refusal when it does hold state.
+    assert 'leftovers="$leftovers /var/lib/aicc-agent"' in text
+
+    # A dangling symlink is an artefact too: `[ -e ]` alone would miss one.
+    assert 'if path_present "$candidate"; then' in text

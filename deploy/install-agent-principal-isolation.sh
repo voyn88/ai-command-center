@@ -79,6 +79,36 @@ case "$install_profile" in
   *) echo "unknown AICC_INSTALL_PROFILE: $install_profile" >&2; exit 1 ;;
 esac
 
+# Does the agent credential tree hold agent state, as opposed to merely
+# existing? Anything that is not a plain directory, at any depth, is state: the
+# model credentials themselves, and anything else an agent left behind.
+#
+# `-L` is tested before `-d` because `-d` follows a symlink: a tree replaced by
+# a link into, say, the operator's home would otherwise be judged by what it
+# points at. The `find` below refuses that same case a second time -- it is
+# given neither -L nor -H, so a command-line symlink is reported as the
+# non-directory it is -- and either mechanism alone is sufficient. Both are
+# kept on purpose: the guard states the invariant here rather than resting on
+# find's default symlink handling. A link at any depth inside is find's alone.
+#
+# The distinction is load-bearing, not pedantry -- see the preflight below.
+agent_tree_holds_state() {
+  if [ -L "$1" ]; then
+    return 0
+  fi
+  if [ ! -d "$1" ]; then
+    # A non-directory sitting at that path is state; absent is not.
+    if path_present "$1"; then
+      return 0
+    fi
+    return 1
+  fi
+  if find "$1" ! -type d -print -quit | grep -q .; then
+    return 0
+  fi
+  return 1
+}
+
 # A control host must not carry the agent layer at all -- and excluding those
 # targets from this transaction does not remove what a previous worker
 # installation already put on disk. Installing "around" them would leave agent
@@ -86,17 +116,37 @@ esac
 # exact boundary this installer exists to create (independent review of
 # 090afcf caught precisely that). So refuse, and name what has to go: removal
 # belongs to the transactional uninstall, not to a side effect of this run.
+#
+# Because that refusal prescribes the uninstall, it may only name artefacts
+# the uninstall can actually remove. The four below are WORKER_ONLY_TARGETS
+# installed as files by the worker transaction and unlinked by its uninstall,
+# so for those, existing IS the agent layer and the advice is actionable.
+#
+# /var/lib/aicc-agent is a target of nothing. The agent tmpfiles config makes
+# it, `restore()` unlinks only installed file targets, and no uninstall path
+# removes a directory -- so refusing on its mere existence named the single
+# artefact the prescribed remedy provably cannot clear. That is a deadlock
+# rather than a boundary, and a general one: worker -> uninstall -> control
+# install was impossible on any host, and a control install that predated the
+# guard further down created the directory itself, locking out its own retry.
+#
+# So refuse on the agent layer, not on the empty skeleton. An empty root-owned
+# 0700 directory brokers nothing, holds no secret and grants no capability,
+# while a host that still holds credentials is refused on those files -- and a
+# worker that still has its units is refused four more ways besides.
 if [ "$install_profile" = "control" ]; then
   leftovers=""
   for candidate in \
-    /var/lib/aicc-agent \
     /etc/aicc/worker-lanes \
     /etc/aicc/agent.env \
     /etc/systemd/system/aicc-agent-launcher.socket \
     /etc/systemd/system/voyn-aicc-worker@.service
   do
-    if [ -e "$candidate" ]; then leftovers="$leftovers $candidate"; fi
+    if path_present "$candidate"; then leftovers="$leftovers $candidate"; fi
   done
+  if agent_tree_holds_state /var/lib/aicc-agent; then
+    leftovers="$leftovers /var/lib/aicc-agent"
+  fi
   if [ -n "$leftovers" ]; then
     echo "control profile refuses: worker artefacts present:$leftovers" >&2
     echo "uninstall the worker profile first; this run will not remove them" >&2
