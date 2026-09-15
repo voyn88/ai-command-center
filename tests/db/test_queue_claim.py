@@ -1268,6 +1268,129 @@ def test_infra_waits_do_not_consume_the_attempt_budget_even_as_history_grows(
     assert (attempt_count, infra_wait_count) == (2, 2)
 
 
+def _wait_budgets(admin_conn, item_id: str) -> tuple[int, int]:
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "SELECT lease_wait_count, infra_wait_count FROM work_item "
+            "WHERE work_item_id = %s",
+            (item_id,),
+        )
+        return cur.fetchone()
+
+
+def test_the_last_lease_wait_refunds_its_attempt_like_every_one_before(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """0028: the refusal that exhausts the wait budget is a no-fault refusal
+    like the ones it follows, so the DLQ row says plainly that not one model
+    attempt was ever spent on the item. The delivery numbers keep moving
+    (0025/0026) while the budget comes back each time."""
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
+    with psycopg.connect(app_dsn, autocommit=True) as app:
+        item_id = _enqueue(app, "capped", max_attempts=5, backoff_seconds=0)
+    reason = "executor infrastructure failure (provider/auth/quota): session limit"
+    with (
+        _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names),
+        psycopg.connect(host_dsns[0], autocommit=True) as worker,
+    ):
+        for delivery, expected in enumerate(
+            ("lease_wait_requeued", "lease_wait_requeued", "lease_wait_dead_lettered"),
+            start=1,
+        ):
+            token, token_hash = _token()
+            verdict = _claim(worker, token_hash)
+            assert verdict[0], verdict[1]
+            assert verdict[4] == delivery, "the number follows the history"
+            ok, got = _call(
+                worker,
+                "SELECT ok, reason FROM queue_fail_lease_wait(%s, %s, %s, %s)",
+                (verdict[3], token, reason, 2),
+            )
+            assert ok is True and got == expected
+    state = _item(admin_conn, item_id)
+    assert state[0] == "dead"
+    assert state[5] == f"lease_wait_exhausted: {reason}"
+    assert re.search(r"(?i)session limit", state[5]), "infra_monitor classifies by reason"
+    assert state[1] == 0, "not one model attempt was ever spent on this item"
+
+
+def test_redrive_clears_both_wait_budgets_it_widens_the_attempts_for(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """0027: a redrive of an item the FLEET dead-lettered must survive the
+    next refusal of the same class. Before it, `lease_wait_count` and
+    `infra_wait_count` carried across a redrive unchanged, so the item fell
+    straight back into the dead letter and was counted as fresh growth.
+    The attempt history is still not reset; both wait budgets are, and the
+    cleared counts survive in the audit."""
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
+    with psycopg.connect(app_dsn, autocommit=True) as app:
+        item_id = _enqueue(app, "fleet-dead", max_attempts=2, backoff_seconds=0)
+    with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
+        with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+            # One real attempt first, so "history survived" is distinguishable
+            # from "there was none".
+            token, token_hash = _token()
+            verdict = _claim(worker, token_hash)
+            _call(
+                worker,
+                "SELECT ok, reason FROM queue_fail(%s, %s, %s, true)",
+                (verdict[3], token, "a real failure"),
+            )
+            # One infra wait (refunded, its own budget) ...
+            token, token_hash = _token()
+            verdict = _claim(worker, token_hash)
+            assert _call(
+                worker,
+                "SELECT ok, reason FROM queue_fail_infra_wait(%s, %s, %s, 5)",
+                (verdict[3], token, "executor infrastructure failure: launcher"),
+            ) == (True, "infra_wait_requeued")
+            # ... then two lease waits against a cap of one: the second exceeds it.
+            for expected in ("lease_wait_requeued", "lease_wait_dead_lettered"):
+                token, token_hash = _token()
+                verdict = _claim(worker, token_hash)
+                assert verdict[0], verdict[1]
+                ok, got = _call(
+                    worker,
+                    "SELECT ok, reason FROM queue_fail_lease_wait(%s, %s, %s, %s)",
+                    (verdict[3], token, "writer lease unavailable", 1),
+                )
+                assert ok is True and got == expected
+        assert _item(admin_conn, item_id)[0] == "dead"
+        assert _wait_budgets(admin_conn, item_id) == (2, 1)
+        with psycopg.connect(app_dsn, autocommit=True) as app:
+            assert _call(app, "SELECT queue_redrive(%s, 2)", (item_id,))[0] is True
+        state = _item(admin_conn, item_id)
+        assert state[0] == "ready"
+        assert state[1] == 1, "the real failure's attempt is still not reset"
+        assert state[2] == 4, "the attempt budget is still widened explicitly"
+        assert state[5] is None
+        assert _wait_budgets(admin_conn, item_id) == (0, 0), "both wait budgets start over"
+        # The whole point: the redriven item survives the next fleet refusal.
+        with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+            token, token_hash = _token()
+            verdict = _claim(worker, token_hash)
+            assert verdict[0], verdict[1]
+            assert verdict[4] == 5, "delivery numbers never restart"
+            ok, got = _call(
+                worker,
+                "SELECT ok, reason FROM queue_fail_lease_wait(%s, %s, %s, %s)",
+                (verdict[3], token, "writer lease unavailable", 1),
+            )
+            assert ok is True and got == "lease_wait_requeued"
+        assert _item(admin_conn, item_id)[0] == "ready"
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "SELECT detail ->> 'cleared_lease_wait_count', "
+            "detail ->> 'cleared_infra_wait_count' FROM work_event "
+            "WHERE work_item_id = %s AND event = 'redrive' AND outcome = 'granted'",
+            (item_id,),
+        )
+        assert cur.fetchall() == [("2", "1")]
+
+
 def test_the_dead_letter_view_preserves_the_cause_and_the_history(
     admin_conn, psycopg, test_dsn, role_passwords
 ):
