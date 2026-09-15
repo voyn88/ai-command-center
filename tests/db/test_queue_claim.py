@@ -440,9 +440,11 @@ def test_claim_follows_attempt_history_when_the_counter_lags(
         with psycopg.connect(host_dsns[0], autocommit=True) as worker:
             verdict = _claim(worker, _token()[1])
     assert verdict[0] is True, verdict
-    assert verdict[4] == 2
+    assert verdict[4] == 2, "the attempt NUMBER continues the history"
     state = _item(admin_conn, item_id)
-    assert state[0] == "claimed" and state[1] == 2
+    assert state[0] == "claimed" and state[1] == 1, (
+        "the attempt COUNT is the budget consumed: the orphan row never ran"
+    )
 
 
 def test_one_claim_call_consumes_exactly_one_attempt(
@@ -1196,6 +1198,74 @@ def test_infra_wait_failure_refunds_attempt_count_and_uses_its_own_budget(
             (item_id,),
         )
         assert cur.fetchone()[0] == 1
+
+
+def test_infra_waits_do_not_consume_the_attempt_budget_even_as_history_grows(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """0024 refunds an infra wait; 0025 numbers attempts from the history.
+
+    Live 2026-09-15: after two refunded infra waits on a `max_attempts = 2`
+    item the counter said 0 but the history said 2, and the claim derived
+    attempt 3 > 2 -> `attempt_budget_exhausted` -- the task never ran once.
+    The number must keep following the history (no reused `attempt_no`) while
+    the budget follows the counter (refunds count), so the item gets its two
+    real attempts and only then dies on `max_attempts_exhausted`.
+    """
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
+    with psycopg.connect(app_dsn, autocommit=True) as app:
+        item_id = _enqueue(app, "infra-then-real", max_attempts=2, backoff_seconds=0)
+    with (
+        _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names),
+        psycopg.connect(host_dsns[0], autocommit=True) as worker,
+    ):
+        for expected_no in (1, 2):
+            token, token_hash = _token()
+            verdict = _claim(worker, token_hash)
+            assert verdict[0] and verdict[4] == expected_no, verdict
+            assert _call(
+                worker,
+                "SELECT ok, reason FROM queue_fail_infra_wait(%s, %s, %s, 5)",
+                (verdict[3], token, "executor infrastructure failure: launcher"),
+            ) == (True, "infra_wait_requeued")
+        state = _item(admin_conn, item_id)
+        assert state[0] == "ready" and state[1] == 0, "both waits refunded"
+
+        # Attempt 3 by number, attempt 1 by budget.
+        token, token_hash = _token()
+        verdict = _claim(worker, token_hash)
+        assert verdict[0], verdict
+        assert verdict[4] == 3, "the number never reuses a history row"
+        state = _item(admin_conn, item_id)
+        assert state[0] == "claimed" and state[1] == 1, "one attempt consumed"
+        assert _call(
+            worker,
+            "SELECT ok, reason FROM queue_fail(%s, %s, %s, true)",
+            (verdict[3], token, "real failure one"),
+        )[0]
+
+        # Attempt 4 by number, attempt 2 by budget: the last real one.
+        token, token_hash = _token()
+        verdict = _claim(worker, token_hash)
+        assert verdict[0] and verdict[4] == 4, verdict
+        assert _item(admin_conn, item_id)[1] == 2
+        assert _call(
+            worker,
+            "SELECT ok, reason FROM queue_fail(%s, %s, %s, true)",
+            (verdict[3], token, "real failure two"),
+        )[0]
+    state = _item(admin_conn, item_id)
+    assert state[0] == "dead"
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "SELECT dead_reason, attempt_count, infra_wait_count FROM work_item "
+            "WHERE work_item_id = %s",
+            (item_id,),
+        )
+        dead_reason, attempt_count, infra_wait_count = cur.fetchone()
+    assert dead_reason.startswith("max_attempts_exhausted"), dead_reason
+    assert (attempt_count, infra_wait_count) == (2, 2)
 
 
 def test_the_dead_letter_view_preserves_the_cause_and_the_history(
