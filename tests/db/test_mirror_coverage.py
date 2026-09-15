@@ -120,6 +120,17 @@ UNMIRRORED_SCHEMA_TABLES: dict[str, Exclusion] = {
         ),
         task="VOYN-W0-BACKLOG-ORCHESTRATOR",
     ),
+    "backlog_duplicate": Exclusion(
+        reason=(
+            "PostgreSQL-native (migration 0025): the pair rows written only by "
+            "backlog_mark_duplicate, in the same transaction as the OPEN -> "
+            "DECIDED move they justify. The duplicates they retire were found "
+            "by an embedding scan over the PostgreSQL store itself, so no "
+            "SQLite authority ever held them and a mirror would have nothing "
+            "to copy from."
+        ),
+        task="VOYN-W0-AICC-BGE-M3-DEDUP-SCAN",
+    ),
     "backlog_evidence": Exclusion(
         reason=(
             "PostgreSQL-native (BO-S1): acceptance evidence rows are written only "
