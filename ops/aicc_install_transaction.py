@@ -5103,6 +5103,7 @@ WORKER_ONLY_TARGETS = frozenset(
         "/etc/systemd/system/voyn-aicc-source-clone-refresh.timer",
         "/etc/aicc/agent-workspace-roots",
         "/etc/aicc/worker-lanes",
+        "/etc/voyn/aicc-worker-lanes.conf",
         "/etc/aicc/gitconfig",
         "/etc/aicc/agent.env",
         "/etc/systemd/system/voyn-aicc-worker@.service",
@@ -5188,6 +5189,286 @@ CONTROL_ONLY_TIMERS = (
 CONTROL_ONLY_TIMER = "voyn-aicc-pr-window.timer"
 
 
+#: The per-host self-deploy tick, per profile: `(committed file, installed
+#: unit name)`.
+#:
+#: This is the first unit to become repo-owned on BOTH hosts, and it is first
+#: because it is the one the live inventory found safest to move: the timer
+#: is byte-identical to this repository on control-01 and worker-01, and so
+#: is the control service, so on three of the four files the transition
+#: changes the unit's PROVENANCE and nothing about what it runs (2026-08-30
+#: inventory, VOYN-W0-AICC-CONTROL-PLANE-REPO-OWNED-UNITS). The fourth --
+#: the worker service -- is NOT claimed identical to what runs on worker-01
+#: today: the inventory did not prove it and #927 has since changed the
+#: committed file. That one is a content change as well as a provenance
+#: change, which is why it goes in as part of a transaction that snapshots
+#: the unit it replaces and restores it on any failure, and why the
+#: before/after `systemctl show -p FragmentPath` proof the task asks for is
+#: taken per unit at the install rather than assumed here. Before any of it,
+#: every enabled
+#: unit on control-01 -- 11 of 11 -- and 9 of 13 on worker-01 were
+#: `systemctl link`ed out of the operator's home directory: nothing installed
+#: them, nothing versioned them, and when the planner's timer disappeared
+#: from systemd the dispatch loop was down fourteen hours with no file
+#: anywhere that said it should have been there
+#: (VOYN-W0-AICC-PLANNER-TIMER-ABSENT).
+#:
+#: The two profiles install DIFFERENT service content under the SAME unit
+#: name: the control host owns the database and runs migrations, the worker
+#: host holds no DDL privilege and restarts lanes instead. That is why the
+#: table maps a source file to a unit name rather than listing names --
+#: `voyn-aicc-self-deploy-worker.service` is installed as
+#: `voyn-aicc-self-deploy.service`, which is what the timer activates.
+#:
+#: Both profiles get the SERVICE and the TIMER, never one without the other.
+#: An earlier revision of this change shipped the timer to the worker profile
+#: while excluding the service, which is a unit that fails on every firing
+#: with `Unit voyn-aicc-self-deploy.service not found` (independent review on
+#: 9d1a61f6). `verify_unit_closure` below now makes that unrepresentable for
+#: every timer this installer writes, not just this one.
+SELF_DEPLOY_UNIT_SOURCES: dict[str, tuple[tuple[str, str], ...]] = {
+    "worker": (
+        ("voyn-aicc-self-deploy-worker.service", "voyn-aicc-self-deploy.service"),
+        ("voyn-aicc-self-deploy.timer", "voyn-aicc-self-deploy.timer"),
+    ),
+    "control": (
+        ("voyn-aicc-self-deploy.service", "voyn-aicc-self-deploy.service"),
+        ("voyn-aicc-self-deploy.timer", "voyn-aicc-self-deploy.timer"),
+    ),
+}
+
+
+def profile_unit_sources(profile: str) -> tuple[tuple[str, str], ...]:
+    """`(committed file, installed unit name)` for the units a profile owns.
+
+    The control-only ticks install under their own names; the self-deploy
+    tick is the one unit whose committed file differs per profile.
+    """
+    if profile not in PROFILES:
+        raise ValueError(f"unknown installation profile: {profile!r}")
+    units = SELF_DEPLOY_UNIT_SOURCES[profile]
+    if profile == "control":
+        units += tuple((unit, unit) for unit in CONTROL_ONLY_UNITS)
+    return units
+
+
+def profile_timers(profile: str) -> tuple[str, ...]:
+    """The timers of `profile_unit_sources`, which the installer enables.
+
+    Derived from what the profile INSTALLS rather than listed beside it: a
+    second hand-maintained list of the same units is the failure mode this
+    whole task exists to remove, and a timer enabled but not installed is the
+    "works, but nobody installs it" state in its purest form.
+
+    These are the timers of the unit table, not every timer the installer
+    writes, and the difference is deliberate in both directions:
+
+    * `voyn-aicc-source-clone-refresh.timer` is enabled by the worker branch
+      of the installer beside the launcher socket, as part of the agent layer
+      rather than the repo-owned unit table.
+    * `voyn-aicc-github-token.timer` is installed on both profiles and
+      enabled by NEITHER, because its service reads a private key an owner
+      places by hand (`/etc/voyn/secrets/aicc-github-app.pem`, see
+      docs/operations/CONTROL_TICK_GITHUB_IDENTITY.md). Enabling it here
+      would put a failing unit on every host that has not placed the key.
+      It is the remaining "installed but nobody enables it" unit and it is
+      named here rather than left for someone to notice.
+    """
+    return tuple(
+        unit for _source, unit in profile_unit_sources(profile)
+        if unit.endswith(".timer")
+    )
+
+
+def _unit_target(target: str) -> bool:
+    """Whether a logical target is a unit FILE directly under the unit dir.
+
+    A drop-in (`<unit>.d/<name>.conf`) shares the prefix but is not a unit:
+    it can neither satisfy a timer's `Unit=` nor carry a `[Timer]` section of
+    its own, so it takes no part in the closure check either way.
+    """
+    if not target.startswith(_SYSTEMD_UNIT_DIR):
+        return False
+    return "/" not in target[len(_SYSTEMD_UNIT_DIR) :]
+
+
+def _template_of(unit: str) -> str:
+    """The unit FILE that serves `unit`.
+
+    systemd serves `name@arg.service` from the template file `name@.service`,
+    which is the name the installer writes. Comparing an instance name
+    against the installed files directly would fail a timer that legitimately
+    activates one, so instances are folded onto their template first.
+    """
+    name, at_sign, rest = unit.partition("@")
+    if not at_sign:
+        return unit
+    _instance, dot, suffix = rest.partition(".")
+    if not dot:
+        return unit
+    return f"{name}@.{suffix}"
+
+
+def timer_activated_unit(source: Path, unit: str | None = None) -> str:
+    """The unit a committed `.timer` activates once INSTALLED as `unit`.
+
+    systemd's rule: `Unit=` in the `[Timer]` section, last assignment wins,
+    defaulting to the timer's own name with a `.service` suffix. Parsed
+    section-aware on purpose -- every timer here also has a `[Unit]` SECTION
+    header, and a parser that matched `Unit=` anywhere would read a directive
+    out of the wrong section the first time one appears there.
+
+    The implicit default is taken from the INSTALLED name rather than the
+    committed file name, because the two are allowed to differ: the
+    self-deploy service ships as two per-profile files installed under one
+    unit name, and a timer gaining the same treatment must not be checked
+    against a name systemd never sees.
+    """
+    installed = unit if unit is not None else source.name
+    activated = installed.removesuffix(".timer") + ".service"
+    section = ""
+    for raw in source.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].lower()
+            continue
+        if section != "timer":
+            continue
+        key, sep, value = line.partition("=")
+        if sep and key.strip() == "Unit" and value.strip():
+            activated = value.strip()
+    return activated
+
+
+def verify_unit_closure(specs: Iterable[FileSpec]) -> None:
+    """Refuse a generation that installs a timer without its service.
+
+    A `.timer` whose activated unit is not installed by the same generation
+    is not a partial install that an operator can finish -- it is a unit that
+    fails on every single firing, forever, and reports that failure against
+    the timer rather than against whatever was supposed to install the
+    service. It is also silent in exactly the way this task is about: the
+    timer is present, enabled and `systemctl list-timers` shows it ticking.
+    Checked over the whole spec list, so it holds for every timer the
+    installer writes -- the control ticks, the GitHub-token refresh, the
+    source-clone refresh and the self-deploy pair alike -- and not only for
+    the table that happened to introduce it (independent review on 9d1a61f6).
+    """
+    specs = tuple(specs)
+    installed = {
+        PurePosixPath(spec.target).name
+        for spec in specs
+        if not spec.remove and _unit_target(spec.target)
+    }
+    for spec in specs:
+        if spec.remove or not _unit_target(spec.target):
+            continue
+        if not spec.target.endswith(".timer"):
+            continue
+        name = PurePosixPath(spec.target).name
+        activated = timer_activated_unit(spec.source, name)
+        if _template_of(activated) not in installed:
+            raise ValueError(
+                f"{name} activates {activated}, "
+                "which this generation does not install"
+            )
+
+
+#: The committed spellings of the worker lane fleet, and why there is more
+#: than one of them.
+#:
+#: `deploy/aicc/worker-lanes` is the AUTHORED list -- bare lane numbers, read
+#: by the staged rollout and installed as `/etc/aicc/worker-lanes`.
+#: `deploy/voyn-aicc-worker-lanes.conf` is the same fleet written as unit
+#: names, because the credential rotator and the root rotation helper
+#: authorise against it across a sudo boundary and must not be handed a
+#: number to expand into a unit name themselves
+#: (`command_center.ops.credential_rotation.load_lane_registry`,
+#: `deploy/voyn-aicc-rotation-helper`). A third, in
+#: `deploy/systemd/voyn-aicc-self-deploy-worker.service`, is the lanes the
+#: worker self-deploy tick restarts after staging a release; see
+#: `verify_self_deploy_lane_coverage` for why that one is containment rather
+#: than equality.
+#:
+#: None of them is kept in sync by remembering to. `verify_lane_registry_
+#: agreement` and `verify_self_deploy_lane_coverage` below are both called
+#: from `default_specs`, so no generation can be built -- on any profile, on
+#: any host -- while they disagree, and a repo fitness test
+#: (`test_the_committed_lane_spellings_cannot_disagree`) runs the same two
+#: checks against this repository before anything reaches a host. A lane
+#: added to one file and forgotten in another used to mean the rotator
+#: silently never rotating that lane's credential: a security control quietly
+#: covering less than the fleet it names (independent review on 9d1a61f6).
+LANE_REGISTRY_SOURCE = "deploy/aicc/worker-lanes"
+ROTATION_LANE_REGISTRY_SOURCE = "deploy/voyn-aicc-worker-lanes.conf"
+ROTATION_LANE_REGISTRY_TARGET = "/etc/voyn/aicc-worker-lanes.conf"
+_LANE_NUMBER_RE = re.compile(r"^[0-9]{1,4}$")
+
+
+def _registry_entries(source: Path) -> tuple[str, ...]:
+    """Comment- and blank-stripped lines of a lane registry, in file order."""
+    return tuple(
+        line
+        for line in (raw.strip() for raw in source.read_text(encoding="utf-8").splitlines())
+        if line and not line.startswith("#")
+    )
+
+
+def worker_lane_units(repo_root: Path) -> tuple[str, ...]:
+    """The lane units `deploy/aicc/worker-lanes` names, in file order."""
+    lanes = _registry_entries(repo_root / LANE_REGISTRY_SOURCE)
+    for lane in lanes:
+        if not _LANE_NUMBER_RE.fullmatch(lane):
+            raise ValueError(f"malformed worker lane: {lane!r}")
+    if len(set(lanes)) != len(lanes):
+        raise ValueError("duplicate worker lane")
+    if not lanes:
+        raise ValueError("worker lane registry names no lanes")
+    return tuple(f"voyn-aicc-worker@{lane}.service" for lane in lanes)
+
+
+def verify_lane_registry_agreement(repo_root: Path) -> None:
+    """Refuse to build a generation whose two lane spellings disagree."""
+    expected = worker_lane_units(repo_root)
+    actual = _registry_entries(repo_root / ROTATION_LANE_REGISTRY_SOURCE)
+    if actual != expected:
+        raise ValueError(
+            f"{ROTATION_LANE_REGISTRY_SOURCE} names {list(actual)}, but "
+            f"{LANE_REGISTRY_SOURCE} names {list(expected)}"
+        )
+
+
+def verify_self_deploy_lane_coverage(repo_root: Path) -> None:
+    """Refuse a worker generation whose self-deploy tick skips a known lane.
+
+    `voyn-aicc-self-deploy-worker.service` enumerates the lanes it restarts
+    after staging a release, and this generation is the first thing that
+    installs it -- so it is a THIRD committed spelling of the worker fleet,
+    beside the two registries above, and it would rot the same way they
+    would. A lane the tick does not name keeps serving the previous release
+    forever: not a failure, not an alert, just one worker silently a
+    deploy behind until somebody compares two files by eye.
+
+    Containment, not equality, on purpose. The rollout discovers already-
+    instantiated lanes beyond the configured ones
+    (`ops/aicc_staged_worker_rollout.py`), so naming MORE lanes than the
+    registry is how a host scales; naming fewer is the defect. Every lane the
+    registry authorises must be a lane the tick restarts.
+    """
+    source = repo_root / "deploy/systemd" / SELF_DEPLOY_UNIT_SOURCES["worker"][0][0]
+    restarted = set()
+    words = source.read_text(encoding="utf-8").split()
+    for index, word in enumerate(words[:-1]):
+        if word == "--restart":
+            restarted.add(words[index + 1])
+    missing = [lane for lane in worker_lane_units(repo_root) if lane not in restarted]
+    if missing:
+        raise ValueError(
+            f"{source.name} does not restart {missing}, which "
+            f"{LANE_REGISTRY_SOURCE} names"
+        )
+
+
 def _runtime_target(target: str) -> bool:
     """Whether a logical target lives on the tmpfs runtime tree.
 
@@ -5237,12 +5518,15 @@ def default_specs(
     credential files) removed atomically with the control install itself,
     not as a separate step that could commit while the other fails.
 
-    The control-plane's own ticks become repo-owned under VOYN-W0-AICC-
-    CONTROL-PLANE-REPO-OWNED-UNITS, one at a time as each is needed.
-    `CONTROL_ONLY_UNITS` is the set that has arrived: the PR review-window
-    tick, which had never been installed on control-01 at all. The rest
-    (planner, review, merge, reaper, rotation) are still symlinks into the
-    operator's home and still follow.
+    The fleet's ticks become repo-owned under VOYN-W0-AICC-CONTROL-PLANE-
+    REPO-OWNED-UNITS, one unit at a time, because each move has to be proven
+    against the live unit it replaces. `profile_unit_sources(profile)` is the
+    set that has arrived: `CONTROL_ONLY_UNITS` (the review, merge, remediate
+    and PR review-window ticks) plus the self-deploy service and timer, which
+    BOTH profiles install -- the first units this installer owns on a worker
+    host as well as on the control plane. The rest (planner, queue reaper,
+    pgtunnel, credential rotation, ollama) are still `systemctl link`s into
+    the operator's home directory and still follow.
 
     What the transition does and does not remove, stated exactly, because
     "the agent principal is absent" is a claim this cannot make:
@@ -5269,6 +5553,18 @@ def default_specs(
     """
     if profile not in PROFILES:
         raise ValueError(f"unknown installation profile: {profile!r}")
+    # Before anything is staged: every committed spelling of the worker lane
+    # fleet must agree with the authored one. A disagreement is silent in
+    # both directions -- the credential rotator authorises against a narrower
+    # fleet than the generation installs lanes for and simply never rotates
+    # the missing lane, and the self-deploy tick restarts a narrower fleet
+    # than it staged a release for and simply leaves the missing lane a
+    # deploy behind. Checked here, on every profile, rather than only in a
+    # fitness test: a host installs from its own tree, which is not
+    # necessarily one CI ever saw, and a spelling that disagrees is a defect
+    # of the repository whichever role is being installed.
+    verify_lane_registry_agreement(repo_root)
+    verify_self_deploy_lane_coverage(repo_root)
     root_uid, root_gid = 0, 0
     # `aicc-agent` is resolved only where the agent layer is installed. That
     # identity comes from deploy/sysusers.d/aicc-agent.conf, which a control
@@ -5390,6 +5686,25 @@ def default_specs(
             root_uid,
             root_gid,
         ),
+        # The same fleet, written as unit names for the credential rotator
+        # and the root rotation helper that authorises against it across the
+        # sudo boundary. Repo-owned from here on. Until now it was placed by
+        # hand -- docs/operations/WORKER_CREDENTIAL_ROTATION.md step 2 told
+        # an operator to install it -- so nothing put it on a rebuilt host
+        # and nothing noticed that it and /etc/aicc/worker-lanes could
+        # disagree. The rotator fails closed without it ("cannot open lane
+        # registry"), which is the better half of that bargain; the silent
+        # half is a registry that opens and names fewer lanes than the fleet.
+        # Kept equal to /etc/aicc/worker-lanes by
+        # verify_lane_registry_agreement(), not by a comment asking the next
+        # editor to remember.
+        FileSpec(
+            repo_root / ROTATION_LANE_REGISTRY_SOURCE,
+            ROTATION_LANE_REGISTRY_TARGET,
+            0o644,
+            root_uid,
+            root_gid,
+        ),
         FileSpec(
             repo_root / "deploy/aicc/gitconfig",
             "/etc/aicc/gitconfig",
@@ -5501,6 +5816,22 @@ def default_specs(
             root_gid,
         ),
     )
+    # The units this host role owns, this generation's half of
+    # VOYN-W0-AICC-CONTROL-PLANE-REPO-OWNED-UNITS: the control plane's own
+    # ticks, plus the self-deploy pair both roles run. Installed with the
+    # rest of the generation rather than beside it, so the tick a rebuilt
+    # host runs is the tick this commit describes, and so a failed install
+    # rolls the unit files back with everything else.
+    profile_units = tuple(
+        FileSpec(
+            repo_root / "deploy/systemd" / source,
+            f"/etc/systemd/system/{unit}",
+            0o644,
+            root_uid,
+            root_gid,
+        )
+        for source, unit in profile_unit_sources(profile)
+    )
     if profile == "control":
         # Dropping a target from the spec list only stops this transaction
         # from *writing* it -- it does nothing about a worker-only file a
@@ -5515,20 +5846,6 @@ def default_specs(
         # predecessor). A host that never carried the worker profile simply
         # removes nothing -- every one of these targets is already absent.
         kept = tuple(spec for spec in specs if spec.target not in WORKER_ONLY_TARGETS)
-        # The control plane's own ticks, this generation's half of
-        # VOYN-W0-AICC-CONTROL-PLANE-REPO-OWNED-UNITS. Installed with the
-        # rest of the control generation rather than beside it, so the tick
-        # a rebuilt host runs is the tick this commit describes.
-        control_units = tuple(
-            FileSpec(
-                repo_root / "deploy/systemd" / unit,
-                f"/etc/systemd/system/{unit}",
-                0o644,
-                root_uid,
-                root_gid,
-            )
-            for unit in CONTROL_ONLY_UNITS
-        )
         purge = tuple(
             removal_spec(target, sensitive=target in SENSITIVE_TARGETS)
             for target in sorted(WORKER_ONLY_TARGETS)
@@ -5539,7 +5856,12 @@ def default_specs(
         purge_directories = tuple(
             directory_removal_spec(target) for target in WORKER_ONLY_DIRECTORIES
         )
-        return kept + control_units + purge + purge_directories
+        specs = kept + profile_units + purge + purge_directories
+    else:
+        specs += profile_units
+    # Last, over the finished list: no generation installs a timer whose
+    # service it does not also install.
+    verify_unit_closure(specs)
     return specs
 
 

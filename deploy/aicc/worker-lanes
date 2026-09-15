@@ -1,4 +1,16 @@
 # Canonical minimum lanes. Additional enabled/loaded template instances are
 # discovered automatically; deployments can scale by adding instance names.
+#
+# The authored spelling of the fleet: bare lane numbers, installed as
+# /etc/aicc/worker-lanes and read by ops/aicc_staged_worker_rollout.py.
+# Two other committed files name the same fleet and must agree with this one:
+#   * deploy/voyn-aicc-worker-lanes.conf -- the root-owned rotation registry,
+#     the same lanes written as unit names (exact agreement).
+#   * deploy/systemd/voyn-aicc-self-deploy-worker.service -- the lanes the
+#     worker self-deploy tick restarts (must name at least these).
+# Neither is kept in sync by remembering to: aicc_install_transaction.py
+# refuses to build ANY generation while they disagree, because a lane added
+# here and forgotten there is a lane the rotator silently never rotates and
+# the self-deploy tick silently leaves a release behind.
 1
 2

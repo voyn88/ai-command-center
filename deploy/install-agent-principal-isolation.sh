@@ -639,7 +639,17 @@ trap - EXIT HUP INT TERM
 # the tick is a no-op. This is what makes "deployed" true of the PR
 # review-window labeller instead of "someone typed it once on 2026-09-09"
 # (VOYN-W0-AICC-PR-WINDOW-RECONCILER-NOT-DEPLOYED-ON-CONTROL).
+#
+# The self-deploy timer is enabled on BOTH profiles, and on both it is
+# enabled together with the service it activates -- the two are installed as
+# a pair by `profile_unit_sources` and `verify_unit_closure` refuses a
+# generation where they are not. `release_lane_timers` above has already
+# STARTED this timer (it is one of the two it held for the transaction);
+# enabling it is what makes it survive a reboot on a host where it was a
+# `systemctl link` into the operator's home until now.
 if [ "$install_profile" = "control" ]; then
-  systemctl enable --now voyn-aicc-review.timer voyn-aicc-merge.timer voyn-aicc-remediate.timer voyn-aicc-pr-window.timer
+  systemctl enable --now voyn-aicc-self-deploy.timer voyn-aicc-review.timer voyn-aicc-merge.timer voyn-aicc-remediate.timer voyn-aicc-pr-window.timer
+else
+  systemctl enable --now voyn-aicc-self-deploy.timer
 fi
 echo "AICC_AGENT_PRINCIPAL_ISOLATION_INSTALLED"
