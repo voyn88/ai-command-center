@@ -6,6 +6,7 @@ import importlib.util
 import json
 import math
 import os
+import shutil
 import socket
 import stat
 import struct
@@ -28,6 +29,17 @@ pytestmark = pytest.mark.usefixtures("host_shaped_fixture_roots")
 def _launcher_module():
     path = Path(__file__).parents[2] / "ops" / "aicc_agent_launcher.py"
     spec = importlib.util.spec_from_file_location("aicc_agent_launcher", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _recovery_generator_module():
+    path = Path(__file__).parents[2] / "ops" / "aicc_principal_recovery_generator.py"
+    spec = importlib.util.spec_from_file_location(
+        "aicc_principal_recovery_generator", path
+    )
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -288,6 +300,77 @@ def test_a_client_that_hung_up_is_journalled_and_is_not_a_broker_fault(
     assert "response undeliverable" in capsys.readouterr().err
 
 
+#: Directives systemd defines in the [Unit] section only. Put one of these in
+#: [Service] (or [Socket], [Timer], ...) and systemd does not fail the unit --
+#: it logs "Unknown key name '<key>' in section '<section>', ignoring" and
+#: carries on with the default, so the unit file states a rule the host never
+#: applies. That is how `CollectMode=` under [Service] left every failed
+#: per-connection instance in PID 1's unit table and brought `failed_units`
+#: back on a host that was carrying the fix (worker-01, monitor_finding 2295).
+#: Deliberately excluded: FailureAction, RebootArgument, StartLimitAction and
+#: StartLimitBurst, which systemd still accepts under [Service] for backwards
+#: compatibility (checked against systemd 255, the fleet's version).
+UNIT_SECTION_ONLY_DIRECTIVES = frozenset(
+    {
+        "AllowIsolate",
+        "After",
+        "Before",
+        "BindsTo",
+        "CollectMode",
+        "Conflicts",
+        "DefaultDependencies",
+        "Description",
+        "Documentation",
+        "IgnoreOnIsolate",
+        "JobRunningTimeoutSec",
+        "JobTimeoutAction",
+        "JobTimeoutSec",
+        "JoinsNamespaceOf",
+        "OnFailure",
+        "OnFailureJobMode",
+        "OnSuccess",
+        "PartOf",
+        "PropagatesReloadTo",
+        "PropagatesStopTo",
+        "RefuseManualStart",
+        "RefuseManualStop",
+        "ReloadPropagatedFrom",
+        "Requires",
+        "RequiresMountsFor",
+        "Requisite",
+        "SourcePath",
+        "StartLimitIntervalSec",
+        "StopPropagatedFrom",
+        "StopWhenUnneeded",
+        "SuccessAction",
+        "Upholds",
+        "Wants",
+    }
+)
+
+
+def _unit_sections(text: str) -> dict[str, list[str]]:
+    """`systemd.syntax(7)` enough to say which section a directive landed in:
+    comments dropped, continuation lines joined, section names kept verbatim."""
+    sections: dict[str, list[str]] = {}
+    current = ""
+    pending = ""
+    for raw in text.splitlines():
+        line = pending + raw.strip() if pending else raw.strip()
+        pending = ""
+        if not line or line.startswith(("#", ";")):
+            continue
+        if line.endswith("\\"):
+            pending = line[:-1]
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            current = line[1:-1]
+            sections.setdefault(current, [])
+            continue
+        sections.setdefault(current, []).append(line)
+    return sections
+
+
 def test_per_connection_units_are_reaped_and_the_old_corpses_are_cleared():
     """Even a genuine broker fault must not be permanent systemd state: the
     probe counts units that are failed NOW, and an unreaped instance makes a
@@ -295,15 +378,79 @@ def test_per_connection_units_are_reaped_and_the_old_corpses_are_cleared():
     root = Path(__file__).parents[2]
     launcher_unit = (root / "deploy/systemd/aicc-agent-launcher@.service").read_text()
     installer = (root / "deploy/install-agent-principal-isolation.sh").read_text()
-    directives = [
-        line.strip()
-        for line in launcher_unit.splitlines()
-        if not line.lstrip().startswith("#")
-    ]
-    assert "CollectMode=inactive-or-failed" in directives
+    sections = _unit_sections(launcher_unit)
+    # In [Unit], where systemd parses it -- not in [Service], where it is an
+    # ignored line and the reaping rule does not exist (monitor_finding 2295).
+    assert "CollectMode=inactive-or-failed" in sections["Unit"]
+    assert not [line for line in sections["Service"] if line.startswith("CollectMode")]
+    # A directive systemd ignores is indistinguishable from a directive that
+    # works, in the file. The installer reads PID 1's effective value back and
+    # refuses the host if the rule is not the one in effect.
+    guard = (
+        "collect_mode=$(systemctl show "
+        "'aicc-agent-launcher@collectmode-probe.service' \\\n"
+        "    --property=CollectMode --value 2>/dev/null || true)\n"
+        '  [ "$collect_mode" = "inactive-or-failed" ] || {\n'
+    )
+    assert guard in installer
+    # ...and it does so before the socket can accept a connection, so a host
+    # that would accumulate corpses never serves one.
+    assert installer.index(guard) < installer.index(
+        "systemctl enable --now aicc-agent-launcher.socket"
+    )
     # CollectMode governs instances started after the reload; the ones already
     # failed on the host are only cleared by asking for it.
     assert "systemctl reset-failed 'aicc-agent-launcher@*.service'" in installer
+
+
+def test_shipped_unit_files_keep_unit_directives_in_the_unit_section(tmp_path):
+    """The whole class, not just the one directive that got caught: a misplaced
+    [Unit] key is silently ignored, so the repo asserting it is not evidence the
+    host obeys it."""
+    root = Path(__file__).parents[2]
+    generator = _recovery_generator_module()
+    generator.generate(tmp_path, tmp_path / "state")
+    shipped = sorted((root / "deploy/systemd").iterdir())
+    generated = sorted(path for path in tmp_path.rglob("*") if path.is_file())
+    assert shipped and generated
+    misplaced: list[str] = []
+    for path in shipped + generated:
+        for section, directives in _unit_sections(path.read_text()).items():
+            if section == "Unit":
+                continue
+            for directive in directives:
+                key = directive.split("=", 1)[0].strip()
+                if key in UNIT_SECTION_ONLY_DIRECTIVES:
+                    misplaced.append(f"{path.name}: [{section}] {key}=")
+    assert misplaced == []
+
+
+@pytest.mark.skipif(
+    shutil.which("systemd-analyze") is None, reason="needs systemd to parse units"
+)
+def test_systemd_itself_recognises_every_directive_in_the_shipped_units(tmp_path):
+    """The authority on what systemd parses is systemd. Missing binaries and
+    unreachable paths make `verify` noisy and non-zero on a build host, so the
+    assertion is narrowed to the parse: no directive may be unknown."""
+    root = Path(__file__).parents[2]
+    ignored: list[str] = []
+    for unit in sorted((root / "deploy/systemd").glob("*")):
+        if unit.suffix == ".conf":  # a drop-in fragment, not a loadable unit
+            continue
+        staged = tmp_path / unit.name
+        staged.write_text(unit.read_text())
+        result = subprocess.run(
+            ["systemd-analyze", "verify", str(staged)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        ignored += [
+            line
+            for line in (result.stdout + result.stderr).splitlines()
+            if "Unknown key name" in line or "Unknown lvalue" in line
+        ]
+    assert ignored == []
 
 
 def test_outer_unit_is_exact_workspace_and_cgroup_sealed(

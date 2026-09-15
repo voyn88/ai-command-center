@@ -220,4 +220,47 @@ for unit in aicc-worker.service voyn-aicc-worker@1.service voyn-aicc-worker@2.se
   systemctl show "$unit" --property=Environment --value | tr ' ' '\n' | grep -qx 'AICC_AGENT_PRINCIPAL_ISOLATION=required' \
     || fail "isolation flag did not reach $unit exactly"
 done
-echo "INSTALLER-INTEGRATION PASS: lane 1 isolated next to a live legacy lane; release traversable; runtime roots distinct; canary + flag checks pass"
+log "a dead per-connection broker instance is reaped, not left behind as failed_units"
+# VOYN-MON-WORKER-01-INFRA-FAILED-UNITS. The host unit-health probe counts
+# units that are failed NOW, so an instance nobody reaps turns one broker
+# fault into a standing finding no repair can clear. The rule that reaps it,
+# `CollectMode=`, is a [Unit] directive: written under [Service] it is not an
+# error, it is the journal line "Unknown key name 'CollectMode' in section
+# 'Service', ignoring" -- the unit file claims the rule and the host does not
+# apply it. No file assertion can see that difference; only PID 1 can, which
+# is why this runs here. The control is the same shipped file with the
+# directive moved back to the end (i.e. into [Service]): if the control is
+# reaped too, this check proves nothing and says so.
+install -m 0644 "$REPO/deploy/systemd/aicc-agent-launcher@.service" /etc/systemd/system/aicc-agent-launcher@.service
+{ sed '/^CollectMode=/d' "$REPO/deploy/systemd/aicc-agent-launcher@.service"; echo 'CollectMode=inactive-or-failed'; } \
+  > /etc/systemd/system/aicc-launcher-reap-control@.service
+for template in aicc-agent-launcher aicc-launcher-reap-control; do
+  install -d -m 0755 "/etc/systemd/system/$template@.service.d"
+  # Only the command and its stdio: the connection this broker would be
+  # handed does not exist here, and a broker that dies is what is under test.
+  cat > "/etc/systemd/system/$template@.service.d/10-reaping-harness.conf" <<'REAP'
+[Service]
+ExecStart=
+ExecStart=/bin/false
+StandardInput=null
+StandardOutput=journal
+REAP
+done
+systemctl daemon-reload
+[ "$(systemctl show 'aicc-agent-launcher@probe.service' --property=CollectMode --value)" = inactive-or-failed ] \
+  || fail "the shipped launcher template's reaping rule is not in effect (CollectMode ignored: wrong section?)"
+still_loaded() { [ -n "$(systemctl list-units --all --plain --no-legend --no-pager "$1" 2>/dev/null)" ]; }
+systemctl start aicc-agent-launcher@reaped.service >/dev/null 2>&1 || true
+systemctl start aicc-launcher-reap-control@corpse.service >/dev/null 2>&1 || true
+for _ in $(seq 1 20); do still_loaded 'aicc-agent-launcher@reaped.service' || break; sleep 0.5; done
+still_loaded 'aicc-launcher-reap-control@corpse.service' \
+  || fail "the control instance was reaped as well -- this check cannot see the defect it exists for"
+if still_loaded 'aicc-agent-launcher@reaped.service'; then
+  fail "a dead per-connection broker instance stayed in the unit table; the host probe counts it as failed_units"
+fi
+systemctl reset-failed 'aicc-launcher-reap-control@*.service' >/dev/null 2>&1 || true
+rm -rf /etc/systemd/system/aicc-launcher-reap-control@.service /etc/systemd/system/aicc-launcher-reap-control@.service.d \
+  /etc/systemd/system/aicc-agent-launcher@.service.d
+systemctl daemon-reload
+
+echo "INSTALLER-INTEGRATION PASS: lane 1 isolated next to a live legacy lane; release traversable; runtime roots distinct; canary + flag + reaping checks pass"

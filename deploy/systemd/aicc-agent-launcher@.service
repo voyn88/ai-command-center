@@ -1,6 +1,27 @@
 [Unit]
 Description=AICC root-owned agent launcher connection %i
 After=aicc-agent-launcher.socket
+# A per-connection instance is an EVENT, not a host service: once the answer
+# is on the wire its unit has nothing left to say. Without this, an instance
+# that ends non-zero stays in PID 1's unit table as `failed` until someone
+# runs `reset-failed` -- and those corpses are cumulative, so the host
+# unit-health probe read a week of them as a standing `failed_units` finding
+# (worker-01, monitor_finding 2051) that no repair could ever clear. The
+# broker no longer reports the AGENT's exit code as its own (see
+# `_deliver_response`), so what remains here is a genuine broker fault: it is
+# journalled, it reaches the worker as a launch refusal (infra-class, retried
+# and refunded), and it does not have to also be permanent systemd state. The
+# transient agent unit this one supervises is collected the same way
+# (`systemd-run --collect`).
+#
+# CollectMode= is a [Unit] directive (systemd.unit(5)). Under [Service],
+# where this arrived first, systemd does not fail the unit -- it logs
+# "Unknown key name 'CollectMode' in section 'Service', ignoring" and leaves
+# the default CollectMode=inactive in force, so the reaping rule silently did
+# not exist and `failed_units` came back (monitor_finding 2295). The
+# installer proves PID 1's effective value after daemon-reload rather than
+# trusting this line.
+CollectMode=inactive-or-failed
 
 [Service]
 Type=exec
@@ -47,19 +68,6 @@ RestrictAddressFamilies=AF_UNIX
 # (worker-01 2026-09-09 06:38 UTC).
 ReadWritePaths=/run/aicc-agent-launcher /run/aicc-agent-homes /run/aicc-agent-workspace-binds /srv/aicc-workspaces /srv/aicc-quarantine /var/lib/aicc-agent
 UMask=0077
-# A per-connection instance is an EVENT, not a host service: once the answer
-# is on the wire its unit has nothing left to say. Without this, an instance
-# that ends non-zero stays in PID 1's unit table as `failed` until someone
-# runs `reset-failed` -- and those corpses are cumulative, so the host
-# unit-health probe read a week of them as a standing `failed_units` finding
-# (worker-01, monitor_finding 2051) that no repair could ever clear. The
-# broker no longer reports the AGENT's exit code as its own (see
-# `_deliver_response`), so what remains here is a genuine broker fault: it is
-# journalled, it reaches the worker as a launch refusal (infra-class, retried
-# and refunded), and it does not have to also be permanent systemd state. The
-# transient agent unit this one supervises is collected the same way
-# (`systemd-run --collect`).
-CollectMode=inactive-or-failed
 MemoryMax=256M
 TasksMax=64
 TimeoutStopSec=30s

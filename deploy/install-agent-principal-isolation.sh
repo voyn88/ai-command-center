@@ -599,6 +599,23 @@ systemctl daemon-reload
 # principals, the rollout drives worker lanes, and the boundary verifier
 # asserts an agent/publisher separation a control host has no parties for.
 if [ "$install_profile" = "worker" ]; then
+  # An unrecognised directive is not an error to systemd, it is a journal
+  # line: `CollectMode=` under [Service] parsed as "Unknown key name
+  # 'CollectMode' in section 'Service', ignoring", the default
+  # CollectMode=inactive stayed in force, and the reaping rule the unit file
+  # claims silently did not exist -- so `failed_units` came back on a host
+  # that was carrying the fix (worker-01, monitor_finding 2295). The unit
+  # file is the claim; PID 1's effective value after the reload above is the
+  # fact, and only the fact keeps a one-off broker fault from becoming a
+  # standing finding. `show` on an uninstantiated instance loads the template
+  # without starting anything, and systemctl is proven working one line up by
+  # the daemon-reload, so an empty answer here is a wrong answer.
+  collect_mode=$(systemctl show 'aicc-agent-launcher@collectmode-probe.service' \
+    --property=CollectMode --value 2>/dev/null || true)
+  [ "$collect_mode" = "inactive-or-failed" ] || {
+    echo "aicc-agent-launcher@.service reaping rule is not in effect on this host (CollectMode=${collect_mode:-unset}); per-connection corpses would accumulate as failed_units" >&2
+    exit 1
+  }
   # Connection instances that died before CollectMode= reached this host are
   # still sitting in the unit table as `failed`, and nothing else ever reaps
   # them: the reaping rule only applies to instances started after the reload
