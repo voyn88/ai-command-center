@@ -4,6 +4,14 @@
 # hosts. Unlike the control host variant, this never runs migrations: the
 # worker role has no DDL authority. It stages/selects /opt/aicc/releases/<sha>
 # and then restarts worker lanes so the new code is picked up after drain.
+#
+# The --restart list below is a committed spelling of the worker fleet, so it
+# is checked against the authored one rather than trusted: every lane
+# deploy/aicc/worker-lanes names must appear here, or no generation builds
+# (verify_self_deploy_lane_coverage in ops/aicc_install_transaction.py). More
+# lanes than the registry is how a host scales -- the staged rollout
+# discovers already-instantiated lanes beyond the configured ones -- fewer is
+# a lane left serving the previous release with nothing to say so.
 [Unit]
 Description=AICC worker self-deploy tick (merged -> immutable worker release)
 After=network-online.target

@@ -9,7 +9,7 @@ import stat
 import struct
 import subprocess
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 
 import pytest
@@ -2301,23 +2301,307 @@ def test_the_pr_window_unit_carries_no_host_layout_of_its_own(tmp_path):
     assert "WantedBy=timers.target" in timer
 
 
-def test_the_installer_starts_the_control_timers_after_it_commits(tmp_path):
-    """Installed and enabled, or the file is just a file. Deliberately after
-    `run_transaction commit` AND after the rollback trap is disarmed: this
-    timer is not in the rollback's service snapshot (RESTORABLE_UNIT_RE admits
-    only worker and launcher units), so enabling it inside the transaction
-    would leave an enablement symlink pointing at a unit file the rollback
-    removes."""
-    tx, _control = _specs("control", tmp_path)
-    text = _installer_text()
-    enable = "systemctl enable --now " + " ".join(tx.CONTROL_ONLY_TIMERS)
+def test_the_installer_enables_every_timer_in_its_profile_unit_table(tmp_path):
+    """Installed and enabled, or the file is just a file -- and enabled only
+    where it is installed, or the timer is the "works, but nobody installs
+    it" state this task exists to end.
 
+    Both halves are derived from `profile_timers()`, which is derived from
+    the spec list, so neither the shell nor a constant can drift away from
+    what the transaction actually writes. An earlier revision of this change
+    shipped `voyn-aicc-self-deploy.timer` to the worker profile while
+    excluding its service: a unit that fails on every firing with `Unit
+    voyn-aicc-self-deploy.service not found` (independent review on
+    9d1a61f6). The loop below is what makes that a test failure rather than
+    an operator's discovery on the next tick.
+
+    Deliberately after `run_transaction commit` AND after the rollback trap
+    is disarmed: these timers are not in the rollback's service snapshot
+    (RESTORABLE_UNIT_RE admits only worker and launcher units), so enabling
+    one inside the transaction would leave an enablement symlink pointing at
+    a unit file the rollback removes.
+    """
+    text = _installer_text()
+    guards = {
+        "control": 'if [ "$install_profile" = "control" ]; then',
+        "worker": "else",
+    }
+    for profile, guard in guards.items():
+        tx, installed = _specs(profile, tmp_path)
+        timers = tx.profile_timers(profile)
+        assert timers, f"{profile} enables no timers"
+        # Every timer the shell enables is a timer this generation wrote, and
+        # every unit it activates is one this generation wrote too.
+        for timer in timers:
+            assert f"/etc/systemd/system/{timer}" in installed
+        enable = "systemctl enable --now " + " ".join(timers)
+        _assert_command_inside_shell_if(text, enable, guard)
+        assert text.index("run_transaction commit") < text.index(enable)
+        assert text.index("trap - EXIT HUP INT TERM") < text.index(enable)
+        assert text.index(enable) < text.index(
+            "echo \"AICC_AGENT_PRINCIPAL_ISOLATION_INSTALLED\""
+        ), "a failed enable must not be announced as a completed install"
+
+    # The control profile's own ticks are still exactly the ones it owns; the
+    # self-deploy timer is the one both roles enable.
     assert set(tx.CONTROL_ONLY_TIMERS) <= set(tx.CONTROL_ONLY_UNITS)
-    _assert_command_inside_shell_if(
-        text, enable, 'if [ "$install_profile" = "control" ]; then'
+    assert set(tx.CONTROL_ONLY_TIMERS) < set(tx.profile_timers("control"))
+    assert set(tx.profile_timers("worker")) == {"voyn-aicc-self-deploy.timer"}
+
+    # The two timers this installer writes that the unit table does NOT
+    # enable, named rather than left to be discovered. Silence about a
+    # difference between "installed" and "enabled" is the state this whole
+    # task exists to end, so the exceptions are asserted, not assumed.
+    _tx, worker_specs = _profile_specs("worker", tmp_path)
+    _tx2, control_specs = _profile_specs("control", tmp_path)
+    written = {
+        PurePosixPath(spec.target).name
+        for spec in (*worker_specs, *control_specs)
+        if not spec.remove and spec.target.endswith(".timer")
+    }
+    enabled = set(tx.profile_timers("worker")) | set(tx.profile_timers("control"))
+    assert written - enabled == {
+        # Enabled by the worker branch beside the launcher socket: agent
+        # layer, not repo-owned unit table.
+        "voyn-aicc-source-clone-refresh.timer",
+        # Deliberately never enabled here: its service reads a private key an
+        # owner places by hand, so enabling it would put a failing unit on
+        # every host that has not (CONTROL_TICK_GITHUB_IDENTITY.md).
+        "voyn-aicc-github-token.timer",
+    }
+    assert (
+        "systemctl enable --now voyn-aicc-source-clone-refresh.timer" in text
     )
-    assert text.index("run_transaction commit") < text.index(enable)
-    assert text.index("trap - EXIT HUP INT TERM") < text.index(enable)
-    assert text.index(enable) < text.index(
-        "echo \"AICC_AGENT_PRINCIPAL_ISOLATION_INSTALLED\""
-    ), "a failed enable must not be announced as a completed install"
+    assert "enable --now voyn-aicc-github-token.timer" not in text
+
+
+def test_both_profiles_install_the_self_deploy_service_with_its_timer(tmp_path):
+    """The unit pair, never one half of it.
+
+    A worker host got the timer and no service in the revision an independent
+    review rejected on 9d1a61f6: `systemctl list-timers` shows it ticking and
+    every firing fails with `Unit voyn-aicc-self-deploy.service not found`.
+    The two are now one table entry per profile, and the profiles install
+    DIFFERENT committed files under the SAME unit name -- the control host
+    runs migrations, the worker host has no DDL authority and restarts lanes
+    instead -- which is the reason the table maps source files to unit names
+    rather than listing names.
+    """
+    root = Path(__file__).parents[2]
+    expected_source = {
+        "control": "voyn-aicc-self-deploy.service",
+        "worker": "voyn-aicc-self-deploy-worker.service",
+    }
+    for profile, service_source in expected_source.items():
+        tx, installed = _specs(profile, tmp_path)
+        assert "/etc/systemd/system/voyn-aicc-self-deploy.service" in installed
+        assert "/etc/systemd/system/voyn-aicc-self-deploy.timer" in installed
+        _tx, specs = _profile_specs(profile, tmp_path)
+        written = [
+            Path(spec.source).name
+            for spec in specs
+            if not spec.remove
+            and spec.target == "/etc/systemd/system/voyn-aicc-self-deploy.service"
+        ]
+        assert written == [service_source]
+        assert tx.profile_unit_sources(profile)[:2] == (
+            (service_source, "voyn-aicc-self-deploy.service"),
+            ("voyn-aicc-self-deploy.timer", "voyn-aicc-self-deploy.timer"),
+        )
+        # The worker variant must not carry the control host's DDL authority.
+        body = (root / "deploy/systemd" / service_source).read_text()
+        assert ("--migrate" in body) is (profile == "control")
+
+
+def test_no_generation_installs_a_timer_without_the_unit_it_activates(tmp_path):
+    """The closure the review finding asked for, over the WHOLE spec list.
+
+    Not over the table that introduced it: the property is "a timer this
+    installer writes has a target this installer writes", and it has to hold
+    for the control ticks, the GitHub-token refresh, the source-clone refresh
+    and the self-deploy pair alike. A timer without its service does not fail
+    the install, it fails every firing afterwards, and it reports that
+    failure against the timer rather than against whatever was supposed to
+    install the service.
+    """
+    for profile in ("worker", "control"):
+        tx, specs = _profile_specs(profile, tmp_path)
+        installed = {
+            spec.target for spec in specs if not spec.remove
+        }
+        timers = [
+            spec
+            for spec in specs
+            if not spec.remove and spec.target.endswith(".timer")
+        ]
+        assert timers, f"{profile} installs no timers at all"
+        for spec in timers:
+            activated = tx.timer_activated_unit(
+                Path(spec.source), PurePosixPath(spec.target).name
+            )
+            assert f"/etc/systemd/system/{activated}" in installed, (
+                f"{spec.target} activates {activated}, which nothing installs"
+            )
+        # And the guard itself refuses one, rather than this list merely
+        # happening to be closed today: drop the service the first timer
+        # activates and the same spec list must stop being buildable.
+        tx.verify_unit_closure(specs)
+        widowed = tx.timer_activated_unit(
+            Path(timers[0].source), PurePosixPath(timers[0].target).name
+        )
+        orphaned = [
+            spec
+            for spec in specs
+            if spec.target != f"/etc/systemd/system/{widowed}"
+        ]
+        assert len(orphaned) < len(specs)
+        with pytest.raises(ValueError, match="does not install"):
+            tx.verify_unit_closure(orphaned)
+        # A drop-in under the same prefix is not a unit and cannot stand in
+        # for the missing service.
+        with pytest.raises(ValueError, match="does not install"):
+            tx.verify_unit_closure(
+                [
+                    *orphaned,
+                    tx.FileSpec(
+                        Path(timers[0].source),
+                        f"/etc/systemd/system/{widowed}.d/10-x.conf",
+                        0o644,
+                        0,
+                        0,
+                    ),
+                ]
+            )
+
+
+def test_a_timer_unit_directive_is_read_from_the_timer_section_only(tmp_path):
+    """`Unit=` means different things in `[Unit]` and `[Timer]`.
+
+    Every committed timer has a `[Unit]` section header, so a parser that
+    matched `Unit=` anywhere would read the first `[Unit]`-section directive
+    that happens to be spelled that way and check closure against the wrong
+    name. Last assignment inside `[Timer]` wins; with none, systemd uses the
+    timer's own INSTALLED name with a `.service` suffix.
+    """
+    tx, _specs_ = _profile_specs("control", tmp_path)
+    timer = tmp_path / "voyn-aicc-example.timer"
+
+    timer.write_text("[Unit]\nDescription=x\n[Timer]\nOnUnitInactiveSec=5min\n")
+    assert tx.timer_activated_unit(timer) == "voyn-aicc-example.service"
+    # Installed under another name -- the implicit default follows the name
+    # systemd sees, not the name the repository files it under.
+    assert (
+        tx.timer_activated_unit(timer, "voyn-aicc-renamed.timer")
+        == "voyn-aicc-renamed.service"
+    )
+    timer.write_text(
+        "[Unit]\nDescription=x\nUnit=decoy.service\n"
+        "[Timer]\nUnit=first.service\nUnit=last.service\n"
+    )
+    assert tx.timer_activated_unit(timer) == "last.service"
+    # An instance is served by its template file, which is the name the
+    # installer writes; a closure check against the instance name would fail
+    # a timer that legitimately activates one.
+    assert tx._template_of("voyn-aicc-worker@3.service") == "voyn-aicc-worker@.service"
+    assert tx._template_of("voyn-aicc-worker@.service") == "voyn-aicc-worker@.service"
+    assert tx._template_of("voyn-aicc-review.service") == "voyn-aicc-review.service"
+
+
+def test_the_committed_lane_spellings_cannot_disagree(tmp_path):
+    """The second review finding: a security control that reads narrower than
+    the fleet it covers.
+
+    Three committed files name the worker lanes -- the authored list
+    (`deploy/aicc/worker-lanes`, bare numbers, installed as
+    /etc/aicc/worker-lanes), the root-owned rotation registry
+    (`deploy/voyn-aicc-worker-lanes.conf`, unit names, installed as
+    /etc/voyn/aicc-worker-lanes.conf and read on BOTH sides of the rotator's
+    sudo boundary), and the worker self-deploy tick's `--restart` list. A
+    comment asking the next editor to keep them in sync is not a control: the
+    rotator would silently never rotate a forgotten lane's credential, and
+    the self-deploy tick would silently leave it a release behind. Nothing
+    can build a generation while they disagree.
+    """
+    root = Path(__file__).parents[2]
+    tx, installed = _specs("worker", tmp_path)
+
+    # This repository, first: the two checks `default_specs` runs on a host
+    # are the same two run here, so a disagreement is a red test and not a
+    # refused install somebody discovers at 03:00 on a rebuilt worker.
+    tx.verify_lane_registry_agreement(root)
+    tx.verify_self_deploy_lane_coverage(root)
+    assert tx.worker_lane_units(root) == (
+        "voyn-aicc-worker@1.service",
+        "voyn-aicc-worker@2.service",
+    )
+    # Repo-owned from here: the registry was a hand-placed file on worker-01.
+    assert tx.ROTATION_LANE_REGISTRY_TARGET in installed
+    assert tx.ROTATION_LANE_REGISTRY_TARGET in tx.WORKER_ONLY_TARGETS
+    assert tx.ROTATION_LANE_REGISTRY_TARGET in _purged("control", tmp_path)
+
+    lanes = tmp_path / "repo"
+    (lanes / "deploy/aicc").mkdir(parents=True)
+    (lanes / "deploy/systemd").mkdir(parents=True)
+    (lanes / "deploy/aicc/worker-lanes").write_text("1\n2\n3\n")
+    (lanes / tx.ROTATION_LANE_REGISTRY_SOURCE).write_text(
+        "voyn-aicc-worker@1.service\nvoyn-aicc-worker@2.service\n"
+    )
+    with pytest.raises(ValueError, match="worker@3"):
+        tx.verify_lane_registry_agreement(lanes)
+
+    # Equal registries, but the self-deploy tick does not restart lane 3.
+    (lanes / tx.ROTATION_LANE_REGISTRY_SOURCE).write_text(
+        "voyn-aicc-worker@1.service\nvoyn-aicc-worker@2.service\n"
+        "voyn-aicc-worker@3.service\n"
+    )
+    tx.verify_lane_registry_agreement(lanes)
+    worker_unit = tx.SELF_DEPLOY_UNIT_SOURCES["worker"][0][0]
+    (lanes / "deploy/systemd" / worker_unit).write_text(
+        "ExecStart=/bin/true --restart voyn-aicc-worker@1.service "
+        "--restart voyn-aicc-worker@2.service\n"
+    )
+    with pytest.raises(ValueError, match="does not restart"):
+        tx.verify_self_deploy_lane_coverage(lanes)
+    # Naming MORE lanes than the registry is how a host scales, not a defect:
+    # the rollout discovers already-instantiated lanes beyond the configured
+    # ones, and the committed tick names four for exactly that reason.
+    (lanes / "deploy/systemd" / worker_unit).write_text(
+        "ExecStart=/bin/true "
+        + " ".join(
+            f"--restart voyn-aicc-worker@{lane}.service" for lane in (1, 2, 3, 4)
+        )
+        + "\n"
+    )
+    tx.verify_self_deploy_lane_coverage(lanes)
+
+
+def test_a_disagreeing_lane_registry_refuses_the_generation_not_just_ci(tmp_path):
+    """Checked where a host builds its generation, not only in a fitness test.
+
+    A host installs from its own tree, which is not necessarily one CI ever
+    saw -- a hand-edited registry on the box is exactly the state this task
+    was opened about -- so the refusal has to live in `default_specs` itself.
+    """
+    root = Path(__file__).parents[2]
+    tx, _installed = _specs("worker", tmp_path)
+    clone = tmp_path / "clone"
+    # Copied file by file rather than with `copytree`: the sources are all
+    # this reads, and `copystat` on a directory is not permitted everywhere
+    # the suite runs.
+    for path in (root / "deploy").rglob("*"):
+        if path.is_file():
+            destination = clone / path.relative_to(root)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(path.read_bytes())
+    (clone / "deploy/aicc/worker-lanes").write_text("1\n2\n7\n")
+
+    for profile in ("worker", "control"):
+        with pytest.raises(ValueError, match="worker@7"):
+            tx.default_specs(
+                clone,
+                authority_env=tmp_path / "authority.env",
+                claude_auth=tmp_path / "claude.json",
+                codex_auth=tmp_path / "codex.json",
+                resolve_identities=False,
+                profile=profile,
+            )

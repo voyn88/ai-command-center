@@ -84,12 +84,20 @@ recovery always runs before the circuit is consulted.
    delete the old unit files yet.
 2. Install the five versioned units, the rotation helper
    (`deploy/voyn-aicc-rotation-helper` -> `/usr/local/sbin/voyn-aicc-rotation-helper`,
-   root:root 0755), the lane registry (`deploy/voyn-aicc-worker-lanes.conf` ->
-   `/etc/voyn/aicc-worker-lanes.conf`, root:root 0644) and the sudoers policy from
-   the checked-out merged SHA; validate sudoers with `visudo -c` and run
-   `systemd-analyze verify`. Sudo grants the rotator only the helper; the helper
-   authorizes units against the registry, so scaling the fleet is a registry edit
-   plus enabling the new `voyn-aicc-worker@N.service` — never a sudoers change.
+   root:root 0755) and the sudoers policy from the checked-out merged SHA;
+   validate sudoers with `visudo -c` and run `systemd-analyze verify`. The lane
+   registry is **not** placed by hand any more: `deploy/voyn-aicc-worker-lanes.conf`
+   -> `/etc/voyn/aicc-worker-lanes.conf` (root:root 0644) is part of the worker
+   generation `ops/aicc_install_transaction.py` writes, so a rebuilt host gets
+   it with everything else and a failed install rolls it back with everything
+   else (VOYN-W0-AICC-CONTROL-PLANE-REPO-OWNED-UNITS). Sudo grants the rotator
+   only the helper; the helper authorizes units against the registry, so
+   scaling the fleet is a registry edit plus enabling the new
+   `voyn-aicc-worker@N.service` — never a sudoers change. Scaling means editing
+   `deploy/aicc/worker-lanes` AND `deploy/voyn-aicc-worker-lanes.conf` together:
+   `verify_lane_registry_agreement` refuses to build any generation while the
+   two disagree, so a lane added to one and forgotten in the other can no
+   longer leave the rotator quietly covering less than the fleet.
    The `--recover-only` stop path runs under `--stop-budget` (TimeoutStopSec
    minus the exit margin): a fleet too large to recover in that window refuses
    fail-closed with the phase journal intact, and the next timer start recovers
