@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import Any
 
 from command_center import agent_runner, project_config, workspace_provisioning
+from command_center.orchestrator import authority_preflight
 from command_center.orchestrator.publish import PublishConfig, publish_run
 from command_center.worker import writer_lease
 from command_center.worker.daemon import Handler, HandlerOutcome
@@ -262,6 +263,27 @@ def _executor_preflight(executor: str, task_type: str) -> tuple[bool, str, str]:
     return available, detail, "claude cli unavailable"
 
 
+def _host_granted_authority(executor: str) -> frozenset[str]:
+    """What THIS host actually grants the run we are about to start.
+
+    Two sources, and the cheaper one wins where it can answer:
+
+    * **proved** — `root` is free to verify here and now (`geteuid`), so it is
+      never taken on a table's word. A lane that CLAIMS root while running
+      unprivileged is exactly the failure this task is about, one layer down;
+    * **declared** — `postgres_role:*` and `external_credential:*` cannot be
+      established without opening the connection or spending the credential,
+      which is work. For those the fleet's own lane table is the answer, and
+      an executor absent from it grants nothing.
+    """
+    granted = set(authority_preflight.executor_authority(executor))
+    if os.geteuid() == 0:
+        granted.add(authority_preflight.AUTHORITY_ROOT)
+    else:
+        granted.discard(authority_preflight.AUTHORITY_ROOT)
+    return frozenset(granted)
+
+
 def _run_agent(
     payload: dict[str, Any], lease_lost: threading.Event, attempt_no: int = 1
 ) -> HandlerOutcome:
@@ -295,6 +317,28 @@ def _run_agent(
         model_override = link.get("model")
         if isinstance(model_override, str) and model_override.strip():
             model = model_override
+
+    # The worker's entry gate (VOYN-W0-AICC-PRIVILEGED-TASK-ROUTED-TO-
+    # UNPRIVILEGED-EXECUTOR): check the privileges and secrets the payload
+    # asks for BEFORE spending a token on finding out. The planner's
+    # preflight is the same decision made against the fleet table; this is
+    # the same decision made against the host that will actually run it --
+    # the only place that can be wrong about it in a way that costs a model
+    # call. Non-retryable on purpose: redelivery cannot grant a privilege,
+    # and 0018 classifies this reason as an owner decision rather than a
+    # technical exhaustion, so the task parks instead of looping.
+    missing_authority = frozenset(request.required_authority) - _host_granted_authority(
+        executor
+    )
+    if missing_authority:
+        return HandlerOutcome(
+            ok=False,
+            reason=(
+                "requires_privileged_authority: "
+                + authority_preflight.format_authority(missing_authority)
+            ),
+            retryable=False,
+        )
 
     try:
         repository = agent_runner.validate_repository(

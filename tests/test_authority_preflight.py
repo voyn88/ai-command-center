@@ -300,3 +300,80 @@ def test_a_match_inside_a_standalone_command_line_is_an_order():
     assert ap.suspected_authority("The log shows psql -U postgres failing.") == frozenset(
         {ap.POSTGRES_ROLE_PREFIX + "postgres"}
     )
+
+
+# --------------------------------------------------------------------------
+# Routing: which executor, not merely whether the fleet grants it at all
+# (acceptance 3).
+# --------------------------------------------------------------------------
+
+
+def test_every_routed_executor_has_an_authority_entry():
+    """An executor absent from the table grants nothing — safe, but silent.
+    Keep the table and the routing matrix in step so a new lane is a decision
+    rather than an omission."""
+    from command_center.orchestrator.routing import ROUTING_MATRIX
+
+    routed = {link["executor"] for cascade in ROUTING_MATRIX.values() for link in cascade}
+    assert routed <= set(ap.EXECUTOR_AUTHORITY)
+
+
+def test_no_executor_grants_anything_today():
+    assert all(grants == frozenset() for grants in ap.EXECUTOR_AUTHORITY.values())
+    assert ap.FLEET_GRANTED_AUTHORITY == frozenset()
+
+
+def test_a_requirement_names_the_executors_that_can_serve_it(monkeypatch):
+    monkeypatch.setitem(ap.EXECUTOR_AUTHORITY, "codex", frozenset({ap.AUTHORITY_ROOT}))
+    assert ap.executors_granting({ap.AUTHORITY_ROOT}) == ("codex",)
+    # An empty requirement is served by every executor: an ordinary task
+    # routes exactly as it did before this module existed.
+    assert ap.executors_granting(frozenset()) == tuple(sorted(ap.EXECUTOR_AUTHORITY))
+
+
+def test_an_unknown_executor_grants_nothing():
+    assert ap.executor_authority("nonesuch") == frozenset()
+
+
+def test_authority_split_across_two_lanes_is_not_satisfiable(monkeypatch):
+    """One task runs on ONE executor. Answering "satisfiable" from the fleet-
+    wide union would be wrong the moment two lanes hold different privileges:
+    the cascade would narrow to nothing and the payload would be built for a
+    run that cannot happen."""
+    monkeypatch.setitem(ap.EXECUTOR_AUTHORITY, "claude", frozenset({ap.AUTHORITY_ROOT}))
+    monkeypatch.setitem(
+        ap.EXECUTOR_AUTHORITY, "codex", frozenset({ap.POSTGRES_ROLE_PREFIX + "postgres"})
+    )
+    monkeypatch.setattr(
+        ap,
+        "FLEET_GRANTED_AUTHORITY",
+        frozenset({ap.AUTHORITY_ROOT, ap.POSTGRES_ROLE_PREFIX + "postgres"}),
+    )
+    decision = ap.decide("t", "Requires-Authority: root, postgres")
+    assert not decision.ok
+    assert decision.capable_executors == ()
+    # Nothing is "missing" -- each tag is granted somewhere -- so the reason
+    # has to say the real problem, not print an empty set.
+    assert decision.missing == frozenset()
+    assert decision.reason == (
+        "requires_privileged_authority: no_single_executor_grants: "
+        "postgres_role:postgres,root"
+    )
+    assert not decision.reason.startswith("cascade_exhausted:")
+
+
+def test_one_lane_holding_both_is_satisfiable(monkeypatch):
+    monkeypatch.setitem(
+        ap.EXECUTOR_AUTHORITY,
+        "codex",
+        frozenset({ap.AUTHORITY_ROOT, ap.POSTGRES_ROLE_PREFIX + "postgres"}),
+    )
+    monkeypatch.setattr(
+        ap,
+        "FLEET_GRANTED_AUTHORITY",
+        frozenset({ap.AUTHORITY_ROOT, ap.POSTGRES_ROLE_PREFIX + "postgres"}),
+    )
+    decision = ap.decide("t", "Requires-Authority: root, postgres")
+    assert decision.ok
+    assert decision.capable_executors == ("codex",)
+    assert decision.reason is None

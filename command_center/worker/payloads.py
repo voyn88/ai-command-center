@@ -74,6 +74,18 @@ class AgentRunRequest:
     #: handler); absent keeps the historical behaviour byte-for-byte.
     review_head_pr_number: str | None = None
     review_head_sha: str | None = None
+    #: VOYN-W0-AICC-PRIVILEGED-TASK-ROUTED-TO-UNPRIVILEGED-EXECUTOR: the
+    #: system-level privileges this task's WORK requires (`root`,
+    #: `postgres_role:<role>`, `external_credential:<name>`), stated by the
+    #: dispatcher rather than discovered by the agent the expensive way. The
+    #: handler refuses the payload before the model is invoked if this host
+    #: does not grant them. Absent (an older payload, a direct enqueue) means
+    #: "requires nothing", which is the historical behaviour byte-for-byte.
+    required_authority: tuple[str, ...] = ()
+    #: The same shape, but only SUSPECTED (a command the task text quotes
+    #: rather than orders). Never enforced -- carried so a failure can be
+    #: attributed to authority afterwards instead of guessed at.
+    suspected_authority: tuple[str, ...] = ()
 
 
 def _string(payload: dict[str, Any], key: str) -> str | None:
@@ -184,6 +196,22 @@ def parse_agent_run(payload: dict[str, Any]) -> AgentRunRequest | PayloadError:
         review_head_pr_number = pr_number
         review_head_sha = head_sha
 
+    authority: dict[str, tuple[str, ...]] = {}
+    for key in ("required_authority", "suspected_authority"):
+        raw = payload.get(key, [])
+        if raw is None:
+            raw = []
+        if not isinstance(raw, list) or not all(
+            isinstance(tag, str) and tag.strip() for tag in raw
+        ):
+            # Non-retryable: an unreadable capability contract must never be
+            # read as "requires nothing" -- that is precisely the silent
+            # downgrade this whole task exists to remove.
+            return PayloadError(
+                reason=f"{key} must be a list of non-empty strings, got {raw!r}"
+            )
+        authority[key] = tuple(sorted({tag.strip() for tag in raw}))
+
     return AgentRunRequest(
         project_id=project_id,
         repository_path=repository_path,
@@ -196,4 +224,6 @@ def parse_agent_run(payload: dict[str, Any]) -> AgentRunRequest | PayloadError:
         backlog_task_id=backlog_task_id,
         review_head_pr_number=review_head_pr_number,
         review_head_sha=review_head_sha,
+        required_authority=authority["required_authority"],
+        suspected_authority=authority["suspected_authority"],
     )

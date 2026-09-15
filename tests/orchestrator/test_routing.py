@@ -97,3 +97,101 @@ def test_dispatch_prompt_asks_for_the_commit_and_not_for_a_pull_request() -> Non
     assert "HEAD_SHA: <the branch head commit sha>" in prompt
     # The instruction that asked the agent to publish its own work is gone.
     assert "When you open or update a pull request" not in prompt
+
+
+# ---------------------------------------------------------------------------
+# The capability contract in the payload (VOYN-W0-AICC-PRIVILEGED-TASK-ROUTED-
+# TO-UNPRIVILEGED-EXECUTOR, acceptance 1 and 3). Hermetic properties of the
+# payload, so they belong here rather than in the database-gated planner suite
+# -- a contract checked only when a database happens to be configured is not
+# a checked contract.
+# ---------------------------------------------------------------------------
+
+
+def _task(**overrides):
+    task = {
+        "task_id": "VOYN-W0-AUTHORITY",
+        "wave": "0",
+        "priority": "P0",
+        "title": "t",
+        "body": "b",
+    }
+    task.update(overrides)
+    return task
+
+
+def test_the_payload_states_the_authority_the_task_requires(monkeypatch) -> None:
+    from command_center.orchestrator import authority_preflight
+
+    monkeypatch.setitem(
+        authority_preflight.EXECUTOR_AUTHORITY, "claude", frozenset({"root"})
+    )
+    payload, _budget = _payload_for(
+        _task(body="Restart it: run `sudo systemctl restart aicc-worker`."),
+        PlanLimits(),
+        ("AICC", "/srv/repo"),
+    )
+    assert payload["required_authority"] == ["root"]
+
+
+def test_no_payload_is_built_for_a_requirement_no_executor_grants() -> None:
+    """The planner parks such a task instead of dispatching it, so reaching
+    here is a bug — and a payload whose cascade is empty names no executor at
+    all, which the worker would index past. Fail loudly, not quietly."""
+    import pytest
+
+    with pytest.raises(ValueError, match="no executor grants"):
+        _payload_for(
+            _task(body="Restart it: run `sudo systemctl restart aicc-worker`."),
+            PlanLimits(),
+            ("AICC", "/srv/repo"),
+        )
+
+
+def test_an_ordinary_task_states_an_empty_requirement_not_a_missing_one() -> None:
+    """Absent would be indistinguishable from an older payload; explicit and
+    empty is a statement, and the worker gate reads it as one."""
+    payload, _budget = _payload_for(_task(), PlanLimits(), ("AICC", "/srv/repo"))
+    assert payload["required_authority"] == []
+    assert payload["suspected_authority"] == []
+
+
+def test_quoted_evidence_travels_as_a_suspicion_not_a_requirement() -> None:
+    payload, _budget = _payload_for(
+        _task(body="The agent tried to run `sudo /usr/bin/true` and was refused."),
+        PlanLimits(),
+        ("AICC", "/srv/repo"),
+    )
+    assert payload["required_authority"] == []
+    assert payload["suspected_authority"] == ["root"]
+
+
+def test_a_requirement_narrows_the_cascade_to_the_executors_that_grant_it(
+    monkeypatch,
+) -> None:
+    """Acceptance 3: route to an executor that HAS the authority. Today none
+    does -- the planner parks such a task before this code is reached -- so a
+    granted lane has to be installed to exercise the routing half at all."""
+    from command_center.orchestrator import authority_preflight
+
+    monkeypatch.setitem(
+        authority_preflight.EXECUTOR_AUTHORITY, "codex", frozenset({"root"})
+    )
+    task = _task(body="Restart it: run `sudo systemctl restart aicc-worker`.")
+    decision = authority_preflight.decide(task["title"], task["body"])
+    assert decision.capable_executors == ("codex",)
+
+    payload, budget = _payload_for(task, PlanLimits(), ("AICC", "/srv/repo"), decision)
+    assert [link["executor"] for link in payload["cascade"]] == ["codex"]
+    # The attempt budget IS the cascade length: a narrowed cascade must not
+    # keep a budget for links that were removed.
+    assert budget == 1
+    assert payload["task_type"] == "implementation"
+
+
+def test_an_ordinary_task_keeps_the_whole_cascade() -> None:
+    payload, budget = _payload_for(_task(), PlanLimits(), ("AICC", "/srv/repo"))
+    assert [link["executor"] for link in payload["cascade"]] == [
+        link["executor"] for link in cascade_for("implementation")
+    ]
+    assert budget == len(cascade_for("implementation"))

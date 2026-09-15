@@ -235,6 +235,9 @@ def test_the_control_plane_cannot_claim() -> None:
         # VOYN-W0-AICC-PRIVILEGED-TASK-ROUTED-TO-UNPRIVILEGED-EXECUTOR (0017):
         # OPEN -> DEFER_TO_USER for a task no executor's authority satisfies.
         "backlog_park_requires_authority",
+        # (0018) the shared authority-reason predicate the planner's
+        # auto-resume candidate filter calls.
+        "backlog_reason_requires_authority",
         # VOYN-OPS-AICC-PUBLISH-WINDOW-STARVATION (0015): the persisted
         # scan cursor for the tick windows.
         "backlog_scan_claim",

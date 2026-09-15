@@ -500,6 +500,11 @@ _APP_BACKLOG_FUNCTIONS = (
     # planner INSTEAD OF backlog_dispatch (0017,
     # VOYN-W0-AICC-PRIVILEGED-TASK-ROUTED-TO-UNPRIVILEGED-EXECUTOR).
     "backlog_park_requires_authority(text, text)",
+    # The authority-reason predicate (0018): the planner filters its
+    # auto-resume candidates with it so an authority park is not attempted
+    # every tick. The SECURITY DEFINER gates remain the only authority --
+    # this is a pure, read-only classification of a reason string.
+    "backlog_reason_requires_authority(text)",
     # The persisted scan cursor for the tick windows (0015): returns this
     # tick's offset and advances atomically per invocation.
     "backlog_scan_claim(text, text, text)",

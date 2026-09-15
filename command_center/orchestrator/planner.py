@@ -113,7 +113,10 @@ def repo_route(repo: str) -> tuple[str, str] | None:
 
 
 def _payload_for(
-    task: dict[str, Any], limits: PlanLimits, route: tuple[str, str]
+    task: dict[str, Any],
+    limits: PlanLimits,
+    route: tuple[str, str],
+    decision: authority_preflight.AuthorityDecision | None = None,
 ) -> tuple[dict[str, Any], int]:
     """The agent_run payload plus the attempt budget (= cascade length).
 
@@ -121,8 +124,36 @@ def _payload_for(
     travel verbatim; the worker's provenance gate still applies, and
     ``untrusted=False`` is on the authority of the planner being the control
     plane acting on the canonical store.
+
+    Authority discipline (VOYN-W0-AICC-PRIVILEGED-TASK-ROUTED-TO-UNPRIVILEGED-
+    EXECUTOR, acceptance 1 and 3): the payload CARRIES what the task requires,
+    and the cascade is narrowed to the executors that grant it. Carrying it is
+    what lets the worker refuse at its own entry gate — the planner's decision
+    was made against this fleet's table, and the host that finally runs the
+    payload is the only place that knows whether it is true there.
     """
+    if decision is None:
+        decision = authority_preflight.decide(task.get("title"), task.get("body"))
     cascade = cascade_for("implementation")
+    if decision.required:
+        # Route to an executor that HAS the authority. Today no executor
+        # grants any, so `decide()` already parked the task before this line
+        # is reachable; the filter is what makes adding a privileged lane a
+        # one-entry change in `EXECUTOR_AUTHORITY` instead of a routing edit.
+        capable = set(decision.capable_executors)
+        cascade = [link for link in cascade if link.get("executor") in capable]
+        if not cascade:
+            # Unreachable from `plan_once` — an unservable requirement is
+            # parked before dispatch — and loud rather than silent precisely
+            # because of that. A payload with an empty cascade would name no
+            # executor at all, and the worker's link selection would index
+            # past the end of it; emitting one would trade a park an owner
+            # can see for a dead-letter nobody asked for.
+            raise ValueError(
+                "no executor grants "
+                f"{authority_preflight.format_authority(decision.required)}; "
+                "the task must be parked, not dispatched"
+            )
     project_id, repository_path = route
     prompt = (
         f"Central task: {task['task_id']} ({task['title']}).\n"
@@ -157,6 +188,13 @@ def _payload_for(
         "untrusted": False,
         "cascade": cascade,
         "backlog_task_id": task["task_id"],
+        # The capability contract, stated rather than inferred: the worker
+        # checks THIS against what its own host grants, before it spends a
+        # model call (acceptance 1 and 2). `suspected` is the narrative-only
+        # signal -- never a requirement, carried so a failure can be
+        # attributed instead of guessed at.
+        "required_authority": sorted(decision.required),
+        "suspected_authority": sorted(decision.suspected),
     }
     return payload, len(cascade)
 
@@ -218,6 +256,13 @@ class Planner:
                     ") park "
                     "WHERE t.status = 'DEFER_TO_USER' AND t.kind = 'task' "
                     "  AND park.reason LIKE 'cascade_exhausted:%%' "
+                    # An authority park arrives WRAPPED in that same
+                    # `cascade_exhausted:` prefix when it surfaces through
+                    # the worker gate rather than this preflight (0018), so
+                    # the prefix alone would re-attempt it every tick. The
+                    # 0018 gate refuses it regardless; this only keeps the
+                    # candidate list (and the audit trail) honest.
+                    "  AND NOT backlog_reason_requires_authority(park.reason) "
                     "  AND NOT EXISTS ("
                     "    SELECT 1 FROM backlog_event e2"
                     "     WHERE e2.task_id = t.task_id"
@@ -283,7 +328,9 @@ class Planner:
                     else:
                         report.refused.append((task_id, park_result))
                     continue
-                payload, budget = _payload_for(task, limits, route)
+                payload, budget = _payload_for(
+                    task, limits, route, authority_decision
+                )
                 ok, reason, work_item_id, _revision = self._row(
                     "SELECT * FROM backlog_dispatch(%s, %s, %s, %s, %s::jsonb, %s)",
                     (

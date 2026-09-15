@@ -1612,3 +1612,95 @@ def test_review_head_checkout_builds_a_detached_worktree_at_the_exact_sha(
 
     missing, failure = _review_head_checkout(clone, "7", "f" * 40)
     assert missing is None and "unreachable" in failure
+
+
+# ---------------------------------------------------------------------------
+# The worker's entry gate (VOYN-W0-AICC-PRIVILEGED-TASK-ROUTED-TO-
+# UNPRIVILEGED-EXECUTOR): check the privileges the payload asks for BEFORE
+# spending a model call finding out the hard way.
+# ---------------------------------------------------------------------------
+
+
+def test_required_authority_parses_normalized_and_defaults_to_empty() -> None:
+    request = parse_agent_run(
+        _payload(required_authority=["root", " root ", "postgres_role:postgres"])
+    )
+    assert request.required_authority == ("postgres_role:postgres", "root")
+    # Absent means "requires nothing" -- an older payload keeps its behaviour.
+    assert parse_agent_run(_payload()).required_authority == ()
+    assert parse_agent_run(_payload()).suspected_authority == ()
+
+
+def test_unreadable_authority_contract_is_a_non_retryable_defect() -> None:
+    """An unparseable capability list must never be read as `requires
+    nothing` -- that silent downgrade is the defect this task removes."""
+    for bad in ("root", [""], [None], [1], {"root": True}):
+        error = parse_agent_run(_payload(required_authority=bad))
+        assert isinstance(error, PayloadError), bad
+        assert error.retryable is False
+        assert "required_authority" in error.reason
+
+
+def test_authority_the_host_lacks_is_refused_before_any_model_call(handler) -> None:
+    """The measured incident, stopped one layer lower: the agent never runs,
+    so the refusal costs zero tokens and zero cascade attempts."""
+    run_agent, runs = handler
+    outcome = run_agent(
+        _payload(required_authority=["root", "postgres_role:postgres"]), _event(), 1
+    )
+    assert outcome.ok is False
+    assert outcome.reason == (
+        "requires_privileged_authority: postgres_role:postgres,root"
+    )
+    # Non-retryable: redelivery cannot grant a privilege, and 0018 reads this
+    # reason as an owner decision rather than a technical exhaustion.
+    assert outcome.retryable is False
+    assert runs == [], "the model must not be invoked for a payload we cannot serve"
+
+
+def test_a_payload_requiring_nothing_is_untouched_by_the_gate(handler) -> None:
+    run_agent, runs = handler
+    outcome = run_agent(_payload(required_authority=[]), _event(), 1)
+    assert outcome.ok, outcome.reason
+    assert len(runs) == 1
+
+
+def test_the_gate_honours_an_executor_that_grants_the_authority(handler, monkeypatch) -> None:
+    """The routing half of the same rule: when a lane really does grant the
+    privilege, the payload runs normally. Today no lane does, so this is the
+    only place the granted path is exercised."""
+    from command_center.orchestrator import authority_preflight
+
+    monkeypatch.setitem(
+        authority_preflight.EXECUTOR_AUTHORITY,
+        "claude",
+        frozenset({"postgres_role:postgres"}),
+    )
+    run_agent, runs = handler
+    outcome = run_agent(
+        _payload(required_authority=["postgres_role:postgres"]), _event(), 1
+    )
+    assert outcome.ok, outcome.reason
+    assert len(runs) == 1
+
+
+def test_root_is_proved_not_taken_on_the_tables_word(handler, monkeypatch) -> None:
+    """A lane CLAIMING root while running unprivileged is this very defect one
+    layer down, so `root` is verified against the running process."""
+    from command_center.orchestrator import authority_preflight
+    from command_center.worker import handlers as handlers_module
+
+    monkeypatch.setitem(
+        authority_preflight.EXECUTOR_AUTHORITY, "claude", frozenset({"root"})
+    )
+    run_agent, runs = handler
+    monkeypatch.setattr(handlers_module.os, "geteuid", lambda: 1000)
+    outcome = run_agent(_payload(required_authority=["root"]), _event(), 1)
+    assert outcome.ok is False
+    assert outcome.reason == "requires_privileged_authority: root"
+    assert runs == []
+
+    # ...and a process that really is root serves it.
+    monkeypatch.setattr(handlers_module.os, "geteuid", lambda: 0)
+    assert run_agent(_payload(required_authority=["root"]), _event(), 1).ok
+    assert len(runs) == 1

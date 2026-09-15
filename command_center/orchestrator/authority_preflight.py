@@ -73,9 +73,13 @@ __all__ = [
     "AuthorityDecision",
     "FLEET_GRANTED_AUTHORITY",
     "PARK_REASON_PREFIX",
+    "SPLIT_REASON_INFIX",
     "decide",
+    "EXECUTOR_AUTHORITY",
     "declared_authority",
     "detected_authority",
+    "executor_authority",
+    "executors_granting",
     "format_authority",
     "park_reason",
     "required_authority",
@@ -100,11 +104,50 @@ POSTGRES_ROLE_PREFIX = "postgres_role:"
 #: also match ordinary implementation work ("add the credential to config").
 EXTERNAL_CREDENTIAL_PREFIX = "external_credential:"
 
-#: What THIS fleet's executors grant, today. Empty on purpose: every
-#: executor in `orchestrator.routing.ROUTING_MATRIX` (claude/codex/copilot)
-#: runs as the same unprivileged, sandboxed task-clone worker — none holds
-#: root or a PostgreSQL role. See the module docstring for the live evidence.
-FLEET_GRANTED_AUTHORITY: frozenset[str] = frozenset()
+#: What each executor in `orchestrator.routing.ROUTING_MATRIX` grants, today.
+#: All three empty on purpose: claude, codex and copilot are three ACCOUNTS,
+#: not three privilege levels — every one of them runs the same unprivileged,
+#: sandboxed task-clone worker, which is exactly why the cascade could never
+#: rescue the incident this module exists for. See the module docstring for
+#: the live evidence.
+#:
+#: Per-executor rather than one fleet-wide set because acceptance (3) is
+#: "route to an executor that HAS the authority, or mark the task for its
+#: owner": the routing answer needs to know WHICH executor, and the day a
+#: privileged lane is added, that lane is one entry here and tasks needing it
+#: route to it with no other change.
+#:
+#: Static, like `ROUTING_MATRIX` itself, and for the same recorded reason: a
+#: grant is a claim about a host, and an env-var claim that a lane is
+#: privileged would not make it so — it would re-create this very defect,
+#: silently, one layer further down. An executor absent from this table
+#: grants nothing (fail closed).
+EXECUTOR_AUTHORITY: dict[str, frozenset[str]] = {
+    "claude": frozenset(),
+    "codex": frozenset(),
+    "copilot": frozenset(),
+}
+
+#: What SOME executor in this fleet grants — the union, and so the widest
+#: requirement any routing choice could possibly satisfy. Empty today.
+FLEET_GRANTED_AUTHORITY: frozenset[str] = frozenset().union(*EXECUTOR_AUTHORITY.values())
+
+
+def executor_authority(executor: str) -> frozenset[str]:
+    """What `executor` grants. An unknown executor grants nothing."""
+    return EXECUTOR_AUTHORITY.get(executor, frozenset())
+
+
+def executors_granting(required) -> tuple[str, ...]:
+    """Every executor whose grants cover ALL of `required`, in a stable
+    order. Empty `required` is covered by every executor — an ordinary task
+    routes exactly as it did before this module existed."""
+    wanted = frozenset(required)
+    return tuple(
+        name
+        for name in sorted(EXECUTOR_AUTHORITY)
+        if wanted <= EXECUTOR_AUTHORITY[name]
+    )
 
 # --------------------------------------------------------------------------
 # Declared authority — `Requires-Authority: <token>[, <token>...]`.
@@ -325,6 +368,12 @@ class AuthorityDecision:
     #: carried so the dispatched payload can state it and `classify` can
     #: attribute a later failure to authority instead of looping it.
     suspected: frozenset[str]
+    #: Executors whose own grants cover `required`, in stable order. Empty
+    #: exactly when `ok` is false — the routing half of acceptance (3): a
+    #: satisfiable requirement names the executors that can serve it, so the
+    #: planner can narrow the cascade to them instead of letting the task
+    #: land on a link that is certain to fail.
+    capable_executors: tuple[str, ...]
     ok: bool
     reason: str | None  # machine-readable park reason, or None when ok
 
@@ -338,8 +387,14 @@ def decide(title: str | None, body: str | None) -> AuthorityDecision:
     required = declared | detected
     granted = FLEET_GRANTED_AUTHORITY
     missing = required - granted
-    ok = not missing
-    reason = None if ok else park_reason_for(missing)
+    capable = executors_granting(required)
+    # `ok` is "SOME ONE executor can serve ALL of it", not "the fleet grants
+    # each tag somewhere". The union answer is wrong the moment two lanes
+    # grant different privileges: a task needing root AND a postgres role
+    # would read as satisfiable while no single run could satisfy it, and the
+    # narrowed cascade would come out empty. One task runs on one executor.
+    ok = bool(capable)
+    reason = None if ok else park_reason_for(missing) if missing else _split_reason(required)
     return AuthorityDecision(
         required=required,
         granted=granted,
@@ -347,6 +402,7 @@ def decide(title: str | None, body: str | None) -> AuthorityDecision:
         declared=declared,
         detected=detected,
         suspected=frozenset(suspected - required),
+        capable_executors=capable,
         ok=ok,
         reason=reason,
     )
@@ -364,6 +420,17 @@ PARK_REASON_PREFIX = "requires_privileged_authority: "
 
 def park_reason_for(missing) -> str:
     return PARK_REASON_PREFIX + format_authority(missing)
+
+
+#: The second way a requirement can be unservable: every tag is granted by
+#: SOME executor, but no single one grants them all. Distinct in the reason
+#: so the operator sees "split across lanes" rather than "nobody has this" —
+#: the fix for it is a lane that holds both, not a new privilege.
+SPLIT_REASON_INFIX = "no_single_executor_grants: "
+
+
+def _split_reason(required) -> str:
+    return PARK_REASON_PREFIX + SPLIT_REASON_INFIX + format_authority(required)
 
 
 def park_reason(decision: AuthorityDecision) -> str:
