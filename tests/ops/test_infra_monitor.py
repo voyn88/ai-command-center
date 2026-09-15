@@ -1266,3 +1266,290 @@ def test_main_reports_the_host_probes_when_enabled(monkeypatch, capsys) -> None:
     assert any(f.startswith("crash_loop:") for f in payload["failures"])
     assert any(f.startswith("deploy_lag:") for f in payload["failures"])
     assert result == 1
+
+
+# ---------------------------------------------------------------------------
+# VOYN-W0-AICC-PR-WINDOW-TIMER-NOT-DEPLOYED-ON-CONTROL
+#
+# Live 2026-09-07/08: 67 open PRs (752-822) carried no queue-* label for over a
+# day and operators labelled them by hand. control-01 ran the hand-made
+# voyn-aicc-{planner,review,merge,reaper,self-deploy} timers and NO PR-window
+# timer, so `reconcile_pr_window` never fired and the review window was static.
+# Every probe on the host stayed green: `read_unit_health_snapshot` asks
+# systemd for `--type=service`, and a timer that was never installed is not a
+# failed service -- it is nothing at all. These tests are the probe that asks
+# the question directly.
+# ---------------------------------------------------------------------------
+
+
+def _timer_block(unit: str, load: str, file_state: str, active: str) -> str:
+    return (
+        f"Id={unit}\nLoadState={load}\n"
+        f"UnitFileState={file_state}\nActiveState={active}\n"
+    )
+
+
+def _healthy_timer(unit: str) -> str:
+    return _timer_block(unit, "loaded", "enabled", "active")
+
+
+def _timers(states: dict[str, str]) -> dict[str, infra_monitor.TimerState]:
+    """`{unit: "load/file/active"}` -> the parsed states the evaluator takes."""
+    return {
+        unit: infra_monitor.TimerState(*spec.split("/"))
+        for unit, spec in states.items()
+    }
+
+
+def test_the_control_timers_watched_are_the_ones_the_installer_enables() -> None:
+    """Bound to `CONTROL_ONLY_TIMERS`, so a control tick that becomes
+    repo-owned cannot be installed by the transaction and then go unwatched
+    -- which is the shape of every incident in this class."""
+    import importlib.util
+    import sys
+
+    path = Path(__file__).parents[2] / "ops" / "aicc_install_transaction.py"
+    spec = importlib.util.spec_from_file_location("aicc_install_transaction", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    # Registered before exec: the module defines dataclasses, whose field
+    # annotations `dataclasses` resolves through `sys.modules[cls.__module__]`.
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
+    assert set(infra_monitor.CONTROL_TIMERS) == set(module.CONTROL_ONLY_TIMERS)
+    assert "voyn-aicc-pr-window.timer" in infra_monitor.CONTROL_TIMERS
+
+
+def test_a_timer_that_was_never_installed_is_a_finding() -> None:
+    """The incident itself: the unit file is in deploy/systemd and nothing
+    ever put it on the host, so systemd answers `not-found`."""
+    states = _timers(
+        {unit: "loaded/enabled/active" for unit in infra_monitor.CONTROL_TIMERS}
+        | {"voyn-aicc-pr-window.timer": "not-found//inactive"}
+    )
+
+    snapshot = infra_monitor.evaluate_timer_health(states, infra_monitor.CONTROL_TIMERS)
+
+    assert snapshot.missing == (("voyn-aicc-pr-window.timer", "not-found"),)
+    # Most specific class only: a timer with no unit file is trivially also
+    # not enabled and not active, and saying so three times buries the fact.
+    assert snapshot.not_enabled == () and snapshot.inactive == ()
+
+    report = infra_monitor.evaluate(
+        {},
+        None,
+        minimum_active_workers=0,
+        max_stalled_seconds=900,
+        prometheus_ready=True,
+        timers=snapshot,
+    )
+    assert not report.ok
+    assert (
+        "control_timer_missing:1:voyn-aicc-pr-window.timer=not-found"
+        in report.failures
+    )
+
+
+def test_a_runtime_only_enablement_does_not_count_as_deployed() -> None:
+    """The operator's interim hand-made timer, exactly: it labels PRs today
+    and is gone at the next boot. `enabled-runtime` is reported, not
+    accepted -- a tick that survives only as long as the host does is the
+    thing this task replaces with a deployed one."""
+    states = _timers(
+        {unit: "loaded/enabled/active" for unit in infra_monitor.CONTROL_TIMERS}
+        | {"voyn-aicc-pr-window.timer": "loaded/enabled-runtime/active"}
+    )
+
+    snapshot = infra_monitor.evaluate_timer_health(states, infra_monitor.CONTROL_TIMERS)
+
+    assert snapshot.not_enabled == (("voyn-aicc-pr-window.timer", "enabled-runtime"),)
+    report = infra_monitor.evaluate(
+        {},
+        None,
+        minimum_active_workers=0,
+        max_stalled_seconds=900,
+        prometheus_ready=True,
+        timers=snapshot,
+    )
+    assert (
+        "control_timer_not_enabled:1:voyn-aicc-pr-window.timer=enabled-runtime"
+        in report.failures
+    )
+
+
+def test_a_masked_or_stopped_timer_is_told_apart_from_a_missing_one() -> None:
+    """The three classes have three different remedies: install it, enable
+    it, start it. One `control_timer_broken` code would make the monitor's
+    finding useless to whoever has to act on it."""
+    states = _timers(
+        {
+            "voyn-aicc-review.timer": "masked/masked/inactive",
+            "voyn-aicc-merge.timer": "loaded/disabled/inactive",
+            "voyn-aicc-remediate.timer": "loaded/enabled/failed",
+            "voyn-aicc-pr-window.timer": "loaded/enabled/active",
+        }
+    )
+
+    snapshot = infra_monitor.evaluate_timer_health(states, infra_monitor.CONTROL_TIMERS)
+
+    assert snapshot.missing == (("voyn-aicc-review.timer", "masked"),)
+    assert snapshot.not_enabled == (("voyn-aicc-merge.timer", "disabled"),)
+    assert snapshot.inactive == (("voyn-aicc-remediate.timer", "failed"),)
+
+
+def test_healthy_control_timers_are_no_finding() -> None:
+    states = _timers(
+        {unit: "loaded/enabled/active" for unit in infra_monitor.CONTROL_TIMERS}
+    )
+
+    snapshot = infra_monitor.evaluate_timer_health(states, infra_monitor.CONTROL_TIMERS)
+
+    assert (snapshot.missing, snapshot.not_enabled, snapshot.inactive) == ((), (), ())
+    assert snapshot.checked == len(infra_monitor.CONTROL_TIMERS)
+    report = infra_monitor.evaluate(
+        {},
+        None,
+        minimum_active_workers=0,
+        max_stalled_seconds=900,
+        prometheus_ready=True,
+        timers=snapshot,
+    )
+    assert report.ok and report.timers is snapshot
+
+
+def test_the_timer_probe_asks_systemctl_once_and_never_raises(monkeypatch) -> None:
+    calls: list[list[str]] = []
+
+    def _run(args, **_kwargs):
+        calls.append(args)
+        requested = args[args.index("--") + 1 :]
+        flag = next(a for a in args if a.startswith("--property="))
+        assert set(flag.split("=", 1)[1].split(",")) >= {
+            "Id",
+            "LoadState",
+            "UnitFileState",
+            "ActiveState",
+        }
+        return subprocess.CompletedProcess(
+            args, 0, stdout="\n".join(_healthy_timer(u) for u in requested), stderr=""
+        )
+
+    monkeypatch.setattr(infra_monitor.subprocess, "run", _run)
+    snapshot = infra_monitor.read_timer_snapshot()
+
+    assert snapshot.error is None and snapshot.missing == ()
+    (show,) = calls
+    assert show[:2] == ["systemctl", "show"]
+    assert show[show.index("--") + 1 :] == list(infra_monitor.CONTROL_TIMERS)
+
+    def _boom(args, **_kwargs):
+        raise OSError("no systemctl")
+
+    monkeypatch.setattr(infra_monitor.subprocess, "run", _boom)
+    failed = infra_monitor.read_timer_snapshot()
+    assert failed.error is not None and "no systemctl" in failed.error
+
+
+def test_a_timer_show_silently_drops_is_a_failed_measurement(monkeypatch) -> None:
+    """A partial answer is not a clean host. Treating an unanswered timer as
+    healthy is how a probe reports green about a unit it never looked at."""
+
+    def _run(args, **_kwargs):
+        return subprocess.CompletedProcess(
+            args, 0, stdout=_healthy_timer("voyn-aicc-review.timer"), stderr=""
+        )
+
+    monkeypatch.setattr(infra_monitor.subprocess, "run", _run)
+    snapshot = infra_monitor.read_timer_snapshot()
+
+    assert snapshot.error is not None
+    assert "1 of 4" in snapshot.error and "voyn-aicc-pr-window.timer" in snapshot.error
+    report = infra_monitor.evaluate(
+        {},
+        None,
+        minimum_active_workers=0,
+        max_stalled_seconds=900,
+        prometheus_ready=True,
+        timers=snapshot,
+    )
+    assert not report.ok
+    assert any(f.startswith("control_timer_probe_failed:") for f in report.failures)
+
+
+def test_the_timer_probe_is_off_unless_asked_for(monkeypatch) -> None:
+    """A worker host runs none of these timers and their absence there is
+    correct, so the probe is opt-in and its findings never appear without it."""
+    monkeypatch.delenv(infra_monitor.CONTROL_TIMERS_ENV, raising=False)
+    assert infra_monitor.build_parser().parse_args(
+        ["--prometheus-url", "http://x/ready"]
+    ).control_timers is False
+    assert infra_monitor.build_parser().parse_args(
+        ["--prometheus-url", "http://x/ready", "--control-timers"]
+    ).control_timers is True
+
+    report = infra_monitor.evaluate(
+        {},
+        None,
+        minimum_active_workers=0,
+        max_stalled_seconds=900,
+        prometheus_ready=True,
+    )
+    assert report.ok and report.timers is None
+
+
+def test_the_environment_turns_the_probe_on_without_touching_the_command(
+    monkeypatch,
+) -> None:
+    """Every monitor `ExecStart=` names an absolute home path, and the
+    pre-push leak guard refuses to let a public repository restate such a
+    line in a new one -- so the switch has to be an `Environment=` line
+    beside the command, exactly as `AICC_PR_WINDOW_REPO` already is."""
+    for value in ("1", "true", "on", "YES"):
+        monkeypatch.setenv(infra_monitor.CONTROL_TIMERS_ENV, value)
+        assert infra_monitor.build_parser().parse_args(
+            ["--prometheus-url", "http://x/ready"]
+        ).control_timers is True
+
+    for value in ("", "0", "no", "off"):
+        monkeypatch.setenv(infra_monitor.CONTROL_TIMERS_ENV, value)
+        assert infra_monitor.build_parser().parse_args(
+            ["--prometheus-url", "http://x/ready"]
+        ).control_timers is False
+
+
+def test_the_control_host_monitor_unit_turns_the_timer_probe_on() -> None:
+    """The probe only defends control-01 if control-01 actually runs it. The
+    control probe is the queue monitor (it is the one that already carries
+    the control host's gh identity and the PR-window effect probe); the
+    worker one must not, because a worker host has none of these timers."""
+    root = Path(__file__).parents[2] / "deploy" / "systemd"
+    control = (root / "voyn-queue-monitor.service").read_text()
+    worker = (root / "voyn-infra-monitor.service").read_text()
+
+    directives = [line for line in control.splitlines() if not line.startswith("#")]
+    assert f"Environment={infra_monitor.CONTROL_TIMERS_ENV}=1" in directives
+    assert infra_monitor.CONTROL_TIMERS_ENV not in worker
+    # The leak guard's rule, asserted where it can actually be broken: the
+    # command itself must stay byte-identical to what is already committed.
+    assert "--control-timers" not in control
+
+
+def test_the_pr_window_timer_is_installed_and_enabled_by_the_control_profile() -> None:
+    """End to end on the deploy side: the unit file exists in the repo, the
+    control profile installs it, and the installer enables it. Any one of
+    those three missing is a timer that does not run -- the unit file alone
+    is what control-01 had for months."""
+    root = Path(__file__).parents[2]
+    assert (root / "deploy/systemd/voyn-aicc-pr-window.timer").is_file()
+    assert (root / "deploy/systemd/voyn-aicc-pr-window.service").is_file()
+
+    installer = (root / "deploy/install-agent-principal-isolation.sh").read_text()
+    assert "systemctl enable --now" in installer
+    enabled = [
+        line
+        for line in installer.splitlines()
+        if line.strip().startswith("systemctl enable --now")
+        and "voyn-aicc-pr-window.timer" in line
+    ]
+    assert enabled, "the installer must enable the PR-window timer, not just place it"
