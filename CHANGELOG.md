@@ -8,6 +8,98 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Fixed — a drained lane must find its own way back (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
+- `control-01:queue` reported `queue_stalled` again (`monitor_finding` #3078).
+  Every fix on this branch so far has closed one way for the fleet to end up
+  UP AND CLAIMING NOTHING — a raising claim killing the lane, a poisoned
+  head-of-line row nothing could claim past, a recovery path that reported
+  success and did nothing. This is the last one of that shape still open, and
+  the only one where the lane was never in trouble at all: it was told to stop
+  claiming, and then nothing ever told it to start.
+
+  **The reload that failed once and was never tried again.** `SIGUSR1` closes
+  the claim gate (`_drain`), and the ONLY thing that reopens it is
+  `_credential_reload_loop` clearing the flags after `reload_credentials()`
+  returns. The request is cleared BEFORE the attempt — deliberately, so a
+  `SIGHUP` arriving mid-reload is coalesced rather than dropped (review finding
+  on `c4001c4`) — so a reload that RAISED had consumed the request and left
+  nothing behind to retry it. The lane stayed drained for the life of the
+  process.
+
+  Nothing on the host notices, and that is what makes it an outage rather than
+  an incident. The lane holds a working pool (`replace_pool` builds and
+  authenticates the replacement BEFORE detaching the old one, so a failed
+  rebuild leaves the previous pool intact), and `run_forever`'s draining branch
+  feeds the systemd watchdog on every pass — so the unit is `active (running)`,
+  its watchdog is fed, its database connection is fine, and it will never claim
+  again. `Restart=` never fires because nothing ever fails.
+
+  It is also the likeliest reload to fail: the rebuild runs against a
+  credential the rotator has just changed, over a tunnel
+  (`voyn-aicc-pgtunnel.service`) that the same rotation restarts, and
+  `worker/__main__.py`'s `reload_credentials` raises on any of a missing
+  `AICC_WORKER_ENV_FILE`, an unreadable or half-published env file, a config
+  the loader refuses, or a replacement pool that cannot connect.
+
+  That state is exactly what the probe reports, and reports correctly: lanes
+  that are up but claiming nothing stop the fleet clock
+  (`fleet_idle_seconds`), due ready work is attended by nobody, and
+  `queue_stalled` opens with no exit reachable by fleet action — restarting is
+  not something anything on the host will do for a unit that looks healthy.
+
+  The reload now degrades the way the claim and report paths already do: log
+  it, back off `idle_max_seconds` (the interval every other "cannot proceed
+  yet" answer uses, because none of them is cured by asking again faster), and
+  keep trying. The backoff waits on `_reload_stop`, so a shutdown during it is
+  still prompt.
+
+  **The gate is deliberately NOT reopened on failure.** The drain is the
+  rotator's instruction to stop claiming while the credential it issued is
+  retired, so a lane that resumed because its reload kept failing would claim
+  under exactly the credential being invalidated. It stays shut until a reload
+  actually succeeds — which now happens on its own, with no operator and no
+  second `SIGHUP`, the moment whatever broke the rebuild is over. Both halves
+  are pinned by their own regression.
+
+- **Migration 0027 — the one audited path that held no lock.** Found while
+  auditing the same route from "work enqueued" to "work attended", proven
+  against a real server, and NOT a cause of the stall above. `_queue_audit`
+  numbers `work_event.seq` as `max(seq) + 1` and states the precondition that
+  makes it collision-free without a retry loop: "every caller passing a
+  non-null work_item_id already holds that item's row lock". Every caller did
+  — `queue_claim`, `queue_reap`, `queue_redrive` and everything reached
+  through `_queue_owns` take the item `FOR UPDATE`, and `queue_enqueue`'s
+  granted path inserts the item itself — except `queue_enqueue`'s DUPLICATE
+  path, which resolved the existing item with a bare `SELECT`.
+
+  The FK's `FOR KEY SHARE` is not that lock and is why the bug survived
+  review: it does not conflict with itself, and it is taken by the audit's
+  INSERT *after* the `max(seq)` subquery in the same statement has already
+  been evaluated. So a duplicate enqueue settles its `seq` on one snapshot,
+  waits behind whoever holds the item, and commits a number that party has
+  since used:
+
+      duplicate key value violates unique constraint "idx_work_event_item_seq"
+      DETAIL:  Key (work_item_id, seq)=(wki_..., 3) already exists.
+
+  The unlocked caller is always the loser, which is why this showed up as
+  dispatch failing rather than as the queue protocol failing. And the race is
+  routine, not exotic: the duplicate path is what an idempotency key is FOR
+  ("the dispatcher may retry an enqueue after a timeout without knowing
+  whether the first landed", 0002), `aicc-backlog-review.timer`,
+  `aicc-backlog-merge.timer` and the planner all re-enqueue keys for work
+  still in flight, and the counterparty needs no coincidence — the worker
+  holding that item beats every ~100s (`visibility_seconds / 3`), and every
+  beat is an audited, row-locked write to the same item. The exception aborts
+  the caller's transaction, taking down whatever else that tick had batched
+  with it, and loses the very refusal record the audit exists to keep —
+  the lesson `queue_redrive`'s unknown-item branch already carries in its own
+  comment.
+
+  0027 resolves the existing item `FOR UPDATE`, so the one caller outside the
+  precondition is inside it. The granted path and enqueues of different keys
+  are untouched.
+
 ### Fixed — a claim that raises must not take the lane with it (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
 - `control-01:queue` reported `queue_stalled` again (`monitor_finding` #2873).
   It is the same measurement as #2840 in the entry below, whose root cause —

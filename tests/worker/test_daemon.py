@@ -848,3 +848,134 @@ def test_a_raising_claim_does_not_hold_the_drain_gate_through_its_backoff() -> N
     daemon.run_forever()
 
     assert gate_was_free == [True], "the claim gate stayed locked through the backoff"
+
+
+def test_a_failed_credential_reload_does_not_strand_the_drained_lane() -> None:
+    """A drained lane's ONLY route back to claiming is a successful reload.
+
+    `request_drain()` (SIGUSR1) closes the claim gate and nothing reopens it
+    except `_credential_reload_loop` clearing the flags after
+    `reload_credentials()` returns. The request is cleared BEFORE the attempt
+    -- deliberately, so a SIGHUP arriving mid-reload is coalesced rather than
+    dropped -- so a reload that RAISES consumed the request and left nothing
+    to retry it. The lane then stays drained for the life of the process:
+    up, feeding the systemd watchdog from the draining branch (so no restart
+    is ever triggered), holding a working pool, and claiming nothing.
+
+    That is a `queue_stalled` with no exit reachable by fleet action, which
+    is the failure class every fix on this branch has been closing -- the
+    fleet clock stops, due ready work is attended by nobody, and restarting
+    is not something anything on the host will do for a unit that looks
+    healthy. The reload must degrade the way the claim and report paths
+    already do: log it, back off, keep trying.
+    """
+    import threading
+
+    attempts = []
+    notices: list[str] = []
+    fail_until = 2
+
+    def reload_credentials() -> None:
+        attempts.append(len(attempts) + 1)
+        if len(attempts) <= fail_until:
+            raise RuntimeError("pool rebuild refused: connection reset")
+
+    store = ScriptedStore([])
+    daemon = WorkerDaemon(
+        store,
+        {},
+        # `idle_max_seconds` doubles as the reload retry interval, exactly as
+        # it does for the claim and refusal paths.
+        WorkerConfig(visibility_seconds=3, idle_min_seconds=0.01, idle_max_seconds=0.01),
+        notify=notices.append,
+        reload_credentials=reload_credentials,
+    )
+    worker = threading.Thread(target=daemon.run_forever)
+    worker.start()
+    try:
+        daemon.request_drain()
+        deadline = time.monotonic() + 5
+        while "STATUS=aicc-drained" not in notices and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert "STATUS=aicc-drained" in notices
+
+        claims_while_drained = sum(call[0] == "claim" for call in store.calls)
+        daemon.request_reload()
+
+        # The lane comes back on its own: the failed reloads are retried, and
+        # the first one that succeeds reopens the gate.
+        deadline = time.monotonic() + 5
+        while "STATUS=aicc-ready" not in notices[-3:] and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(attempts) > fail_until, (
+            f"a failed reload was never retried: {attempts}"
+        )
+        assert "STATUS=aicc-reload-failed" in notices
+
+        deadline = time.monotonic() + 5
+        while (
+            sum(call[0] == "claim" for call in store.calls) <= claims_while_drained
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        assert sum(call[0] == "claim" for call in store.calls) > claims_while_drained, (
+            "the lane never resumed claiming after the reload finally succeeded"
+        )
+    finally:
+        daemon.request_stop()
+        worker.join(timeout=5)
+    assert not worker.is_alive()
+
+
+def test_a_failing_credential_reload_keeps_the_claim_gate_shut() -> None:
+    """Retrying must not become failing open.
+
+    The drain is the rotator's instruction to stop claiming while the
+    credential it issued is retired; a lane that reopened the gate because
+    its reload kept failing would claim under exactly the credential the
+    rotation is invalidating. So the retry loop reopens the gate only on a
+    reload that actually SUCCEEDED -- while the reload keeps failing the lane
+    stays drained and claims nothing, which is the safe half of this
+    behaviour and the half a naive "clear the flags in a finally" would lose.
+    """
+    import threading
+
+    notices: list[str] = []
+    attempts = []
+
+    def reload_credentials() -> None:
+        attempts.append(1)
+        raise RuntimeError("credential file unreadable")
+
+    store = ScriptedStore([])
+    daemon = WorkerDaemon(
+        store,
+        {},
+        WorkerConfig(visibility_seconds=3, idle_min_seconds=0.01, idle_max_seconds=0.01),
+        notify=notices.append,
+        reload_credentials=reload_credentials,
+    )
+    worker = threading.Thread(target=daemon.run_forever)
+    worker.start()
+    try:
+        daemon.request_drain()
+        deadline = time.monotonic() + 5
+        while "STATUS=aicc-drained" not in notices and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert "STATUS=aicc-drained" in notices
+        claims_at_drain = sum(call[0] == "claim" for call in store.calls)
+
+        daemon.request_reload()
+        deadline = time.monotonic() + 3
+        while len(attempts) < 3 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(attempts) >= 3, f"the reload was not retried: {attempts}"
+
+        assert sum(call[0] == "claim" for call in store.calls) == claims_at_drain, (
+            "a lane whose reload keeps failing must not claim again"
+        )
+        assert "READY=1" not in notices[1:], "a failed reload must not re-arm READY"
+    finally:
+        daemon.request_stop()
+        worker.join(timeout=5)
+    assert not worker.is_alive()

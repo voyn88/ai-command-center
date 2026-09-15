@@ -2096,3 +2096,169 @@ def test_the_queue_mirror_is_untouched_by_this_migration(
             "ORDER BY ordinal_position"
         )
         assert cur.fetchall() == after
+
+
+def test_a_duplicate_enqueue_cannot_lose_the_audit_sequence_race(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """THE REGRESSION (0027). `_queue_audit` numbers `work_event.seq` as
+    `max(seq) + 1` and says in its own comment why that needs no retry loop:
+    "every caller passing a non-null work_item_id already holds that item's
+    row lock". The duplicate-enqueue path resolved the existing item with a
+    bare SELECT and held nothing.
+
+    The FK's `FOR KEY SHARE` is not that lock and cannot stand in for it: it
+    does not conflict with itself, and it is taken by the audit's INSERT --
+    after the `max(seq)` subquery in the same statement has been evaluated. So
+    two dispatchers re-enqueueing one in-flight key both work out the same
+    number and the unique index refuses the second.
+
+    Driven deterministically rather than by racing threads and hoping: the
+    first enqueue holds its transaction open, so the second is at the exact
+    interleaving the bug needs -- its `seq` decided, its commit behind the
+    other's. Without the lock in 0027 the second raises `UniqueViolation` on
+    `idx_work_event_item_seq`; with it, it waits on the row instead and reads
+    `max(seq)` again afterwards.
+    """
+    import threading
+
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
+    with psycopg.connect(app_dsn, autocommit=True) as app:
+        item_id = _enqueue(app, "in-flight-key")
+
+    # Two dispatchers, each retrying the same enqueue -- which is what the
+    # idempotency key is for, and what `aicc-backlog-review.timer`,
+    # `aicc-backlog-merge.timer` and the planner do to work already queued.
+    first = psycopg.connect(app_dsn)
+    second = psycopg.connect(app_dsn)
+    raised: dict[str, BaseException] = {}
+    finished = threading.Event()
+    try:
+        with first.cursor() as cur:
+            cur.execute(
+                "SELECT queue_enqueue(%s, %s, '{}'::jsonb)", (QUEUE, "in-flight-key")
+            )
+            assert cur.fetchone()[0] == item_id
+
+        def duplicate() -> None:
+            try:
+                with second.cursor() as cur:
+                    cur.execute(
+                        "SELECT queue_enqueue(%s, %s, '{}'::jsonb)",
+                        (QUEUE, "in-flight-key"),
+                    )
+                    assert cur.fetchone()[0] == item_id
+                second.commit()
+            except BaseException as error:  # noqa: BLE001 — reported below
+                raised["error"] = error
+            finally:
+                finished.set()
+
+        worker = threading.Thread(target=duplicate)
+        worker.start()
+        # Long enough that the second enqueue has reached its wait; with the
+        # bare SELECT it does not wait at all and is already past it.
+        time.sleep(0.5)
+        first.commit()
+        assert finished.wait(timeout=10), "the second enqueue never returned"
+        worker.join(timeout=5)
+    finally:
+        first.close()
+        second.close()
+
+    assert "error" not in raised, (
+        "a duplicate enqueue raised instead of recording its refusal: "
+        f"{raised.get('error')!r}"
+    )
+
+    # Both refusals are on the record, and the per-item sequence is still
+    # gap-free -- which is the property `idx_work_event_item_seq` exists to
+    # keep and the reason a deleted row is detectable.
+    events = _events(admin_conn, item_id)
+    assert [event[2] for event in events] == [
+        None,
+        "duplicate_idempotency_key",
+        "duplicate_idempotency_key",
+    ]
+    assert [event[4] for event in events] == [1, 2, 3]
+
+
+def test_a_duplicate_enqueue_does_not_raise_against_the_items_own_heartbeat(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """The pairing this fleet actually produces, and the reason 0027 is not
+    only about two dispatchers.
+
+    A worker holding an item beats every ``visibility_seconds / 3`` (~100s on
+    the deployed lanes), and every beat is an audited write to that item taken
+    under `_queue_owns`'s `FOR UPDATE`. A review or merge tick re-enqueueing
+    that item's key lands on the duplicate path with no lock at all, so it
+    settles its `seq` on a pre-beat snapshot, waits for the beat's FK lock,
+    and commits a number the beat has already used.
+
+    Note the asymmetry the fix rests on: the LOCKED party never loses. It is
+    always the unlocked duplicate enqueue that raises -- which is why the
+    defect showed up as dispatch failing rather than as the queue protocol
+    failing, and why nothing in the worker path could have caught it.
+    """
+    import threading
+
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
+    with psycopg.connect(app_dsn, autocommit=True) as app:
+        item_id = _enqueue(app, "beating-key")
+
+    with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
+        with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+            token, token_hash = _token()
+            claimed = _claim(worker, token_hash)
+            assert claimed[0], claimed
+
+        beating = psycopg.connect(host_dsns[0])
+        enqueuing = psycopg.connect(app_dsn)
+        raised: dict[str, BaseException] = {}
+        finished = threading.Event()
+        try:
+            with beating.cursor() as cur:
+                cur.execute(
+                    "SELECT ok FROM queue_heartbeat(%s, %s)", (claimed[3], token)
+                )
+                assert cur.fetchone()[0] is True
+
+            def duplicate() -> None:
+                try:
+                    with enqueuing.cursor() as cur:
+                        cur.execute(
+                            "SELECT queue_enqueue(%s, %s, '{}'::jsonb)",
+                            (QUEUE, "beating-key"),
+                        )
+                        assert cur.fetchone()[0] == item_id
+                    enqueuing.commit()
+                except BaseException as error:  # noqa: BLE001 — reported below
+                    raised["error"] = error
+                finally:
+                    finished.set()
+
+            thread = threading.Thread(target=duplicate)
+            thread.start()
+            time.sleep(0.5)
+            beating.commit()
+            assert finished.wait(timeout=10), "the duplicate enqueue never returned"
+            thread.join(timeout=5)
+        finally:
+            beating.close()
+            enqueuing.close()
+
+    assert "error" not in raised, (
+        "a re-enqueue of in-flight work raised against its own heartbeat: "
+        f"{raised.get('error')!r}"
+    )
+    events = _events(admin_conn, item_id)
+    assert [event[0] for event in events] == [
+        "enqueue",
+        "claim",
+        "heartbeat",
+        "enqueue",
+    ]
+    assert [event[4] for event in events] == [1, 2, 3, 4]

@@ -197,8 +197,49 @@ class WorkerDaemon:
             try:
                 self._reload_credentials()
             except Exception:  # reload failure is surfaced to systemd by no READY
-                logger.exception("credential reload failed")
+                # A RAISING RELOAD USED TO STRAND THE LANE FOR THE LIFE OF THE
+                # PROCESS. The clear above consumed the request, and this
+                # branch dropped it -- so nothing was left to retry, and the
+                # only thing that reopens the claim gate is the successful
+                # reload below. A lane drained by SIGUSR1 then never claimed
+                # again: up, holding a working pool (`replace_pool` builds and
+                # authenticates the replacement BEFORE detaching the old one,
+                # so a failed rebuild leaves the previous pool intact), and
+                # feeding the systemd watchdog from `run_forever`'s draining
+                # branch -- so the unit looks healthy and nothing on the host
+                # ever restarts it.
+                #
+                # That is the shape `control-01:queue` reports and the reason
+                # it could not be cleared by fleet action: lanes that are up
+                # but claiming nothing stop the fleet clock
+                # (`fleet_idle_seconds`), due ready work is attended by
+                # nobody, and `queue_stalled` opens with no exit any fleet
+                # action reaches. It is also the likeliest reload to fail --
+                # the rebuild runs against a credential the rotator has just
+                # changed, over a tunnel the same rotation restarts.
+                #
+                # So the reload degrades the way the claim and report paths
+                # already do: log it, back off, keep trying. `idle_max_seconds`
+                # is the interval every other "cannot proceed yet" answer uses,
+                # because none of them is cured by asking again faster.
+                #
+                # THE GATE IS NOT REOPENED HERE, and that is the point: the
+                # drain is the rotator's instruction to stop claiming while
+                # the credential it issued is retired, so a lane that resumed
+                # because its reload kept failing would claim under exactly
+                # the credential being invalidated. It stays shut until a
+                # reload actually succeeds -- which now happens on its own,
+                # with no operator and no second SIGHUP, the moment whatever
+                # broke the rebuild is over.
+                logger.exception(
+                    "credential reload failed; retrying after a backoff "
+                    "(the claim gate stays shut until one succeeds)"
+                )
                 self._notify("STATUS=aicc-reload-failed")
+                # Interruptible, so a stop during the backoff is still prompt.
+                if self._reload_stop.wait(self._config.idle_max_seconds):
+                    return
+                self._reload_requested.set()
                 continue
             with self._claim_gate_lock:
                 self._drain.clear()
