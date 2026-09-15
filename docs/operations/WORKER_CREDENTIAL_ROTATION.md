@@ -61,6 +61,32 @@ transaction never performs restart fallback. After
 issuance, every reload/readiness operation is bounded by both that controller
 deadline and the credential's expiry minus a five-minute safety margin.
 
+## Self-renewal grace after expiry
+
+The rotator authenticates with the credential it is renewing, so before 0029
+an expired credential could never be renewed by the host itself: live
+2026-09-15 three refused rotations (a readiness reason) let the one-hour
+credential expire, and every later attempt failed `credential_expired` until an
+operator widened the ledger row and the role by hand. Since 0029:
+
+* A WORKER credential stays renewable -- and usable for nothing else -- for
+  `enroll_self_grace()` (2 hours) after `expires_at`, from its bound address
+  only, with every other guard (revocation, principal state, CIDR) unchanged.
+  Operator and control-plane credentials get no grace.
+* The worker role may log in until `expires_at + grace`; the ledger refuses
+  work in between. Lanes on established sessions keep working until they
+  reconnect, which is the window the grace recovers in. Lanes that have already
+  lost their sessions cannot become ready on an expired secret, and rotation
+  still requires ready lanes: that state is `credential_rotation_stalled` in
+  `infra_monitor`, and it needs an operator (recipe below).
+* The rotator asks `identity_current_credential(secret, true)`, which reports
+  an expired credential inside the grace with a negative remaining lifetime and
+  `renewable_until`; it bounds its attempt by the renewal deadline and rotates
+  immediately. A graced renewal is audited as `assert/granted/expired_grace`
+  and `rotate/granted` with `expired_grace: true`; it is not consumed, so a
+  host that stalls twice inside the grace recovers twice. The bound is time,
+  not count.
+
 The normal timer runs 25 minutes after the service becomes inactive. A failed
 oneshot is retried after two minutes. The threshold proof includes the full
 worst-case duration of all three failures before mutation plus every declared

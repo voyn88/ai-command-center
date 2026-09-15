@@ -267,33 +267,32 @@ def _check_compliance(admin_conn) -> list[str]:
         )
 
     # ---- function grants ---------------------------------------------------
-    with admin_conn.cursor() as cur:
-        cur.execute(
-            "SELECT p.proname || '(' || pg_get_function_arguments(p.oid) || ')' "
-            "FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
-            "WHERE n.nspname = 'public'"
-        )
-        all_db_functions = [row[0] for row in cur.fetchall()]
-
     for role in (roles.APP_ROLE, roles.WORKER_ROLE):
         declared_sigs = list(roles.FUNCTION_PRIVILEGES.get(role, ()))
 
-        # Resolve declared short signatures to catalog form
+        # Resolve each declared signature to catalog form by EXACT signature:
+        # the matrix names argument types, and PostgreSQL's own regprocedure
+        # parser resolves them (aliases included), so an overload -- 0013's
+        # `identity_current_credential(text)` beside 0029's `(text, boolean)`
+        # -- resolves to its own row instead of reading as ambiguous. A name
+        # that matches nothing is a declared grant on a function that does not
+        # exist.
         declared_canonical: set[str] = set()
         for sig in declared_sigs:
-            name = sig.split("(")[0]
-            matches = [f for f in all_db_functions if f.startswith(f"{name}(")]
-            if not matches:
+            with admin_conn.cursor() as cur:
+                cur.execute(
+                    "SELECT p.proname || '(' || pg_get_function_arguments(p.oid) || ')' "
+                    "FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+                    "WHERE n.nspname = 'public' AND p.oid = to_regprocedure(%s)",
+                    (sig,),
+                )
+                found = cur.fetchone()
+            if found is None:
                 violations.append(
                     f"MISSING FUNCTION: role={role} declared function {sig!r} not found in db"
                 )
                 continue
-            if len(matches) > 1:
-                violations.append(
-                    f"AMBIGUOUS FUNCTION: role={role} {sig!r} matches {matches}"
-                )
-                continue
-            declared_canonical.add(matches[0])
+            declared_canonical.add(found[0])
 
         # What is actually granted in the catalog
         with admin_conn.cursor() as cur:
