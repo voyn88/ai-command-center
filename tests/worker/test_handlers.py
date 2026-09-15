@@ -2009,7 +2009,17 @@ def test_review_head_pin_under_isolation_runs_in_a_clone_detached_at_the_pin(
 ) -> None:
     """Isolation isolates the pinned verification review instead of disabling
     it (review of 5361b78a): the detached clone is pinned to the requested
-    sha, the bound clone is never touched."""
+    sha, the bound clone is never touched.
+
+    Never touched on the way out either, and exactly ONE remover owns the
+    clone. The isolated branch used to register its `rmtree` remover and then
+    fall through to the shared one, so a throwaway clone that is not a
+    worktree of anything also got `force_remove_worktree(repository, clone)`
+    -- a `git worktree remove`/`prune` against the read-only bound clone,
+    whose `rmtree` fallback then deleted the tree under the other remover's
+    feet and left it logging "was not fully removed". One refusal site for
+    both branches (VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH) is also one
+    cleanup registration."""
     from command_center import agent_runner
     from command_center.worker import handlers as handlers_module
 
@@ -2023,12 +2033,17 @@ def test_review_head_pin_under_isolation_runs_in_a_clone_detached_at_the_pin(
     clone = tmp_path / "root" / "ro-pinned"
     asked: list[tuple] = []
     removed: list[Path] = []
+    as_worktree: list[tuple] = []
     monkeypatch.setattr(
         handlers_module, "_read_only_isolated_checkout",
         lambda repository, pin_sha=None: (asked.append((repository, pin_sha)), (clone, None))[1],
     )
     monkeypatch.setattr(
         handlers_module, "_remove_read_only_isolated_checkout", lambda target: removed.append(target)
+    )
+    monkeypatch.setattr(
+        handlers_module, "_remove_review_head_checkout",
+        lambda repository, target: as_worktree.append((repository, target)),
     )
     outcome = run_agent(
         _payload(task_type="verification_review", untrusted=True,
@@ -2039,6 +2054,7 @@ def test_review_head_pin_under_isolation_runs_in_a_clone_detached_at_the_pin(
     assert asked == [(tmp_path, "b" * 40)]
     assert runs[0]["repository_path"] == clone
     assert removed == [clone]
+    assert as_worktree == [], "the throwaway clone is not a worktree of the bound clone"
 
 
 def test_read_only_isolated_checkout_pins_to_the_requested_sha_or_waits_for_it(tmp_path, monkeypatch):

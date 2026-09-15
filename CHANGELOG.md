@@ -38,6 +38,16 @@ functional application milestones of `app.py`.
   exit that actually honours that intent: `no_fault` does not spend the
   cascade budget at all, while `retryable=False` skipped it by killing the
   item.
+- Same change, second defect: the isolated branch registered its own
+  `rmtree` cleanup and then fell through to the shared one, so a pinned
+  verification review's throwaway clone — not a worktree of anything — also
+  got `force_remove_worktree(repository, clone)`: a `git worktree
+  remove`/`prune` against the read-only bound clone, whose `rmtree` fallback
+  then deleted the tree under the other remover's feet and left it logging
+  "was not fully removed". One refusal site for both branches is also one
+  cleanup registration;
+  `test_review_head_pin_under_isolation_runs_in_a_clone_detached_at_the_pin`
+  now pins that.
 - `tests/worker/test_daemon.py`:
   `test_a_host_that_cannot_provide_an_isolated_clone_no_longer_kills_the_item`
   drives both classifications of the same host fact through the queue model
