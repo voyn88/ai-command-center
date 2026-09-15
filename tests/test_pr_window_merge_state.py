@@ -513,3 +513,58 @@ def test_unreadable_queue_active_label_age_fails_open_to_the_override(monkeypatc
     )
     assert report.active == [(1, "a" * 40)] and report.blocked == []
     assert queue_removed == []
+
+
+def test_eligible_queue_waiting_pr_is_promoted_into_a_free_slot(monkeypatch):
+    """`queue-waiting-review` is a marker, not a verdict: an eligible PR
+    enters a free slot (live 2026-09-15: 149 hand-labelled PRs were mirrored
+    WAITING every tick and never reviewed)."""
+    queued = _pr(1, "a" * 40, label="queue-waiting-review")
+    labels: list[tuple[int, str]] = []
+    queue_removed: list[tuple[int, frozenset[str]]] = []
+    monkeypatch.setattr(review_merge, "_list_open_pulls", lambda _r, _c: ([queued], None))
+    monkeypatch.setattr(
+        review_merge,
+        "_set_pr_window_labels",
+        lambda _r, pr, _c, desired: labels.append((pr["number"], desired)) or True,
+    )
+    monkeypatch.setattr(
+        review_merge,
+        "_remove_queue_labels",
+        lambda _r, pr, remove: queue_removed.append((pr["number"], frozenset(remove)))
+        or True,
+    )
+    report = reconcile_pr_window("/repo", PrWindowConfig(max_active=1, stale_seconds=10**12))
+    assert report.active == [(1, "a" * 40)] and report.waiting == []
+    assert labels == [(1, "review-window:active")]
+    assert queue_removed == [(1, frozenset({"queue-waiting-review"}))]
+
+
+def test_blocked_queue_waiting_pr_stays_waiting_without_a_blocked_label(monkeypatch):
+    queued = _pr(1, "a" * 40, label="queue-waiting-review", merge_state="DIRTY")
+    labels: list[tuple[int, str]] = []
+    window_removed: list[tuple[int, frozenset[str]]] = []
+    queue_removed: list[tuple[int, frozenset[str]]] = []
+    monkeypatch.setattr(review_merge, "_list_open_pulls", lambda _r, _c: ([queued], None))
+    monkeypatch.setattr(
+        review_merge,
+        "_set_pr_window_labels",
+        lambda _r, pr, _c, desired: labels.append((pr["number"], desired)) or True,
+    )
+    monkeypatch.setattr(
+        review_merge,
+        "_remove_pr_window_labels",
+        lambda _r, pr, _c, remove: window_removed.append((pr["number"], frozenset(remove)))
+        or True,
+    )
+    monkeypatch.setattr(
+        review_merge,
+        "_remove_queue_labels",
+        lambda _r, pr, remove: queue_removed.append((pr["number"], frozenset(remove)))
+        or True,
+    )
+    report = reconcile_pr_window("/repo", PrWindowConfig(max_active=1, stale_seconds=10**12))
+    assert report.waiting == [(1, "a" * 40)] and report.blocked == [] and report.active == []
+    assert labels == []
+    assert window_removed == [(1, frozenset({"review-window:active", "review-window:blocked"}))]
+    assert queue_removed == []

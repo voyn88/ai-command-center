@@ -4447,6 +4447,20 @@ def _queue_active_override_holds(
     return age is None or age <= cfg.queue_active_ttl_seconds
 
 
+def _hold_queue_waiting(
+    repo_path: str,
+    pr: dict[str, Any],
+    cfg: PrWindowConfig,
+    report: PrWindowReport,
+    number: int,
+    head: str,
+) -> None:
+    """A queue-waiting PR that cannot be promoted this tick keeps its queue
+    label and loses only contradictory window labels (#935)."""
+    report.waiting.append((number, head))
+    _remove_pr_window_labels(repo_path, pr, cfg, {cfg.label_active, cfg.label_blocked})
+
+
 def _remove_labels(repo_path: str, pr: dict[str, Any], names: set[str]) -> bool:
     """Delete `names` from the PR, only those it currently carries, via REST."""
     parsed = _owner_repo_number_from_pr_url(str(pr.get("url") or ""))
@@ -4540,12 +4554,12 @@ def _reconcile_pr_window(
         # slot below like every other candidate: eligibility is decided by
         # `_window_block_reason`, never by a label. A blocked queue-active PR
         # loses the label, so it cannot hold a slot tick after tick.
-        if queue_waiting_now:
-            report.waiting.append((number, head))
-            _remove_pr_window_labels(
-                repo_path, pr, cfg, {cfg.label_active, cfg.label_blocked}
-            )
-            continue
+        # `queue-waiting-review` is likewise a queue marker, not a verdict:
+        # the PR is evaluated below and promoted into a free slot when it
+        # is eligible (live 2026-09-15: 149 hand-labelled PRs were mirrored
+        # WAITING tick after tick and never entered the window). When it
+        # cannot be judged or is blocked it stays WAITING with the queue
+        # label and only contradictory window labels shed (#935).
         # A cache hit costs no API call, so it costs no detail budget
         # either: the budget exists to bound this tick's GitHub traffic, and
         # a PR whose head has not moved since the last tick generates none.
@@ -4575,6 +4589,9 @@ def _reconcile_pr_window(
                     repo_path, pr, cfg, {cfg.label_waiting, cfg.label_blocked}
                 )
                 continue
+            if queue_waiting_now:
+                _hold_queue_waiting(repo_path, pr, cfg, report, number, head)
+                continue
             report.unchecked.append((number, head))
             continue
         if detailed is None:
@@ -4597,6 +4614,9 @@ def _reconcile_pr_window(
                 _remove_pr_window_labels(
                     repo_path, pr, cfg, {cfg.label_waiting, cfg.label_blocked}
                 )
+                continue
+            if queue_waiting_now:
+                _hold_queue_waiting(repo_path, pr, cfg, report, number, head)
                 continue
             report.unreadable.append((number, head))
             continue
@@ -4671,19 +4691,20 @@ def _reconcile_pr_window(
                     repo_path, pr, cfg, {cfg.label_waiting, cfg.label_blocked}
                 )
                 continue
+            if queue_waiting_now:
+                _hold_queue_waiting(repo_path, pr, cfg, report, number, head)
+                continue
             report.blocked.append((number, reason))
             _set_pr_window_labels(repo_path, detailed, cfg, cfg.label_blocked)
             if queue_active_now:
                 _remove_queue_labels(repo_path, pr, {_QUEUE_ACTIVE_LABEL})
             continue
         if window_full:
+            if queue_active_now or queue_waiting_now:
+                _hold_queue_waiting(repo_path, pr, cfg, report, number, head)
+                continue
             report.waiting.append((number, head))
-            if queue_active_now:
-                _remove_pr_window_labels(
-                    repo_path, pr, cfg, {cfg.label_active, cfg.label_blocked}
-                )
-            else:
-                _set_pr_window_labels(repo_path, detailed, cfg, cfg.label_waiting)
+            _set_pr_window_labels(repo_path, detailed, cfg, cfg.label_waiting)
             continue
         selected += 1
         report.active.append((number, head))
@@ -4691,8 +4712,11 @@ def _reconcile_pr_window(
             _remove_pr_window_labels(
                 repo_path, pr, cfg, {cfg.label_waiting, cfg.label_blocked}
             )
-        else:
-            _set_pr_window_labels(repo_path, detailed, cfg, cfg.label_active)
+            continue
+        if queue_waiting_now:
+            # Promoted: the queue marker is fulfilled, the window owns it now.
+            _remove_queue_labels(repo_path, pr, {_QUEUE_WAITING_REVIEW_LABEL})
+        _set_pr_window_labels(repo_path, detailed, cfg, cfg.label_active)
 
 
 #: One REST page of pull requests. GitHub's ceiling for `per_page`, so a
