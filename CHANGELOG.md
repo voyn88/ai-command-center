@@ -8,6 +8,140 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Fixed — recovery must make progress, not merely avoid corruption (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
+- `control-01:queue` reported `queue_stalled` again (`monitor_finding` #3321).
+  Every fix on this branch has closed one way for the fleet to end up UP AND
+  CLAIMING NOTHING. This one closes the other half of the finding: not the
+  lanes, but the RECOVERY PATH those lanes depend on — the only exit from the
+  one starvation class no lane restart and no redrive can reach.
+
+  **Why the reaper is what `queue_stalled` is measuring.** `evaluate` weighs
+  two clocks, and only one of them is unconditional:
+
+      starved_ages = [queue.lapsed_claim_age_seconds]
+      if spare_capacity: starved_ages.append(ready_due_starved)
+
+  Due ready work is excused by a full fleet and bounded by the fleet clock. A
+  lapsed claim is neither — "no lane is holding it, so no lane being free is
+  irrelevant to it … only the reaper does, and the lapse age is what measures
+  whether `aicc-queue-reaper.timer` (every minute) is still recovering." So
+  for that half of the finding the probe is measuring the reaper directly,
+  and a reaper that stops recovering is a `queue_stalled` with no exit
+  reachable by fleet action: restarting a lane does not reap, and
+  `queue_redrive` only reaches items that are already `dead`.
+
+  **0002 shipped the safety property and stopped there.** Its header states
+  the row lock as the reason a reap "cannot race a concurrent `complete()`",
+  and `WorkQueueAdmin.reap`'s docstring repeated it as the reason "a missed
+  tick delays recovery and never corrupts it". Both are true about
+  CORRECTNESS. Neither is a statement about PROGRESS — and `queue_claim`'s own
+  comment, two hundred lines above in the same file, draws exactly that
+  distinction for the claim path:
+
+      `SKIP LOCKED` BUYS THROUGHPUT, NOT CORRECTNESS … one slow claim
+      transaction stalls every other claimer.
+      `test_a_claimer_is_never_blocked_by_another_transactions_row_lock` pins
+      that property, and pins it as liveness rather than dressing it up as
+      exclusivity.
+
+  The claim path has that liveness property and a test pinning it. The
+  recovery path had neither, and it is the path where being stuck is
+  unbounded rather than merely slow.
+
+  **MEASURED against a real PostgreSQL 16 server.** Three items claimed,
+  three leases lapsed, one of the three items' rows held by another
+  transaction — any `_queue_owns` caller, a duplicate `queue_enqueue` since
+  0027, a `queue_redrive`, a migration's `ALTER`, an operator at a psql
+  prompt:
+
+      reap interrupted: canceling statement due to statement timeout
+      CONTEXT: while locking tuple (0,4)
+      recovered by the interrupted reap: 0 of 3
+
+  Both halves of that are the defect, and the second is the worse one. It
+  WAITED on the held row rather than stepping past it, so one contended item
+  stopped the recovery of every item behind it. And it is ALL OR NOTHING: the
+  first item had already been expired and requeued before the block, and the
+  interrupted transaction took that back with it. An interrupted tick
+  recovers nothing — not "everything up to where it stopped" — so its work is
+  not delayed, it is discarded, and the next tick starts from the same place.
+
+  **And the tick is interruptible by design.**
+  `aicc-queue-reaper.service` is a `Type=oneshot` with
+  `TimeoutStartSec=60s`, so systemd kills a tick that runs long; the
+  connection crosses `voyn-aicc-pgtunnel.service`, which the credential
+  rotation restarts; and the scan is over every expired attempt in the table
+  with no bound at all. Each of those turns a reap into a rollback, and every
+  rollback returns the fleet to the state that produced it.
+
+  **Migration 0028, in the two pieces that make recovery monotonic.**
+  `FOR UPDATE SKIP LOCKED` on the item, exactly as `queue_claim` takes it, so
+  a contended item is DEFERRED to the next tick (60 seconds) instead of
+  stopping this one — and the deferral is AUDITED rather than silent, with a
+  NULL `work_item_id` and the id in `detail`, because `_queue_audit` requires
+  the caller to hold the item's row lock (0027) and not holding it is the
+  whole reason the branch exists. Then a BOUNDED BATCH: `queue_reap(p_max_items)`
+  stops at a number the caller chose rather than at the size of the table, and
+  `WorkQueueAdmin.reap` loops batches on its autocommit connection so each is
+  durable before the next begins. An interruption now costs one batch.
+
+  Correctness is untouched. The re-test under the lock already handled
+  "somebody else finished this attempt", and whoever holds the row is by
+  definition one of the parties that resolves it — a completion, a claim, a
+  redrive. Skipping is how the reaper waits for them without making every
+  other item wait too.
+
+  **WHY AN OVERLOAD, which is 0024's lesson applied.** `CREATE OR REPLACE`
+  cannot add a parameter, so `p_max_items integer DEFAULT NULL` would define a
+  SECOND function and make the no-argument call AMBIGUOUS — `function
+  queue_reap() is not unique`, measured, and it breaks every existing caller.
+  `queue_reap()` therefore keeps its exact signature and 0002's `EXECUTE`
+  grant and delegates to the bounded form, so the reaper timer running from an
+  older checkout keeps working AND inherits the liveness fix, because the fix
+  is in the body both arities share. `WorkQueueAdmin.reap` falls back to the
+  unbounded arity against a database still at 0027 for the same
+  deploy-independence reason.
+
+  **WHAT THIS DOES NOT CLAIM.** It is not the cause of any one `queue_stalled`
+  reading. A reaper that is never interrupted and never contended behaves
+  exactly as before, and this branch's earlier commits removed the causes that
+  were producing the finding. It is why the lapsed-claim half of that finding
+  had no reliable exit: the recovery path could lose a tick's work to a fault
+  that had nothing to do with the items it was recovering, and nothing on the
+  host would ever have said so.
+
+- **The probe's poll floor was half the daemon's real poll ceiling.** Found
+  while auditing the same route from "work enqueued" to "work attended", and
+  NOT a cause of `queue_stalled` — it produces the sibling failure
+  `throughput_stalled`, which 0024 made independently clearable.
+
+  `CLAIM_POLL_CEILING_SECONDS` is "the longest a free lane can take to notice
+  due work", and `throughput_stalled` — the one check that fires INSIDE the
+  stall window — will not call anything younger than that starved. It was
+  `30.0`, pinned by a test asserting only
+  `>= WorkerConfig().idle_max_seconds`, which `30.0` satisfies. But
+  `idle_max_seconds` caps THE BACKOFF, not the sleep:
+
+      self._sleep(min(idle + random.uniform(0, idle), cap))
+      idle = min(idle * 2, self._config.idle_max_seconds)
+
+  Once the backoff saturates at 30s, every gap between polls is uniform on
+  [30s, 60s), and `cap` (the watchdog half-interval, 120s for the unit's
+  `WatchdogSec=240s`) never clamps it. So half of that range sat above the
+  floor: an item enqueued onto a queue that had been quiet all night could sit
+  30–60s unoffered and be read at the probe's next two-minute sample as
+  `throughput_stalled` — precisely the reading the floor exists to prevent
+  ("a queue that had been empty all night would otherwise go red the second
+  the first task was enqueued"). Not a corner: reachable on every poll cycle.
+
+  The floor is now `60.0`, and the test DERIVES the bound by running the
+  daemon's own backoff to saturation instead of restating one of its
+  constants, so a future change to either the cap or the jitter fails the test
+  rather than the fleet. The shared `_queue()` fixture's starved age is
+  derived from the constant for the same reason — it was a literal `60.0`
+  chosen against the old ceiling, and raising the ceiling would otherwise have
+  looked like a broken test instead of a moved band.
+
 ### Fixed — a drained lane must find its own way back (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
 - `control-01:queue` reported `queue_stalled` again (`monitor_finding` #3078).
   Every fix on this branch so far has closed one way for the fleet to end up

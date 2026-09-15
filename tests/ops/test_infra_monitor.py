@@ -386,12 +386,19 @@ def test_main_skip_workers_reads_queue_without_inspecting_systemd(
 def _queue(**kw):
     from command_center.ops.infra_monitor import QueueSnapshot
 
-    # Five starved items 60s in: three ready with a lane free to take them,
-    # two claims whose leases lapsed. Inside the stall window and past the
-    # poll ceiling -- the band `throughput_stalled` owns.
+    # Five starved items well past the poll ceiling: three ready with a lane
+    # free to take them, two claims whose leases lapsed. Inside the stall
+    # window and past the ceiling -- the band `throughput_stalled` owns.
+    #
+    # DERIVED from the ceiling rather than written out, because it was 60.0
+    # when the ceiling was 30.0 and the ceiling turned out to be half the
+    # daemon's real worst-case poll gap. A literal here would have made
+    # raising the ceiling look like it broke this test, when what it actually
+    # did was move the band this helper is trying to sit in.
+    starved = infra_monitor.CLAIM_POLL_CEILING_SECONDS * 2
     base = dict(ready=3, claimed=2, succeeded=100, dead=0, success_age_seconds=200.0,
-                recent_dead=0, ready_due=3, ready_due_age_seconds=60.0,
-                lapsed_claims=2, lapsed_claim_age_seconds=60.0)
+                recent_dead=0, ready_due=3, ready_due_age_seconds=starved,
+                lapsed_claims=2, lapsed_claim_age_seconds=starved)
     base.update(kw)
     return QueueSnapshot(**base)
 
@@ -842,12 +849,64 @@ def test_a_just_enqueued_item_is_not_a_throughput_stall_on_a_quiet_fleet() -> No
 
 def test_the_throughput_floor_covers_the_workers_poll_ceiling() -> None:
     """The floor is not a number pulled from the air: it is how long a free
-    lane may take to notice due work. The daemon's idle poll backs off to
-    `idle_max_seconds` and no further, so below that nothing has been offered
-    to a claimer yet."""
+    lane may take to notice due work.
+
+    THE REGRESSION (VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED). This test used
+    to assert `CLAIM_POLL_CEILING_SECONDS >= WorkerConfig().idle_max_seconds`
+    and the constant was exactly that, 30.0 -- restating one of the daemon's
+    numbers rather than measuring the thing the floor is about.
+    `idle_max_seconds` caps THE BACKOFF, not the sleep: the daemon sleeps
+    `idle + random.uniform(0, idle)`, so once the backoff saturates at 30s
+    every gap between polls is uniform on [30s, 60s). Half of that range sat
+    above the floor, and an item enqueued onto a quiet queue in it read as
+    `throughput_stalled`.
+
+    So the bound is DERIVED here, by running the daemon's own backoff to
+    saturation, and a change to either the cap or the jitter fails this test
+    instead of the fleet.
+    """
     from command_center.worker.daemon import WorkerConfig
 
-    assert infra_monitor.CLAIM_POLL_CEILING_SECONDS >= WorkerConfig().idle_max_seconds
+    config = WorkerConfig()
+    idle = config.idle_min_seconds
+    worst_gap = 0.0
+    for _ in range(64):  # well past saturation at idle_min=1 -> idle_max=30
+        # `self._sleep(min(idle + random.uniform(0, idle), cap))`, taken at
+        # its supremum: `cap` is the watchdog half-interval (120s for the
+        # unit's WatchdogSec=240s) and never clamps this.
+        worst_gap = max(worst_gap, idle * 2)
+        idle = min(idle * 2, config.idle_max_seconds)
+
+    assert worst_gap == pytest.approx(config.idle_max_seconds * 2)
+    assert infra_monitor.CLAIM_POLL_CEILING_SECONDS >= worst_gap
+
+
+def test_a_lane_that_has_not_polled_yet_is_not_a_throughput_stall() -> None:
+    """The live false positive the floor above was too low to stop: a quiet
+    queue, a free lane whose saturated idle backoff has not come round again,
+    and an item 45 seconds old. Nothing has been OFFERED to a claimer yet, so
+    there is nothing to have been ignored -- but with the floor at 30s this
+    minted a `throughput_stalled` finding, and the planner minted a task from
+    it. 45s is inside [30s, 60s): reachable on every poll cycle, not a
+    corner."""
+    report = evaluate(
+        {"voyn-aicc-worker@1.service": "active"},
+        QueueSnapshot(
+            ready=1,
+            claimed=0,
+            succeeded=100,
+            dead=0,
+            success_age_seconds=7200,
+            recent_succeeded=0,
+            ready_due=1,
+            ready_due_age_seconds=45,
+        ),
+        minimum_active_workers=1,
+        max_stalled_seconds=900,
+        prometheus_ready=True,
+    )
+
+    assert report.ok, report.failures
 
 
 def test_the_claim_capacity_default_matches_the_canonical_lane_registry() -> None:

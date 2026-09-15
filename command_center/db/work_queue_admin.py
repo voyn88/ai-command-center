@@ -14,6 +14,11 @@ attempt budgets, backoff arithmetic, audit rows), and duplicating any of it
 here would create a second authority. What Python adds is only the operator
 seam — a callable the CLI and the reaper timer can reach.
 
+With ONE exception, and it is here because it cannot be anywhere else: a SQL
+function runs inside its caller's transaction and so cannot commit, and one
+transaction is exactly what an interrupted reap throws away (0028). Batching
+the reap is therefore the caller's job, and this is the caller. See ``reap``.
+
 Identity: these are ``aicc_app`` privileges by design. A worker may not reap
 (a compromised host must not be able to expire the fleet's leases) and may
 not redrive (the DLQ's exit is an operator decision). The connection's own
@@ -63,6 +68,12 @@ class WorkQueueAdmin:
 
     # -- recovery -------------------------------------------------------------
 
+    #: How many expirations one ``queue_reap`` call commits before the next
+    #: one starts. Small enough that an interrupted tick loses a batch rather
+    #: than a backlog, large enough that a fleet of two lanes reaps a whole
+    #: ordinary minute's lapses in one round trip. See ``reap``.
+    REAP_BATCH = 100
+
     def reap(self) -> int:
         """Expire every lapsed lease: requeue items with budget left, dead-
         letter the exhausted. Returns the number of attempts expired.
@@ -70,13 +81,45 @@ class WorkQueueAdmin:
         Safe to run at any moment and from any number of schedulers —
         ``queue_reap()`` takes each item's row lock, so it cannot race a
         concurrent completion, and a reap that finds nothing is a no-op.
-        That idempotence is what makes it a timer's job rather than a
-        daemon's: a missed tick delays recovery, it never corrupts it.
+
+        BATCHED, BECAUSE ONE CALL IS ONE TRANSACTION (0028). The older
+        unbounded form recovered nothing at all when it was interrupted —
+        not "everything up to where it stopped" — and the tick is
+        interruptible by design: ``aicc-queue-reaper.service`` is a
+        ``Type=oneshot`` with ``TimeoutStartSec=60s``, and the connection
+        crosses the tunnel the credential rotation restarts. This connection
+        is autocommit, so each batch is DURABLE before the next begins and an
+        interruption costs one batch. Loops until a batch comes back short,
+        which is the only honest termination test: a full batch means the
+        function stopped at its bound, not at the end of the work.
+
+        Falls back to the unbounded arity when ``queue_reap(integer)`` is not
+        there yet — the control host and the worker host deploy
+        independently, so this module can be newer than the schema it is
+        talking to, and a reap that refuses to run at all is the one outcome
+        worse than an unbatched one.
         """
+        total = 0
         with self._connection() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT queue_reap()")
-                return int(cur.fetchone()[0])
+                while True:
+                    try:
+                        cur.execute("SELECT queue_reap(%s)", (self.REAP_BATCH,))
+                    except Exception:
+                        # `UndefinedFunction` on a database still at 0027.
+                        # Only the FIRST call may fall back: once a batch has
+                        # committed, a failure is a real fault and re-running
+                        # the unbounded form would hide it behind a second,
+                        # larger attempt at the same work.
+                        if total:
+                            raise
+                        conn.rollback()
+                        cur.execute("SELECT queue_reap()")
+                        return int(cur.fetchone()[0])
+                    reaped = int(cur.fetchone()[0])
+                    total += reaped
+                    if reaped < self.REAP_BATCH:
+                        return total
 
     # -- the dead-letter queue ------------------------------------------------
 

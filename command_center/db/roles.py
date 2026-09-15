@@ -552,6 +552,13 @@ _WORKER_FUNCTIONS = (
 _APP_FUNCTIONS = (
     "queue_enqueue(text, text, jsonb, text, text, integer, integer, integer, integer)",
     "queue_reap()",
+    # 0028 adds the bounded arity: one call is one transaction, and an
+    # interrupted transaction recovers nothing at all, so `WorkQueueAdmin.reap`
+    # commits batches instead of betting a whole backlog on a tick that
+    # `aicc-queue-reaper.service` gives 60 seconds. Both arities are listed
+    # because PostgreSQL identifies a function by its argument types — the
+    # reason this inventory carries signatures at all.
+    "queue_reap(integer)",
     "queue_redrive(text, integer)",
 )
 

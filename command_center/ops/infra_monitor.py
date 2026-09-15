@@ -50,14 +50,34 @@ DEFAULT_CLAIM_CAPACITY = 2
 # refused publish rather than a lint. The flag still wins when both are given.
 FINDING_SOURCE_ENV = "AICC_MONITOR_FINDING_SOURCE"
 
-# The longest a free lane can take to notice due work: the daemon's idle poll
-# backs off to `WorkerConfig.idle_max_seconds` (30s) and no further, so by then
-# every free lane has polled at least once. Below this floor the work has not
-# yet been offered to a claimer, so `throughput_stalled` -- the one check that
-# fires INSIDE the stall window -- must not read a just-enqueued item as
-# starvation. `test_the_throughput_floor_covers_the_workers_poll_ceiling` pins
-# it against the daemon's own constant.
-CLAIM_POLL_CEILING_SECONDS = 30.0
+# The longest a free lane can take to notice due work. Below this floor the
+# work has not yet been offered to a claimer, so `throughput_stalled` -- the
+# one check that fires INSIDE the stall window -- must not read a
+# just-enqueued item as starvation.
+#
+# IT IS TWICE `WorkerConfig.idle_max_seconds`, NOT ONCE, and the difference is
+# a live false positive rather than a rounding argument. The daemon's idle
+# poll is
+#
+#     self._sleep(min(idle + random.uniform(0, idle), cap))
+#     idle = min(idle * 2, self._config.idle_max_seconds)
+#
+# so `idle_max_seconds` (30s) caps THE BACKOFF, not the sleep: once the
+# backoff saturates, each gap between polls is uniform on [30s, 60s). This
+# constant was 30.0 and was pinned by a test asserting only
+# `>= WorkerConfig().idle_max_seconds`, which the wrong number satisfies. An
+# item enqueued onto a queue that had been quiet all night could therefore sit
+# 30-60s before any lane had polled -- unoffered, not starved -- and be read
+# at the probe's next two-minute sample as `throughput_stalled`, which is
+# precisely the reading this floor exists to prevent ("a queue that had been
+# empty all night would otherwise go red the second the first task was
+# enqueued", below in `evaluate`).
+#
+# `test_the_throughput_floor_covers_the_workers_poll_ceiling` now derives the
+# bound by running the daemon's own backoff to saturation instead of restating
+# one of its constants, so a future change to either the cap or the jitter
+# fails the test rather than the fleet.
+CLAIM_POLL_CEILING_SECONDS = 60.0
 
 # WHICH QUEUE THIS PROBE MEASURES. `work_item.queue` is a real dimension --
 # `queue_enqueue` writes it, UNIQUE(queue, idempotency_key) keys on it, and
