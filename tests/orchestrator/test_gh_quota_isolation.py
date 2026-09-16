@@ -23,9 +23,10 @@ from pathlib import Path
 
 import pytest
 
-from command_center.orchestrator import gh_access
+from command_center.orchestrator import gh_access, review_merge
 from command_center.orchestrator.review_merge import (
     PrWindowConfig,
+    _merge_window_allows_expensive_read,
     reconcile_pr_window,
 )
 
@@ -78,14 +79,25 @@ elif "/pulls?" in path:
     print(json.dumps(body))
 elif "/reviews" in path:
     page = int(path.split("page=")[-1])
-    print(json.dumps([] if page > 1 else [{
+    if os.environ.get("FAKE_GH_NO_REVIEWS"):
+        print(json.dumps([]))
+    else:
+        print(json.dumps([] if page > 1 else [{
         "state": "COMMENTED",
         "submitted_at": "2026-09-09T13:00:00Z",
         "body": "ACCEPTANCE: ACCEPT " + head,
         "user": {"login": "voyn88-acceptance-gate[bot]"},
-    }]))
+        }]))
 elif path.endswith("/pulls/42"):
-    print(json.dumps({"mergeable_state": "clean"}))
+    labels = [{"name": name} for name in os.environ.get("FAKE_GH_PR_LABELS", "").split(",") if name]
+    print(json.dumps({
+        "state": "open",
+        "merged_at": None,
+        "mergeable_state": "clean",
+        "labels": labels,
+        "head": {"sha": head},
+        "user": {"login": "voyn-aicc-fleet[bot]"},
+    }))
 elif "/check-runs" in path:
     page = int(path.split("page=")[-1])
     print(json.dumps({"check_runs": [] if page > 1 else [{
@@ -244,6 +256,202 @@ def test_the_window_tick_works_while_the_human_graphql_quota_is_exhausted(
     ), "the label write is REST too, so a spent GraphQL budget cannot block it"
 
 
+def test_merge_window_gate_skips_inactive_pr_without_graphql(
+    fake_gh, checkout, fleet_store, monkeypatch
+):
+    """The merge tick's cheap window gate is REST-only: inactive backlog-tail
+    PRs must be rejected before any `gh pr view` GraphQL porcelain can run."""
+    monkeypatch.setenv("FAKE_GH_PR_LABELS", "review-window:waiting")
+
+    allowed, reason = _merge_window_allows_expensive_read(
+        str(checkout), "https://github.com/voyn88/ai-command-center/pull/42"
+    )
+
+    assert (allowed, reason) == (False, "merge_window_inactive")
+    calls = [call["argv"] for call in _calls(fake_gh)]
+    assert calls
+    assert all(argv[0] == "api" for argv in calls)
+    assert any(argv[1].endswith("/pulls/42") for argv in calls)
+
+
+def test_merge_window_gate_fails_open_when_labels_are_missing(monkeypatch):
+    """Old or partial PR payloads are inconclusive, not evidence that a PR is
+    outside the active window."""
+    monkeypatch.setattr(
+        review_merge,
+        "_rest_json",
+        lambda repo_path, path: (review_merge._REST_OK, {"state": "open"}),
+    )
+
+    allowed, reason = _merge_window_allows_expensive_read(
+        "/tmp", "https://github.com/voyn88/ai-command-center/pull/42"
+    )
+
+    assert (allowed, reason) == (True, "merge_window_labels_missing")
+
+
+def test_accept_marker_lookup_uses_rest_when_pull_snapshot_is_available(
+    fake_gh, checkout, fleet_store, monkeypatch
+):
+    """The review tick can publish/skip markers without `gh pr view`; REST
+    pull+reviews data is enough for the current-head marker question."""
+    monkeypatch.setenv("FAKE_GH_PR_LABELS", "review-window:active")
+
+    has_marker, head = review_merge._has_accept_marker(
+        str(checkout), "https://github.com/voyn88/ai-command-center/pull/42"
+    )
+
+    assert (has_marker, head) == (True, HEAD)
+    calls = [call["argv"] for call in _calls(fake_gh)]
+    assert calls
+    assert all(argv[0] == "api" for argv in calls)
+    assert any(argv[1].endswith("/pulls/42") for argv in calls)
+    assert any("/pulls/42/reviews" in argv[1] for argv in calls)
+
+
+def test_accept_marker_lookup_can_skip_a_redundant_rest_pull(monkeypatch):
+    """After the window gate already failed to load the PR over REST, the
+    marker lookup should fail open through the legacy view path without
+    immediately repeating the same REST pull."""
+    calls: list[list[str]] = []
+
+    def fake_gh(argv, repo_path):
+        import subprocess
+
+        calls.append(argv)
+        if argv[:2] == ["pr", "view"]:
+            body = {
+                "headRefOid": HEAD,
+                "author": {"login": "writer"},
+                "reviews": [
+                    {
+                        "author": {"login": "voyn88-acceptance-gate[bot]"},
+                        "body": f"ACCEPTANCE: ACCEPT {HEAD}",
+                    }
+                ],
+            }
+            return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
+        return subprocess.CompletedProcess(argv, 1, "", "unexpected")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+
+    has_marker, head = review_merge._has_accept_marker(
+        "/tmp",
+        "https://github.com/voyn88/ai-command-center/pull/42",
+        rest_allowed=False,
+    )
+
+    assert (has_marker, head) == (True, HEAD)
+    assert calls == [
+        [
+            "pr",
+            "view",
+            "https://github.com/voyn88/ai-command-center/pull/42",
+            "--json",
+            "reviews,headRefOid,author",
+        ]
+    ]
+
+
+def test_merge_open_active_pr_skips_the_merged_target_detail_read(monkeypatch):
+    """The REST window lookup already proves an active PR is still open, so
+    merge_once should not spend a pre-read checking whether it is merged."""
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        review_merge,
+        "_scan_tasks",
+        lambda factory, cursor_name, query, params, limit: (
+            [("VOYN-W0-MG", "https://github.com/voyn88/ai-command-center/pull/42")],
+            "tok",
+        ),
+    )
+    monkeypatch.setattr(review_merge, "_scan_commit", lambda *args: None)
+    monkeypatch.setattr(
+        review_merge,
+        "_pr_window_expensive_read_decision",
+        lambda repo_path, pr_url, prefix: review_merge._PrWindowReadDecision(
+            True,
+            "merge_window_active",
+            {"state": "open", "merged_at": None},
+        ),
+    )
+
+    def fail_if_called(repo_path, pr_url):
+        raise AssertionError("_merged_target_sha should not run for an open PR")
+
+    def not_ready(repo_path, pr_url, required_checks):
+        calls.append("readiness")
+        return False, "no_accept_marker_on_head"
+
+    monkeypatch.setattr(review_merge, "_merged_target_sha", fail_if_called)
+    monkeypatch.setattr(review_merge, "_pr_is_mergeable", not_ready)
+
+    report = review_merge._merge_once(lambda: None, "/repo")
+
+    assert calls == ["readiness"]
+    assert ("VOYN-W0-MG", "no_accept_marker_on_head") in report.skipped
+
+
+def test_merge_tick_reuses_one_window_listing_for_inactive_tail(monkeypatch):
+    """One light open-PR listing is enough to reject inactive READY tail rows.
+
+    The per-PR fallback still exists for closed/merged or lookup-failed PRs,
+    but ordinary open inactive PRs should not each spend their own REST pull
+    read before the heavier mergeability path is even considered.
+    """
+    monkeypatch.setattr(
+        review_merge,
+        "_scan_tasks",
+        lambda factory, cursor_name, query, params, limit: (
+            [
+                ("VOYN-W0-MG-1", "https://github.com/voyn88/ai-command-center/pull/41"),
+                ("VOYN-W0-MG-2", "https://github.com/voyn88/ai-command-center/pull/42"),
+                ("VOYN-W0-MG-3", "https://github.com/voyn88/ai-command-center/pull/43"),
+            ],
+            "tok",
+        ),
+    )
+    monkeypatch.setattr(review_merge, "_scan_commit", lambda *args: None)
+    monkeypatch.setattr(
+        review_merge,
+        "_origin_owner_repo",
+        lambda repo_path: ("voyn88", "ai-command-center"),
+    )
+    monkeypatch.setattr(
+        review_merge,
+        "_merge_window_open_pr_snapshot",
+        lambda repo_path: (
+            {
+                number: {
+                    "number": number,
+                    "labels": [{"name": "review-window:waiting"}],
+                }
+                for number in (41, 42, 43)
+            },
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        review_merge,
+        "_pr_window_expensive_read_decision",
+        lambda *args, **kwargs: pytest.fail("per-PR window lookup should not run"),
+    )
+    monkeypatch.setattr(
+        review_merge,
+        "_pr_is_mergeable",
+        lambda *args, **kwargs: pytest.fail("inactive PRs must not reach mergeability"),
+    )
+
+    report = review_merge._merge_once(lambda: None, "/repo")
+
+    assert report.skipped == [
+        ("VOYN-W0-MG-1", "merge_window_inactive"),
+        ("VOYN-W0-MG-2", "merge_window_inactive"),
+        ("VOYN-W0-MG-3", "merge_window_inactive"),
+    ]
+
+
 def test_queue_active_pr_sheds_stale_blocked_label(
     fake_gh, checkout, fleet_store, monkeypatch
 ):
@@ -262,10 +470,144 @@ def test_queue_active_pr_sheds_stale_blocked_label(
         and argv[3].endswith("/issues/42/labels/review-window%3Ablocked")
         for argv in calls
     )
-    assert any(
+    assert not any(
         argv[:3] == ["api", "--method", "POST"]
         and argv[3].endswith("/issues/42/labels")
         and argv[-1] == "labels[]=review-window:active"
+        for argv in calls
+    )
+
+
+def test_queue_active_pr_sheds_blocked_label_even_with_block_reason(
+    fake_gh, checkout, fleet_store, monkeypatch
+):
+    """Queue-selected PRs may still have stale window evidence. That must not
+    recreate the contradictory `queue-active` + `review-window:blocked` pair."""
+    monkeypatch.setenv("FAKE_GH_PR_LABELS", "queue-active,review-window:blocked")
+    monkeypatch.setenv("FAKE_GH_NO_REVIEWS", "1")
+
+    report = reconcile_pr_window(str(checkout), PrWindowConfig(stale_seconds=1))
+
+    assert report.error is None
+    assert report.blocked == []
+    assert report.active == [(42, HEAD)]
+    calls = [call["argv"] for call in _calls(fake_gh)]
+    assert any(
+        argv[:3] == ["api", "--method", "DELETE"]
+        and argv[3].endswith("/issues/42/labels/review-window%3Ablocked")
+        for argv in calls
+    )
+    assert not any(
+        argv[:3] == ["api", "--method", "POST"]
+        and argv[3].endswith("/issues/42/labels")
+        and argv[-1] == "labels[]=review-window:blocked"
+        for argv in calls
+    )
+
+
+def test_queue_active_pr_sheds_blocked_label_before_detail_budget(
+    fake_gh, checkout, fleet_store, monkeypatch
+):
+    """Backlog hygiene cannot depend on the per-PR detail budget. Queue state
+    is already present in the listing, so contradictory window labels are
+    normalized before any detail lookup is attempted."""
+    monkeypatch.setenv("FAKE_GH_PR_LABELS", "queue-active,review-window:blocked")
+
+    report = reconcile_pr_window(str(checkout), PrWindowConfig(detail_budget=0))
+
+    assert report.error is None
+    assert report.active == [(42, HEAD)]
+    calls = [call["argv"] for call in _calls(fake_gh)]
+    assert not any("/reviews" in argv[-1] for argv in calls)
+    assert any(
+        argv[:3] == ["api", "--method", "DELETE"]
+        and argv[3].endswith("/issues/42/labels/review-window%3Ablocked")
+        for argv in calls
+    )
+    assert not any(
+        argv[:3] == ["api", "--method", "POST"]
+        and argv[3].endswith("/issues/42/labels")
+        and argv[-1] == "labels[]=review-window:active"
+        for argv in calls
+    )
+
+
+def test_queue_active_pr_sheds_stale_waiting_label_without_adding_active(
+    fake_gh, checkout, fleet_store, monkeypatch
+):
+    """A queued PR already has the active queue signal. The window tick should
+    remove stale waiting state without adding a redundant active label event."""
+    monkeypatch.setenv("FAKE_GH_PR_LABELS", "queue-active,review-window:waiting")
+
+    report = reconcile_pr_window(str(checkout), PrWindowConfig(detail_budget=0))
+
+    assert report.error is None
+    assert report.active == [(42, HEAD)]
+    calls = [call["argv"] for call in _calls(fake_gh)]
+    assert any(
+        argv[:3] == ["api", "--method", "DELETE"]
+        and argv[3].endswith("/issues/42/labels/review-window%3Awaiting")
+        for argv in calls
+    )
+    assert not any(
+        argv[:3] == ["api", "--method", "POST"]
+        and argv[3].endswith("/issues/42/labels")
+        and argv[-1] == "labels[]=review-window:active"
+        for argv in calls
+    )
+
+
+def test_queue_waiting_pr_sheds_blocked_label_before_detail_budget(
+    fake_gh, checkout, fleet_store, monkeypatch
+):
+    """The same early normalization applies to queue-waiting PRs, which make
+    up most of the old backlog tail."""
+    monkeypatch.setenv(
+        "FAKE_GH_PR_LABELS", "queue-waiting-review,review-window:blocked"
+    )
+
+    report = reconcile_pr_window(str(checkout), PrWindowConfig(detail_budget=0))
+
+    assert report.error is None
+    assert report.waiting == [(42, HEAD)]
+    calls = [call["argv"] for call in _calls(fake_gh)]
+    assert not any("/reviews" in argv[-1] for argv in calls)
+    assert any(
+        argv[:3] == ["api", "--method", "DELETE"]
+        and argv[3].endswith("/issues/42/labels/review-window%3Ablocked")
+        for argv in calls
+    )
+    assert not any(
+        argv[:3] == ["api", "--method", "POST"]
+        and argv[3].endswith("/issues/42/labels")
+        and argv[-1] == "labels[]=review-window:waiting"
+        for argv in calls
+    )
+
+
+def test_queue_waiting_pr_sheds_stale_active_label_without_adding_waiting(
+    fake_gh, checkout, fleet_store, monkeypatch
+):
+    """A queue-waiting PR is owned by queue triage. The window tick should not
+    create a second waiting label just to describe the same state."""
+    monkeypatch.setenv(
+        "FAKE_GH_PR_LABELS", "queue-waiting-review,review-window:active"
+    )
+
+    report = reconcile_pr_window(str(checkout), PrWindowConfig(detail_budget=0))
+
+    assert report.error is None
+    assert report.waiting == [(42, HEAD)]
+    calls = [call["argv"] for call in _calls(fake_gh)]
+    assert any(
+        argv[:3] == ["api", "--method", "DELETE"]
+        and argv[3].endswith("/issues/42/labels/review-window%3Aactive")
+        for argv in calls
+    )
+    assert not any(
+        argv[:3] == ["api", "--method", "POST"]
+        and argv[3].endswith("/issues/42/labels")
+        and argv[-1] == "labels[]=review-window:waiting"
         for argv in calls
     )
 
@@ -388,6 +730,32 @@ def test_a_permission_the_app_lacks_falls_back_to_the_ambient_credential(
     assert proc.returncode == 0, "the ambient credential completed the call"
     assert quota.ambient_fallbacks == 1
     assert quota.degraded is False, "a resource refusal is not a credential failure"
+
+
+def test_a_tick_can_disable_ambient_fallback_for_fleet_refusals(
+    tmp_path, monkeypatch, fleet_store
+):
+    """Merge automation is allowed to fail visibly on missing App permissions;
+    it must not silently spend the operator's ambient credential."""
+    binary = tmp_path / "bin" / "gh"
+    binary.parent.mkdir(parents=True)
+    binary.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, sys\n"
+        "if 'fleet' in os.environ.get('GH_CONFIG_DIR', ''):\n"
+        "    sys.stderr.write('HTTP 403: Resource not accessible by integration\\n')\n"
+        "    sys.exit(1)\n"
+        "print('{\"attempt\": 1}')\n"
+    )
+    binary.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{binary.parent}:{Path('/usr/bin')}")
+
+    with gh_access.tick(allow_ambient_fallback=False) as quota:
+        proc = gh_access.run(["run", "view", "7", "--json", "attempt"], str(tmp_path))
+
+    assert proc.returncode == 1
+    assert quota.ambient_fallbacks == 0
+    assert quota.degraded is False
 
 
 def test_a_credential_failure_demotes_the_whole_tick_once_not_per_call(

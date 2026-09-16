@@ -82,6 +82,7 @@ module for the incident that forced it
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -105,6 +106,7 @@ __all__ = [
     "PrWindowReport",
     "ReconcileReport",
     "ReviewConfig",
+    "autonomy_remediate_once",
     "merge_once",
     "publish_review_verdicts",
     "reconcile_merge_evidence",
@@ -171,6 +173,31 @@ class LoopReport:
     #: `gh_access.GhQuota`. None when the report was built outside a tick
     #: scope (a unit test constructing one by hand).
     quota: gh_access.GhQuota | None = None
+
+
+@dataclass
+class AutonomyRemediationReport:
+    """What the hands-off remediation tick did to blocked review PRs."""
+
+    #: (task_id, pr_url) whose current head was sent back through exact-head
+    #: review because the old acceptance evidence was stale or missing.
+    refreshed: list[tuple[str, str]] = field(default_factory=list)
+    #: (task_id, reason) whose failed/cancelled checks were rerun.
+    rerun: list[tuple[str, str]] = field(default_factory=list)
+    #: (blocked_task_id, new_remediation_task_id) whose accepted PR needed a
+    #: real follow-up implementation attempt (red checks after bounded rerun,
+    #: merge conflict, or another non-transient merge blocker).
+    remediated: list[tuple[str, str]] = field(default_factory=list)
+    #: (task_id, reason) deliberately left alone this tick.
+    skipped: list[tuple[str, str]] = field(default_factory=list)
+    quota: gh_access.GhQuota | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _PrWindowReadDecision:
+    allowed: bool
+    reason: str
+    pull: dict[str, Any] | None = None
 
 
 @dataclass
@@ -386,8 +413,8 @@ def _gh(argv: list[str], repo_path: str) -> subprocess.CompletedProcess[str]:
     already exceeded for user ID 297853521`) and all three ticks failed at
     once for an hour. `gh_access.run` sends the identical argv under the
     fleet App's installation token -- its own, separate quota -- whenever
-    the host has one, falls back to the ambient credential when it does
-    not, and counts the call either way."""
+    the host has one, falls back to the ambient credential when the enclosing
+    tick allows it, and counts the call either way."""
     return gh_access.run(argv, repo_path)
 
 
@@ -1216,7 +1243,9 @@ def _failover_cascade(
     return preferred + deprioritized
 
 
-def _pr_diff_and_head(repo_path: str, pr_url: str) -> _PRSnapshot | None:
+def _pr_diff_and_head(
+    repo_path: str, pr_url: str, pull: dict[str, Any] | None = None
+) -> _PRSnapshot | None:
     """The PR's diff and current head sha, fetched by the trusted
     orchestrator -- not the review agent itself. Embedding the diff in the
     prompt (rather than granting the agent its own `gh`/Bash access to fetch
@@ -1232,9 +1261,12 @@ def _pr_diff_and_head(repo_path: str, pr_url: str) -> _PRSnapshot | None:
     if parsed is None:
         return None
     owner, repo, number = parsed
-    view = _gh(["api", f"repos/{owner}/{repo}/pulls/{number}"], repo_path)
     try:
-        data = json.loads(view.stdout or "{}") if view.returncode == 0 else {}
+        if pull is None:
+            view = _gh(["api", f"repos/{owner}/{repo}/pulls/{number}"], repo_path)
+            data = json.loads(view.stdout or "{}") if view.returncode == 0 else {}
+        else:
+            data = pull
         base, head = data["base"], data["head"]
         base_sha, head_sha = base["sha"], head["sha"]
         same_repo = base["repo"]["full_name"].casefold() == f"{owner}/{repo}".casefold()
@@ -1263,6 +1295,29 @@ def _pr_diff_and_head(repo_path: str, pr_url: str) -> _PRSnapshot | None:
         sum(line.startswith("-") and not line.startswith("--- ") for line in lines),
     )
     return _PRSnapshot.create(text, base_sha, head_sha) if observed == stats else None
+
+
+def _pr_diff_and_head_with_pull(
+    repo_path: str, pr_url: str, pull: dict[str, Any] | None
+) -> _PRSnapshot | None:
+    """Fetch a PR snapshot, reusing a window-gate pull body when available."""
+    if pull is None:
+        return _pr_diff_and_head(repo_path, pr_url)
+    try:
+        signature = inspect.signature(_pr_diff_and_head)
+    except (TypeError, ValueError):
+        signature = None
+    if signature is not None:
+        parameters = list(signature.parameters.values())
+        accepts_varargs = any(p.kind == p.VAR_POSITIONAL for p in parameters)
+        positional = [
+            p
+            for p in parameters
+            if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+        ]
+        if not accepts_varargs and len(positional) < 3:
+            return _pr_diff_and_head(repo_path, pr_url)
+    return _pr_diff_and_head(repo_path, pr_url, pull)
 
 
 _SCAN_KEY_SEP = "\x1f"
@@ -1450,7 +1505,13 @@ def _review_once(
         if route is None:
             report.skipped.append((task_id, f"no_repo_route: {pr_url!r}"))
             continue
-        fetched = _pr_diff_and_head(repo_path, pr_url)
+        window = _pr_window_expensive_read_decision(
+            repo_path, pr_url, prefix="review_window"
+        )
+        if not window.allowed:
+            report.skipped.append((task_id, window.reason))
+            continue
+        fetched = _pr_diff_and_head_with_pull(repo_path, pr_url, window.pull)
         if fetched is None:
             report.skipped.append((task_id, f"pr_diff_fetch_failed: {pr_url!r}"))
             continue
@@ -1565,11 +1626,22 @@ def reconcile_review_once(
         if route is None:
             report.skipped.append((current_task_id, "no_repo_route"))
             continue
-        snapshot = _pr_diff_and_head(repo_path, pr_url)
+        window = _pr_window_expensive_read_decision(
+            repo_path, pr_url, prefix="review_window"
+        )
+        if not window.allowed:
+            report.skipped.append((current_task_id, window.reason))
+            continue
+        snapshot = _pr_diff_and_head_with_pull(repo_path, pr_url, window.pull)
         if snapshot is None:
             report.skipped.append((current_task_id, "pr_diff_fetch_failed"))
             continue
-        marker, marker_head = _has_accept_marker(repo_path, pr_url)
+        marker, marker_head = _has_accept_marker_with_pull(
+            repo_path,
+            pr_url,
+            window.pull,
+            rest_allowed=window.reason != "review_window_lookup_failed",
+        )
         if marker and marker_head == snapshot.head:
             report.skipped.append((current_task_id, "marker_already_posted"))
             continue
@@ -1896,22 +1968,54 @@ def _accept_marker_on_latest_review(
     live = [review for review in reviews if review.get("state") != "DISMISSED"]
     if not live:
         return False
-    latest = max(live, key=lambda r: r.get("submittedAt") or "")
+    latest = max(live, key=lambda r: r.get("submittedAt") or r.get("submitted_at") or "")
     if f"ACCEPTANCE: ACCEPT {head}" not in (latest.get("body") or ""):
         return False
     if pr_author_login is None:
         return True
-    reviewer_login = (latest.get("author") or {}).get("login")
+    reviewer_login = (
+        (latest.get("author") or {}).get("login")
+        or (latest.get("user") or {}).get("login")
+    )
     return (
         reviewer_login is not None
         and reviewer_login.casefold() != pr_author_login.casefold()
     )
 
 
-def _has_accept_marker(repo_path: str, pr_url: str) -> tuple[bool, str]:
+def _has_accept_marker(
+    repo_path: str,
+    pr_url: str,
+    pull: dict[str, Any] | None = None,
+    *,
+    rest_allowed: bool = True,
+) -> tuple[bool, str]:
     """Whether an ACCEPT marker already stands on the PR's current head --
     read-only, no gh pr merge/checks concern (that's _pr_is_mergeable's
     job). Returns (has_marker, head_sha)."""
+    parsed = _owner_repo_number_from_pr_url(pr_url)
+    if parsed is not None:
+        owner, repo, number = parsed
+        if pull is None and rest_allowed:
+            outcome, loaded = _rest_json(repo_path, f"repos/{owner}/{repo}/pulls/{number}")
+            pull = loaded if outcome == _REST_OK and isinstance(loaded, dict) else None
+        if pull is not None:
+            head = str(((pull.get("head") or {}).get("sha")) or "")
+            author_login = (pull.get("user") or {}).get("login")
+            ok, reviews = _rest_pages(
+                repo_path,
+                f"repos/{owner}/{repo}/pulls/{number}/reviews",
+                max_pages=5,
+            )
+            if (
+                ok
+                and re.fullmatch(r"[0-9a-f]{40}", head)
+                and isinstance(reviews, list)
+            ):
+                return (
+                    _accept_marker_on_latest_review(reviews, head, author_login),
+                    head,
+                )
     view = _gh(
         ["pr", "view", pr_url, "--json", "reviews,headRefOid,author"], repo_path
     )
@@ -1922,6 +2026,37 @@ def _has_accept_marker(repo_path: str, pr_url: str) -> tuple[bool, str]:
     author_login = (data.get("author") or {}).get("login")
     accept = _accept_marker_on_latest_review(data.get("reviews", []), head, author_login)
     return accept, head
+
+
+def _has_accept_marker_with_pull(
+    repo_path: str,
+    pr_url: str,
+    pull: dict[str, Any] | None,
+    *,
+    rest_allowed: bool,
+) -> tuple[bool, str]:
+    try:
+        signature = inspect.signature(_has_accept_marker)
+    except (TypeError, ValueError):
+        signature = None
+    if signature is None:
+        return _has_accept_marker(
+            repo_path, pr_url, pull, rest_allowed=rest_allowed
+        )
+    parameters = list(signature.parameters.values())
+    if any(p.kind == p.VAR_KEYWORD for p in parameters) or "rest_allowed" in signature.parameters:
+        return _has_accept_marker(
+            repo_path, pr_url, pull, rest_allowed=rest_allowed
+        )
+    accepts_varargs = any(p.kind == p.VAR_POSITIONAL for p in parameters)
+    positional = [
+        p
+        for p in parameters
+        if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+    ]
+    if accepts_varargs or len(positional) >= 3:
+        return _has_accept_marker(repo_path, pr_url, pull)
+    return _has_accept_marker(repo_path, pr_url)
 
 
 #: How many remediation links may stand above a task before the chain stops
@@ -2463,14 +2598,25 @@ def publish_review_verdicts(
             break
         prev_processed = last_processed
         last_processed = (task_id, pr_url)
-        already, current_head = _has_accept_marker(repo_path, pr_url)
+        window = _pr_window_expensive_read_decision(
+            repo_path, pr_url, prefix="review_window"
+        )
+        if not window.allowed:
+            report.skipped.append((task_id, window.reason))
+            continue
+        already, current_head = _has_accept_marker_with_pull(
+            repo_path,
+            pr_url,
+            window.pull,
+            rest_allowed=window.reason != "review_window_lookup_failed",
+        )
         if already:
             report.skipped.append((task_id, "marker_already_posted"))
             continue
         if not current_head:
             report.skipped.append((task_id, "pr_view_failed"))
             continue
-        snapshot = _pr_diff_and_head(repo_path, pr_url)
+        snapshot = _pr_diff_and_head_with_pull(repo_path, pr_url, window.pull)
         if snapshot is None or snapshot.head != current_head:
             report.skipped.append((task_id, "pr_diff_snapshot_failed"))
             continue
@@ -2650,12 +2796,18 @@ def _latest_checks_by_name(rollup: list[dict[str, Any]]) -> list[dict[str, Any]]
             continue
         previous_at = previous.get("startedAt") or previous.get("completedAt")
         current_at = check.get("startedAt") or check.get("completedAt")
-        if not previous_at or not current_at:
-            ambiguous.add(name)
+        if not previous_at or not current_at or str(current_at) == str(previous_at):
+            # Two runs of one check that cannot be ordered are ambiguous only
+            # when they DISAGREE: a green and a red twin hide a verdict, and
+            # the tick must not guess which is newer. Twins that agree carry
+            # one verdict between them (live 2026-09-15, #974: the label-noise
+            # placeholder job -- one expression-shaped name shared by every
+            # skipped run -- had several SKIPPED runs started in the same
+            # second, and the ACCEPTED PR sat unmergeable on "AMBIGUOUS").
+            if _check_is_green(previous) != _check_is_green(check):
+                ambiguous.add(name)
             continue
-        if str(current_at) == str(previous_at):
-            ambiguous.add(name)
-        elif str(current_at) > str(previous_at):
+        if str(current_at) > str(previous_at):
             latest[name] = check
     for name in ambiguous:
         latest[name] = {"name": name, "conclusion": "AMBIGUOUS"}
@@ -2698,7 +2850,8 @@ def _pr_is_mergeable(
     accept = _accept_marker_on_latest_review(data.get("reviews", []), head, author_login)
     if not accept:
         return False, "no_accept_marker_on_head"
-    rollup = _latest_checks_by_name(data.get("statusCheckRollup") or [])
+    raw_rollup = data.get("statusCheckRollup") or []
+    rollup = _latest_checks_by_name(raw_rollup)
     bad = [c.get("name", "?") for c in rollup if not _check_is_green(c)]
     if bad:
         rerun = _rerun_cancelled_latest_runs(repo_path, rollup)
@@ -2709,6 +2862,13 @@ def _pr_is_mergeable(
     missing = [name for name in required_checks if name not in present]
     if missing:
         return False, f"checks_missing: {missing[:3]}"
+    rerun, stale_duplicate = _rerun_stale_duplicate_red_runs(
+        repo_path, raw_rollup, required_checks
+    )
+    if rerun:
+        return False, f"stale_duplicate_checks_rerun_requested: {rerun[:3]}"
+    if stale_duplicate:
+        return False, "stale_duplicate_checks_unresolved"
     return True, head
 
 
@@ -2761,6 +2921,81 @@ def _rerun_cancelled_latest_runs(
     return requested
 
 
+def _check_run_time(check: dict[str, Any]) -> str:
+    return str(check.get("startedAt") or check.get("completedAt") or "")
+
+
+def _rerun_stale_duplicate_red_runs(
+    repo_path: str,
+    rollup: list[dict[str, Any]],
+    required_checks: tuple[str, ...] = _DEFAULT_REQUIRED_MERGE_CHECKS,
+) -> tuple[list[str], bool]:
+    """Rerun older red duplicate workflow runs once a newer duplicate is green.
+
+    GitHub may keep old failed/cancelled check-runs on the same commit after a
+    label-churn or concurrency cancellation. `_latest_checks_by_name` correctly
+    treats the PR's latest check verdict as green, but GitHub's overall rollup
+    can still remain FAILURE until the old run is retried. Clean that stale
+    tail automatically, bounded by the same per-run attempt cap used for latest
+    cancelled checks.
+    """
+    required = set(required_checks)
+    by_name: dict[str, list[dict[str, Any]]] = {}
+    for check in rollup:
+        name = str(check.get("name") or "")
+        if name in required:
+            by_name.setdefault(name, []).append(check)
+
+    run_ids: list[tuple[str, str]] = []
+    for checks in by_name.values():
+        if len(checks) < 2:
+            continue
+        timed = [(check, _check_run_time(check)) for check in checks]
+        if any(not stamp for _check, stamp in timed):
+            continue
+        latest, latest_at = max(timed, key=lambda item: item[1])
+        if not _check_is_green(latest):
+            continue
+        latest_run = _RUN_ID_IN_DETAILS_URL.search(str(latest.get("detailsUrl") or ""))
+        latest_run_id = latest_run.group(1) if latest_run is not None else ""
+        for check, stamp in timed:
+            if stamp >= latest_at or _check_is_green(check):
+                continue
+            conclusion = str(check.get("conclusion") or "").upper()
+            if conclusion not in {"FAILURE", "CANCELLED", "TIMED_OUT"}:
+                continue
+            match = _RUN_ID_IN_DETAILS_URL.search(str(check.get("detailsUrl") or ""))
+            if match is None:
+                continue
+            run_id = match.group(1)
+            if run_id == latest_run_id:
+                continue
+            mode = "--failed" if conclusion == "FAILURE" else ""
+            if (run_id, mode) not in run_ids:
+                run_ids.append((run_id, mode))
+
+    requested: list[str] = []
+    for run_id, mode in run_ids:
+        if len(requested) >= _MAX_RERUNS_PER_PR_PER_TICK:
+            break
+        view = _gh(["run", "view", run_id, "--json", "attempt"], repo_path)
+        if view.returncode != 0:
+            continue
+        try:
+            attempt = int((json.loads(view.stdout or "{}") or {}).get("attempt") or 0)
+        except (ValueError, TypeError, json.JSONDecodeError):
+            continue
+        if attempt >= _MAX_RUN_ATTEMPTS_FOR_RERUN:
+            continue
+        argv = ["run", "rerun", run_id]
+        if mode:
+            argv.append(mode)
+        rerun = _gh(argv, repo_path)
+        if rerun.returncode == 0:
+            requested.append(run_id)
+    return requested, bool(run_ids)
+
+
 def _merge_state(repo_path: str, pr_url: str) -> str:
     """The PR's GitHub mergeStateStatus for the merge-train coordinator.
 
@@ -2782,6 +3017,68 @@ def _merge_state(repo_path: str, pr_url: str) -> str:
     if not isinstance(data, dict) or data.get("state") != "OPEN":
         return ""
     return str(data.get("mergeStateStatus") or "")
+
+
+def _pr_window_expensive_read_decision(
+    repo_path: str, pr_url: str, *, prefix: str
+) -> _PrWindowReadDecision:
+    """Whether a hot loop should spend expensive PR detail reads.
+
+    The PR-window reconciler is the cheap, REST-backed backlog triage pass.
+    Review and merge ticks should honor that triage and spend heavier PR
+    detail reads only on the active merge/review window. If the lightweight
+    lookup fails, fail open: stranding a READY_TO_REVIEW task because labels
+    could not be read would be worse than one conservative expensive read.
+    """
+    parsed = _owner_repo_number_from_pr_url(pr_url)
+    if parsed is None:
+        return _PrWindowReadDecision(True, "pr_url_unparseable")
+    if not Path(repo_path).exists():
+        return _PrWindowReadDecision(True, f"{prefix}_lookup_failed")
+    owner, repo, number = parsed
+    outcome, pull = _rest_json(repo_path, f"repos/{owner}/{repo}/pulls/{number}")
+    if outcome != _REST_OK or not isinstance(pull, dict):
+        return _PrWindowReadDecision(True, f"{prefix}_lookup_failed")
+    if str(pull.get("state") or "").lower() != "open" or pull.get("merged_at"):
+        return _PrWindowReadDecision(True, "pr_not_open", pull)
+    raw_labels = pull.get("labels")
+    if not isinstance(raw_labels, list):
+        return _PrWindowReadDecision(True, f"{prefix}_labels_missing", pull)
+    labels = {
+        str(label.get("name") or "")
+        for label in raw_labels
+        if isinstance(label, dict)
+    }
+    if _QUEUE_ACTIVE_LABEL in labels or DEFAULT_PR_WINDOW_CONFIG.label_active in labels:
+        return _PrWindowReadDecision(True, f"{prefix}_active", pull)
+    return _PrWindowReadDecision(False, f"{prefix}_inactive", pull)
+
+
+def _merge_window_allows_expensive_read(repo_path: str, pr_url: str) -> tuple[bool, str]:
+    """Whether merge_once should spend GraphQL detail reads on this PR."""
+    decision = _pr_window_expensive_read_decision(
+        repo_path, pr_url, prefix="merge_window"
+    )
+    return decision.allowed, decision.reason
+
+
+def _merge_window_open_pr_snapshot(
+    repo_path: str,
+) -> tuple[dict[int, dict[str, Any]] | None, str | None]:
+    """Lightweight open-PR labels for one merge tick.
+
+    This is a cache, not an authority. If the listing fails, or a READY task
+    points at a PR not present in the open list, merge_once falls back to the
+    precise per-PR lookup so already-merged PRs can still be completed.
+    """
+    prs, failure = _list_open_pulls(repo_path, DEFAULT_PR_WINDOW_CONFIG)
+    if prs is None:
+        return None, failure
+    return {
+        int(pr["number"]): pr
+        for pr in prs
+        if isinstance(pr.get("number"), int)
+    }, None
 
 
 def _merged_target_sha(repo_path: str, pr_url: str) -> tuple[str | None, str]:
@@ -3130,6 +3427,275 @@ def _carry_over_marker_if_patch_id_stable(
     return ok
 
 
+def _pull_for_pr_url(repo_path: str, pr_url: str) -> dict[str, Any] | None:
+    parsed = _owner_repo_number_from_pr_url(pr_url)
+    if parsed is None:
+        return None
+    owner, repo, number = parsed
+    outcome, pull = _rest_json(repo_path, f"repos/{owner}/{repo}/pulls/{number}")
+    return pull if outcome == _REST_OK and isinstance(pull, dict) else None
+
+
+def _enqueue_review_refresh(
+    enqueue: Any,
+    repo_path: str,
+    task_id: str,
+    pr_url: str,
+    pull: dict[str, Any] | None,
+    cfg: ReviewConfig,
+) -> str | None:
+    """Enqueue exact-head review even when the PR-window label is blocked.
+
+    This is the hands-off equivalent of an operator saying "the old ACCEPT is
+    stale; review the current head again". It deliberately reuses the normal
+    review payload, review key, chunking, model-only cascade and repo routing,
+    but skips the active-window gate because stale blocked tails are exactly
+    what this remediation tick exists to drain.
+    """
+    if enqueue is None:
+        return "review_enqueue_unavailable"
+    cascade = _model_only_review_cascade()
+    if not cascade:
+        return "no_review_executor_route"
+    from command_center.orchestrator.planner import repo_route
+
+    repo = _repo_from_pr_url(pr_url)
+    route = repo_route(repo) if repo else None
+    if route is None:
+        return f"no_repo_route: {pr_url!r}"
+    snapshot = _pr_diff_and_head_with_pull(repo_path, pr_url, pull)
+    if snapshot is None:
+        return "pr_diff_fetch_failed"
+    key = _review_key(task_id, pr_url, snapshot)
+    if key is None:
+        return "review_key_invalid"
+    try:
+        chunks = _review_chunks(snapshot, task_id, pr_url)
+    except (RuntimeError, ValueError) as exc:
+        return f"review_prompt_budget_invalid: {exc}"
+    project_id, repository_path = route
+    for chunk in chunks:
+        prompt = _render_review_prompt(task_id, pr_url, snapshot, chunk)
+        payload = {
+            "kind": "agent_run",
+            "v": 1,
+            "project_id": project_id,
+            "repository_path": repository_path,
+            "task_type": "independent_review",
+            "prompt": prompt,
+            "timeout_seconds": cfg.review_timeout,
+            "untrusted": True,
+            "cascade": cascade,
+        }
+        review_key = key
+        if chunk.count != 1:
+            chunk_key = _chunk_review_key(task_id, pr_url, snapshot, chunk)
+            if chunk_key is None:
+                return "review_key_invalid"
+            review_key = chunk_key
+            payload["review_chunk"] = {
+                "version": 3,
+                "index": chunk.index,
+                "count": chunk.count,
+                "content_bytes": len(chunk.text.encode("utf-8")),
+                "content_hash": chunk.content_hash,
+                "manifest_hash": chunk.manifest_hash,
+                "base_sha": snapshot.base,
+                "head_sha": snapshot.head,
+                "diff_hash": snapshot.digest,
+            }
+        enqueue(cfg.queue, review_key, payload, task_id, len(cascade))
+    return None
+
+
+def _remediate_merge_blocker(
+    factory: Any,
+    task_id: str,
+    pr_url: str,
+    head: str,
+    reason: str,
+) -> str | None:
+    body = (
+        "Automatic merge remediation requested.\n\n"
+        f"PR: {pr_url}\n"
+        f"HEAD_SHA: {head}\n"
+        f"BLOCKER: {reason}\n\n"
+        "Fix the blocker on a follow-up branch and open a new pull request. "
+        "The original accepted PR is left as evidence and superseded by this "
+        "remediation task; the normal review, acceptance and merge gates still "
+        "apply to the follow-up."
+    )
+    return _remediate_rejection(factory, task_id, pr_url, head, body)
+
+
+def _autonomy_window_config(cfg: ReviewConfig) -> PrWindowConfig:
+    base = DEFAULT_PR_WINDOW_CONFIG
+    return PrWindowConfig(
+        label_active=base.label_active,
+        label_waiting=base.label_waiting,
+        label_blocked=base.label_blocked,
+        max_active=base.max_active,
+        scan_limit=base.scan_limit,
+        scan_hard_cap=base.scan_hard_cap,
+        detail_budget=base.detail_budget,
+        blocked_refresh_budget=base.blocked_refresh_budget,
+        stale_seconds=base.stale_seconds,
+        required_checks=cfg.required_checks,
+    )
+
+
+def autonomy_remediate_once(
+    factory: Any,
+    enqueue: Any,
+    repo_path: str,
+    cfg: ReviewConfig | None = None,
+    *,
+    task_id: str | None = None,
+) -> AutonomyRemediationReport:
+    """Drain blocked review PRs without weakening merge gates.
+
+    The ordinary PR-window tick labels blocked tails, review ticks only process
+    active PRs, and merge ticks intentionally refuse red/conflicted accepted
+    PRs. This tick is the bounded hygiene loop between them:
+
+    * stale/missing exact-head acceptance -> enqueue a normal review for the
+      current head, bypassing only the active-window label;
+    * accepted red/cancelled checks -> ask GitHub for one bounded rerun;
+    * accepted red checks after the bounded rerun, or merge conflicts -> spawn
+      the existing capped remediation task chain.
+
+    It never posts an ACCEPT marker directly and never merges a PR.
+    """
+    cfg = cfg or ReviewConfig()
+    report = AutonomyRemediationReport()
+    with gh_access.tick(repo_path, allow_ambient_fallback=False) as quota:
+        report.quota = quota
+        if task_id is not None:
+            tasks, scan_token = _rows(
+                factory,
+                "SELECT t.task_id, e.value FROM backlog_task t "
+                "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
+                "WHERE t.status = 'READY_TO_REVIEW' AND t.task_id = %s "
+                "ORDER BY e.value LIMIT %s",
+                (task_id, cfg.max_per_tick),
+            ), None
+        else:
+            tasks, scan_token = _scan_tasks(
+                factory,
+                "scan:autonomy_remediate_once",
+                "SELECT t.task_id, e.value FROM backlog_task t "
+                "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
+                "WHERE t.status = 'READY_TO_REVIEW' "
+                "AND (t.task_id, e.value) > (%s, %s) "
+                "ORDER BY t.task_id, e.value LIMIT %s",
+                (),
+                cfg.scan_cap,
+            )
+        window_cfg = _autonomy_window_config(cfg)
+        cache = gh_access.detail_cache()
+        actions = 0
+        last_processed = None
+        for current_task_id, pr_url in tasks:
+            if actions >= cfg.max_per_tick:
+                break
+            last_processed = (current_task_id, pr_url)
+            pull = _pull_for_pr_url(repo_path, pr_url)
+            light = _light_pr_from_rest(pull)
+            if pull is None or light is None:
+                report.skipped.append((current_task_id, "pr_lookup_failed"))
+                continue
+            detailed = _pr_window_details(
+                repo_path, light, cache, refresh=True, include_reviews=True
+            )
+            if detailed is None:
+                report.skipped.append((current_task_id, "pr_detail_lookup_failed"))
+                continue
+            parsed = _owner_repo_number_from_pr_url(pr_url)
+            if parsed is not None:
+                merge_state = _rest_merge_state(
+                    repo_path, parsed[0], parsed[1], int(parsed[2])
+                )
+                if merge_state:
+                    detailed["mergeStateStatus"] = merge_state
+            age_seconds, _fell_back = _pr_age_seconds(repo_path, detailed, now=time.time())
+            window_reason = _window_block_reason(
+                detailed, window_cfg, age_seconds=age_seconds
+            )
+            accepted, head = _has_accept_marker_with_pull(
+                repo_path, pr_url, pull, rest_allowed=True
+            )
+            if not head:
+                head = str(detailed.get("headRefOid") or "")
+            if not accepted:
+                if window_reason in (
+                    "stale_exact_head_acceptance",
+                    "checks_stale",
+                    "checks_missing",
+                    None,
+                ):
+                    reason = _enqueue_review_refresh(
+                        enqueue, repo_path, current_task_id, pr_url, pull, cfg
+                    )
+                    if reason is None:
+                        report.refreshed.append((current_task_id, pr_url))
+                        actions += 1
+                    else:
+                        report.skipped.append((current_task_id, reason))
+                    continue
+                report.skipped.append((current_task_id, window_reason or "not_blocked"))
+                continue
+            ready, merge_detail = _pr_is_mergeable(
+                repo_path, pr_url, cfg.required_checks
+            )
+            if ready:
+                report.skipped.append((current_task_id, "merge_ready"))
+                continue
+            if merge_detail.startswith(("checks_not_green", "checks_cancelled")):
+                rerun = _rerun_failed_ci_once(repo_path, pr_url)
+                if rerun:
+                    report.rerun.append((current_task_id, rerun))
+                    actions += 1
+                    continue
+                if head:
+                    new_task_id = _remediate_merge_blocker(
+                        factory, current_task_id, pr_url, head, merge_detail
+                    )
+                    if new_task_id:
+                        report.remediated.append((current_task_id, new_task_id))
+                        actions += 1
+                    else:
+                        report.skipped.append(
+                            (current_task_id, "merge_blocker_remediation_already_dispatched")
+                        )
+                    continue
+            if (
+                head
+                and (
+                    window_reason == "merge_conflict"
+                    or merge_detail == "branch_dirty_needs_rebase"
+                )
+            ):
+                new_task_id = _remediate_merge_blocker(
+                    factory,
+                    current_task_id,
+                    pr_url,
+                    head,
+                    window_reason or merge_detail,
+                )
+                if new_task_id:
+                    report.remediated.append((current_task_id, new_task_id))
+                    actions += 1
+                else:
+                    report.skipped.append(
+                        (current_task_id, "merge_conflict_remediation_already_dispatched")
+                    )
+                continue
+            report.skipped.append((current_task_id, merge_detail))
+        if scan_token is not None:
+            _scan_commit(factory, "scan:autonomy_remediate_once", scan_token, last_processed)
+    return report
+
+
 def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -> LoopReport:
     """One merge tick, scoped to one GitHub identity and one quota counter
     (`gh_access.tick`) exactly as `review_once` is; `_merge_once` is the
@@ -3146,9 +3712,11 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
     one `pr view` answers state, reviews, rollup and `mergeStateStatus`
     together -- rewriting it in REST would cost MORE requests for the same
     decision. What it needed was a quota nobody else spends, and that is what
-    the fleet App's identity gives it
+    the fleet App's identity gives it. Merge additionally disables ambient
+    fallback for its tick, so missing App permissions surface as merge skips
+    instead of spending a human identity.
     (VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS)."""
-    with gh_access.tick(repo_path) as quota:
+    with gh_access.tick(repo_path, allow_ambient_fallback=False) as quota:
         report = _merge_once(factory, repo_path, cfg)
         report.quota = quota
     return report
@@ -3186,6 +3754,8 @@ def _merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -
     last_processed = None
     branch_updates = 0
     actions = 0
+    open_pr_snapshot, _snapshot_failure = _merge_window_open_pr_snapshot(repo_path)
+    origin = _origin_owner_repo(repo_path) if open_pr_snapshot is not None else None
     for task_id, pr_url in tasks:
         if actions >= cfg.max_per_tick:
             break
@@ -3206,7 +3776,45 @@ def _merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -
         # otherwise strand the task in READY_TO_REVIEW forever. A merged PR
         # WITHOUT acceptance evidence (external/bypass merge) is an incident
         # for the operator, never a silent DONE.
-        merge_sha, merge_reason = _merged_target_sha(repo_path, pr_url)
+        window = None
+        parsed = _owner_repo_number_from_pr_url(pr_url)
+        if open_pr_snapshot is not None and origin is not None and parsed is not None:
+            owner, repo, raw_number = parsed
+            try:
+                number = int(raw_number)
+            except ValueError:
+                number = 0
+            if (owner, repo) == origin and number in open_pr_snapshot:
+                snapshot_pr = open_pr_snapshot[number]
+                labels = _pr_window_labels(snapshot_pr)
+                if (
+                    _QUEUE_ACTIVE_LABEL in labels
+                    or DEFAULT_PR_WINDOW_CONFIG.label_active in labels
+                ):
+                    window = _PrWindowReadDecision(
+                        True,
+                        "merge_window_active",
+                        {"state": "open", "merged_at": None},
+                    )
+                else:
+                    window = _PrWindowReadDecision(
+                        False,
+                        "merge_window_inactive",
+                        {"state": "open", "merged_at": None},
+                    )
+        if window is None:
+            window = _pr_window_expensive_read_decision(
+                repo_path, pr_url, prefix="merge_window"
+            )
+        if not window.allowed:
+            report.skipped.append((task_id, window.reason))
+            continue
+        window_state = str((window.pull or {}).get("state") or "").lower()
+        window_merged = bool((window.pull or {}).get("merged_at"))
+        if window_state == "open" and not window_merged:
+            merge_sha, merge_reason = None, "not_merged"
+        else:
+            merge_sha, merge_reason = _merged_target_sha(repo_path, pr_url)
         if merge_sha is None and merge_reason == "merged_without_acceptance_evidence":
             report.skipped.append((task_id, merge_reason))
             continue
@@ -3758,6 +4366,35 @@ def _set_pr_window_labels(
     return ok
 
 
+def _remove_pr_window_labels(
+    repo_path: str, pr: dict[str, Any], cfg: PrWindowConfig, remove: set[str]
+) -> bool:
+    """Remove only contradictory PR-window labels.
+
+    Queue-owned labels (`queue-active`, `queue-waiting-review`) are a stronger
+    state signal than the review-window labels and already drive the expensive
+    read gates. For those PRs the reconciler should clean stale contradictions
+    without adding another window label and creating an avoidable label event.
+    """
+    parsed = _owner_repo_number_from_pr_url(str(pr.get("url") or ""))
+    if parsed is None:
+        return False
+    owner, repo, number = parsed
+    window_labels = {cfg.label_active, cfg.label_waiting, cfg.label_blocked}
+    current = _pr_window_labels(pr) & window_labels & remove
+    if not current:
+        return True
+    issues = f"repos/{owner}/{repo}/issues/{number}/labels"
+    ok = True
+    for name in sorted(current):
+        removed = _gh(
+            ["api", "--method", "DELETE", f"{issues}/{urllib.parse.quote(name)}"],
+            repo_path,
+        )
+        ok = ok and removed.returncode == 0
+    return ok
+
+
 def reconcile_pr_window(
     repo_path: str, cfg: PrWindowConfig | None = None
 ) -> PrWindowReport:
@@ -3818,13 +4455,28 @@ def _reconcile_pr_window(
         head = str(pr.get("headRefOid") or "")
         labels = _pr_window_labels(pr)
         active_now = cfg.label_active in labels or _QUEUE_ACTIVE_LABEL in labels
+        queue_active_now = _QUEUE_ACTIVE_LABEL in labels
+        queue_waiting_now = _QUEUE_WAITING_REVIEW_LABEL in labels
         blocked_now = (
             cfg.label_blocked in labels
             and not active_now
-            and not _pr_is_queue_selected(labels)
+            and not (queue_active_now or queue_waiting_now)
         )
         window_full = selected >= cfg.max_active
         needs_merge_state = active_now or not window_full
+        if queue_active_now:
+            selected += 1
+            report.active.append((number, head))
+            _remove_pr_window_labels(
+                repo_path, pr, cfg, {cfg.label_waiting, cfg.label_blocked}
+            )
+            continue
+        if queue_waiting_now:
+            report.waiting.append((number, head))
+            _remove_pr_window_labels(
+                repo_path, pr, cfg, {cfg.label_active, cfg.label_blocked}
+            )
+            continue
         # A cache hit costs no API call, so it costs no detail budget
         # either: the budget exists to bound this tick's GitHub traffic, and
         # a PR whose head has not moved since the last tick generates none.

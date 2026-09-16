@@ -654,6 +654,9 @@ def test_repo_routes_translate_the_backlog_vocabulary(monkeypatch) -> None:
         "AICC", "/home/voynadmin/Projects/ai-command-center"
     )
     assert repo_route("aios")[0] == "AIOS"
+    assert repo_route("voyn-logistics-crm") == (
+        "CRM", "/home/voynadmin/Projects/voyn-logistics-crm"
+    )
     assert repo_route("nowhere/unknown") is None
     monkeypatch.setenv("AICC_PLANNER_REPO_ROUTES", '{"x": ["AIOS", "/p"]}')
     assert repo_route("x") == ("AIOS", "/p")

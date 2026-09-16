@@ -178,6 +178,11 @@ class GhQuota:
     ambient_fallbacks: int = 0
     #: Calls GitHub refused for rate limiting -- the incident's own signal.
     rate_limited: int = 0
+    #: Whether fleet refusals may be retried on the ambient credential. Some
+    #: irreversible automation, notably the merge tick, must stay fleet-only
+    #: so a missing App permission is a visible operator problem rather than
+    #: silently spending a human identity.
+    allow_ambient_fallback: bool = True
     core_remaining: int | None = None
     core_limit: int | None = None
     graphql_remaining: int | None = None
@@ -369,7 +374,12 @@ def run(
     # already exhausted would just double the damage. It is counted instead,
     # and the tick report says so.
     limited = _matches(stderr, _RATE_LIMIT_MARKERS)
-    if proc.returncode != 0 and identity.name == FLEET and not limited:
+    if (
+        proc.returncode != 0
+        and identity.name == FLEET
+        and not limited
+        and (quota is None or quota.allow_ambient_fallback)
+    ):
         credential = _matches(stderr, _CREDENTIAL_FAILURES)
         if credential or _matches(stderr, _RESOURCE_FAILURES):
             if quota is not None:
@@ -418,7 +428,7 @@ def record_rate_limit(cwd: str, quota: GhQuota) -> None:
 
 
 @contextmanager
-def tick(cwd: str | None = None) -> Iterator[GhQuota]:
+def tick(cwd: str | None = None, *, allow_ambient_fallback: bool = True) -> Iterator[GhQuota]:
     """Scope one control tick: fresh counters, a re-resolved identity, and a
     budget reading on the way out.
 
@@ -429,7 +439,11 @@ def tick(cwd: str | None = None) -> Iterator[GhQuota]:
         yield existing
         return
     identity = _identity(refresh=True)
-    quota = GhQuota(identity=identity.name, identity_reason=identity.reason)
+    quota = GhQuota(
+        identity=identity.name,
+        identity_reason=identity.reason,
+        allow_ambient_fallback=allow_ambient_fallback,
+    )
     token = _ACTIVE_QUOTA.set(quota)
     try:
         yield quota

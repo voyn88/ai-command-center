@@ -148,6 +148,19 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Review and publish a verdict only for this exact backlog task id.",
     )
+    remediate = sub.add_parser(
+        "backlog-remediate",
+        help="One autonomy remediation tick: drain blocked READY_TO_REVIEW PRs "
+        "by refreshing stale exact-head review, rerunning bounded stale/red "
+        "checks, or spawning capped follow-up remediation tasks. Never merges "
+        "or posts acceptance directly. Needs --repo-path.",
+    )
+    remediate.add_argument("--repo-path", default=".", help="Local clone for gh calls.")
+    remediate.add_argument(
+        "--task-id",
+        default=None,
+        help="Remediate only this exact backlog task id.",
+    )
     sub.add_parser(
         "backlog-merge",
         help="One merge tick (BO-S3b): merge every reviewed PR whose ACCEPT "
@@ -652,6 +665,33 @@ def main(argv: list[str] | None = None) -> int:
                 # of the line is read on the way out (`gh api rate_limit`,
                 # which does not itself consume quota).
                 print(quota.line())
+                return 0
+
+            if args.command == "backlog-remediate":
+                from contextlib import nullcontext as _nc
+
+                from command_center.db.work_queue_store import WorkQueueStore
+                from command_center.orchestrator.review_merge import (
+                    autonomy_remediate_once,
+                )
+
+                store = WorkQueueStore(lambda: _nc(conn))
+                report = autonomy_remediate_once(
+                    lambda: _nc(conn),
+                    _review_enqueue(store),
+                    args.repo_path,
+                    task_id=args.task_id,
+                )
+                for task_id, pr in report.refreshed:
+                    print(f"REFRESH   {task_id} -> {pr}")
+                for task_id, reason in report.rerun:
+                    print(f"RERUN     {task_id}: {reason}")
+                for task_id, new_task_id in report.remediated:
+                    print(f"REMEDIATE {task_id} -> {new_task_id}")
+                for task_id, reason in report.skipped:
+                    print(f"SKIP      {task_id}: {reason}")
+                if report.quota is not None:
+                    print(report.quota.line())
                 return 0
 
             if args.command == "backlog-merge":
