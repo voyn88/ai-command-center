@@ -8,6 +8,27 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Tests — the monitor's own measurement is now taken from a real database (`VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH`)
+- `tests/db/test_monitor_queue_measurement.py` (new) drives the real queue
+  functions and then reads the real `infra_monitor.read_queue_snapshot()`.
+  Everything that pinned the `dead_letter_growth` verdict built
+  `QueueSnapshot` by hand (`tests/ops/test_infra_monitor.py` has no database),
+  so the one query that actually touches the schema this branch changed — and
+  that decides whether finding #3396 clears — was pinned by nothing.
+- Three properties, each stated where the acceptance is stated: 25 no-fault
+  refusals during a total outage measure `recent_dead == 0` and surface as
+  `throughput_stalled` rather than as silence; the same refusal after one
+  served sibling reaches the monitor as `dead_letter_growth:1>0` plus
+  `executor_quota_exhausted` (so the measurement is live, not vacuously zero,
+  and the quota regex still matches through the `lease_wait_exhausted: `
+  prefix the SQL composes); and `recent_dead` is a one-hour WINDOW, which is
+  why the finding clears when dead-lettering stops and no operator has to
+  redrive what the old classification already produced.
+- Verified by mutation, not by assertion: making `_queue_fleet_is_serving()`
+  return true turns the first test red at the monitor's count, counting `dead`
+  outright instead of within the hour turns the third red, and narrowing the
+  quota regex turns the second red.
+
 ### Fixed — the migration-lock guard was itself failing the AIOS boundary gate (`VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH`)
 - `scripts/migration_lock.py` (new) takes over `--write`;
   `python -m command_center.db migration-lock` is now the check only. The
