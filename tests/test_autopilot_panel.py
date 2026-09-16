@@ -228,6 +228,30 @@ def test_auto_launch_disabled_is_explained_rather_than_looking_broken(isolated_d
     assert "Автозапуск выключен" in _captions(at)
 
 
+def test_an_unreadable_spend_is_not_reported_as_an_exhausted_budget(isolated_data_dir):
+    """VOYN-W0-AICC-REPORT-319: the two fail-closed reasons read differently to
+    an operator. "Бюджет исчерпан" is a verdict about a spend that was actually
+    measured; an unreadable spend must say so instead of borrowing it."""
+    unknown = _tick_result(
+        decisions=(_decision(),),
+        launch_status=task_pipeline.LAUNCH_SPEND_UNKNOWN,
+        errors=("daily_spend_budget: trailing-24h spend unreadable, status "
+                "unknown (RuntimeError: db unreachable)",),
+    )
+    at = _at(**{autopilot_panel.TICK_RESULT_KEY: unknown})
+    warnings = " ".join(w.value for w in at.warning)
+    assert "не удалось прочитать" in warnings
+    assert "исчерпан" not in warnings
+    # The underlying read failure stays visible, not just the fact of one.
+    assert "db unreachable" in _captions(at)
+
+    exhausted = _tick_result(
+        decisions=(_decision(),), launch_status=task_pipeline.LAUNCH_BUDGET_EXHAUSTED
+    )
+    at = _at(**{autopilot_panel.TICK_RESULT_KEY: exhausted})
+    assert "Дневной бюджет исчерпан" in " ".join(w.value for w in at.warning)
+
+
 def test_busy_tick_is_reported_as_information_not_failure(isolated_data_dir):
     result = _tick_result(ran=False, status=task_pipeline.TICK_BUSY)
     at = _at(**{autopilot_panel.TICK_RESULT_KEY: result})

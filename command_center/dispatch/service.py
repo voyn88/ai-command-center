@@ -6,7 +6,8 @@ never reimplementing them:
 * queued tasks       -> `tasks_repository.load_tasks` (single reader of the board)
 * executor pool      -> `executors.EXECUTORS` + their live availability probes
 * permitted per task -> `project_config.allowed_execution_providers`
-* daily spend        -> `task_pipeline.daily_spend_usd` (the trailing-24h primitive)
+* daily spend        -> `task_pipeline.daily_spend_status` (the trailing-24h
+                        primitive plus whether it could be read at all)
 * spend ceiling      -> `pipeline_settings.max_daily_spend_usd`
 * kill switch        -> `pipeline_settings.enabled` (the master switch the
                         `task_pipeline.kill_switch` sets off)
@@ -29,6 +30,7 @@ from command_center import task_pipeline
 from command_center.project_config import is_sensitive
 from command_center.dispatch import policy_config
 from command_center.dispatch.models import (
+    DEFER_SPEND_UNKNOWN,
     DispatchPlan,
     DispatchPolicy,
     ExecutorProfile,
@@ -177,13 +179,15 @@ def plan(root: Path, *, db_path: Path | None = None) -> DispatchPlan:
     # `0.0`, so the reported `daily_spend_usd`/`projected_spend_usd` in the
     # plan also read as "unknown" rather than "nothing spent today" — the same
     # fail-closed standard the assignment decision already gets.
-    budget_unknown = False
-    spend: float | None
-    try:
-        spend = task_pipeline.daily_spend_usd(resolved_db)
-    except Exception:  # noqa: BLE001 — no cost data => fail closed: block dispatch
-        spend = None
-        budget_unknown = True
+    #
+    # `daily_spend_status` is the single place that turns a read failure into
+    # "unknown" (rather than each caller wrapping `daily_spend_usd` in its own
+    # `except Exception`) — this diagnostic branch on `.known` is what keeps
+    # this plan and the pipeline's own launch gate from ever disagreeing about
+    # what an unreadable spend figure means (VOYN-W0-AICC-REPORT-319).
+    status = task_pipeline.daily_spend_status(resolved_db)
+    budget_unknown = not status.known
+    spend = status.amount
 
     return plan_dispatch(
         collect_queued_tasks(root),
@@ -240,7 +244,7 @@ def assign(
     if computed.budget_unknown:
         return {
             "applied": False,
-            "reason": "cost_data_unavailable",
+            "reason": DEFER_SPEND_UNKNOWN,
             "plan": computed.as_dict(),
         }
 
