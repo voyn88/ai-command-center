@@ -93,6 +93,36 @@ def test_accepted_red_checks_remediate_after_bounded_rerun_is_exhausted(monkeypa
     assert not report.rerun
 
 
+def test_accepted_pending_checks_wait_without_rerun_or_remediation(monkeypatch):
+    """VOYN-W0-AICC-MERGE-TICK-REJECTS-ON-PENDING-CHECKS: checks still running
+    on an accepted head are a timing fact. No flake rerun (nothing failed),
+    no remediation task (nothing to fix), no transition -- the tick reports
+    `checks_pending` and looks again next tick."""
+    _install_common(monkeypatch, accepted=True, window_reason="checks_stale")
+    monkeypatch.setattr(
+        review_merge,
+        "_pr_is_mergeable",
+        lambda *_args, **_kwargs: (False, "checks_pending: ['Linux quality shard 1 of 4']"),
+    )
+    reruns, remediations = [], []
+    monkeypatch.setattr(
+        review_merge, "_rerun_failed_ci_once", lambda *_args: reruns.append(_args) or ""
+    )
+    monkeypatch.setattr(
+        review_merge,
+        "_remediate_merge_blocker",
+        lambda *_args: remediations.append(_args) or "TASK-REM",
+    )
+
+    report = review_merge.autonomy_remediate_once(
+        object(), object(), "/repo", task_id="TASK"
+    )
+
+    assert report.remediated == []
+    assert reruns == [] and remediations == []
+    assert ("TASK", "checks_pending: ['Linux quality shard 1 of 4']") in report.skipped
+
+
 def test_accepted_red_checks_get_one_bounded_rerun_before_remediation(monkeypatch):
     _install_common(monkeypatch, accepted=True, window_reason="checks_stale")
     monkeypatch.setattr(
