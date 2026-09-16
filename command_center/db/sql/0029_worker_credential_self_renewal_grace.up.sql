@@ -13,18 +13,23 @@
 -- What changes, and what does not:
 --   * `identity_assert(p_secret, p_expired_grace)` -- the 0003 assert with one
 --     added branch: an EXPIRED credential of a `worker_host` principal passes
---     when the caller names a grace and `expires_at + grace` has not passed.
---     The grace is clamped to `enroll_self_grace()` (2 hours, twice the
---     1-hour TTL), so no caller can widen it. Every other guard -- role match,
---     revocation, principal state, expected CIDR, bound address -- applies to
---     the graced pass exactly as to a live one, and for a worker host the
---     address guards REFUSE, so an expired worker secret is only ever usable
---     from the address the credential is bound to. Operator and control-plane
---     credentials get no grace: for them expiry is expiry, as in 0003, because
---     their address guards only audit. A graced pass is audited as
---     `assert/granted/expired_grace`, never as a denial, and the verdict's
---     `reason` stays NULL on success: `reason IS NOT NULL` still means refused.
---     The one-argument `identity_assert` keeps its 0003 effect (grace 0).
+--     when the caller names a grace, `expires_at + grace` has not passed
+--     (exclusive), and the credential is already BOUND to an address -- one
+--     that was never used has no address to be restricted to and is refused.
+--     The grace is clamped to `enroll_self_grace()` (1 hour, the TTL itself),
+--     so no caller can widen it. Every other guard -- role match, revocation,
+--     principal state, expected CIDR, bound address -- applies to the graced
+--     pass exactly as to a live one, and for a worker host the address guards
+--     REFUSE, so an expired worker secret can only ever RENEW from the address
+--     the credential is bound to. Operator and control-plane credentials get
+--     no grace: for them expiry is expiry, as in 0003, because their address
+--     guards only audit. A graced pass is audited as
+--     `assert/granted/expired_grace`, never as a denial, and the VERDICT's
+--     `reason` stays NULL on success: on the verdict, `reason IS NOT NULL`
+--     still means refused. (0003's audit rows keep their vocabulary,
+--     including the `rejected` row it writes for a tolerated operator address
+--     mismatch; that is a 0003 trait this file restores unchanged.) The
+--     one-argument `identity_assert` keeps its 0003 effect (grace 0).
 --   * `identity_current_credential(p_secret, p_for_renewal)` -- the 0013 query
 --     the rotator runs first, with the grace applied when asked for renewal,
 --     plus `renewable_until`: the server-authoritative instant after which
@@ -35,27 +40,51 @@
 --     ledger expiry plus the grace. 0003 set role validity and ledger expiry to
 --     the same instant, which made any ledger-side grace unreachable over a
 --     fresh connection (the pooled sessions were the only thing keeping the
---     lanes up). The ledger, not the role, refuses work in between. Every
---     other kind keeps role validity equal to the ledger expiry.
+--     lanes up). Every other kind keeps role validity equal to the ledger
+--     expiry. Roles of live worker credentials minted before this migration
+--     are widened the same way -- only ever widened, one row per role, from
+--     the latest credential -- so the fix reaches a fleet at its next
+--     rotation; the down narrows them back to the ledger.
 --   * `enroll_rotate_self` -- asks with the grace and records `expired_grace`
---     on its `rotate/granted` event, so a host limping on grace is visible in
---     the ledger (and, through the rotator's audit heartbeat, to the monitor).
+--     on its `rotate/granted` event. THAT row is the "host renewed on an
+--     expired secret" signal: it is written only when a rotation happened.
+--     The `assert/granted/expired_grace` row is written by any graced pass,
+--     including the read-only renewal query, and says only that the secret
+--     was presented after expiry.
 --
--- The property, stated honestly: a stolen worker secret is usable for renewal
--- -- and for nothing else -- for `grace` longer than before, from the bound
--- address only. A graced renewal is NOT consumed: a host that stalls again may
--- renew under grace again. The bound is time (each credential's
--- `expires_at + grace`), not a count of recoveries; a stall longer than
--- TTL + grace still needs an operator, and that is the stall an operator
--- should be paged for. This deliberately claims no "one hop": once any secret,
--- graced or live, has rotated, its successor is an ordinary live credential --
--- exactly what a stolen LIVE secret already yields today. What the grace
--- recovers is a fleet whose lanes are still ready on established sessions
--- (PostgreSQL checks validity at authentication only); lanes that have already
--- lost their sessions cannot become ready on an expired secret, and rotation
--- still requires ready lanes.
+-- The property, stated honestly. The grace extends the WORKER ROLE's password
+-- validity by `grace` past the ledger expiry. Within that window the secret
+-- can still log in and do whatever the worker role can do without a ledger
+-- verdict: `queue_claim` and the other queue functions do not call
+-- `identity_assert`, and the role has direct INSERT/UPDATE on run, completion
+-- and report rows (see `command_center.db.roles`). What it cannot do: pass
+-- `identity_assert` (any identity-gated call), or RENEW from any address but
+-- the bound one, or renew at all once unbound, revoked, suspended or past
+-- `expires_at + grace`. So the exposure delta of a stolen worker secret is:
+-- the same capabilities it had during its TTL, for one more hour, from any
+-- address pg_hba admits for the role (on the control host that is loopback
+-- only, i.e. through a worker's own SSH tunnel: the secret alone opens
+-- nothing). Revocation still curtails it at once:
+-- `identity_revoke_principal` disables the role, and a rotation replaces the
+-- verifier so the superseded secret cannot log in whatever the validity
+-- says. That hour is the price of self-recovery; narrowing it further means a
+-- renewal-only login role per worker (a follow-up, not this migration).
+-- A graced renewal is NOT consumed: a host that stalls again may renew under
+-- grace again. The bound is time (each credential's `expires_at + grace`),
+-- not a count of recoveries; a stall longer than TTL + grace still needs an
+-- operator, and that is the stall an operator should be paged for. This
+-- deliberately claims no "one hop": once any secret, graced or live, has
+-- rotated, its successor is an ordinary live credential -- exactly what a
+-- stolen LIVE secret already yields today. What the grace recovers is a fleet
+-- whose lanes are still ready on established sessions (PostgreSQL checks
+-- validity at authentication only); lanes that have already lost their
+-- sessions cannot become ready on an expired secret, and rotation still
+-- requires ready lanes.
+-- One knob. Equal to the credential TTL: enough to absorb a missed rotation
+-- tick plus the retry and circuit cadence, and no wider than the exposure the
+-- TTL already accepts.
 CREATE FUNCTION enroll_self_grace() RETURNS interval
-    LANGUAGE sql IMMUTABLE AS $$ SELECT interval '2 hours' $$;
+    LANGUAGE sql IMMUTABLE AS $$ SELECT interval '1 hour' $$;
 
 CREATE FUNCTION identity_assert(p_secret text, p_expired_grace interval)
     RETURNS identity_verdict
@@ -112,16 +141,23 @@ BEGIN
     -- or shorten a credential.
     IF c.expires_at <= now() THEN
         -- Expired. A WORKER credential whose caller names a grace still passes
-        -- while `expires_at + grace` has not elapsed; the guards that follow
-        -- (principal state, expected CIDR, bound address) still apply, and for
-        -- a worker host the address guards refuse. Every other kind, and every
-        -- caller that names no grace, is refused here as in 0003.
+        -- while `expires_at + grace` has not elapsed, PROVIDED it is already
+        -- bound to an address: the bound-address guard below is what confines
+        -- a graced renewal to the host that earned it, and a credential that
+        -- was never used has nothing to be confined to. Every condition here
+        -- is written fail-closed (a NULL kind is not a worker host). The
+        -- guards that follow (principal state, expected CIDR, bound address)
+        -- still apply, and for a worker host the address guards refuse.
+        -- Every other kind, and every caller that names no grace, is refused
+        -- here as in 0003.
         IF v_grace <= interval '0'
-           OR p.kind <> 'worker_host'
+           OR p.kind IS DISTINCT FROM 'worker_host'
+           OR c.bound_addr IS NULL
            OR c.expires_at + v_grace <= now() THEN
             PERFORM _principal_audit(c.principal_id, 'assert', 'rejected', c.credential_id,
                      'credential_expired', jsonb_build_object('expires_at', c.expires_at,
-                                                              'grace', v_grace::text));
+                                                              'grace', v_grace::text,
+                                                              'bound', c.bound_addr IS NOT NULL));
             v.reason := 'credential_expired';
             RETURN v;
         END IF;
@@ -192,9 +228,15 @@ END
 $$;
 
 -- The rotator's first question, answered for an expired worker credential too
--- when it asks for renewal. `renewable_until` is the instant after which
--- `enroll_rotate_self` will refuse the credential: expiry plus the grace for a
--- worker host, the expiry itself for every other kind.
+-- when it asks for renewal. `renewable_until` is the first instant at which
+-- `enroll_rotate_self` refuses the credential (exclusive): expiry plus the
+-- grace for a worker host, the expiry itself for every other kind. Asking is
+-- a read gated by proof of possession -- it mints nothing -- and like the 0013
+-- query it goes through `identity_assert`, so it records the use
+-- (`last_used_at`) exactly as the one-argument form does. `server_now` is
+-- `clock_timestamp()` as in 0013: at or after the transaction `now()` the
+-- deadlines were judged against, so a remaining lifetime computed from it is
+-- never longer than the one the ledger will honour.
 CREATE FUNCTION identity_current_credential(p_secret text, p_for_renewal boolean)
     RETURNS TABLE (
         current_expires_at timestamptz,
@@ -218,8 +260,8 @@ BEGIN
     END IF;
 
     SELECT c.expires_at,
-           c.expires_at + CASE WHEN p.kind = 'worker_host' THEN enroll_self_grace()
-                               ELSE interval '0' END
+           c.expires_at + CASE WHEN p.kind IS NOT DISTINCT FROM 'worker_host'
+                                THEN enroll_self_grace() ELSE interval '0' END
       INTO v_expires, v_renewable
       FROM principal_credential c
       JOIN principal p ON p.principal_id = c.principal_id
@@ -270,7 +312,10 @@ BEGIN
     v_caller := current_principal();
     IF v_caller IS NOT NULL AND v_caller IS DISTINCT FROM p_principal_id THEN
         SELECT trust_tier INTO v_caller_tier FROM principal WHERE principal_id = v_caller;
-        IF v_caller_tier >= p.trust_tier THEN
+        -- Fail closed: a caller that has an id but no resolvable tier is not
+        -- the provisioning path (that one has no id at all) and gets no
+        -- credential.
+        IF v_caller_tier IS NULL OR v_caller_tier >= p.trust_tier THEN
             PERFORM _principal_audit(p_principal_id, 'issue', 'rejected', NULL,
                      'tier_violation',
                      jsonb_build_object('caller', v_caller, 'caller_tier', v_caller_tier,
@@ -285,10 +330,13 @@ BEGIN
     -- able to widen its own lifetime. One hour, because revocation cannot reach
     -- a partitioned host — `pg_terminate_backend` needs a connection to
     -- terminate — so the effective revocation latency for such a host is
-    -- bounded by this TTL for WORK. For a worker host the role stays able to
-    -- log in for a further `enroll_self_grace()` past it, for self-renewal
-    -- only (0029): the ledger refuses everything else in that window, and the
-    -- renewal itself is refused from any address but the bound one.
+    -- bounded by this TTL. For a worker host the role stays able to log in
+    -- for a further `enroll_self_grace()` past it (0029, see the header for
+    -- exactly what that window allows); the renewal itself is refused from
+    -- any address but the bound one. `enroll_rotate_self` asks for the full
+    -- hour on purpose: the rotator's protocol budget
+    -- (`SELF_CREDENTIAL_TTL_SECONDS` in `command_center.ops.credential_rotation`)
+    -- is sized to a fixed one-hour credential.
     v_ttl := least(coalesce(p_ttl, interval '15 minutes'), interval '1 hour');
 
     -- PostgreSQL stores exactly ONE verifier per role, so leaving the previous
@@ -314,8 +362,8 @@ BEGIN
     -- for every kind would widen the login surface of operator and
     -- control-plane roles for a window nothing of theirs can use.
     v_valid_until := now() + v_ttl
-                   + CASE WHEN p.kind = 'worker_host' THEN enroll_self_grace()
-                          ELSE interval '0' END;
+                   + CASE WHEN p.kind IS NOT DISTINCT FROM 'worker_host'
+                          THEN enroll_self_grace() ELSE interval '0' END;
     PERFORM identity_set_role_secret(p.db_role, p_scram_verifier, v_valid_until);
 
     PERFORM _principal_audit(p_principal_id, 'issue', 'granted', v_id, NULL,
@@ -378,21 +426,30 @@ GRANT EXECUTE ON FUNCTION identity_current_credential(text, boolean) TO aicc_wor
 
 -- A live worker credential minted before this migration gets the same renewal
 -- window as one minted after it, so the fix reaches a fleet at its NEXT
--- rotation rather than one rotation later. Only active worker hosts with an
--- unrevoked credential; the down narrows the same rows back.
+-- rotation rather than one rotation later. Three rules keep this from ever
+-- doing what the incident did: exactly one row per role -- the LATEST
+-- unrevoked credential, whatever older rows the ledger still holds; only
+-- active worker hosts; and only ever WIDENING -- a role whose validity is
+-- already later (an operator's hand extension, `NULL` = never expires) is
+-- left alone, and a stale ledger row can never pull a role into the past.
 DO $$
-DECLARE r record;
+DECLARE
+    r record;
+    v_new timestamptz;
 BEGIN
-    FOR r IN SELECT p.db_role, c.expires_at
+    FOR r IN SELECT DISTINCT ON (p.db_role) p.db_role, c.expires_at, g.rolvaliduntil
                FROM principal_credential c
                JOIN principal p ON p.principal_id = c.principal_id
+               JOIN pg_roles g ON g.rolname = p.db_role
               WHERE c.revoked_at IS NULL
                 AND p.kind = 'worker_host'
                 AND p.state = 'active'
-                AND EXISTS (SELECT 1 FROM pg_roles WHERE rolname = p.db_role)
+              ORDER BY p.db_role, c.expires_at DESC
     LOOP
-        EXECUTE format('ALTER ROLE %I VALID UNTIL %L',
-                       r.db_role, (r.expires_at + enroll_self_grace())::text);
+        v_new := r.expires_at + enroll_self_grace();
+        IF r.rolvaliduntil IS NOT NULL AND r.rolvaliduntil < v_new THEN
+            EXECUTE format('ALTER ROLE %I VALID UNTIL %L', r.db_role, v_new::text);
+        END IF;
     END LOOP;
 END
 $$;

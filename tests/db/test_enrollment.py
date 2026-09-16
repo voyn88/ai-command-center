@@ -974,11 +974,52 @@ def _role_validity_gap(admin_conn, secret: str) -> timedelta:
     return gap
 
 
-def _enrol_worker(psycopg, test_dsn, role_passwords):
+def _enrol_worker(psycopg, test_dsn, role_passwords, *, bind: bool = True):
+    """Enrol a worker host and, as in production, use the credential once
+    while it is live (the first `identity_assert` binds it to the host's
+    address). A never-used credential is deliberately not renewable after
+    expiry; `bind=False` produces that shape."""
     with psycopg.connect(
         _dsn_for(test_dsn, roles.APP_ROLE, role_passwords), autocommit=True
     ) as app:
-        return _enrol(app, _unique())
+        # A distinct machine per host: two hosts reporting one fingerprint is
+        # the clone case, refused by design.
+        row, secret = _enrol(app, _unique(), {**DESCRIPTOR, "machine_id": secrets.token_hex(4)})
+    assert row[4] is None, row
+    if bind:
+        _use_once(psycopg, test_dsn, row[1], secret)
+    return row, secret
+
+
+def _use_once(psycopg, test_dsn, role: str, secret: str) -> None:
+    """One live `identity_assert` as the host: what every worker does on its
+    first claim, and what binds the credential to the host's address."""
+    with (
+        psycopg.connect(_as_role(test_dsn, role, secret), autocommit=True) as host,
+        host.cursor() as cur,
+    ):
+        cur.execute("SELECT ok, reason FROM identity_assert(%s)", (secret,))
+        assert cur.fetchone() == (True, None)
+
+
+def test_an_expired_credential_that_was_never_used_is_not_renewable(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """The bound address is what confines a graced renewal to the host that
+    earned it; a credential with no bound address has nothing to be confined
+    to, so it is refused even inside the grace."""
+    with _cluster(admin_conn, psycopg, test_dsn, role_passwords):
+        row, secret = _enrol_worker(psycopg, test_dsn, role_passwords, bind=False)
+        _expire_credential(admin_conn, secret, ago=timedelta(minutes=1))
+        with psycopg.connect(_as_role(test_dsn, row[1], secret), autocommit=True) as c:
+            assert _renewal_view(c, secret)[2] == "credential_expired"
+        rotated, _ = _rotate_over_fresh_connection(psycopg, test_dsn, row[1], secret)
+        assert rotated == (None, "credential_expired")
+        denials = [
+            e for e in _principal_events(admin_conn, row[0], "assert", "rejected")
+            if e[0] == "credential_expired"
+        ]
+        assert denials and all(d[1].get("bound") is False for d in denials)
 
 
 def test_an_expired_worker_credential_renews_itself_over_a_fresh_connection_within_grace(
@@ -1147,6 +1188,7 @@ def test_graced_renewals_are_bounded_by_time_not_count(
         rotated, second = _rotate_over_fresh_connection(psycopg, test_dsn, row[1], first)
         assert rotated[1] is None, rotated
         assert _role_validity_gap(admin_conn, second) == grace
+        _use_once(psycopg, test_dsn, row[1], second)  # the lanes claim on it, as always
         _expire_credential(admin_conn, second, ago=timedelta(minutes=1))
         rotated, third = _rotate_over_fresh_connection(psycopg, test_dsn, row[1], second)
         assert rotated[1] is None, "a credential issued under grace is renewable under grace"
@@ -1224,26 +1266,67 @@ def test_the_role_may_log_in_for_the_grace_after_the_ledger_expiry(
         assert _role_validity_gap(admin_conn, secret) == _grace(admin_conn)
 
 
-def test_downgrading_0029_narrows_live_worker_roles_back_to_the_ledger_expiry(
+def _set_role_validity(admin_conn, role: str, value: str) -> None:
+    from psycopg import sql
+
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            sql.SQL("ALTER ROLE {} VALID UNTIL {}").format(sql.Identifier(role), sql.Literal(value))
+        )
+
+
+def test_downgrading_0029_narrows_worker_roles_and_upgrading_only_ever_widens_them(
     admin_conn, psycopg, test_dsn, role_passwords
 ):
-    """The down does not only restore the 0003 functions: the roles the up
-    widened (and every issuance since) agree with the ledger again afterwards,
-    and the up widens them again on the way back up."""
+    """The down does not only restore the 0003 functions: EVERY worker role
+    agrees with the ledger again afterwards (a suspended host's too), and the
+    up on the way back widens from the LATEST credential only, never narrows
+    (an operator's hand extension survives), and leaves a suspended host alone.
+    The stale unrevoked row planted on the first host is the pre-invariant data
+    that made the naive backfill a lockout (review of #989)."""
     with _cluster(admin_conn, psycopg, test_dsn, role_passwords):
-        _row, secret = _enrol_worker(psycopg, test_dsn, role_passwords)
+        plain, plain_secret = _enrol_worker(psycopg, test_dsn, role_passwords)
+        extended, extended_secret = _enrol_worker(psycopg, test_dsn, role_passwords)
+        suspended, suspended_secret = _enrol_worker(psycopg, test_dsn, role_passwords)
         grace = _grace(admin_conn)
-        assert _role_validity_gap(admin_conn, secret) == grace
+        for secret in (plain_secret, extended_secret, suspended_secret):
+            assert _role_validity_gap(admin_conn, secret) == grace
+        with admin_conn.cursor() as cur:
+            # A stale, older, still-unrevoked row for the first host: the
+            # backfill must follow the latest credential, not scan order.
+            cur.execute(
+                "INSERT INTO principal_credential (credential_id, principal_id, secret_hash, "
+                "issued_at, expires_at, created_at, updated_at) "
+                "VALUES (%s, %s, %s, now() - interval '3 hours', now() - interval '2 hours', "
+                "now() - interval '3 hours', now() - interval '3 hours')",
+                ("cred_stale_test", plain[0], hashlib.sha256(b"stale").hexdigest()),
+            )
+            cur.execute(
+                "UPDATE principal SET state = 'suspended' WHERE principal_id = %s",
+                (suspended[0],),
+            )
         with psycopg.connect(
             _as_role(test_dsn, roles.MIGRATOR_ROLE, role_passwords[roles.MIGRATOR_ROLE]),
             autocommit=True,
         ) as migrator:
             migrations.downgrade(migrator, target=28)
-            assert _role_validity_gap(admin_conn, secret) == timedelta(0)
-            migrations.upgrade(migrator)
-            roles.apply_table_grants(migrator)
-        assert _role_validity_gap(admin_conn, secret) == grace
-
+            try:
+                for secret in (plain_secret, extended_secret, suspended_secret):
+                    assert _role_validity_gap(admin_conn, secret) == timedelta(0), secret
+                _set_role_validity(admin_conn, extended[1], "2099-01-01 00:00:00+00")
+            finally:
+                migrations.upgrade(migrator)
+                roles.apply_table_grants(migrator)
+        assert _role_validity_gap(admin_conn, plain_secret) == grace, "latest row, widened"
+        with admin_conn.cursor() as cur:
+            cur.execute(
+                "SELECT rolvaliduntil FROM pg_roles WHERE rolname = %s", (extended[1],)
+            )
+            (kept,) = cur.fetchone()
+        assert kept.year == 2099, "an operator's hand extension is never narrowed"
+        assert _role_validity_gap(admin_conn, suspended_secret) == timedelta(0), (
+            "a suspended host is not widened"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1673,6 +1756,8 @@ def test_every_reachable_audit_site_writes_a_row(
             # assert: rejected/credential_expired for work, granted/expired_grace
             # for renewal (0029) -- on this established session, whose
             # authentication happened before the ledger expiry.
+            cur.execute("SELECT ok FROM identity_assert(%s)", (host_secret,))
+            assert cur.fetchone() == (True,), "bound while live, as every worker is"
             with admin_conn.cursor() as admin:
                 admin.execute(
                     "UPDATE principal_credential SET issued_at = now() - interval '61 minutes', "

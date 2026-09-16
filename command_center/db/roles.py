@@ -610,9 +610,15 @@ _WORKER_ENROLMENT_FUNCTIONS = (
     "identity_current_credential(text)",
     # 0029: the same expiry question, answered for an expired credential inside
     # the self-renewal grace too, with the instant renewal stops being possible.
-    # The grace itself (`enroll_self_grace()`) and the graced assert are not
-    # granted: the worker reaches them only through this SECURITY DEFINER
-    # function and `enroll_rotate_self`, so it cannot choose the window.
+    # The worker chooses per call whether it wants the graced answer (the
+    # boolean); it cannot choose how long the grace is, because the knob
+    # (`enroll_self_grace()`) and the graced assert are not granted and are
+    # reached only inside this SECURITY DEFINER read and `enroll_rotate_self`.
+    # Asking mints nothing: it is a read gated by proof of possession.
+    # This signature exists from 0029 on; like 0013's entry above it, a grant
+    # pass against an older schema (or right after 0029's down) fails on it,
+    # so code and schema roll back together -- the self-deploy tick applies
+    # migrations and grants from the same release.
     "identity_current_credential(text, boolean)",
     "enroll_rotate_self(text, text, text)",
 )
