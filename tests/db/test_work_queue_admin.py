@@ -553,3 +553,107 @@ def test_an_interrupted_batch_is_never_retried_unbounded(
     with admin_conn.cursor() as cur:
         cur.execute("SELECT count(*) FROM work_item WHERE state = 'claimed'")
         assert int(cur.fetchone()[0]) == total
+
+
+def test_the_reaper_timers_own_entrypoint_recovers_a_lapsed_claim(
+    queue_actors, test_dsn, monkeypatch, capsys
+) -> None:
+    """What `aicc-queue-reaper.service` actually execs, run end to end.
+
+    Everything above proves `WorkQueueAdmin.reap` against a real server as
+    `aicc_app`. None of it proves the thing systemd starts every minute:
+
+        ExecStart=/opt/aicc/.venv/bin/python -m command_center.db queue-reap
+
+    and between that line and the method under test sits a seam nothing
+    exercised -- `tests/db/test_cli_queue.py` reaches `queue-reap` at the
+    argparse layer and stops there. The seam is not incidental plumbing;
+    every property 0028's fix rests on lives in it:
+
+      * THE CONNECTION IS AUTOCOMMIT. `reap`'s batching is only a fix
+        because each `queue_reap(REAP_BATCH)` is durable before the next one
+        starts -- "an interruption costs one batch". That is a fact about
+        `pool.connection()` (`autocommit=True`), not about the loop, and the
+        loop cannot tell the difference. Handed a transactional connection it
+        would still return the same count while an interrupted tick threw
+        away the whole backlog again, which is the exact defect 0028 removed.
+      * THE IDENTITY IS `aicc_app`. Recovery is deliberately not a worker
+        privilege, and 0028's `GRANT EXECUTE ... queue_reap(integer)` names
+        that role; the CLI gets it from `AICC_PG_*`, not from a DSN a test
+        constructed.
+      * AND IT IS THE ONLY EXIT FROM THE ONE STARVATION CLASS THE PROBE
+        WEIGHS UNCONDITIONALLY. `infra_monitor.evaluate` excuses due ready
+        work behind a full fleet and bounds it by the fleet clock, but
+        `lapsed_claim_age_seconds` is neither excused nor bounded -- and no
+        lane restart and no `queue_redrive` reaches a lapsed claim. A
+        regression anywhere in this seam is `queue_stalled` on
+        `control-01:queue` with no exit reachable by fleet action, and every
+        test above stays green while it happens.
+
+    Mirrors `test_readyz_is_200_against_a_real_database`, which exists for the
+    same reason on the serving side: the unit tests there monkeypatched
+    `pool.connection` and so stayed green while the served process never
+    opened the pool at all.
+    """
+    from pathlib import Path
+
+    from psycopg.conninfo import conninfo_to_dict
+
+    from command_center.db import cli, pool
+    from command_center.db.config import load_config
+
+    # The two halves of that ExecStart this repository controls. Driving
+    # `cli.main(["queue-reap"])` proves the CLI recovers a lapsed claim and
+    # proves nothing about the timer if the unit execs something else.
+    unit = (
+        Path(__file__).resolve().parents[2] / "deploy/systemd/aicc-queue-reaper.service"
+    ).read_text(encoding="utf-8")
+    exec_start = next(
+        line for line in unit.splitlines() if line.startswith("ExecStart=")
+    )
+    assert "-m command_center.db" in exec_start
+    assert exec_start.rstrip().endswith("queue-reap")
+
+    store, _admin, psycopg, app_dsn = queue_actors
+    _enqueue(psycopg, app_dsn, "reaper-entrypoint-1", {"kind": "echo"})
+    claimed = store.claim(QUEUE, visibility_seconds=60)
+    assert isinstance(claimed, ClaimedWork)
+    _lapse_every_lease(psycopg, test_dsn)
+
+    params = conninfo_to_dict(app_dsn)
+    monkeypatch.setenv("AICC_PG_HOST", params.get("host", "127.0.0.1"))
+    monkeypatch.setenv("AICC_PG_PORT", str(params.get("port", 5432)))
+    monkeypatch.setenv("AICC_PG_DB", params["dbname"])
+    monkeypatch.setenv("AICC_PG_USER", params["user"])
+    monkeypatch.setenv("AICC_PG_PASSWORD", params["password"])
+    monkeypatch.setenv("AICC_PG_SSLMODE", "prefer")  # loopback, per config policy
+
+    pool.close_pool()
+    # The batching's whole claim, asserted where it actually lives. `reap`
+    # loops on whatever connection it is handed and cannot tell a
+    # transactional one from an autocommit one -- it would return the same
+    # count either way, with the same interruption throwing away every batch.
+    try:
+        pool.open_pool(load_config())
+        with pool.connection() as conn:
+            assert conn.autocommit, (
+                "the reaper's connection must be autocommit: without it a "
+                "batched reap is one transaction again, and an interrupted "
+                "tick recovers nothing (0028)"
+            )
+    finally:
+        pool.close_pool()
+
+    try:
+        assert cli.main(["queue-reap"]) == 0
+    finally:
+        pool.close_pool()
+    assert "reaped 1 lapsed attempt(s)" in capsys.readouterr().out
+
+    # The exit code and the count are what the operator sees; this is what the
+    # fleet sees. The item is claimable again, so the probe's lapsed-claim
+    # clock has something to stop measuring.
+    retaken = store.claim(QUEUE, visibility_seconds=60)
+    assert isinstance(retaken, ClaimedWork)
+    assert retaken.work_item_id == claimed.work_item_id
+    assert retaken.attempt_no == claimed.attempt_no + 1

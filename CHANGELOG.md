@@ -8,6 +8,48 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Tested — the reaper's own entrypoint, not just the method behind it (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
+- **`aicc-queue-reaper.service` execs a line nothing in this repository ran.**
+  The entries below prove `WorkQueueAdmin.reap` against a real PostgreSQL
+  server as `aicc_app`. What systemd starts every minute is
+
+      ExecStart=/opt/aicc/.venv/bin/python -m command_center.db queue-reap
+
+  and `tests/db/test_cli_queue.py` reached that subcommand at the argparse
+  layer and stopped there. Between the two sat a seam nothing exercised —
+  and it is not incidental plumbing, because the properties this branch's
+  recovery fix rests on live in it rather than in the method:
+
+  * **The connection is autocommit.** Batching is only a fix because each
+    `queue_reap(REAP_BATCH)` is durable before the next starts, so "an
+    interruption costs one batch". That is a fact about `pool.connection()`
+    (`autocommit=True`), not about the loop — handed a transactional
+    connection, `reap` returns the same count while an interrupted tick
+    throws away the whole backlog again, which is the exact defect 0028
+    removed.
+  * **The identity is `aicc_app`.** Recovery is deliberately not a worker
+    privilege and 0028's `GRANT EXECUTE … queue_reap(integer)` names that
+    role; the CLI derives it from `AICC_PG_*`, not from a DSN a test built.
+  * **And it is the only exit from the one starvation class the probe weighs
+    unconditionally.** `evaluate` excuses due ready work behind a full fleet
+    and bounds it by the fleet clock; `lapsed_claim_age_seconds` is neither
+    excused nor bounded, and no lane restart and no `queue_redrive` reaches
+    a lapsed claim.
+
+  So a regression anywhere in that seam is `queue_stalled` on
+  `control-01:queue` with no exit reachable by fleet action, while every
+  existing test stays green. `test_the_reaper_timers_own_entrypoint_recovers_a_lapsed_claim`
+  now drives the unit's actual command end to end against a real server —
+  claim, lapse the lease, `cli.main(["queue-reap"])`, item claimable again
+  with its attempt numbering continuing — and pins the ExecStart's module and
+  subcommand to the command it proves. Verified to have teeth by mutation: a
+  non-autocommit pool, a CLI that stops calling `reap`, and an ExecStart that
+  drifts to another subcommand each fail it.
+
+  Same reason `test_readyz_is_200_against_a_real_database` exists on the
+  serving side: the unit tests there monkeypatched `pool.connection` and so
+  stayed green while the served process never opened the pool at all.
+
 ### Fixed — a recovery fault must surface, not be answered with the bug it replaced (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
 - **`WorkQueueAdmin.reap`'s fallback caught every first-batch failure, and the
   two it caught by mistake are the two 0028 exists for.** Found auditing the
