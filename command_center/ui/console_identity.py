@@ -29,6 +29,19 @@ Two distinct checks, deliberately not collapsed into one:
   credential must be refused on the very next privileged act, not merely the
   next login, and a cache here would reintroduce the staleness window the
   HTTP boundary was written to close.
+
+Both begin by asking :func:`_in_script_run`, and they answer it differently
+on purpose. ``app.py`` is a module: importing it (a test collecting
+``app.create_task``, a doc tool) executes the top-level gate call with no
+``ScriptRunContext``. Nothing is rendered to anyone there, so
+:func:`require_identity` has nothing to gate and emits nothing — emitting a
+login form anyway is not a harmless no-op, because a ``with st.form(...)``
+that enqueues nothing gets handed Streamlit's process-global ``main_dg``
+instead of a child block and stamps the form id onto it permanently, which
+makes every later widget in the process look like it is inside that form.
+:func:`require_console_operation` has the opposite problem — something
+privileged is about to happen and every refusal primitive it could use is a
+no-op — so it raises :class:`ConsoleGateUnavailable` instead.
 """
 
 from __future__ import annotations
@@ -69,12 +82,13 @@ def _in_script_run() -> bool:
     its top-level gate call with no ``ScriptRunContext``. That is not a user
     session: nothing is rendered to anyone, and every Streamlit control-flow
     primitive this module relies on is a documented no-op there. ``st.stop()``
-    is the decisive one — it only acts ``if ctx and ctx.script_requests`` —
-    so a gate that "refuses" by calling it does not refuse at all. This is the
-    same predicate Streamlit's own ``stop()`` tests, so the two agree by
-    construction.
+    is the decisive one, and this is the exact predicate it tests before it
+    acts, so the two agree by construction: without a context *and* the
+    request channel that carries the stop, a gate that "refuses" by calling
+    ``st.stop()`` does not refuse at all, and the code after it runs.
     """
-    return get_script_run_ctx(suppress_warning=True) is not None
+    ctx = get_script_run_ctx(suppress_warning=True)
+    return ctx is not None and ctx.script_requests is not None
 
 
 def _authenticated_principal() -> Principal | None:
@@ -115,12 +129,6 @@ def _render_login(*, page_title: str, page_icon: str) -> NoReturn:
         st.error("Введите токен.")
         st.stop()
 
-    # Guards a fallthrough after `st.stop()` above: real Streamlit execution
-    # never reaches here without a token, but `st.stop()` is a documented
-    # no-op with no `ScriptRunContext` (see the module docstring on
-    # `tests.conftest.bypass_console_identity_gate`) — without this, that
-    # fallthrough hits `principal` unassigned below instead of denying cleanly.
-    principal: Principal | None = None
     try:
         principal = whoami(token)
     except PlatformUnavailable:
@@ -146,7 +154,7 @@ def require_identity(
     page_icon: str,
     layout: Literal["centered", "wide"] = "wide",
     sidebar_state: Literal["auto", "expanded", "collapsed", "locked"] = "expanded",
-) -> Principal:
+) -> Principal | None:
     """Block the entire console behind a signed-in platform identity.
 
     Calls ``st.set_page_config`` itself (Streamlit requires it be the first
@@ -156,7 +164,21 @@ def require_identity(
 
     Returns the session's cached :class:`Principal` once signed in. Does not
     itself authorize anything — see :func:`require_console_operation`.
+
+    Outside a Streamlit script run this does nothing at all and returns
+    ``None``. There is no browser session to gate there and no one to render
+    a login form to, and — decisively — emitting one anyway is not a harmless
+    no-op: the widgets land on whatever ``DeltaGenerator`` the importing
+    thread happens to hold, leaving an open ``st.form`` behind that the next
+    real script run in that process inherits (it surfaces as
+    ``StreamlitInvalidFormCallbackError`` on an unrelated widget). Refusing is
+    also unnecessary: nothing privileged happens on an import, and the one
+    thing that is privileged — :func:`require_console_operation` — raises
+    :class:`ConsoleGateUnavailable` there rather than returning.
     """
+    if not _in_script_run():
+        return None
+
     st.set_page_config(
         page_title=page_title,
         page_icon=page_icon,
@@ -177,7 +199,17 @@ def require_console_operation(operation: str) -> Principal:
     Must be called immediately before the action it guards, never cached
     across a rerun — see the module docstring for why this differs from
     :func:`require_identity`'s session-scoped cache.
+
+    Raises :class:`ConsoleGateUnavailable` outside a Streamlit script run,
+    where every refusal primitive below (``st.error`` + ``st.stop()``) is a
+    no-op and execution would simply continue into the privileged action.
     """
+    if not _in_script_run():
+        raise ConsoleGateUnavailable(
+            f"{operation!r} was reached outside a Streamlit script run, where "
+            "the console gate cannot refuse it."
+        )
+
     token = st.session_state.get(_TOKEN_KEY)
     if not isinstance(token, str) or not token:
         _sign_out(message="Сессия не аутентифицирована. Войдите заново.")

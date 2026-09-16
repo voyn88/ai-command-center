@@ -93,6 +93,13 @@ def _console_operation_script() -> None:
     st.write(f"authorized:{principal.principal_id}")
 
 
+def _callback_widget_script() -> None:
+    import streamlit as st
+
+    st.button("Действие", on_click=lambda: None)
+    st.write("rendered")
+
+
 def _run_identity_gate():
     from streamlit.testing.v1 import AppTest
 
@@ -224,3 +231,89 @@ def test_require_console_operation_allows_with_grant(platform, grants):
 
     assert not at.exception
     assert any("authorized:operator:one" in m.value for m in at.markdown)
+
+
+# --- outside a Streamlit script run ----------------------------------------
+#
+# `app.py` is a module, and importing it (a test collecting `app.create_task`,
+# `tests/conftest.py`'s `isolated_generated_dir`, a doc tool) executes its
+# top-level gate call with no `ScriptRunContext`. Nothing is rendered to anyone
+# there and no refusal primitive works, so the gate must touch no Streamlit
+# state at all — see `console_identity._in_script_run`.
+
+
+@pytest.fixture
+def unpoisoned_main_dg():
+    """Undo a leaked form binding so one regression does not cascade.
+
+    `main_dg` is a process-global singleton. A `with st.form(...)` executed
+    with no script run enqueues nothing, so `DeltaGenerator._block` hands back
+    `main_dg` itself instead of a child block, and the form id is stamped onto
+    that singleton permanently — every later widget in the process, in any
+    thread, then looks like it is inside that form. Without this restore, a
+    regression in the guard under test would fail not just these tests but
+    every AppTest-driven test scheduled after them on the same worker.
+    """
+    from streamlit.delta_generator_singletons import get_dg_singleton_instance
+
+    main_dg = get_dg_singleton_instance().main_dg
+    before = main_dg._form_data
+    yield main_dg
+    main_dg._form_data = before
+
+
+def test_require_identity_emits_no_streamlit_command_outside_a_script_run(monkeypatch):
+    """Not "renders a form nobody sees" — emits nothing at all.
+
+    Asserted against the two commands that would run first, because the damage
+    is done by the emitting, not by the rendering: `st.set_page_config` claims
+    a once-per-run slot the real run still needs, and `st.form` is what leaks
+    (see the next test).
+    """
+    import streamlit as st
+
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("the gate emitted a Streamlit command with no script run")
+
+    monkeypatch.setattr(st, "set_page_config", refuse)
+    monkeypatch.setattr(st, "form", refuse)
+
+    assert console_identity.require_identity(page_title="T", page_icon="🧭") is None
+
+
+def test_a_bare_gate_call_cannot_break_a_later_script_run(unpoisoned_main_dg):
+    """The shape the regression actually took: an unrelated widget, later.
+
+    A login form leaked onto `main_dg` by a bare gate call does not fail where
+    it leaked — it fails the next `st.button(..., on_click=...)` anywhere in
+    the process with `StreamlitInvalidFormCallbackError`, because callbacks are
+    illegal inside a form. That is a real console page's top command bar, in a
+    run that never went near the gate.
+    """
+    from streamlit.testing.v1 import AppTest
+
+    console_identity.require_identity(page_title="T", page_icon="🧭")
+
+    at = AppTest.from_function(_callback_widget_script, default_timeout=30).run()
+
+    assert not at.exception
+    assert any("rendered" in m.value for m in at.markdown)
+
+
+def test_require_console_operation_refuses_outside_a_script_run(platform, grants):
+    """Fail closed where `st.error` + `st.stop()` would both be no-ops.
+
+    A denial that only calls them does not deny: execution falls straight
+    through into the privileged action. The refusal has to be one Python
+    itself enforces, so it is an exception.
+    """
+    platform.issue("op-token", "operator:one")
+    grants({"operator:one": ["console:start_task"]})
+
+    with pytest.raises(console_identity.ConsoleGateUnavailable) as excinfo:
+        console_identity.require_console_operation("console:start_task")
+
+    assert "console:start_task" in str(excinfo.value)
+    # Refused before it ever asked the platform: there is no session here to
+    # hold a credential, so there is nothing to verify.
+    assert platform.calls == []
