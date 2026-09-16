@@ -2796,12 +2796,18 @@ def _latest_checks_by_name(rollup: list[dict[str, Any]]) -> list[dict[str, Any]]
             continue
         previous_at = previous.get("startedAt") or previous.get("completedAt")
         current_at = check.get("startedAt") or check.get("completedAt")
-        if not previous_at or not current_at:
-            ambiguous.add(name)
+        if not previous_at or not current_at or str(current_at) == str(previous_at):
+            # Two runs of one check that cannot be ordered are ambiguous only
+            # when they DISAGREE: a green and a red twin hide a verdict, and
+            # the tick must not guess which is newer. Twins that agree carry
+            # one verdict between them (live 2026-09-15, #974: the label-noise
+            # placeholder job -- one expression-shaped name shared by every
+            # skipped run -- had several SKIPPED runs started in the same
+            # second, and the ACCEPTED PR sat unmergeable on "AMBIGUOUS").
+            if _check_is_green(previous) != _check_is_green(check):
+                ambiguous.add(name)
             continue
-        if str(current_at) == str(previous_at):
-            ambiguous.add(name)
-        elif str(current_at) > str(previous_at):
+        if str(current_at) > str(previous_at):
             latest[name] = check
     for name in ambiguous:
         latest[name] = {"name": name, "conclusion": "AMBIGUOUS"}
