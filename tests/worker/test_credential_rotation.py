@@ -45,7 +45,7 @@ from command_center.worker.credential_file import (
 OLD_PASSWORD = "a" * 64
 #: Mirrors `enroll_self_grace()` (0029): how long past its ledger expiry a
 #: worker credential may still renew itself.
-RENEWAL_GRACE_SECONDS = 7200.0
+RENEWAL_GRACE_SECONDS = 3600.0
 NOW = datetime(2026, 8, 24, 12, 0, tzinfo=UTC)
 LANE_1 = "voyn-aicc-worker@1.service"
 LANE_2 = "voyn-aicc-worker@2.service"

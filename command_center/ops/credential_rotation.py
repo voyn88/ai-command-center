@@ -908,10 +908,17 @@ class RotationController:
 
     def _load_credential_deadline(
         self, config: PostgresConfig, description: str, *, renewal: bool
-    ) -> tuple[datetime, float]:
+    ) -> CredentialExpiry:
+        """Prove the credential's lifetime and bound later work by it.
+
+        Returns the whole proof so a caller picks the quantity it means:
+        ``remaining`` (work) may be negative in the renewal phase by design,
+        ``renewable`` is what was enforced there. Nothing here hands back a
+        bare float that reads as a budget.
+        """
         proof = self.authority.current_expiry(config)
         self._set_credential_deadline(proof, description, renewal=renewal)
-        return proof.expires, proof.remaining
+        return proof
 
     def _set_credential_deadline(
         self, proof: CredentialExpiry, description: str, *, renewal: bool
@@ -1589,9 +1596,9 @@ class RotationController:
             current
         )
         authority_timeout = self._authority_timeout(current)
-        _, current_remaining = self._load_credential_deadline(
+        current_remaining = self._load_credential_deadline(
             current, "current credential", renewal=True
-        )
+        ).remaining
         minimum_rotation_threshold = (
             self._retry_lifetime_budget(current) + CREDENTIAL_SAFETY_MARGIN_SECONDS
         )
@@ -1640,9 +1647,9 @@ class RotationController:
         self._wait_workers_healthy()
         # Worker readiness may legitimately consume most of its bounded wait.
         # Refresh the server-clock proof immediately before the mutation.
-        _, current_remaining = self._load_credential_deadline(
+        current_remaining = self._load_credential_deadline(
             current, "pre-mutation current credential", renewal=True
-        )
+        ).remaining
         self._require_current_attempt_budget(
             current,
             current_remaining,
@@ -1727,9 +1734,10 @@ class RotationController:
                 raise RotationError(
                     "committed credential file does not contain new secret"
                 )
-            expiry, remaining = self._load_credential_deadline(
+            proof = self._load_credential_deadline(
                 new_config, "new credential", renewal=False
             )
+            expiry, remaining = proof.expires, proof.remaining
             if remaining < safe_post_rotation:
                 # Deliberately NOT a resume path (reviewed on 17ca910 and
                 # kept): resume_config is still None here, so the except

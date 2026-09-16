@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from command_center.db import migrations
@@ -112,3 +114,70 @@ def test_expected_schema_version_tracks_the_migration_set() -> None:
     from command_center.db import health
 
     assert health.EXPECTED_SCHEMA_VERSION == len(migrations.discover())
+
+
+# ---------------------------------------------------------------------------
+# Static guards the reviewers of 0029 asked for: things a reader of one diff
+# cannot verify, pinned by the whole migration set.
+# ---------------------------------------------------------------------------
+
+_SQL_DIR = Path(migrations.__file__).resolve().parent / "sql"
+
+
+def _function_bodies(text: str, names: tuple[str, ...]) -> dict[str, str]:
+    """`name -> body` for every `CREATE [OR REPLACE] FUNCTION name(` in `text`,
+    the body running to the closing `$$;`, normalised to `CREATE FUNCTION`."""
+    import re
+
+    found: dict[str, str] = {}
+    for name in names:
+        pattern = re.compile(
+            rf"^CREATE (?:OR REPLACE )?FUNCTION {re.escape(name)}\(.*?^\$\$;\n",
+            re.DOTALL | re.MULTILINE,
+        )
+        matches = pattern.findall(text)
+        if matches:
+            assert len(matches) == 1, (name, len(matches))
+            found[name] = matches[0].replace("CREATE OR REPLACE FUNCTION", "CREATE FUNCTION", 1)
+    return found
+
+
+def test_every_migration_uses_balanced_dollar_quoting() -> None:
+    """A bare `$` delimiter is a syntax error PostgreSQL only reports at apply
+    time; a reviewer reading a diff envelope cannot tell `$$` from a
+    normalised `$`. Every migration must open and close with `$$` (or a
+    tagged `$tag$`) an even number of times and never end a line on a bare
+    ` $` or ` $;`."""
+    import re
+
+    for path in sorted(_SQL_DIR.glob("*.sql")):
+        text = path.read_text(encoding="utf-8")
+        assert text.count("$$") % 2 == 0, f"{path.name}: unbalanced $$"
+        for number, line in enumerate(text.splitlines(), 1):
+            assert not re.search(r"(^|\s)\$;?\s*$", line), f"{path.name}:{number}: bare $"
+
+
+def test_0029_down_restores_the_0003_bodies_verbatim() -> None:
+    """0029's down claims 0003 is the only prior definition of the three
+    functions it restores. Both halves are checked here: the restored bodies
+    are byte-for-byte the 0003 bodies, and no other up migration defines any
+    of them, so the down is a revert to the immediately prior definition."""
+    names = ("identity_assert", "identity_issue_db_credential", "enroll_rotate_self")
+    origin = _function_bodies(
+        (_SQL_DIR / "0003_worker_enrollment.up.sql").read_text(encoding="utf-8"), names
+    )
+    assert set(origin) == set(names)
+    down = _function_bodies(
+        (_SQL_DIR / "0029_worker_credential_self_renewal_grace.down.sql").read_text(
+            encoding="utf-8"
+        ),
+        names,
+    )
+    assert set(down) == set(names)
+    for name in names:
+        assert down[name] == origin[name], f"{name}: down body differs from 0003"
+    for path in sorted(_SQL_DIR.glob("*.up.sql")):
+        if path.name.startswith(("0003_", "0029_")):
+            continue
+        redefined = _function_bodies(path.read_text(encoding="utf-8"), names)
+        assert redefined == {}, f"{path.name} redefines {sorted(redefined)}"

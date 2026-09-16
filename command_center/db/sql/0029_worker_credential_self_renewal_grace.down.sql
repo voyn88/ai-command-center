@@ -9,6 +9,9 @@
 -- CREATE OR REPLACE because 0029 changed neither their signatures nor their
 -- return types; the overloads 0029 ADDED are dropped by exact signature, so
 -- no grace-capable overload can stay resident beside a restored one.
+-- `tests/db/test_migration_set.py` pins both halves of that claim: the three
+-- bodies below are byte-for-byte the 0003 bodies, and no other up migration
+-- defines any of the three.
 DROP FUNCTION IF EXISTS identity_current_credential(text, boolean);
 
 CREATE OR REPLACE FUNCTION identity_assert(p_secret text)
@@ -229,22 +232,28 @@ $$;
 
 DROP FUNCTION IF EXISTS identity_assert(text, interval);
 
--- Live worker roles were widened by the up and by every issuance since; narrow
--- them back to the ledger expiry so the role and the ledger agree again, as
--- 0003 promised. Same rows the up widened: active worker hosts with an
--- unrevoked credential.
+-- Roles of worker hosts were widened by the up and by every issuance since;
+-- narrow them back so "role validity equals the ledger expiry" holds again
+-- for every worker role, not only the ones the up touched: for EVERY worker
+-- host principal, whatever its state, the latest credential ever issued
+-- (revoked or not -- the verifier on the role is that issuance's) sets the
+-- bound, one row per role, and only ever NARROWING: a validity already
+-- earlier, or `NULL` (never expires, never set by this family), is left
+-- alone. A credential revoked through `identity_revoke_principal` already
+-- has its role disabled (NOLOGIN, -infinity) and stays that way.
 DO $$
 DECLARE r record;
 BEGIN
-    FOR r IN SELECT p.db_role, c.expires_at
+    FOR r IN SELECT DISTINCT ON (p.db_role) p.db_role, c.expires_at, g.rolvaliduntil
                FROM principal_credential c
                JOIN principal p ON p.principal_id = c.principal_id
-              WHERE c.revoked_at IS NULL
-                AND p.kind = 'worker_host'
-                AND p.state = 'active'
-                AND EXISTS (SELECT 1 FROM pg_roles WHERE rolname = p.db_role)
+               JOIN pg_roles g ON g.rolname = p.db_role
+              WHERE p.kind = 'worker_host'
+              ORDER BY p.db_role, c.issued_at DESC, c.expires_at DESC
     LOOP
-        EXECUTE format('ALTER ROLE %I VALID UNTIL %L', r.db_role, r.expires_at::text);
+        IF r.rolvaliduntil IS NOT NULL AND r.rolvaliduntil > r.expires_at THEN
+            EXECUTE format('ALTER ROLE %I VALID UNTIL %L', r.db_role, r.expires_at::text);
+        END IF;
     END LOOP;
 END
 $$;
