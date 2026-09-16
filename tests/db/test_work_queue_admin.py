@@ -403,3 +403,150 @@ def test_reap_falls_back_when_the_schema_has_not_reached_0028(
         assert cur.fetchone()[0] == 0
 
     assert admin.reap() == 1
+
+
+class _RecordingConnection:
+    """A real connection that remembers which statements were sent.
+
+    The distinction under test is *which arity `reap` falls back to*, and no
+    observable state separates them: both recover the same rows. So the test
+    reads the wire rather than the outcome. Everything else delegates, so the
+    server, the role and the grants are still the real ones.
+    """
+
+    def __init__(self, inner) -> None:
+        self.inner = inner
+        self.statements: list[str] = []
+
+    class _Cursor:
+        def __init__(self, inner, log) -> None:
+            self.inner, self.log = inner, log
+
+        def execute(self, query, params=None):
+            self.log.append(query)
+            return self.inner.execute(query, params)
+
+        def fetchone(self):
+            return self.inner.fetchone()
+
+        def __enter__(self):
+            self.inner.__enter__()
+            return self
+
+        def __exit__(self, *exc):
+            return self.inner.__exit__(*exc)
+
+    def cursor(self):
+        return self._Cursor(self.inner.cursor(), self.statements)
+
+    def rollback(self):
+        return self.inner.rollback()
+
+
+def _admin_over(psycopg, dsn, recorder_box) -> WorkQueueAdmin:
+    from contextlib import contextmanager
+
+    @contextmanager
+    def factory():
+        with psycopg.connect(dsn, autocommit=True) as conn:
+            recorder = _RecordingConnection(conn)
+            recorder_box.append(recorder)
+            yield recorder
+
+    return WorkQueueAdmin(factory)
+
+
+def test_a_grant_that_missed_the_new_arity_is_raised_not_papered_over(
+    queue_actors, admin_conn, test_dsn
+) -> None:
+    """THE REGRESSION for the fallback's reach. It was a bare
+    `except Exception` on the first batch, so ANY first-call failure re-ran
+    the UNBOUNDED arity -- and the fallback is only correct for one of them.
+
+    A role re-provision that missed 0028's `GRANT EXECUTE ... queue_reap(integer)`
+    leaves the no-argument arity working (it carries 0002's grant) and the
+    bounded one refused: `InsufficientPrivilege`, SQLSTATE 42501, measured.
+    The old code answered that with the unbounded whole-table scan and
+    returned a count, so a real deploy fault read as a healthy reap and
+    nothing on the host ever said otherwise -- on the one path whose absence
+    `control-01:queue` reports as `queue_stalled` with no exit a lane restart
+    can reach.
+    """
+    store, _admin, psycopg, app_dsn = queue_actors
+    _enqueue(psycopg, app_dsn, "ungranted-1", {"kind": "echo"})
+    assert isinstance(store.claim(QUEUE, visibility_seconds=60), ClaimedWork)
+    _lapse_every_lease(psycopg, test_dsn)
+
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            f"REVOKE EXECUTE ON FUNCTION queue_reap(integer) FROM {roles.APP_ROLE}"
+        )
+
+    seen: list[_RecordingConnection] = []
+    admin = _admin_over(psycopg, app_dsn, seen)
+    with pytest.raises(Exception) as caught:
+        admin.reap()
+    assert getattr(caught.value, "sqlstate", None) == "42501", caught.value
+
+    # And it did NOT reach for the unbounded arity on the way out.
+    sent = [statement for recorder in seen for statement in recorder.statements]
+    assert not any("queue_reap()" in statement for statement in sent), sent
+
+    # The lapsed claim is therefore still lapsed -- which is the honest state,
+    # and the state the probe's `lapsed_claim_age_seconds` will report. A
+    # silent fallback would have cleared it and hidden the broken grant.
+    with admin_conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM work_item WHERE state = 'claimed'")
+        assert int(cur.fetchone()[0]) == 1
+
+
+def test_an_interrupted_batch_is_never_retried_unbounded(
+    queue_actors, admin_conn, test_dsn
+) -> None:
+    """The other error the bare `except` caught by mistake, and the worse one.
+
+    An interruption -- `aicc-queue-reaper.service` is a `Type=oneshot` with
+    `TimeoutStartSec=60s`, and the connection crosses the tunnel the
+    credential rotation restarts -- arrives as `QueryCanceled`, SQLSTATE
+    57014. Answering THAT by re-running the unbounded arity re-runs the
+    whole-table scan whose all-or-nothing rollback is the defect 0028 removed,
+    over strictly more rows than the batch that just failed, at the one moment
+    the server has already shown it cannot finish that much work.
+
+    `statement_timeout` is how the test interrupts it, because it is the same
+    cancellation systemd's kill and the tunnel's restart produce.
+    """
+    store, _admin, psycopg, app_dsn = queue_actors
+    for index in range(5):
+        _enqueue(psycopg, app_dsn, f"interrupted-{index}", {"kind": "echo"})
+        assert isinstance(store.claim(QUEUE, visibility_seconds=60), ClaimedWork)
+    _lapse_every_lease(psycopg, test_dsn)
+
+    from contextlib import contextmanager
+
+    seen: list[_RecordingConnection] = []
+
+    @contextmanager
+    def factory():
+        with psycopg.connect(app_dsn, autocommit=True) as conn:
+            with conn.cursor() as cur:
+                # Below any plausible runtime for a batch of expirations and
+                # their audit rows, so the cancellation is deterministic
+                # rather than a race with the machine's speed.
+                cur.execute("SET statement_timeout = '1ms'")
+            recorder = _RecordingConnection(conn)
+            seen.append(recorder)
+            yield recorder
+
+    with pytest.raises(Exception) as caught:
+        WorkQueueAdmin(factory).reap()
+    assert getattr(caught.value, "sqlstate", None) == "57014", caught.value
+
+    sent = [statement for recorder in seen for statement in recorder.statements]
+    assert not any("queue_reap()" in statement for statement in sent), sent
+
+    # Nothing was recovered and nothing was lost: the next tick starts from
+    # the same place, with its bound intact.
+    with admin_conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM work_item WHERE state = 'claimed'")
+        assert int(cur.fetchone()[0]) == 5

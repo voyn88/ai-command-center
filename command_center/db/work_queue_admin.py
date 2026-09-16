@@ -74,6 +74,11 @@ class WorkQueueAdmin:
     #: ordinary minute's lapses in one round trip. See ``reap``.
     REAP_BATCH = 100
 
+    #: SQLSTATE ``undefined_function``. The ONE error that means "this
+    #: database has not reached 0028", and so the only one ``reap``'s
+    #: unbounded fallback may answer. See there for the two it must not.
+    UNDEFINED_FUNCTION = "42883"
+
     def reap(self) -> int:
         """Expire every lapsed lease: requeue items with budget left, dead-
         letter the exhausted. Returns the number of attempts expired.
@@ -97,7 +102,9 @@ class WorkQueueAdmin:
         there yet — the control host and the worker host deploy
         independently, so this module can be newer than the schema it is
         talking to, and a reap that refuses to run at all is the one outcome
-        worse than an unbatched one.
+        worse than an unbatched one. ONLY then: every other failure is a
+        recovery fault and is raised, because a reaper that cannot recover is
+        what ``control-01:queue`` reports as a stall.
         """
         total = 0
         with self._connection() as conn:
@@ -105,13 +112,49 @@ class WorkQueueAdmin:
                 while True:
                     try:
                         cur.execute("SELECT queue_reap(%s)", (self.REAP_BATCH,))
-                    except Exception:
-                        # `UndefinedFunction` on a database still at 0027.
-                        # Only the FIRST call may fall back: once a batch has
-                        # committed, a failure is a real fault and re-running
-                        # the unbounded form would hide it behind a second,
-                        # larger attempt at the same work.
-                        if total:
+                    except Exception as exc:
+                        # ONLY "there is no `queue_reap(integer)` here" may be
+                        # answered by re-running the unbounded arity, and only
+                        # before a batch has committed. Once one has, a failure
+                        # is a real fault and re-running the unbounded form
+                        # would hide it behind a second, larger attempt at the
+                        # same work.
+                        #
+                        # THE BARE `except Exception` THIS REPLACES CAUGHT
+                        # EVERY FIRST-BATCH FAILURE, and the two it caught by
+                        # mistake are the two 0028 EXISTS FOR. Measured against
+                        # PostgreSQL 16 as `aicc_app`:
+                        #
+                        #     statement timeout       QueryCanceled         57014
+                        #     GRANT missed the arity  InsufficientPrivilege 42501
+                        #     database still at 0027  UndefinedFunction     42883
+                        #
+                        # A `TimeoutStartSec=60s` kill or a pgtunnel restart
+                        # mid-reap arrives as 57014, and answering it with the
+                        # UNBOUNDED form re-runs the whole-table scan whose
+                        # all-or-nothing rollback is the defect 0028 removed --
+                        # over strictly MORE rows than the batch that just
+                        # failed, at the one moment the server has already
+                        # shown it cannot finish that much work. The fallback
+                        # was reintroducing the bug exactly when it mattered.
+                        #
+                        # And 42501 it swallowed SILENTLY: a role re-provision
+                        # that missed 0028's GRANT is a real deploy fault, and
+                        # the fallback turned it into a successful-looking reap
+                        # that returned a count and left nothing for anyone to
+                        # see. Recovery is the one path whose absence
+                        # `control-01:queue` reports as `queue_stalled` with no
+                        # exit reachable by fleet action -- restarting a lane
+                        # does not reap -- so a recovery fault has to surface.
+                        #
+                        # Keyed on SQLSTATE rather than on an exception class
+                        # so this module stays driver-agnostic the way the rest
+                        # of it is: it never imports psycopg, it is handed a
+                        # connection. A driver that reports no SQLSTATE gets
+                        # the raise, which is the fail-closed answer.
+                        if total or getattr(exc, "sqlstate", None) != (
+                            self.UNDEFINED_FUNCTION
+                        ):
                             raise
                         conn.rollback()
                         cur.execute("SELECT queue_reap()")

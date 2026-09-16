@@ -8,6 +8,50 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Fixed — a recovery fault must surface, not be answered with the bug it replaced (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
+- **`WorkQueueAdmin.reap`'s fallback caught every first-batch failure, and the
+  two it caught by mistake are the two 0028 exists for.** Found auditing the
+  batching this branch had just added, and it is on the one path the probe
+  measures with no escape clause: `evaluate` excuses due ready work behind a
+  full fleet and bounds it by the fleet clock, but `lapsed_claim_age_seconds`
+  is weighed unconditionally, and `queue_reap` is the only thing that clears a
+  lapsed claim. Restarting a lane does not reap, and `queue_redrive` only
+  reaches items already `dead`.
+
+  The fallback exists so a control host newer than its database still reaps:
+  `queue_reap(integer)` is absent before 0028, so the call is retried against
+  the unbounded arity. It was written as a bare `except Exception` on the
+  first batch. Measured against PostgreSQL 16 as `aicc_app`, three different
+  faults reach that handler:
+
+      statement timeout            QueryCanceled          57014
+      GRANT missed the new arity   InsufficientPrivilege  42501
+      database still at 0027       UndefinedFunction      42883
+
+  Only the last one may be answered by re-running the unbounded form.
+
+  **57014 is the worse miss.** The tick is interruptible by design —
+  `aicc-queue-reaper.service` is a `Type=oneshot` with `TimeoutStartSec=60s`,
+  and the connection crosses the tunnel the credential rotation restarts — and
+  an interruption arrives as a cancellation. Answering it with the unbounded
+  arity re-runs the whole-table scan whose all-or-nothing rollback is the
+  exact defect 0028 removed, over strictly MORE rows than the batch that just
+  failed, at the one moment the server has already shown it cannot finish that
+  much work. The fallback reintroduced the bug precisely when it mattered.
+
+  **42501 it swallowed silently.** A role re-provision that misses 0028's
+  `GRANT EXECUTE ... queue_reap(integer)` leaves the no-argument arity working
+  (it carries 0002's grant) and the bounded one refused. Measured: `reap()`
+  returned a count and reported success while a real deploy fault went
+  unrecorded — on the path whose absence becomes a `queue_stalled` finding
+  with no exit reachable by fleet action.
+
+  Now keyed on SQLSTATE `42883` alone. Keyed on the code rather than an
+  exception class because this module never imports psycopg — it is handed a
+  connection — and a driver that reports no SQLSTATE gets the raise, which is
+  the fail-closed answer. Two regression tests against a real server pin both
+  halves; both fail against the previous code, one on each mis-caught fault.
+
 ### Fixed — recovery must make progress, not merely avoid corruption (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
 - `control-01:queue` reported `queue_stalled` again (`monitor_finding` #3321).
   Every fix on this branch has closed one way for the fleet to end up UP AND
