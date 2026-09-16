@@ -85,6 +85,37 @@ def test_zombie_is_not_treated_as_a_running_process():
         os.waitpid(pid, 0)
 
 
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")
+def test_capture_identity_allow_zombie_returns_identity_for_an_unreaped_zombie():
+    """A caller holding the unreaped handle (e.g. a `Popen` right after spawn)
+    owns the pid even once it is a zombie: nothing else can have reused it
+    before this parent reaps it. `allow_zombie=True` exists for exactly that
+    caller — see the `_capture_stable_process_identity` launch-time capture in
+    `supervisor.py`, which must not fail just because a very short-lived child
+    became a zombie before the first sample could run."""
+    pid = os.fork()
+    if pid == 0:
+        os._exit(0)
+
+    try:
+        deadline = time.monotonic() + 2.0
+        state = _process_state(pid)
+        while state is not None and not state.startswith("Z") and time.monotonic() < deadline:
+            time.sleep(0.01)
+            state = _process_state(pid)
+
+        assert state is not None and state.startswith("Z")
+        # Default behaviour is unchanged: a zombie still yields no identity.
+        assert identity.capture_identity(pid) is None
+        ident = identity.capture_identity(pid, allow_zombie=True)
+        assert ident is not None
+        assert ident.pid == pid
+        assert ident.start_time
+        assert ident.command
+    finally:
+        os.waitpid(pid, 0)
+
+
 def test_process_exists_true_while_running_false_after_exit():
     proc = _sleep_process(1)
     try:
@@ -363,7 +394,7 @@ def test_windows_pid_outside_dword_is_unknown_without_native_call(monkeypatch) -
 def test_failed_ps_for_existing_pid_is_unknown_and_conservatively_exists(
     monkeypatch,
 ) -> None:
-    monkeypatch.setattr(identity, "_query_identity_linux_procfs", lambda _pid: None)
+    monkeypatch.setattr(identity, "_query_identity_linux_procfs", lambda _pid, **_kwargs: None)
     monkeypatch.setattr(
         identity.subprocess,
         "run",
@@ -383,7 +414,7 @@ def test_failed_ps_for_existing_pid_is_unknown_and_conservatively_exists(
 
 @pytest.mark.skipif(os.name == "nt", reason="tests the POSIX ps fallback")
 def test_failed_ps_for_absent_pid_is_confirmed_absent(monkeypatch) -> None:
-    monkeypatch.setattr(identity, "_query_identity_linux_procfs", lambda _pid: None)
+    monkeypatch.setattr(identity, "_query_identity_linux_procfs", lambda _pid, **_kwargs: None)
     monkeypatch.setattr(
         identity.subprocess,
         "run",
@@ -403,7 +434,7 @@ def test_failed_ps_for_absent_pid_is_confirmed_absent(monkeypatch) -> None:
 
 @pytest.mark.skipif(os.name == "nt", reason="tests the POSIX ps fallback")
 def test_malformed_successful_ps_output_is_unknown_not_absent(monkeypatch) -> None:
-    monkeypatch.setattr(identity, "_query_identity_linux_procfs", lambda _pid: None)
+    monkeypatch.setattr(identity, "_query_identity_linux_procfs", lambda _pid, **_kwargs: None)
     monkeypatch.setattr(
         identity.subprocess,
         "run",
@@ -419,7 +450,7 @@ def test_malformed_successful_ps_output_is_unknown_not_absent(monkeypatch) -> No
 @pytest.mark.skipif(os.name == "nt", reason="tests the POSIX ps environment")
 def test_posix_identity_query_canonicalizes_ps_locale_and_timezone(monkeypatch) -> None:
     observed: dict[str, str] = {}
-    monkeypatch.setattr(identity, "_query_identity_linux_procfs", lambda _pid: None)
+    monkeypatch.setattr(identity, "_query_identity_linux_procfs", lambda _pid, **_kwargs: None)
 
     def fake_ps(*_args, **kwargs):
         observed.update(kwargs["env"])
