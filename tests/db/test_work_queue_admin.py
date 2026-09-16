@@ -515,9 +515,15 @@ def test_an_interrupted_batch_is_never_retried_unbounded(
 
     `statement_timeout` is how the test interrupts it, because it is the same
     cancellation systemd's kill and the tunnel's restart produce.
+
+    A FULL batch against a 1ms timeout, not a token few rows, so the margin is
+    not a bet on the machine's speed: measured on PostgreSQL 16, five
+    expirations and their audit rows already take ~5ms server-side, so a
+    hundred of them run two orders of magnitude past the bound.
     """
     store, _admin, psycopg, app_dsn = queue_actors
-    for index in range(5):
+    total = WorkQueueAdmin.REAP_BATCH + 3
+    for index in range(total):
         _enqueue(psycopg, app_dsn, f"interrupted-{index}", {"kind": "echo"})
         assert isinstance(store.claim(QUEUE, visibility_seconds=60), ClaimedWork)
     _lapse_every_lease(psycopg, test_dsn)
@@ -530,9 +536,6 @@ def test_an_interrupted_batch_is_never_retried_unbounded(
     def factory():
         with psycopg.connect(app_dsn, autocommit=True) as conn:
             with conn.cursor() as cur:
-                # Below any plausible runtime for a batch of expirations and
-                # their audit rows, so the cancellation is deterministic
-                # rather than a race with the machine's speed.
                 cur.execute("SET statement_timeout = '1ms'")
             recorder = _RecordingConnection(conn)
             seen.append(recorder)
@@ -549,4 +552,4 @@ def test_an_interrupted_batch_is_never_retried_unbounded(
     # the same place, with its bound intact.
     with admin_conn.cursor() as cur:
         cur.execute("SELECT count(*) FROM work_item WHERE state = 'claimed'")
-        assert int(cur.fetchone()[0]) == 5
+        assert int(cur.fetchone()[0]) == total
