@@ -61,6 +61,43 @@ transaction never performs restart fallback. After
 issuance, every reload/readiness operation is bounded by both that controller
 deadline and the credential's expiry minus a five-minute safety margin.
 
+## Self-renewal grace after expiry
+
+The rotator authenticates with the credential it is renewing, so before 0029
+an expired credential could never be renewed by the host itself: live
+2026-09-15 three refused rotations (a readiness reason) let the one-hour
+credential expire, and every later attempt failed `credential_expired` until an
+operator widened the ledger row and the role by hand. Since 0029:
+
+* A WORKER role's password stays valid for `enroll_self_grace()` (1 hour, the
+  TTL itself) past the ledger `expires_at`. In that hour the secret can still
+  log in and do whatever the worker role can do without a ledger verdict
+  (queue functions do not call `identity_assert`; the role writes run and
+  completion rows directly), so lanes stay ready and keep claiming during that
+  hour while the rotator renews. It cannot pass `identity_assert`, and it can
+  RENEW only while unrevoked, active, inside the hour, used at least once
+  while live, and from a connection whose address equals the one it was bound
+  to (under the SSH-tunnel deployment that address is the loopback for every
+  worker, so the confinement there is the tunnel key per host and pg_hba, not
+  the bound address). Operator and control-plane credentials get no grace.
+  Revocation still cuts the role off at once, and a rotation replaces the
+  verifier, so a superseded secret cannot log in whatever the validity says.
+* A stall longer than TTL + grace still ends in the deadlock: the role's
+  password lapses, fresh connections fail, and the rotator cannot renew. That
+  state is `credential_rotation_stalled` in `infra_monitor`, and it needs an
+  operator (recipe below).
+* The rotator asks `identity_current_credential(secret, true)`, which reports
+  an expired credential inside the grace with a negative remaining lifetime and
+  `renewable_until` (exclusive); it bounds its pre-mutation attempt by the
+  renewal deadline and rotates immediately. A renewal on an expired secret is
+  `rotate/granted` with `expired_grace: true` in the ledger -- that row is the
+  "host limped on grace" signal; `assert/granted/expired_grace` is written by
+  every graced pass, including the read-only renewal query. The grace is not
+  consumed: a host that stalls twice inside the hour recovers twice. The bound
+  is time, not count.
+* Narrowing the extra hour to renewal only would take a renewal-only login
+  role per worker host; that is a follow-up, not part of 0029.
+
 The normal timer runs 25 minutes after the service becomes inactive. A failed
 oneshot is retried after two minutes. The threshold proof includes the full
 worst-case duration of all three failures before mutation plus every declared
