@@ -73,17 +73,19 @@ operator widened the ledger row and the role by hand. Since 0029:
   TTL itself) past the ledger `expires_at`. In that hour the secret can still
   log in and do whatever the worker role can do without a ledger verdict
   (queue functions do not call `identity_assert`; the role writes run and
-  completion rows directly). It cannot pass `identity_assert`, and it can
-  RENEW only from the address the credential is bound to, only while
-  unrevoked, active and inside the hour; a credential that was never used is
-  not renewable at all. Operator and control-plane credentials get no grace.
+  completion rows directly), so lanes stay ready and keep claiming during that
+  hour while the rotator renews. It cannot pass `identity_assert`, and it can
+  RENEW only while unrevoked, active, inside the hour, used at least once
+  while live, and from a connection whose address equals the one it was bound
+  to (under the SSH-tunnel deployment that address is the loopback for every
+  worker, so the confinement there is the tunnel key per host and pg_hba, not
+  the bound address). Operator and control-plane credentials get no grace.
   Revocation still cuts the role off at once, and a rotation replaces the
   verifier, so a superseded secret cannot log in whatever the validity says.
-* Lanes on established sessions keep working until they reconnect, which is
-  the window the grace recovers in. Lanes that have already lost their
-  sessions cannot become ready on an expired secret, and rotation still
-  requires ready lanes: that state is `credential_rotation_stalled` in
-  `infra_monitor`, and it needs an operator (recipe below).
+* A stall longer than TTL + grace still ends in the deadlock: the role's
+  password lapses, fresh connections fail, and the rotator cannot renew. That
+  state is `credential_rotation_stalled` in `infra_monitor`, and it needs an
+  operator (recipe below).
 * The rotator asks `identity_current_credential(secret, true)`, which reports
   an expired credential inside the grace with a negative remaining lifetime and
   `renewable_until` (exclusive); it bounds its pre-mutation attempt by the
