@@ -13,6 +13,7 @@ import shlex
 import stat
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -91,6 +92,18 @@ LANE_MUTATING_TIMERS = (
 # a tick already in flight when the timers are stopped, or one started
 # directly rather than through its timer, still sees this file and defers.
 ROLLOUT_LOCK_PATH = Path("/run/aicc-staged-rollout.lock")
+
+#: How long `restore` lets an expected-active unit finish coming up before it
+#: refuses the restore. A `Type=notify` service forks its MainPID and only
+#: then sends `READY=1`, so systemd can legitimately report it "activating"
+#: with a live MainPID for a short window (~170 ms for a worker lane, live on
+#: worker-01 2026-09-07/08). That window is a race to wait out, not a state
+#: to accept: a unit that never leaves "activating" -- hung start, failing
+#: dependency, bad readiness handshake -- is exactly what this rollback has
+#: to catch, so the wait is bounded and its expiry is a failure.
+RESTORE_ACTIVATION_TIMEOUT_SECONDS = 30.0
+#: Interval between `is-active` reads while waiting out that window.
+RESTORE_ACTIVATION_POLL_SECONDS = 0.25
 
 
 class RolloutError(RuntimeError):
@@ -567,7 +580,37 @@ def snapshot(systemd: Systemd, units: tuple[str, ...]) -> dict[str, object]:
     }
 
 
-def restore(systemd: Systemd, state: dict[str, object]) -> None:
+def _settle_activating(
+    systemd: Systemd,
+    unit: str,
+    *,
+    sleep=time.sleep,
+    monotonic=time.monotonic,
+) -> str:
+    """Re-read `is-active` until a starting unit leaves "activating".
+
+    Returns the last state observed -- "active" once the `Type=notify`
+    handshake lands, whatever terminal state a failed start produced, or
+    "activating" itself if the unit is still not up when the bound expires.
+    The caller applies exactly the same checks to that answer as it would to
+    an immediate one, so waiting can only ever turn a transient race into a
+    proven state; it never converts an unproven unit into an accepted one.
+    """
+    deadline = monotonic() + RESTORE_ACTIVATION_TIMEOUT_SECONDS
+    active = "activating"
+    while active == "activating" and monotonic() < deadline:
+        sleep(RESTORE_ACTIVATION_POLL_SECONDS)
+        active = systemd.run("is-active", unit, check=False)
+    return active
+
+
+def restore(
+    systemd: Systemd,
+    state: dict[str, object],
+    *,
+    sleep=time.sleep,
+    monotonic=time.monotonic,
+) -> None:
     raw_units = state.get("units")
     version = state.get("version")
     if version not in {2, 3} or not isinstance(raw_units, dict):
@@ -660,6 +703,33 @@ def restore(systemd: Systemd, state: dict[str, object]) -> None:
         systemd.run("enable" if raw.get("enabled") is True else "disable", unit)
         systemd.run("start" if expected_active else "stop", unit)
         active = systemd.run("is-active", unit, check=False)
+        if expected_active and active == "activating":
+            # A Type=notify unit forks its MainPID before it sends READY=1,
+            # so a lane can read "activating" with a live MainPID while its
+            # readiness handshake is still in flight -- the service coming up
+            # normally, not one that failed to go inactive (the shape that
+            # wedged install recovery on worker-01, 2026-09-07/08).
+            #
+            # Waiting is the only safe way to tell that window apart from a
+            # lane that never comes up, and this restore CAN wait: its start
+            # is synchronous, unlike the deliberately queued `--no-block`
+            # start in aicc_install_transaction.restore_service_snapshot,
+            # which is ordered before sysinit and would deadlock if it
+            # blocked. So where that one must accept "activating" as
+            # possible-not-yet-run, this one gives it a bounded chance to
+            # finish and then judges the result. "activating" is never a
+            # terminal state a rollback accepts here: a staged rollout's
+            # whole safety model is proving each lane before the next.
+            active = _settle_activating(systemd, unit, sleep=sleep, monotonic=monotonic)
+            if active == "activating":
+                # The generic refusal below would catch this too. It is
+                # named separately because the two are different operator
+                # problems: "the snapshot and the host disagree" versus
+                # "this lane has been starting for
+                # RESTORE_ACTIVATION_TIMEOUT_SECONDS and is not up".
+                raise RolloutError(
+                    f"service did not finish starting after restore: {unit}"
+                )
         enabled = systemd.run("is-enabled", unit, check=False)
         load_state = systemd.run(
             "show", unit, "--property=LoadState", "--value", check=False
@@ -667,22 +737,11 @@ def restore(systemd: Systemd, state: dict[str, object]) -> None:
         main_pid = systemd.run(
             "show", unit, "--property=MainPID", "--value", check=False
         )
-        # A Type=notify unit forks its MainPID before it sends READY=1, so a
-        # start that completes in that window is legitimately reported
-        # "activating" with a live MainPID -- not a service that failed to go
-        # inactive. Only exempt that transitional state when the unit is
-        # actually expected active; an expected-inactive unit stuck
-        # deactivating with a MainPID is still refused below.
-        activating_start = expected_active and active == "activating"
         if (
             load_state in {"", "not-found"}
-            or ((active == "active") is not expected_active and not activating_start)
+            or ((active == "active") is not expected_active)
             or ((enabled == "enabled") is not (raw.get("enabled") is True))
-            or (
-                active != "active"
-                and not activating_start
-                and main_pid not in {"", "0"}
-            )
+            or (active != "active" and main_pid not in {"", "0"})
         ):
             raise RolloutError(f"service snapshot did not restore exactly: {unit}")
         if version == 3:
