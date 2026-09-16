@@ -27,6 +27,15 @@ FAKE_CLAUDE_SCRIPT = Path(__file__).parent / "fixtures" / "fake_claude.py"
 FAKE_CLAUDE_TREE_SCRIPT = Path(__file__).parent / "fixtures" / "fake_claude_tree.py"
 
 
+def _migrations_through(migrations, version: int) -> list:
+    """Every migration up to and including `version`, by version number rather
+    than by list position — `MIGRATIONS[:-1]` meant "stop at v24" only while
+    v25 was the last entry, and silently meant "stop at v25" once v26 landed.
+    See the twin in `tests/test_runtime_db.py`.
+    """
+    return [migration for migration in migrations if migration[0] <= version]
+
+
 def _extract_last_json_object(stdout: str) -> dict:
     """`_print()` in the CLI always renders a top-level dict starting with a
     lone `{` line (via `json.dumps(..., indent=2)`) — find the last one."""
@@ -80,7 +89,7 @@ def test_offline_finalization_cutover_recovers_v24_terminal_crash_row(
     path = db.resolve_db_path()
     current_migrations = list(db.MIGRATIONS)
     with monkeypatch.context() as pre_claim:
-        pre_claim.setattr(db, "MIGRATIONS", current_migrations[:-1])
+        pre_claim.setattr(db, "MIGRATIONS", _migrations_through(current_migrations, 24))
         pre_claim.setattr(db, "SCHEMA_VERSION", 24)
         db.migrate(path)
         task = db.create_task(
@@ -138,7 +147,10 @@ def test_offline_finalization_cutover_recovers_v24_terminal_crash_row(
 
     assert result.returncode == 0, result.stdout + result.stderr
     evidence = _extract_last_json_object(result.stdout)
-    assert evidence["schema_version"] == 25
+    # The head this binary knows, not the version the cutover itself stops at:
+    # `ExecutionCenterAPI` below migrates the rest of the way, so a literal here
+    # would pin the assertion to whichever migration happened to be last.
+    assert evidence["schema_version"] == db.SCHEMA_VERSION
     assert evidence["claims_seeded"] == 1
     assert evidence["unfinalized_remaining"] == 0
     recovered = db.get_run(path, run["id"])

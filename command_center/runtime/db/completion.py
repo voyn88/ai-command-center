@@ -106,6 +106,9 @@ _COMPLETION_INSERT_COLUMNS: tuple[str, ...] = (
     "version",
     "created_at",
     "updated_at",
+    # Schema 26. Last, because both engines append an added column at the end
+    # of the ordinal order and this list is read as the row's shape.
+    "insert_seq",
 )
 
 
@@ -163,14 +166,35 @@ def create_completion(
             "updated_at": now,
         }
     )
-    columns = ", ".join(db._COMPLETION_INSERT_COLUMNS)
-    placeholders = ", ".join(f":{name}" for name in db._COMPLETION_INSERT_COLUMNS)
     with db.connect(db_path) as conn:
         with db.transaction(conn):
+            # Build the column list from the table as it exists rather than
+            # from the literal above — the same rule `create_run` already
+            # follows, and for the same reason. `_COMPLETION_INSERT_COLUMNS`
+            # was a static literal, so the moment schema 26 added `insert_seq`
+            # to it this function stopped working against every older schema:
+            # `tests/test_autonomy_db.py` calls it on a deliberately v5
+            # database to prove the v5 -> v6 upgrade preserves rows, and an
+            # `INSERT` naming a column that database does not have fails
+            # outright.
+            table_columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(completion)")
+            }
+            if "insert_seq" in table_columns:
+                # Insertion order, stamped inside the transaction that already
+                # serialises this insert; see the twin in `create_run`.
+                record["insert_seq"] = conn.execute(
+                    "SELECT COALESCE(MAX(insert_seq), 0) + 1 AS next_seq FROM completion"
+                ).fetchone()["next_seq"]
+            insert_columns = [
+                name for name in db._COMPLETION_INSERT_COLUMNS if name in table_columns
+            ]
+            columns = ", ".join(insert_columns)
+            placeholders = ", ".join(f":{name}" for name in insert_columns)
             conn.execute(f"INSERT INTO completion ({columns}) VALUES ({placeholders})", record)
-            # The stored row, not `record`: the insert names only
-            # `_COMPLETION_INSERT_COLUMNS`, so the record is missing whatever
-            # the schema defaults — the shape trap slice 11 measured on `run`.
+            # The stored row, not `record`: the insert names only the columns
+            # this database has, so the record is missing whatever the schema
+            # defaults — the shape trap slice 11 measured on `run`.
             stored = dict(
                 conn.execute("SELECT * FROM completion WHERE run_id = ?", (record["run_id"],)).fetchone()
             )
@@ -223,11 +247,17 @@ def get_completion_by_task(db_path: Path, task_id: str) -> dict | None:
     not hypothetical: an automatic rework relaunches a task as soon as its
     failure is observed, so several completions per task is the normal case, and
     a caller reading the stale row would act on a failure that has already been
-    superseded. `rowid` — monotonic per insert — breaks the tie in true
-    insertion order."""
+    superseded.
+
+    Ordered by `insert_seq` (schema 26) alone — the monotonic insertion stamp,
+    minted under the same write lock as the insert. It replaced `rowid`, which
+    answered this on SQLite only: the PostgreSQL mirror has no implicit row id,
+    so the identical query there resolved ties arbitrarily. See the twin
+    docstring on `get_latest_run_for_task` for why `created_at` no longer leads
+    the ordering."""
     with db.connect(db_path) as conn:
         row = conn.execute(
-            "SELECT * FROM completion WHERE task_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            "SELECT * FROM completion WHERE task_id = ? ORDER BY insert_seq DESC LIMIT 1",
             (task_id,),
         ).fetchone()
         return db._row_to_dict(row)

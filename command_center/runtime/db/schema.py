@@ -22,7 +22,7 @@ import command_center.runtime.db as db  # facade (late-bound; see docstring)
 # full script after a partially-applied migration is always safe)
 # --------------------------------------------------------------------------
 
-SCHEMA_VERSION = 25
+SCHEMA_VERSION = 26
 
 _SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS task (
@@ -423,7 +423,11 @@ def _bootstrap_finalization_claim_cutover_unlocked(
                     "offline finalization cutover refuses runtime schema "
                     f"v{current}; this binary only understands v{db.SCHEMA_VERSION}"
                 )
-            if current == 25:
+            if current >= 25:
+                # Already fenced — nothing to cut over, whatever has landed on
+                # top of v25 since. `== 25` would have started refusing an
+                # already-migrated database as "requires schema v24" the moment
+                # a v26 existed.
                 _validate_finalization_claim_schema(conn)
                 return 0
             if current != 24:
@@ -1360,6 +1364,94 @@ CREATE INDEX IF NOT EXISTS idx_networking_invitation_project ON networking_invit
 """
 
 
+#: The two tables that carry a monotonic insertion-order column, and the name
+#: they carry it under. Both are read newest-first with a per-task filter, and
+#: both had nothing but `rowid` to order by (VOYN-W0-AICC-INSERT-SEQ).
+_INSERT_SEQ_TABLES: tuple[str, ...] = ("run", "completion")
+
+
+def _migration_26_add_insert_seq(conn: sqlite3.Connection) -> None:
+    """A real insertion-order column on `run` and `completion`, replacing the
+    implicit `rowid` the newest-first reads leaned on (VOYN-W0-AICC-INSERT-SEQ).
+
+    `created_at` is `iso_now()` — ISO text at *second* resolution — so two runs
+    (or two completions) for one task created within the same second tie, and a
+    bare `ORDER BY created_at DESC` returns an arbitrary one of them. That is
+    the normal case, not a corner: an automatic rework relaunches a task as soon
+    as its failure is observed. `get_latest_run_for_task` and
+    `get_completion_by_task` therefore broke the tie on `rowid`, which is a
+    SQLite implementation detail with no counterpart on the PostgreSQL mirror —
+    the same query there resolves ties arbitrarily, so the two engines disagree
+    about which row is newest.
+
+    The two columns that look like they would already answer this do not:
+
+    * `run.sequence` is `MAX(sequence) + 1` **within a session**
+      (`execution.create_run`), and `supervisor` opens a new session for every
+      non-resume launch — so a task relaunched N times has N runs all holding
+      `sequence = 1`, and ordering by it is ordering by a constant.
+    * `completion` has no such column at all.
+
+    A text tiebreak is no use either: `new_id()` is `uuid4().hex`, and
+    `create_run` accepts a caller-supplied `run_id` besides, so the id carries
+    no order.
+
+    Seeded from `rowid`, which is now the only place in the runtime store that
+    orders by it (`completion.record_validation_result` still reads it back via
+    `last_insert_rowid()`, which is a different use: identifying the row just
+    written, not ordering rows against each other). Seeding rather than
+    inventing a fresh sequence is what makes the upgrade invisible — every
+    pre-existing row keeps exactly the order the old queries gave it, so the
+    migration changes which column answers "which came first", never the answer.
+    The `UPDATE` is a one-time full pass over each table; it runs inside the
+    same transaction as the `ALTER`, so an interrupted migration leaves neither.
+    New rows get `MAX(insert_seq) + 1` inside the `BEGIN IMMEDIATE` the writers
+    already hold, the same shape `run.sequence`, `run_event.seq` and
+    `completion_event.seq` use — no new abstraction, and the write lock is what
+    makes the value unique rather than a hope about clocks.
+
+    Two indexes per table, each load-bearing:
+
+    * `(insert_seq)` — the stamp is `MAX(insert_seq) + 1` over the whole table,
+      so without an index with `insert_seq` leading, every insert would pay a
+      full scan inside the write lock.
+    * `(task_id, insert_seq)` — the per-task newest-first read, which is the
+      only reason the column exists.
+
+    Neither is `UNIQUE`, and that is a decision rather than an omission. The
+    values are unique by construction — `MAX + 1` under `BEGIN IMMEDIATE`, the
+    same discipline `run.sequence` and `run_event.seq` already rely on — but the
+    PostgreSQL mirror deliberately cannot carry a uniqueness constraint here:
+    `0025_run_completion_insert_seq` adds the column as an identity, so during
+    dual-write the values PostgreSQL generated for pre-existing rows and the
+    values the authority mints coexist until each row is next mirrored, and a
+    constraint would turn that overlap into an insert failure the dual-write
+    hook swallows. A `UNIQUE` index on this side only would be a divergence
+    `tests/db/test_schema_correspondence.py` is there to reject.
+
+    Same idempotent check-then-`ALTER TABLE ADD COLUMN` shape as migrations 2,
+    3, 4, 9, 11, 12 and 24, wrapped in one `BEGIN IMMEDIATE`: the add and its
+    backfill commit together, so there is no observable state where the column
+    exists and is empty.
+    """
+    with db.transaction(conn):
+        for table in _INSERT_SEQ_TABLES:
+            existing = {
+                row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+            if "insert_seq" not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN insert_seq INTEGER")
+                conn.execute(f"UPDATE {table} SET insert_seq = rowid")
+            conn.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_{table}_insert_seq "
+                f"ON {table}(insert_seq)"
+            )
+            conn.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_{table}_task_insert_seq "
+                f"ON {table}(task_id, insert_seq)"
+            )
+
+
 # Each migration is either a raw SQL script (applied via `executescript`, every
 # statement `IF NOT EXISTS`) or a callable(conn) for changes — like `ALTER
 # TABLE ADD COLUMN` — that need their own idempotency check.
@@ -1394,4 +1486,5 @@ MIGRATIONS: list[tuple[int, str | Callable[[sqlite3.Connection], None]]] = [
     (23, _SCHEMA_V23),
     (24, _migration_24_add_finalized_at),
     (25, _migration_25_add_finalization_claim),
+    (26, _migration_26_add_insert_seq),
 ]
