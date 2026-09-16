@@ -92,7 +92,7 @@ class PostgresQueueMirror:
                     cur.execute("DELETE FROM queue_entry")
                     if rows:
                         cur.executemany(
-                            f"INSERT INTO queue_entry ({', '.join(columns)}) "
+                            f"INSERT INTO queue_entry ({', '.join(columns)}) "  # nosec B608 - columns is QUEUE_ENTRY_COLUMNS (module-level hardcoded tuple) plus the literal "position"; no caller input reaches the SQL text, only bound row values
                             f"VALUES ({placeholders})",
                             rows,
                         )
@@ -101,7 +101,7 @@ class PostgresQueueMirror:
         with self._connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    f"SELECT {', '.join(QUEUE_ENTRY_COLUMNS)} FROM queue_entry "
+                    f"SELECT {', '.join(QUEUE_ENTRY_COLUMNS)} FROM queue_entry "  # nosec B608 - QUEUE_ENTRY_COLUMNS is a module-level hardcoded tuple; no caller input reaches this query
                     "ORDER BY position ASC"
                 )
                 rows = cur.fetchall()

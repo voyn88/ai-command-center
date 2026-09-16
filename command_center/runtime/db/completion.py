@@ -167,7 +167,7 @@ def create_completion(
     placeholders = ", ".join(f":{name}" for name in db._COMPLETION_INSERT_COLUMNS)
     with db.connect(db_path) as conn:
         with db.transaction(conn):
-            conn.execute(f"INSERT INTO completion ({columns}) VALUES ({placeholders})", record)
+            conn.execute(f"INSERT INTO completion ({columns}) VALUES ({placeholders})", record)  # nosec B608 - columns/placeholders are built from the hardcoded `_COMPLETION_INSERT_COLUMNS` tuple, not caller input; values are bound via named placeholders in `record`.
             # The stored row, not `record`: the insert names only
             # `_COMPLETION_INSERT_COLUMNS`, so the record is missing whatever
             # the schema defaults — the shape trap slice 11 measured on `run`.
@@ -208,7 +208,7 @@ def get_completions_for_runs(db_path: Path, run_ids: list[str]) -> dict[str, dic
     placeholders = ", ".join("?" for _ in run_ids)
     with db.connect(db_path) as conn:
         rows = conn.execute(
-            f"SELECT * FROM completion WHERE run_id IN ({placeholders})", tuple(run_ids)
+            f"SELECT * FROM completion WHERE run_id IN ({placeholders})", tuple(run_ids)  # nosec B608 - `placeholders` is just N repetitions of the literal "?" (one per run_id, no data interpolated); the actual run_ids are bound via `tuple(run_ids)`.
         ).fetchall()
     return {row["run_id"]: db._row_to_dict(row) for row in rows}
 
@@ -262,7 +262,7 @@ def list_completions(
     params.append(limit)
     with db.connect(db_path) as conn:
         rows = conn.execute(
-            f"SELECT * FROM completion{where} ORDER BY created_at ASC LIMIT ?", params
+            f"SELECT * FROM completion{where} ORDER BY created_at ASC LIMIT ?", params  # nosec B608 - `where` is assembled only from the hardcoded clause literals above ("completion_state IN (...)" with "?"-only placeholders, "(next_retry_at IS NULL OR next_retry_at <= ?)"); every actual value (states, due_before, limit) is bound via `params`.
         ).fetchall()
         return [dict(row) for row in rows]
 
@@ -313,8 +313,8 @@ def update_completion(db_path: Path, run_id: str, *, expected_version: int, fiel
             params["run_id"] = run_id
             params["expected_version"] = expected_version
             cur = conn.execute(
-                f"""UPDATE completion SET {set_clause}, version = version + 1
-                    WHERE run_id = :run_id AND version = :expected_version""",
+                f"UPDATE completion SET {set_clause}, version = version + 1 "  # nosec B608 - `set_clause` keys were validated above by `_validate_updatable_completion_fields` against the fixed `_UPDATABLE_COMPLETION_FIELDS` allowlist (plus the hardcoded "updated_at" literal); all values are bound via `params`.
+                "WHERE run_id = :run_id AND version = :expected_version",
                 params,
             )
             if cur.rowcount != 1:

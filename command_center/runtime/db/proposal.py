@@ -227,7 +227,7 @@ def create_proposal(
     placeholders = ", ".join(f":{name}" for name in db._PROPOSAL_INSERT_COLUMNS)
     with db.connect(db_path) as conn:
         with db.transaction(conn):
-            conn.execute(f"INSERT INTO proposal ({columns}) VALUES ({placeholders})", record)
+            conn.execute(f"INSERT INTO proposal ({columns}) VALUES ({placeholders})", record)  # nosec B608 - columns/placeholders built from the hardcoded _PROPOSAL_INSERT_COLUMNS tuple, values passed via params dict
             stored = dict(
                 conn.execute("SELECT * FROM proposal WHERE id = ?", (record["id"],)).fetchone()
             )
@@ -293,7 +293,7 @@ def list_proposals(
     params.append(limit)
     with db.connect(db_path) as conn:
         rows = conn.execute(
-            f"SELECT * FROM proposal{where} ORDER BY created_at DESC, id DESC LIMIT ?", params
+            f"SELECT * FROM proposal{where} ORDER BY created_at DESC, id DESC LIMIT ?", params  # nosec B608 - where is built only from "project = ?"/"kind = ?" literals and a "state IN (?, ...)" fragment whose placeholder count matches states' length; all values bound via params
         ).fetchall()
         return [dict(row) for row in rows]
 
@@ -311,7 +311,7 @@ def list_proposals(
 
 def _proposal_next_seq(conn: sqlite3.Connection, table: str, proposal_id: str) -> int:
     row = conn.execute(
-        f"SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq FROM {table} WHERE proposal_id = ?",
+        f"SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq FROM {table} WHERE proposal_id = ?",  # nosec B608 - table is a private helper's own param, called only with the hardcoded literals "proposal_evidence"/"proposal_event" from this module; never caller-supplied
         (proposal_id,),
     ).fetchone()
     return row["next_seq"]
@@ -466,7 +466,7 @@ def _proposal_update(
     params["expected_version"] = expected_version
     cur = conn.execute(
         f"""UPDATE proposal SET {set_clause}, version = version + 1
-            WHERE id = :proposal_id AND version = :expected_version""",
+            WHERE id = :proposal_id AND version = :expected_version""",  # nosec B608 - set_clause keys are validated against _UPDATABLE_PROPOSAL_FIELDS by _validate_updatable_proposal_fields above (plus the code-added "updated_at" literal) before this string is built; values are bound via the params dict
         params,
     )
     if cur.rowcount != 1:
@@ -696,7 +696,7 @@ def create_proposal_atomic(
     placeholders = ", ".join(f":{name}" for name in db._PROPOSAL_INSERT_COLUMNS)
     with db.connect(db_path) as conn:
         with db.transaction(conn):
-            conn.execute(f"INSERT INTO proposal ({columns}) VALUES ({placeholders})", record)
+            conn.execute(f"INSERT INTO proposal ({columns}) VALUES ({placeholders})", record)  # nosec B608 - columns/placeholders built from the hardcoded _PROPOSAL_INSERT_COLUMNS tuple, values passed via params dict
             children: list[tuple[str, dict, str]] = []
             for e in evidence or []:
                 children.append(
