@@ -18,7 +18,17 @@ name: CI
 on:
   pull_request:
     branches: [main]
-    types: [opened, synchronize, reopened, labeled, unlabeled]
+    # No `unlabeled`: a label REMOVAL never runs the gates, so it must not
+    # create a check suite either. GitHub judges a required check by the
+    # newest check suite associated with the pull request; a skipped
+    # "label noise" suite created AFTER the real run (the window reconciler
+    # removes `review-window:waiting` right after admitting a PR) carries no
+    # "Final merge gate" and leaves the required check "expected" until the
+    # next real pull_request run -- live 2026-09-15/16, every fleet PR sat
+    # unmergeable with green CI (VOYN-W0-AICC-LABEL-NOISE-CHECK-SUITE-MASKS-
+    # REQUIRED-FINAL-MERGE-GATE). `labeled` stays: adding the window-entry
+    # label IS the trigger for a real run at the same SHA.
+    types: [opened, synchronize, reopened, labeled]
   # The merge queue tests the *prospective* merged result — this branch's
   # commits on top of whatever else the queue is about to land — rather than
   # the branch in isolation. Without this trigger the queue's checks never

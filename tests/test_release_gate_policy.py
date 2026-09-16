@@ -161,12 +161,17 @@ def test_release_context_names_and_workflow_coverage_are_exact() -> None:
             "push",
             "workflow_dispatch",
         }
+        # No `unlabeled`: a label removal never runs the gates, so it must not
+        # create a check suite either -- GitHub judges a required check by the
+        # newest PR-associated suite, and a skipped suite created after the
+        # real run left "Final merge gate" expected forever (VOYN-W0-AICC-
+        # LABEL-NOISE-CHECK-SUITE-MASKS-REQUIRED-FINAL-MERGE-GATE). `labeled`
+        # stays: the window-entry label is the trigger for a real run.
         assert set(workflow["on"]["pull_request"]["types"]) == {
             "opened",
             "synchronize",
             "reopened",
             "labeled",
-            "unlabeled",
         }
         if workflow is ci:
             assert workflow["permissions"] == {
@@ -551,9 +556,9 @@ def test_final_gate_is_fail_closed_for_every_upstream_result() -> None:
 
 
 def test_label_noise_never_cancels_or_reruns_the_head_gates():
-    """VOYN-W0-AICC-CI-SELF-CANCEL-SAME-SHA: `labeled`/`unlabeled` stay in the
-    trigger set for the `release-gate-canary-*` labels, but the queue
-    reconciler and operators move `queue-*` labels constantly. Reproduced
+    """VOYN-W0-AICC-CI-SELF-CANCEL-SAME-SHA: `labeled` stays in the trigger
+    set for the `release-gate-canary-*` labels and the window-entry label,
+    but the queue reconciler and operators move `queue-*` labels constantly. Reproduced
     3x on 2026-09-06 (PRs 649, 672, 762) and all night 2026-09-07/08: every
     label change started a second run on the same SHA inside the same
     concurrency group, `cancel-in-progress` killed the live run, its
@@ -598,7 +603,11 @@ def test_label_noise_never_cancels_or_reruns_the_head_gates():
         assert required_name == (
             f"${{{{ ({LABEL_NOISE_GUARD}) && 'Gate not run (label noise or outside review window)' || '{real_name}' }}}}"
         ), (workflow_name, required_name)
-    # Never traded for dropping the canary triggers: the release-gate canaries
-    # still need a fresh event carrying the label.
+    # `labeled` is never traded away: the release-gate canaries and the
+    # review-window entry both need a fresh event carrying the label. Label
+    # REMOVAL is no longer a trigger at all (see the `types` pin above): a
+    # removed canary label is re-tested by re-adding the entry label, not by
+    # a run that would only leave a skipped suite on top of the real one.
     ci = _workflow(CI_WORKFLOW)
-    assert {"labeled", "unlabeled"} <= set(ci["on"]["pull_request"]["types"])
+    assert "labeled" in set(ci["on"]["pull_request"]["types"])
+    assert "unlabeled" not in set(ci["on"]["pull_request"]["types"])

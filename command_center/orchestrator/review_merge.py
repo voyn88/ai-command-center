@@ -140,6 +140,18 @@ class ReviewConfig:
     #: with main). Bounded so a moving base cannot make the merge tick spend
     #: the whole tick re-updating branches that will just fall behind again.
     max_branch_updates_per_tick: int = 3
+    #: Per-tick cap on PR-gate re-triggers: when GitHub refuses to enqueue an
+    #: accepted, green PR because a required check is "expected" (the newest
+    #: PR-associated check suite is a skipped label-noise run that carries no
+    #: "Final merge gate"), the tick re-applies the window-entry label once so
+    #: a real `pull_request` run at the same SHA becomes the newest suite.
+    #: Bounded like branch updates: a label storm must not become a CI storm.
+    max_gate_retriggers_per_tick: int = 2
+    #: The window-entry label whose `labeled` event runs the gates; must be
+    #: the label the PR-window reconciler applies (asserted equal to
+    #: `DEFAULT_PR_WINDOW_CONFIG.label_active` in tests) so the tick and the
+    #: reconciler never disagree about which label opens the window.
+    gate_retrigger_label: str = "review-window:active"
     #: Per-tick cap on tasks EXAMINED (each examination costs gh API calls).
     #: Fairness across ticks comes from the rotating deterministic scan order
     #: below, not from unbounded scanning -- see the window-starvation note
@@ -3133,6 +3145,159 @@ def _merged_target_sha(repo_path: str, pr_url: str) -> tuple[str | None, str]:
     return oid, ""
 
 
+_EXPECTED_CHECK_RE = re.compile(r'Required status check "([^"]+)" is expected')
+
+
+def _ensure_merge_queue_entry(repo_path: str, pr_url: str) -> tuple[bool, str]:
+    """Make sure the PR is REALLY in the merge queue -- ask GitHub, and if it
+    is not, ask GitHub to enqueue it (a mutation: this is the merge tick's
+    own `gh pr merge` intent, retried through the API that reports WHY it is
+    refused). Called only for a PR that is still OPEN after `gh pr merge`.
+
+    `gh pr merge --squash` on a merge-queue-protected repository exits 0 as
+    soon as auto-merge is enabled -- that is a promise, not a queue entry.
+    Live 2026-09-15 19:18 UTC (#984): auto-merge enabled, every required
+    check green in the rollup, and GitHub never enqueued the PR for seven
+    hours; the tick kept reporting `merge_queued_awaiting_target`. GitHub's
+    reason, visible only from `enqueuePullRequest`, was `Required status
+    check "Final merge gate" is expected`: it judges a required check by the
+    newest check suite ASSOCIATED WITH THE PR, and the newest one was a
+    skipped label-noise run (VOYN-W0-AICC-LABEL-NOISE-CHECK-SUITE-MASKS-
+    REQUIRED-FINAL-MERGE-GATE). Returns ``(True, reason)`` when the PR is in
+    the queue (or was just enqueued here), else ``(False, reason)`` with
+    ``required_check_expected: <name>`` for that case and
+    ``enqueue_refused: <message>`` for any other refusal. Best-effort: a
+    lookup failure keeps the old optimistic reason."""
+    parsed = _owner_repo_number_from_pr_url(pr_url)
+    if parsed is None:
+        return True, "merge_queued_awaiting_target"
+    owner, repo, number = parsed
+    query = (
+        'query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo)'
+        '{pullRequest(number:$number){id isInMergeQueue}}}'
+    )
+    view = _gh(
+        ["api", "graphql", "-f", f"query={query}", "-F", f"owner={owner}",
+         "-F", f"repo={repo}", "-F", f"number={number}"],
+        repo_path,
+    )
+    if view.returncode != 0:
+        return True, "merge_queued_awaiting_target"
+    try:
+        pull = json.loads(view.stdout or "{}")["data"]["repository"]["pullRequest"]
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return True, "merge_queued_awaiting_target"
+    if pull.get("isInMergeQueue"):
+        return True, "merge_queued_awaiting_target"
+    node_id = str(pull.get("id") or "")
+    if not node_id:
+        return True, "merge_queued_awaiting_target"
+    mutation = (
+        'mutation($id:ID!){enqueuePullRequest(input:{pullRequestId:$id})'
+        '{mergeQueueEntry{state}}}'
+    )
+    enqueue = _gh(
+        ["api", "graphql", "-f", f"query={mutation}", "-F", f"id={node_id}"], repo_path
+    )
+    messages: list[str] = []
+    try:
+        payload = json.loads(enqueue.stdout or "{}")
+        for error in payload.get("errors") or []:
+            if isinstance(error, dict) and error.get("message"):
+                messages.append(str(error["message"]))
+        if not messages and (payload.get("data") or {}).get("enqueuePullRequest"):
+            return True, "merge_enqueued_awaiting_target"
+    except (json.JSONDecodeError, AttributeError):
+        pass
+    if not messages and (enqueue.stderr or "").strip():
+        messages.append(enqueue.stderr.strip())
+    if enqueue.returncode == 0 and not messages:
+        return True, "merge_enqueued_awaiting_target"
+    # Every error is scanned, not only the first: GitHub may list several
+    # unmet requirements and the one this tick can act on need not lead.
+    for message in messages:
+        expected = _EXPECTED_CHECK_RE.search(message)
+        if expected:
+            return False, f"required_check_expected: {expected.group(1)}"
+    return False, f"enqueue_refused: {' | '.join(messages)[:100]}"
+
+
+def _gates_already_retriggered_on_head(
+    repo_path: str, pr_url: str, label: str, head_committed_at: str
+) -> bool:
+    """Whether this tick (any tick) has already re-applied the entry label
+    for the PR's CURRENT head: a `labeled` timeline event with that label
+    after the head commit's date. GitHub is the durable memory, so the bound
+    holds across ticks and restarts -- a check that is GENUINELY never
+    reported (a renamed required context, a path-filtered workflow) gets
+    exactly one re-trigger per head and then a loud
+    `required_check_expected_after_retrigger`, not a label/CI storm every
+    tick until someone notices (review of 00e11855, finding 2). A lookup
+    failure reads as "already done": failing closed costs one missed retry,
+    the other way costs a CI run per tick."""
+    parsed = _owner_repo_number_from_pr_url(pr_url)
+    if parsed is None or not head_committed_at:
+        return True
+    owner, repo, number = parsed
+    events = _gh(
+        ["api", f"repos/{owner}/{repo}/issues/{number}/timeline?per_page=100",
+         "--paginate", "--jq",
+         '[.[] | select(.event == "labeled") | {label: .label.name, at: .created_at}]'],
+        repo_path,
+    )
+    if events.returncode != 0:
+        return True
+    try:
+        rows = json.loads(events.stdout or "[]")
+    except json.JSONDecodeError:
+        return True
+    if isinstance(rows, dict):
+        rows = [rows]
+    flat: list[dict[str, Any]] = []
+    for row in rows:
+        flat.extend(row if isinstance(row, list) else [row])
+    return any(
+        isinstance(row, dict)
+        and row.get("label") == label
+        and str(row.get("at") or "") > str(head_committed_at)
+        for row in flat
+    )
+
+
+def _head_committed_at(repo_path: str, pr_url: str) -> str:
+    """ISO timestamp of the PR head commit ('' when unavailable)."""
+    view = _gh(["pr", "view", pr_url, "--json", "commits"], repo_path)
+    if view.returncode != 0:
+        return ""
+    try:
+        commits = json.loads(view.stdout or "{}").get("commits") or []
+    except (json.JSONDecodeError, AttributeError):
+        return ""
+    if not commits:
+        return ""
+    last = commits[-1] if isinstance(commits[-1], dict) else {}
+    return str(last.get("committedDate") or "")
+
+
+def _retrigger_pr_gates(repo_path: str, pr_url: str, label: str) -> bool:
+    """Make a real `pull_request` run the newest PR-associated check suite
+    at the SAME head: remove and re-add the window-entry label. Removal
+    creates no suite (the gated workflows do not trigger on `unlabeled`);
+    the `labeled` event with the entry label runs every gate. Dispatching
+    the workflow on the branch and re-running the older run were both
+    tried live (2026-09-16 02:20 and 02:42 UTC) and did not count: a
+    dispatch suite is not associated with the PR, a rerun does not change
+    suite order. REST labels endpoints, like the window reconciler."""
+    parsed = _owner_repo_number_from_pr_url(pr_url)
+    if parsed is None:
+        return False
+    owner, repo, number = parsed
+    issues = f"repos/{owner}/{repo}/issues/{number}/labels"
+    _gh(["api", "--method", "DELETE", f"{issues}/{urllib.parse.quote(label)}"], repo_path)
+    added = _gh(["api", "--method", "POST", issues, "-f", f"labels[]={label}"], repo_path)
+    return added.returncode == 0
+
+
 def _rerun_failed_ci_once(repo_path: str, pr_url: str) -> str:
     """Bounded flake retry (VOYN-W0-AICC-CI-FLAKE-AUTO-RERUN): rerun the
     FAILED jobs of completed-and-failed workflow runs on the PR's current
@@ -3753,6 +3918,7 @@ def _merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -
     )
     last_processed = None
     branch_updates = 0
+    gate_retriggers = 0
     actions = 0
     open_pr_snapshot, _snapshot_failure = _merge_window_open_pr_snapshot(repo_path)
     origin = _origin_owner_repo(repo_path) if open_pr_snapshot is not None else None
@@ -3884,8 +4050,38 @@ def _merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -
             if merge_sha is None:
                 if merge_reason == "merged_without_acceptance_evidence":
                     reason = merge_reason
-                elif merged.returncode == 0:
+                elif merged.returncode == 0 and merge_reason != "not_merged":
+                    # The PR is not OPEN any more but its merge could not be
+                    # verified (`merge_commit_missing`, `pr_view_failed`):
+                    # nothing to enqueue; keep the old optimistic reason and
+                    # let a later tick read the target branch.
                     reason = "merge_queued_awaiting_target"
+                elif merged.returncode == 0:
+                    # Exit 0 only means auto-merge is enabled. Ask GitHub
+                    # whether the PR is in the queue (enqueueing it if not);
+                    # if GitHub refuses because a required check is
+                    # "expected" -- the rollup is green but the newest
+                    # PR-associated suite is a skipped label-noise run --
+                    # re-trigger the gates so the next tick finds a real
+                    # suite on top: at most once per head (the PR timeline
+                    # is the memory) and at most a few per tick.
+                    queued, reason = _ensure_merge_queue_entry(repo_path, pr_url)
+                    if not queued and reason.startswith("required_check_expected"):
+                        if _gates_already_retriggered_on_head(
+                            repo_path, pr_url, cfg.gate_retrigger_label,
+                            _head_committed_at(repo_path, pr_url),
+                        ):
+                            reason = reason.replace(
+                                "required_check_expected",
+                                "required_check_expected_after_retrigger", 1,
+                            )
+                        elif gate_retriggers < cfg.max_gate_retriggers_per_tick:
+                            gate_retriggers += 1
+                            actions += 1
+                            if _retrigger_pr_gates(
+                                repo_path, pr_url, cfg.gate_retrigger_label
+                            ):
+                                reason = f"{reason}; gates_retriggered"
                 else:
                     reason = f"merge_failed: {merged.stderr.strip()[:100]}"
                 report.skipped.append((task_id, reason))
