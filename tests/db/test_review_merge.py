@@ -294,6 +294,49 @@ def test_review_skips_when_the_diff_fetch_fails(rig, _test_repo_routes, monkeypa
     )
 
 
+def test_review_skips_prs_outside_the_active_review_window(rig, _test_repo_routes, monkeypatch):  # noqa: F811,E501
+    """The review tick must honor the cheap PR-window triage before fetching
+    diffs for the backlog tail."""
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-RW", "https://github.com/x/repo-d2/pull/112")
+    gh_calls = []
+
+    def fake_gh(argv, repo):
+        import subprocess
+
+        gh_calls.append(argv)
+        if argv[0] == "api" and argv[1] == "repos/x/repo-d2/pulls/112":
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                json.dumps({
+                    "state": "open",
+                    "merged_at": None,
+                    "labels": [{"name": "review-window:waiting"}],
+                    "base": {"sha": BASE, "repo": {"full_name": "x/repo-d2"}},
+                    "head": {"sha": "a" * 40},
+                    "changed_files": 1,
+                    "additions": 1,
+                    "deletions": 0,
+                }),
+                "",
+            )
+        return subprocess.CompletedProcess(argv, 1, "", "unexpected expensive lookup")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    enqueued = []
+
+    report = review_once(
+        app_factory,
+        lambda q, k, p, tid, attempts: enqueued.append((q, k, p, tid, attempts)),
+        "/tmp",
+    )
+
+    assert ("VOYN-W0-RW", "review_window_inactive") in report.skipped
+    assert enqueued == []
+    assert gh_calls == [["api", "repos/x/repo-d2/pulls/112"]]
+
+
 def test_review_chunks_a_diff_over_the_single_prompt_cap(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
     app_factory, store, _ = rig
     _ready(store, app_factory, "VOYN-W0-R4", "https://github.com/x/repo-d2/pull/13")
@@ -379,6 +422,45 @@ def test_merge_requires_accept_marker_and_green_checks(rig, monkeypatch):  # noq
         assert cur.fetchone()[0] == "DONE"
         cur.execute("SELECT value FROM backlog_evidence WHERE task_id=%s AND kind='sha'", ("VOYN-W0-M1",))
         assert cur.fetchone()[0] == merge_oid
+
+
+def test_merge_skips_prs_outside_the_active_review_window(rig, monkeypatch):  # noqa: F811,E501
+    """The merge tick must honor the cheap PR-window triage before spending
+    GraphQL detail reads on a READY_TO_REVIEW backlog tail."""
+    import subprocess as sp
+
+    app_factory, store, _ = rig
+    pr_url = "https://github.com/x/y/pull/208"
+    _ready(store, app_factory, "VOYN-W0-MW", pr_url)
+    porcelain_calls = []
+
+    def fake_rest_json(repo_path, path):
+        assert path == "repos/x/y/pulls/208"
+        return review_merge._REST_OK, {
+            "state": "open",
+            "merged_at": None,
+            "labels": [{"name": "review-window:waiting"}],
+        }
+
+    def fake_gh(argv, repo):
+        porcelain_calls.append(argv)
+        return sp.CompletedProcess(argv, 1, "", "unexpected expensive lookup")
+
+    monkeypatch.setattr(
+        review_merge,
+        "_merge_window_open_pr_snapshot",
+        lambda repo_path: (None, "pr_list_failed"),
+    )
+    monkeypatch.setattr(review_merge, "_rest_json", fake_rest_json)
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+
+    report = merge_once(app_factory, "/tmp")
+
+    assert ("VOYN-W0-MW", "merge_window_inactive") in report.skipped
+    assert porcelain_calls == []
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-MW",))
+        assert cur.fetchone()[0] == "READY_TO_REVIEW"
 
 
 def test_merge_skips_a_self_issued_marker_from_the_pr_author(rig, monkeypatch):  # noqa: F811
@@ -1128,7 +1210,7 @@ def test_publish_verdict_skips_when_already_posted(rig, monkeypatch):  # noqa: F
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     report = publish_review_verdicts(app_factory, "/tmp")
     assert ("VOYN-W0-P4", "marker_already_posted") in report.skipped
-    assert not posted
+    assert posted == [["api", "repos/x/y/pulls/14"]]
 
 
 def test_publish_verdict_a_review_of_an_old_head_never_gets_read_as_current(rig, monkeypatch):  # noqa: F811
@@ -1167,7 +1249,7 @@ def test_publish_verdict_a_review_of_an_old_head_never_gets_read_as_current(rig,
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     report = publish_review_verdicts(app_factory, "/tmp")
     assert ("VOYN-W0-P5", "no_review_result_yet") in report.skipped
-    assert not posted
+    assert posted == [["api", "repos/x/y/pulls/15"]]
 
 
 def test_merge_skips_when_a_check_is_red(rig, monkeypatch):  # noqa: F811
@@ -3942,9 +4024,49 @@ def test_queue_selected_prs_shed_stale_blocked_labels(monkeypatch):
     assert report.active == [(10, active_head)]
     assert report.waiting == [(11, waiting_head)]
     assert ("10", "remove", "review-window:blocked") in fake.labels
-    assert ("10", "add", "review-window:active") in fake.labels
+    assert ("10", "add", "review-window:active") not in fake.labels
     assert ("11", "remove", "review-window:blocked") in fake.labels
-    assert ("11", "add", "review-window:waiting") in fake.labels
+    assert ("11", "add", "review-window:waiting") not in fake.labels
+
+
+def test_queue_selected_prs_shed_blocked_labels_even_with_block_reason(monkeypatch):
+    """Queue ownership is a stronger window signal than stale window evidence.
+
+    A queue-selected PR may still be old, missing an accept marker, or waiting
+    on stale checks. Those are still merge-gate concerns, but the PR-window
+    reconciler must not keep or re-add `review-window:blocked` next to
+    `queue-active`/`queue-waiting-review`; that contradictory label pair is
+    exactly what made review/merge ticks rescan the dirty tail."""
+    active_head = "7" * 40
+    waiting_head = "8" * 40
+    prs = [
+        _win_pr(
+            12,
+            "2020-01-01T00:00:00Z",
+            active_head,
+            labels=["queue-active", "review-window:blocked"],
+        ),
+        _win_pr(
+            13,
+            "2020-01-02T00:00:00Z",
+            waiting_head,
+            labels=["queue-waiting-review", "review-window:blocked"],
+        ),
+    ]
+    fake = _RestGitHub(prs)
+    monkeypatch.setattr(review_merge, "_gh", fake)
+
+    report = reconcile_pr_window(
+        "/repo", PrWindowConfig(max_active=1, stale_seconds=1)
+    )
+
+    assert report.blocked == []
+    assert report.active == [(12, active_head)]
+    assert report.waiting == [(13, waiting_head)]
+    assert ("12", "remove", "review-window:blocked") in fake.labels
+    assert ("12", "add", "review-window:active") not in fake.labels
+    assert ("13", "remove", "review-window:blocked") in fake.labels
+    assert ("13", "add", "review-window:waiting") not in fake.labels
 
 
 def test_window_listing_failure_is_reported_not_silently_empty(monkeypatch):
@@ -4161,3 +4283,51 @@ def test_a_failed_detail_lookup_leaves_the_existing_label_untouched(monkeypatch)
     assert {n for n, _ in report.unreadable} == {1, 2, 3}
     assert report.active == [] and report.waiting == [] and report.blocked == []
     assert fake.labels == [], "no evidence, no label change"
+
+
+def _rollup_entry(name: str, conclusion: str, started_at: str | None):
+    entry = {"name": name, "conclusion": conclusion}
+    if started_at is not None:
+        entry["startedAt"] = started_at
+    return entry
+
+
+def test_agreeing_twin_runs_of_one_check_are_not_ambiguous():
+    """Live 2026-09-15, #974: the label-noise placeholder job shares one
+    expression-shaped name across every skipped run; several started in the
+    same second, and the ACCEPTED PR sat unmergeable on `AMBIGUOUS`."""
+    noise = "((github.event_name == 'pull_request' && ...) && 'Gate not run' || 'Build gates'"
+    rollup = [
+        _rollup_entry(noise, "SKIPPED", "2026-09-15T07:13:02Z"),
+        _rollup_entry(noise, "SKIPPED", "2026-09-15T07:13:02Z"),
+        _rollup_entry(noise, "SKIPPED", "2026-09-15T13:11:40Z"),
+        _rollup_entry("Final merge gate", "SUCCESS", "2026-09-15T07:20:00Z"),
+    ]
+    latest = {c["name"]: c for c in review_merge._latest_checks_by_name(rollup)}
+    assert latest[noise]["conclusion"] == "SKIPPED"
+    assert all(review_merge._check_is_green(c) for c in latest.values())
+
+
+def test_disagreeing_twin_runs_of_one_check_stay_ambiguous():
+    rollup = [
+        _rollup_entry("Linux quality shard 1 of 4", "SUCCESS", "2026-09-15T07:13:02Z"),
+        _rollup_entry("Linux quality shard 1 of 4", "FAILURE", "2026-09-15T07:13:02Z"),
+    ]
+    (only,) = review_merge._latest_checks_by_name(rollup)
+    assert only["conclusion"] == "AMBIGUOUS"
+    assert not review_merge._check_is_green(only)
+    unstamped = [
+        _rollup_entry("Final merge gate", "SUCCESS", None),
+        _rollup_entry("Final merge gate", "FAILURE", "2026-09-15T07:13:02Z"),
+    ]
+    (only,) = review_merge._latest_checks_by_name(unstamped)
+    assert only["conclusion"] == "AMBIGUOUS"
+
+
+def test_agreeing_unstamped_twins_carry_their_shared_verdict():
+    rollup = [
+        _rollup_entry("Build gates (web production)", "SKIPPED", None),
+        _rollup_entry("Build gates (web production)", "SKIPPED", "2026-09-15T07:13:02Z"),
+    ]
+    (only,) = review_merge._latest_checks_by_name(rollup)
+    assert only["conclusion"] == "SKIPPED"

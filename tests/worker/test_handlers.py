@@ -586,6 +586,86 @@ def test_copilot_provider_failure_switches_inside_the_same_attempt(
     ]
 
 
+def test_codex_usage_limit_switches_inside_the_same_attempt(handler, monkeypatch):
+    """Live 2026-09-11: Codex quota used to complete the review as succeeded
+    with an empty result. It must failover like Copilot, not publish."""
+    run_agent, runs = handler
+
+    def failed_codex(**kwargs):
+        if kwargs["executor"] == "codex":
+            return agent_runner.RunResult(
+                status="failed",
+                exit_code=1,
+                stdout="",
+                stderr=(
+                    "ERROR: You've hit your usage limit. Visit "
+                    "https://chatgpt.com/codex/settings/usage to purchase more "
+                    "credits or try again at Sep 15th, 2026 1:24 AM."
+                ),
+                duration_seconds=0.1,
+                started_at="2026-09-11T12:00:00+00:00",
+                completed_at="2026-09-11T12:00:03+00:00",
+            )
+        runs.append(kwargs)
+        return agent_runner.RunResult(
+            status="completed",
+            exit_code=0,
+            stdout='{"result": "done"}',
+            stderr="",
+            duration_seconds=0.1,
+            started_at="2026-09-11T12:00:03+00:00",
+            completed_at="2026-09-11T12:00:04+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", failed_codex)
+    payload = _cascade_payload()
+    payload["cascade"] = [
+        {"executor": "codex", "task_type": "review"},
+        {"executor": "claude", "task_type": "review"},
+    ]
+    outcome = run_agent(payload, _event(), 1)
+
+    assert outcome.ok
+    assert runs[-1]["executor"] == "claude"
+    assert outcome.result["cascade_step"] == 2
+    assert outcome.result["route_failovers"] == [
+        {
+            "cascade_step": 1,
+            "executor": "codex",
+            "reason": "provider_auth_or_quota",
+        }
+    ]
+
+
+def test_codex_usage_limit_on_the_last_link_is_infra_not_success(handler, monkeypatch):
+    run_agent, runs = handler
+
+    def failed_codex(**kwargs):
+        runs.append(kwargs)
+        return agent_runner.RunResult(
+            status="failed",
+            exit_code=1,
+            stdout="",
+            stderr=(
+                "ERROR: You've hit your usage limit. Visit "
+                "https://chatgpt.com/codex/settings/usage to purchase more "
+                "credits or try again at Sep 15th, 2026 1:24 AM."
+            ),
+            duration_seconds=0.1,
+            started_at="2026-09-11T12:00:00+00:00",
+            completed_at="2026-09-11T12:00:03+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", failed_codex)
+    payload = _cascade_payload()
+    payload["cascade"] = [{"executor": "codex", "task_type": "review"}]
+    outcome = run_agent(payload, _event(), 1)
+
+    assert not outcome.ok and outcome.retryable and outcome.infra_wait
+    assert [run["executor"] for run in runs] == ["codex"]
+    assert "provider/auth/quota" in outcome.reason
+
+
 @pytest.mark.parametrize("workspace_unchanged", [True, False])
 def test_mutating_provider_failover_requires_unchanged_workspace(
     handler, monkeypatch, workspace_unchanged
@@ -2299,4 +2379,280 @@ def test_review_head_refresh_fetches_the_pull_ref_before_isolated_pin(
     )
     assert (failure, retryable) == (None, False) and target is not None
     assert _git("-C", str(target), "rev-parse", "HEAD").stdout.strip() == pin
+    handlers_module._remove_read_only_isolated_checkout(target)
+
+
+# -- infra-class failures refund the attempt --------------------------------
+# (VOYN-W0-AICC-INFRA-FAILURES-BURN-TASK-ATTEMPTS, worker-01 2026-09-14)
+
+
+def _implementation_cascade_payload():
+    payload = _payload(task_type="implementation")
+    payload["cascade"] = [
+        {"executor": "claude", "task_type": "implementation"},
+        {"executor": "codex", "task_type": "implementation"},
+    ]
+    return payload
+
+
+def test_preflight_failover_wraps_back_to_an_earlier_healthy_link(
+    handler, monkeypatch
+) -> None:
+    """Attempt 2 selects the second link by construction; when THAT executor
+    is the one that is down, the healthy first link must still serve the
+    delivery instead of the attempt being spent on a routing fact."""
+    run_agent, runs = handler
+    monkeypatch.setattr(
+        agent_runner, "codex_workspace_write_preflight", lambda: (False, "quota")
+    )
+    outcome = run_agent(_implementation_cascade_payload(), _event(), 2)
+    assert outcome.ok
+    assert outcome.result["cascade_step"] == 1
+    assert runs[0]["executor"] == "claude"
+
+
+def test_no_healthy_cascade_link_is_an_infra_wait_not_a_spent_attempt(
+    handler, monkeypatch
+) -> None:
+    run_agent, runs = handler
+    monkeypatch.setattr(
+        agent_runner, "codex_workspace_write_preflight", lambda: (False, "quota")
+    )
+    monkeypatch.setattr(
+        agent_runner, "claude_cli_preflight", lambda binary=None: (False, "expired")
+    )
+    outcome = run_agent(_implementation_cascade_payload(), _event(), 1)
+    assert not outcome.ok and outcome.retryable and outcome.infra_wait
+    assert "unavailable" in outcome.reason
+    assert runs == []
+
+
+def _checkpoint_mismatch(spec):
+    raise workspace_provisioning.WorkspaceVerificationError(
+        failed_step="task_workspace_checkpoint",
+        remediation="Recover the uncheckpointed branch through trusted operator review.",
+        expected_workspace=str(spec.workspace_path),
+        actual_workspace=str(spec.workspace_path),
+        expected_branch=spec.expected_branch,
+        detail="saved HEAD 1111111 differs from signed checkpoint 2222222",
+    )
+
+
+def test_uncheckpointed_clone_is_quarantined_and_the_attempt_refunded(
+    handler, monkeypatch
+) -> None:
+    run_agent, runs = handler
+    monkeypatch.setattr(
+        workspace_provisioning, "provision_and_verify", _checkpoint_mismatch
+    )
+    quarantined: list[str] = []
+
+    def fake_quarantine(workspace):
+        quarantined.append(str(workspace))
+        return f"{workspace}.quarantined"
+
+    monkeypatch.setattr(
+        workspace_provisioning, "quarantine_task_workspace", fake_quarantine
+    )
+    outcome = run_agent(_payload(task_type="implementation"), _event(), 1)
+    assert not outcome.ok and outcome.retryable and outcome.infra_wait
+    assert "task_workspace_checkpoint" in outcome.reason
+    assert "quarantined at" in outcome.reason
+    assert len(quarantined) == 1
+    assert runs == []
+
+
+def test_uncheckpointed_clone_that_cannot_be_quarantined_still_spends_the_attempt(
+    handler, monkeypatch
+) -> None:
+    """Fail closed: if the clone could not be moved aside, the next delivery
+    would hit the same mismatch, so the bounded attempt budget must apply."""
+    run_agent, runs = handler
+    monkeypatch.setattr(
+        workspace_provisioning, "provision_and_verify", _checkpoint_mismatch
+    )
+    monkeypatch.setattr(
+        workspace_provisioning, "quarantine_task_workspace", lambda workspace: None
+    )
+    outcome = run_agent(_payload(task_type="implementation"), _event(), 1)
+    assert not outcome.ok and outcome.retryable and not outcome.infra_wait
+    assert "could not be quarantined" in outcome.reason
+    assert runs == []
+
+
+def test_other_verification_failures_keep_the_ordinary_retry_path(
+    handler, monkeypatch
+) -> None:
+    def branch_missing(spec):
+        raise workspace_provisioning.WorkspaceVerificationError(
+            failed_step="base_branch_present",
+            remediation="Create the base branch.",
+            expected_workspace=str(spec.workspace_path),
+            actual_workspace=str(spec.workspace_path),
+            expected_branch=spec.expected_branch,
+            detail="base branch is missing",
+        )
+
+    run_agent, runs = handler
+    monkeypatch.setattr(workspace_provisioning, "provision_and_verify", branch_missing)
+    outcome = run_agent(_payload(task_type="implementation"), _event(), 1)
+    assert not outcome.ok and outcome.retryable and not outcome.infra_wait
+    assert runs == []
+
+
+def test_unknown_executor_name_in_cascade_is_a_task_fact_not_an_infra_wait(
+    handler, monkeypatch
+) -> None:
+    run_agent, runs = handler
+    payload = _payload(task_type="implementation")
+    payload["cascade"] = [
+        {"executor": "codex", "task_type": "implementation"},
+        {"executor": "no-such-executor", "task_type": "implementation"},
+    ]
+    monkeypatch.setattr(
+        agent_runner, "codex_workspace_write_preflight", lambda: (False, "quota")
+    )
+    outcome = run_agent(payload, _event(), 1)
+    assert not outcome.ok and outcome.retryable and not outcome.infra_wait
+    assert "no-such-executor" in outcome.reason
+    assert runs == []
+
+
+def test_uncheckpointed_clone_is_left_in_place_when_the_lease_is_lost(
+    handler, monkeypatch
+) -> None:
+    run_agent, runs = handler
+    monkeypatch.setattr(
+        workspace_provisioning, "provision_and_verify", _checkpoint_mismatch
+    )
+    called: list[str] = []
+    monkeypatch.setattr(
+        workspace_provisioning,
+        "quarantine_task_workspace",
+        lambda workspace: called.append(str(workspace)) or "q",
+    )
+    lost = _event()
+    lost.set()
+    outcome = run_agent(_payload(task_type="implementation"), lost, 1)
+    assert not outcome.ok and outcome.retryable and not outcome.infra_wait
+    assert "lease lost" in outcome.reason
+    assert called == [] and runs == []
+
+
+def test_lease_lost_during_quarantine_restores_the_clone(handler, monkeypatch) -> None:
+    run_agent, runs = handler
+    monkeypatch.setattr(
+        workspace_provisioning, "provision_and_verify", _checkpoint_mismatch
+    )
+    lost = _event()
+    restored: list[tuple[str, str]] = []
+
+    def quarantine(workspace):
+        lost.set()  # the lease evaporates while the move is in flight
+        return f"{workspace}.quarantined"
+
+    monkeypatch.setattr(workspace_provisioning, "quarantine_task_workspace", quarantine)
+    monkeypatch.setattr(
+        workspace_provisioning,
+        "restore_quarantined_task_workspace",
+        lambda q, w: restored.append((str(q), str(w))) or True,
+    )
+    outcome = run_agent(_payload(task_type="implementation"), lost, 1)
+    assert not outcome.ok and outcome.retryable and not outcome.infra_wait
+    assert "clone restored" in outcome.reason
+    assert len(restored) == 1 and runs == []
+def _commit_on_pr_ref(source, number: int, filename: str) -> str:
+    """A commit reachable ONLY through refs/remotes/origin/pr/<number>/head,
+    the layout the host source mirror produces for review heads."""
+    (source / filename).write_text(f"{filename}\n")
+    assert _git("-C", str(source), "add", filename).returncode == 0
+    assert (
+        _git(
+            "-C", str(source), "-c", "user.email=t@t", "-c", "user.name=t",
+            "commit", "-q", "-m", filename,
+        ).returncode
+        == 0
+    )
+    sha = _git("-C", str(source), "rev-parse", "HEAD").stdout.strip()
+    assert (
+        _git(
+            "-C", str(source), "update-ref", f"refs/remotes/origin/pr/{number}/head", sha
+        ).returncode
+        == 0
+    )
+    assert _git("-C", str(source), "reset", "-q", "--hard", "HEAD~1").returncode == 0
+    return sha
+
+
+def test_read_only_isolated_checkout_fetches_only_the_pinned_pr_ref(
+    tmp_path, monkeypatch
+) -> None:
+    """Real git: the pin lives only under a mirrored pr ref. The clone must
+    reach it by fetching THAT ref, not every pr ref -- ~900 loose
+    `refs/remotes/source-pr/<N>/head` directories put the clone past the
+    launcher's 256-pending-directory walk budget (worker-01, 2026-09-14)."""
+    from command_center import agent_runner
+    from command_center.worker import handlers as handlers_module
+
+    source = tmp_path / "source"
+    _git_repo_with_one_commit(source)
+    pinned = _commit_on_pr_ref(source, 7, "seven.txt")
+    for number in range(100, 140):
+        _commit_on_pr_ref(source, number, f"pr-{number}.txt")
+    root = tmp_path / "root"
+    root.mkdir()
+    monkeypatch.setattr(agent_runner, "principal_workspace_root", lambda: root)
+    target, failure, _ = handlers_module._read_only_isolated_checkout(
+        source, pin_sha=pinned
+    )
+    assert failure is None and target is not None
+    assert _git("-C", str(target), "rev-parse", "HEAD").stdout.strip() == pinned
+    loose = target / ".git" / "refs" / "remotes" / "source-pr"
+    loose_dirs = [p for p in loose.iterdir() if p.is_dir()] if loose.exists() else []
+    assert loose_dirs == [], loose_dirs
+    handlers_module._remove_read_only_isolated_checkout(target)
+
+
+def test_read_only_isolated_checkout_packs_refs_after_a_wholesale_pr_fetch(
+    tmp_path, monkeypatch
+) -> None:
+    """When no ref points at the pin exactly (an older head still reachable
+    from a pr ref) the wholesale fetch is the fallback -- and its loose ref
+    directories must be packed away before the launcher walks the clone."""
+    from command_center import agent_runner
+    from command_center.worker import handlers as handlers_module
+
+    source = tmp_path / "source"
+    _git_repo_with_one_commit(source)
+    older = _commit_on_pr_ref(source, 7, "seven.txt")
+    assert _git("-C", str(source), "checkout", "-q", older).returncode == 0
+    (source / "eight.txt").write_text("eight\n")
+    assert _git("-C", str(source), "add", "eight.txt").returncode == 0
+    assert (
+        _git(
+            "-C", str(source), "-c", "user.email=t@t", "-c", "user.name=t",
+            "commit", "-q", "-m", "newer",
+        ).returncode
+        == 0
+    )
+    newer = _git("-C", str(source), "rev-parse", "HEAD").stdout.strip()
+    assert (
+        _git("-C", str(source), "update-ref", "refs/remotes/origin/pr/7/head", newer)
+        .returncode
+        == 0
+    )
+    assert _git("-C", str(source), "checkout", "-q", "-").returncode == 0
+    for number in range(100, 130):
+        _commit_on_pr_ref(source, number, f"pr-{number}.txt")
+    root = tmp_path / "root"
+    root.mkdir()
+    monkeypatch.setattr(agent_runner, "principal_workspace_root", lambda: root)
+    target, failure, _ = handlers_module._read_only_isolated_checkout(
+        source, pin_sha=older
+    )
+    assert failure is None and target is not None
+    assert _git("-C", str(target), "rev-parse", "HEAD").stdout.strip() == older
+    loose = target / ".git" / "refs" / "remotes" / "source-pr"
+    loose_dirs = [p for p in loose.iterdir() if p.is_dir()] if loose.exists() else []
+    assert loose_dirs == [], loose_dirs
     handlers_module._remove_read_only_isolated_checkout(target)

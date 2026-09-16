@@ -2200,6 +2200,8 @@ def test_the_control_profile_installs_the_pr_window_tick(tmp_path):
         "voyn-aicc-review.timer",
         "voyn-aicc-merge.service",
         "voyn-aicc-merge.timer",
+        "voyn-aicc-remediate.service",
+        "voyn-aicc-remediate.timer",
         "voyn-aicc-pr-window.service",
         "voyn-aicc-pr-window.timer",
     )
@@ -2224,6 +2226,7 @@ def test_the_review_and_merge_units_are_immutable_control_ticks(tmp_path):
     for unit, command in (
         ("review", "backlog-review"),
         ("merge", "backlog-merge"),
+        ("remediate", "backlog-remediate"),
     ):
         service = (
             root / f"deploy/systemd/voyn-aicc-{unit}.service"
@@ -2318,3 +2321,66 @@ def test_the_installer_starts_the_control_timers_after_it_commits(tmp_path):
     assert text.index(enable) < text.index(
         "echo \"AICC_AGENT_PRINCIPAL_ISOLATION_INSTALLED\""
     ), "a failed enable must not be announced as a completed install"
+
+
+def test_workspace_walk_holds_descriptors_per_pending_directory_not_per_visited_one(
+    launcher, monkeypatch, tmp_path
+):
+    """One fd per PENDING directory is the walk's contract; a leak of one fd per
+    VISITED directory (the old `os.scandir(os.dup(fd))`) exhausts the soft
+    RLIMIT_NOFILE on any wide tree and surfaced as "entry changed while
+    opening" (worker-01, 2026-09-15). Walk 400 shallow directories under a
+    120-descriptor limit: it must finish and normalize every mode."""
+    import resource
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    # 20 x 20 = 400 directories VISITED, but never more than ~40 PENDING at
+    # once: the walk legitimately holds one fd per pending directory, so a
+    # per-visit leak is what a 120-descriptor limit exposes here.
+    for outer in range(20):
+        for inner in range(20):
+            leaf = workspace / f"pkg{outer:02d}" / f"sub{inner:02d}"
+            leaf.mkdir(parents=True)
+            (leaf / "module.py").write_text("x = 1\n", encoding="utf-8")
+    monkeypatch.setattr(
+        launcher.grp, "getgrnam", lambda name: SimpleNamespace(gr_gid=os.getgid())
+    )
+    monkeypatch.setattr(launcher.os, "chown", lambda *args, **kwargs: None)
+    monkeypatch.setattr(launcher, "_tracked_executables", lambda path: frozenset())
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (min(120, soft), hard))
+    try:
+        launcher._prepare_workspace_permissions(workspace)
+    finally:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+    assert stat.S_IMODE((workspace / "pkg19" / "sub19").stat().st_mode) == 0o2770
+    assert (
+        stat.S_IMODE((workspace / "pkg19" / "sub19" / "module.py").stat().st_mode)
+        == 0o660
+    )
+
+
+def test_workspace_walk_names_descriptor_exhaustion_honestly(
+    launcher, monkeypatch, tmp_path
+):
+    workspace = tmp_path / "workspace"
+    (workspace / "a").mkdir(parents=True)
+    monkeypatch.setattr(
+        launcher.grp, "getgrnam", lambda name: SimpleNamespace(gr_gid=os.getgid())
+    )
+    monkeypatch.setattr(launcher.os, "chown", lambda *args, **kwargs: None)
+    monkeypatch.setattr(launcher, "_tracked_executables", lambda path: frozenset())
+    real_open = os.open
+
+    def exhausted(path, flags, *args, **kwargs):
+        # `launcher.os` is the os module itself, so this patch is global:
+        # fail only the walk's own open of the workspace entry "a".
+        if kwargs.get("dir_fd") is not None and path == "a":
+            raise OSError(24, "Too many open files")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(launcher.os, "open", exhausted)
+    with pytest.raises(launcher.LaunchRefused) as refused:
+        launcher._prepare_workspace_permissions(workspace)
+    assert "ran out of file descriptors" in str(refused.value)

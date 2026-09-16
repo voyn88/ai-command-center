@@ -1289,7 +1289,7 @@ def test_the_last_lease_wait_refunds_its_attempt_like_every_one_before(
     app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
     with psycopg.connect(app_dsn, autocommit=True) as app:
         item_id = _enqueue(app, "capped", max_attempts=5, backoff_seconds=0)
-    reason = "executor infrastructure failure (provider/auth/quota): session limit"
+    reason = "writer lease unavailable"
     with (
         _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names),
         psycopg.connect(host_dsns[0], autocommit=True) as worker,
@@ -1311,8 +1311,60 @@ def test_the_last_lease_wait_refunds_its_attempt_like_every_one_before(
     state = _item(admin_conn, item_id)
     assert state[0] == "dead"
     assert state[5] == f"lease_wait_exhausted: {reason}"
-    assert re.search(r"(?i)session limit", state[5]), "infra_monitor classifies by reason"
     assert state[1] == 0, "not one model attempt was ever spent on this item"
+    assert _wait_budgets(admin_conn, item_id) == (3, 0), "the waits themselves are all counted"
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "SELECT reason, detail ->> 'attempt_count', detail ->> 'lease_wait_count' "
+            "FROM work_event WHERE work_item_id = %s AND event = 'fail' "
+            "AND outcome = 'granted' ORDER BY id",
+            (item_id,),
+        )
+        assert cur.fetchall() == [
+            ("lease_wait_requeued", "0", "1"),
+            ("lease_wait_requeued", "0", "2"),
+            ("lease_wait_dead_lettered", "0", "3"),
+        ], "every refusal audits the refunded budget it left behind"
+
+
+def test_the_last_infra_wait_refunds_its_attempt_too(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """0028, the capacity-outage half of the same rule: 0024 refunded on
+    requeue and kept the last delivery on dead-letter, so an item that never
+    reached a model through an outage read `attempt_count = 1` in the DLQ."""
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
+    with psycopg.connect(app_dsn, autocommit=True) as app:
+        item_id = _enqueue(app, "outage", max_attempts=5, backoff_seconds=0)
+    reason = "executor infrastructure failure (provider/auth/quota): session limit"
+    with (
+        _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names),
+        psycopg.connect(host_dsns[0], autocommit=True) as worker,
+    ):
+        for expected in ("infra_wait_requeued", "infra_wait_dead_lettered"):
+            token, token_hash = _token()
+            verdict = _claim(worker, token_hash)
+            assert verdict[0], verdict[1]
+            ok, got = _call(
+                worker,
+                "SELECT ok, reason FROM queue_fail_infra_wait(%s, %s, %s, %s)",
+                (verdict[3], token, reason, 1),
+            )
+            assert ok is True and got == expected
+    state = _item(admin_conn, item_id)
+    assert state[0] == "dead"
+    assert state[5] == f"infra_wait_exhausted: {reason}"
+    assert re.search(r"(?i)session limit", state[5]), "infra_monitor classifies by reason"
+    assert state[1] == 0, "the outage spent no model attempt"
+    assert _wait_budgets(admin_conn, item_id) == (0, 2)
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "SELECT reason, detail ->> 'attempt_count' FROM work_event "
+            "WHERE work_item_id = %s AND event = 'fail' AND outcome = 'granted' ORDER BY id",
+            (item_id,),
+        )
+        assert cur.fetchall() == [("infra_wait_requeued", "0"), ("infra_wait_dead_lettered", "0")]
 
 
 def test_redrive_clears_both_wait_budgets_it_widens_the_attempts_for(
