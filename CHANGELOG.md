@@ -8,6 +8,85 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Fixed — the reaper expired leases that were still live (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
+- **`queue_reap`'s re-test under the item's row lock dropped half the predicate
+  it was re-testing.** Migration 0029. The scan selects on two conditions,
+  `state = 'active' AND visible_until <= now()`; the re-test carried only the
+  first, under 0002's comment "a completion may have landed since the scan". A
+  completion is not the only thing that can land in that window, and
+  `queue_heartbeat` is the other one: a beat moves `visible_until` and never
+  touches `state`, so a renewal that committed between the scan and the lock
+  passed the re-test and had its lease expired anyway.
+
+  The window is structural. The scan is one statement, read at the
+  transaction's snapshot; the re-test is a later statement in the same READ
+  COMMITTED transaction and sees everything committed since. Between them sits
+  the rest of the loop — up to `WorkQueueAdmin.REAP_BATCH` items, each a row
+  lock, two UPDATEs and an audit INSERT. 0028's `SKIP LOCKED` narrowed it and
+  could not close it: while a beat's transaction is open it holds the item
+  `FOR UPDATE` (`_queue_owns`), so a reap arriving *then* defers the item,
+  which is correct. What remained is the beat that has already COMMITTED and
+  released — the reap finds the row free, finds the attempt `active`, and
+  expires a lease with time left on it.
+
+  **MEASURED against a real PostgreSQL 16 server**, with the beat's
+  transaction pinned open across the expiry instant and the reap blocked
+  mid-loop on another attempt's row:
+
+      queue_heartbeat -> (ok = true)     lease renewed, an hour of it left
+      queue_reap      -> 2
+      beating attempt: state = expired, visible_until > now()
+      beating item:    state = ready,   current_attempt_id = NULL
+
+  An attempt marked `expired` while its lease is still in the future, and an
+  item handed back to the queue out from under the lane running it.
+
+  **What it costs, none of which is the reap's to give away.** The lane is
+  still executing: its next beat and its `queue_complete` both resolve to
+  `attempt_superseded`, so `worker.daemon._execute` discards an outcome worth
+  up to one whole `TimeoutStopSec=3660s` attempt. The item is `ready` again and
+  any lane may take it, so the work is done twice — the one-owner promise holds
+  on paper (the fence refuses the loser's *write*) while the side effects have
+  already re-run. And `queue_claim` charged `attempt_count` for the delivery
+  that was taken away; `queue_fail_lease_wait` is the only refund and nothing
+  on this path calls it, so enough repeats dead-letter a healthy item
+  (`dead_letter_growth`), reachable after that only by an operator's
+  `queue_redrive`.
+
+  **Why it is filed under the stall.** 0028 gave the reaper liveness because
+  `lapsed_claim_age_seconds` is the one starvation class
+  `infra_monitor.evaluate` neither excuses by capacity nor bounds by the fleet
+  clock — "only the reaper" clears it. A reaper that also expires LIVE claims
+  is not merely failing to recover; it mints that class one attended claim at a
+  time, and every occurrence pushes an item back onto the due-ready pile the
+  same probe weighs. It fires when a beat straddles its own deadline — begun
+  live, committed lapsed — which is the fleet coming *back* from a database
+  blip or a `voyn-aicc-pgtunnel.service` restart that cost it two beats. That
+  is exactly the moment the lane is recoverable and the reap is most likely to
+  be running.
+
+  The re-test now carries both halves, against the tick's own `now()` (the
+  value the scan compared against), so a lease renewed past this tick is left
+  alone and an attempt that lapses *during* a reap is next tick's work — the
+  same answer 0028 gives a contended row, for the same reason: recovery a
+  minute late costs a minute, recovery that is wrong costs an attempt.
+  `CREATE OR REPLACE` on the bounded arity only; `queue_reap()` is one line
+  over that body (0028) and inherits the fix without being re-declared.
+- **Both halves of that re-test are now pinned, including the one 0002 wrote.**
+  Deleting `state = 'active'` from it left the entire suite green — the same
+  shape of unproven guard this branch has been closing everywhere else, and a
+  regression that only pinned the new half would have repeated the original
+  mistake. `test_a_lease_renewed_mid_reap_is_not_expired_anyway` and
+  `test_a_completion_landed_mid_reap_is_not_expired_over` stage the two
+  interleavings against a real server with nothing simulated: a real
+  `queue_heartbeat` / `queue_complete` from a transaction that opened while the
+  lease was live (`transaction_timestamp()` freezes there, which is what makes
+  it a call that raced its own deadline), committing while a real `queue_reap`
+  is blocked mid-loop on another attempt's row. The block is what makes the
+  interleaving deterministic rather than a race the suite would only sometimes
+  lose, and it is waited for in `pg_stat_activity` rather than slept at. Each
+  mutation fails exactly one of them.
+
 ### Tested — the reaper's own entrypoint, not just the method behind it (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
 - **`aicc-queue-reaper.service` execs a line nothing in this repository ran.**
   The entries below prove `WorkQueueAdmin.reap` against a real PostgreSQL

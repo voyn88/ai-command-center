@@ -2262,3 +2262,303 @@ def test_a_duplicate_enqueue_does_not_raise_against_the_items_own_heartbeat(
         "enqueue",
     ]
     assert [event[4] for event in events] == [1, 2, 3, 4]
+
+
+def test_a_lease_renewed_mid_reap_is_not_expired_anyway(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """The reap's re-test under the lock must carry BOTH halves of the scan's
+    predicate (0029).
+
+    `queue_reap` reads `work_attempt` once, at its transaction's snapshot, and
+    then re-tests each attempt under the item's row lock before expiring it.
+    0002 wrote that re-test as `state = 'active'` alone -- "a completion may
+    have landed since the scan". A completion is not the only thing that can
+    land there. `queue_heartbeat` moves `visible_until` and leaves `state`
+    exactly where it was, so a beat that committed between the scan and the
+    lock passed the re-test and had its lease expired anyway.
+
+    0028's `SKIP LOCKED` narrowed the window and could not close it: while the
+    beat's transaction is open it holds the item `FOR UPDATE` (`_queue_owns`),
+    so a reap arriving then defers the item -- correct. What remains is the
+    beat that has already COMMITTED and released, which is what this test
+    stages.
+
+    Nothing here is simulated. The beat is a real `queue_heartbeat` from a
+    transaction that opened while the lease was still live -- which is what
+    makes it a beat that raced its own deadline, since
+    `transaction_timestamp()` freezes there -- and it commits while a real
+    `queue_reap` is blocked mid-loop on another attempt's row. The block is the
+    device that makes the interleaving deterministic instead of a race the
+    suite would only lose sometimes; it is waited for in `pg_stat_activity`
+    rather than slept at.
+
+    What the defect costs is why it is filed under a stall: the lane is still
+    running. Its next beat and its `queue_complete` both resolve to
+    `attempt_superseded`, so `worker.daemon._execute` discards an outcome worth
+    up to one whole `TimeoutStopSec=3660s` attempt; the item goes back on the
+    due-ready pile `infra_monitor.evaluate` weighs, to be executed a second
+    time; and the attempt `queue_claim` charged for the delivery is spent with
+    no refund, so enough repeats dead-letter a perfectly healthy item.
+    """
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
+    with psycopg.connect(app_dsn, autocommit=True) as app:
+        blocking_id = _enqueue(app, "blocks-the-reap", backoff_seconds=0)
+        beating_id = _enqueue(app, "beats-the-reap", backoff_seconds=0)
+
+    with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
+        with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+            blocking = _claim(worker, _token()[1])
+            beating_token, beating_hash = _token()
+            beating = _claim(worker, beating_hash)
+        assert blocking[0] and beating[0], (blocking[1], beating[1])
+        assert blocking[2] == blocking_id and beating[2] == beating_id
+
+        # The beating lane's heartbeat transaction opens HERE, while its lease
+        # is still live, and is not committed until the reap is under way.
+        beat = psycopg.connect(host_dsns[0])
+        try:
+            with beat.cursor() as cur:
+                cur.execute("SELECT 1")  # freezes transaction_timestamp()
+
+            with admin_conn.cursor() as cur:
+                # `blocking` lapsed long ago, so the reap reaches it first
+                # (`ORDER BY a.visible_until`). `beating` lapses just after the
+                # beat's frozen clock and well before the reap's -- the beat is
+                # therefore still entitled to renew, and the reap still selects
+                # the attempt.
+                cur.execute(
+                    "UPDATE work_attempt SET visible_until = now() - interval '1 hour' "
+                    "WHERE attempt_id = %s",
+                    (blocking[3],),
+                )
+                cur.execute(
+                    "UPDATE work_attempt "
+                    "SET visible_until = now() + interval '0.5 seconds' "
+                    "WHERE attempt_id = %s",
+                    (beating[3],),
+                )
+            time.sleep(1.0)
+
+            # Pin the blocking attempt's row so the reap stops inside its loop,
+            # after the scan has already selected both attempts. Nothing in the
+            # protocol takes this lock; the test does, because a reap that ran
+            # straight through would leave no window to commit into.
+            pin = psycopg.connect(
+                _as_role(test_dsn, roles.MIGRATOR_ROLE, role_passwords[roles.MIGRATOR_ROLE])
+            )
+            try:
+                with pin.cursor() as cur:
+                    cur.execute(
+                        "SELECT 1 FROM work_attempt WHERE attempt_id = %s FOR UPDATE",
+                        (blocking[3],),
+                    )
+                    assert cur.fetchone() is not None
+
+                reaped: dict[str, object] = {}
+
+                def reap() -> None:
+                    try:
+                        with psycopg.connect(app_dsn, autocommit=True) as app:
+                            reaped["n"] = _call(app, "SELECT queue_reap()", ())[0]
+                    except BaseException as error:  # noqa: BLE001 — reported below
+                        reaped["error"] = error
+
+                thread = threading.Thread(target=reap)
+                thread.start()
+                try:
+                    deadline = time.monotonic() + 15
+                    while time.monotonic() < deadline:
+                        with admin_conn.cursor() as cur:
+                            cur.execute(
+                                # Scoped to this test's own database and to
+                                # other backends: `pg_stat_activity` is
+                                # cluster-wide, and the pattern below appears
+                                # in this very statement's `query` text.
+                                "SELECT count(*) FROM pg_stat_activity "
+                                "WHERE datname = current_database() "
+                                "AND pid <> pg_backend_pid() "
+                                "AND query LIKE '%%queue_reap%%' "
+                                "AND wait_event_type = 'Lock'"
+                            )
+                            if cur.fetchone()[0]:
+                                break
+                        time.sleep(0.05)
+                    else:
+                        raise AssertionError("the reap never blocked on the pinned row")
+
+                    # The beat lands now: inside the reap's transaction, after
+                    # its scan, and committed before it reaches this attempt.
+                    with beat.cursor() as cur:
+                        cur.execute(
+                            "SELECT ok, reason FROM queue_heartbeat(%s, %s)",
+                            (beating[3], beating_token),
+                        )
+                        assert cur.fetchone() == (True, None), (
+                            "the staged beat must be one the protocol accepts, or "
+                            "this test proves nothing about a renewed lease"
+                        )
+                    beat.commit()
+                finally:
+                    pin.rollback()
+                    thread.join(timeout=20)
+                assert not thread.is_alive(), "the reap never finished"
+                assert "error" not in reaped, reaped.get("error")
+            finally:
+                pin.close()
+        finally:
+            beat.close()
+
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "SELECT state, visible_until > now() FROM work_attempt WHERE attempt_id = %s",
+            (beating[3],),
+        )
+        attempt_state, lease_live = cur.fetchone()
+
+    assert lease_live, "the staged renewal did not survive to the assertion"
+    assert attempt_state == "active", (
+        "queue_reap expired an attempt whose lease the protocol had just "
+        "renewed: the re-test under the item's row lock checked only that the "
+        "attempt was still 'active' and not that it was still lapsed"
+    )
+    # And the consequence the worker would actually feel: the item is still
+    # its claim, so its beats and its result are still accepted.
+    state, _count, _max, current, _result, _dead = _item(admin_conn, beating_id)
+    assert (state, current) == ("claimed", beating[3])
+    # The blocking item was recovered in the same tick -- the fix defers a
+    # renewed lease, not the reap.
+    assert _item(admin_conn, blocking_id)[0] == "ready"
+    assert reaped["n"] == 1
+
+
+def test_a_completion_landed_mid_reap_is_not_expired_over(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """The other half of the same re-test, which 0002 wrote and nothing proved.
+
+    `queue_reap`'s re-test has carried `state = 'active'` since 0002, with the
+    comment that says why -- "a completion may have landed since the scan". The
+    test above pins the half 0029 added; deleting the half 0002 wrote left the
+    whole suite green, which is the same shape of unproven guard this branch
+    has been closing everywhere else. So it is pinned here, by the same
+    deterministic staging: a real `queue_complete` from a transaction that
+    opened while the lease was live, committing while a real `queue_reap` is
+    blocked mid-loop on another attempt's row.
+
+    Without it the reap expires a succeeded attempt and then rewrites its item
+    -- back to `ready`, so finished work is executed again, or straight to
+    `dead` once the budget is spent, so finished work needs an operator's
+    `queue_redrive` to come back. Either way the result the worker wrote is
+    still in `work_result` with nothing pointing at it.
+    """
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
+    with psycopg.connect(app_dsn, autocommit=True) as app:
+        blocking_id = _enqueue(app, "blocks-the-reap", backoff_seconds=0)
+        finishing_id = _enqueue(app, "finishes-mid-reap", backoff_seconds=0)
+
+    with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
+        with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+            blocking = _claim(worker, _token()[1])
+            finishing_token, finishing_hash = _token()
+            finishing = _claim(worker, finishing_hash)
+        assert blocking[0] and finishing[0], (blocking[1], finishing[1])
+        assert finishing[2] == finishing_id
+
+        finish = psycopg.connect(host_dsns[0])
+        try:
+            with finish.cursor() as cur:
+                cur.execute("SELECT 1")  # freezes transaction_timestamp()
+
+            with admin_conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE work_attempt SET visible_until = now() - interval '1 hour' "
+                    "WHERE attempt_id = %s",
+                    (blocking[3],),
+                )
+                cur.execute(
+                    "UPDATE work_attempt "
+                    "SET visible_until = now() + interval '0.5 seconds' "
+                    "WHERE attempt_id = %s",
+                    (finishing[3],),
+                )
+            time.sleep(1.0)
+
+            pin = psycopg.connect(
+                _as_role(test_dsn, roles.MIGRATOR_ROLE, role_passwords[roles.MIGRATOR_ROLE])
+            )
+            try:
+                with pin.cursor() as cur:
+                    cur.execute(
+                        "SELECT 1 FROM work_attempt WHERE attempt_id = %s FOR UPDATE",
+                        (blocking[3],),
+                    )
+                    assert cur.fetchone() is not None
+
+                reaped: dict[str, object] = {}
+
+                def reap() -> None:
+                    try:
+                        with psycopg.connect(app_dsn, autocommit=True) as app:
+                            reaped["n"] = _call(app, "SELECT queue_reap()", ())[0]
+                    except BaseException as error:  # noqa: BLE001 — reported below
+                        reaped["error"] = error
+
+                thread = threading.Thread(target=reap)
+                thread.start()
+                try:
+                    deadline = time.monotonic() + 15
+                    while time.monotonic() < deadline:
+                        with admin_conn.cursor() as cur:
+                            cur.execute(
+                                # Scoped to this test's own database and to
+                                # other backends: `pg_stat_activity` is
+                                # cluster-wide, and the pattern below appears
+                                # in this very statement's `query` text.
+                                "SELECT count(*) FROM pg_stat_activity "
+                                "WHERE datname = current_database() "
+                                "AND pid <> pg_backend_pid() "
+                                "AND query LIKE '%%queue_reap%%' "
+                                "AND wait_event_type = 'Lock'"
+                            )
+                            if cur.fetchone()[0]:
+                                break
+                        time.sleep(0.05)
+                    else:
+                        raise AssertionError("the reap never blocked on the pinned row")
+
+                    with finish.cursor() as cur:
+                        cur.execute(
+                            "SELECT ok, reason FROM queue_complete(%s, %s, %s::jsonb)",
+                            (finishing[3], finishing_token, json.dumps({"done": True})),
+                        )
+                        assert cur.fetchone() == (True, None), (
+                            "the staged completion must be one the protocol "
+                            "accepts, or this test proves nothing"
+                        )
+                    finish.commit()
+                finally:
+                    pin.rollback()
+                    thread.join(timeout=20)
+                assert not thread.is_alive(), "the reap never finished"
+                assert "error" not in reaped, reaped.get("error")
+            finally:
+                pin.close()
+        finally:
+            finish.close()
+
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "SELECT state FROM work_attempt WHERE attempt_id = %s", (finishing[3],)
+        )
+        assert cur.fetchone()[0] == "succeeded", (
+            "queue_reap expired an attempt that had already succeeded: the "
+            "re-test under the item's row lock did not re-read its state"
+        )
+    state, _count, _max, current, result_id, _dead = _item(admin_conn, finishing_id)
+    assert (state, current) == ("succeeded", None)
+    assert result_id is not None, "the completed item lost the result it wrote"
+    assert _item(admin_conn, blocking_id)[0] == "ready"
+    assert reaped["n"] == 1
