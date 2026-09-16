@@ -801,8 +801,13 @@ def evaluate(
         )
         if queue.ready + queue.claimed > 0 and pending_is_stale:
             failures.append("queue_stalled")
-        if queue.recent_dead > max_recent_dead:
-            failures.append(f"dead_letter_growth:{queue.recent_dead}>{max_recent_dead}")
+        # Quota/spend refusals are counted below under their own class; the
+        # same death must not also raise dead_letter_growth (live 2026-09-15:
+        # every hour with a Codex-quota preflight death opened a growth
+        # finding on control-01 -- one cause, two tasks).
+        unexplained_dead = max(queue.recent_dead - queue.recent_quota_dead, 0)
+        if unexplained_dead > max_recent_dead:
+            failures.append(f"dead_letter_growth:{unexplained_dead}>{max_recent_dead}")
         # Executor quota/spend/rate refusals are a capacity fact the fleet
         # cannot retry through; surface them as their own class so routing
         # (quota-aware cascade) and budgets get a task, not a guess.
