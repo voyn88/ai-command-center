@@ -41,6 +41,9 @@ flowchart LR
     Streamlit -. "D1 shell shipped; wiring & packaging planned" .-> Desktop["Native PySide6 client"]
 ```
 
+[`docs/architecture/`](docs/architecture/README.md) carries this as a maintained, generated C4
+context+container diagram pair; this section's diagram is the narrative version.
+
 Streamlit itself serves HTTP and WebSocket traffic. **The application has no authentication layer**
 yet performs privileged git/gh and subprocess operations, so every launch path is constrained to
 keep it off-host unless the operator deliberately opts out:
