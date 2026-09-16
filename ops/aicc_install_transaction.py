@@ -1725,14 +1725,96 @@ def _normalise_property(value: str) -> str:
     return "{ " + " ; ".join(kept) + " }"
 
 
+#: Durable record of starts that boot recovery could only QUEUE.
+#:
+#: `systemctl --no-block start` returns as soon as the job is enqueued. A
+#: queued job is not a started service: it can still fail, and boot recovery
+#: used to delete the WAL and the service snapshot the moment enqueueing
+#: succeeded, so a lane that had been active before the interrupted install
+#: could end up inactive with every piece of recovery evidence already gone
+#: (independent review on 988de49).
+#:
+#: This journal is what survives that deletion. It is written -- and fsynced --
+#: BEFORE the caller consumes the WAL, and it is consumed only once every unit
+#: it names has been proven active by `aicc-principal-recovery-complete`,
+#: which the boot generator emits after `multi-user.target`.
+DEFERRED_STARTS_JOURNAL = "deferred-starts.json"
+DEFERRED_STARTS_VERSION = 1
+
+
+def _boot_id() -> str:
+    """Per-boot random id; empty when unavailable so callers fail closed.
+
+    Kept identical in shape to `_boot_id` in ops/aicc_agent_launcher.py: both
+    are root-owned host-local programs with no import relationship.
+    """
+    try:
+        return (
+            Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
+        )
+    except OSError:
+        return ""
+
+
+def _record_deferred_starts(journal: Path, units: list[str]) -> None:
+    """Durably record queued-but-unproven starts, or clear a spent record.
+
+    Bound to the boot that queued them: the promise "this job is on its way"
+    is only meaningful within the boot systemd queued it in. Across a reboot
+    the units' restored enablement -- which IS durable -- is what starts them,
+    and a stale journal must not force-start a unit an operator has since
+    stopped.
+    """
+    if not units:
+        # An earlier boot's journal must not outlive a recovery that deferred
+        # nothing; it would be replayed against this generation.
+        journal.unlink(missing_ok=True)
+        _fsync_dir(journal.parent)
+        return
+    _atomic_bytes(
+        journal,
+        (
+            json.dumps(
+                {
+                    "version": DEFERRED_STARTS_VERSION,
+                    "boot_id": _boot_id(),
+                    "units": sorted(units),
+                },
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode(),
+        0o600,
+        os.geteuid(),
+        os.getegid(),
+    )
+    _fsync_dir(journal.parent)
+
+
 def restore_service_snapshot(
-    path: Path, *, run=subprocess.run, defer_starts: bool = False
+    path: Path,
+    *,
+    run=subprocess.run,
+    defer_starts: bool = False,
+    deferred_journal: Path | None = None,
 ) -> None:
     """Restore the pre-attempt unit state after file generation recovery.
 
     Everything the snapshot describes except the per-connection launcher
     instances, which are restored by not being touched: see the loop below.
+
+    With `defer_starts`, a start this call could only enqueue is recorded in
+    `deferred_journal` before returning, so the caller may consume the WAL
+    without that start becoming unfalsifiable. Passing `defer_starts` without
+    a journal is refused: the whole point is that the evidence outlives this
+    process.
+
+    A synchronous restore passes the same journal and thereby CLEARS it: this
+    restore proved the unit states itself, which supersedes whatever an
+    earlier boot was still owed.
     """
+    if defer_starts and deferred_journal is None:
+        raise RuntimeError("deferred starts require a durable journal path")
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -1862,6 +1944,7 @@ def restore_service_snapshot(
                     )
 
     systemctl("daemon-reload")
+    queued: list[str] = []
     for unit, state in validated:
         if TEMPLATE_LAUNCHER_UNIT_RE.fullmatch(unit):
             # `aicc-agent-launcher.socket` is `Accept=yes`: each of these
@@ -1923,9 +2006,17 @@ def restore_service_snapshot(
         if not self_recovery:
             if queued_start:
                 systemctl("--no-block", "start", unit)
+                queued.append(unit)
             else:
                 systemctl("start" if state["active"] else "stop", unit)
         assert_restored(unit, state, queued_start=queued_start)
+    if deferred_journal is not None:
+        # Written before this function returns, and therefore before the
+        # caller unlinks the WAL and the snapshot: a queued job that later
+        # fails still leaves a host-local record naming exactly which units
+        # owe an active state. `queued` is empty on the synchronous path,
+        # which clears a superseded record instead of writing one.
+        _record_deferred_starts(deferred_journal, queued)
 
 
 #: Where systemd reads administrator-installed units. Unit files the journal
@@ -3965,9 +4056,16 @@ class FileTransaction:
         restore_legacy_authority_membership(self.state_dir, manifest=manifest)
         if snapshot_present:
             if boot:
-                restore_service_snapshot(snapshot, defer_starts=True)
+                restore_service_snapshot(
+                    snapshot,
+                    defer_starts=True,
+                    deferred_journal=self.state_dir / DEFERRED_STARTS_JOURNAL,
+                )
             else:
-                restore_service_snapshot(snapshot)
+                restore_service_snapshot(
+                    snapshot,
+                    deferred_journal=self.state_dir / DEFERRED_STARTS_JOURNAL,
+                )
             verify_service_snapshot_closure(
                 snapshot, preserve_unsnapshotted_launchers=True
             )
@@ -4501,9 +4599,16 @@ def recover_uninstall(
         raise TypeError("uninstall baseline selector is invalid")
     transaction.select_uninstall_baseline(baseline)
     if boot:
-        restore_service_snapshot(state_dir / "baseline-units.json", defer_starts=True)
+        restore_service_snapshot(
+            state_dir / "baseline-units.json",
+            defer_starts=True,
+            deferred_journal=state_dir / DEFERRED_STARTS_JOURNAL,
+        )
     else:
-        restore_service_snapshot(state_dir / "baseline-units.json")
+        restore_service_snapshot(
+            state_dir / "baseline-units.json",
+            deferred_journal=state_dir / DEFERRED_STARTS_JOURNAL,
+        )
     verify_service_snapshot_closure(snapshot)
     complete_uninstall(state_dir, snapshot)
 
