@@ -16,7 +16,9 @@ deprecated. Native parity is being reached deliberately, increment by increment;
 Streamlit is where you launch agents and drive the completion pipeline.
 
 This repository is not a production, distributed, or remote-worker execution platform. Its durable
-state is local to the machine running it, and there is no authentication layer in any interface.
+state is local to the machine running it. The Streamlit console and the mutating HTTP surface are
+authenticated against the platform's identity authority (`AICC_PLATFORM_URL`); the native desktop
+client and the read-only web dashboard are not.
 
 ## Which interface does what
 
