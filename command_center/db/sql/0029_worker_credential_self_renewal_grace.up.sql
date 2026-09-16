@@ -14,15 +14,22 @@
 --   * `identity_assert(p_secret, p_expired_grace)` -- the 0003 assert with one
 --     added branch: an EXPIRED credential of a `worker_host` principal passes
 --     when the caller names a grace, `expires_at + grace` has not passed
---     (exclusive), and the credential is already BOUND to an address -- one
---     that was never used has no address to be restricted to and is refused.
---     The grace is clamped to `enroll_self_grace()` (1 hour, the TTL itself),
---     so no caller can widen it. Every other guard -- role match, revocation,
---     principal state, expected CIDR, bound address -- applies to the graced
---     pass exactly as to a live one, and for a worker host the address guards
---     REFUSE, so an expired worker secret can only ever RENEW from the address
---     the credential is bound to. Operator and control-plane credentials get
---     no grace: for them expiry is expiry, as in 0003, because their address
+--     (exclusive), the credential was used at least once while live
+--     (`bound_addr` set -- a secret that never authenticated, e.g. one leaked
+--     at provisioning, is not renewable), and the presenting connection's
+--     address is known AND equal to that bound address (positively asserted
+--     on the graced path; a Unix-socket presenter has no address and is
+--     refused). The grace is clamped to `enroll_self_grace()` (1 hour, the TTL
+--     itself), so no caller can widen it. Every other guard -- role match,
+--     revocation, principal state, expected CIDR -- applies to the graced pass
+--     exactly as to a live one, and for a worker host they REFUSE. Be clear
+--     about what the address guard buys: in a deployment where every worker
+--     reaches the database through its own SSH tunnel, `inet_client_addr()`
+--     is the loopback address for all of them, so the bound address does not
+--     tell host A from host B -- the confinement there is the tunnel (one SSH
+--     key per host) and pg_hba, not this column; the guard matters for
+--     direct-TCP deployments. Operator and control-plane credentials get no
+--     grace: for them expiry is expiry, as in 0003, because their address
 --     guards only audit. A graced pass is audited as
 --     `assert/granted/expired_grace`, never as a denial, and the VERDICT's
 --     `reason` stays NULL on success: on the verdict, `reason IS NOT NULL`
@@ -75,11 +82,15 @@
 -- operator, and that is the stall an operator should be paged for. This
 -- deliberately claims no "one hop": once any secret, graced or live, has
 -- rotated, its successor is an ordinary live credential -- exactly what a
--- stolen LIVE secret already yields today. What the grace recovers is a fleet
--- whose lanes are still ready on established sessions (PostgreSQL checks
--- validity at authentication only); lanes that have already lost their
--- sessions cannot become ready on an expired secret, and rotation still
--- requires ready lanes.
+-- stolen LIVE secret already yields today. Because the ROLE stays valid for
+-- the grace, lanes can also authenticate fresh connections in that hour and
+-- keep claiming work (the queue functions do not consult the ledger), so the
+-- fleet stays ready while the rotator renews; only identity-gated calls
+-- refuse. What no grace recovers is a stall longer than TTL + grace.
+-- Every function this file defines or redefines lists `pg_temp` LAST in its
+-- `search_path` (0003's family did not name it, which lets PostgreSQL search a
+-- caller's temporary schema for relation names first); the down restores 0003
+-- verbatim, so that hardening is 0029's alone.
 -- One knob. Equal to the credential TTL: enough to absorb a missed rotation
 -- tick plus the retry and circuit cadence, and no wider than the exposure the
 -- TTL already accepts.
@@ -88,7 +99,7 @@ CREATE FUNCTION enroll_self_grace() RETURNS interval
 
 CREATE FUNCTION identity_assert(p_secret text, p_expired_grace interval)
     RETURNS identity_verdict
-    LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+    LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, public, pg_temp AS $$
 DECLARE
     c principal_credential%ROWTYPE;
     p principal%ROWTYPE;
@@ -141,13 +152,15 @@ BEGIN
     -- or shorten a credential.
     IF c.expires_at <= now() THEN
         -- Expired. A WORKER credential whose caller names a grace still passes
-        -- while `expires_at + grace` has not elapsed, PROVIDED it is already
-        -- bound to an address: the bound-address guard below is what confines
-        -- a graced renewal to the host that earned it, and a credential that
-        -- was never used has nothing to be confined to. Every condition here
-        -- is written fail-closed (a NULL kind is not a worker host). The
-        -- guards that follow (principal state, expected CIDR, bound address)
-        -- still apply, and for a worker host the address guards refuse.
+        -- while `expires_at + grace` has not elapsed, PROVIDED it was used at
+        -- least once while live (`bound_addr` set) AND the presenting
+        -- connection has an address equal to that bound address -- asserted
+        -- positively here, because 0003's guard below only fires when both
+        -- addresses are known, and "not contradicted" is not good enough to
+        -- accept an expired secret (a Unix-socket presenter has no address
+        -- and is refused). Every condition is written fail-closed (a NULL
+        -- kind is not a worker host). The guards that follow (principal
+        -- state, expected CIDR) still apply and refuse for a worker host.
         -- Every other kind, and every caller that names no grace, is refused
         -- here as in 0003.
         IF v_grace <= interval '0'
@@ -159,6 +172,14 @@ BEGIN
                                                               'grace', v_grace::text,
                                                               'bound', c.bound_addr IS NOT NULL));
             v.reason := 'credential_expired';
+            RETURN v;
+        END IF;
+        IF inet_client_addr() IS NULL OR inet_client_addr() <> c.bound_addr THEN
+            PERFORM _principal_audit(c.principal_id, 'assert', 'rejected', c.credential_id,
+                     'addr_mismatch', jsonb_build_object('bound', c.bound_addr,
+                                                         'seen', inet_client_addr(),
+                                                         'check', 'graced_bound_addr'));
+            v.reason := 'addr_mismatch';
             RETURN v;
         END IF;
         v_graced := true;
@@ -221,7 +242,7 @@ $$;
 -- The unchanged contract for everyone else: expiry is expiry.
 CREATE OR REPLACE FUNCTION identity_assert(p_secret text)
     RETURNS identity_verdict
-    LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+    LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, public, pg_temp AS $$
 BEGIN
     RETURN identity_assert(p_secret, interval '0');
 END
@@ -283,7 +304,7 @@ CREATE OR REPLACE FUNCTION identity_issue_db_credential(
     p_scram_verifier text,
     p_ttl            interval
 ) RETURNS TABLE (issued_credential_id text, issue_refuse_reason text)
-    LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+    LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, public, pg_temp AS $$
 DECLARE
     p             principal%ROWTYPE;
     v_id          text;
@@ -337,7 +358,10 @@ BEGIN
     -- hour on purpose: the rotator's protocol budget
     -- (`SELF_CREDENTIAL_TTL_SECONDS` in `command_center.ops.credential_rotation`)
     -- is sized to a fixed one-hour credential.
-    v_ttl := least(coalesce(p_ttl, interval '15 minutes'), interval '1 hour');
+    -- Bounded below as well: a non-positive TTL would mint an already-expired
+    -- credential and push the role's validity into the past.
+    v_ttl := greatest(least(coalesce(p_ttl, interval '15 minutes'), interval '1 hour'),
+                      interval '1 minute');
 
     -- PostgreSQL stores exactly ONE verifier per role, so leaving the previous
     -- credential live would make this table disagree with `pg_authid`.
@@ -377,7 +401,7 @@ CREATE OR REPLACE FUNCTION enroll_rotate_self(
     p_new_secret_hash    text,
     p_new_scram_verifier text
 ) RETURNS TABLE (new_expires_at timestamptz, refuse_reason text)
-    LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+    LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, public, pg_temp AS $$
 DECLARE
     v        identity_verdict;
     v_graced boolean;

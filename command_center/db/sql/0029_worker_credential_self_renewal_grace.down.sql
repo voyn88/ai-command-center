@@ -233,14 +233,20 @@ $$;
 DROP FUNCTION IF EXISTS identity_assert(text, interval);
 
 -- Roles of worker hosts were widened by the up and by every issuance since;
--- narrow them back so "role validity equals the ledger expiry" holds again
--- for every worker role, not only the ones the up touched: for EVERY worker
--- host principal, whatever its state, the latest credential ever issued
--- (revoked or not -- the verifier on the role is that issuance's) sets the
--- bound, one row per role, and only ever NARROWING: a validity already
--- earlier, or `NULL` (never expires, never set by this family), is left
--- alone. A credential revoked through `identity_revoke_principal` already
--- has its role disabled (NOLOGIN, -infinity) and stays that way.
+-- restore the 0003 invariant "no worker role outlives the ledger expiry of its
+-- latest issuance": for EVERY worker host principal, whatever its state, take
+-- the latest issuance (its verifier is the one resident on the role; ties on
+-- `issued_at` -- two issuances in one transaction -- break toward the EARLIER
+-- expiry, because a control that only narrows must never pick the wider
+-- deadline) and narrow the role to it when its validity is later. A validity
+-- already earlier is left alone; a `NULL` validity (never expires) cannot
+-- occur for a role this family issued and is left alone too. A credential
+-- revoked through `identity_revoke_principal` already has its role disabled
+-- (NOLOGIN, -infinity) and stays that way.
+--
+-- Operator note: this is the honest 0003 semantics, so a worker whose ledger
+-- credential has already elapsed is locked out by this rollback and cannot
+-- self-rotate; its recovery path is re-provisioning, not rotation.
 DO $$
 DECLARE r record;
 BEGIN
@@ -249,7 +255,7 @@ BEGIN
                JOIN principal p ON p.principal_id = c.principal_id
                JOIN pg_roles g ON g.rolname = p.db_role
               WHERE p.kind = 'worker_host'
-              ORDER BY p.db_role, c.issued_at DESC, c.expires_at DESC
+              ORDER BY p.db_role, c.issued_at DESC, c.expires_at ASC
     LOOP
         IF r.rolvaliduntil IS NOT NULL AND r.rolvaliduntil > r.expires_at THEN
             EXECUTE format('ALTER ROLE %I VALID UNTIL %L', r.db_role, r.expires_at::text);

@@ -181,3 +181,34 @@ def test_0029_down_restores_the_0003_bodies_verbatim() -> None:
             continue
         redefined = _function_bodies(path.read_text(encoding="utf-8"), names)
         assert redefined == {}, f"{path.name} redefines {sorted(redefined)}"
+
+
+def test_0029_down_drops_exactly_the_functions_its_up_created() -> None:
+    """The up adds overloads with `CREATE FUNCTION` (never `OR REPLACE`); the
+    down must drop exactly those signatures, by exact signature, so no
+    grace-capable overload can stay resident beside a restored 0003 body and
+    no unrelated function is dropped. Argument NAMES are stripped so the two
+    spellings compare as signatures."""
+    import re
+
+    up = (_SQL_DIR / "0029_worker_credential_self_renewal_grace.up.sql").read_text(encoding="utf-8")
+    down = (_SQL_DIR / "0029_worker_credential_self_renewal_grace.down.sql").read_text(encoding="utf-8")
+
+    def signature(name: str, args: str) -> str:
+        types = []
+        for arg in filter(None, (a.strip() for a in args.split(","))):
+            types.append(arg.split()[-1])  # `p_secret text` -> `text`, `text` -> `text`
+        return f"{name}({', '.join(types)})"
+
+    created = {
+        signature(name, args)
+        for name, args in re.findall(r"^CREATE FUNCTION (\w+)\(([^)]*)\)", up, re.MULTILINE)
+    }
+    dropped = {
+        signature(name, args)
+        for name, args in re.findall(r"^DROP FUNCTION IF EXISTS (\w+)\(([^)]*)\);", down, re.MULTILINE)
+    }
+    assert created == dropped, (created ^ dropped)
+    # And nothing the up merely REPLACES is dropped by the down.
+    replaced = set(re.findall(r"^CREATE OR REPLACE FUNCTION (\w+)\(", up, re.MULTILINE))
+    assert not {d.split("(")[0] for d in dropped} & (replaced - {"identity_assert"}), replaced
