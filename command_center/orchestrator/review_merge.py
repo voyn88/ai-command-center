@@ -2778,6 +2778,29 @@ def _check_is_green(check: dict[str, Any]) -> bool:
     return False
 
 
+def _check_is_pending(check: dict[str, Any]) -> bool:
+    """A rollup entry that has not FINISHED yet: a CheckRun still QUEUED /
+    IN_PROGRESS / WAITING / PENDING / REQUESTED (no conclusion), or a legacy
+    StatusContext in state PENDING. A running check is not a verdict either
+    way -- it is not green (`_check_is_green` fails closed on it) and it is
+    not red. Live 2026-09-16 03:05 UTC: the merge tick read three checks
+    still running on an ACCEPTED head as `checks_not_green`, REJECTED the
+    task and opened an automatic remediation ("push a fix and open a new
+    pull request"); thirteen minutes later GitHub's queue merged that very
+    head (VOYN-W0-AICC-MERGE-TICK-REJECTS-ON-PENDING-CHECKS). Ambiguity
+    (`conclusion: AMBIGUOUS`, synthesised by `_latest_checks_by_name`) is
+    deliberately not pending: two disagreeing runs are a verdict problem,
+    not a timing one."""
+    if check.get("conclusion") is not None:
+        return False
+    status = check.get("status")
+    if status is not None:
+        return str(status).upper() in (
+            "QUEUED", "IN_PROGRESS", "WAITING", "PENDING", "REQUESTED"
+        )
+    return str(check.get("state") or "").upper() == "PENDING"
+
+
 def _latest_checks_by_name(rollup: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Return the latest run for every check name, failing closed on ambiguity.
 
@@ -2852,12 +2875,26 @@ def _pr_is_mergeable(
         return False, "no_accept_marker_on_head"
     raw_rollup = data.get("statusCheckRollup") or []
     rollup = _latest_checks_by_name(raw_rollup)
-    bad = [c.get("name", "?") for c in rollup if not _check_is_green(c)]
-    if bad:
+    # Three states, not two: a check that FAILED is a verdict (rerun a
+    # cancelled one, otherwise report it red -- the callers turn that into a
+    # bounded flake rerun and then a remediation); a check that is still
+    # RUNNING is a timing fact (report it pending -- the callers wait; no
+    # rerun, no remediation, no task transition); only a check that finished
+    # green counts toward mergeability. A red check beside a running one is
+    # still red: the verdict does not wait for the siblings.
+    red = [
+        c.get("name", "?")
+        for c in rollup
+        if not _check_is_green(c) and not _check_is_pending(c)
+    ]
+    if red:
         rerun = _rerun_cancelled_latest_runs(repo_path, rollup)
         if rerun:
             return False, f"checks_cancelled_rerun_requested: {rerun[:3]}"
-        return False, f"checks_not_green: {bad[:3]}"
+        return False, f"checks_not_green: {red[:3]}"
+    pending = [c.get("name", "?") for c in rollup if _check_is_pending(c)]
+    if pending:
+        return False, f"checks_pending: {pending[:3]}"
     present = {str(c.get("name") or "") for c in rollup}
     missing = [name for name in required_checks if name not in present]
     if missing:
