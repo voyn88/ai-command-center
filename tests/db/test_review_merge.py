@@ -624,7 +624,8 @@ def test_merge_skips_a_still_running_check_instead_of_waving_it_through(rig, mon
     null` because it hasn't finished (`status` QUEUED/IN_PROGRESS) used to
     read identically to one that simply carries no conclusion key at all --
     both passed. A required check still running must block merge, not be
-    treated as passing."""
+    treated as passing -- and it blocks as a WAIT (`checks_pending`), not as a
+    red verdict that would open a remediation."""
     app_factory, store, _ = rig
     _ready(store, app_factory, "VOYN-W0-M3", "https://github.com/x/y/pull/20")
     head = "c" * 40
@@ -642,7 +643,7 @@ def test_merge_skips_a_still_running_check_instead_of_waving_it_through(rig, mon
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     report = merge_once(app_factory, "/tmp")
-    assert ("VOYN-W0-M3", "checks_not_green: ['CI']") in report.skipped
+    assert ("VOYN-W0-M3", "checks_pending: ['CI']") in report.skipped
     with app_factory() as c, c.cursor() as cur:
         cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-M3",))
         assert cur.fetchone()[0] == "READY_TO_REVIEW"
@@ -651,7 +652,8 @@ def test_merge_skips_a_still_running_check_instead_of_waving_it_through(rig, mon
 def test_merge_skips_a_pending_legacy_status_context_too(rig, monkeypatch):  # noqa: F811
     """The rollup mixes CheckRun and legacy StatusContext shapes; a pending
     StatusContext (`state: PENDING`, no `conclusion`/`status` keys at all)
-    must block merge the same as a running CheckRun does."""
+    must block merge the same as a running CheckRun does -- and, like one,
+    as a WAIT (`checks_pending`), never as a red verdict."""
     app_factory, store, _ = rig
     _ready(store, app_factory, "VOYN-W0-M4", "https://github.com/x/y/pull/21")
     head = "f" * 40
@@ -667,7 +669,7 @@ def test_merge_skips_a_pending_legacy_status_context_too(rig, monkeypatch):  # n
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     report = merge_once(app_factory, "/tmp")
-    assert ("VOYN-W0-M4", "checks_not_green: ['legacy-ci']") in report.skipped
+    assert ("VOYN-W0-M4", "checks_pending: ['legacy-ci']") in report.skipped
 
 
 def test_merge_only_the_most_recent_review_can_carry_the_marker(rig, monkeypatch):  # noqa: F811, E501
@@ -1393,6 +1395,74 @@ def test_mergeability_fails_closed_when_rerun_order_is_ambiguous(monkeypatch, ch
     )
     assert not ready
     assert reason == "checks_not_green: ['Acceptance gate']"
+
+
+def _mergeable_with_rollup(monkeypatch, rollup):
+    import subprocess
+
+    head = "f" * 40
+
+    def fake_gh(argv, repo):
+        body = json.dumps({
+            "state": "OPEN",
+            "headRefOid": head,
+            "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
+            "statusCheckRollup": rollup,
+        })
+        return subprocess.CompletedProcess(argv, 0, body, "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    monkeypatch.setattr(review_merge, "_rerun_cancelled_latest_runs", lambda *_a: [])
+    return review_merge._pr_is_mergeable("/tmp", "https://github.com/x/y/pull/10")
+
+
+def test_a_running_required_check_is_pending_not_red(monkeypatch):
+    """VOYN-W0-AICC-MERGE-TICK-REJECTS-ON-PENDING-CHECKS: live 2026-09-16 the
+    tick read three checks still IN_PROGRESS on an accepted head as red and
+    opened a remediation; the queue merged that head thirteen minutes later.
+    A running check is a timing fact, reported as such."""
+    ready, reason = _mergeable_with_rollup(monkeypatch, [
+        {"name": "Final merge gate", "status": "IN_PROGRESS", "conclusion": None,
+         "startedAt": "2026-09-16T03:01:00Z"},
+        {"name": "Acceptance gate (independent verdict on exact SHA)",
+         "status": "COMPLETED", "conclusion": "SUCCESS",
+         "startedAt": "2026-09-16T03:00:00Z"},
+    ])
+    assert not ready
+    assert reason == "checks_pending: ['Final merge gate']"
+
+
+def test_a_queued_check_and_a_legacy_pending_status_are_pending_too(monkeypatch):
+    ready, reason = _mergeable_with_rollup(monkeypatch, [
+        {"name": "Final merge gate", "status": "QUEUED", "conclusion": None},
+        {"name": "Acceptance gate (independent verdict on exact SHA)", "state": "PENDING"},
+    ])
+    assert not ready
+    assert reason == (
+        "checks_pending: ['Final merge gate', "
+        "'Acceptance gate (independent verdict on exact SHA)']"
+    )
+
+
+def test_a_red_check_beside_a_running_one_is_still_red(monkeypatch):
+    """The verdict does not wait for the siblings: a FAILURE is red even while
+    another required check is still running, and only the red one is named."""
+    ready, reason = _mergeable_with_rollup(monkeypatch, [
+        {"name": "Final merge gate", "status": "IN_PROGRESS", "conclusion": None,
+         "startedAt": "2026-09-16T03:01:00Z"},
+        {"name": "Acceptance gate (independent verdict on exact SHA)",
+         "status": "COMPLETED", "conclusion": "FAILURE",
+         "startedAt": "2026-09-16T03:00:00Z"},
+    ])
+    assert not ready
+    assert reason == "checks_not_green: ['Acceptance gate (independent verdict on exact SHA)']"
+
+
+def test_an_ambiguous_twin_is_a_verdict_problem_not_a_pending_one():
+    assert not review_merge._check_is_pending({"name": "x", "conclusion": "AMBIGUOUS"})
+    assert not review_merge._check_is_pending({"name": "x", "status": "COMPLETED", "conclusion": None})
+    assert review_merge._check_is_pending({"name": "x", "status": "in_progress"})
+    assert not review_merge._check_is_pending({"name": "x", "state": "FAILURE"})
 
 
 def test_repo_from_pr_url():
