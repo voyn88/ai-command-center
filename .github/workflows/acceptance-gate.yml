@@ -31,6 +31,17 @@ name: Acceptance gate
 on:
   pull_request:
     branches: [main]
+    # No `unlabeled`. This gate's verdict is label-state-independent: it reads
+    # the independent reviewer's ACCEPT marker for the exact head SHA, and
+    # revocation reaches it through `pull_request_review` (submitted/edited/
+    # dismissed) and `synchronize`, never through a label. Labels only decide
+    # whether a run executes the gate at all (the window guard below), so a
+    # label REMOVAL has nothing to re-evaluate -- and must not create a check
+    # suite, because GitHub judges a required check by the newest suite
+    # associated with the PR and a skipped suite on top of the real one left
+    # "Acceptance gate" expected forever (VOYN-W0-AICC-LABEL-NOISE-CHECK-
+    # SUITE-MASKS-REQUIRED-FINAL-MERGE-GATE). The window-entry `labeled`
+    # event stays as the trigger that runs the gate at the same SHA.
     types: [opened, synchronize, reopened, labeled]
   pull_request_review:
     types: [submitted, edited, dismissed]

@@ -671,18 +671,34 @@ def test_merge_skips_a_pending_legacy_status_context_too(rig, monkeypatch):  # n
     assert ("VOYN-W0-M4", "checks_not_green: ['legacy-ci']") in report.skipped
 
 
-def _queue_gh(head, *, in_queue: bool, enqueue_error: str | None, calls: list):
+def _queue_gh(head, *, in_queue: bool, enqueue_error: str | None, calls: list,
+              prior_retrigger_at: str | None = None, view_state: str = "OPEN"):
     """A `_gh` stand-in for the merge path: `pr view` reports an OPEN,
-    accepted, all-green head; `pr merge` exits 0 (auto-merge enabled, as on a
-    merge-queue-protected repo); GraphQL answers the queue question and the
-    enqueue attempt; REST label writes are recorded."""
+    accepted, all-green head (or `view_state`); `pr merge` exits 0
+    (auto-merge enabled, as on a merge-queue-protected repo); GraphQL answers
+    the queue question and the enqueue attempt; the PR timeline lists a prior
+    entry-label event at `prior_retrigger_at` if given; REST label writes are
+    recorded."""
     import subprocess as sp
+
+    merged_seen = {"yes": False}
 
     def fake_gh(argv, repo):
         calls.append(argv)
+        if argv[:2] == ["pr", "view"] and "commits" in argv[-1]:
+            body = json.dumps({"commits": [{"oid": head, "committedDate": "2026-09-16T03:00:00Z"}]})
+            return sp.CompletedProcess(argv, 0, body, "")
+        if argv[0] == "api" and len(argv) > 1 and "/timeline?" in argv[1]:
+            rows = [] if prior_retrigger_at is None else [
+                {"label": "review-window:active", "at": prior_retrigger_at}
+            ]
+            return sp.CompletedProcess(argv, 0, json.dumps(rows), "")
         if argv[:2] == ["pr", "view"]:
+            # `view_state` applies only AFTER `pr merge` ran: before it the
+            # PR is OPEN and merge-ready, exactly as on a live tick.
+            state = view_state if merged_seen["yes"] else "OPEN"
             body = json.dumps({
-                "state": "OPEN", "headRefOid": head,
+                "state": state, "headRefOid": head,
                 "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
                 "statusCheckRollup": [
                     {"name": "Final merge gate", "conclusion": "SUCCESS"},
@@ -692,6 +708,7 @@ def _queue_gh(head, *, in_queue: bool, enqueue_error: str | None, calls: list):
             })
             return sp.CompletedProcess(argv, 0, body, "")
         if argv[:2] == ["pr", "merge"]:
+            merged_seen["yes"] = True
             return sp.CompletedProcess(argv, 0, "", "")
         if argv[:2] == ["api", "graphql"] and "isInMergeQueue" in argv[3]:
             body = json.dumps({"data": {"repository": {"pullRequest": {
@@ -736,6 +753,7 @@ def test_an_expected_required_check_retriggers_the_gates_once_instead_of_waiting
 
     assert ("VOYN-W0-MQ2", "required_check_expected: Final merge gate; gates_retriggered") in report.skipped
     assert not report.merged
+    assert any(c[0] == "api" and "/issues/31/timeline" in c[1] for c in calls), "the PR timeline is the memory"
     label_writes = [c for c in calls if c[:2] == ["api", "--method"]]
     assert [c[2] for c in label_writes] == ["DELETE", "POST"]
     assert label_writes[0][3].endswith("/issues/31/labels/review-window%3Aactive")
@@ -791,6 +809,96 @@ def test_any_other_enqueue_refusal_is_surfaced_verbatim_without_a_retrigger(rig,
     assert not [c for c in calls if c[:2] == ["api", "--method"]]
 
 
+def test_a_head_whose_gates_were_already_retriggered_is_reported_not_retriggered_again(rig, monkeypatch):  # noqa: F811, E501
+    """Review of 00e11855, finding 2: a check that is GENUINELY never reported
+    (renamed context, path-filtered workflow) must not turn into a label/CI
+    storm every tick. The PR timeline is the durable memory: one entry-label
+    event after the head commit means the remedy already ran for this head."""
+    app_factory, store, _ = rig
+    head = "a" * 40
+    pr_url = "https://github.com/x/y/pull/37"
+    _ready(store, app_factory, "VOYN-W0-MQ37", pr_url)
+    calls: list = []
+    monkeypatch.setattr(review_merge, "_gh", _queue_gh(
+        head, in_queue=False, calls=calls, prior_retrigger_at="2026-09-16T03:30:00Z",
+        enqueue_error='Pull request Required status check "Final merge gate" is expected.',
+    ))
+    monkeypatch.setattr(review_merge, "_merge_state", lambda *_a: "CLEAN")
+
+    report = merge_once(app_factory, "/tmp")
+
+    assert ("VOYN-W0-MQ37", "required_check_expected_after_retrigger: Final merge gate") in report.skipped
+    assert not [c for c in calls if c[:2] == ["api", "--method"]]
+
+
+def test_a_retrigger_before_this_head_does_not_count(rig, monkeypatch):  # noqa: F811
+    app_factory, store, _ = rig
+    head = "b" * 40
+    pr_url = "https://github.com/x/y/pull/38"
+    _ready(store, app_factory, "VOYN-W0-MQ38", pr_url)
+    calls: list = []
+    monkeypatch.setattr(review_merge, "_gh", _queue_gh(
+        head, in_queue=False, calls=calls, prior_retrigger_at="2026-09-15T20:00:00Z",
+        enqueue_error='Pull request Required status check "Final merge gate" is expected.',
+    ))
+    monkeypatch.setattr(review_merge, "_merge_state", lambda *_a: "CLEAN")
+
+    report = merge_once(app_factory, "/tmp")
+
+    assert ("VOYN-W0-MQ38", "required_check_expected: Final merge gate; gates_retriggered") in report.skipped
+    assert len([c for c in calls if c[:2] == ["api", "--method"]]) == 2
+
+
+def test_a_pr_that_left_open_state_without_a_verifiable_merge_is_not_enqueued(rig, monkeypatch):  # noqa: F811, E501
+    """Review of 00e11855, finding 3: `gh pr merge` may have merged outright;
+    when the PR is no longer OPEN but the merge commit is not yet readable,
+    the tick must not fire a mutation at a closed PR -- it keeps the old wait
+    reason and reads the target branch on a later tick."""
+    app_factory, store, _ = rig
+    head = "c" * 40
+    pr_url = "https://github.com/x/y/pull/39"
+    _ready(store, app_factory, "VOYN-W0-MQ39", pr_url)
+    calls: list = []
+    monkeypatch.setattr(review_merge, "_gh", _queue_gh(
+        head, in_queue=False, calls=calls, enqueue_error=None, view_state="MERGED",
+    ))
+    monkeypatch.setattr(review_merge, "_merge_state", lambda *_a: "CLEAN")
+
+    report = merge_once(app_factory, "/tmp")
+
+    assert ("VOYN-W0-MQ39", "merge_queued_awaiting_target") in report.skipped
+    assert not [c for c in calls if c[:2] == ["api", "graphql"]]
+
+
+def test_the_gate_retrigger_label_is_the_window_entry_label():
+    """Review of 00e11855, finding 4: the tick and the reconciler must agree
+    on which label opens the window; a deployment on a non-default window
+    config sets both from one place."""
+    assert (
+        review_merge.ReviewConfig().gate_retrigger_label
+        == review_merge.DEFAULT_PR_WINDOW_CONFIG.label_active
+    )
+
+
+def test_the_expected_check_is_found_in_any_error_not_only_the_first(monkeypatch):
+    import subprocess as sp
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["api", "graphql"] and "isInMergeQueue" in argv[3]:
+            return sp.CompletedProcess(argv, 0, json.dumps({"data": {"repository": {"pullRequest": {"id": "N", "isInMergeQueue": False}}}}), "")
+        if argv[:2] == ["api", "graphql"]:
+            body = json.dumps({"data": {"enqueuePullRequest": None}, "errors": [
+                {"message": "Pull request is behind the base branch"},
+                {"message": 'Pull request Required status check "Final merge gate" is expected.'},
+            ]})
+            return sp.CompletedProcess(argv, 1, body, "gh: refused\n")
+        return sp.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    queued, reason = review_merge._ensure_merge_queue_entry("/tmp", "https://github.com/x/y/pull/40")
+    assert (queued, reason) == (False, "required_check_expected: Final merge gate")
+
+
 def test_gate_retriggers_are_capped_per_tick(rig, monkeypatch):  # noqa: F811
     """The second expected-check PR in one tick gets the reason without the
     label writes: a label storm must not become a CI storm."""
@@ -808,7 +916,7 @@ def test_gate_retriggers_are_capped_per_tick(rig, monkeypatch):  # noqa: F811
 
     report = merge_once(app_factory, "/tmp", cfg)
 
-    reasons = sorted(r for t, r in report.skipped if t.startswith("VOYN-W0-MQ3"))
+    reasons = sorted(r for t, r in report.skipped if t in ("VOYN-W0-MQ35", "VOYN-W0-MQ36"))
     assert reasons == [
         "required_check_expected: Final merge gate",
         "required_check_expected: Final merge gate; gates_retriggered",
