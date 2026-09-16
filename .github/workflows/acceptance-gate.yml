@@ -31,7 +31,7 @@ name: Acceptance gate
 on:
   pull_request:
     branches: [main]
-    types: [opened, synchronize, reopened, labeled, unlabeled]
+    types: [opened, synchronize, reopened, labeled]
   pull_request_review:
     types: [submitted, edited, dismissed]
   merge_group:

@@ -20,7 +20,7 @@ name: AIOS boundary fitness
 on:
   pull_request:
     branches: [main]
-    types: [opened, synchronize, reopened, labeled, unlabeled]
+    types: [opened, synchronize, reopened, labeled]
   # The merge queue tests the *prospective* merged result — this branch's
   # commits on top of whatever else the queue is about to land — rather than
   # the branch in isolation. Without this trigger the queue's checks never
