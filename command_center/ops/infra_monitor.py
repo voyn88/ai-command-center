@@ -13,6 +13,7 @@ import json
 import os
 import subprocess
 import time
+from collections.abc import Iterator
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -115,6 +116,64 @@ class UnitHealthSnapshot:
 UNIT_LISTING_CAP = 20
 
 
+#: The control plane's repo-owned timers: the ones the control profile of
+#: `ops/aicc_install_transaction.py` installs and `enable --now`s
+#: (`CONTROL_ONLY_TIMERS`, which a test binds this tuple to so the two cannot
+#: drift apart). Watching them is the direct form of the question every one
+#: of these incidents turned out to be: is the tick actually on this host?
+CONTROL_TIMERS = (
+    "voyn-aicc-review.timer",
+    "voyn-aicc-merge.timer",
+    "voyn-aicc-remediate.timer",
+    "voyn-aicc-pr-window.timer",
+)
+
+#: `UnitFileState` values that mean "systemd will start this timer on the next
+#: boot". Deliberately only `enabled`: `enabled-runtime` is a `/run`-only
+#: enablement that does NOT survive a reboot, and a tick that disappears at
+#: the next reboot is precisely the failure this probe exists to name -- it is
+#: what an operator's hand-made interim timer looks like.
+ENABLED_UNIT_FILE_STATES = frozenset({"enabled"})
+
+
+@dataclass(frozen=True, slots=True)
+class TimerState:
+    load_state: str
+    unit_file_state: str
+    active_state: str
+
+
+@dataclass(frozen=True, slots=True)
+class TimerSnapshot:
+    """Whether the ticks this host is supposed to run are actually scheduled.
+
+    VOYN-W0-AICC-PR-WINDOW-TIMER-NOT-DEPLOYED-ON-CONTROL. control-01 ran
+    voyn-aicc-{planner,review,merge,reaper,self-deploy} and no PR-window
+    timer, so `reconcile_pr_window` never fired: 67 open PRs (752-822) went
+    over a day with no queue label and operators labelled them by hand. Every
+    probe on the host stayed green throughout, because a timer that was never
+    installed has no failed unit, no crash loop and no unit at all to find --
+    `read_unit_health_snapshot` asks only for `--type=service`, so a missing
+    *timer* was invisible to it by construction.
+
+    The effect-side probe (`read_pr_window_snapshot`) catches this too, but
+    only once unlabelled fleet PRs exist and only after their grace period:
+    on a quiet fleet an uninstalled timer stays invisible until the moment
+    PRs appear, which is the moment it hurts. This probe asks the question
+    directly and needs no PR to be open to answer it.
+
+    Three classes because the remedies differ: `missing` is an install that
+    never happened, `not_enabled` is a unit file on disk that no boot will
+    start, and `inactive` is an enabled timer someone stopped.
+    """
+
+    missing: tuple[tuple[str, str], ...]
+    not_enabled: tuple[tuple[str, str], ...]
+    inactive: tuple[tuple[str, str], ...]
+    checked: int = 0
+    error: str | None = None
+
+
 @dataclass(frozen=True, slots=True)
 class DeployLagSnapshot:
     """What production reports versus the branch head it should be running.
@@ -161,6 +220,7 @@ class MonitorReport:
     source_clone: SourceCloneSnapshot | None = None
     unit_health: UnitHealthSnapshot | None = None
     deploy_lag: DeployLagSnapshot | None = None
+    timers: TimerSnapshot | None = None
 
 
 def parse_worker_units(output: str) -> dict[str, str]:
@@ -487,9 +547,11 @@ def read_source_clone_snapshot(repo_path: str) -> SourceCloneSnapshot:
         )
 
 
-def parse_unit_show(output: str) -> dict[str, UnitState]:
-    """Parse blank-line separated `systemctl show` blocks into unit states."""
-    units: dict[str, UnitState] = {}
+def _show_blocks(output: str) -> Iterator[tuple[str, dict[str, str]]]:
+    """`(unit id, properties)` for each blank-line separated `systemctl show`
+    block. Shared by the service and timer probes so both read one systemd
+    output format, and a block with no `Id` is skipped rather than guessed at.
+    """
     for block in output.strip().split("\n\n"):
         fields: dict[str, str] = {}
         for line in block.splitlines():
@@ -497,8 +559,14 @@ def parse_unit_show(output: str) -> dict[str, UnitState]:
             if sep:
                 fields[key.strip()] = value.strip()
         unit = fields.get("Id")
-        if not unit:
-            continue
+        if unit:
+            yield unit, fields
+
+
+def parse_unit_show(output: str) -> dict[str, UnitState]:
+    """Parse blank-line separated `systemctl show` blocks into unit states."""
+    units: dict[str, UnitState] = {}
+    for unit, fields in _show_blocks(output):
         try:
             restarts = int(fields.get("NRestarts", "0") or 0)
         except ValueError:
@@ -508,6 +576,93 @@ def parse_unit_show(output: str) -> dict[str, UnitState]:
             active_state=fields.get("ActiveState", ""),
         )
     return units
+
+
+def parse_timer_show(output: str) -> dict[str, TimerState]:
+    """Parse `systemctl show` blocks into timer enablement/activity states."""
+    return {
+        unit: TimerState(
+            load_state=fields.get("LoadState", ""),
+            unit_file_state=fields.get("UnitFileState", ""),
+            active_state=fields.get("ActiveState", ""),
+        )
+        for unit, fields in _show_blocks(output)
+    }
+
+
+def evaluate_timer_health(
+    states: dict[str, TimerState], expected: tuple[str, ...]
+) -> TimerSnapshot:
+    """Judge each expected timer, most specific class first.
+
+    A timer with no unit file is `missing` and nothing else: it is trivially
+    also not enabled and not active, and reporting it three times would bury
+    the one fact an operator has to act on.
+    """
+    missing: list[tuple[str, str]] = []
+    not_enabled: list[tuple[str, str]] = []
+    inactive: list[tuple[str, str]] = []
+    for unit in expected:
+        state = states[unit]
+        if state.load_state != "loaded":
+            # `not-found` is the never-installed case; `masked`/`bad-setting`
+            # are unit files systemd refuses to load. None of them will fire.
+            missing.append((unit, state.load_state or "unknown"))
+        elif state.unit_file_state not in ENABLED_UNIT_FILE_STATES:
+            not_enabled.append((unit, state.unit_file_state or "unknown"))
+        elif state.active_state != "active":
+            inactive.append((unit, state.active_state or "unknown"))
+    return TimerSnapshot(
+        missing=tuple(missing),
+        not_enabled=tuple(not_enabled),
+        inactive=tuple(inactive),
+        checked=len(expected),
+    )
+
+
+def read_timer_snapshot(expected: tuple[str, ...] = CONTROL_TIMERS) -> TimerSnapshot:
+    """One unprivileged `systemctl show` for the expected timers, never raising.
+
+    `systemctl show` answers for a unit that does not exist (`LoadState=
+    not-found`) rather than failing, which is what lets one call distinguish
+    "never installed" from "installed and stopped". A unit the call silently
+    dropped is a unit this probe did not judge, so a partial answer is a
+    failed measurement and not a clean host -- the same rule
+    `read_unit_health_snapshot` applies to services.
+    """
+    if not expected:
+        return TimerSnapshot(missing=(), not_enabled=(), inactive=(), checked=0)
+    try:
+        shown = subprocess.run(
+            [
+                "systemctl",
+                "show",
+                "--property=Id,LoadState,UnitFileState,ActiveState",
+                "--no-pager",
+                "--",
+                *expected,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        states = parse_timer_show(shown.stdout)
+        unanswered = [unit for unit in expected if unit not in states]
+        if unanswered:
+            raise RuntimeError(
+                f"systemctl show returned {len(states)} of {len(expected)} timers: "
+                + ",".join(unanswered[:UNIT_LISTING_CAP])
+            )
+        return evaluate_timer_health(states, expected)
+    except Exception as exc:  # noqa: BLE001 - see read_pr_window_snapshot
+        return TimerSnapshot(
+            missing=(),
+            not_enabled=(),
+            inactive=(),
+            checked=len(expected),
+            error=f"{type(exc).__name__}: {exc}"[:200],
+        )
 
 
 def parse_service_names(output: str) -> list[str]:
@@ -557,7 +712,7 @@ def evaluate_unit_health(
     )
 
 
-def _unit_listing(entries: tuple[tuple[str, int], ...]) -> str:
+def _unit_listing(entries: tuple[tuple[str, object], ...]) -> str:
     shown = ",".join(f"{unit}={count}" for unit, count in entries[:UNIT_LISTING_CAP])
     hidden = len(entries) - UNIT_LISTING_CAP
     return f"{shown},+{hidden}_more" if hidden > 0 else shown
@@ -783,6 +938,7 @@ def evaluate(
     source_clone: SourceCloneSnapshot | None = None,
     unit_health: UnitHealthSnapshot | None = None,
     deploy_lag: DeployLagSnapshot | None = None,
+    timers: TimerSnapshot | None = None,
 ) -> MonitorReport:
     active_workers = sum(state == "active" for state in worker_states.values())
     failures: list[str] = []
@@ -859,6 +1015,30 @@ def evaluate(
                     f":{_unit_listing(unit_health.failed_units)}"
                 )
 
+    if timers is not None:
+        if timers.error is not None:
+            failures.append(f"control_timer_probe_failed:{timers.error}")
+        else:
+            # One finding per class, every timer in the detail: the identity
+            # is the code before the first ':' (`finding_key`), and the state
+            # that earned each timer its class rides in the listing so the
+            # operator sees `not-found` and `enabled-runtime` apart.
+            if timers.missing:
+                failures.append(
+                    f"control_timer_missing:{len(timers.missing)}"
+                    f":{_unit_listing(timers.missing)}"
+                )
+            if timers.not_enabled:
+                failures.append(
+                    f"control_timer_not_enabled:{len(timers.not_enabled)}"
+                    f":{_unit_listing(timers.not_enabled)}"
+                )
+            if timers.inactive:
+                failures.append(
+                    f"control_timer_inactive:{len(timers.inactive)}"
+                    f":{_unit_listing(timers.inactive)}"
+                )
+
     if deploy_lag is not None:
         if deploy_lag.error is not None:
             failures.append(f"deploy_lag_probe_failed:{deploy_lag.error}")
@@ -881,7 +1061,25 @@ def evaluate(
         source_clone=source_clone,
         unit_health=unit_health,
         deploy_lag=deploy_lag,
+        timers=timers,
     )
+
+
+#: Env var a control unit sets to turn the control-timer probe on.
+CONTROL_TIMERS_ENV = "AICC_CONTROL_TIMERS"
+
+
+def _env_flag(name: str) -> bool:
+    """Whether a unit turned a probe on through its environment.
+
+    Every monitor `ExecStart=` in `deploy/systemd` names an absolute home
+    path, and a public repository cannot restate such a line in a new one
+    (`scripts/ci/prepush/leak_guard.sh`) -- so a probe that has to be switched
+    on for one host profile is switched on by an `Environment=` line beside
+    the command rather than by editing the command. It is the same knob
+    either way, and it is how `AICC_PR_WINDOW_REPO` already works.
+    """
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _positive_int(value: str) -> int:
@@ -982,6 +1180,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="NRestarts at or above which a unit is a crash loop (default 5, minimum 1).",
     )
     parser.add_argument(
+        "--control-timers",
+        action="store_true",
+        default=_env_flag(CONTROL_TIMERS_ENV),
+        help=(
+            "Check that this host's repo-owned control timers "
+            f"({', '.join(CONTROL_TIMERS)}) are installed, enabled and active. "
+            f"Off by default, on when ${CONTROL_TIMERS_ENV} is set (which is "
+            "how the control unit turns it on): a worker host runs none of "
+            "these timers, and their absence there is correct."
+        ),
+    )
+    parser.add_argument(
         "--deploy-lag-repo",
         default=None,
         help="GitHub owner/name whose branch head production must run (off by default).",
@@ -1078,6 +1288,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.unit_health
             else None
         )
+        timers = read_timer_snapshot() if args.control_timers else None
         deploy_lag = (
             read_deploy_lag_snapshot(
                 args.deploy_lag_repo,
@@ -1099,6 +1310,7 @@ def main(argv: list[str] | None = None) -> int:
             source_clone=source_clone,
             unit_health=unit_health,
             deploy_lag=deploy_lag,
+            timers=timers,
         )
     except Exception as exc:  # noqa: BLE001 - the monitor itself must fail closed
         print(json.dumps({"ok": False, "failures": [f"monitor_error:{exc}"]}))
