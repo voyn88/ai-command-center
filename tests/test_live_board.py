@@ -189,16 +189,56 @@ def test_project_repository_path_is_used_when_the_task_has_none(tmp_path):
 
 def test_every_blocking_code_carries_an_action(tmp_path):
     """A disabled button that does not say what to do about it is the defect
-    this gate exists to avoid."""
+    this gate exists to avoid.
+
+    "Every" is taken from the module, not from this list. The three cases this
+    test used to carry reached three of the five blocking codes, and both
+    codes it missed -- the two conflict codes, the ones that need a non-empty
+    `active_runs` -- could be returned with `LaunchGate.action` left at its
+    `""` default with nothing in the suite noticing. So the codes are
+    enumerated by introspection and the cases are required to cover them: a
+    sixth code added tomorrow fails here until it has both a case and an
+    action.
+    """
+    blocking_codes = {
+        value
+        for name, value in vars(live_board).items()
+        if name.startswith("GATE_")
+        and isinstance(value, str)
+        and value != live_board.GATE_OK
+    }
+    assert set(live_board.GATE_ACTIONS) == blocking_codes, (
+        "a blocking code with no entry in GATE_ACTIONS has nothing to advise"
+    )
+
+    busy = tmp_path / "busy"
+    busy.mkdir()
     cases = [
-        _task("A", status="Done"),
-        _task("B", depends_on=["MISSING"]),
-        _task("C"),
+        (_task("A", status="Done"), []),
+        (_task("B", depends_on=["MISSING"]), []),
+        (_task("C"), []),  # no workspace anywhere
+        (
+            _task("D", workspace_path=str(busy)),
+            [{"id": "run-1", "task_id": "D", "repository_path": str(busy)}],
+        ),
+        (
+            _task("E", workspace_path=str(busy)),
+            [{"id": "run-9", "task_id": "OTHER", "repository_path": str(busy)}],
+        ),
     ]
-    for task in cases:
-        gate = live_board.launch_gate(task, tasks_by_id=_by_id(task), active_runs=[])
+
+    reached = set()
+    for task, active_runs in cases:
+        gate = live_board.launch_gate(
+            task, tasks_by_id=_by_id(task), active_runs=active_runs
+        )
         assert not gate.allowed
         assert gate.action, f"{gate.code} без рекомендации"
+        reached.add(gate.code)
+
+    assert reached == blocking_codes, (
+        f"blocking codes this test never reaches: {sorted(blocking_codes - reached)}"
+    )
 
 
 # --------------------------------------------------------------------------
