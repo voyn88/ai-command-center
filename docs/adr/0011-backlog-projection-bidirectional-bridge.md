@@ -37,13 +37,15 @@ match — not `backlog_task.status`'s *execution* vocabulary
 empty for an export-generated file. `backlog_export._planning_status`
 translates one to the other (`EXECUTABLE_STATUSES` → `PO-Approved`,
 everything else → `PO-Review`), at the cost of losing execution-status
-granularity in this field. That granularity lives on the master file's *other* record
-surface, the one `backlog_client.parse_rich_records` reads (consumed by
-`native_gateway/projection_producer.py` for Kanban lanes and the wave-goal
-card).
+granularity in this field — permanently, since this field belongs to the
+planning vocabulary. That granularity lives on the master file's *other*
+record surface, the one `backlog_client.parse_rich_records` reads (consumed
+by `native_gateway/projection_producer.py` for Kanban lanes and the
+wave-goal card), which the exporter did not emit until 2026-09-21.
 
-**Gap closed 2026-09-21 by option (a) below: section `0C. Execution
-status`.** The safety analysis of 2026-09-05 stands exactly as written —
+**Gap closed 2026-09-21, by the first of the two options the 2026-09-05
+analysis named: a distinct marker format, rendered as section `0C.
+Execution status`.** That analysis stands exactly as written —
 `backlog_client._RICH_LINE` (`- **VOYN-<id>** | <wave> | <status> |
 <priority> |`) is a strict subset of `backlog_parser`'s
 `_TASK_LINE`/`_RECORD_SHAPED` match (bold `**VOYN-...**` id followed by
@@ -64,10 +66,12 @@ carry both, **the machine record wins**: `backlog_task` is canonical and a
 `VOYN_TASK_STATUS` line is a direct reading of it, while a bold line is
 owner-typed input the store may already have moved past — preferring the
 authored line would let a stale hand edit mask live execution state, which
-is the staleness this ADR's export half exists to end. Option (b),
-outliving the revisit date, is no longer the cheaper path because it is no
-longer needed; the bold-line shape can still be adopted directly once
-`backlog-import` retires, but nothing depends on that happening.
+is the staleness this ADR's export half exists to end. The analysis's other option —
+outliving this ADR's revisit condition, after which the bold-line shape is
+no longer a live import surface — was judged the cheaper of the two at the
+time and is now simply unnecessary. The exporter may still switch to the
+bold shape once `backlog-import` retires, but nothing depends on it
+doing so.
 
 Two consequences worth recording, both caught by widening the vocabulary
 rather than by the shape work:
