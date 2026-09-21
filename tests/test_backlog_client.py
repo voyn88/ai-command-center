@@ -660,3 +660,22 @@ def test_an_unknown_machine_status_is_surfaced_never_guessed():
         " | priority=P0 | slug=x\n"
     )
     assert bc.parse_rich_records(line)[0].status == "UNKNOWN"
+
+
+def test_an_override_collapses_a_duplicated_authored_id_to_one_record():
+    """The store holds one row per `task_id`, so one machine record can be
+    the answer for an id the authored file happens to list twice (a real
+    condition: `backlog_parser` reports two duplicate ids in the live master
+    file and resolves them first-wins).
+
+    Emitting the override once per duplicate would put the same task on the
+    board twice; keeping a duplicate's later bold line beside the override
+    would put it there under two different statuses. One id, one record."""
+    text = (
+        "- **VOYN-W0-A** | Wave 0 | OPEN | P0 | X | `a` | t\n"
+        "- **VOYN-W0-A** | Wave 0 | UNTRIAGED | P0 | X | `a-stray-copy` | t\n"
+        "- VOYN_TASK_STATUS | id=VOYN-W0-A | wave=Wave 0 | status=DONE"
+        " | priority=P0 | slug=a\n"
+    )
+    records = bc.parse_rich_records(text)
+    assert [(r.record_id, r.status) for r in records] == [("VOYN-W0-A", "DONE")]
