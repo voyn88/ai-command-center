@@ -2190,7 +2190,7 @@ def test_a_duplicate_enqueue_does_not_raise_against_the_items_own_heartbeat(
     """The pairing this fleet actually produces, and the reason 0027 is not
     only about two dispatchers.
 
-    A worker holding an item beats every ``visibility_seconds / 3`` (~100s on
+    A worker holding an item beats every ``beat_interval_seconds`` (~75s on
     the deployed lanes), and every beat is an audited write to that item taken
     under `_queue_owns`'s `FOR UPDATE`. A review or merge tick re-enqueueing
     that item's key lands on the duplicate path with no lock at all, so it

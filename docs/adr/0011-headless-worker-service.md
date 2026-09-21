@@ -55,9 +55,12 @@ This is a distinct mechanism from the queue's visibility lease, and the two must
 - `work_queue_store.claim`'s `visibility_seconds` (default 300, clamped server-side to `[1, 3600]`
   by `queue_claim`) is the width of a single lease window on the claimed `work_item` row.
 - That window is **renewed, not lengthened**, by a heartbeat thread that runs beside the handler for
-  the entire duration of a run (`WorkerDaemon._heartbeat_loop`, firing at a third of the visibility
-  window) — the daemon docstring's own words: "the heartbeat runs beside the handler, not inside
-  it... [it] renews at a third of the visibility window." A run many multiples of 300 seconds long
+  the entire duration of a run (`WorkerDaemon._heartbeat_loop`, firing at
+  `beat_interval_seconds` — often enough that `TOLERATED_FAILED_BEATS` consecutive failures still
+  leave a beat's margin before the deadline; 75s against the default 300s window). It fired at a
+  *third* of the window until VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED, which is one beat too slow:
+  the third beat lands on the deadline, so the two failed beats the design is sized around lost the
+  lease and the whole run with it. A run many multiples of 300 seconds long
   survives on live heartbeats exactly as well as a 60-second one; only a *lapsed* heartbeat (the
   process wedged, the database unreachable) ends the lease early.
 - A payload's `timeout_seconds` therefore never "outlives" the queue's visibility lease in the sense
@@ -113,7 +116,7 @@ against it — exactly the race `blocking_lease`'s own docstring disclaims respo
 
 `deploy/systemd/aicc-worker.service` runs `Type=notify` with a watchdog fed from both the claim loop
 (between claims) and the heartbeat thread (during a run), so every healthy state pings within one
-heartbeat interval (`visibility_seconds / 3`, ~100s by default). `WatchdogSec=240s` is two missed
+heartbeat interval (`beat_interval_seconds`, 75s by default). `WatchdogSec=240s` is three missed
 intervals plus slack; a wedged process (a handler that hangs and takes the heartbeat thread with it)
 is restarted, and that restart is safe by the same construction as a SIGKILL — lease expiry plus the
 control-plane reaper resume the item elsewhere. `TimeoutStopSec=330s` outlives one visibility window

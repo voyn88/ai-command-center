@@ -8,6 +8,120 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Fixed — the lease had no renewal margin, so the fleet manufactured its own lapses (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
+- `control-01:queue` reported `queue_stalled` again (`monitor_finding` #13420).
+  The three commits before this one taught the MEASUREMENT to read a fleet
+  whose leases slip — #13366 stopped a slipped lease freeing the lane that is
+  still holding the item, 0029 stopped the reaper expiring a lease that had
+  been renewed. Both rest on the same premise, written into both of their
+  headers as if it were weather:
+
+      The beat runs at `visibility_seconds / 3` (100s against a 300s window),
+      so ANY TWO CONSECUTIVE FAILED BEATS lapse the lease.
+
+  It was not a fact about the fleet. It was an off-by-one beat in
+  `WorkerDaemon._heartbeat_loop`, sitting under a comment that promised the
+  opposite — "A third of the window: two consecutive beats may fail (a
+  restarting PostgreSQL, a network blip) **before the lease actually lapses**"
+  — with nothing anywhere measuring which of the two was true.
+
+  **The arithmetic.** A successful beat at `T` renews the lease to `T + V`
+  (`queue_heartbeat` renews by the attempt's own `visibility_seconds`, read
+  from the row). The beats that follow fall at `T + I`, `T + 2I`, …, so the
+  first beat that MUST succeed is number `F + 1`. At `I = V/3` and `F = 2`
+  that is `3 × (V/3)` — `V` EXACTLY. The beat lands ON the deadline, and
+  `_queue_owns` refuses it: `visible_until <= now()` is `claim_expired`, a
+  `<=` and not a `<`. The delivered tolerance was ONE failed beat.
+
+  **MEASURED against a real PostgreSQL 16 server**, through the real
+  `queue_claim`/`queue_heartbeat` and the real `_heartbeat_loop`, at
+  `visibility_seconds=12`:
+
+      0 consecutive failed beats   lease held   beats=[ok, ok, ok, ok]
+      1 consecutive failed beat    lease held   beats=[raised, ok, ok, ok]
+      2 consecutive failed beats   LEASE LOST   beats=[raised, raised, REFUSED]
+
+  and after the fix, on the same server and the same harness:
+
+      2 consecutive failed beats   lease held   beats=[raised, raised, ok, ok]
+      3 consecutive failed beats   LEASE LOST   beats=[raised, raised, raised, REFUSED]
+
+  **The fleet meets this on a schedule it runs itself.**
+  `voyn-aicc-worker@.service` declares `Requires=voyn-aicc-pgtunnel.service`,
+  and the credential rotation restarts that tunnel on its own timer. One
+  restart that costs two beats — ~200s at the deployed 300s window — takes
+  every in-flight attempt in the fleet at once.
+
+  **What each one costs, and none of it was the blip's to take.** The lane is
+  still executing. Its next beat resolves to `claim_expired` and
+  `daemon._execute` discards the outcome, so up to a whole
+  `TimeoutStopSec=3660s` run is thrown away at the finish line; the reaper
+  hands the item to another lane, so the side effects run again; and
+  `queue_claim` had already charged `attempt_count` for the delivery that was
+  taken away, so on the default `max_attempts` of 3 the third such blip
+  dead-letters a perfectly healthy item as `visibility_timeout_exhausted`,
+  reachable after that only by an operator's `queue_redrive`.
+
+  **Why it is this finding and not a neighbouring one.** Every lapse enters
+  the one starvation class `infra_monitor.evaluate` neither excuses by
+  capacity nor bounds by the fleet clock — "no lane is holding it, so no lane
+  being free is irrelevant to it … only the reaper does" — and then, once the
+  reaper has done its job, leaves the item back on the due-ready pile the same
+  probe weighs, with its clock running. The branch has spent three commits
+  making the probe read that state correctly. This is the fleet no longer
+  producing it.
+
+  **The fix: derive the cadence from the tolerance.** `TOLERATED_FAILED_BEATS`
+  is now a named constant with the arithmetic beside it, and
+  `beat_interval_seconds` returns `V / (F + 2)` — one interval for the
+  renewal, `F` for the failures, and one whole interval of MARGIN. The margin
+  is a beat rather than an epsilon because every term drifts the same way:
+  `beat_stop.wait(interval)` restarts from when the previous call RETURNED, so
+  each cycle costs `I` plus a round trip plus whatever the scheduler adds, and
+  the error accumulates. At the deployed window the beat moves from 100s to
+  75s — four renewals per window instead of three, per lane.
+
+  Nothing else moves. The error path's own ceiling is
+  `consecutive_errors * interval >= visibility_seconds`, which is "a full
+  window with no successful beat" at ANY interval, so it stays exact. The
+  watchdog cap still only ever SHORTENS the wait, now pinned as a property.
+  `WatchdogSec=240s` is deliberately left alone: against 75s beats it is a
+  little over three missed pings rather than two, which is more slack for a
+  wedge detector, and tightening a watchdog is a restart risk this finding has
+  no reason to take — the unit comment that stated the old arithmetic as fact
+  now states the new one.
+
+- **Nothing pinned the tolerance, which is why the comment could be wrong for
+  as long as it was.** `test_persistent_heartbeat_errors_stop_the_work` pins
+  the error ceiling, and the watchdog test pins the cap; the interval itself
+  was pinned by no test at all, and a fake store cannot catch it — it has no
+  deadline to be late for, so it answers every beat the same whenever it
+  arrives. Six tests now, and they name the tolerance rather than the divisor,
+  so retuning either number has to keep the promise or go red:
+
+    * Four need no server (`tests/worker/test_daemon.py`) and so run in every
+      gate on every machine — the lesson `tests/db/test_reap_bound.py` was
+      written for. One states the survival property over every window the
+      clamps do not reach, one states it concretely at the deployed number,
+      one pins that the watchdog cap can only ever shorten the beat, and one
+      drives the REAL loop against a store that keeps the lease the way the
+      server keeps it (renew to `now() + V`; refuse at `visible_until <=
+      now()`), so the recovery beat is judged by a clock rather than by the
+      fake's goodwill.
+    * Two run against a real server
+      (`tests/db/test_infra_monitor_queue_snapshot.py`), because the claim is
+      about the whole chain and not about one number: a lane 40 minutes into
+      an attempt loses the tolerated beats, and afterwards the lease is live,
+      the real `WorkQueueAdmin.reap()` finds nothing to recover, and the probe
+      reads an ATTENDED claim with `lapsed_claims == 0`. Its sibling proves
+      the direction — one beat past the tolerance and the lease is gone
+      exactly as before, the daemon stops the work and the reaper takes the
+      item back — so this is a margin and not a weakening of the protocol.
+
+  Three of the six fail on the mutation back to `visibility_seconds / 3`
+  (including the real-server one); the other three are the fail-closed guards
+  and hold either way.
+
 ### Fixed — a lane whose lease slipped is still holding its lane (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
 - `control-01:queue` reported `queue_stalled` again (`monitor_finding` #13366),
   against a fleet at full stretch. `evaluate`'s capacity test asks "was a lane

@@ -1236,13 +1236,19 @@ def test_the_statement_binds_the_queue_to_both_of_its_questions(monkeypatch) -> 
 # the row stays `claimed` until the reaper takes it back, and `queue_claim`
 # will not hand that lane a second one meanwhile.
 #
-# The gap between the two is the ordinary appearance of a healthy long run.
-# The beat runs at `visibility_seconds / 3` (100s against a 300s window), so
-# ANY TWO CONSECUTIVE FAILED BEATS lapse the lease -- a database blip, or the
+# The gap between the two is how a healthy long run can still look for a few
+# seconds, and the measurement has to survive it however rare it gets. It was
+# once ROUTINE: the beat ran at `visibility_seconds / 3` (100s against a 300s
+# window), which puts the third beat ON the deadline, so any two consecutive
+# failed beats lapsed the lease -- a database blip, or the
 # `voyn-aicc-pgtunnel.service` restart the credential rotation cycles on its
 # own schedule (0029: "the fleet coming BACK from a stall ... that cost two
-# beats"). `aicc-queue-reaper.timer` clears it on the next minute and the
-# probe samples every two, so this is not a race that might happen.
+# beats"). `WorkerDaemon.beat_interval_seconds` now renews with a whole beat
+# of margin (monitor_finding #13420), so that blip no longer lapses anything
+# and these rules have less to excuse. What still reaches them --  an outage
+# past the tolerance, a host that is gone -- is the same shape, and
+# `aicc-queue-reaper.timer` still clears it on the next minute while the probe
+# samples every two.
 #
 # These are here beside the DB proofs and not only in them, for the reason
 # `test_reap_bound.py` exists: they need no server, so they run in every gate

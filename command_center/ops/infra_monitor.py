@@ -496,14 +496,21 @@ def evaluate(
         # `claimed` until the reaper takes it back, and until then the lane is
         # running its handler with nowhere to put another attempt.
         #
-        # A lapsed lease is the ordinary way a healthy long attempt looks for
-        # a few seconds. The beat runs at `visibility_seconds / 3` (100s
-        # against a 300s window), so ANY TWO CONSECUTIVE FAILED BEATS lapse
-        # it -- a database blip, or the `voyn-aicc-pgtunnel.service` restart
-        # the credential rotation cycles on its own schedule, which 0029
-        # names as the moment this fleet meets ("the fleet coming BACK from a
-        # stall ... that cost two beats"). `aicc-queue-reaper.timer` clears
-        # it on the next minute; the probe samples every two.
+        # A lapsed lease is still how a healthy long attempt can look for a
+        # few seconds, and the measurement must survive it however rare it
+        # gets. It is no longer ORDINARY, and that changed under this comment
+        # rather than in it: the beat ran at `visibility_seconds / 3` (100s
+        # against a 300s window), which puts the third beat ON the deadline,
+        # so any two consecutive failed beats lapsed the lease -- a database
+        # blip, or the `voyn-aicc-pgtunnel.service` restart the credential
+        # rotation cycles on its own schedule. `WorkerDaemon` now renews with
+        # a whole beat of margin (`beat_interval_seconds`,
+        # VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED / monitor_finding #13420),
+        # so that blip costs nothing and this rule has correspondingly less
+        # to excuse. What still reaches it -- an outage past the tolerance, a
+        # host that is gone -- is the same shape, and
+        # `aicc-queue-reaper.timer` still clears it on the next minute while
+        # the probe samples every two.
         #
         # MEASURED against a real PostgreSQL 16 server -- two lanes 40
         # minutes into legitimate attempts, the two surplus dispatched items

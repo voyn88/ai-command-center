@@ -19,10 +19,22 @@ Type=notify
 # The daemon sends READY=1 when its claim loop starts and feeds the watchdog
 # from BOTH its threads (claim loop between claims, heartbeat thread during a
 # run), so every healthy state pings within one heartbeat interval
-# (visibility/3 = 100s by default). Two consecutive missed pings mean the
-# process is wedged, and restart is safe by the same construction as SIGKILL:
-# lease expiry plus the reaper timer (aicc-queue-reaper.timer) resume the item
-# elsewhere. 240s = two heartbeat intervals plus slack.
+# (`WorkerDaemon.beat_interval_seconds`: 75s against the default 300s
+# visibility window). A wedged process misses ping after ping, and restart is
+# safe by the same construction as SIGKILL: lease expiry plus the reaper timer
+# (aicc-queue-reaper.timer) resume the item elsewhere.
+#
+# THE INTERVAL IS DERIVED, NOT CHOSEN, and this line used to restate it as
+# "visibility/3 = 100s ... 240s = two heartbeat intervals plus slack". Both
+# halves were wrong together (VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED): a
+# third of the window puts the third beat ON the lease deadline, so the two
+# failed beats this unit's slack was sized around cost the whole attempt. The
+# daemon now renews with a beat to spare; see `beat_interval_seconds`.
+#
+# 240s is deliberately left where it is. Against 75s intervals it is a little
+# over three missed pings rather than two, which is MORE slack for a wedge
+# detector, and tightening a watchdog is a restart risk this finding has no
+# reason to take.
 WatchdogSec=240s
 User=aicc-worker
 Group=aicc-worker

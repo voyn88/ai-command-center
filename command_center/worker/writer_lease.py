@@ -69,9 +69,20 @@ __all__ = ["WriterLeaseConfig", "WriterLeaseUnavailable", "hold"]
 
 logger = logging.getLogger(__name__)
 
-# A third of the TTL, matching `WorkerDaemon._heartbeat_loop`'s reasoning
-# verbatim: two consecutive renewal failures (an authority restart, a
-# network blip) may pass before the lease actually lapses server-side.
+# A third of the TTL: a successful renewal leaves two whole intervals of
+# margin before the lease lapses server-side.
+#
+# This used to say it was "matching `WorkerDaemon._heartbeat_loop`'s reasoning
+# verbatim: two consecutive renewal failures ... may pass". Neither half of
+# that survives inspection (VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED): the beat
+# loop's third of a window left NO margin, which is why it now derives its
+# cadence from `TOLERATED_FAILED_BEATS` instead; and a failed renewal never
+# "passes" HERE in the first place -- `_renew_loop` below sets `_lease_lost`
+# and returns on the FIRST failure, so this fraction governs how much TTL a
+# SUCCESSFUL renewal leaves in hand and nothing else. Whether this loop should
+# absorb a transient authority blip the way the beat loop does is a real
+# question about SRV-04a's takeover rules, and it is not this finding's to
+# answer unmeasured.
 _RENEW_FRACTION = 3.0
 _MIN_RENEW_INTERVAL_SECONDS = 1.0
 

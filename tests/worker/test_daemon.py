@@ -979,3 +979,151 @@ def test_a_failing_credential_reload_keeps_the_claim_gate_shut() -> None:
         daemon.request_stop()
         worker.join(timeout=5)
     assert not worker.is_alive()
+
+
+# ---------------------------------------------------------------------------
+# VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED (monitor_finding #13420): the lease
+# had no renewal margin at all.
+#
+# `_heartbeat_loop` waited `visibility_seconds / 3` between beats under a
+# comment promising that "two consecutive beats may fail (a restarting
+# PostgreSQL, a network blip) before the lease actually lapses". Three beats
+# at a third of the window land at V/3, 2V/3 and V EXACTLY -- so after two
+# failures the beat that has to succeed arrives ON the deadline, and
+# `_queue_owns` refuses it (`claim_expired`, a `<=` test). The delivered
+# tolerance was ONE.
+#
+# These pin the tolerance itself rather than the divisor, so a future change
+# to either number has to keep the promise or go red.
+# `tests/db/test_lease_renewal_margin.py` proves the same property end to end
+# against a real server; these need none and so run in every gate on every
+# machine -- the lesson `tests/db/test_reap_bound.py` was written for.
+
+
+def test_the_lease_survives_the_beats_the_daemon_says_may_fail() -> None:
+    """THE REGRESSION, as arithmetic over the window the deployment runs and
+    every other window the clamps do not reach.
+
+    A successful beat at T renews the lease to T + V. The beat that must
+    succeed is the one after the tolerated failures, at T + (F + 1) * I, and
+    it has to land while the lease is still LIVE -- `visible_until <= now()`
+    is refused, so landing exactly on the deadline is landing late.
+    """
+    from command_center.worker.daemon import (
+        TOLERATED_FAILED_BEATS as tolerated,
+    )
+    from command_center.worker.daemon import (
+        beat_interval_seconds,
+    )
+
+    for window in (8, 12, 60, WorkerConfig().visibility_seconds, 600, 3600):
+        interval = beat_interval_seconds(window)
+        first_required_beat = (tolerated + 1) * interval
+        assert first_required_beat < window, (
+            f"visibility_seconds={window}: the beat after {tolerated} failures "
+            f"lands at {first_required_beat}s against a {window}s lease"
+        )
+        # ... and with a whole beat to spare, because every term drifts the
+        # same way: `beat_stop.wait(interval)` restarts after the PREVIOUS
+        # call returned, so each cycle costs the round trip too.
+        assert first_required_beat + interval <= window, (
+            f"visibility_seconds={window}: no margin left after "
+            f"{tolerated} failed beats"
+        )
+
+
+def test_the_deployed_window_beats_often_enough_to_survive_a_tunnel_restart() -> None:
+    """The same property at the number the fleet actually runs, stated
+    concretely so the regression reads as a fleet fact and not as algebra.
+
+    `voyn-aicc-worker@.service` declares `Requires=voyn-aicc-pgtunnel.service`
+    and the credential rotation restarts that tunnel on its own timer, so a
+    blip costing two beats is a scheduled event, not a coincidence.
+    """
+    from command_center.worker.daemon import beat_interval_seconds
+
+    window = WorkerConfig().visibility_seconds
+    interval = beat_interval_seconds(window)
+    beats_before_expiry = [n * interval for n in (1, 2, 3)]
+
+    assert max(beats_before_expiry) < window, (
+        f"beats at {beats_before_expiry} against a {window}s lease"
+    )
+
+
+def test_the_watchdog_cap_can_only_shorten_the_beat() -> None:
+    """The cap exists so a long window cannot park the beat thread past the
+    systemd watchdog deadline. It must never LENGTHEN the interval, which
+    would silently spend the tolerance this module just bought back."""
+    from command_center.worker.daemon import beat_interval_seconds
+
+    window = 3600
+    uncapped = beat_interval_seconds(window)
+
+    assert beat_interval_seconds(window, 1.0) == 1.0
+    assert beat_interval_seconds(window, uncapped * 10) == uncapped
+    # The floor is the same clamp `queue_claim` puts on the window itself.
+    assert beat_interval_seconds(1, 0.0) == 1.0
+    assert beat_interval_seconds(0.5) == 1.0
+
+
+def test_a_blip_of_the_tolerated_length_does_not_stop_the_work() -> None:
+    """The loop itself, against a store that keeps the lease the way the
+    server keeps it.
+
+    `queue_heartbeat` renews `visible_until` to `now() + visibility_seconds`
+    and `_queue_owns` refuses a beat that arrives when `visible_until <=
+    now()` -- landing ON the deadline is landing late. This fake enforces
+    exactly those two rules and nothing else, so the beat that recovers from
+    the blip is judged by the clock rather than by the fake's goodwill. Under
+    `visibility_seconds / 3` the third beat lands at the deadline, the store
+    refuses it, and the handler's run is thrown away.
+
+    A blip of `TOLERATED_FAILED_BEATS` beats is what a
+    `voyn-aicc-pgtunnel.service` restart does to a lane, and the credential
+    rotation restarts that tunnel on its own timer.
+    """
+    import threading
+
+    from command_center.worker.daemon import TOLERATED_FAILED_BEATS
+
+    window = 8.0
+    store = ScriptedStore([_work({"kind": "slow"})])
+    beats: list[str] = []
+    recovered = threading.Event()
+    claimed_at = time.monotonic()
+    visible_until = [claimed_at + window]
+
+    def leased_heartbeat(work):
+        if len(beats) < TOLERATED_FAILED_BEATS:
+            beats.append("raised")
+            raise ConnectionError("tunnel restarting")
+        now = time.monotonic()
+        if visible_until[0] <= now:
+            # `_queue_owns`: 'claim_expired'. The attempt is forfeit even
+            # though nobody has taken it yet.
+            beats.append("refused")
+            recovered.set()
+            return False
+        visible_until[0] = now + window
+        beats.append("ok")
+        recovered.set()
+        return True
+
+    store.heartbeat = leased_heartbeat  # type: ignore[method-assign]
+
+    def slow(payload, lease_lost, attempt_no=1):
+        assert recovered.wait(timeout=window * 3), f"no beat recovered: {beats}"
+        assert not lease_lost.is_set(), (
+            f"{TOLERATED_FAILED_BEATS} failed beats gave the lease up: {beats}"
+        )
+        return HandlerOutcome(ok=True, result={"ok": True})
+
+    daemon = WorkerDaemon(store, {"slow": slow}, WorkerConfig(visibility_seconds=window))
+    _run_until_idle(daemon, store)
+
+    assert beats[:TOLERATED_FAILED_BEATS] == ["raised"] * TOLERATED_FAILED_BEATS
+    assert "refused" not in beats, f"the recovery beat arrived too late: {beats}"
+    assert any(call[0] == "complete" for call in store.calls), (
+        "the attempt was thrown away by a blip it was sized to survive"
+    )

@@ -663,10 +663,14 @@ def test_a_lane_whose_lease_slipped_is_still_holding_its_lane(monitor) -> None:
     (`voyn-aicc-worker@.service` allows one 3660s), the surplus dispatched
     item ready and due behind them the whole time -- `PlanLimits.wip_limit` 4
     against 2 lanes, the shape the queue is DESIGNED to hold. Then lane two's
-    lease lapses by 30 seconds, which is what two consecutive failed beats
-    look like: the beat runs at `visibility_seconds / 3`, and 0029 names the
-    occasion this fleet meets it on -- a database blip, or the
+    lease lapses by 30 seconds -- an outage past what the beat cadence
+    absorbs, which 0029 names the occasion for: a database blip, or the
     `voyn-aicc-pgtunnel.service` restart the credential rotation cycles.
+    (Two failed beats used to be enough, because the beat ran at
+    `visibility_seconds / 3` and the third landed on the deadline; see
+    `test_a_tunnel_restart_of_the_tolerated_length_keeps_the_lane_attended`
+    at the foot of this file. Rarer is not never, and this rule is what the
+    measurement needs either way.)
 
     Nothing about the fleet changed. No lane is free, no lane stopped, and
     `aicc-queue-reaper.timer` will clear the lapse on its next minute. The
@@ -819,3 +823,167 @@ def test_the_reaper_hands_the_lane_back_and_the_due_clock_resumes(monitor) -> No
         prometheus_ready=True, claim_capacity=2,
     )
     assert "queue_stalled" in report.failures
+
+
+# ---------------------------------------------------------------------------
+# VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED (monitor_finding #13420): the fleet
+# was MANUFACTURING the lapsed-claim class the probe weighs unconditionally.
+#
+# Everything above this line taught the MEASUREMENT to read a fleet whose
+# leases slip -- #13366 stopped a slipped lease freeing the lane that still
+# holds the item, 0029 stopped the reaper expiring a lease that had been
+# renewed. Both rest on the same premise, stated in both of their headers:
+# "the beat runs at `visibility_seconds / 3` ... so ANY TWO CONSECUTIVE FAILED
+# BEATS lapse the lease", treated as an unavoidable fact of the fleet.
+#
+# It was not a fact about the fleet. It was an off-by-one beat in
+# `WorkerDaemon._heartbeat_loop`, under a comment promising the opposite
+# ("two consecutive beats may fail ... before the lease actually lapses").
+# Three beats at a third of the window fall at V/3, 2V/3 and V EXACTLY, so
+# after two failures the beat that has to succeed arrives ON the deadline and
+# `_queue_owns` refuses it (`claim_expired` is `visible_until <= now()`).
+#
+# These run the REAL beat loop against the REAL protocol, because the claim
+# under test is about a clock: the lease is kept by the server, renewed by
+# `queue_heartbeat` from the attempt's own row, and judged by `now()`. A fake
+# store would be asserting that the test's own idea of a deadline agrees with
+# itself. They wait real seconds for the same reason -- the cadence IS the
+# subject -- so the window is the smallest one the clamps leave meaningful.
+
+
+def _blipping(store: WorkQueueStore, failures: int) -> list[str]:
+    """Make the next ``failures`` beats raise, the way a restarting
+    `voyn-aicc-pgtunnel.service` does to a lane, and record every beat."""
+    beats: list[str] = []
+    real = store.heartbeat
+
+    def heartbeat(work: ClaimedWork) -> bool:
+        if len(beats) < failures:
+            beats.append("raised")
+            raise ConnectionError("tunnel restarting")
+        alive = real(work)
+        beats.append("renewed" if alive else "refused")
+        return alive
+
+    store.heartbeat = heartbeat  # type: ignore[method-assign]
+    return beats
+
+
+def _beat_through(store: WorkQueueStore, work: ClaimedWork, window: float):
+    """Run the production beat loop over one claim for a whole window plus a
+    beat, and report whether it gave the lease up."""
+    import threading
+
+    from command_center.worker.daemon import WorkerConfig, WorkerDaemon, beat_interval_seconds
+
+    daemon = WorkerDaemon(
+        store, {}, WorkerConfig(queue=QUEUE, visibility_seconds=int(window))
+    )
+    lease_lost = threading.Event()
+    beat_stop = threading.Event()
+    thread = threading.Thread(
+        target=daemon._heartbeat_loop,
+        args=(work, lease_lost, beat_stop),
+        daemon=True,
+    )
+    thread.start()
+    lease_lost.wait(window + beat_interval_seconds(window) + 1.0)
+    beat_stop.set()
+    thread.join(timeout=5)
+    return lease_lost.is_set()
+
+
+#: Small enough that a test waits seconds rather than minutes, large enough
+#: that `beat_interval_seconds`' one-second floor does not swallow the
+#: cadence under test. The RATIO is what is being measured, and it is the
+#: deployed one.
+BLIP_WINDOW = 8
+
+
+def test_a_tunnel_restart_of_the_tolerated_length_keeps_the_lane_attended(
+    monitor,
+) -> None:
+    """THE REGRESSION. A lane 40 minutes into a legitimate attempt loses the
+    two consecutive beats a `voyn-aicc-pgtunnel.service` restart costs it --
+    the unit declares `Requires=voyn-aicc-pgtunnel.service` and the credential
+    rotation restarts that tunnel on its own timer.
+
+    Afterwards nothing has happened to the queue: the lease is live, the
+    reaper has nothing to recover, and the probe reads an ATTENDED claim. The
+    lapsed-claim class -- the one starvation clock `evaluate` neither excuses
+    by capacity nor bounds by the fleet clock, and whose only exit is the
+    reaper -- is never entered at all.
+
+    Before the fix the third beat landed on the deadline: the lease was lost,
+    `daemon._execute` discarded up to a whole `TimeoutStopSec=3660s` run, the
+    reaper handed the item to another lane, the side effects re-ran and
+    `queue_claim` had already charged `attempt_count` for the delivery that
+    was taken away."""
+    from command_center.db.work_queue_admin import WorkQueueAdmin
+    from command_center.worker.daemon import TOLERATED_FAILED_BEATS
+
+    measure, app, worker, age = monitor
+    app.enqueue(QUEUE, idempotency_key="long-run", payload={"kind": "agent_run"})
+    claimed = _claim(worker, visibility=BLIP_WINDOW)
+    age(
+        "UPDATE work_item SET updated_at = now() - interval '40 minutes' "
+        "WHERE current_attempt_id = %s",
+        (claimed.attempt_id,),
+    )
+
+    beats = _blipping(worker, TOLERATED_FAILED_BEATS)
+    lost = _beat_through(worker, claimed, BLIP_WINDOW)
+
+    assert beats[:TOLERATED_FAILED_BEATS] == ["raised"] * TOLERATED_FAILED_BEATS
+    assert "refused" not in beats, f"the recovery beat arrived too late: {beats}"
+    assert not lost, f"{TOLERATED_FAILED_BEATS} failed beats lost the lease: {beats}"
+
+    # The reaper's tick, run as the identity `aicc-queue-reaper.service`
+    # carries. A live lane's item is not its business.
+    assert WorkQueueAdmin(app._factory).reap() == 0
+
+    snapshot = measure()
+    assert (snapshot.claimed, snapshot.attended_claims) == (1, 1)
+    assert snapshot.lapsed_claims == 0
+    assert snapshot.lapsed_claim_age_seconds is None
+    # The claim IS older than the stall window -- it is a long run, which is
+    # what this fleet is for -- and that is bounded by --max-claim-seconds,
+    # never by the stall clock.
+    assert snapshot.live_claim_age_seconds > MAX_STALLED
+
+    report = infra_monitor.evaluate(
+        {}, snapshot, minimum_active_workers=0, max_stalled_seconds=MAX_STALLED,
+        prometheus_ready=True, claim_capacity=2,
+    )
+    assert report.ok, report.failures
+
+
+def test_a_blip_past_the_tolerance_still_hands_the_item_back(monitor) -> None:
+    """The other direction, so the fix is a MARGIN and not a weakening of the
+    protocol. One beat past the tolerance and the lease is gone exactly as
+    before: the server refuses the late beat, the daemon stops the work, and
+    `aicc-queue-reaper.timer` recovers the item on its next tick.
+
+    This is what keeps the recovery path honest -- an outage longer than the
+    fleet is built to absorb must still reach the reaper, which is the only
+    exit from the class `lapsed_claim_age_seconds` measures."""
+    from command_center.db.work_queue_admin import WorkQueueAdmin
+    from command_center.worker.daemon import TOLERATED_FAILED_BEATS
+
+    measure, app, worker, _age = monitor
+    app.enqueue(QUEUE, idempotency_key="long-blip", payload={"kind": "agent_run"})
+    claimed = _claim(worker, visibility=BLIP_WINDOW)
+
+    beats = _blipping(worker, TOLERATED_FAILED_BEATS + 1)
+    lost = _beat_through(worker, claimed, BLIP_WINDOW)
+
+    assert lost, f"a blip past the tolerance must stop the work: {beats}"
+
+    lapsed = measure()
+    assert (lapsed.claimed, lapsed.attended_claims) == (1, 0)
+    assert lapsed.lapsed_claims == 1
+
+    assert WorkQueueAdmin(app._factory).reap() == 1
+    recovered = measure()
+    assert recovered.claimed == 0
+    assert recovered.lapsed_claims == 0

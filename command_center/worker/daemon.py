@@ -10,8 +10,10 @@ Design decisions, each traceable to the shipped substrate:
   before this service first starts.
 * **The heartbeat runs beside the handler, not inside it.** A handler that
   blocks must not silence the heartbeat, and a lapsed lease must stop the
-  work: the beat thread renews at a third of the visibility window and raises
-  a stop flag the moment the database says ``attempt_superseded``.
+  work: the beat thread renews often enough to survive
+  ``TOLERATED_FAILED_BEATS`` consecutive failures (see
+  ``beat_interval_seconds``) and raises a stop flag the moment the database
+  says ``attempt_superseded``.
 * **Shutdown finishes the item in hand.** SIGTERM stops *claiming*; the
   current attempt runs to completion inside systemd's stop timeout. A second
   signal — or the timeout's SIGKILL — abandons it, and the lease expiry plus
@@ -51,7 +53,76 @@ from command_center.worker import sdnotify
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["Handler", "HandlerOutcome", "WorkerConfig", "WorkerDaemon"]
+__all__ = [
+    "TOLERATED_FAILED_BEATS",
+    "Handler",
+    "HandlerOutcome",
+    "WorkerConfig",
+    "WorkerDaemon",
+    "beat_interval_seconds",
+]
+
+#: How many CONSECUTIVE heartbeats may fail without the lease lapsing.
+#:
+#: Two, and it is not a preference: it is the number the deployment was
+#: already built around, written down in three places that each assumed the
+#: code delivered it and none of which measured whether it did. This module's
+#: own comment said "two consecutive beats may fail (a restarting PostgreSQL,
+#: a network blip) before the lease actually lapses"; `aicc-worker.service`
+#: sized `WatchdogSec` as "two heartbeat intervals plus slack"; ADR-0011
+#: repeated it. The code delivered ONE
+#: (VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED) -- see `beat_interval_seconds`,
+#: which now derives the cadence from this number instead of restating it.
+#:
+#: The fleet meets the case on a schedule it runs itself:
+#: `voyn-aicc-worker@.service` declares `Requires=voyn-aicc-pgtunnel.service`,
+#: and the credential rotation restarts that tunnel on its own timer.
+TOLERATED_FAILED_BEATS = 2
+
+
+def beat_interval_seconds(
+    visibility_seconds: float, watchdog_seconds: float | None = None
+) -> float:
+    """How long to wait between lease renewals, so that
+    ``TOLERATED_FAILED_BEATS`` consecutive failures really are survivable.
+
+    THE ARITHMETIC, because it was wrong by exactly one beat and nothing
+    measured it. A successful beat at ``T`` sets the lease to ``T + V``
+    (``queue_heartbeat`` renews by the attempt's own ``visibility_seconds``,
+    from the row -- a beat cannot lengthen its own lease). The beats that
+    follow fall at ``T + I``, ``T + 2I``, ...  So the first beat that MUST
+    succeed is number ``F + 1``, at ``T + (F + 1) * I``, and the lease
+    survives only if that lands while it is still live::
+
+        (F + 1) * I  <  V        the tolerance itself
+        (F + 2) * I  <= V        with a whole beat of margin
+
+    ``V / 3`` satisfies NEITHER at ``F = 2``: ``3 * (V/3)`` is ``V`` exactly,
+    so the third beat lands ON the deadline and `_queue_owns` refuses it
+    (``claim_expired``, which is ``<=``, not ``<``). MEASURED against a real
+    PostgreSQL 16 server through the real `queue_claim`/`queue_heartbeat` at
+    ``visibility_seconds=12``: one failed beat held the lease, two lost it.
+    The comment above that line had promised two for as long as it existed.
+
+    The margin is a whole interval rather than an epsilon because every term
+    here drifts in the same direction. ``beat_stop.wait(interval)`` measures
+    from when the PREVIOUS call RETURNED, so each cycle costs ``I`` plus a
+    round trip plus whatever the scheduler adds, and the error is cumulative;
+    the server's clock is what decides; and the penalty for arriving late is
+    not a retry but the whole attempt (`daemon._execute` discards the outcome,
+    the reaper hands the item to another lane, and `queue_claim` has already
+    charged `attempt_count` for the delivery that was taken away).
+
+    ``watchdog_seconds`` only ever SHORTENS the wait, and is the reason this
+    returns a bound rather than a formula: a long visibility window would
+    otherwise park the beat thread past the systemd watchdog deadline during
+    exactly the run the ping is meant to cover. The one-second floor is the
+    same clamp `queue_claim` applies to the window it is derived from.
+    """
+    interval = max(visibility_seconds / (TOLERATED_FAILED_BEATS + 2), 1.0)
+    if watchdog_seconds is not None:
+        interval = min(interval, max(watchdog_seconds, 1.0))
+    return interval
 
 
 @dataclass(frozen=True, slots=True)
@@ -473,14 +544,15 @@ class WorkerDaemon:
         lease_lost: threading.Event,
         beat_stop: threading.Event,
     ) -> None:
-        # A third of the window: two consecutive beats may fail (a restarting
-        # PostgreSQL, a network blip) before the lease actually lapses. The
-        # watchdog cap can shorten the wait — an extra lease renewal is
-        # harmless, a missed watchdog deadline during a long run is a restart.
-        interval = max(self._config.visibility_seconds / 3.0, 1.0)
-        watchdog = sdnotify.watchdog_interval_seconds()
-        if watchdog is not None:
-            interval = min(interval, max(watchdog, 1.0))
+        # The renewal cadence, derived from the tolerance rather than guessed
+        # at. See `beat_interval_seconds` for the arithmetic; this line used to
+        # be `visibility_seconds / 3.0`, which delivered ZERO of the two failed
+        # beats the comment above it promised. The watchdog cap can shorten the
+        # wait — an extra lease renewal is harmless, a missed watchdog deadline
+        # during a long run is a restart.
+        interval = beat_interval_seconds(
+            self._config.visibility_seconds, sdnotify.watchdog_interval_seconds()
+        )
         consecutive_errors = 0
         while not beat_stop.wait(interval):
             # Fed even when the database is unreachable: the watchdog answers
