@@ -293,6 +293,14 @@ def begin_uninstall(
             raise RuntimeError("worker lane registry disappeared before uninstall armed")
         return str(payload["phase"])
 
+    # Nothing has been removed yet, so the installed generation still says
+    # what this host is. Check the declared profile against it before the
+    # journal binds anything to it: a worker uninstall of a control host would
+    # otherwise get as far as `_registry_identity` and report a missing lane
+    # registry, which is true but describes the symptom rather than the
+    # mistake. Once the journal exists the resume branch above is the
+    # authority -- by then the generation may already be gone.
+    assert_profile_matches_installation(state_dir, profile)
     identity = _uninstall_identity(
         baseline_selector=baseline_selector,
         current_selector=current_selector,
@@ -2750,7 +2758,114 @@ def default_specs(
     return specs
 
 
+#: Targets both profiles install. Their presence says a generation is one of
+#: this installer's own file sets without saying which one -- which is exactly
+#: what a control verdict needs, because the control set is a strict subset of
+#: the worker set and so owns no target of its own to be recognised by.
+#: Pinned to `default_specs` by tests/ops/test_agent_principal_isolation.py:
+#: dropping one of these from the control profile without dropping it here
+#: would leave a control generation unrecognised, and unrecognised is silent.
+SHARED_PROFILE_TARGETS = frozenset(
+    {
+        "/usr/local/sbin/voyn-aicc-bootstrap",
+        "/usr/libexec/aicc-install-transaction",
+        "/etc/aicc/workspace-authority.env",
+    }
+)
+
+
+def installed_profile(state_dir: Path) -> str | None:
+    """Which profile this host is installed under, or None if that is not
+    something the installed generation answers.
+
+    Read from what the committed generation installed, not from a record of
+    what someone once asked for. The manifest is already the authority every
+    rollback and uninstall unwinds; it comes into existence exactly when an
+    installation does and is removed with it, so there is no second lifetime
+    to keep in step and no marker that can outlive the thing it describes --
+    which is what made refusing on `/var/lib/aicc-agent` a deadlock (74a917fc).
+
+    Three answers, not two. A worker generation carries WORKER_ONLY_TARGETS
+    and is identified by them. A control generation carries none of them --
+    but so does any other file set, so absence alone is not evidence of a
+    control host and must not be read as one; it is a control generation only
+    if it also carries what both profiles install. Anything else is a
+    generation this rule has nothing to say about, and saying nothing is the
+    honest answer: no legitimate install is blocked by a manifest that was
+    never one of these two profiles in the first place.
+    """
+    current = state_dir / "current.json"
+    if not _path_present(current):
+        return None
+    pointer = _read_regular(current, max_bytes=64 * 1024)
+    if (
+        pointer.uid not in {0, os.geteuid()}
+        or pointer.gid not in {0, os.getegid()}
+        or pointer.mode != 0o600
+    ):
+        raise RuntimeError("installed generation pointer ownership or mode drifted")
+    try:
+        manifest = Path(json.loads(pointer.payload)["manifest"]).resolve(strict=True)
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError("installed generation pointer is malformed") from exc
+    if (
+        not manifest.is_relative_to(state_dir.resolve())
+        or manifest.name != "manifest.json"
+    ):
+        raise RuntimeError("installed generation manifest escaped the state directory")
+    try:
+        records = json.loads(manifest.read_text(encoding="utf-8"))["records"]
+        targets = {record["target"] for record in records}
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError("installed generation manifest is malformed") from exc
+    if targets & WORKER_ONLY_TARGETS:
+        return "worker"
+    if SHARED_PROFILE_TARGETS <= targets:
+        return "control"
+    return None
+
+
+def assert_profile_matches_installation(state_dir: Path, profile: str) -> None:
+    """Refuse a run that would silently change the role of an installed host.
+
+    The profile reaches every tool within a run and nothing carried it across
+    runs: it is re-declared from scratch each time, and an unset
+    `AICC_INSTALL_PROFILE` means `worker`. So a second install of a control
+    host that merely forgot the flag -- a routine re-run, an automation that
+    predates profiles -- installed the whole worker set onto the control
+    plane, agent principal and both credential files included. That is the
+    isolation the P0 exists to create, undone by a default.
+
+    The installer's preflight refuses the opposite direction by looking for
+    worker artefacts on disk, and it stays: it catches a worker layer this
+    installer never installed, which no manifest of ours records. This catches
+    the direction that preflight structurally cannot -- a worker install is a
+    superset, so it passes every artefact check -- and the message names both
+    profiles, because on the uninstall path the same mismatch means the
+    operator dropped the flag rather than that the host must be converted.
+    """
+    if profile not in PROFILES:
+        raise RuntimeError(f"unknown installation profile: {profile!r}")
+    installed = installed_profile(state_dir)
+    if installed is None or installed == profile:
+        return
+    raise RuntimeError(
+        f"host is installed under the {installed} profile, this run declared "
+        f"{profile}: uninstall the {installed} profile first, or re-run it "
+        f"with --profile {installed}"
+    )
+
+
 def _dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    if args.action == "profile-assert":
+        # Read-only, and deliberately the first thing the installer asks of
+        # this tool: a host whose role the run would change must be refused
+        # before the recovery anchor is touched or a provider toolchain is
+        # downloaded, not after. The same rule is enforced again below, so a
+        # caller that skips this action and goes straight to an installing
+        # one does not skip the rule with it.
+        assert_profile_matches_installation(args.state_dir, args.profile)
+        return 0
     if args.action == "recovery-anchor-install":
         if _path_present(args.state_dir / "uninstall.json"):
             raise RuntimeError("unfinished uninstall blocks recovery anchor update")
@@ -2875,6 +2990,7 @@ def _dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         raise RuntimeError("unfinished uninstall journal blocks installation")
     transaction = FileTransaction(args.root, args.state_dir)
     if args.action in {"validate", "prepare", "install"}:
+        assert_profile_matches_installation(args.state_dir, args.profile)
         specs = default_specs(
             args.repo_root,
             authority_env=args.authority_env,
@@ -2926,6 +3042,7 @@ def main() -> int:
             "uninstall-complete",
             "uninstall-select-baseline",
             "uninstall-status",
+            "profile-assert",
             "release-record",
             "release-verify",
             "release-publish",

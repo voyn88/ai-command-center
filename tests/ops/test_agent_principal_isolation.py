@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import hashlib
 import importlib.util
 import json
@@ -1917,3 +1918,183 @@ def test_every_tool_the_installer_runs_on_both_profiles_is_given_the_profile(tmp
         "these run on a control host and name a worker-only target without "
         f"passing the profile to anything: {unprofiled}"
     )
+
+
+# ---------------------------------------------------------------------------
+# The profile reaches every tool WITHIN one run. Nothing carried it across
+# runs: it is re-declared from scratch each time and an unset
+# AICC_INSTALL_PROFILE means "worker", so a second install of a control host
+# that merely dropped the flag -- a routine re-run, an automation that
+# predates profiles -- installed the whole worker set onto the control plane:
+# agent principal, launcher socket, and both agent credential files. The
+# preflight above refuses worker -> control and structurally cannot refuse
+# this direction, because a worker install is a superset and passes every
+# artefact check there is. One secret on two hosts is the exact outcome this
+# P0 exists to prevent, and a default was enough to produce it.
+# ---------------------------------------------------------------------------
+
+
+def _installed_host(tmp_path: Path, targets) -> tuple[Path, Path]:
+    """A host whose state dir holds one committed generation of `targets`.
+
+    Really installed through `FileTransaction`, not hand-written: what the
+    rule under test reads is the manifest a real commit leaves behind, so a
+    hand-built one could agree with the test and disagree with production.
+    """
+    tx = _transaction()
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700, parents=True)
+    source = tmp_path / "source"
+    source.write_bytes(b"installed\n")
+    tx.FileTransaction(root, state).install(
+        tuple(
+            tx.FileSpec(source, target, 0o640, os.geteuid(), os.getegid())
+            for target in sorted(targets)
+        )
+    )
+    return root, state
+
+
+def test_a_worker_install_is_refused_on_a_host_that_is_already_control(tmp_path):
+    """The defect, end to end. The control host is built by installing exactly
+    what the control profile installs, and the refusal is read off that
+    generation -- so dropping the flag on the next run cannot quietly deliver
+    the agent layer to the control plane."""
+    tx, control = _specs("control", tmp_path / "specs")
+    _root, state = _installed_host(tmp_path, control)
+
+    assert tx.installed_profile(state) == "control"
+    # The run that declares what the host already is proceeds untouched.
+    tx.assert_profile_matches_installation(state, "control")
+    with pytest.raises(RuntimeError, match="installed under the control profile"):
+        tx.assert_profile_matches_installation(state, "worker")
+
+
+def test_the_worker_profile_is_still_installable_and_re_installable(tmp_path):
+    """Negative control: this must refuse a change of role and nothing else. A
+    bare host takes either profile, and a worker host still takes the worker
+    profile it already has -- including the hosts installed before profiles
+    existed, whose generations carry the worker-only targets and are therefore
+    identified without any migration."""
+    tx, worker = _specs("worker", tmp_path / "specs")
+
+    bare = tmp_path / "bare"
+    bare.mkdir()
+    assert tx.installed_profile(bare / "state") is None
+    for profile in ("worker", "control"):
+        tx.assert_profile_matches_installation(bare / "state", profile)
+
+    _root, state = _installed_host(tmp_path / "worker-host", worker)
+    assert tx.installed_profile(state) == "worker"
+    tx.assert_profile_matches_installation(state, "worker")
+    with pytest.raises(RuntimeError, match="installed under the worker profile"):
+        tx.assert_profile_matches_installation(state, "control")
+
+
+def test_a_generation_that_is_neither_profile_is_not_read_as_control(tmp_path):
+    """Absence of the agent layer is not evidence of a control host: every
+    file set that is not the worker one lacks it too. A verdict inferred from
+    that absence would refuse installs over generations this rule was never
+    about, so a control verdict needs what both profiles positively install,
+    and anything else answers None rather than guessing."""
+    tx = _transaction()
+    _root, state = _installed_host(tmp_path, {"/etc/aicc-installed"})
+
+    assert tx.installed_profile(state) is None
+    for profile in ("worker", "control"):
+        tx.assert_profile_matches_installation(state, profile)
+
+
+def test_the_shared_targets_are_really_what_both_profiles_install(tmp_path):
+    """SHARED_PROFILE_TARGETS is what makes a control generation recognisable,
+    so it must stay a subset of the control profile's own file set. Dropping
+    one of those specs without updating it here would leave every control
+    generation unidentified -- and unidentified fails silently open."""
+    tx, control = _specs("control", tmp_path)
+    _tx, worker = _specs("worker", tmp_path)
+
+    assert tx.SHARED_PROFILE_TARGETS <= control
+    assert tx.SHARED_PROFILE_TARGETS <= worker
+    assert tx.SHARED_PROFILE_TARGETS.isdisjoint(tx.WORKER_ONLY_TARGETS)
+
+
+def test_the_uninstall_refuses_a_wrong_profile_before_it_journals_anything(
+    tmp_path,
+):
+    """The same evidence, on the way out. A worker uninstall of a control host
+    used to get as far as the lane registry and report it missing, which is
+    true but names the symptom; and the journal it would have written binds a
+    profile, so a mistake made here is a mistake the resume path then
+    enforces. Once that journal exists the generation may already be gone, so
+    the journal -- not the evidence -- stays the authority for a resume."""
+    tx = _transaction()
+    _specs_module, control = _specs("control", tmp_path / "specs")
+    root, state = _installed_host(tmp_path, control)
+    registry = root / "etc/aicc/worker-lanes"
+    begin = {
+        "baseline_selector": "ABSENT",
+        "current_selector": root / "opt/aicc/current",
+        "lane_registry": registry,
+    }
+
+    with pytest.raises(RuntimeError, match="installed under the control profile"):
+        tx.begin_uninstall(state, **begin, profile="worker")
+    assert not (state / "uninstall.json").exists(), "refused after journalling"
+
+    assert tx.begin_uninstall(state, **begin, profile="control") == "INTENT"
+
+    # A resume reads the journal, not the host: by then `uninstall_all` may
+    # have removed the very generation the first call was checked against.
+    tx.FileTransaction(root, state).uninstall_all()
+    assert tx.installed_profile(state) is None
+    assert tx.begin_uninstall(state, **begin, profile="control") == "INTENT"
+
+
+def test_the_transaction_tool_refuses_a_profile_change_on_its_own(tmp_path):
+    """Not glued on at the shell end only. `/usr/libexec/aicc-install-transaction`
+    is installed on every host and takes `--profile`, so the rule has to hold
+    for a caller that runs it directly -- on validate, which is the first
+    thing the installer asks it, and therefore before prepare() stages a byte."""
+    tx = _transaction()
+    _specs_module, control = _specs("control", tmp_path / "specs")
+    root, state = _installed_host(tmp_path, control)
+    parser = argparse.ArgumentParser()
+
+    for action in ("validate", "prepare", "install"):
+        args = SimpleNamespace(
+            action=action,
+            state_dir=state,
+            repo_root=tmp_path,
+            root=root,
+            profile="worker",
+        )
+        with pytest.raises(RuntimeError, match="installed under the control profile"):
+            tx._dispatch(args, parser)
+
+
+def test_the_installer_asserts_the_profile_before_its_first_mutation(tmp_path):
+    """Where the refusal stands is the whole of its value: the preflight above
+    refuses before anything is touched, and this one must too. A profile
+    change caught after the recovery anchor was rewritten, a toolchain
+    downloaded or a generation prepared is a refusal that already changed the
+    host it refused to change."""
+    text = _installer_text()
+    commands = [line.strip() for line in text.splitlines()]
+    assert_index = commands.index("run_transaction profile-assert")
+
+    for later in (
+        "run_transaction recovery-anchor-install",
+        'PYTHONPATH="$repo_root" /usr/bin/python3 - "$workspace_authority_env" <<\'PY\'',
+        '/usr/bin/python3 "$repo_root/ops/aicc_toolchain_install.py" \\',
+        "run_transaction validate",
+        "run_transaction prepare",
+    ):
+        assert assert_index < commands.index(later), f"{later} runs first"
+
+    # Both roles, both directions: an assertion behind a profile guard would
+    # only ever refuse the profile it is already agreeing with.
+    guard = 'if [ "$install_profile" = "worker" ]; then'
+    assert not _sits_behind("run_transaction profile-assert", guard, text)
+    # ...and it must be reached on the way out too, not just on the way in.
+    assert assert_index < commands.index('if [ "${1:-}" = "--uninstall" ]; then')

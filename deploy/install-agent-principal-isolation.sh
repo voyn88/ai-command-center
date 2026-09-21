@@ -254,6 +254,28 @@ PY
     --repo-root "$repo_root"
 }
 
+# The profile is a claim this run makes; the generation already installed on
+# the host is evidence of what it is. Nothing carried that evidence ACROSS
+# runs -- the profile is re-declared every time, and an unset variable means
+# "worker" -- so a control host re-installed by an invocation that merely
+# dropped AICC_INSTALL_PROFILE was given the whole worker set: agent
+# principal, launcher socket and both credential files. The boundary this
+# whole P0 exists to draw, undone by a default.
+#
+# The preflight above refuses the other direction only, and structurally
+# cannot cover this one: a worker install is a superset, so it passes every
+# artefact check there is. Both are kept -- that preflight also catches an
+# agent layer this installer never installed, which no manifest of ours
+# records.
+#
+# Placed before the first mutation of the run, for the same reason the
+# preflight is: a run that will not be allowed to finish must not touch the
+# recovery anchor or download a provider toolchain first. The transaction
+# asserts the same rule again on validate/prepare/install and on a fresh
+# uninstall journal, so a caller reaching /usr/libexec/aicc-install-transaction
+# directly cannot flip the profile either.
+run_transaction profile-assert
+
 # The permanent boot-recovery anchor must precede both a fresh install WAL and
 # a fresh uninstall WAL. An already-journalled uninstall is resumed only by
 # its digest-bound capsule, so it cannot swap recovery code mid-transaction.
