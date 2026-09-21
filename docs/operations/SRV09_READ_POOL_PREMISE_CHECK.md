@@ -228,3 +228,97 @@ this one. `tests/architecture` 58 passed; the two SRV-01b guard tests were
 re-run unmodified and still pass. No read was moved onto the pool — the survey
 above still finds none left to move — and the `runtime/` half of the item stays
 option 2, blocked on SRV-01b.
+
+## The precondition, measured in this repository (2026-09-21)
+
+Two things were still true after the gate landed. The gate proves every
+PostgreSQL connection in the tree comes from the pool; it says nothing about
+what that is worth. And the item's precondition — "~19.8x, and the threshold
+fails on all four measured queries independent of correctness" — was still a
+number from outside this checkout, which the section above could only report as
+uncheckable. A rule whose cost lives in someone else's spreadsheet is a rule
+that gets argued away the first time it is inconvenient.
+
+`tests/db/pool_read_cost.py` (the measurement) and
+`tests/db/test_pool_read_cost.py` (what pytest runs) close that. Four reads,
+timed against a real PostgreSQL through the code the service actually runs,
+under two connection policies that differ in one thing only:
+
+* **pooled** — no `connection_factory` passed at all, so each store falls back
+  to `pool.connection()` exactly as it does in production (rule 3 of the
+  routing gate);
+* **unpooled** — `psycopg.connect()` per call, built from the *same* conninfo
+  the pool was built from (same role, same `statement_timeout`, same
+  autocommit), closed at block exit. Not a straw man: it is the shape a store
+  acquires by being written from a driver example, which is the failure mode
+  the gate exists for. `tests/` is the one place in this repository allowed to
+  open such a connection, which is what makes the comparison possible here.
+
+First run, medians of 120 calls after 15 warm-up calls, 100 seeded rows per
+table:
+
+```
+read                       unpooled ms  pooled ms  +ms/call   ratio
+-------------------------------------------------------------------
+backlog.list_tasks              14.637      0.801    13.836   18.3x
+backlog.get_task                13.077      0.338    12.739   38.7x
+work_queue.list_items           15.416      0.819    14.597   18.8x
+queue_mirror.list_entries       14.412      0.818    13.595   17.6x
+```
+
+Three consecutive runs on the same box gave 18.3x/20.7x/22.0x
+(`list_tasks`), 38.7x/43.8x/60.8x (`get_task`), 18.8x/18.9x/21.6x
+(`list_items`) and 17.6x/19.7x/20.8x (`list_entries`): the run-to-run spread
+is on the pooled side, whose per-call time is small enough (0.2–0.8 ms) that
+scheduler noise is a visible fraction of it, and the widest spread is on the
+cheapest read for that reason. The unpooled side is steady to within a
+millisecond, which is the point — a connection costs what a connection costs.
+
+Environment: PostgreSQL 16.15 in this task container, loopback TCP,
+`scram-sha-256`, no TLS, `pool_min_size=2`. CI runs PostgreSQL 17.6 against the
+same test. On the same box a bare `connect()` + `close()` costs 10.9 ms and a
+`SELECT 1` on an established session costs 0.157 ms, which is the whole result
+in two numbers: **the penalty is per connection, not per query.**
+
+What this does and does not settle:
+
+* The item's ratio is **corroborated in family**, not reproduced: 17.6x–38.7x
+  in the run tabled above (17.6x–60.8x across the three) against a cited
+  ~19.8x. Absolute milliseconds are this container's
+  (its syscall overhead inflates both sides); the ratio is the part that
+  travels.
+* "**Independent of correctness**" is the load-bearing half, and it holds. The
+  overhead is flat across the four shapes (13.6–14.6 ms/call, a 1.15x spread)
+  while the ratios are not, because the ratio is `1 + overhead/query_time`.
+  The *cheapest* read is punished hardest — `get_task`, a single indexed row,
+  at 38.7x — so a read cutover cannot be rescued by making its queries faster,
+  which is exactly what the precondition claims and why it is a precondition
+  rather than an optimisation note.
+* No "S8" threshold exists in this tree to fail (unchanged from the section
+  above), so what the tests assert are floors — every read ≥ 3x, every
+  connection ≥ 0.25 ms of overhead, overhead spread ≤ 8x — chosen far enough
+  below the measurement that a slow or contended box moves the numbers without
+  moving the verdict. The measured figures belong in the item and in this
+  document; a test that pinned them would be pinning one machine's connect
+  cost.
+
+The tests are `serial` (`-p no:xdist`, the serial tail on shard 1): a timing
+comparison sharing its box with `-n auto` workers measures the other workers.
+They skip with the rest of `tests/db` when `AICC_TEST_PG_ADMIN_DSN` is unset.
+To re-measure on your own hardware, point that variable at a superuser DSN and
+run the table out:
+
+```
+AICC_TEST_PG_ADMIN_DSN='host=… dbname=postgres user=postgres password=…' \
+  pytest tests/db/test_pool_read_cost.py -p no:xdist -s
+```
+
+Use a server configured for `scram-sha-256`, not `trust`: password
+authentication is part of what a connection costs, and a trust-authenticated
+loopback server understates the unpooled side.
+
+Still unchanged: no read moved onto the pool, because there is none left to
+move, and the `runtime/` half of the item remains option 2 — blocked on the
+SRV-01b read cutover and its drills. What has changed is that the cost this
+item was raised over is now a fact this repository can re-measure on demand,
+rather than a figure it had to take on trust.
