@@ -126,6 +126,33 @@ def test_out_of_range_concurrency_falls_back_to_the_default():
     assert settings.max_agent_concurrency == pipeline_settings.DEFAULT_MAX_AGENT_CONCURRENCY
 
 
+def test_a_nan_spend_ceiling_falls_back_like_every_other_malformed_value(tmp_path):
+    """`json.loads` accepts a bare `NaN` literal, so a settings file can carry
+    one — and a NaN is invisible to a bounds check: `nan < minimum` and
+    `nan > maximum` are both False, so it is the one malformed ceiling stored
+    rather than replaced by the default. It then round-trips back to disk as a
+    bare `NaN` token (not valid JSON for any strict reader of this file),
+    renders as `nan` wherever the ceiling is shown, and makes every comparison
+    against the ceiling False — including `max_daily_spend_usd <= 0` in
+    `DispatchPlan.budget_remaining_usd`, which reports a NaN budget instead of
+    "no ceiling". It must fall back like every other bad value; so must `inf`.
+    """
+    path = pipeline_settings.settings_file_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{"enabled": true, "max_daily_spend_usd": NaN}', encoding="utf-8")
+
+    settings = pipeline_settings.load_settings(tmp_path)
+
+    assert settings.max_daily_spend_usd == 0.0
+    assert settings.max_daily_spend_usd == PipelineSettings().max_daily_spend_usd
+    assert (
+        PipelineSettings.from_dict({"max_daily_spend_usd": float("inf")}).max_daily_spend_usd
+        == 0.0
+    )
+    # A real ceiling is untouched by the guard.
+    assert PipelineSettings.from_dict({"max_daily_spend_usd": 12.5}).max_daily_spend_usd == 12.5
+
+
 def test_a_lone_auto_launch_flag_cannot_launch_without_the_master_switch():
     settings = PipelineSettings(enabled=False, auto_launch=True, auto_merge_after_checks=True)
     assert settings.auto_launch_active is False
