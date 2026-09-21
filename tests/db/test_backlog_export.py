@@ -13,7 +13,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from command_center import backlog_client
 from command_center.db import backlog_export
-from command_center.db.backlog_parser import ParsedTask, parse_backlog
+from command_center.db.backlog_parser import (
+    STATUSES,
+    ParsedTask,
+    normalize_wave,
+    parse_backlog,
+)
 from command_center.db.backlog_store import BacklogStore
 
 #: The render clock every test below pins, so a rendered file is a
@@ -141,7 +146,13 @@ def test_reimporting_a_projection_through_the_real_importer_is_a_no_op():
     rendered record (``- VOYN_RECOMMENDATION | ts=... | ...``, no bold id) does
     not match that shape at all -- not even as a reported "unparsed" line, it
     is simply invisible to the importer. The two formats occupy disjoint
-    syntax, which is the actual mechanism keeping a manual re-import inert."""
+    syntax, which is the actual mechanism keeping a manual re-import inert.
+
+    Covers BOTH rendered surfaces, which is why it renders the whole file
+    rather than a record line: section 0C's ``- VOYN_TASK_STATUS | ...`` lines
+    describe the same tasks the importer's own bold shape describes, so they
+    are the ones with something to collide with. They stay invisible only
+    while they remain unbolded list items with their own marker."""
     report = parse_backlog(
         backlog_export.render_projection(_ROWS, generated_at=_GENERATED_AT)
     )
@@ -273,6 +284,127 @@ def test_the_generated_marker_is_the_line_the_header_actually_carries():
     assert backlog_export.GENERATED_MARKER in lines
     position = lines.index(backlog_export.GENERATED_MARKER)
     assert position < backlog_client.HEADER_SCAN_LINES
+
+
+# --- Section 0C: the execution-status surface --------------------------------
+
+
+def test_execution_status_survives_the_projection_exactly():
+    """The reason section 0C exists. The 0B record's `status` field has to
+    coarsen the store's execution lifecycle into the planning vocabulary
+    (`PO-Approved`/`PO-Review`), so an export-generated file used to tell
+    `native_gateway` nothing finer than approved/not-approved -- no
+    IN_PROGRESS, no READY_TO_REVIEW, no DONE, for a fleet that was doing all
+    three. Proves the exact store value comes back through the reader that
+    the Kanban lanes actually call."""
+    rows = [
+        {**_ROWS[0], "task_id": f"VOYN-W0-{status}", "status": status}
+        for status in sorted(STATUSES)
+    ]
+    text = backlog_export.render_projection(rows, generated_at=_GENERATED_AT)
+
+    read_back = {r.record_id: r.status for r in backlog_client.parse_rich_records(text)}
+    assert read_back == {f"VOYN-W0-{status}": status for status in STATUSES}
+    # ...and none of them degraded to UNKNOWN on the way, which is what a
+    # vocabulary drift between store and reader would look like.
+    assert "UNKNOWN" not in read_back.values()
+
+
+def test_both_surfaces_describe_the_same_rows():
+    """One store, two renderings of it. A task on one surface but not the
+    other would be a task whose lane and whose approval state came from
+    different reads of the backlog -- the split-brain the single canonical
+    store exists to prevent."""
+    text = backlog_export.render_projection(_ROWS, generated_at=_GENERATED_AT)
+    planning = [r.issue_id for r in backlog_client.parse_recommendations(text).records]
+    execution = [r.record_id for r in backlog_client.parse_rich_records(text)]
+    assert planning == execution == [row["task_id"] for row in _ROWS]
+
+
+def test_the_status_line_survives_a_value_built_to_break_it():
+    """Same hostile row as the 0B contract test: `backlog_task.title` is free
+    text, and a raw `|` would shift every later field while a newline would
+    split the record in two. The reader has no error channel on this surface
+    (`parse_rich_records` returns a bare list), so a broken line here is a
+    task that silently vanishes from the board rather than a reported fault --
+    which is exactly why the exporter cleans before rendering."""
+    text = backlog_export.render_projection(_ROWS, generated_at=_GENERATED_AT)
+    records = {r.record_id: r for r in backlog_client.parse_rich_records(text)}
+
+    hostile = records["VOYN-W0-AICC-HOSTILE"]
+    assert hostile.status == "READY_TO_REVIEW"
+    assert hostile.wave == "Wave 0.5"
+    assert hostile.priority == "-"
+    assert backlog_client.FIELD_SEP not in hostile.slug
+    assert "\n" not in hostile.slug
+
+
+def test_wave_renders_as_the_text_its_reader_matches():
+    """`backlog_task.wave` holds the NORMALIZED value ("0"), but every reader
+    of this surface matches the authored text: `projection_producer._wave_goal`
+    takes `Wave <n>` exactly and skips anything else. Rendering the bare
+    column value would empty the owner's goal card with no error anywhere --
+    so the exporter renders the inverse of `backlog_parser.normalize_wave`,
+    and this pins the round trip against that real normalizer rather than a
+    restatement of its regex.
+
+    Named lanes (COM/W1/...) have no "Wave " prefix on the authored surface
+    and must not acquire one here, or they would normalize back to a wave
+    that does not exist."""
+    waves = ["0", "0.5", "1", "10", "COM", "WOW", "AICOS", "W1", "W7", "P1", "P0.5"]
+    for wave in waves:
+        rendered = backlog_export._wave_text(wave)
+        assert normalize_wave(rendered) == wave, rendered
+    assert backlog_export._wave_text("0") == "Wave 0"
+    assert backlog_export._wave_text("COM") == "COM"
+
+
+def test_the_status_section_renders_through_the_readers_own_renderer():
+    """The exporter must not format this line itself. `backlog_client` owns
+    the shape and `render_task_status` is the one writer, so a field the
+    reader renames breaks here instead of quietly producing a file whose
+    execution status nobody can read."""
+    line = backlog_export.render_status_record(_ROWS[0])
+    assert line == backlog_client.render_task_status(
+        backlog_client.RichRecord(
+            record_id="VOYN-W0-AICC-EXAMPLE",
+            wave="Wave 0",
+            status="OPEN",
+            priority="P1",
+            slug="plain title",
+        )
+    )
+    tokens = line[2:].split(backlog_client.FIELD_SEP)
+    assert tokens[0] == backlog_client.TASK_STATUS_MARKER
+    keys = [token.partition("=")[0] for token in tokens[1:]]
+    assert keys == list(backlog_client.TASK_STATUS_FIELDS)
+
+
+def test_the_status_section_does_not_disturb_the_0B_contract(tmp_path):
+    """Section 0C is added beside section 0B, not woven into it. The header's
+    row count describes each section, and `stamp_matches_content` -- the
+    "edited after render" detector -- counts 0B records only, so adding a
+    second line per row must not make a freshly rendered file look tampered
+    with."""
+    rendered = tmp_path / "VOYN_TASKS_BACKLOG.md"
+    rendered.write_text(
+        backlog_export.render_projection(_ROWS, generated_at=_GENERATED_AT),
+        encoding="utf-8",
+    )
+    projection = backlog_client.load_projection(rendered)
+    assert projection.errors == []
+    assert len(projection.records) == len(_ROWS)
+    assert backlog_client.stamp_matches_content(projection) is True
+
+
+def test_an_empty_store_renders_a_readable_status_section():
+    """The zero-row file must still be a well-formed document with both
+    sections present, not a header with a dangling heading -- the empty store
+    is the render most likely to be misread as a broken one."""
+    text = backlog_export.render_projection([], generated_at=_GENERATED_AT)
+    assert "## 0C. Execution status" in text
+    assert backlog_client.parse_rich_records(text) == []
+    assert backlog_client.parse_recommendations(text).errors == []
 
 
 def _task(task_id: str, **overrides) -> ParsedTask:

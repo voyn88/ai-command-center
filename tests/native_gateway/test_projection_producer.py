@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from command_center import backlog_client
 from native_gateway.config import GatewaySettings
 from native_gateway.projection_producer import build_projection, write_projection
 from native_gateway.source import FileProjectionSource
@@ -51,6 +52,19 @@ def _seed_root(tmp_path: Path, monkeypatch) -> Path:
     # state built here (and local hermetic runs behave identically to CI).
     monkeypatch.setenv("AICC_DATA_DIR", str(root / "data"))
     return root
+
+
+#: A `backlog_task` row as `backlog_export.fetch_rows` returns one, for the
+#: tests that render a real projection instead of typing markdown by hand.
+_EXPORT_ROW = {
+    "task_id": "VOYN-W0-EXPORTED",
+    "wave": "0",
+    "priority": "P1",
+    "status": "OPEN",
+    "title": "exported-thing",
+    "repo": "ai-command-center",
+    "updated_at": None,
+}
 
 
 def test_build_projection_maps_tasks_and_projects(tmp_path, monkeypatch):
@@ -210,3 +224,84 @@ def test_goal_survives_round_trip_to_snapshot(tmp_path, monkeypatch):
     assert snapshot.goal is not None
     assert snapshot.goal.title == "Волна 0"
     assert (snapshot.goal.done, snapshot.goal.total) == (1, 2)
+
+
+def test_every_execution_status_has_a_lane(tmp_path, monkeypatch):
+    """`_RICH_STATE` is subscripted, not `.get`-ed, so a status with no entry
+    is a KeyError that takes the whole projection build down — every card, not
+    just the unmapped one.
+
+    That was survivable while the vocabulary only grew by hand; since
+    `backlog-export` renders this surface straight from `backlog_task`, a
+    status the store's CHECK constraint allows can arrive here the moment a
+    row carries it. Pins totality over the reader's vocabulary so the gap
+    shows up as this test failing rather than as a dark board."""
+    from native_gateway.projection_producer import _RICH_STATE
+
+    assert set(_RICH_STATE) == set(backlog_client.RICH_STATUSES) | {"UNKNOWN"}
+    # Every lane must also be one the client actually renders.
+    states = {state for state, _ in _RICH_STATE.values()}
+    assert states <= {"backlog", "next", "in_progress", "review", "done", "deferred"}
+
+
+def test_an_exported_projection_drives_the_board_and_the_goal(tmp_path, monkeypatch):
+    """End to end over the bridge, against the file `backlog-export` really
+    writes rather than a hand-typed fixture.
+
+    This is what BO-S4 is for. The console's board used to read an authored
+    markdown file that stopped being true weeks earlier; now it reads a
+    rendering of the canonical store. Every hop has to survive: store row ->
+    `render_projection` -> `parse_rich_records` -> lane. If the exporter
+    rendered the bare wave column instead of the wave TEXT, or coarsened
+    execution status the way section 0B must, this still produces a valid
+    projection — just one with an empty goal card and every task in Backlog.
+    So both are asserted here, not only that the call succeeded."""
+    from datetime import UTC, datetime
+
+    from command_center.db import backlog_export
+
+    root = _seed_root(tmp_path, monkeypatch)
+    rows = [
+        {
+            "task_id": "VOYN-W0-BO-S1",
+            "wave": "0",
+            "priority": "P0",
+            "status": "DONE",
+            "title": "structured-store",
+            "repo": "ai-command-center",
+            "updated_at": datetime(2026, 9, 9, 6, 0, tzinfo=UTC),
+        },
+        {**_EXPORT_ROW, "task_id": "VOYN-W0-BO-S4", "status": "IN_PROGRESS"},
+        {**_EXPORT_ROW, "task_id": "VOYN-W0-BO-S5", "status": "READY_TO_REVIEW"},
+        {**_EXPORT_ROW, "task_id": "VOYN-W0-BO-S6", "status": "DEFER_TO_USER"},
+    ]
+    backlog = tmp_path / "backlog.md"
+    backlog.write_text(
+        backlog_export.render_projection(
+            rows, generated_at=datetime(2026, 9, 9, 6, 30, tzinfo=UTC)
+        ),
+        encoding="utf-8",
+    )
+
+    projection = build_projection(root, backlog_path=backlog)
+    tasks = {t["id"]: t for t in projection["tasks"]}
+    assert tasks["VOYN-W0-BO-S1"]["state"] == "done"
+    assert tasks["VOYN-W0-BO-S4"]["state"] == "in_progress"
+    assert tasks["VOYN-W0-BO-S5"]["state"] == "review"
+    assert tasks["VOYN-W0-BO-S6"]["state"] == "deferred"
+    assert tasks["VOYN-W0-BO-S6"]["blocker"] == "Ждёт вашего решения"
+    # Both surfaces name the card from the same `backlog_task.title` column
+    # (which IS the authored backtick slug), so the board cannot show one task
+    # under two names depending on which record it was built from. The 0B
+    # record supplies it here -- the rich loop `setdefault`s -- and 0B's
+    # humanizer leaves `-` alone where the rich one would space it.
+    assert tasks["VOYN-W0-BO-S1"]["title"] == "Structured-store"
+    # ...and the goal card counts the real wave, which only works because the
+    # exporter renders `wave` as the "Wave <n>" text `_wave_goal` matches.
+    assert projection["goal"] == {
+        "title": "Волна 0",
+        "done": 1,
+        "total": 4,
+        "in_progress": 1,
+        "review": 1,
+    }

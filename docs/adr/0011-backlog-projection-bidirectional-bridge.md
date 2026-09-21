@@ -37,43 +37,62 @@ match — not `backlog_task.status`'s *execution* vocabulary
 empty for an export-generated file. `backlog_export._planning_status`
 translates one to the other (`EXECUTABLE_STATUSES` → `PO-Approved`,
 everything else → `PO-Review`), at the cost of losing execution-status
-granularity in this field. That granularity still exists nowhere in an
-export-generated file: it lives only in the master file's *other* record
-surface, the body's bold task lines (`backlog_client.parse_rich_records`,
-consumed by `native_gateway/projection_producer.py` for Kanban lanes and the
-wave-goal card), which this exporter does not emit — doing so is exactly the
-bold-line shape `backlog_parser`'s importer recognizes, so it needs its own
-safety analysis against the "never share a line shape" argument below,
-rather than being added as a quick follow-up. Until then, `native_gateway`
-sees only the approved/not-approved distinction, never
-IN_PROGRESS/READY_TO_REVIEW/DONE, for an export-generated file.
+granularity in this field. That granularity lives on the master file's *other* record
+surface, the one `backlog_client.parse_rich_records` reads (consumed by
+`native_gateway/projection_producer.py` for Kanban lanes and the wave-goal
+card).
 
-**Safety analysis for that gap, completed 2026-09-05: no drop-in fix
-exists.** `backlog_client._RICH_LINE` (`- **VOYN-<id>** | <wave> | <status>
-| <priority> |`) is a strict subset of `backlog_parser`'s
+**Gap closed 2026-09-21 by option (a) below: section `0C. Execution
+status`.** The safety analysis of 2026-09-05 stands exactly as written —
+`backlog_client._RICH_LINE` (`- **VOYN-<id>** | <wave> | <status> |
+<priority> |`) is a strict subset of `backlog_parser`'s
 `_TASK_LINE`/`_RECORD_SHAPED` match (bold `**VOYN-...**` id followed by
-`| `) — any line the rich-record reader accepts, the importer accepts too,
-and parses fully as a real task, not merely as a reported `unparsed` line.
+`| `), so any line the rich-record reader accepts the importer accepts too,
+and parses fully as a real task rather than as a reported `unparsed` line.
 The two readers were built to share that one convention on purpose, so no
-variant of the bold-id/pipe shape can satisfy one and not the other.
-Closing this gap needs either (a) a distinct marker format for
-machine-rendered rich status — the same move `VOYN_RECOMMENDATION` already
-made for 0B records — taught to `parse_rich_records` alongside the existing
-hand-authored bold-line shape, with an explicit precedence rule for a task
-that carries both during the migration window; or (b) simply outliving this
-ADR's own revisit condition below, after which the bold-line shape is no
-longer a live import surface and the exporter can emit it directly. Neither
-is a quick follow-up, and (b) is likely cheaper than (a) given the target
-date already sets an end to the ambiguity.
+variant of the bold-id/pipe shape can satisfy one and not the other. What
+changed is that the exporter no longer tries to use that shape. It renders
+the surface under its own marker instead — `- VOYN_TASK_STATUS | id=... |
+wave=... | status=... | priority=... | slug=...`, a plain *unbolded* list
+item matching neither importer pattern, the same move `VOYN_RECOMMENDATION`
+already made for 0B records. The line is invisible to `backlog-import`, not
+merely rejected by it, so this ADR's "never share a line shape" argument
+below holds unchanged and is now proved over both rendered sections by the
+same re-import test. `parse_rich_records` reads the new shape alongside the
+hand-authored bold one, and for the migration window where a task could
+carry both, **the machine record wins**: `backlog_task` is canonical and a
+`VOYN_TASK_STATUS` line is a direct reading of it, while a bold line is
+owner-typed input the store may already have moved past — preferring the
+authored line would let a stale hand edit mask live execution state, which
+is the staleness this ADR's export half exists to end. Option (b),
+outliving the revisit date, is no longer the cheaper path because it is no
+longer needed; the bold-line shape can still be adopted directly once
+`backlog-import` retires, but nothing depends on that happening.
+
+Two consequences worth recording, both caught by widening the vocabulary
+rather than by the shape work:
+
+- `backlog_client.RICH_STATUSES` had drifted from the store's own
+  `backlog_parser.STATUSES` (it omitted `DECIDED`). Harmless while the
+  surface was hand-authored — a human typing `DECIDED` got `UNKNOWN` and
+  noticed — but once a rendered record carries a column value, a divergence
+  is a status the store holds and every reader silently mislabels. The two
+  sets are now pinned equal by test.
+- `projection_producer._RICH_STATE` subscripts rather than `.get`s, so the
+  newly reachable `DECIDED` would have been a `KeyError` taking down the
+  whole projection build. It has a lane, and a test keeps the map total over
+  the reader's vocabulary.
 
 Running both directions at once would be a dual-write hazard if they ever
 shared a line shape or a file path; they do neither. Feeding a
 `backlog-export` render back through `backlog-import` is inert, but not
 because the two jobs agree on field values: `parse_backlog` only matches
-bold task lines, and a rendered `VOYN_RECOMMENDATION` line does not match
-that shape at all — it is invisible to the importer, not merely unparsed
+bold task lines, and neither rendered shape — `- VOYN_RECOMMENDATION | ...`
+(0B) nor `- VOYN_TASK_STATUS | ...` (0C) — matches it at all: both are
+invisible to the importer, not merely unparsed
 (`tests/db/test_backlog_export.py::test_reimporting_a_projection_through_the_real_importer_is_a_no_op`
-proves both `tasks == []` and `unparsed == []` for a re-parsed export). In
+proves both `tasks == []` and `unparsed == []` for a whole re-parsed export,
+covering both sections). In
 production the two also never touch the same file: import reads a
 digest-staged copy of the owner's own machine's file
 (`ops/aicc_backlog_publish.py`), never `$AICC_MASTER_BACKLOG`, which only

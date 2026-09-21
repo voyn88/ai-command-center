@@ -29,7 +29,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-__all__ = ["ParsedTask", "ParseReport", "parse_backlog"]
+__all__ = ["ParsedTask", "ParseReport", "normalize_wave", "parse_backlog"]
 
 EXECUTABLE_STATUSES = ("OPEN", "IN_PROGRESS", "READY_TO_REVIEW", "DONE")
 NON_EXECUTABLE_STATUSES = (
@@ -82,6 +82,26 @@ def _strip_bold(text: str) -> str:
     if text.startswith("**") and text.endswith("**") and len(text) > 4:
         return text[2:-2].strip()
     return text
+
+
+def normalize_wave(text: str) -> str | None:
+    """The store value an authored wave field normalizes to, or ``None``.
+
+    ``"Wave 0"`` -> ``"0"``; a named lane (``"COM"``) is its own value; anything
+    outside the closed vocabulary is ``None`` rather than a guess.
+
+    Named (rather than inlined at its one call site) because the projection
+    exporter has to render the inverse of this mapping — ``backlog_task.wave``
+    holds the normalized value, while every reader of the authored surface,
+    notably ``native_gateway.projection_producer._wave_goal``, matches the
+    ``"Wave <n>"`` text. Sharing the function lets that exporter's test pin the
+    round trip against the real normalizer instead of a copy of this regex that
+    could drift away from it.
+    """
+    match = _WAVE.match(text)
+    if match is None:
+        return None
+    return match.group(1) or match.group(2)
 
 
 _REPO_HINT = re.compile(r"Target repo[^`]*`([^`]+)`")
@@ -219,13 +239,12 @@ def parse_backlog(text: str) -> ParseReport:
             report.unparsed.append((line_no, "fewer than two fields after id", excerpt))
             continue
 
-        wave_match = _WAVE.match(_strip_bold(fields[0]))
-        if wave_match is None:
+        wave = normalize_wave(_strip_bold(fields[0]))
+        if wave is None:
             report.unparsed.append(
                 (line_no, f"wave does not normalize: {fields[0]!r}", excerpt)
             )
             continue
-        wave = wave_match.group(1) or wave_match.group(2)
 
         status_field = _strip_bold(fields[1])
         # An annotated status — "IN_PROGRESS (slice 1 DONE)" — normalizes to

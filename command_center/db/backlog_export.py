@@ -67,48 +67,59 @@ breakdown coarsens to two buckets for an export-generated file, the same
 kind of accepted, documented lossiness as the narrative fields above rather
 than the silent wrongness it replaces.
 
-This does NOT restore execution-status granularity for consumers that read
-it from the master file's *other* record surface — the body's bold
-``- **VOYN-<ID>** | <wave> | <status> | ...`` task lines
-(``backlog_client.parse_rich_records``/``load_rich_records``, consumed by
-``native_gateway/projection_producer.py`` for its Kanban lanes and wave-goal
-card). This module renders 0B records only; it does not emit rich lines, so
-those consumers still see only the coarse approved/not-approved distinction
-for an export-generated file, never the finer IN_PROGRESS/READY_TO_REVIEW/
-DONE detail.
+Execution-status granularity is not lost, though: it is carried on the
+master file's *other* record surface, the one
+``backlog_client.parse_rich_records``/``load_rich_records`` reads (consumed
+by ``native_gateway/projection_producer.py`` for its Kanban lanes and
+wave-goal card). Section 0C below renders it, one
+``- VOYN_TASK_STATUS | id=... | wave=... | status=... | ...`` line per row,
+through ``backlog_client.render_task_status`` — same discipline as the 0B
+records and the header stamp: the reader owns the format, the exporter
+renders through it, and the two cannot drift into a line nobody parses.
 
-**Safety analysis, done, conclusion: no drop-in fix exists.** Emitting rich
-lines is not safe by reusing the existing convention: ``backlog_client``'s
-own ``_RICH_LINE`` (``- **VOYN-<id>** | <wave> | <status> | <priority> |``)
-is a strict subset of ``backlog_parser``'s ``_TASK_LINE``/``_RECORD_SHAPED``
-match (bold ``**VOYN-...**`` id followed by a ``| ``) — every line the rich
-parser accepts, the importer accepts too, and would fully parse as a real
-task (not even land in ``unparsed``). There is no variant of the bold-id/
-pipe shape that satisfies one parser and not the other; the two consumers
-were built to share that exact convention on purpose. Closing this gap for
-real needs one of:
+That marker shape is not cosmetic, it is the safety property. The surface's
+hand-authored form — a bold ``- **VOYN-<id>** | <wave> | <status> |
+<priority> |`` task line — cannot be machine-written while the import
+direction is alive: ``backlog_client._RICH_LINE`` is a strict SUBSET of
+``backlog_parser``'s ``_TASK_LINE``/``_RECORD_SHAPED`` match (bold
+``**VOYN-...**`` id followed by a ``| ``), so every line the rich reader
+accepts the importer would accept too, and parse fully as a real authored
+task — not even landing in ``unparsed``. No variant of the bold-id/pipe
+shape satisfies one parser and not the other; the two were built to share
+that convention on purpose. So this section takes the move
+``VOYN_RECOMMENDATION`` already made for 0B records instead: a distinct
+leading marker on a plain, *unbolded* list item, which matches neither
+importer pattern — invisible to ``backlog-import``, not merely rejected by
+it (proved end to end through the real importer in
+``tests/db/test_backlog_export.py``). ADR-0011's central argument, that the
+two directions share no line shape, holds unchanged.
 
-1. A genuinely distinct marker format for machine-rendered rich status
-   (the same move ``VOYN_RECOMMENDATION`` already made for 0B records),
-   plus teaching ``parse_rich_records`` to read it alongside the existing
-   hand-authored bold-line shape, plus a precedence rule for the migration
-   window where a task could carry both an owner-typed bold line and an
-   export-rendered line — real design work, not a follow-up patch; or
-2. Waiting out ADR-0011's revisit condition (target 2026-11-01): once
-   ``backlog-import`` is deleted, the bold-line shape is no longer a live
-   import surface at all, and this module can start emitting it directly
-   with no ambiguity left to resolve.
+Two fields are translated rather than copied, for the same reason
+``status`` is on the 0B record — the reader's vocabulary is the contract,
+not the column's:
 
-Left as an open, tracked gap rather than a silent one.
+* ``wave`` renders as the authored *text* (``"0"`` -> ``"Wave 0"``; a named
+  lane like ``COM`` stands alone), because that is what reads this field:
+  ``projection_producer._wave_goal`` matches ``Wave <n>`` exactly, and a
+  bare ``0`` would silently empty the goal card. The inverse mapping is
+  ``backlog_parser.normalize_wave``, shared so the round trip is pinned
+  against the real normalizer rather than a copy of its regex;
+* ``slug`` carries ``backlog_task.title``, which IS the authored backtick
+  slug (``backlog_parser`` fills ``title`` from it), so
+  ``RichRecord.title`` humanizes an exported record exactly as it does an
+  authored one.
 
 Rendering exists here but a tick has to actually call it: production runs
 this through ``backlog-export`` on ``deploy/systemd/aicc-backlog-export.timer``
 (five-minute cadence, matching the import side's own publisher). Both
 directions running together is a deliberately temporary bridge — see
 ``docs/adr/0011-backlog-projection-bidirectional-bridge.md`` for the
-condition and date the import side (``backlog-import`` /
-``ops/aicc_backlog_publish.py``) retires under, leaving this module as the
-only crossing.
+condition and the 2026-11-01 target date under which the import side
+(``backlog-import`` / ``ops/aicc_backlog_publish.py``) retires, leaving this
+module as the only crossing. Until then both record surfaces above are
+written for readers, never read back: section 0C's precedence rule (a
+machine record outranks a hand-authored line for the same id) is what
+governs a file where the two ever meet.
 """
 
 from __future__ import annotations
@@ -221,6 +232,20 @@ def _planning_status(execution_status: object) -> str:
     )
 
 
+#: A wave whose store value is a number ("0", "0.5") rather than a named lane
+#: ("COM", "W1"). Only these take the "Wave " prefix on the authored surface —
+#: the exact split ``backlog_parser._WAVE`` makes in the other direction, and
+#: pinned against ``normalize_wave`` itself in the tests rather than trusted.
+_NUMERIC_WAVE = re.compile(r"^[0-9]+(?:\.[0-9]+)?$")
+
+
+def _wave_text(wave: object) -> str:
+    """Render ``backlog_task.wave`` as the wave TEXT readers of the rich
+    surface expect — see the module docstring's field-translation note."""
+    value = _clean(wave)
+    return f"Wave {value}" if _NUMERIC_WAVE.match(value) else value
+
+
 def render_record(row: dict[str, Any]) -> str:
     """One ``- VOYN_RECOMMENDATION | ...`` line from one ``backlog_task`` row."""
     updated = row.get("updated_at")
@@ -247,9 +272,44 @@ def render_record(row: dict[str, Any]) -> str:
     return "- " + backlog_client.FIELD_SEP.join(tokens)
 
 
+def render_status_record(row: dict[str, Any]) -> str:
+    """One ``- VOYN_TASK_STATUS | ...`` line from one ``backlog_task`` row.
+
+    Renders through ``backlog_client.render_task_status`` rather than
+    formatting the line here, so the surface's one reader also owns its
+    shape — the same arrangement as ``render_record`` and the header stamp.
+    Every value goes through ``_clean`` first: the store's ``title`` is free
+    text and a raw ``|`` or newline in it would shift or break the record,
+    exactly as on the 0B line.
+    """
+    return backlog_client.render_task_status(
+        backlog_client.RichRecord(
+            record_id=_clean(row.get("task_id")),
+            wave=_wave_text(row.get("wave")),
+            status=_clean(row.get("status")),
+            priority=_clean(row.get("priority")),
+            slug=_clean(row.get("title")),
+        )
+    )
+
+
+#: Preamble of the execution-status section. Prose, so it must not parse as a
+#: record on either surface — it carries no leading ``- `` list marker.
+_STATUS_SECTION = (
+    "\n"
+    "## 0C. Execution status\n"
+    "\n"
+    "One record per task carrying the store's execution lifecycle exactly\n"
+    "(`OPEN`/`IN_PROGRESS`/`READY_TO_REVIEW`/`DONE`/...), which section 0B\n"
+    "above necessarily coarsens to approved/not-approved. Read by\n"
+    "`backlog_client.parse_rich_records`; invisible to `backlog-import`.\n"
+    "\n"
+)
+
+
 def render_projection(rows: list[dict[str, Any]], *, generated_at: datetime) -> str:
-    """The whole file: header (stamped ``generated_at``) plus one record line
-    per row.
+    """The whole file: header (stamped ``generated_at``), one 0B record line
+    per row, then one 0C execution-status line per row.
 
     ``generated_at`` is a required argument rather than a ``datetime.now()``
     read inside this function, so the renderer stays a pure function of its
@@ -257,10 +317,20 @@ def render_projection(rows: list[dict[str, Any]], *, generated_at: datetime) -> 
     expected file. Required rather than defaulted, because a stamp silently
     omitted would leave the projection claiming nothing about its own age,
     which is the state this header exists to end.
+
+    Both sections cover the same ``rows`` in the same order: the two record
+    surfaces describe one store, and a task present in one but not the other
+    would be a task whose lane and whose approval state came from different
+    reads. The header's row count therefore still describes each section,
+    and ``backlog_client.stamp_matches_content`` — which counts 0B records
+    only — keeps agreeing with it.
     """
     return (
         _header(generated_at, len(rows))
         + "\n".join(render_record(row) for row in rows)
+        + "\n"
+        + _STATUS_SECTION
+        + "\n".join(render_status_record(row) for row in rows)
         + "\n"
     )
 
