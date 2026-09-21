@@ -130,13 +130,17 @@ def test_import_never_writes_to_the_real_v1_2_runs_jsonl(tmp_path, monkeypatch):
     # Door two: the default, which is the one that actually opens the file.
     # Driving it is the point -- a guarantee about reading without writing is
     # unevidenced until something reads.
-    created = legacy_import.import_legacy_runs(tmp_path / "default.db")
-    assert sorted(
-        db.get_session(tmp_path / "default.db", db.get_run(tmp_path / "default.db", run_id)["session_id"])[
+    default_db = tmp_path / "default.db"
+    created = legacy_import.import_legacy_runs(default_db)
+    imported = sorted(
+        db.get_session(default_db, db.get_run(default_db, run_id)["session_id"])[
             "legacy_run_id"
         ]
         for run_id in created
-    ) == ["legacy-a", "legacy-b"], "default import did not read the real runs file"
+    )
+    assert imported == ["legacy-a", "legacy-b"], (
+        f"default import did not read the real runs file: {imported}"
+    )
     assert unchanged(), "default import mutated the runs file"
 
 
