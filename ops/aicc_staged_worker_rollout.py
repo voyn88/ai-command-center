@@ -22,7 +22,7 @@ from pathlib import Path
 # (review on d8920b6). Both scripts are invoked by absolute path, so add
 # this file's own directory to the path before importing its sibling.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from aicc_install_transaction import SNAPSHOT_PROPERTIES
+from aicc_install_transaction import PROFILES, SNAPSHOT_PROPERTIES
 
 LANE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,62}")
 UNIT_RE = re.compile(r"voyn-aicc-worker@([A-Za-z0-9][A-Za-z0-9_-]{0,62})\.service")
@@ -271,11 +271,26 @@ def _listed_template_units(systemd: Systemd, *, check: bool) -> frozenset[str]:
 
 
 def discover_units(
-    systemd: Systemd, lanes_path: Path = DEFAULT_LANES
+    systemd: Systemd, lanes_path: Path = DEFAULT_LANES, *, profile: str = "worker"
 ) -> tuple[str, ...]:
-    units = _configured_units(lanes_path)
+    """Every worker unit this host has, configured or merely instantiated.
+
+    `/etc/aicc/worker-lanes` is a WORKER_ONLY_TARGET: the control profile
+    installs it nowhere, so reading it on a control host raised
+    `FileNotFoundError` and took the whole uninstall with it. Zero configured
+    lanes is the *correct* state there, not the misconfiguration it is on a
+    worker, so only the worker profile reads the registry and only the worker
+    profile insists the result be non-empty.
+
+    Instantiated template units are still folded in on both: a control host
+    should have none, and one that does belongs in the snapshot rather than
+    outside it, where `verify_snapshot_closure` would refuse it as an extra.
+    """
+    if profile not in PROFILES:
+        raise RolloutError(f"unknown installation profile: {profile!r}")
+    units: set[str] = _configured_units(lanes_path) if profile == "worker" else set()
     units.update(_listed_template_units(systemd, check=False))
-    if not units:
+    if profile == "worker" and not units:
         raise RolloutError("no worker lanes discovered")
     return tuple(sorted(units))
 
@@ -799,6 +814,17 @@ def main() -> int:
     )
     parser.add_argument("--lanes", type=Path, default=DEFAULT_LANES)
     parser.add_argument(
+        "--profile",
+        choices=PROFILES,
+        default="worker",
+        help=(
+            "Which host role this runs against. 'worker' is the default and "
+            "reads the lane registry exactly as before. 'control' reads no "
+            "registry -- a control host installs none -- and accepts the "
+            "empty lane set that is correct there."
+        ),
+    )
+    parser.add_argument(
         "--privileged-users-file", type=Path, default=DEFAULT_PRIVILEGED_USERS
     )
     parser.add_argument("--state", type=Path)
@@ -819,7 +845,11 @@ def main() -> int:
             systemd, json.loads(args.state.read_text(encoding="utf-8"))
         )
         return 0
-    units = discover_units(systemd, args.lanes)
+    if args.action in {"rollout", "verify"} and args.profile != "worker":
+        # These drive and prove worker lanes. A control host has none, so an
+        # empty run must not be mistaken for a successful rollout.
+        parser.error(f"{args.action} requires the worker profile")
+    units = discover_units(systemd, args.lanes, profile=args.profile)
     if args.action in {"rollout", "verify"}:
         verify_immutable_release()
     if args.action == "snapshot":

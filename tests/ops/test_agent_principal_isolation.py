@@ -1578,3 +1578,342 @@ def test_the_control_preflight_only_names_what_its_own_remedy_removes(tmp_path):
 
     # A dangling symlink is an artefact too: `[ -e ]` alone would miss one.
     assert 'if path_present "$candidate"; then' in text
+
+
+# ---------------------------------------------------------------------------
+# A profile a host can enter but never leave is half a profile. The control
+# install works; its uninstall did not. `/etc/aicc/worker-lanes` is a
+# WORKER_ONLY_TARGET the control profile deliberately installs nowhere, yet
+# three places read it unconditionally: `uninstall-begin` (before it journals
+# anything), the staged-rollout `snapshot` the uninstall takes, and the boot
+# recovery capsule that aborts an INTENT. The first killed the uninstall with
+# `FileNotFoundError: /etc/aicc/worker-lanes` -- the same shape of failure,
+# against the same class of path, as the credential file that started this
+# task.
+# ---------------------------------------------------------------------------
+
+
+def _transaction():
+    root = Path(__file__).parents[2]
+    sys.path.insert(0, str(root / "ops"))
+    import importlib
+
+    return importlib.import_module("aicc_install_transaction")
+
+
+def _rollout():
+    root = Path(__file__).parents[2]
+    sys.path.insert(0, str(root / "ops"))
+    import importlib
+
+    return importlib.import_module("aicc_staged_worker_rollout")
+
+
+def _uninstall_host(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """A host root with the state dir the installer keeps its journal in.
+
+    Every component is made 0700: the transaction walks the whole chain from
+    the filesystem root and refuses any ancestor that grants group or other
+    rename authority, which `mkdir(parents=True)` would leave wide open.
+    """
+    root = tmp_path / "root"
+    state = _private_dir(root / "var/lib/aicc-principal-isolation")
+    # The registry the control profile never installs, named but not created.
+    return root, state, root / "etc/aicc/worker-lanes"
+
+
+def _private_dir(path: Path) -> Path:
+    if not path.parent.exists():
+        _private_dir(path.parent)
+    path.mkdir(mode=0o700, exist_ok=True)
+    path.chmod(0o700)
+    return path
+
+
+def test_a_control_profile_install_can_be_uninstalled(tmp_path):
+    """The crux. `uninstall-begin` read the lane registry before it wrote the
+    journal, so a control host died there and could never be uninstalled --
+    while the control preflight it would have to satisfy prescribes exactly
+    that uninstall."""
+    tx = _transaction()
+    root, state, registry = _uninstall_host(tmp_path)
+    assert not registry.exists(), "premise: a control host installs no registry"
+
+    phase = tx.begin_uninstall(
+        state,
+        baseline_selector="ABSENT",
+        current_selector=root / "opt/aicc/current",
+        lane_registry=registry,
+        profile="control",
+    )
+
+    assert phase == "INTENT"
+    payload = json.loads((state / "uninstall.json").read_text(encoding="utf-8"))
+    # The journal records that no registry was bound, rather than a digest of
+    # a file that does not exist.
+    assert payload["registry_sha256"] == tx.ABSENT_REGISTRY
+    # ...and that sentinel can never be read as a digest, so the resume check
+    # below is comparing two disjoint vocabularies rather than guessing.
+    assert not re.fullmatch(r"[0-9a-f]{64}", tx.ABSENT_REGISTRY)
+    assert tx._REGISTRY_IDENTITY_RE.fullmatch(tx.ABSENT_REGISTRY)
+
+
+def test_boot_recovery_resumes_a_control_uninstall_with_no_flag_to_pass(tmp_path):
+    """`recover_uninstall` runs from the digest-bound capsule at boot: nothing
+    can hand it a profile. So the decision has to live in the journal, and the
+    sentinel is what carries it -- otherwise the INTENT abort reads a registry
+    that is correctly absent and a crashed control uninstall can never be
+    cleaned up."""
+    tx = _transaction()
+    root, state, registry = _uninstall_host(tmp_path)
+    tx.begin_uninstall(
+        state,
+        baseline_selector="ABSENT",
+        current_selector=root / "opt/aicc/current",
+        lane_registry=registry,
+        profile="control",
+    )
+
+    tx.recover_uninstall(state, root=root)
+
+    assert not (state / "uninstall.json").exists(), "the intent was not aborted"
+
+
+def test_the_uninstall_profile_cannot_flip_under_a_live_journal(tmp_path):
+    """The profile is re-declared on every invocation, so it must be checked
+    against what the journal bound. A worker resume of a control journal would
+    quiesce nothing; a control resume of a worker journal would drop the
+    registry binding that detects a lane change mid-uninstall."""
+    tx = _transaction()
+    root, state, registry = _uninstall_host(tmp_path)
+    resume = {
+        "baseline_selector": "ABSENT",
+        "current_selector": root / "opt/aicc/current",
+        "lane_registry": registry,
+    }
+    tx.begin_uninstall(state, **resume, profile="control")
+
+    assert tx.begin_uninstall(state, **resume, profile="control") == "INTENT"
+    with pytest.raises(RuntimeError, match="uninstall profile changed"):
+        tx.begin_uninstall(state, **resume, profile="worker")
+
+    # The agent layer appearing underneath a control uninstall is not
+    # something to bind either -- it is the boundary the profile exists for.
+    _private_dir(registry.parent)
+    registry.write_text("blue\n", encoding="utf-8")
+    registry.chmod(0o644)
+    with pytest.raises(RuntimeError, match="lane registry appeared"):
+        tx.begin_uninstall(state, **resume, profile="control")
+    with pytest.raises(RuntimeError, match="lane registry appeared during uninstall"):
+        tx.recover_uninstall(state, root=root)
+
+
+def test_the_worker_uninstall_still_binds_its_lane_registry(tmp_path):
+    """Negative control: do not "fix" the control case by dropping the binding.
+    A worker journal still carries the registry digest and still refuses a
+    registry that changed underneath it -- and a worker asked to uninstall a
+    host that has no registry is told which profile it wanted."""
+    tx = _transaction()
+    root, state, registry = _uninstall_host(tmp_path)
+    _private_dir(registry.parent)
+    registry.write_text("blue\n", encoding="utf-8")
+    registry.chmod(0o644)
+    resume = {
+        "baseline_selector": "ABSENT",
+        "current_selector": root / "opt/aicc/current",
+        "lane_registry": registry,
+    }
+
+    tx.begin_uninstall(state, **resume, profile="worker")
+    payload = json.loads((state / "uninstall.json").read_text(encoding="utf-8"))
+    assert re.fullmatch(r"[0-9a-f]{64}", payload["registry_sha256"])
+    assert tx.begin_uninstall(state, **resume, profile="worker") == "INTENT"
+
+    registry.write_text("blue\ngreen\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="lane registry changed during uninstall"):
+        tx.begin_uninstall(state, **resume, profile="worker")
+
+    _fresh_root, fresh_state, absent = _uninstall_host(tmp_path / "fresh")
+    with pytest.raises(RuntimeError, match="uninstall a control-profile host"):
+        tx.begin_uninstall(
+            fresh_state,
+            baseline_selector="ABSENT",
+            current_selector=_fresh_root / "opt/aicc/current",
+            lane_registry=absent,
+            profile="worker",
+        )
+
+
+def test_lane_discovery_reads_no_registry_under_the_control_profile(
+    tmp_path, monkeypatch
+):
+    """Executed, not text-matched. Zero configured lanes is the correct state
+    on a control host and a misconfiguration on a worker, so the registry read
+    and the non-empty assertion both belong to the worker alone."""
+    rollout = _rollout()
+    systemd = rollout.Systemd()
+    absent = tmp_path / "worker-lanes"
+
+    assert rollout.discover_units(systemd, absent, profile="control") == ()
+    with pytest.raises(rollout.RolloutError):
+        rollout.discover_units(systemd, absent, profile="worker")
+    with pytest.raises(rollout.RolloutError, match="unknown installation profile"):
+        rollout.discover_units(systemd, absent, profile="controlplane")
+
+    # The other half, and the one a control-shaped relaxation would quietly
+    # take with it: a worker whose registry is present but configures nothing
+    # is still a misconfiguration, not an empty rollout.
+    empty = tmp_path / "empty-worker-lanes"
+    empty.write_text("# no lanes\n", encoding="utf-8")
+    empty.chmod(0o644)
+    assert rollout.discover_units(systemd, empty, profile="control") == (), (
+        "the control profile must not read the registry even when it is there"
+    )
+
+    # The reader insists the installed registry is root-owned, which a test
+    # file is not. The module exposes that as a seam for exactly this.
+    real_fstat = rollout._registry_fstat
+
+    class _RootOwned:
+        def __init__(self, value):
+            self._value = value
+            self.st_uid = 0
+            self.st_gid = 0
+
+        def __getattr__(self, name):
+            return getattr(self._value, name)
+
+    monkeypatch.setattr(
+        rollout, "_registry_fstat", lambda fd: _RootOwned(real_fstat(fd))
+    )
+    with pytest.raises(rollout.RolloutError, match="no worker lanes discovered"):
+        rollout.discover_units(systemd, empty, profile="worker")
+
+
+def test_the_control_snapshot_still_covers_the_units_it_is_given(tmp_path):
+    """Dropping lane discovery must not drop the snapshot. The uninstall binds
+    its journal to this file and restores from it, and on a control host
+    `aicc-principal-recovery.service` -- emitted by the boot generator, so
+    present on every profile -- is in it."""
+    rollout = Path(__file__).parents[2] / "ops" / "aicc_staged_worker_rollout.py"
+    state = tmp_path / "units.json"
+    if not Path("/usr/bin/systemctl").exists():
+        # snapshot() asks systemd for each unit's state. A failing systemctl is
+        # handled (check=False); a missing binary is a different environment,
+        # not a defect in the profile.
+        pytest.skip("systemctl is not installed")
+
+    done = subprocess.run(
+        [
+            sys.executable,
+            str(rollout),
+            "snapshot",
+            "--profile",
+            "control",
+            "--lanes",
+            str(tmp_path / "worker-lanes"),
+            "--state",
+            str(state),
+            "--include-unit",
+            "aicc-agent-launcher.socket",
+            "--include-unit",
+            "aicc-principal-recovery.service",
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert done.returncode == 0, done.stderr
+    payload = json.loads(state.read_text(encoding="utf-8"))
+    assert set(payload["units"]) == {
+        "aicc-agent-launcher.socket",
+        "aicc-principal-recovery.service",
+    }
+
+
+def test_worker_lane_rollout_and_verify_refuse_the_control_profile(tmp_path):
+    """An empty lane set is legitimate for a snapshot and meaningless for a
+    rollout: draining and proving nothing must never report success."""
+    rollout = Path(__file__).parents[2] / "ops" / "aicc_staged_worker_rollout.py"
+
+    for action in ("rollout", "verify"):
+        done = subprocess.run(
+            [
+                sys.executable,
+                str(rollout),
+                action,
+                "--profile",
+                "control",
+                "--lanes",
+                str(tmp_path / "worker-lanes"),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert done.returncode != 0
+        assert "requires the worker profile" in done.stderr
+
+
+def _logical_lines_with_guard() -> tuple[tuple[str, str | None], ...]:
+    """Each logical line of the installer, with the profile guard in force.
+
+    Backslash continuations are folded so a command is classified by the
+    command it is rather than by the fragment a line break left behind. Every
+    profile guard in this installer opens at column 0, so a column-0 `fi`,
+    `else` or non-profile `elif` closes it -- the same rule `_sits_behind`
+    relies on.
+    """
+    worker = 'if [ "$install_profile" = "worker" ]; then'
+    control = 'if [ "$install_profile" = "control" ]; then'
+    control_elif = 'elif [ "$install_profile" = "control" ]; then'
+    guard: str | None = None
+    folded: list[tuple[str, str | None]] = []
+    pending = ""
+    for raw in _installer_text().splitlines():
+        if not pending:
+            if raw.startswith(worker):
+                guard = "worker"
+            elif raw.startswith((control, control_elif)):
+                guard = "control"
+            elif raw in {"fi", "else"} or raw.startswith("elif "):
+                guard = None
+        if raw.endswith("\\"):
+            pending += raw[:-1]
+            continue
+        folded.append(((pending + raw).strip(), guard))
+        pending = ""
+    assert not pending, "the installer ends inside a line continuation"
+    return tuple(folded)
+
+
+def test_every_tool_the_installer_runs_on_both_profiles_is_given_the_profile(tmp_path):
+    """Standing invariant, and the general form of three separate defects.
+
+    Excluding a target from the control file set says nothing about a command
+    that names that path directly -- that is how the agent tmpfiles config,
+    and then the lane registry, reached a control host anyway. So: a command
+    naming a worker-only target either runs under a profile guard, or goes
+    through one of the two wrappers that hand the profile down. And those
+    wrappers must actually hand it down, which is the half a text match for
+    `run_rollout` alone would miss.
+    """
+    tx, _targets = _specs("worker", tmp_path)
+    profiled = re.compile(r"\b(?:run_transaction|run_rollout)\b")
+
+    for wrapper in ("run_transaction", "run_rollout"):
+        assert '--profile "$install_profile"' in _shell_function(wrapper), (
+            f"{wrapper} invokes an ops tool without telling it the profile"
+        )
+
+    unprofiled = [
+        line
+        for line, guard in _logical_lines_with_guard()
+        if guard is None
+        and not line.startswith("#")
+        and any(target in line for target in tx.WORKER_ONLY_TARGETS)
+        and not profiled.search(line)
+    ]
+    assert not unprofiled, (
+        "these run on a control host and name a worker-only target without "
+        f"passing the profile to anything: {unprofiled}"
+    )

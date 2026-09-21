@@ -166,8 +166,13 @@ run_transaction() {
     "$@"
 }
 
+# The profile reaches the rollout for the same reason it reaches the
+# transaction: /etc/aicc/worker-lanes is a worker-only target, so on a control
+# host `snapshot` read a registry that is correctly absent and died before the
+# uninstall could journal anything. `rollout` and `verify` are worker-only and
+# already guarded below, so they always pass "worker" from here.
 run_rollout() {
-  /usr/bin/python3 "$rollout" "$@"
+  /usr/bin/python3 "$rollout" "$@" --profile "$install_profile"
 }
 
 run_release() {

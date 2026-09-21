@@ -167,20 +167,60 @@ def _trusted_uninstall_recovery(
     return resolved
 
 
+#: What a profile with no worker lane registry records where a worker records
+#: the registry digest. `/etc/aicc/worker-lanes` is a WORKER_ONLY_TARGET, so a
+#: control host installs it nowhere and there is no content to bind. Reading it
+#: anyway is what made a control-profile uninstall impossible: `uninstall-begin`
+#: died on `FileNotFoundError: /etc/aicc/worker-lanes` before it wrote the
+#: journal, so a host could enter the control profile and never leave it.
+#:
+#: The sentinel lives in the journal rather than in a flag because the boot
+#: recovery capsule resumes from the journal ALONE -- nothing can pass it a
+#: profile at boot. It cannot collide with a digest: a sha256 is 64 hex chars.
+ABSENT_REGISTRY = "ABSENT"
+_REGISTRY_IDENTITY_RE = re.compile(rf"(?:[0-9a-f]{{64}}|{ABSENT_REGISTRY})")
+
+
+def _registry_identity(lane_registry: Path, profile: str) -> str:
+    """The lane-registry identity this profile's uninstall journal binds."""
+    if profile not in PROFILES:
+        raise RuntimeError(f"unknown installation profile: {profile!r}")
+    if profile == "control":
+        # The control preflight already refused a host that still carries the
+        # agent layer, so the registry being absent is the state this uninstall
+        # was declared for -- and one appearing underneath it is not something
+        # to bind, it is something to refuse.
+        if _path_present(lane_registry):
+            raise RuntimeError(
+                f"control uninstall found a worker lane registry: {lane_registry}"
+            )
+        return ABSENT_REGISTRY
+    if not _path_present(lane_registry):
+        raise RuntimeError(
+            f"worker lane registry is missing: {lane_registry}; "
+            "uninstall a control-profile host with --profile control"
+        )
+    registry = _read_regular(lane_registry, max_bytes=64 * 1024)
+    if registry.mode & 0o022 or registry.uid not in {0, os.geteuid()}:
+        raise RuntimeError("worker lane registry is not trusted")
+    return registry.sha256
+
+
 def _uninstall_identity(
-    *, baseline_selector: str, current_selector: Path, lane_registry: Path
+    *,
+    baseline_selector: str,
+    current_selector: Path,
+    lane_registry: Path,
+    profile: str = "worker",
 ) -> dict[str, str]:
     if baseline_selector != "ABSENT" and not re.fullmatch(
         r"releases/[0-9a-f]{40}", baseline_selector
     ):
         raise RuntimeError("baseline release selector is invalid")
-    registry = _read_regular(lane_registry, max_bytes=64 * 1024)
-    if registry.mode & 0o022 or registry.uid not in {0, os.geteuid()}:
-        raise RuntimeError("worker lane registry is not trusted")
     return {
         "baseline_selector": baseline_selector,
         "start_selector": _release_selector(current_selector),
-        "registry_sha256": registry.sha256,
+        "registry_sha256": _registry_identity(lane_registry, profile),
     }
 
 
@@ -190,6 +230,7 @@ def begin_uninstall(
     baseline_selector: str,
     current_selector: Path,
     lane_registry: Path,
+    profile: str = "worker",
 ) -> str:
     """Durably record uninstall intent before its service snapshot is made."""
     journal_path = state_dir / "uninstall.json"
@@ -215,6 +256,7 @@ def begin_uninstall(
             or payload["baseline_selector"] != baseline_selector
             or not isinstance(payload["start_selector"], str)
             or not isinstance(payload["registry_sha256"], str)
+            or not _REGISTRY_IDENTITY_RE.fullmatch(payload["registry_sha256"])
             or (
                 payload["snapshot_sha256"] is not None
                 and not isinstance(payload["snapshot_sha256"], str)
@@ -231,7 +273,19 @@ def begin_uninstall(
             payload["baseline_selector"],
         }:
             raise RuntimeError("release selector changed during uninstall")
-        if _path_present(lane_registry):
+        # A resume must not change what the journal was bound to. The profile
+        # is re-declared on every invocation, so compare it against what the
+        # journal recorded: a worker resume of a control journal would
+        # otherwise quiesce nothing and a control resume of a worker journal
+        # would skip the registry binding entirely.
+        if profile == "control":
+            if _path_present(lane_registry):
+                raise RuntimeError("worker lane registry appeared during uninstall")
+            if payload["registry_sha256"] != ABSENT_REGISTRY:
+                raise RuntimeError("uninstall profile changed during uninstall")
+        elif payload["registry_sha256"] == ABSENT_REGISTRY:
+            raise RuntimeError("uninstall profile changed during uninstall")
+        elif _path_present(lane_registry):
             registry = _read_regular(lane_registry, max_bytes=64 * 1024)
             if registry.sha256 != payload["registry_sha256"]:
                 raise RuntimeError("worker lane registry changed during uninstall")
@@ -243,6 +297,7 @@ def begin_uninstall(
         baseline_selector=baseline_selector,
         current_selector=current_selector,
         lane_registry=lane_registry,
+        profile=profile,
     )
     transaction_id = secrets.token_hex(16)
     capsule_dir = state_dir / f"uninstall-{transaction_id}"
@@ -1828,9 +1883,23 @@ def recover_uninstall(
         current = _release_selector(root / "opt/aicc/current")
         if current != payload.get("start_selector"):
             raise RuntimeError("release selector changed during uninstall intent")
-        registry = _read_regular(root / "etc/aicc/worker-lanes", max_bytes=64 * 1024)
-        if registry.sha256 != payload.get("registry_sha256"):
-            raise RuntimeError("worker lane registry changed during uninstall intent")
+        # No flag reaches this function -- boot recovery resumes from the
+        # journal alone -- so the journal is what says which profile bound it.
+        # A control-profile uninstall bound no registry because the control
+        # profile installs none; reading it unconditionally here died with
+        # FileNotFoundError on exactly the host the profile exists for.
+        lane_registry = root / "etc/aicc/worker-lanes"
+        if payload.get("registry_sha256") == ABSENT_REGISTRY:
+            if _path_present(lane_registry):
+                raise RuntimeError(
+                    "worker lane registry appeared during uninstall intent"
+                )
+        else:
+            registry = _read_regular(lane_registry, max_bytes=64 * 1024)
+            if registry.sha256 != payload.get("registry_sha256"):
+                raise RuntimeError(
+                    "worker lane registry changed during uninstall intent"
+                )
         snapshot.unlink(missing_ok=True)
         _fsync_dir(state_dir)
         journal_path.unlink()
@@ -2775,6 +2844,7 @@ def _dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
                 baseline_selector=args.baseline_selector,
                 current_selector=args.current_selector,
                 lane_registry=args.lane_registry,
+                profile=args.profile,
             )
         )
         return 0

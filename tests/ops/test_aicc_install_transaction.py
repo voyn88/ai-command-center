@@ -707,6 +707,9 @@ def test_uninstall_cli_emits_only_closed_phase_literals(capsys, tmp_path):
         baseline_selector="ABSENT",
         current_selector=current,
         lane_registry=lanes,
+        # The real parser always supplies this and defaults it to "worker";
+        # the journal binds the lane registry digest under that profile.
+        profile="worker",
     )
 
     assert module._dispatch(begin_args, parser) == 0
