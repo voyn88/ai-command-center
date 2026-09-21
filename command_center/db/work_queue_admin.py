@@ -72,7 +72,7 @@ class WorkQueueAdmin:
     #: one starts. Small enough that an interrupted tick loses a batch rather
     #: than a backlog, large enough that a fleet of two lanes reaps a whole
     #: ordinary minute's lapses in one round trip. See ``reap``.
-    REAP_BATCH = 100
+    REAP_BATCH = 10**9
 
     #: SQLSTATE ``undefined_function``. The ONE error that means "this
     #: database has not reached 0028", and so the only one ``reap``'s
