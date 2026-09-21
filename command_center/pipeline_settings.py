@@ -28,6 +28,7 @@ for the latter.
 from __future__ import annotations
 
 import contextlib
+import math
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -114,10 +115,36 @@ def _bounded_int(value: object, default: int, minimum: int, maximum: int) -> int
 
 def _bounded_float(value: object, default: float, minimum: float, maximum: float) -> float:
     """A float within `[minimum, maximum]`, or `default`; bools rejected like
-    `_bounded_int`, out-of-range falls back rather than clamping."""
+    `_bounded_int`, out-of-range falls back rather than clamping.
+
+    Non-finite values fall back too, and NaN is why that is checked rather
+    than left to the range comparison: `nan < minimum` and `nan > maximum`
+    are *both* False, so a NaN is the one malformed value that sails through
+    a bounds test which rejects every other. `load_settings` reaches here via
+    `json.loads`, which accepts a bare `NaN` literal, so it is a value a
+    settings file can genuinely carry.
+
+    The one field this guards is `max_daily_spend_usd`. A NaN ceiling gates
+    no differently than the `0.0` default does (both mean "no cap"), so this
+    is not the money gate fail-open `daily_spend_usd` refuses to return a NaN
+    for (VOYN-W0-AICC-SPEND-CAP-CALLER-SWALLOWS) — it is the stored value
+    being malformed rather than replaced. What that costs: it is written
+    straight back out by `as_dict`/`save_settings` as a bare `NaN` token,
+    which is not valid JSON and is rejected by any strict reader of this file
+    (the PostgreSQL mirror, the web client); it renders as `nan` wherever the
+    ceiling is displayed; and it makes every comparison against the ceiling
+    False, including the `max_daily_spend_usd <= 0` test in
+    `DispatchPlan.budget_remaining_usd`, which then reports a NaN budget
+    instead of "no ceiling". Falling back makes a malformed ceiling behave
+    like every other malformed setting. `inf` is already rejected by the range
+    test; it is covered here only so "a bound is a real number" holds for one
+    reason rather than two.
+    """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return default
     number = float(value)
+    if not math.isfinite(number):
+        return default
     if number < minimum or number > maximum:
         return default
     return number

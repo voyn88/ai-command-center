@@ -158,7 +158,13 @@ def _resolve_db_path(db_path: Path | None) -> Path:
 
 
 def plan(root: Path, *, db_path: Path | None = None) -> DispatchPlan:
-    """Dry run: what would be assigned, and why. No writes."""
+    """Dry run: what would be assigned, and why.
+
+    Writes no board, task or queue state. The single exception is an
+    `activity_log` line when the trailing-24h spend cannot be read: a refusal
+    that stops dispatch has to be recorded somewhere a person will find it,
+    and the plan object alone is only seen by whoever asked for it.
+    """
     resolved_db = _resolve_db_path(db_path)
     policy = policy_config.load_policy(root)
     settings = pipeline_settings.load_settings(root)
