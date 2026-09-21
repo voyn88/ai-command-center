@@ -202,6 +202,24 @@ class FileState:
 
 
 UNINSTALL_JOURNAL_VERSION = 2
+# Every CLI action that mutates the installed tree, the systemd layer or the
+# authority groups. While an uninstall journal is open the baseline these
+# actions would write against is mid-teardown, so each of them is refused.
+# "install" belongs here for the same reason "apply" and "commit" do: it is the
+# single-shot form of the staged path, and leaving it out would let the one
+# action the refusal message names walk straight past the refusal.
+UNINSTALL_BLOCKED_ACTIONS = frozenset(
+    {
+        "validate",
+        "prepare",
+        "apply",
+        "commit",
+        "install",
+        "quiesce-worker-only",
+        "validate-control-authority",
+        "revoke-worker-authority",
+    }
+)
 
 #: Generation-manifest format this build WRITES.
 #:
@@ -5580,15 +5598,10 @@ def _dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
             args.baseline_selector
         )
         return 0
-    if _path_present(args.state_dir / "uninstall.json") and args.action in {
-        "validate",
-        "prepare",
-        "apply",
-        "commit",
-        "quiesce-worker-only",
-        "validate-control-authority",
-        "revoke-worker-authority",
-    }:
+    if (
+        _path_present(args.state_dir / "uninstall.json")
+        and args.action in UNINSTALL_BLOCKED_ACTIONS
+    ):
         raise RuntimeError("unfinished uninstall journal blocks installation")
     if args.action == "install" and args.profile == "control":
         raise RuntimeError(

@@ -1102,6 +1102,62 @@ def test_mutation_guards_reject_dangling_uninstall_journal(tmp_path):
         )
 
 
+def test_open_uninstall_journal_blocks_every_action_the_guard_names(tmp_path):
+    module = _module()
+
+    # The refusal message says "blocks installation", so the set it guards has
+    # to contain the action actually called "install" -- and every other action
+    # that writes the tree, the units or the authority groups. Pinning the
+    # membership here means dropping one is a test failure, not a silent hole:
+    # a test that cannot see a command cannot see its divergence.
+    assert module.UNINSTALL_BLOCKED_ACTIONS == frozenset(
+        {
+            "validate",
+            "prepare",
+            "apply",
+            "commit",
+            "install",
+            "quiesce-worker-only",
+            "validate-control-authority",
+            "revoke-worker-authority",
+        }
+    )
+
+    for action in sorted(module.UNINSTALL_BLOCKED_ACTIONS):
+        state = tmp_path / action / "state"
+        state.mkdir(mode=0o700, parents=True)
+        args = SimpleNamespace(
+            action=action,
+            state_dir=state,
+            repo_root=tmp_path,
+            root=tmp_path / action / "root",
+            profile="worker",
+        )
+
+        # Side one: with the journal open every named action is refused. An
+        # action that walks past the guard reports itself by name rather than
+        # by whatever it happens to trip over first.
+        (state / "uninstall.json").write_text("{}", encoding="utf-8")
+        try:
+            module._dispatch(args, argparse.ArgumentParser())
+        except RuntimeError as exc:
+            assert "unfinished uninstall" in str(exc), action
+        except Exception as exc:  # noqa: BLE001 - reached only past the guard
+            pytest.fail(f"{action} ran past the open-journal guard: {exc!r}")
+        else:
+            pytest.fail(f"{action} ran past the open-journal guard without refusing")
+
+        # Side two: the refusal has to be attributable to the journal. Without
+        # it the very same call must get past the guard -- it may still fail
+        # further in on this stub namespace, but never with this message. A
+        # one-sided check would also pass if the guard rejected everything.
+        (state / "uninstall.json").unlink()
+        try:
+            module._dispatch(args, argparse.ArgumentParser())
+        except Exception as exc:  # noqa: BLE001 - any later failure is fine
+            assert "unfinished uninstall" not in str(exc), action
+
+
 def test_uninstall_completion_keeps_wal_until_all_adjuncts_are_durable(
     monkeypatch, tmp_path
 ):
