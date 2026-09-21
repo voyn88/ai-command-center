@@ -312,55 +312,73 @@ def _assert_no_banned_values(node, banned_strings: list[str]) -> None:
 def test_snapshot_never_contains_banned_fields_for_sensitive_project(
     tmp_path, git_repo, configure_project_repo, fake_claude, _isolated_artifact_dirs
 ):
+    """Both halves: BANK is redacted *and* a non-sensitive project is not.
+
+    Every assertion this test makes is inside a loop over entries filtered out
+    of the snapshot by project, so an empty section satisfies all of them --
+    and the "non-sensitive control project, same shape, must retain
+    everything" the setup announced was never once asserted, nor even created.
+    A snapshot builder that dropped every BANK entry, or renamed the
+    ``project`` key, or one whose redaction stripped ``prompt`` from *every*
+    project, all passed. So: prove each section can be seen on both sides
+    first, then check redaction against the control that says the redaction is
+    aimed rather than universal.
+    """
     configure_project_repo("BANK", git_repo)
     project_config.save_repository_path("BANK", str(git_repo))
+    configure_project_repo("AIOS", git_repo)
+    project_config.save_repository_path("AIOS", str(git_repo))
     api = _api(tmp_path)
-
-    run = api.start_run(
-        project="BANK", repository_path=str(git_repo), task_type="implementation",
-        instruction="TOP SECRET financial instruction", confirmed=True,
-    )
-    api.supervisor.wait_for_run(run["id"], timeout=10)
-    activity_log.log_event(
-        "run_completed", project="BANK", run_id=run["id"], message="secret-financial-data details"
-    )
-
     reports_dir, generated_dir = _isolated_artifact_dirs
-    (reports_dir / "BANK").mkdir(parents=True, exist_ok=True)
-    (reports_dir / "BANK" / "secret_report.md").write_text("TOP SECRET report body")
-    (generated_dir / "BANK").mkdir(parents=True, exist_ok=True)
-    (generated_dir / "BANK" / "task_implementation.md").write_text("secret output content")
 
-    # Non-sensitive control project, same shape, must retain everything.
-    other_repo = tmp_path / "other-repo"
-    other_repo.mkdir()
-    import subprocess
-
-    subprocess.run(["git", "init", "-q"], cwd=other_repo, check=True)
-    subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=other_repo, check=True)
-    subprocess.run(["git", "config", "user.name", "t"], cwd=other_repo, check=True)
-    (other_repo / "f.txt").write_text("x")
-    subprocess.run(["git", "add", "f.txt"], cwd=other_repo, check=True)
-    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=other_repo, check=True)
-    project_config.save_repository_path("AIOS", str(other_repo))
+    # The same four artefact kinds for the sensitive project and for the
+    # control, so any asymmetry below is redaction and not fixture shape.
+    for project, marker in (("BANK", "TOP SECRET"), ("AIOS", "RETAINED")):
+        run = api.start_run(
+            project=project, repository_path=str(git_repo), task_type="implementation",
+            instruction=f"{marker} financial instruction", confirmed=True,
+        )
+        api.supervisor.wait_for_run(run["id"], timeout=10)
+        activity_log.log_event(
+            "run_completed", project=project, run_id=run["id"], message=f"{marker} details"
+        )
+        (reports_dir / project).mkdir(parents=True, exist_ok=True)
+        (reports_dir / project / "report.md").write_text(f"{marker} report body")
+        (generated_dir / project).mkdir(parents=True, exist_ok=True)
+        (generated_dir / project / "task_implementation.md").write_text(f"{marker} output")
 
     snapshot = workspace_home.build_workspace_home_snapshot(execution_center_api=api)
 
-    bank_entries = (
-        [r for r in snapshot["recent_runs"] if r.get("project") == "BANK"]
-        + [r for r in snapshot["active_runs"] if r.get("project") == "BANK"]
-        + [r for r in snapshot["reports"] if r.get("project") == "BANK"]
-        + [r for r in snapshot["artifacts"] if r.get("project") == "BANK"]
-        + [r for r in snapshot["recent_activity"] if r.get("project") == "BANK"]
-    )
+    def entries(section: str, project: str) -> list[dict]:
+        return [e for e in snapshot[section] if e.get("project") == project]
+
+    # A test that cannot see the entries cannot see their leak. Nothing below
+    # means anything until every section is non-empty on both sides.
+    # `active_runs` is deliberately not in this list: both runs are awaited to
+    # completion, so it is legitimately empty and asserting otherwise would be
+    # a false alarm.
+    sections = ("recent_runs", "reports", "artifacts", "recent_activity")
+    for section in sections:
+        assert entries(section, "BANK"), f"no BANK entry in snapshot[{section!r}] to inspect"
+        assert entries(section, "AIOS"), f"no control entry in snapshot[{section!r}] to compare against"
+
+    bank_entries = [e for section in (*sections, "active_runs") for e in entries(section, "BANK")]
     _assert_no_banned_values(bank_entries, _BANNED_VALUES)
 
-    for run_entry in [r for r in snapshot["recent_runs"] if r.get("project") == "BANK"]:
-        assert "prompt" not in run_entry
-    for report_entry in [r for r in snapshot["reports"] if r.get("project") == "BANK"]:
-        assert "report_path" not in report_entry
-    for artifact_entry in [a for a in snapshot["artifacts"] if a.get("project") == "BANK"]:
-        assert "path" not in artifact_entry
+    # The redacted key in each section, and the control that proves the
+    # redaction is aimed at the sensitive project rather than at everyone.
+    for section, field in (
+        ("recent_runs", "prompt"),
+        ("reports", "report_path"),
+        ("artifacts", "path"),
+        ("recent_activity", "message"),
+    ):
+        for entry in entries(section, "BANK"):
+            assert field not in entry, f"{field!r} survived redaction in {section}: {entry}"
+        assert any(field in entry for entry in entries(section, "AIOS")), (
+            f"{field!r} is absent from the non-sensitive control's {section} too -- "
+            "this test cannot tell redaction from a field nothing populates"
+        )
 
 
 # --------------------------------------------------------------------------
