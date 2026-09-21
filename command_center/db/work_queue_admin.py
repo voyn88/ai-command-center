@@ -72,7 +72,17 @@ class WorkQueueAdmin:
     #: one starts. Small enough that an interrupted tick loses a batch rather
     #: than a backlog, large enough that a fleet of two lanes reaps a whole
     #: ordinary minute's lapses in one round trip. See ``reap``.
-    REAP_BATCH = 10**9
+    #:
+    #: BOTH EDGES ARE PINNED, in ``tests/db/test_reap_bound.py`` and nowhere
+    #: else: every batching test in ``test_work_queue_admin.py`` sizes its
+    #: backlog as ``REAP_BATCH + 3``, so they follow this number wherever it
+    #: goes and cannot see it stop being a bound. Raised past the tick it
+    #: restores the all-or-nothing reap 0028 removed (measured: a killed tick
+    #: recovered 0 of 1000 at ``10**9``, 600 at ``100``); dropped to zero or
+    #: below it never satisfies ``reap``'s own termination test, because the
+    #: function clamps with ``greatest(p_max_items, 1)`` and the loop compares
+    #: against the bound it asked for.
+    REAP_BATCH = 100
 
     #: SQLSTATE ``undefined_function``. The ONE error that means "this
     #: database has not reached 0028", and so the only one ``reap``'s

@@ -8,6 +8,79 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Fixed — the reaper's batch bound had stopped being a bound (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
+- `control-01:queue` reported `queue_stalled` again (`monitor_finding` #13145).
+  The only change on this branch since the last healthy measurement is one
+  line: `WorkQueueAdmin.REAP_BATCH` went from `100` to `10**9`, with no test,
+  no changelog and no argument, directly contradicting the comment two lines
+  above it ("Small enough that an interrupted tick loses a batch rather than a
+  backlog") and the whole of 0028. `10**9` is a legal `integer`, so nothing
+  refused it — `queue_reap(1000000000)` is simply the unbounded reap under a
+  bounded arity's name. Reverted to `100`.
+
+  **MEASURED against a real PostgreSQL 16 server.** 1000 lapsed leases, the
+  tick cancelled 100ms in — which is how `aicc-queue-reaper.service`'s
+  `TimeoutStartSec=60s` kill arrives, and how the restart of the tunnel the
+  credential rotation cycles arrives:
+
+      REAP_BATCH = 100    tick killed after 104.8 ms -> recovered 600 of 1000
+      REAP_BATCH = 10**9  tick killed after 105.5 ms -> recovered   0 of 1000
+
+  Same server, same backlog, same interruption, the same ~100ms of work done
+  in both: the bounded tick had banked six durable batches, the unbounded one
+  rolled back every expiration it had performed. That is 0028's defect
+  verbatim — "the older unbounded form recovered nothing at all when it was
+  interrupted, not everything up to where it stopped" — and the tick is
+  interruptible by design.
+
+  **Why this is the finding and not merely a regression.** `evaluate` weighs
+  two starvation clocks and only one of them is unconditional: due ready work
+  is excused by a full fleet and bounded by the fleet clock, while
+  `lapsed_claim_age_seconds` is neither. No lane is holding a lapsed claim, so
+  no lane being free says anything about it; only the reaper clears it, and no
+  lane restart and no `queue_redrive` — which reaches only items already
+  `dead` — is an exit. A reaper that commits nothing is therefore not a slow
+  reaper: it is that age climbing without limit, and `queue_stalled` with
+  nothing the fleet can do about it.
+
+  The normal case hides it, which is why it could ship. A handful of lapses
+  comes back short of any bound and is committed by the first call, so a quiet
+  queue reaps identically at `100` and at `10**9`. The two diverge only once
+  there is a backlog — after a worker host is lost, after a rotation window,
+  after a database blip — at exactly the moment recovery is the thing being
+  measured.
+
+- **The suite could not see it, and that is the part worth fixing.** Every
+  existing batching test sizes its backlog as `WorkQueueAdmin.REAP_BATCH + 3`.
+  They are proofs about the LOOP and they read the constant, so they follow it
+  wherever it goes: at `10**9` they do not go red, they stop being runnable —
+  a backlog of a billion claims is a gate that hangs, not a test that fails.
+  0028's fix is the loop AND a bound small enough to make the loop mean
+  something; only the loop was pinned.
+
+  `tests/db/test_reap_bound.py` pins the other half, from outside the
+  constant. It needs no server — deliberately, since the regression reached
+  HEAD past a suite whose only witnesses to it could not be collected without
+  one — and it names both edges:
+
+    * **Ceiling.** One batch is what an interruption throws away, so it must
+      be a small fraction of the tick: at a measured 0.206 ms per expiration
+      and its audit row (rounded to 1 ms, because production crosses
+      `voyn-aicc-pgtunnel.service` to a loaded server), a batch may spend at
+      most a tenth of the kill budget. `TimeoutStartSec` is parsed from
+      `deploy/systemd/aicc-queue-reaper.service` rather than restated, so the
+      ceiling follows the unit if the tick is ever retuned.
+    * **Floor.** `REAP_BATCH <= 0` is the same stall in a worse shape, found
+      while deriving the first edge: `queue_reap` clamps its own argument
+      (`greatest(p_max_items, 1)`) while `reap()` tests termination against
+      the bound it ASKED for, so the two never agree — the server reaps one
+      and answers `1`, `1 < 0` is false; the queue empties and answers `0`,
+      `0 < 0` is false. Reproduced in-process: still looping after 51 calls
+      against an empty queue. The tick would spin until systemd killed it,
+      recover nothing, and do it again the next minute.
+
+  Each edge fails on exactly one mutation and neither fails on the other.
+
 ### Fixed — the reaper expired leases that were still live (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
 - **`queue_reap`'s re-test under the item's row lock dropped half the predicate
   it was re-testing.** Migration 0029. The scan selects on two conditions,
