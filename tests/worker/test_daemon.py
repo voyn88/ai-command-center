@@ -670,11 +670,12 @@ def test_the_watchdog_budget_caps_the_refusal_sleep(monkeypatch) -> None:
 def test_the_watchdog_cap_keeps_the_beat_alive_under_a_long_visibility(
     monkeypatch,
 ) -> None:
-    """Mutant E: with visibility_seconds=3600 the beat interval is 1200s, and
-    the watchdog cap on that interval is the ONLY thing that keeps a healthy
+    """Mutant E: with visibility_seconds=3600 the beat interval is 900s
+    (`beat_interval_seconds`, which the cadence fix moved from 1200s), and the
+    watchdog cap on that interval is the ONLY thing that keeps a healthy
     long-lease worker pinging inside its budget. Without the cap the first
-    beat (and first in-run ping) would arrive 20 minutes late — here, never
-    within the 10s bound."""
+    beat (and first in-run ping) would arrive a quarter-hour late — here,
+    never within the 10s bound."""
     import os
     import threading
 
@@ -693,7 +694,7 @@ def test_the_watchdog_cap_keeps_the_beat_alive_under_a_long_visibility(
     def slow(payload, lease_lost, attempt_no=1):
         assert beat_seen.wait(timeout=10), (
             "no heartbeat within the watchdog budget: the uncapped interval "
-            "would have parked the beat thread for visibility/3 seconds"
+            "would have parked the beat thread for a quarter of the window"
         )
         return HandlerOutcome(ok=True, result={})
 
@@ -995,9 +996,11 @@ def test_a_failing_credential_reload_keeps_the_claim_gate_shut() -> None:
 #
 # These pin the tolerance itself rather than the divisor, so a future change
 # to either number has to keep the promise or go red.
-# `tests/db/test_lease_renewal_margin.py` proves the same property end to end
-# against a real server; these need none and so run in every gate on every
-# machine -- the lesson `tests/db/test_reap_bound.py` was written for.
+# `tests/db/test_infra_monitor_queue_snapshot.py` proves the same property end
+# to end against a real server -- the real `queue_heartbeat` keeping the real
+# lease, then the probe reading the lane it leaves behind; these need no
+# server and so run in every gate on every machine -- the lesson
+# `tests/db/test_reap_bound.py` was written for.
 
 
 def test_the_lease_survives_the_beats_the_daemon_says_may_fail() -> None:
@@ -1030,6 +1033,21 @@ def test_the_lease_survives_the_beats_the_daemon_says_may_fail() -> None:
             f"visibility_seconds={window}: no margin left after "
             f"{tolerated} failed beats"
         )
+
+
+def test_the_configured_window_is_one_the_server_will_actually_grant() -> None:
+    """The arithmetic above is about the window the CALLER ASKS FOR; the lease
+    is the one the SERVER GRANTS. `queue_claim` clamps the request to
+    ``[1, 3600]`` (`least(greatest(coalesce(p_visibility_seconds, 60), 1),
+    3600)`), so a configured window above the ceiling would size the beat to a
+    lease that does not exist -- 7200s asked for, 3600s kept, beats at 1800s,
+    and the tolerance this module just bought back is gone again without a
+    line of it changing.
+
+    Nothing can reach that today: `command_center.worker.__main__` builds the
+    daemon with the default config and exposes no knob. This pins the reason
+    it is safe, so a knob added later lands here instead of in the fleet."""
+    assert 1 <= WorkerConfig().visibility_seconds <= 3600
 
 
 def test_the_deployed_window_beats_often_enough_to_survive_a_tunnel_restart() -> None:

@@ -118,6 +118,17 @@ def beat_interval_seconds(
     otherwise park the beat thread past the systemd watchdog deadline during
     exactly the run the ping is meant to cover. The one-second floor is the
     same clamp `queue_claim` applies to the window it is derived from.
+
+    ``visibility_seconds`` is the window the CALLER ASKED FOR, and the whole
+    arithmetic above assumes it is the one the server GRANTED. That holds for
+    every window this daemon can be run with: `queue_claim` clamps to
+    ``[1, 3600]``, `WorkerConfig.visibility_seconds` is 300, and
+    `command_center.worker.__main__` exposes no knob to change it. An operator
+    knob above 3600 would re-open exactly the gap this function was written to
+    close -- the beat sized to a 7200s window against a lease the server keeps
+    at 3600 -- so the window would have to be read back from the claim (the
+    granted deadline is on `ClaimedWork.visible_until`) rather than from the
+    config, and the caller's number would stop being the subject.
     """
     interval = max(visibility_seconds / (TOLERATED_FAILED_BEATS + 2), 1.0)
     if watchdog_seconds is not None:

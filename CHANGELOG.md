@@ -96,10 +96,10 @@ functional application milestones of `app.py`.
   the error ceiling, and the watchdog test pins the cap; the interval itself
   was pinned by no test at all, and a fake store cannot catch it — it has no
   deadline to be late for, so it answers every beat the same whenever it
-  arrives. Six tests now, and they name the tolerance rather than the divisor,
-  so retuning either number has to keep the promise or go red:
+  arrives. Seven tests now, and they name the tolerance rather than the
+  divisor, so retuning either number has to keep the promise or go red:
 
-    * Four need no server (`tests/worker/test_daemon.py`) and so run in every
+    * Five need no server (`tests/worker/test_daemon.py`) and so run in every
       gate on every machine — the lesson `tests/db/test_reap_bound.py` was
       written for. One states the survival property over every window the
       clamps do not reach, one states it concretely at the deployed number,
@@ -107,7 +107,16 @@ functional application milestones of `app.py`.
       drives the REAL loop against a store that keeps the lease the way the
       server keeps it (renew to `now() + V`; refuse at `visible_until <=
       now()`), so the recovery beat is judged by a clock rather than by the
-      fake's goodwill.
+      fake's goodwill. The fifth pins the arithmetic's own PREMISE: the
+      window the beat is sized to is the one the caller ASKS FOR, and the
+      lease is the one the server GRANTS. `queue_claim` clamps the request to
+      `[1, 3600]`, so a configured window above that ceiling would size the
+      beat to a lease that does not exist — 7200s asked for, 3600s kept,
+      beats at 1800s, and the tolerance gone again with no line of this fix
+      changed. Nothing reaches it today (`command_center.worker.__main__`
+      builds the daemon with the default config and exposes no knob), which
+      is exactly why it wanted pinning rather than leaving to the next
+      operator flag.
     * Two run against a real server
       (`tests/db/test_infra_monitor_queue_snapshot.py`), because the claim is
       about the whole chain and not about one number: a lane 40 minutes into
@@ -118,9 +127,18 @@ functional application milestones of `app.py`.
       exactly as before, the daemon stops the work and the reaper takes the
       item back — so this is a margin and not a weakening of the protocol.
 
-  Three of the six fail on the mutation back to `visibility_seconds / 3`
-  (including the real-server one); the other three are the fail-closed guards
-  and hold either way.
+  Three of the seven fail on the mutation back to `visibility_seconds / 3`
+  (including the real-server one); the other four are the fail-closed guards
+  and hold either way. Re-run on the branch head: the mutation reproduces the
+  finding's own failure in the loop test — beats `[raised, raised, refused]`,
+  `lease lost mid-execution; outcome discarded` — and reverting it takes all
+  three back to green.
+
+- **Housekeeping from the same work.** A checkpoint commit on this branch had
+  swept `coverage`'s own `.coverage` data file into the tree — a per-run,
+  per-checkout binary that no gate reads. It is untracked again and now
+  ignored (`.coverage`, `.coverage.*`), beside `.testmondata` and for the same
+  reason.
 
 ### Fixed — a lane whose lease slipped is still holding its lane (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
 - `control-01:queue` reported `queue_stalled` again (`monitor_finding` #13366),
