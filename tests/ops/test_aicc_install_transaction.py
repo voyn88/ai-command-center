@@ -1123,6 +1123,14 @@ def test_open_uninstall_journal_blocks_every_action_the_guard_names(tmp_path):
         }
     )
 
+    # ...and that every name in it is a string the CLI actually accepts. A
+    # typo'd member would satisfy the drive below (the guard would refuse the
+    # typo happily) while the real action it was meant to name walked through
+    # unguarded.
+    assert module.UNINSTALL_BLOCKED_ACTIONS <= set(module.CLI_ACTIONS), sorted(
+        module.UNINSTALL_BLOCKED_ACTIONS - set(module.CLI_ACTIONS)
+    )
+
     for action in sorted(module.UNINSTALL_BLOCKED_ACTIONS):
         state = tmp_path / action / "state"
         state.mkdir(mode=0o700, parents=True)

@@ -208,6 +208,39 @@ UNINSTALL_JOURNAL_VERSION = 2
 # "install" belongs here for the same reason "apply" and "commit" do: it is the
 # single-shot form of the staged path, and leaving it out would let the one
 # action the refusal message names walk straight past the refusal.
+#: Every action the CLI accepts. Named here rather than inline in `main()` so
+#: a set that claims to guard a subset of them -- `UNINSTALL_BLOCKED_ACTIONS`
+#: below -- can be checked against the surface it is guarding: an action
+#: spelled one way in the guard and another way on the command line is a guard
+#: that refuses a string no operator can type.
+CLI_ACTIONS = (
+    "validate",
+    "prepare",
+    "apply",
+    "commit",
+    "quiesce",
+    "quiesce-worker-only",
+    "validate-control-authority",
+    "revoke-worker-authority",
+    "install",
+    "recover",
+    "recover-boot",
+    "recover-uninstall-boot",
+    "recover-uninstall-safe",
+    "rollback",
+    "uninstall",
+    "uninstall-begin",
+    "uninstall-arm",
+    "uninstall-complete",
+    "uninstall-select-baseline",
+    "uninstall-status",
+    "release-record",
+    "release-verify",
+    "release-publish",
+    "release-reconcile",
+    "release-select",
+    "recovery-anchor-install",
+)
 UNINSTALL_BLOCKED_ACTIONS = frozenset(
     {
         "validate",
@@ -5681,34 +5714,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "action",
-        choices=(
-            "validate",
-            "prepare",
-            "apply",
-            "commit",
-            "quiesce",
-            "quiesce-worker-only",
-            "validate-control-authority",
-            "revoke-worker-authority",
-            "install",
-            "recover",
-            "recover-boot",
-            "recover-uninstall-boot",
-            "recover-uninstall-safe",
-            "rollback",
-            "uninstall",
-            "uninstall-begin",
-            "uninstall-arm",
-            "uninstall-complete",
-            "uninstall-select-baseline",
-            "uninstall-status",
-            "release-record",
-            "release-verify",
-            "release-publish",
-            "release-reconcile",
-            "release-select",
-            "recovery-anchor-install",
-        ),
+        choices=CLI_ACTIONS,
     )
     parser.add_argument("--repo-root", type=Path, default=Path("/opt/aicc"))
     parser.add_argument("--root", type=Path, default=Path("/"))
