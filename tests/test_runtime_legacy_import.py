@@ -4,6 +4,8 @@ store must never touch the real JSONL file and must be idempotent.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from command_center.runtime import db, legacy_import, reports
@@ -70,19 +72,72 @@ def test_import_is_idempotent(tmp_path):
 
 
 def test_import_never_writes_to_the_real_v1_2_runs_jsonl(tmp_path, monkeypatch):
-    """This is the non-destructive guarantee: import must not call anything
-    that appends/rewrites `data/runs.jsonl` — it only ever reads from the
-    list handed to it (or, by default, `agent_runner.load_runs()`, which
-    itself only reads)."""
-    from command_center import storage
+    """This is the non-destructive guarantee: import must not append to,
+    rewrite or truncate `data/runs.jsonl` — it only ever reads from the list
+    handed to it (or, by default, `agent_runner.load_runs()`, which itself
+    only reads).
 
-    def fail_if_called(*args, **kwargs):
-        raise AssertionError("legacy import must never write to data/runs.jsonl")
+    The guarantee is about a *file*, so the file is what this watches. It
+    stands a populated runs log at the path `agent_runner` itself calls the
+    runs file (the autouse `isolated_module_data_constants` fixture has
+    already pointed that constant into an isolated directory, so "the real
+    file" here is real in every way that matters and none that are dangerous)
+    and compares its bytes across both ways in.
+    """
+    from command_center import agent_runner, storage
 
-    monkeypatch.setattr(storage, "append_jsonl", fail_if_called)
+    runs_file = agent_runner.RUNS_FILE
+    for record in (_legacy_run(id="legacy-a"), _legacy_run(id="legacy-b")):
+        storage.append_jsonl(runs_file, record)
+    before = runs_file.read_bytes()
 
-    db_path = tmp_path / "runtime.db"
-    legacy_import.import_legacy_runs(db_path, legacy_runs=[_legacy_run()])
+    def unchanged() -> bool:
+        return runs_file.read_bytes() == before
+
+    # The probe has to be shown failing before its silence means anything. A
+    # byte comparison aimed at a path nothing under test can reach reports
+    # "untouched" for every possible defect, which is how the version of this
+    # test that only patched `storage.append_jsonl` passed: the explicit-list
+    # call it drove never reaches `agent_runner` at all, so the one door it
+    # watched was a door the import never walks through.
+    storage.append_jsonl(runs_file, {"id": "probe-write"})
+    assert not unchanged(), f"the probe cannot see a write to {runs_file}"
+    runs_file.write_bytes(before)
+    assert unchanged()
+
+    # Name any destructive writer aimed at the runs file, rather than letting
+    # a write-then-restore slip past the byte comparison. `ensure_seeded_jsonl`
+    # is deliberately not in this list: its exclusive `open(path, "x")` creates
+    # an absent log and cannot touch an existing one, and `load_runs()` calls
+    # it on the way in.
+    for writer in ("append_jsonl", "atomic_write_text", "atomic_write_json"):
+        real = getattr(storage, writer)
+
+        def guarded(path, *args, _writer=writer, _real=real, **kwargs):
+            if Path(path) == Path(runs_file):
+                pytest.fail(f"legacy import called storage.{_writer} on the runs file")
+            return _real(path, *args, **kwargs)
+
+        monkeypatch.setattr(storage, writer, guarded)
+
+    # Door one: the explicit list, which never consults the file at all.
+    created = legacy_import.import_legacy_runs(
+        tmp_path / "explicit.db", legacy_runs=[_legacy_run()]
+    )
+    assert created
+    assert unchanged(), "explicit-list import mutated the runs file"
+
+    # Door two: the default, which is the one that actually opens the file.
+    # Driving it is the point -- a guarantee about reading without writing is
+    # unevidenced until something reads.
+    created = legacy_import.import_legacy_runs(tmp_path / "default.db")
+    assert sorted(
+        db.get_session(tmp_path / "default.db", db.get_run(tmp_path / "default.db", run_id)["session_id"])[
+            "legacy_run_id"
+        ]
+        for run_id in created
+    ) == ["legacy-a", "legacy-b"], "default import did not read the real runs file"
+    assert unchanged(), "default import mutated the runs file"
 
 
 @pytest.mark.parametrize(
