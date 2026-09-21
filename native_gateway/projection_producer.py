@@ -154,14 +154,27 @@ def _map_lanes(runs: list[dict], now: datetime) -> list[dict]:
     return lanes
 
 
-# Exact rich-status vocabulary -> the projection's task state and the AICC
-# read-model lane it corresponds to. DEFER_TO_USER additionally carries a
-# blocker so the client's attention surface picks it up.
+#: Exact rich-status vocabulary -> the projection's task state and the AICC
+#: read-model lane it corresponds to. DEFER_TO_USER additionally carries a
+#: blocker so the client's attention surface picks it up.
+#:
+#: Must be TOTAL over
+#: ``backlog_client.RICH_STATUSES`` plus ``"UNKNOWN"`` — the lookup below is a
+#: bare subscript, so a status with no entry here is a KeyError that takes the
+#: whole projection build down, not a mislabelled card. Kept total by
+#: ``tests/native_gateway/test_projection_producer.py`` rather than by
+#: remembering to come back here, and deliberately NOT a ``.get`` with a
+#: default: a new status silently bucketed as Backlog is the kind of quiet
+#: wrongness this surface exists to end.
 _RICH_STATE = {
     "UNTRIAGED": ("backlog", "Backlog"),
     "OPEN": ("next", "Next"),
     "NEEDS_REFINEMENT": ("backlog", "Backlog"),
     "SPLIT": ("backlog", "Backlog"),
+    # Triaged and resolved without execution (BO-S1's store vocabulary); it is
+    # not going to a worker, so it reads as Backlog like its non-executable
+    # siblings rather than claiming a Done card the fleet never earned.
+    "DECIDED": ("backlog", "Backlog"),
     "IN_PROGRESS": ("in_progress", "In Progress"),
     "READY_TO_REVIEW": ("review", "Review"),
     "DONE": ("done", "Done"),

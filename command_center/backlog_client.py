@@ -541,23 +541,51 @@ def to_read_model(rec: BacklogRecommendation) -> dict:
     }
 
 
-# --- Rich execution records (section-body task lines) -------------------------
+# --- Rich execution records (execution status) --------------------------------
 #
-# Beyond section 0B's machine `VOYN_RECOMMENDATION` records, the master file's
-# body carries one structured list line per executable task:
-#
-#     - **VOYN-<ID>** | <wave> | <status>[ annotations] | <priority> | ...
-#
-# These lines are where execution STATUS actually lives (`OPEN`,
-# `IN_PROGRESS`, `READY_TO_REVIEW`, `DONE`, ...) — the 0B records carry only
-# the planning status (`PO-Approved`). This parser is the shared, exact-token
-# reader for that surface (machine-fields rule: no substring matching; an
+# Beyond section 0B's machine `VOYN_RECOMMENDATION` records, execution STATUS
+# (`OPEN`, `IN_PROGRESS`, `READY_TO_REVIEW`, `DONE`, ...) lives on its own
+# record surface — the 0B records carry only the coarse planning status
+# (`PO-Approved`/`PO-Review`). This parser is the shared, exact-token reader
+# for that surface (machine-fields rule: no substring matching; an
 # unrecognized status is surfaced as `UNKNOWN`, never guessed and never
 # silently dropped). Read-only, like everything in this module.
+#
+# TWO shapes carry it, for the length of ADR-0011's migration window:
+#
+#   hand-authored   - **VOYN-<ID>** | <wave> | <status>[ annotations] | <priority> | ...
+#   machine-rendered - VOYN_TASK_STATUS | id=... | wave=... | status=... | priority=... | slug=...
+#
+# The second exists because the first cannot be machine-written while the
+# import direction is alive. `backlog_parser._TASK_LINE` (the importer) matches
+# a bold `**VOYN-...**` id followed by `| ` — of which the hand-authored rich
+# shape is a strict SUBSET, so anything `backlog-export` rendered in that shape
+# would be read straight back in as an authored task. There is no variant of
+# the bold-id/pipe shape that satisfies one reader and not the other; the two
+# were built to share that convention on purpose.
+#
+# So the machine surface takes the move `VOYN_RECOMMENDATION` already made for
+# 0B records: a distinct leading marker on a plain (unbolded) list item, which
+# neither `backlog_parser._TASK_LINE` nor `_RECORD_SHAPED` matches at all — it
+# is invisible to the importer, not merely rejected by it (proved end-to-end in
+# `tests/db/test_backlog_export.py`, through the real importer). That keeps
+# ADR-0011's central safety property intact — the two directions still share no
+# line shape — while letting the exporter state execution status exactly
+# instead of collapsing it to approved/not-approved.
 
 #: The exact execution-status vocabulary. Annotations after the token (e.g.
 #: "OPEN (сверено ...)") are permitted and ignored; the token itself must
 #: match exactly.
+#:
+#: Deliberately the SAME set as the store's own ``backlog_parser.STATUSES``.
+#: It used to be that set minus ``DECIDED``, which was harmless while this
+#: surface was only ever hand-authored — a human writing ``DECIDED`` on a body
+#: line got ``UNKNOWN`` and nobody noticed. Once ``backlog-export`` renders
+#: this surface FROM ``backlog_task``, a divergence here is a status the store
+#: holds and every rich-record reader silently mislabels: a ``DECIDED`` row
+#: would arrive as ``UNKNOWN`` and land in the Backlog lane with no trace that
+#: a real, known status was thrown away. The two vocabularies now have to
+#: agree, and ``tests/test_backlog_client.py`` pins that they do.
 RICH_STATUSES: frozenset[str] = frozenset(
     {
         "UNTRIAGED",
@@ -568,6 +596,7 @@ RICH_STATUSES: frozenset[str] = frozenset(
         "DEFER_TO_USER",
         "NEEDS_REFINEMENT",
         "SPLIT",
+        "DECIDED",
     }
 )
 
@@ -576,6 +605,19 @@ _RICH_LINE = re.compile(
     r"(?P<status>[^|]+?)\s*\|\s*(?P<priority>[^|]+?)\s*\|",
     re.MULTILINE,
 )
+
+#: Leading token of a machine-rendered execution-status record. Distinct from
+#: ``RECOMMENDATION_MARKER`` because the two carry different vocabularies on
+#: purpose (execution vs planning status) and a reader must never take one for
+#: the other; distinct from the bold ``**VOYN-...**`` shape because that one
+#: belongs to the importer (see the section comment above).
+TASK_STATUS_MARKER = "VOYN_TASK_STATUS"
+
+#: The fields of a ``VOYN_TASK_STATUS`` record, in order. Same contract style
+#: as ``RECOMMENDATION_FIELDS``: exactly these keys, in exactly this order,
+#: ``FIELD_SEP``-separated — anything else is not a record this module
+#: understands, and is skipped rather than partially accepted.
+TASK_STATUS_FIELDS: tuple[str, ...] = ("id", "wave", "status", "priority", "slug")
 
 
 @dataclass(frozen=True)
@@ -602,7 +644,65 @@ class RichRecord:
 _RICH_SLUG = re.compile(r"`([^`]+)`")
 
 
-def parse_rich_records(text: str) -> list[RichRecord]:
+def render_task_status(record: RichRecord) -> str:
+    """One machine-rendered execution-status line.
+
+    Lives here, beside the parser that reads it, for the same reason
+    ``render_generated_stamp`` does: ``backlog_export`` renders THROUGH this
+    function rather than formatting the line itself, so the writer cannot drift
+    into a shape this module no longer reads.
+
+    Values are not escaped here. The exporter is the only caller and it cleans
+    every value first (``backlog_export._clean``: no ``|``, no line breaks) —
+    which is where cleaning belongs, since it is the store's free text that
+    needs it, not this format.
+    """
+    values = {
+        "id": record.record_id,
+        "wave": record.wave,
+        "status": record.status,
+        "priority": record.priority,
+        "slug": record.slug,
+    }
+    tokens = [TASK_STATUS_MARKER] + [f"{key}={values[key]}" for key in TASK_STATUS_FIELDS]
+    return "- " + FIELD_SEP.join(tokens)
+
+
+def _parse_task_status_line(stripped: str) -> RichRecord | None:
+    """One ``- VOYN_TASK_STATUS | ...`` line, or ``None`` if it is not one.
+
+    Malformed lines return ``None`` (skipped) rather than raising: like every
+    other reader in this module, a damaged file degrades the read instead of
+    taking the caller's page down. Unlike the 0B records there is no error
+    channel to report them on — ``parse_rich_records`` returns a bare list —
+    so a record that cannot be read is simply absent, exactly as it was before
+    this shape existed.
+    """
+    body = stripped[1:].lstrip()
+    tokens = body.split(FIELD_SEP)
+    if tokens[0] != TASK_STATUS_MARKER:
+        return None
+    fields = tokens[1:]
+    if len(fields) != len(TASK_STATUS_FIELDS):
+        return None
+    values: dict[str, str] = {}
+    for expected_key, token in zip(TASK_STATUS_FIELDS, fields, strict=True):
+        key, sep, value = token.partition("=")
+        if not sep or key != expected_key:
+            return None
+        values[key] = value
+    status = values["status"]
+    return RichRecord(
+        record_id=values["id"],
+        wave=values["wave"],
+        status=status if status in RICH_STATUSES else "UNKNOWN",
+        priority=values["priority"],
+        slug=values["slug"],
+    )
+
+
+def _parse_authored_rich_records(text: str) -> list[RichRecord]:
+    """The hand-authored bold-line surface: ``- **VOYN-<ID>** | ...``."""
     records: list[RichRecord] = []
     for match in _RICH_LINE.finditer(text):
         status_raw = match.group("status").strip().strip("*")
@@ -620,6 +720,79 @@ def parse_rich_records(text: str) -> list[RichRecord]:
                 slug=slug_match.group(1) if slug_match else "",
             )
         )
+    return records
+
+
+def _parse_machine_rich_records(text: str) -> dict[str, RichRecord]:
+    """The machine-rendered surface, keyed by id, first occurrence winning.
+
+    First-wins matches ``backlog_parser``'s own duplicate-id rule, so the two
+    sides of the bridge resolve a repeated id the same way. A tick's own output
+    never repeats one (the store's ``task_id`` is unique), so this only governs
+    a file that was edited after rendering.
+
+    Indentation is ignored, as it is for the 0B records whose marker
+    convention this shape copies — and unlike the bold surface, where an
+    indented line is deliberately skipped because it belongs to a parent
+    record's evidence trail. The exporter never indents, so the difference
+    only shows in a hand-mixed file, and finding the record there beats
+    dropping it silently.
+    """
+    records: dict[str, RichRecord] = {}
+    for raw in text.splitlines():
+        stripped = raw.strip()
+        if not stripped.startswith("- " + TASK_STATUS_MARKER):
+            continue
+        parsed = _parse_task_status_line(stripped)
+        if parsed is not None:
+            records.setdefault(parsed.record_id, parsed)
+    return records
+
+
+def parse_rich_records(text: str) -> list[RichRecord]:
+    """Every execution-status record in ``text``, from both surfaces.
+
+    **Precedence: a machine-rendered record wins over a hand-authored one for
+    the same id.** In production the two never meet — ``backlog-import`` reads
+    the owner's authored file and ``backlog-export`` writes the rendering, and
+    ADR-0011 keeps those two paths pointed at different files — so this rule
+    governs a file that mixes them, which is possible only during the migration
+    window (an owner pasting rendered lines into their own file, a
+    part-converted document, a test). It resolves the way the whole task's
+    invariant does: ``backlog_task`` is canonical and a ``VOYN_TASK_STATUS``
+    line is a direct reading of it, while a bold line is owner-typed *input*
+    that the store may already have moved past. Preferring the authored line
+    would let a stale hand edit override live execution state — the exact
+    silent staleness BO-S4 exists to end.
+
+    A file with no machine lines — every hand-authored backlog, which is still
+    most of them — is returned exactly as the bold-line parser read it,
+    duplicate ids and all. The override path is the only behaviour this shape
+    added; it does not otherwise re-interpret the surface that predates it.
+
+    An overriding record keeps the position where its id first appeared, so a
+    reader rendering this list in document order does not watch tasks jump
+    around depending on which surface described them. Machine records for ids
+    with no bold line at all follow, in file order.
+    """
+    authored = _parse_authored_rich_records(text)
+    machine = _parse_machine_rich_records(text)
+    if not machine:
+        return authored
+
+    records: list[RichRecord] = []
+    overridden: set[str] = set()
+    for record in authored:
+        override = machine.get(record.record_id)
+        if override is None:
+            records.append(record)
+        elif record.record_id not in overridden:
+            records.append(override)
+            overridden.add(record.record_id)
+    for record_id, record in machine.items():
+        if record_id not in overridden:
+            records.append(record)
+            overridden.add(record_id)
     return records
 
 

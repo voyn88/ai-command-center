@@ -521,3 +521,142 @@ def test_rich_records_on_the_real_master_shape(tmp_path):
     )
     statuses = {r.record_id: r.status for r in load_rich_records(master)}
     assert statuses == {"VOYN-W0-A": "IN_PROGRESS", "VOYN-W0-B": "READY_TO_REVIEW"}
+
+
+# --- The machine-rendered execution-status surface (BO-S4) --------------------
+
+
+def test_machine_status_records_round_trip_through_their_own_renderer():
+    """`backlog_export` writes this surface THROUGH `render_task_status`, so
+    the renderer and the reader are the one contract that must not drift.
+    Pins the field set, the order, and that a rendered record reads back
+    identical — a field renamed on either side breaks here, not in the
+    console."""
+    record = bc.RichRecord(
+        record_id="VOYN-W0-EXAMPLE",
+        wave="Wave 0",
+        status="IN_PROGRESS",
+        priority="P0",
+        slug="example-slug",
+    )
+    line = bc.render_task_status(record)
+
+    tokens = line[2:].split(bc.FIELD_SEP)
+    assert tokens[0] == bc.TASK_STATUS_MARKER
+    assert [t.partition("=")[0] for t in tokens[1:]] == list(bc.TASK_STATUS_FIELDS)
+    assert bc.parse_rich_records(line) == [record]
+
+
+def test_the_machine_surface_shares_no_line_shape_with_the_authored_one():
+    """ADR-0011's safety property, from this side: the rendered line must be
+    invisible to the importer's patterns, which is only true while it stays
+    an UNBOLDED list item with its own marker. A reader that started emitting
+    `- **VOYN-...** |` would be re-importable as an authored task."""
+    from command_center.db.backlog_parser import _RECORD_SHAPED, _TASK_LINE
+
+    line = bc.render_task_status(
+        bc.RichRecord("VOYN-W0-EXAMPLE", "Wave 0", "DONE", "P0", "slug")
+    )
+    assert _TASK_LINE.match(line) is None
+    assert _RECORD_SHAPED.match(line) is None
+    # ...and it is not a 0B record either: the two machine surfaces carry
+    # different vocabularies and neither reader may claim the other's lines.
+    assert bc.parse_recommendations(line).records == []
+    assert bc.parse_recommendations(line).errors == []
+
+
+def test_the_rich_vocabulary_matches_the_store_exactly():
+    """`RICH_STATUSES` and the store's `backlog_parser.STATUSES` have to be
+    the same set now that a rendered record carries a column value straight
+    from `backlog_task`.
+
+    While this surface was only hand-authored, a divergence was harmless — a
+    human typing a status outside the set got UNKNOWN and noticed. Once
+    `backlog-export` renders it, a status the store holds but this set omits
+    is silently relabelled UNKNOWN and dropped into the Backlog lane, with
+    nothing anywhere saying a known status was thrown away."""
+    from command_center.db.backlog_parser import STATUSES
+
+    assert bc.RICH_STATUSES == STATUSES
+
+
+def test_a_machine_record_overrides_a_stale_authored_line_for_the_same_id():
+    """The migration-window precedence rule. The store is canonical and a
+    `VOYN_TASK_STATUS` line is a direct reading of it; a bold line is
+    owner-typed input the store may have moved past. Preferring the authored
+    line would let a stale hand edit mask live execution state — the exact
+    silent staleness BO-S4 exists to end."""
+    text = (
+        "- **VOYN-W0-A** | Wave 0 | OPEN | P0 | X | `a` | t\n"
+        "- **VOYN-W0-B** | Wave 0 | OPEN | P1 | X | `b` | t\n"
+        "\n"
+        "- VOYN_TASK_STATUS | id=VOYN-W0-A | wave=Wave 0 | status=DONE"
+        " | priority=P0 | slug=a\n"
+        "- VOYN_TASK_STATUS | id=VOYN-W0-C | wave=Wave 0 | status=IN_PROGRESS"
+        " | priority=P2 | slug=c\n"
+    )
+    records = bc.parse_rich_records(text)
+
+    # The overridden record keeps A's original position, so a reader
+    # rendering in document order does not watch tasks jump lanes-and-places.
+    assert [r.record_id for r in records] == ["VOYN-W0-A", "VOYN-W0-B", "VOYN-W0-C"]
+    by_id = {r.record_id: r for r in records}
+    assert by_id["VOYN-W0-A"].status == "DONE"
+    # An id only the authored surface knows is untouched...
+    assert by_id["VOYN-W0-B"].status == "OPEN"
+    # ...and one only the machine surface knows is still present.
+    assert by_id["VOYN-W0-C"].status == "IN_PROGRESS"
+
+
+def test_a_file_with_no_machine_records_reads_exactly_as_before():
+    """The override path is the only behaviour this shape added. Every
+    hand-authored backlog — still most of them — must come back from the
+    bold-line parser untouched, duplicate ids and all."""
+    text = (
+        "- **VOYN-W0-A** | Wave 0 | OPEN | P0 | X | `a` | t\n"
+        "- **VOYN-W0-A** | Wave 0 | DONE | P0 | X | `a-again` | t\n"
+    )
+    records = bc.parse_rich_records(text)
+    assert [(r.record_id, r.status) for r in records] == [
+        ("VOYN-W0-A", "OPEN"),
+        ("VOYN-W0-A", "DONE"),
+    ]
+
+
+def test_damaged_machine_records_are_skipped_not_half_read():
+    """Same contract as the 0B records: exactly these keys in exactly this
+    order, or it is not a record this module understands. A partially
+    accepted line would put a wave in a status field and mislabel a card.
+
+    Skipped rather than raised, like every read in this module — a damaged
+    file degrades the read instead of taking the owner's page down."""
+    good = (
+        "- VOYN_TASK_STATUS | id=VOYN-W0-OK | wave=Wave 0 | status=DONE"
+        " | priority=P0 | slug=ok\n"
+    )
+    damaged = (
+        # a field short
+        "- VOYN_TASK_STATUS | id=VOYN-W0-SHORT | wave=Wave 0 | status=DONE"
+        " | priority=P0\n"
+        # keys out of order
+        "- VOYN_TASK_STATUS | wave=Wave 0 | id=VOYN-W0-SWAP | status=DONE"
+        " | priority=P0 | slug=s\n"
+        # not key=value
+        "- VOYN_TASK_STATUS | VOYN-W0-BARE | Wave 0 | DONE | P0 | s\n"
+        # the marker as prose, not a list item
+        "VOYN_TASK_STATUS | id=VOYN-W0-PROSE | wave=Wave 0 | status=DONE"
+        " | priority=P0 | slug=s\n"
+    )
+    records = bc.parse_rich_records(good + damaged)
+    assert [r.record_id for r in records] == ["VOYN-W0-OK"]
+
+
+def test_an_unknown_machine_status_is_surfaced_never_guessed():
+    """A status outside the vocabulary reads as UNKNOWN on this surface for
+    the same reason it does on the authored one: the machine-fields rule
+    forbids guessing, and UNKNOWN is a value consumers already handle."""
+    line = (
+        "- VOYN_TASK_STATUS | id=VOYN-W0-X | wave=Wave 0 | status=TRIAGE_LATER"
+        " | priority=P0 | slug=x\n"
+    )
+    assert bc.parse_rich_records(line)[0].status == "UNKNOWN"
