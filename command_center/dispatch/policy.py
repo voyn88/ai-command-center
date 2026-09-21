@@ -19,6 +19,12 @@ The hard guarantees, enforced structurally here:
    a simulated spend figure: a faked number can be silently absorbed by a
    zero/unset daily cap or by a free executor, which would make "no cost
    data" fail *open* instead of closed.
+1c. **With no ceiling, there is nothing to measure.** When
+   `max_daily_spend_usd <= 0` the caller may pass `daily_spend_usd=None` with
+   `budget_unknown=False`: no ceiling means no gate, so the trailing-24h spend
+   is never read and the plan reports it as `not_measured` rather than as a
+   `0.0` nobody measured. Passing `None` *with* a live ceiling and no
+   `budget_unknown` is a caller bug and raises.
 2. **Budget is never exceeded.** An executor is only assigned when the
    *projected* cumulative spend (the trailing-24h spend already incurred plus
    every assignment made so far in this plan plus this one) stays at or under
@@ -55,6 +61,7 @@ from command_center.dispatch.models import (
     DEFER_PROJECT_BUDGET,
     DEFER_TAIL_RISK,
     SPEND_MEASUREMENT_ACTUAL,
+    SPEND_MEASUREMENT_NOT_MEASURED,
     SPEND_MEASUREMENT_UNAVAILABLE,
     AlternativeCandidate,
     DispatchDecision,
@@ -160,21 +167,33 @@ def plan_dispatch(
             # `projected_spend_usd` mirrors it exactly, so an unmeasured spend
             # never sprouts a concrete number one field over.
             projected_spend_usd=daily_spend_usd,
-            spend_measurement=(
-                SPEND_MEASUREMENT_UNAVAILABLE
-                if budget_unknown
-                else SPEND_MEASUREMENT_ACTUAL
-            ),
+            spend_measurement=_spend_measurement(daily_spend_usd, budget_unknown),
         )
 
-    # `budget_unknown` was False to reach here, so the caller supplied a real
-    # trailing-24h figure rather than the `None` it sends when the read fails.
-    assert daily_spend_usd is not None
+    # `budget_unknown` was False to reach here, so the spend is either a real
+    # trailing-24h figure or was deliberately never measured — and the latter
+    # is only legitimate with no ceiling to enforce (`max_daily_spend_usd <=
+    # 0`). A caller that has a ceiling and no figure must say `budget_unknown`
+    # and get the hard gate above; silently planning against an absent spend
+    # under a live ceiling is exactly the fail-open this engine exists to make
+    # impossible, so it is refused loudly rather than repaired quietly.
+    measured = daily_spend_usd is not None
+    if not measured and max_daily_spend_usd > 0:
+        raise ValueError(
+            "plan_dispatch: daily_spend_usd is None under a ceiling of "
+            f"{max_daily_spend_usd} — pass budget_unknown=True to gate on an "
+            "unreadable spend"
+        )
 
     # (3) SLA/priority order.
     ordered = sorted(tasks, key=lambda t: _task_sort_key(t, policy))
 
-    projected = daily_spend_usd
+    # With no ceiling the base is never compared against anything (see
+    # `_budget_block`: the daily check is skipped when `max_daily_spend_usd <=
+    # 0`), so a 0.0 base for an unmeasured spend cannot influence a decision.
+    # It stays strictly internal — the *reported* `projected_spend_usd` below
+    # is `None`, never this stand-in.
+    projected = daily_spend_usd if daily_spend_usd is not None else 0.0
     agent_spend: dict[str, float] = {}
     agent_assigned: dict[str, int] = {}
     project_spend: dict[str, float] = {}
@@ -307,9 +326,19 @@ def plan_dispatch(
         kill_switch_engaged=False,
         daily_spend_usd=daily_spend_usd,
         max_daily_spend_usd=max_daily_spend_usd,
-        projected_spend_usd=projected,
-        spend_measurement=SPEND_MEASUREMENT_ACTUAL,
+        projected_spend_usd=projected if measured else None,
+        spend_measurement=_spend_measurement(daily_spend_usd, False),
     )
+
+
+def _spend_measurement(daily_spend_usd: float | None, budget_unknown: bool):
+    """Provenance of the spend figures, stated rather than inferred: a read
+    that failed, a read that was never taken (no ceiling), or a real one."""
+    if budget_unknown:
+        return SPEND_MEASUREMENT_UNAVAILABLE
+    if daily_spend_usd is None:
+        return SPEND_MEASUREMENT_NOT_MEASURED
+    return SPEND_MEASUREMENT_ACTUAL
 
 
 def _budget_block(
