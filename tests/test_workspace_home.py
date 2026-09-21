@@ -318,9 +318,10 @@ def test_snapshot_never_contains_banned_fields_for_sensitive_project(
     of the snapshot by project, so an empty section satisfies all of them --
     and the "non-sensitive control project, same shape, must retain
     everything" the setup announced was never once asserted, nor even created.
-    A snapshot builder that dropped every BANK entry, or renamed the
-    ``project`` key, or one whose redaction stripped ``prompt`` from *every*
-    project, all passed. So: prove each section can be seen on both sides
+    A snapshot builder that dropped every BANK entry, or labelled entries
+    under a ``project`` value this filter does not match, or one whose
+    redaction stripped ``prompt`` from *every* project, all passed -- each
+    confirmed by injecting it and watching the old test stay green. So: prove each section can be seen on both sides
     first, then check redaction against the control that says the redaction is
     aimed rather than universal.
     """

@@ -202,12 +202,6 @@ class FileState:
 
 
 UNINSTALL_JOURNAL_VERSION = 2
-# Every CLI action that mutates the installed tree, the systemd layer or the
-# authority groups. While an uninstall journal is open the baseline these
-# actions would write against is mid-teardown, so each of them is refused.
-# "install" belongs here for the same reason "apply" and "commit" do: it is the
-# single-shot form of the staged path, and leaving it out would let the one
-# action the refusal message names walk straight past the refusal.
 #: Every action the CLI accepts. Named here rather than inline in `main()` so
 #: a set that claims to guard a subset of them -- `UNINSTALL_BLOCKED_ACTIONS`
 #: below -- can be checked against the surface it is guarding: an action
@@ -241,6 +235,19 @@ CLI_ACTIONS = (
     "release-select",
     "recovery-anchor-install",
 )
+#: Every step of the install path: the staged sequence (`validate`, `prepare`,
+#: `apply`, `commit`), its single-shot form (`install`), and the two
+#: control-profile authority steps that run between prepare and apply. While
+#: an uninstall journal is open the baseline this path builds against is
+#: mid-teardown, so the path is refused at its first step rather than at the
+#: first one that happens to write. `validate` is in here for that reason and
+#: not because it mutates anything -- it does not; it is where the refusal is
+#: cheapest to deliver. `recovery-anchor-install` has its own, separate guard
+#: at the top of `_dispatch`; the recover/rollback/uninstall/release actions
+#: are deliberately absent, because those are how an open journal gets closed.
+#: "install" belongs here for the same reason "apply" and "commit" do, and
+#: leaving it out (as head 0f331fbb did) let the one action the refusal message
+#: names walk straight past the refusal.
 UNINSTALL_BLOCKED_ACTIONS = frozenset(
     {
         "validate",

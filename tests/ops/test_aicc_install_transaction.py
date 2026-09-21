@@ -1106,10 +1106,10 @@ def test_open_uninstall_journal_blocks_every_action_the_guard_names(tmp_path):
     module = _module()
 
     # The refusal message says "blocks installation", so the set it guards has
-    # to contain the action actually called "install" -- and every other action
-    # that writes the tree, the units or the authority groups. Pinning the
-    # membership here means dropping one is a test failure, not a silent hole:
-    # a test that cannot see a command cannot see its divergence.
+    # to contain the action actually called "install" -- and every other step
+    # of the install path. Pinning the membership here means dropping one is a
+    # test failure, not a silent hole: a test that cannot see a command cannot
+    # see its divergence.
     assert module.UNINSTALL_BLOCKED_ACTIONS == frozenset(
         {
             "validate",
