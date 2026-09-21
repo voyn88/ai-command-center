@@ -133,8 +133,13 @@ class QueueSnapshot:
     #: How long the oldest lapsed claim has been leaseless. ``None`` exactly
     #: when ``lapsed_claims`` is 0.
     lapsed_claim_age_seconds: float | None = None
-    #: Claims under a live, renewing lease -- lanes doing their job. Weighed
-    #: against ``--claim-capacity`` to tell queued work from stalled work.
+    #: Claims under a live, renewing lease -- lanes doing their job.
+    #:
+    #: NOT what ``--claim-capacity`` is weighed against: that is ``claimed``,
+    #: because capacity asks which lanes are HOLDING an item and a lane whose
+    #: lease slipped is still holding one (monitor_finding #13366; see
+    #: ``evaluate``). This is the narrower fact -- how much of that holding
+    #: is provably alive -- and it is what ``live_claim_age_seconds`` ages.
     attended_claims: int = 0
     #: Age of the oldest claim under a live lease. Bounded by
     #: ``--max-claim-seconds``, never by ``--max-stalled-seconds``.
@@ -259,8 +264,8 @@ def discover_worker_units() -> dict[str, str]:
 #     could keep.
 #   * Worse, and in the fail-OPEN direction a fail-closed monitor must never
 #     have: claims on another queue counted toward THIS queue's
-#     `--claim-capacity`. Two attended claims anywhere in the table made
-#     `attended_claims == 2`, `spare_capacity` false, and a genuine hours-old
+#     `--claim-capacity`. Two claims anywhere in the table filled this
+#     queue's capacity, made `spare_capacity` false, and a genuine hours-old
 #     stall on `execution` was excused as backpressure behind a fleet that was
 #     not working on it at all.
 _QUEUE_SNAPSHOT_SQL = """
@@ -481,7 +486,57 @@ def evaluate(
         # convention `backlog_dispatch` applies to its own cap: a capacity of
         # 0 would otherwise mean "no lane can ever claim", which would excuse
         # every unclaimed item forever.
-        spare_capacity = queue.attended_claims < max(claim_capacity, 1)
+        #
+        # OCCUPANCY, NOT ATTENDANCE, AND THE DIFFERENCE IS A LIVE FALSE
+        # POSITIVE (monitor_finding #13366). This was
+        # `queue.attended_claims`, which asks "how many lanes hold a LIVE
+        # LEASE" -- but the question capacity has to answer is "how many
+        # lanes are HOLDING AN ITEM", and a lane whose lease slipped is still
+        # holding one. `queue_claim` will not hand it a second: the item stays
+        # `claimed` until the reaper takes it back, and until then the lane is
+        # running its handler with nowhere to put another attempt.
+        #
+        # A lapsed lease is the ordinary way a healthy long attempt looks for
+        # a few seconds. The beat runs at `visibility_seconds / 3` (100s
+        # against a 300s window), so ANY TWO CONSECUTIVE FAILED BEATS lapse
+        # it -- a database blip, or the `voyn-aicc-pgtunnel.service` restart
+        # the credential rotation cycles on its own schedule, which 0029
+        # names as the moment this fleet meets ("the fleet coming BACK from a
+        # stall ... that cost two beats"). `aicc-queue-reaper.timer` clears
+        # it on the next minute; the probe samples every two.
+        #
+        # MEASURED against a real PostgreSQL 16 server -- two lanes 40
+        # minutes into legitimate attempts, the two surplus dispatched items
+        # ready and due behind them, and lane B's lease 30 seconds past its
+        # deadline while lane B is still running:
+        #
+        #     both leases live   attended=2 claimed=2  -> ok
+        #     B's lease slipped  attended=1 claimed=2  -> queue_stalled
+        #
+        # Nothing about the fleet changed between those two lines. The lapse
+        # itself is 30s, nowhere near the window; the whole verdict is the
+        # 2400s due-ready clock, compared against 900s on the strength of a
+        # free lane that does not exist.
+        #
+        # THE FLEET CLOCK CANNOT CATCH THIS ONE, which is why it survived the
+        # bound that was added for exactly this shape. `fleet_idle_seconds`
+        # is 2400 here PRECISELY BECAUSE both lanes have been busy the whole
+        # time: no attempt changed state, which is what two healthy long runs
+        # look like. The bound below excuses the instant a lane frees; it has
+        # nothing to say about a fleet that never freed one.
+        #
+        # WHAT THIS GIVES UP, AND WHY IT IS ALREADY COVERED. A lapsed claim
+        # can also mean the lane is GONE, in which case a lane really is free
+        # and this excuses due work for as long as the claim sits unreaped.
+        # That case is not lost, because it is measured twice over:
+        # `lapsed_claim_age_seconds` is appended below UNCONDITIONALLY -- not
+        # gated by capacity, not bounded by the fleet clock -- and fires at
+        # this same window; and the reaper moves the item out of `claimed`
+        # within a minute, after which the count drops, spare capacity
+        # reappears and the due-ready clock runs again on its own. Nothing
+        # here can outlast the reaper, and a reaper that stops is the one
+        # thing the unconditional clock is for.
+        spare_capacity = queue.claimed < max(claim_capacity, 1)
         # HOW LONG THE DUE READY WORK HAS ACTUALLY BEEN IGNORED, which is not
         # how long it has been due. The capacity test above gates the
         # COMPARISON but not the CLOCK, and the queue is designed to hold work

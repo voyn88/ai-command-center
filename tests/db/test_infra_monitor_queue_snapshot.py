@@ -647,3 +647,175 @@ def test_another_queues_attempts_do_not_wind_this_queues_fleet_clock(monitor) ->
         prometheus_ready=True, claim_capacity=2,
     )
     assert "queue_stalled" in report.failures
+
+
+def test_a_lane_whose_lease_slipped_is_still_holding_its_lane(monitor) -> None:
+    """THE REGRESSION (monitor_finding #13366), against the server that
+    produces the shape.
+
+    Capacity asks "was a lane free to take this?". It used to be answered
+    with `attended_claims` -- how many lanes hold a LIVE lease -- and that is
+    a different question. A lane whose lease slipped is still HOLDING its
+    item: the row stays `claimed` until the reaper takes it back, and
+    `queue_claim` will not hand that lane a second one meanwhile.
+
+    So here: two lanes 40 minutes into legitimate attempts
+    (`voyn-aicc-worker@.service` allows one 3660s), the surplus dispatched
+    item ready and due behind them the whole time -- `PlanLimits.wip_limit` 4
+    against 2 lanes, the shape the queue is DESIGNED to hold. Then lane two's
+    lease lapses by 30 seconds, which is what two consecutive failed beats
+    look like: the beat runs at `visibility_seconds / 3`, and 0029 names the
+    occasion this fleet meets it on -- a database blip, or the
+    `voyn-aicc-pgtunnel.service` restart the credential rotation cycles.
+
+    Nothing about the fleet changed. No lane is free, no lane stopped, and
+    `aicc-queue-reaper.timer` will clear the lapse on its next minute. The
+    probe samples every two, so the old reading was not a race that might
+    happen: it was `queue_stalled` against a fleet at full stretch.
+
+    AND THE FLEET CLOCK CANNOT CATCH THIS ONE, which is why it outlived the
+    bound added for exactly this family (#2471, the test above). `fleet_idle`
+    is an hour here PRECISELY BECAUSE both lanes have been busy that hour --
+    no attempt changed state, which is what two healthy long runs look like.
+    That bound excuses the instant a lane frees; it has nothing to say about
+    a fleet that never freed one."""
+    measure, app, worker, age = monitor
+    claims = []
+    for key in ("lane-one", "lane-two"):
+        app.enqueue(QUEUE, idempotency_key=key, payload={"kind": "agent_run"})
+        claims.append(_claim(worker))
+    app.enqueue(QUEUE, idempotency_key="queued", payload={"kind": "agent_run"})
+    age(
+        "UPDATE work_item SET updated_at = now() - interval '40 minutes', "
+        "available_at = now() - interval '40 minutes' WHERE state = 'ready'"
+    )
+    age("UPDATE work_attempt SET created_at = now() - interval '40 minutes'")
+
+    full_fleet = measure()
+    assert (full_fleet.claimed, full_fleet.attended_claims) == (2, 2)
+    assert infra_monitor.evaluate(
+        {}, full_fleet, minimum_active_workers=0, max_stalled_seconds=MAX_STALLED,
+        prometheus_ready=True, claim_capacity=2,
+    ).ok
+
+    # Two beats missed. The lane is alive and still running its handler; only
+    # the lease is late, and only by 30 seconds.
+    age(
+        "UPDATE work_attempt SET visible_until = now() - interval '30 seconds' "
+        "WHERE attempt_id = %s",
+        (claims[1].attempt_id,),
+    )
+
+    slipped = measure()
+    # The fleet still holds both items -- which is the whole point.
+    assert slipped.claimed == 2
+    assert (slipped.attended_claims, slipped.lapsed_claims) == (1, 1)
+    # The lapse itself is nowhere near the window; it is not what the old
+    # verdict was made of.
+    assert slipped.lapsed_claim_age_seconds < 120
+    # The due item's own clock is unchanged and far past the window, and the
+    # fleet clock is too -- because both lanes have been busy the whole time.
+    assert slipped.ready_due == 1
+    assert slipped.ready_due_age_seconds > MAX_STALLED
+    assert slipped.fleet_idle_seconds > MAX_STALLED
+
+    report = infra_monitor.evaluate(
+        {}, slipped, minimum_active_workers=0, max_stalled_seconds=MAX_STALLED,
+        prometheus_ready=True, claim_capacity=2,
+    )
+    assert report.ok, report.failures
+
+
+def test_a_lapse_the_reaper_never_clears_is_still_a_stall(monitor) -> None:
+    """The fail-closed half, and the reason the fix above gives nothing away.
+
+    A lapsed claim can also mean the LANE IS GONE, in which case a lane
+    really is free. Weighing capacity by occupancy excuses the due work for
+    as long as that claim sits unreaped -- and nothing is lost, because
+    `lapsed_claim_age_seconds` is weighed UNCONDITIONALLY: not gated by
+    capacity, not bounded by the fleet clock, and fired at this same window.
+
+    Same full-fleet shape as above, so the capacity test is excusing the due
+    item exactly as it did there. The only change is that the lapse is now
+    older than the stall window, which means `aicc-queue-reaper.timer` -- a
+    minute's cadence -- has missed fifteen ticks."""
+    measure, app, worker, age = monitor
+    claims = []
+    for key in ("lane-one", "lane-two"):
+        app.enqueue(QUEUE, idempotency_key=key, payload={"kind": "agent_run"})
+        claims.append(_claim(worker))
+    app.enqueue(QUEUE, idempotency_key="queued", payload={"kind": "agent_run"})
+    age(
+        "UPDATE work_item SET updated_at = now() - interval '40 minutes', "
+        "available_at = now() - interval '40 minutes' WHERE state = 'ready'"
+    )
+    age("UPDATE work_attempt SET created_at = now() - interval '40 minutes'")
+    age(
+        "UPDATE work_attempt SET visible_until = now() - interval '20 minutes' "
+        "WHERE attempt_id = %s",
+        (claims[1].attempt_id,),
+    )
+
+    snapshot = measure()
+    # The fleet is still holding two items, so capacity excuses the due one.
+    assert snapshot.claimed == 2
+    assert snapshot.lapsed_claim_age_seconds > MAX_STALLED
+
+    report = infra_monitor.evaluate(
+        {}, snapshot, minimum_active_workers=0, max_stalled_seconds=MAX_STALLED,
+        prometheus_ready=True, claim_capacity=2,
+    )
+    assert "queue_stalled" in report.failures
+
+
+def test_the_reaper_hands_the_lane_back_and_the_due_clock_resumes(monitor) -> None:
+    """The other exit, and the one that bounds how long the fix can excuse
+    anything: the reaper moves the item OUT of `claimed`, so the occupancy
+    count drops on its own and the due-ready clock is live again against a
+    fleet that has been standing still.
+
+    This is what makes "a lapsed claim occupies a lane" safe to assume. It
+    cannot outlast `aicc-queue-reaper.timer`, and a reaper that stops is
+    precisely what the unconditional clock above measures."""
+    measure, app, worker, age = monitor
+    from command_center.db.work_queue_admin import WorkQueueAdmin
+
+    claims = []
+    for key in ("lane-one", "lane-two"):
+        app.enqueue(QUEUE, idempotency_key=key, payload={"kind": "agent_run"})
+        claims.append(_claim(worker))
+    app.enqueue(QUEUE, idempotency_key="queued", payload={"kind": "agent_run"})
+    age(
+        "UPDATE work_item SET updated_at = now() - interval '40 minutes', "
+        "available_at = now() - interval '40 minutes' WHERE state = 'ready'"
+    )
+    age("UPDATE work_attempt SET created_at = now() - interval '40 minutes'")
+    # The whole fleet is gone: both leases lapsed, inside the stall window so
+    # the unconditional clock is not what decides this one.
+    age("UPDATE work_attempt SET visible_until = now() - interval '30 seconds'")
+
+    held = measure()
+    assert held.claimed == 2
+    assert infra_monitor.evaluate(
+        {}, held, minimum_active_workers=0, max_stalled_seconds=MAX_STALLED,
+        prometheus_ready=True, claim_capacity=2,
+    ).ok
+
+    # The reaper's next tick. It runs as `aicc_app`, which is the identity
+    # `aicc-queue-reaper.service` carries.
+    assert WorkQueueAdmin(app._factory).reap() == 2
+
+    # The requeued items are not due yet (`_queue_backoff`), but the one that
+    # was waiting behind the fleet still is -- and now nothing is holding a
+    # lane, so nothing excuses it.
+    age("UPDATE work_attempt SET updated_at = now() - interval '40 minutes'")
+    recovered = measure()
+    assert recovered.claimed == 0
+    assert recovered.ready_due >= 1
+    assert recovered.fleet_idle_seconds > MAX_STALLED
+
+    report = infra_monitor.evaluate(
+        {}, recovered, minimum_active_workers=0, max_stalled_seconds=MAX_STALLED,
+        prometheus_ready=True, claim_capacity=2,
+    )
+    assert "queue_stalled" in report.failures

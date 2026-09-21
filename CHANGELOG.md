@@ -8,6 +8,107 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Fixed — a lane whose lease slipped is still holding its lane (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
+- `control-01:queue` reported `queue_stalled` again (`monitor_finding` #13366),
+  against a fleet at full stretch. `evaluate`'s capacity test asks "was a lane
+  free to take this?" and answered it with `attended_claims < claim_capacity`
+  — how many lanes hold a LIVE LEASE. That is a different question, and the
+  gap between the two is the ordinary appearance of a healthy long run.
+
+  **A lapsed lease does not free a lane.** The item stays `claimed` until the
+  reaper takes it back, and `queue_claim` will not hand that lane a second
+  one meanwhile — it is still inside `_execute`, running the handler. But the
+  measurement counted it as spare capacity, and spare capacity is what
+  unlocks the due-ready clock: `PlanLimits.wip_limit` is 4 against 2 lanes,
+  so the surplus dispatched item is *designed* to sit ready and due for a
+  whole attempt, and its clock had been running for an hour.
+
+  **MEASURED against a real PostgreSQL 16 server.** Two lanes 40 minutes into
+  legitimate attempts (`voyn-aicc-worker@.service` allows one 3660s), the
+  surplus item due behind them the whole time, and then lane two's lease 30
+  seconds past its deadline while lane two is still running:
+
+      both leases live   attended=2 claimed=2 due_age=2400  ->  ok
+      lease slipped 30s  attended=1 claimed=2 due_age=2400  ->  queue_stalled
+
+  Nothing about the fleet changed between those two lines. No lane is free,
+  no lane stopped, the lapse itself is 30s — nowhere near the 900s window —
+  and `aicc-queue-reaper.timer` clears it on its next minute. The entire
+  verdict is the 2400s due-ready clock, compared against the stall window on
+  the strength of a free lane that does not exist.
+
+  **How often the fleet is in that state.** The beat runs at
+  `visibility_seconds / 3` — 100s against a 300s window — so ANY TWO
+  CONSECUTIVE FAILED BEATS lapse the lease. 0029 names the occasion this
+  fleet meets it on: "a database blip or a `voyn-aicc-pgtunnel.service`
+  restart that cost two beats", which the credential rotation cycles on its
+  own schedule. The reaper clears it within a minute and the probe samples
+  every two, so this is not a race that might happen — it is a red tick
+  whenever the sample lands in the window.
+
+  **Why the fleet clock could not catch it**, having been added (#2471) for
+  exactly this family of false positive. `fleet_idle_seconds` is an hour here
+  *precisely because* both lanes have been busy for an hour: no attempt
+  changed state, which is what two healthy long runs look like. That bound
+  excuses the instant a lane frees. It has nothing to say about a fleet that
+  never freed one, and `min(3600, 3600)` is still 3600.
+
+  The fix weighs capacity by OCCUPANCY — `queue.claimed`, how many items the
+  fleet is holding — instead of by attendance. `attended_claims` keeps its
+  narrower job: it is what `live_claim_age_seconds` ages, under
+  `--max-claim-seconds`.
+
+- **What it gives up, and why that is already covered twice.** A lapsed claim
+  can also mean the LANE IS GONE, in which case a lane really is free and
+  this excuses due work for as long as the claim sits unreaped. Nothing is
+  lost, because that case was never reached through capacity:
+  `lapsed_claim_age_seconds` is weighed UNCONDITIONALLY — not gated by
+  capacity, not bounded by the fleet clock — and fires at this same window.
+  And the excuse cannot outlast the reaper: `queue_reap` moves the item out
+  of `claimed`, so occupancy drops on its own, capacity reopens and the
+  due-ready clock runs again. A reaper that stops is what the unconditional
+  clock is for, and it is what the previous entry on this branch measured.
+
+- **The change can only excuse, never accuse, and that is pinned as a
+  property.** `claimed` is `attended_claims + lapsed_claims` by construction
+  — the two filters are disjoint and together cover `state = 'claimed'` — so
+  `claimed < capacity` implies `attended_claims < capacity` and never the
+  reverse. Spare capacity can only go from true to false, the starved set can
+  only shrink, and no tick that was green can be turned red by this rule.
+  Checked exhaustively over the snapshot shapes the two definitions can
+  disagree on (0 cases where the new rule frees a lane the old one did not),
+  and pinned by
+  `test_counting_a_lapsed_claim_as_occupancy_can_only_excuse_never_accuse`.
+  It matters because a red tick on this probe mints a task: a change to the
+  capacity test earns its way in by removing false accusations, and must not
+  be able to add one.
+
+  One reclassification falls out of that, and it is a rename rather than a
+  new accusation: a lapse older than `CLAIM_POLL_CEILING_SECONDS` on a fleet
+  with no successes in the trailing hour used to read `queue_stalled` and now
+  reads `throughput_stalled`, which is its own failure code and its own
+  finding. `aicc-queue-reaper.timer` runs every minute, so a lapse the probe
+  still sees past that floor means a reap tick did not clear it. Whether that
+  floor — derived from the CLAIMER's poll ceiling — is the right one for a
+  clock only the REAPER can stop is a separate question from this one, and it
+  belongs to `throughput_stalled` rather than to the finding fixed here.
+
+- **Seven tests. Five fail on the mutation back to `attended_claims`; the
+  other two are the fail-closed guards and hold either way, which is what
+  makes them guards.** Three run the production statement against a real
+  server (`test_a_lane_whose_lease_slipped_is_still_holding_its_lane` builds
+  the shape through `queue_claim`/`queue_heartbeat` and lapses one lease;
+  `test_a_lapse_the_reaper_never_clears_is_still_a_stall` holds the same
+  snapshot past the window; `test_the_reaper_hands_the_lane_back_and_the_due_
+  clock_resumes` runs the real `WorkQueueAdmin.reap` as `aicc_app` and shows
+  the verdict return). Four need no server and so run in every gate on every
+  machine — the lesson `test_reap_bound.py` was written for — including
+  `test_occupancy_is_what_capacity_weighs_and_the_two_can_differ`, which
+  states the distinction directly so a future reader cannot restore the old
+  test by reading `attended_claims` as "the busy lanes", and the property
+  test above.
+
+
 ### Fixed — the reaper's batch bound had stopped being a bound (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
 - `control-01:queue` reported `queue_stalled` again (`monitor_finding` #13145).
   The only change on this branch since the last healthy measurement is one

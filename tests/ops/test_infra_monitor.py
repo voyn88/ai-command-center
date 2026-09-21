@@ -1225,3 +1225,164 @@ def test_the_statement_binds_the_queue_to_both_of_its_questions(monkeypatch) -> 
     infra_monitor.read_queue_snapshot("staging")
 
     assert bound == [(infra_monitor._QUEUE_SNAPSHOT_SQL, ("staging", "staging"))]
+
+
+# ---------------------------------------------------------------------------
+# Capacity is OCCUPANCY, not attendance (monitor_finding #13366).
+#
+# `spare_capacity` answers "was a lane free to take this?", and it used to ask
+# `attended_claims < capacity` -- how many lanes hold a LIVE LEASE. That is a
+# different question. A lane whose lease slipped is still HOLDING its item:
+# the row stays `claimed` until the reaper takes it back, and `queue_claim`
+# will not hand that lane a second one meanwhile.
+#
+# The gap between the two is the ordinary appearance of a healthy long run.
+# The beat runs at `visibility_seconds / 3` (100s against a 300s window), so
+# ANY TWO CONSECUTIVE FAILED BEATS lapse the lease -- a database blip, or the
+# `voyn-aicc-pgtunnel.service` restart the credential rotation cycles on its
+# own schedule (0029: "the fleet coming BACK from a stall ... that cost two
+# beats"). `aicc-queue-reaper.timer` clears it on the next minute and the
+# probe samples every two, so this is not a race that might happen.
+#
+# These are here beside the DB proofs and not only in them, for the reason
+# `test_reap_bound.py` exists: they need no server, so they run in every gate
+# on every machine.
+
+
+def test_a_lease_that_slipped_does_not_free_the_lane_holding_it() -> None:
+    """THE REGRESSION. The fleet is at capacity -- two lanes, two items held
+    -- with the surplus dispatched item due behind them for an hour, which is
+    `PlanLimits.wip_limit` (4) against 2 lanes working as designed. One
+    lease is 30 seconds late. No lane is free, nothing has stopped, and the
+    reaper will clear the lapse within the minute."""
+    report = evaluate(
+        {"voyn-aicc-worker@1.service": "active", "voyn-aicc-worker@2.service": "active"},
+        _backpressure(
+            claimed=2,
+            attended_claims=1,
+            lapsed_claims=1,
+            lapsed_claim_age_seconds=30,
+            # An hour, because both lanes have been busy for an hour: no
+            # attempt changed state, which is what two long runs look like.
+            # The fleet clock cannot catch this one.
+            fleet_idle_seconds=3600,
+        ),
+        minimum_active_workers=2,
+        max_stalled_seconds=900,
+        prometheus_ready=True,
+        claim_capacity=2,
+    )
+
+    assert report.ok, report.failures
+
+
+def test_a_lapse_past_the_window_is_a_stall_at_any_occupancy() -> None:
+    """What the fix gives up, and why nothing is lost. A lapsed claim can
+    also mean the lane is GONE. That case is not reached through capacity --
+    it never was -- because `lapsed_claim_age_seconds` is weighed
+    unconditionally: not gated by capacity, not bounded by the fleet clock.
+    The same full-fleet snapshot, with the lapse older than the window."""
+    report = evaluate(
+        {"voyn-aicc-worker@1.service": "active", "voyn-aicc-worker@2.service": "active"},
+        _backpressure(
+            claimed=2,
+            attended_claims=1,
+            lapsed_claims=1,
+            lapsed_claim_age_seconds=1200,
+            fleet_idle_seconds=3600,
+        ),
+        minimum_active_workers=2,
+        max_stalled_seconds=900,
+        prometheus_ready=True,
+        claim_capacity=2,
+    )
+
+    assert report.failures == ("queue_stalled",)
+
+
+def test_a_lane_that_gave_its_item_back_is_free_again() -> None:
+    """The bound on how long the fix can excuse anything. The reaper moves
+    the item OUT of `claimed`, so occupancy drops on its own and the
+    due-ready clock runs again against a fleet standing still. A lapsed claim
+    can never excuse work for longer than `aicc-queue-reaper.timer` takes --
+    and a reaper that stops is what the test above measures."""
+    report = evaluate(
+        {"voyn-aicc-worker@1.service": "active", "voyn-aicc-worker@2.service": "active"},
+        _backpressure(claimed=1, attended_claims=1, fleet_idle_seconds=3600),
+        minimum_active_workers=2,
+        max_stalled_seconds=900,
+        prometheus_ready=True,
+        claim_capacity=2,
+    )
+
+    assert report.failures == ("queue_stalled",)
+
+
+def test_occupancy_is_what_capacity_weighs_and_the_two_can_differ() -> None:
+    """The distinction stated directly, so a future reader cannot restore the
+    old test by reading `attended_claims` as "the busy lanes". Identical
+    snapshots but for which column carries the second claim: both describe a
+    fleet holding two items against two lanes, and both are backpressure."""
+    common = dict(
+        minimum_active_workers=0,
+        max_stalled_seconds=900,
+        prometheus_ready=True,
+        claim_capacity=2,
+    )
+    both_live = evaluate({}, _backpressure(claimed=2, attended_claims=2), **common)
+    one_slipped = evaluate(
+        {},
+        _backpressure(
+            claimed=2,
+            attended_claims=1,
+            lapsed_claims=1,
+            lapsed_claim_age_seconds=30,
+        ),
+        **common,
+    )
+
+    assert both_live.ok and one_slipped.ok
+    assert both_live.failures == one_slipped.failures == ()
+
+
+def test_counting_a_lapsed_claim_as_occupancy_can_only_excuse_never_accuse() -> None:
+    """The direction of the change, pinned as a property rather than as a
+    case. `claimed` is `attended_claims + lapsed_claims` by construction --
+    the two filters are disjoint and together cover `state = 'claimed'` -- so
+    `claimed < capacity` implies `attended_claims < capacity` and never the
+    reverse. Spare capacity can therefore only go from true to false, the
+    starved set can only shrink, and no tick that was green can be turned red
+    by this rule.
+
+    That matters because this is a FAIL-CLOSED probe whose red ticks mint
+    tasks: a change to the capacity test earns its way in by removing false
+    accusations, and must not be able to add one anywhere. Here the same
+    fleet is described twice at every capacity, moving one claim from
+    attended to lapsed -- which is exactly what a slipped lease does to the
+    snapshot."""
+    for capacity in (1, 2, 3, 4):
+        for held in range(1, 5):
+            common = dict(
+                minimum_active_workers=0,
+                max_stalled_seconds=900,
+                prometheus_ready=True,
+                claim_capacity=capacity,
+            )
+            all_live = evaluate(
+                {}, _backpressure(claimed=held, attended_claims=held), **common
+            )
+            one_slipped = evaluate(
+                {},
+                _backpressure(
+                    claimed=held,
+                    attended_claims=held - 1,
+                    lapsed_claims=1,
+                    # Inside the window, so the unconditional lapse clock is
+                    # not what is being compared here.
+                    lapsed_claim_age_seconds=30,
+                ),
+                **common,
+            )
+
+            accused = set(one_slipped.failures) - set(all_live.failures)
+            assert not accused, (capacity, held, accused)
