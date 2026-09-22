@@ -30,6 +30,24 @@ CLAIMERS = (
     "voyn-aicc-worker@.service",
 )
 
+#: What an uninstall journal records in `registry_sha256` when the profile it
+#: was bound under installs no `/etc/aicc/worker-lanes` at all -- which the
+#: control profile does not, because that path is a WORKER_ONLY_TARGET.
+#:
+#: Kept identical to `ABSENT_REGISTRY` in ops/aicc_install_transaction.py and
+#: pinned by tests/ops/test_aicc_install_transaction.py. The duplication is
+#: deliberate, for the same reason `GIT_CONFIG_FREE` is duplicated into the
+#: bootstrap: this file is a standalone anchor. It is copied alone to
+#: /usr/lib/systemd/system-generators and runs before sysinit.target, and the
+#: uninstall it is recovering removes /usr/libexec/aicc-install-transaction --
+#: so importing that module here would make boot recovery depend on a file
+#: whose deletion is the very thing being resumed.
+ABSENT_REGISTRY = "ABSENT"
+#: A lane-registry digest or that sentinel, and nothing else. Kept byte
+#: identical to `_REGISTRY_IDENTITY_RE` in ops/aicc_install_transaction.py so
+#: the two schemas can be compared rather than re-read.
+_REGISTRY_IDENTITY_RE = re.compile(rf"(?:[0-9a-f]{{64}}|{ABSENT_REGISTRY})")
+
 _READ_ERRORS = (
     FileNotFoundError,
     KeyError,
@@ -124,7 +142,15 @@ def _uninstall_capsule(state_dir: Path, *, expected_uid: int) -> Path:
             )
         )
         or not isinstance(payload["registry_sha256"], str)
-        or not re.fullmatch(r"[0-9a-f]{64}", payload["registry_sha256"])
+        # A digest OR the absent-registry sentinel. This gate is a second,
+        # independent copy of the journal schema, and it kept the narrow
+        # `[0-9a-f]{64}` after the writer learned to record `ABSENT` for a
+        # profile that installs no lane registry. A control-profile uninstall
+        # therefore wrote a journal its own boot recovery called malformed:
+        # this unit is pulled into sysinit.target.requires, so the reboot that
+        # needs the journal most failed the barrier and took the boot with it,
+        # on the very host the control profile exists for.
+        or not _REGISTRY_IDENTITY_RE.fullmatch(payload["registry_sha256"])
         or (
             payload["phase"] == "INTENT"
             and payload["snapshot_sha256"] is not None

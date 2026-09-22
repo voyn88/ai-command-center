@@ -1076,8 +1076,8 @@ def test_versioned_os_boundary_acceptance_is_fail_closed():
 # unconditionally -- so installing the control plane meant either putting
 # agent secrets on a host that must never hold them, or not installing it at
 # all. The live attempt on control-01 took the second branch and stopped at
-# `source is not a safe regular file: /home/voynadmin/.claude/.credentials.json`,
-# on a file whose absence was correct.
+# `source is not a safe regular file`, naming the operator's Claude credential
+# store -- a file whose absence was correct.
 # ---------------------------------------------------------------------------
 
 
@@ -1485,7 +1485,7 @@ def test_agent_state_predicate_tells_credentials_from_an_empty_skeleton(tmp_path
     # being given neither -L nor -H), so dropping either mechanism alone still
     # refuses it; what this pins is that they are not both lost.
     link = root / "claude" / ".claude" / "link"
-    link.symlink_to("/home/voynadmin/.claude")
+    link.symlink_to(tmp_path / "operator-home" / ".claude")
     assert _holds_state(tmp_path, root), "a symlink inside the tree is state"
     link.unlink()
     assert not _holds_state(tmp_path, root)
@@ -1610,6 +1610,14 @@ def _rollout():
     return importlib.import_module("aicc_staged_worker_rollout")
 
 
+def _generator():
+    root = Path(__file__).parents[2]
+    sys.path.insert(0, str(root / "ops"))
+    import importlib
+
+    return importlib.import_module("aicc_principal_recovery_generator")
+
+
 def _uninstall_host(tmp_path: Path) -> tuple[Path, Path, Path]:
     """A host root with the state dir the installer keeps its journal in.
 
@@ -1678,6 +1686,151 @@ def test_boot_recovery_resumes_a_control_uninstall_with_no_flag_to_pass(tmp_path
     tx.recover_uninstall(state, root=root)
 
     assert not (state / "uninstall.json").exists(), "the intent was not aborted"
+
+
+def _dispatched_capsule(generator, state: Path, monkeypatch) -> tuple[str, ...]:
+    """What the boot barrier execs for the journal currently on disk."""
+    called: list[tuple] = []
+    monkeypatch.setattr(generator.os, "execv", lambda *args: called.append(args))
+    with pytest.raises(AssertionError, match="unreachable"):
+        generator.recover(state, expected_uid=os.geteuid())
+    return tuple(called[0][1])
+
+
+def test_the_boot_barrier_accepts_the_journal_a_control_uninstall_writes(
+    tmp_path, monkeypatch
+):
+    """The crux, and the fourth instance of one class: the boot generator holds
+    a SECOND, independent copy of the uninstall journal schema, and it kept the
+    narrow `[0-9a-f]{64}` for `registry_sha256` after the writer learned to
+    record `ABSENT` for a profile that installs no lane registry.
+
+    So a control uninstall wrote a journal its own boot recovery called
+    malformed. That is not a refusal that merely fails: this unit is pulled
+    into `sysinit.target.requires` and is `Before=sysinit.target`, so the
+    reboot that needs the journal most fails the barrier and takes the boot
+    with it -- on the very host the control profile exists for.
+
+    Executed against a journal really written by `begin_uninstall`, not a
+    hand-built one, because what is under test is whether the two schemas
+    agree about what that function produces.
+    """
+    tx = _transaction()
+    generator = _generator()
+    root, state, registry = _uninstall_host(tmp_path)
+    tx.begin_uninstall(
+        state,
+        baseline_selector="ABSENT",
+        current_selector=root / "opt/aicc/current",
+        lane_registry=registry,
+        profile="control",
+    )
+    journal = state / "uninstall.json"
+    payload = json.loads(journal.read_text(encoding="utf-8"))
+    assert payload["registry_sha256"] == tx.ABSENT_REGISTRY, "premise"
+
+    argv = _dispatched_capsule(generator, state, monkeypatch)
+    assert argv[1] == payload["recovery"]
+    assert argv[2] == "recover-uninstall-boot"
+
+    # ...and at ARMED too, which is the phase where a crash has already
+    # quiesced services and the resume is the only thing that restores them.
+    snapshot = state / "uninstall-units.json"
+    snapshot.write_text(json.dumps({"units": {}}), encoding="utf-8")
+    snapshot.chmod(0o600)
+    tx.arm_uninstall(state, snapshot)
+    assert json.loads(journal.read_text(encoding="utf-8"))["phase"] == "ARMED"
+    assert _dispatched_capsule(generator, state, monkeypatch)[2] == (
+        "recover-uninstall-boot"
+    )
+
+
+def test_the_boot_barrier_still_refuses_a_registry_identity_of_neither_kind(
+    tmp_path, monkeypatch
+):
+    """Negative control against fixing the above by loosening the field. The
+    journal admits exactly two vocabularies -- a sha256 or the one sentinel --
+    and the sentinel is confined to the one field that can be absent: a
+    capsule or snapshot digest of `ABSENT` is still a malformed journal.
+    """
+    tx = _transaction()
+    generator = _generator()
+    root, state, registry = _uninstall_host(tmp_path)
+    tx.begin_uninstall(
+        state,
+        baseline_selector="ABSENT",
+        current_selector=root / "opt/aicc/current",
+        lane_registry=registry,
+        profile="control",
+    )
+    journal = state / "uninstall.json"
+    original = json.loads(journal.read_text(encoding="utf-8"))
+    # Nothing here may reach the capsule, and an unpatched `execv` that did
+    # would replace this process rather than fail the assertion.
+    executed: list[tuple] = []
+    monkeypatch.setattr(generator.os, "execv", lambda *args: executed.append(args))
+
+    def refuses(**updates) -> None:
+        journal.write_text(
+            json.dumps({**original, **updates}, sort_keys=True), encoding="utf-8"
+        )
+        with pytest.raises(RuntimeError, match="journal is invalid"):
+            generator.recover(state, expected_uid=os.geteuid())
+        assert not executed
+
+    refuses(registry_sha256="")
+    refuses(registry_sha256="absent")
+    refuses(registry_sha256=f"{tx.ABSENT_REGISTRY} ")
+    refuses(registry_sha256="e" * 63)
+    refuses(registry_sha256=None)
+    # The sentinel widens one field and no other.
+    refuses(recovery_sha256=tx.ABSENT_REGISTRY)
+    refuses(phase="ARMED", snapshot_sha256=tx.ABSENT_REGISTRY)
+
+
+def test_the_boot_barrier_and_the_journal_writer_share_one_schema(
+    tmp_path, monkeypatch
+):
+    """Standing invariant, in its general form. The generator cannot import the
+    writer -- it is copied alone to /usr/lib/systemd/system-generators, runs
+    before sysinit.target, and the uninstall it resumes removes
+    /usr/libexec/aicc-install-transaction -- so the schema is duplicated on
+    purpose and has to be pinned instead of shared.
+
+    Pinned two ways, because the constants alone would not have caught this:
+    the vocabulary is compared literally, and every field the writer actually
+    emits is proved load-bearing at the barrier. A key the writer adds and the
+    generator does not know, or one it stops emitting, fails here rather than
+    at the next reboot of a half-uninstalled host.
+    """
+    tx = _transaction()
+    generator = _generator()
+    assert generator.ABSENT_REGISTRY == tx.ABSENT_REGISTRY
+    assert (
+        generator._REGISTRY_IDENTITY_RE.pattern == tx._REGISTRY_IDENTITY_RE.pattern
+    )
+
+    root, state, registry = _uninstall_host(tmp_path)
+    tx.begin_uninstall(
+        state,
+        baseline_selector="ABSENT",
+        current_selector=root / "opt/aicc/current",
+        lane_registry=registry,
+        profile="control",
+    )
+    journal = state / "uninstall.json"
+    written = json.loads(journal.read_text(encoding="utf-8"))
+    assert _dispatched_capsule(generator, state, monkeypatch)[2] == (
+        "recover-uninstall-boot"
+    ), "premise: the barrier accepts what the writer wrote"
+
+    for key in (*written, "a_field_the_writer_does_not_emit"):
+        mutated = {k: v for k, v in written.items() if k != key}
+        if key not in written:
+            mutated[key] = "x"
+        journal.write_text(json.dumps(mutated, sort_keys=True), encoding="utf-8")
+        with pytest.raises(RuntimeError, match="journal is invalid"):
+            generator.recover(state, expected_uid=os.geteuid())
 
 
 def test_the_uninstall_profile_cannot_flip_under_a_live_journal(tmp_path):

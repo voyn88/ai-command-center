@@ -2579,9 +2579,9 @@ def default_specs(
     credentials unconditionally: installing the control plane meant either
     placing agent secrets on a host that must never hold them, or not
     installing it at all. The live attempt on control-01 took the second
-    branch and stopped at `source is not a safe regular file:
-    /home/voynadmin/.claude/.credentials.json` -- a file whose *absence* was
-    correct (2026-08-31).
+    branch and stopped at `source is not a safe regular file`, naming the
+    operator's Claude credential store -- a file whose *absence* was correct
+    (2026-08-31).
 
     The control-plane's own units (planner, review, merge, reaper, rotation)
     are not added here: they are still symlinks into the operator's home and
