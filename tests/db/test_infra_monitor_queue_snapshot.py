@@ -730,6 +730,96 @@ def test_a_lane_whose_lease_slipped_is_still_holding_its_lane(monitor) -> None:
     assert report.ok, report.failures
 
 
+def test_a_slipped_lease_one_reaper_tick_later_is_still_not_a_failure(
+    monitor,
+) -> None:
+    """THE REGRESSION (monitor_finding #14016): the SAME fleet as the test
+    above, with the lapse two minutes old instead of thirty seconds.
+
+    Nothing else differs. Two lanes are 70 minutes into legitimate attempts,
+    the surplus dispatched item is due behind them, lane two's lease has
+    slipped while lane two is still running, and
+    `aicc-queue-reaper.timer` will clear it on its next minute. Only the age
+    of the slip moved -- from inside `CLAIM_POLL_CEILING_SECONDS` to past it
+    -- and the probe went red under a DIFFERENT failure name:
+
+        throughput_stalled:0_succeeded_in_1h
+
+    That floor is the claimer's, and a lapse is not the claimer's to clear.
+    `CLAIM_POLL_CEILING_SECONDS` is how long a free lane may take to notice
+    DUE READY work (`WorkerConfig`'s saturated idle backoff, 30-60s); past it
+    every free lane has polled, so an unclaimed due row really was passed
+    over. A lapsed claim is invisible to every claimer -- the row is still
+    `claimed` -- and only the reaper clears it, on a one-minute timer with
+    `AccuracySec=15s` whose own unit calls a failed tick "a failed tick, not
+    an incident". Two minutes of slip is one missed tick. It is measured
+    against `--max-stalled-seconds` above, unconditionally, and that is the
+    only threshold here that describes the reaper.
+
+    And the other half of the red verdict is just as ordinary: nothing has
+    succeeded in the trailing hour BECAUSE both attempts are longer than an
+    hour, which `evaluate`'s own comment calls the ordinary case on this
+    fleet. So a healthy fleet could not produce an `ok` tick, which is this
+    finding's acceptance, while the `queue_stalled` measurement it was filed
+    for was green the whole time.
+    """
+    measure, app, worker, age = monitor
+    claims = []
+    for key in ("lane-one", "lane-two"):
+        app.enqueue(QUEUE, idempotency_key=key, payload={"kind": "agent_run"})
+        claims.append(_claim(worker))
+    app.enqueue(QUEUE, idempotency_key="queued", payload={"kind": "agent_run"})
+    # Longer than the trailing hour `recent_succeeded` counts over, so that
+    # zero successes is a fact about attempt LENGTH and not about failure.
+    age(
+        "UPDATE work_item SET updated_at = now() - interval '70 minutes', "
+        "available_at = now() - interval '70 minutes' WHERE state = 'ready'"
+    )
+    age("UPDATE work_attempt SET created_at = now() - interval '70 minutes'")
+    # One reaper tick's worth of slip, not thirty seconds' worth.
+    age(
+        "UPDATE work_attempt SET visible_until = now() - interval '2 minutes' "
+        "WHERE attempt_id = %s",
+        (claims[1].attempt_id,),
+    )
+
+    slipped = measure()
+    # The state the probe is judging, measured rather than asserted about.
+    assert slipped.claimed == 2
+    assert (slipped.attended_claims, slipped.lapsed_claims) == (1, 1)
+    assert (
+        infra_monitor.CLAIM_POLL_CEILING_SECONDS
+        < slipped.lapsed_claim_age_seconds
+        < MAX_STALLED
+    )
+    assert slipped.recent_succeeded == 0
+    assert slipped.ready_due == 1
+    assert slipped.ready_due_age_seconds > MAX_STALLED
+    assert slipped.fleet_idle_seconds > MAX_STALLED
+
+    report = infra_monitor.evaluate(
+        {}, slipped, minimum_active_workers=0, max_stalled_seconds=MAX_STALLED,
+        prometheus_ready=True, claim_capacity=2,
+    )
+    assert report.ok, report.failures
+
+    # THE FAIL-CLOSED HALF, on the same shape: the excuse is the reaper's
+    # cadence, so it ends where the reaper's own threshold does. One second
+    # past the stall window the very same lapse is reported -- as
+    # `queue_stalled`, by the unconditional clock, and not as a second
+    # finding beside it.
+    age(
+        "UPDATE work_attempt SET visible_until = now() - interval '901 seconds' "
+        "WHERE attempt_id = %s",
+        (claims[1].attempt_id,),
+    )
+    unreaped = infra_monitor.evaluate(
+        {}, measure(), minimum_active_workers=0, max_stalled_seconds=MAX_STALLED,
+        prometheus_ready=True, claim_capacity=2,
+    )
+    assert unreaped.failures == ("queue_stalled",)
+
+
 def test_a_lapse_the_reaper_never_clears_is_still_a_stall(monitor) -> None:
     """The fail-closed half, and the reason the fix above gives nothing away.
 

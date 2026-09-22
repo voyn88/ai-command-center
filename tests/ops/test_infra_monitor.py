@@ -413,15 +413,46 @@ def test_executor_quota_refusals_are_their_own_failure_class() -> None:
     assert not any(f.startswith("dead_letter_growth") for f in report.failures)
 
 
+def _spinning(**kw):
+    """Lanes spinning on refusals -- the shape `throughput_stalled` is for.
+
+    One lane holds an item, the other is free, and the work they keep failing
+    has come back as due-ready rows past the poll ceiling. That is what
+    "spinning" leaves behind in the queue: `queue_fail` requeues, so occupancy
+    DROPS between spins and the requeued item is offered to a free lane again.
+
+    Built out here rather than taken from `_queue()`, which is a
+    FULL-OCCUPANCY shape (`claimed` == the default capacity). Its corroboration
+    used to come from its two lapsed claims, and a lapse below the stall window
+    is the reaper working rather than the pipeline stalling -- see
+    `test_a_slipped_lease_inside_the_reapers_cadence_is_not_a_throughput_stall`.
+    """
+    from command_center.ops.infra_monitor import QueueSnapshot
+
+    starved = infra_monitor.CLAIM_POLL_CEILING_SECONDS * 2
+    base = dict(
+        ready=3, claimed=1, succeeded=100, dead=0, success_age_seconds=200.0,
+        recent_dead=0, ready_due=3, ready_due_age_seconds=starved,
+        lapsed_claims=0, lapsed_claim_age_seconds=None,
+        attended_claims=1, live_claim_age_seconds=starved,
+        # The spin itself keeps this fresh: a claim or a `queue_fail` every few
+        # seconds is an attempt changing state, which is what the fleet clock
+        # measures. It must not be what excuses the verdict.
+        fleet_idle_seconds=starved,
+    )
+    base.update(kw)
+    return QueueSnapshot(**base)
+
+
 def test_spinning_lanes_with_no_success_in_an_hour_are_a_throughput_stall() -> None:
     from command_center.ops.infra_monitor import evaluate
 
     # Pending age keeps resetting (items re-claimed), so queue_stalled does
     # not fire -- but nothing succeeded for an hour while work is waiting.
-    report = evaluate({"voyn-aicc-worker@1.service": "active"}, _queue(recent_succeeded=0),
+    report = evaluate({"voyn-aicc-worker@1.service": "active"}, _spinning(recent_succeeded=0),
                       minimum_active_workers=1, max_stalled_seconds=900, prometheus_ready=True)
     assert report.failures == ("throughput_stalled:0_succeeded_in_1h",)
-    healthy = evaluate({"voyn-aicc-worker@1.service": "active"}, _queue(recent_succeeded=4),
+    healthy = evaluate({"voyn-aicc-worker@1.service": "active"}, _spinning(recent_succeeded=4),
                        minimum_active_workers=1, max_stalled_seconds=900, prometheus_ready=True)
     assert healthy.ok
 
@@ -845,6 +876,140 @@ def test_a_just_enqueued_item_is_not_a_throughput_stall_on_a_quiet_fleet() -> No
     )
 
     assert polled_past.failures == ("throughput_stalled:0_succeeded_in_1h",)
+
+
+def _slipped_lease(**kw):
+    """The deployed fleet at full stretch with one lease late.
+
+    Two lanes 70 minutes into legitimate attempts (`voyn-aicc-worker@.service`
+    allows one 3660s, `--max-claim-seconds` 5400s), the two surplus dispatched
+    items due behind them (`PlanLimits.wip_limit` 4 against 2 lanes), and lane
+    B's lease past its deadline while lane B is still running. Nothing here is
+    a fault: `recent_succeeded` is 0 because both attempts are longer than the
+    hour it counts over, occupancy is full so no lane was free, and
+    `aicc-queue-reaper.timer` clears the slip on its next minute.
+    """
+    from command_center.ops.infra_monitor import QueueSnapshot
+
+    base = dict(
+        ready=2, claimed=2, succeeded=100, dead=0, success_age_seconds=4500.0,
+        recent_dead=0, recent_quota_dead=0, recent_succeeded=0,
+        ready_due=2, ready_due_age_seconds=7200.0,
+        lapsed_claims=1, lapsed_claim_age_seconds=120.0,
+        attended_claims=1, live_claim_age_seconds=4200.0,
+        # An hour, because both lanes have been busy for one -- no attempt
+        # changed state, which is what two healthy long runs look like.
+        fleet_idle_seconds=4200.0,
+    )
+    base.update(kw)
+    return QueueSnapshot(**base)
+
+
+def _judge(snapshot):
+    from command_center.ops.infra_monitor import evaluate
+
+    return evaluate(
+        {},
+        snapshot,
+        minimum_active_workers=0,
+        max_stalled_seconds=900,
+        prometheus_ready=True,
+        max_recent_dead=0,
+    )
+
+
+def test_a_slipped_lease_inside_the_reapers_cadence_is_not_a_throughput_stall() -> None:
+    """THE REGRESSION (monitor_finding #14016), and the last way this probe
+    could not report `ok` at a healthy fleet.
+
+    `throughput_stalled` is the one check that fires INSIDE the stall window,
+    so its floor is what makes it honest -- and the floor belongs to ONE of
+    the two starvation clocks. `CLAIM_POLL_CEILING_SECONDS` is how long a free
+    lane may take to notice DUE READY work, so past it every free lane has
+    polled and an unclaimed due row really was passed over.
+
+    Nothing a claimer does clears a LAPSED CLAIM. `queue_claim` cannot even
+    see the row -- it is still `claimed` -- and only `aicc-queue-reaper.timer`
+    clears it: a one-minute timer with `AccuracySec=15s` whose own unit calls
+    a failed tick "a failed tick, not an incident", plus 0028's and 0029's
+    deliberate deferral of a contended or freshly renewed row to the next
+    tick. A two-minute slip is one missed tick, and the only threshold in
+    `evaluate` that describes the reaper is `--max-stalled-seconds`, which is
+    exactly what `lapsed_claim_age_seconds` is weighed against -- above, and
+    unconditionally.
+
+    Applying the claimer's floor to the reaper's clock made the state the
+    three commits before this one taught the probe to read as healthy red
+    again under a different name, two minutes after the slip that
+    `test_a_lane_whose_lease_slipped_is_still_holding_its_lane` (30 seconds)
+    proved green."""
+    assert _judge(_slipped_lease()).ok, _judge(_slipped_lease()).failures
+
+    # Where the excuse ends: the reaper's cadence, not the reaper's absence.
+    # One second past the window the same slip IS reported -- by the
+    # unconditional clock, under its own name, and alone.
+    unreaped = _judge(_slipped_lease(lapsed_claim_age_seconds=901.0))
+    assert unreaped.failures == ("queue_stalled",)
+
+
+def test_no_lapse_inside_the_stall_window_can_mint_a_throughput_stall() -> None:
+    """The property behind the test above, swept rather than sampled.
+
+    A lapse is the reaper's to clear and `--max-stalled-seconds` is the only
+    threshold that measures whether the reaper still is, so no lapse age
+    strictly below that window may produce a failure on its own -- at any
+    occupancy, with any due backlog behind it, and whether or not anything
+    succeeded in the trailing hour. Above the window exactly one failure
+    appears, and it is `queue_stalled`: one condition, one finding, one task.
+
+    Swept because the defect was a BAND (60s to 900s), not a point, and a
+    single sampled age inside it would leave the rest of the band free to
+    come back."""
+    window = 900.0
+    for age in (0.5, 30.0, 59.9, 60.0, 60.1, 120.0, 450.0, 899.9, window):
+        for succeeded in (0, 4):
+            report = _judge(
+                _slipped_lease(
+                    lapsed_claim_age_seconds=age, recent_succeeded=succeeded
+                )
+            )
+            assert report.ok, (age, succeeded, report.failures)
+    for age in (900.1, 1800.0, 86400.0):
+        for succeeded in (0, 4):
+            report = _judge(
+                _slipped_lease(
+                    lapsed_claim_age_seconds=age, recent_succeeded=succeeded
+                )
+            )
+            assert report.failures == ("queue_stalled",), (age, succeeded)
+
+
+def test_the_throughput_check_never_fires_beside_queue_stalled() -> None:
+    """The two are mutually exclusive by construction, and the planner is why:
+    0024 keys a finding on the failure CODE and mints one task per code, so a
+    single stalled queue reporting under both names opens two findings and
+    files two tasks for one thing to fix.
+
+    The upper bound is therefore still keyed on the WHOLE starved age rather
+    than on the unoffered one -- a lapse past the window has already minted
+    `queue_stalled`, even when the due-ready clock beside it is inside the
+    window and a lane is free."""
+    from command_center.ops.infra_monitor import QueueSnapshot
+
+    # A lapse the reaper never cleared, with a free lane and a due item that
+    # only just became due: the unoffered clock is inside the window, the
+    # lapse clock is far outside it.
+    both = _judge(
+        QueueSnapshot(
+            ready=1, claimed=1, succeeded=100, dead=0, success_age_seconds=7200.0,
+            recent_dead=0, recent_succeeded=0,
+            ready_due=1, ready_due_age_seconds=300.0,
+            lapsed_claims=1, lapsed_claim_age_seconds=5000.0,
+            attended_claims=0, live_claim_age_seconds=None,
+            fleet_idle_seconds=5000.0,
+        )
+    )
+    assert both.failures == ("queue_stalled",)
 
 
 def test_the_throughput_floor_covers_the_workers_poll_ceiling() -> None:

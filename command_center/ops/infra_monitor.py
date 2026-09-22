@@ -629,11 +629,70 @@ def evaluate(
         # so a queue that had been empty all night would otherwise go red the
         # second the first task was enqueued); and at or below the stall
         # window, above which `queue_stalled` already reports it.
+        #
+        # WHAT MAY CORROBORATE IT IS THE UNOFFERED CLOCK, AND ONLY THAT ONE
+        # (monitor_finding #14016). The floor is the whole reason this check is
+        # allowed to fire inside the window, and it is derived from ONE of the
+        # two starvation clocks: `CLAIM_POLL_CEILING_SECONDS` is how long a
+        # free lane may take to notice due work (`WorkerConfig`'s saturated
+        # idle backoff, 30-60s), so past it every free lane has polled at
+        # least once and work still sitting there really was passed over.
+        #
+        # It says NOTHING about a lapsed claim, and applying it to one made
+        # this probe red at a healthy fleet. No claimer clears a lapse --
+        # `queue_claim` cannot even see the row, it is still `claimed` -- only
+        # `aicc-queue-reaper.timer` does, and the only threshold in this
+        # function that describes the reaper is `--max-stalled-seconds`, which
+        # is exactly why `lapsed_claim_age_seconds` is weighed against it
+        # above, unconditionally and unbounded by the fleet clock. Below that
+        # window a lapse is the reaper WORKING, not the pipeline stalling: the
+        # timer is `OnUnitActiveSec=1min` with `AccuracySec=15s`, a failed tick
+        # is "a failed tick, not an incident" by that unit's own comment, and
+        # 0028/0029 defer a contended or freshly renewed row to the next tick
+        # on purpose. Two such minutes are ordinary, and 120s is past a floor
+        # built for 60s.
+        #
+        # MEASURED, at the deployed numbers, on the state this branch spent
+        # three commits teaching the probe to read as healthy -- two lanes 70
+        # minutes into legitimate attempts (`voyn-aicc-worker@.service` allows
+        # one 3660s and `--max-claim-seconds` 5400s), the two surplus
+        # dispatched items due behind them, and lane B's lease 120 seconds
+        # past its deadline while lane B is still running:
+        #
+        #     claimed=2 attended=1 lapse_age=120 due_age=7200 fleet_idle=4200
+        #         -> throughput_stalled:0_succeeded_in_1h
+        #
+        # Every clause of that is the fleet doing its job. `recent_succeeded`
+        # is 0 because both attempts are longer than an hour, which this
+        # function's own comment calls ordinary; occupancy is full, so the
+        # due-ready clock is correctly excused (#13366) and the lapse is all
+        # that is left to corroborate with; and the lapse clears on the
+        # reaper's next minute. `queue_stalled` stays green throughout --
+        # which is the point: the finding this probe was sent to fix is
+        # healthy, and the probe still could not report `ok`.
+        #
+        # WHAT THIS GIVES UP is detection LATENCY on one shape and no
+        # coverage: a fleet that is wedged at full occupancy with nothing
+        # succeeding is now reported when its lapse passes the stall window
+        # rather than the poll ceiling. That is the latency
+        # `--max-stalled-seconds` exists to declare, it is the same latency
+        # every other starvation class here has, and the clock that reports it
+        # is the unconditional one. The case this check was written for is
+        # untouched: lanes spinning on refusals fail fast, `queue_fail`
+        # requeues, occupancy drops between spins and the requeued items come
+        # back as due-ready work no lane took -- the unoffered clock exactly.
+        unoffered_age = ready_due_starved if spare_capacity else None
         if (
             queue.recent_succeeded is not None
             and queue.recent_succeeded == 0
+            and unoffered_age is not None
+            and CLAIM_POLL_CEILING_SECONDS < unoffered_age
+            # Still mutually exclusive with `queue_stalled`, and still keyed on
+            # the WHOLE starved age rather than on the unoffered one: a lapse
+            # past the window has already minted that failure, and one
+            # condition must not mint two findings and two planner tasks.
             and starved_age is not None
-            and CLAIM_POLL_CEILING_SECONDS < starved_age <= max_stalled_seconds
+            and starved_age <= max_stalled_seconds
         ):
             failures.append("throughput_stalled:0_succeeded_in_1h")
 
