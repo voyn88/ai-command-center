@@ -9,8 +9,6 @@ no PostgreSQL, so this file runs on a laptop with no server and no Docker.
 
 from __future__ import annotations
 
-import os
-import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -24,29 +22,11 @@ from command_center.db.mirror_support import (
 )
 
 # --- the conversion that was wrong once -------------------------------------
-
-
-@pytest.fixture
-def process_tz():
-    """Run a test under an explicit process timezone.
-
-    The conversion's whole job is to be independent of this, and on a UTC host
-    a zone-dependent implementation is indistinguishable from a correct one —
-    so the tests that pin the scale set a non-UTC zone rather than trusting the
-    machine they run on.
-    """
-    original = os.environ.get("TZ")
-
-    def _set(name: str) -> None:
-        os.environ["TZ"] = name
-        time.tzset()
-
-    yield _set
-    if original is None:
-        os.environ.pop("TZ", None)
-    else:
-        os.environ["TZ"] = original
-    time.tzset()
+#
+# `process_tz` (tests/db/conftest.py) runs these under an explicit, non-UTC
+# process zone: the conversion's whole job is to be independent of it, and on
+# a UTC host a zone-dependent implementation is indistinguishable from a
+# correct one.
 
 
 def test_a_naive_timestamp_is_read_as_utc(process_tz) -> None:

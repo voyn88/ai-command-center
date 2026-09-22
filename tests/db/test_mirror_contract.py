@@ -51,7 +51,7 @@ _ADD_COLUMN = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 
-#: What `models.iso_now()` emits: naive local, second precision, no offset.
+#: What `models.iso_now()` emits: naive UTC, second precision, no offset.
 SAMPLE_TIMESTAMP = "2026-08-14T00:00:00"
 
 

@@ -40,7 +40,12 @@ functional application milestones of `app.py`.
   closes the hazard that module documented — while the authority wrote local
   time, the instant stored depended on which process ran the mirror, and
   `divergence` reconciled the mistake clean in both directions
-  (`VOYN-W0-AICC-TZ-AWARE-TIMESTAMPS`).
+  (`VOYN-W0-AICC-TZ-AWARE-TIMESTAMPS`). The queue and owner-item mirror tests
+  that assert what instant a naive string is stored as now pin UTC under an
+  explicit non-UTC process zone (`process_tz`, moved to `tests/db/conftest.py`
+  so all three files share one copy): they previously asserted the *local*
+  reading, which on a UTC CI host is the same value — so they would have passed
+  against either implementation and pinned neither.
 - `web/src/lib/time.ts`: one helper for reading these timestamps in the SPA.
   ECMAScript parses an offsetless date-time as *local*, so `new Date(created_at)`
   displayed every API timestamp shifted by the browser's offset. `npm test

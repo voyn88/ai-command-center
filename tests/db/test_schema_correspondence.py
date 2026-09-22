@@ -449,10 +449,13 @@ def test_the_columns_needing_value_conversion_are_the_documented_ones(
     """The map's headline hazard, pinned.
 
     108 of 402 columns change type, and 78 of them are `TEXT` -> `timestamptz`.
-    `command_center/models.py:iso_now` writes naive local time with no offset, so
-    those strings are reinterpreted under the importer's session time zone —
-    a silent, unrecoverable shift. The count is asserted so the migration cannot
-    be planned against a smaller number than the one that exists.
+    `command_center/models.py:iso_now` writes an offsetless string (naive UTC
+    since `VOYN-W0-AICC-ISO-NOW-NAIVE-LOCAL`), so an importer that does not say
+    which zone it means reinterprets those strings under its own session time
+    zone — a silent, unrecoverable shift; pinning the *scale* does not attach it
+    to the text. `db.mirror_support.to_instant` is where the mirrors say it.
+    The count is asserted so the migration cannot be planned against a smaller
+    number than the one that exists.
     """
     conversions: dict[str, int] = defaultdict(int)
     for table, spec in postgres_schema["tables"].items():

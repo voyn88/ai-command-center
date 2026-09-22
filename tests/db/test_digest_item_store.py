@@ -35,7 +35,7 @@ def _row(item_id: str, **overrides: object) -> dict:
         "body": "",
         "category": None,
         "refs_json": '["task:1"]',
-        "created_at": "2026-08-14T00:00:00",  # naive local, what `models.iso_now()` emits
+        "created_at": "2026-08-14T00:00:00",  # naive UTC, what `models.iso_now()` emits
         "day": "2026-08-14",
         "position": 0,
         "project_ref": None,
