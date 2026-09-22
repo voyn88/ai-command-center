@@ -56,12 +56,12 @@ functional application milestones of `app.py`.
   zone its `schema_version.timestamp_tz` ledger recorded, and naive UTC rows
   after it. Nothing distinguishes them by inspection, so
   `runtime.db.retention_cutoff` now applies the **earlier of the two candidate
-  renderings** — the only bound under which no row is deleted before its
-  window has truly elapsed on its own clock. Rendering only UTC would move the
-  boundary forward by the legacy zone's offset (up to ~14h) and prune every
-  pre-upgrade row that much early, which is irreversible. The cost is bounded
-  and on the safe side: on such a file rows may outlive the window by up to
-  that offset. A file this code created is stamped `"UTC"` and gets the window
+  renderings** — the only bound under which neither set of rows is deleted a
+  whole zone offset before its window has elapsed on its own clock. Rendering
+  only UTC would move the boundary forward by the legacy zone's offset (up to
+  ~14h) and prune every pre-upgrade row that much early, which is
+  irreversible. The cost is bounded and on the safe side: on such a file rows
+  may outlive the window by up to that offset. A file this code created is stamped `"UTC"` and gets the window
   exactly; `migrate()` stamps the host's local zone for a file that already had
   a schema, precisely so its legacy rows stay readable. A retention report
   names the clock that judged the rows (`utc-floor` when UTC's bound won). The
@@ -69,7 +69,12 @@ functional application milestones of `app.py`.
   was written, so the second candidate does not retire itself: an operator who
   knows the file holds no pre-switchover rows any more sets
   `AICC_RUNTIME_TZ=UTC` to restore the exact window. Deliberately their call —
-  guessing it deletes rows early and irreversibly.
+  guessing it deletes rows early and irreversibly. One residual the minimum
+  cannot remove is documented on the function: a legacy zone west of UTC
+  renders the applied bound, so its own DST shift sits inside it and a
+  pre-switchover row written on standard time but pruned on summer time can go
+  up to that shift (an hour) early. The column carries no offset, so which of
+  the zone's two offsets wrote a given row is not recoverable from it.
 
 ### Fixed — Control ticks have their own GitHub quota (`VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS`)
 - `command_center/orchestrator/gh_access.py`: every `gh` call the review,

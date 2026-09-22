@@ -722,16 +722,17 @@ def retention_cutoff(db_path: Path, *, retention_days: int) -> tuple[str, str, s
 
     Nothing distinguishes the two by inspection — same format, same column —
     so the bound is the **earlier of the two candidate renderings**. That is
-    the only choice under which no row is deleted before `retention_days` have
-    truly elapsed on its own clock, whichever clock that was. Rendering only
-    UTC would shift the boundary forward by the legacy zone's offset (up to
-    ~14h) for every pre-switchover row and prune it that much early, which is
-    irreversible; rendering only the legacy zone would do the mirror image to
-    the UTC rows. The cost of taking the minimum is bounded and lands on the
-    safe side: on a database with a non-UTC legacy zone, rows may survive up to
-    that offset *longer* than the configured window. A file stamped `"UTC"`
-    (anything this code created) has one candidate in effect and gets the
-    window exactly.
+    the only choice under which neither set of rows is deleted a whole zone
+    offset before `retention_days` have elapsed on its own clock (one bounded
+    residual survives it — the DST note at the end of this docstring).
+    Rendering only UTC would shift the boundary forward by the legacy zone's
+    offset (up to ~14h) for every pre-switchover row and prune it that much
+    early, which is irreversible; rendering only the legacy zone would do the
+    mirror image to the UTC rows. The cost of taking the minimum is bounded
+    and lands on the safe side: on a database with a non-UTC legacy zone, rows
+    may survive up to that offset *longer* than the configured window. A file
+    stamped `"UTC"` (anything this code created) has one candidate in effect
+    and gets the window exactly.
 
     That cost does not expire on its own — the ledger records which zone the
     legacy rows are on, never when the last one was written, so the second
@@ -741,6 +742,21 @@ def retention_cutoff(db_path: Path, *, retention_days: int) -> tuple[str, str, s
     string and restores the exact window. It is deliberately their call and not
     an inference: the wrong guess here deletes rows early and irreversibly,
     which is the whole reason this function is conservative by default.
+
+    The one thing the minimum does **not** remove, named because this function
+    deletes: a legacy zone west of UTC renders the earlier bound itself, so
+    that zone's own DST shift falls inside the applied bound. A pre-switchover
+    row written on standard time and pruned while the zone is on summer time is
+    judged against a boundary an hour late and can go that much early. The
+    column holds no offset, so which of the zone's two offsets a given row was
+    written under is not recoverable — only the offset in force *now* is
+    knowable here, and one string compared in SQL cannot carry both. The
+    residual is therefore bounded by the zone's DST shift (an hour for every
+    zone that has one, against the up-to-~14h error the shared-clock rendering
+    would cause), it can only reach rows within that hour of the boundary, and
+    `AICC_RUNTIME_TZ=UTC` retires it with the rest of the legacy reading. East
+    of UTC the UTC candidate is the earlier bound, so the question does not
+    arise there at all.
 
     With no declared zone at all (a database that predates migration 24 and has
     not been migrated since) the process clock is the only guess available for

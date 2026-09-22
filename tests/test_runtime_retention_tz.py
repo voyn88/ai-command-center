@@ -448,3 +448,48 @@ def test_an_undeclared_database_is_never_pruned_past_its_old_bound(
 
     assert source in ("process-local", db.RETENTION_ZONE_SOURCE_UTC_FLOOR)
     assert cutoff <= process_clock_only
+
+
+def test_the_legacy_bound_still_carries_its_own_zones_dst_shift():
+    """The one residual the conservative minimum does *not* remove, pinned here
+    so the claim on `retention_cutoff` is checked rather than only asserted.
+
+    A legacy zone west of UTC renders the applied bound, and that zone's own
+    DST shift sits inside it: a pre-switchover row written on standard time but
+    judged while the zone is on summer time is compared against a boundary an
+    hour late. Which of the two offsets wrote a given row is not recoverable
+    from the column — it holds no offset — and one string compared in SQL
+    cannot carry both, so this is the floor of what a single cutoff can do.
+
+    Evaluated on an explicit `now` rather than through `retention_cutoff`,
+    which reads the real clock: the residual only appears when the retention
+    window spans a spring-forward, so a test against "now" would assert
+    something different in each season. The arithmetic below is the function's
+    own (`_cutoff_at` over `now.astimezone(zone)`), with `now` fixed three
+    weeks after the 2026 US transition.
+    """
+    zone = ZoneInfo(LEGACY_WEST)
+    now = datetime(2026, 4, 1, 12, 0, tzinfo=timezone.utc)  # PDT, UTC-7
+
+    legacy_cutoff = db._cutoff_at(now.astimezone(zone), RETENTION_DAYS)
+    utc_cutoff = db._cutoff_at(now, RETENTION_DAYS)
+    # West of UTC the legacy rendering is the earlier of the two, i.e. the one
+    # `retention_cutoff` would apply — otherwise this residual is not reachable.
+    assert legacy_cutoff < utc_cutoff
+
+    def stored(age: timedelta) -> str:
+        """What a pre-switchover writer on `LEGACY_WEST` recorded for a row of
+        exactly this age — on standard time, `age` before `now` being March."""
+        return _naive_in(now - age, LEGACY_WEST)
+
+    window = RETENTION_DAYS * timedelta(days=1)
+    dst_shift = timedelta(hours=1)
+    # Inside the window by less than the shift: deleted anyway. This is the
+    # residual, and its direction — early, not late. A change that closes it
+    # (rendering the legacy bound on the *lowest* offset the zone takes over
+    # the window) flips this assertion, and should: it would be a narrowing of
+    # what gets deleted, and this test then states the stronger guarantee.
+    assert stored(window - timedelta(minutes=30)) < legacy_cutoff
+    # Inside it by more than the shift: survives. This is the bound holding —
+    # the shortfall is the zone's DST shift and never more.
+    assert stored(window - dst_shift - timedelta(minutes=30)) > legacy_cutoff
