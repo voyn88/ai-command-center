@@ -20,8 +20,12 @@ Environment=GH_CONFIG_DIR=/var/lib/aicc/github/gh
 # a loop is a rate, and a total can only ever grow (VOYN-MON-WORKER-01-INFRA-
 # CRASH-LOOP). Comparing across ticks needs one file that outlives the tick,
 # and $STATE_DIRECTORY is the only writable path the ProtectSystem=strict
-# envelope below leaves -- so this line is what switches the probe on at all:
-# without it --unit-health refuses to start rather than measure nothing.
+# envelope below leaves -- so this line is what switches the rate half on at
+# all. REINSTALL THIS FILE AND `systemctl daemon-reload` when deploying the
+# commit that added it: self-deploy fast-forwards the checkout ExecStart runs
+# from and never touches /etc/systemd/system, so until that is done the tick
+# reports `crash_loop_unmeasured` (failed units, and every other probe, keep
+# measuring -- a stale unit file must not blind the whole monitor).
 # (It is a StateDirectory= and not a flag on the line below because that line
 # names an absolute home path, which a public repository cannot restate in an
 # added line -- scripts/ci/prepush/leak_guard.sh -- so unit-level knobs go in

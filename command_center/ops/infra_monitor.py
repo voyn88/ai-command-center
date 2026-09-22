@@ -239,6 +239,23 @@ class UnitHealthSnapshot:
     failed_units: tuple[tuple[str, int], ...]
     window_seconds: float = 0.0
     error: str | None = None
+    #: Set when the host WAS read but the rate half could not be judged --
+    #: today, only a tick with nowhere to remember its predecessor. Its own
+    #: failure code, because "no loop was measured" must never read as "no
+    #: loop", and the failed-unit half needs no memory and keeps reporting.
+    crash_loop_error: str | None = None
+
+
+#: Why the rate half is unmeasured when the tick has nowhere to remember.
+#: The code reaches worker-01 the moment self-deploy fast-forwards the
+#: checkout that `ExecStart` runs from; `/etc/systemd/system` is not in that
+#: checkout and does not move with it, so there is a window in which new code
+#: reads an old unit file with no `StateDirectory=`. The probe says exactly
+#: what closes the window rather than assuming it never opens.
+CRASH_LOOP_STATE_UNSET = (
+    "no crash-loop state path: reinstall deploy/systemd/voyn-infra-monitor.service"
+    " (StateDirectory=) and run `systemctl daemon-reload`"
+)
 
 
 #: How many units a finding's detail names before it says `+N more`: the
@@ -689,13 +706,16 @@ def evaluate_unit_health(
     units: dict[str, UnitState],
     *,
     crash_loop_restarts: int,
-    history: RestartHistory,
+    history: RestartHistory | None,
     window_seconds: float,
 ) -> UnitHealthSnapshot:
     """Judge the host from this tick's units and the window of ticks behind it.
 
     ``history`` must already include this tick (``RestartHistory.observe``);
     the crash-loop verdict is the gain across it, never the lifetime counter.
+    ``None`` means this tick had nowhere to remember its predecessor, so there
+    is no rate to judge: the failed-unit half still reports (it needs no
+    memory) and the rate half reports that it did not measure.
     """
     if crash_loop_restarts < 1:
         raise ValueError("crash_loop_restarts must be at least 1")
@@ -703,10 +723,11 @@ def evaluate_unit_health(
         raise ValueError("crash_loop_window_seconds must be positive")
     loops: dict[str, int] = {}
     failed: dict[str, int] = {}
-    for unit in history.samples:
-        gained = history.gained(unit)
-        if gained >= crash_loop_restarts:
-            loops[unit] = gained
+    if history is not None:
+        for unit in history.samples:
+            gained = history.gained(unit)
+            if gained >= crash_loop_restarts:
+                loops[unit] = gained
     for unit, state in units.items():
         if state.active_state == "failed":
             key = _template_name(unit)
@@ -715,6 +736,7 @@ def evaluate_unit_health(
         crash_loops=tuple(sorted(loops.items())),
         failed_units=tuple(sorted(failed.items())),
         window_seconds=window_seconds,
+        crash_loop_error=None if history is not None else CRASH_LOOP_STATE_UNSET,
     )
 
 
@@ -729,7 +751,7 @@ def _unit_listing(entries: tuple[tuple[str, int], ...], *, sign: str = "") -> st
 def read_unit_health_snapshot(
     *,
     crash_loop_restarts: int,
-    state_path: Path,
+    state_path: Path | None,
     window_seconds: float,
     now: float | None = None,
 ) -> UnitHealthSnapshot:
@@ -737,7 +759,10 @@ def read_unit_health_snapshot(
 
     The counters read here are folded into ``state_path`` before they are
     judged, because the verdict is a rate across ticks and this process lives
-    for one tick.
+    for one tick. ``None`` -- a unit file without ``StateDirectory=``, which is
+    what a host looks like between a self-deploy and the unit's reinstall --
+    still reads the host and still reports failed units; only the rate half
+    goes unmeasured, and says so (``CRASH_LOOP_STATE_UNSET``).
     """
     moment = time.time() if now is None else now
     try:
@@ -780,15 +805,17 @@ def read_unit_health_snapshot(
             raise RuntimeError(
                 f"systemctl show returned {len(units)} of {len(names)} units"
             )
-        history = RestartHistory.load(state_path).observe(
-            collapse_restart_counters(units),
-            now=moment,
-            window_seconds=window_seconds,
-        )
-        # Saved before the verdict: a tick that cannot leave a baseline behind
-        # is a tick that makes every FUTURE tick blind, so it fails closed here
-        # rather than reporting a confident "no loops" forever.
-        history.save(state_path)
+        history = None
+        if state_path is not None:
+            history = RestartHistory.load(state_path).observe(
+                collapse_restart_counters(units),
+                now=moment,
+                window_seconds=window_seconds,
+            )
+            # Saved before the verdict: a tick that cannot leave a baseline
+            # behind is a tick that makes every FUTURE tick blind, so it fails
+            # closed here rather than reporting a confident "no loops" forever.
+            history.save(state_path)
         return evaluate_unit_health(
             units,
             crash_loop_restarts=crash_loop_restarts,
@@ -1051,6 +1078,13 @@ def evaluate(
                     f"failed_units:{len(unit_health.failed_units)}"
                     f":{_unit_listing(unit_health.failed_units)}"
                 )
+            if unit_health.crash_loop_error is not None:
+                # Never `crash_loop`: that key is a measured loop, and an
+                # operator who sees it goes looking for a looping unit. This
+                # one is the probe reporting that it judged no rate at all.
+                failures.append(
+                    f"crash_loop_unmeasured:{unit_health.crash_loop_error}"
+                )
 
     if deploy_lag is not None:
         if deploy_lag.error is not None:
@@ -1113,16 +1147,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if bool(args.deploy_lag_repo) != bool(args.deploy_lag_version_url):
         parser.error("--deploy-lag-repo and --deploy-lag-version-url must be given together")
-    if args.unit_health and not args.crash_loop_state:
-        # Same class as the half-configured deploy-lag probe above: a probe
-        # that cannot remember the previous tick cannot measure a rate, and
-        # saying so at startup is better than a probe that reports "no crash
-        # loops" on every tick forever.
-        parser.error(
-            "--unit-health needs --crash-loop-state PATH (or $STATE_DIRECTORY "
-            "from the unit's StateDirectory=): a crash loop is restarts per "
-            "window, and the window spans ticks"
-        )
+    # `--unit-health` without a state path is deliberately NOT a usage error,
+    # unlike the half-configured deploy-lag probe above. Those flags are typed
+    # on one ExecStart line and are wrong together or right together; this path
+    # comes from a DIFFERENT file, on a different deploy path -- self-deploy
+    # fast-forwards the checkout `ExecStart` runs from, and nothing in that
+    # checkout updates `/etc/systemd/system`. Exiting 2 there would take the
+    # worker, queue, Prometheus, deploy-lag and PR-window probes down with the
+    # rate half and record nothing at all, turning one unmeasurable verdict
+    # into a blind host -- the exact silence this module exists to prevent.
+    # The probe reports `crash_loop_unmeasured` instead: still fail-closed,
+    # still a finding, and every other probe still measures.
     return args
 
 
@@ -1231,7 +1266,9 @@ def build_parser() -> argparse.ArgumentParser:
             "JSON file holding the previous ticks' restart counters, because "
             "the window spans ticks and one tick is one process. Defaults to "
             "$STATE_DIRECTORY/unit-restarts.json, which is how the unit's "
-            "StateDirectory= turns it on."
+            "StateDirectory= turns it on. Without one, --unit-health still "
+            "reports failed units and reports the rate half as unmeasured; it "
+            "never reports a confident \"no crash loops\"."
         ),
     )
     parser.add_argument(
@@ -1329,7 +1366,9 @@ def main(argv: list[str] | None = None) -> int:
         unit_health = (
             read_unit_health_snapshot(
                 crash_loop_restarts=args.crash_loop_restarts,
-                state_path=Path(args.crash_loop_state),
+                state_path=(
+                    Path(args.crash_loop_state) if args.crash_loop_state else None
+                ),
                 window_seconds=args.crash_loop_window_seconds,
             )
             if args.unit_health

@@ -1277,20 +1277,95 @@ def test_a_corrupt_state_file_costs_one_window_but_an_unwritable_one_fails_close
     assert any(f.startswith("unit_health_probe_failed:") for f in report.failures)
 
 
-def test_unit_health_without_a_state_path_is_a_usage_error(monkeypatch) -> None:
-    """A probe that cannot remember the previous tick cannot measure a rate:
-    argparse says so at startup instead of reporting a confident "no loops"."""
-    monkeypatch.delenv("STATE_DIRECTORY", raising=False)
-    with pytest.raises(SystemExit):
-        infra_monitor.parse_args(["--prometheus-url", "http://m/ready", "--unit-health"])
-
-    # systemd's StateDirectory= is how the unit turns it on; the list form is
-    # what systemd actually exports.
+def test_the_state_path_comes_from_the_units_state_directory(monkeypatch) -> None:
+    """systemd exports a colon-separated list; the first entry is this unit's
+    own state root, and nothing else on the monitor's filesystem is writable."""
     monkeypatch.setenv("STATE_DIRECTORY", "/var/lib/voyn-infra-monitor:/var/lib/other")
     assert (
         infra_monitor.default_crash_loop_state()
         == "/var/lib/voyn-infra-monitor/unit-restarts.json"
     )
+
+    monkeypatch.delenv("STATE_DIRECTORY", raising=False)
+    assert infra_monitor.default_crash_loop_state() == ""
+
+
+def test_a_unit_file_older_than_the_code_does_not_blind_the_whole_monitor(
+    monkeypatch, capsys
+) -> None:
+    """The regression that guards the rate fix's own deploy.
+
+    `--crash-loop-state` does not come from the ExecStart line -- it comes from
+    the unit's `StateDirectory=`, in `/etc/systemd/system`, which self-deploy
+    never touches: it fast-forwards the checkout ExecStart runs from and stops
+    there. So every host runs new code against an old unit file until an
+    operator reinstalls it. Refusing to start there (argparse exit 2, no JSON,
+    no findings recorded) would take the worker, queue, Prometheus, deploy-lag
+    and PR-window probes down with the rate half and leave the host measured by
+    nothing at all -- strictly worse than the lifetime-counter bug this branch
+    set out to fix, and the acceptance it is judged by ("the monitor reports ok
+    for 24h") unreachable either way.
+
+    So: the tick runs, every other probe reports, the failed-unit half still
+    reports (it needs no memory), and the rate half says it did not measure --
+    under its OWN failure code, never `crash_loop`, which an operator reads as
+    a real looping unit.
+    """
+    monkeypatch.delenv("STATE_DIRECTORY", raising=False)
+    monkeypatch.setattr(infra_monitor, "prometheus_is_ready", lambda _url: True)
+    monkeypatch.setattr(
+        infra_monitor.subprocess,
+        "run",
+        _systemctl_stub({"ollama.service": 315891, "voyn-canary.service": 70305}),
+    )
+
+    args = infra_monitor.parse_args(
+        ["--prometheus-url", "http://m/ready", "--unit-health"]
+    )
+    assert args.crash_loop_state == ""
+
+    result = infra_monitor.main(
+        [
+            "--skip-workers", "--skip-queue", "--minimum-active-workers", "0",
+            "--prometheus-url", "http://m/ready",
+            "--unit-health",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert result == 1
+    assert payload["prometheus_ready"] is True
+    # Unmeasured is its own class, and it never masquerades as a measured loop.
+    assert payload["unit_health"]["crash_loops"] == []
+    assert [f.split(":", 1)[0] for f in payload["failures"]] == [
+        "crash_loop_unmeasured"
+    ]
+    assert infra_monitor.finding_key(payload["failures"][0]) == "crash_loop_unmeasured"
+    assert "daemon-reload" in payload["failures"][0]
+
+
+def test_without_a_state_path_the_failed_unit_half_still_reports() -> None:
+    """Failed units need no memory of the previous tick, so a stale unit file
+    must not cost them either."""
+    units = {
+        "ollama.service": infra_monitor.UnitState(restarts=315891, active_state="failed")
+    }
+    snapshot = infra_monitor.evaluate_unit_health(
+        units, crash_loop_restarts=THRESHOLD, history=None, window_seconds=WINDOW
+    )
+
+    assert snapshot.crash_loops == ()
+    assert snapshot.failed_units == (("ollama.service", 1),)
+    assert snapshot.crash_loop_error == infra_monitor.CRASH_LOOP_STATE_UNSET
+
+    report = infra_monitor.evaluate(
+        {}, None, minimum_active_workers=0, max_stalled_seconds=900,
+        prometheus_ready=True, unit_health=snapshot,
+    )
+    assert [f.split(":", 1)[0] for f in report.failures] == [
+        "failed_units",
+        "crash_loop_unmeasured",
+    ]
 
 
 def test_the_monitor_unit_gives_the_crash_loop_probe_somewhere_to_remember() -> None:
