@@ -543,8 +543,10 @@ _WORKER_FUNCTIONS = (
     "queue_fail_lease_wait(text, text, text, integer)",
     # A sibling refund path for host/launcher/provider infrastructure
     # failures. These are not task attempts, but must still be bounded under
-    # their own wait budget.
-    "queue_fail_infra_wait(text, text, text, integer)",
+    # their own wait budget. The trailing jsonb (0025) is the caller's own
+    # evidence for the audit row -- which executor is out of quota and until
+    # when this worker withholds it -- and defaults to NULL.
+    "queue_fail_infra_wait(text, text, text, integer, jsonb)",
 )
 
 # Deliberately not `queue_claim`: only a role that PostgreSQL authenticated as a

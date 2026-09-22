@@ -1,9 +1,11 @@
+import json
 import os
 import signal
 import subprocess
 import sys
 import threading
 import time
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -1267,3 +1269,231 @@ def test_a_codex_task_failure_without_a_signature_stays_a_task_failure():
 def test_an_unknown_executor_never_matches_free_text_signatures():
     run = _provider_error_run(stderr="unauthorized")
     assert run.is_executor_provider_error("claude") is False
+
+
+# ---------------------------------------------------------------------------
+# Quota-exhaustion recognition and the worker-local circuit it opens
+# (VOYN-W0-AICC-EXECUTOR-QUOTA-AWARE-ROUTING).
+#
+# These are two different controls over the same incident class and the tests
+# keep them apart deliberately. `is_executor_provider_error` decides ONE
+# attempt's failover and may read broadly. `executor_quota_signature` licenses
+# a circuit that withholds an executor from every later task on this host, so
+# its read scope is narrow -- the structured refusal field for Claude, the
+# tail of stderr for the free-text CLIs -- and the tests below exist mostly to
+# pin what it must NOT match.
+# ---------------------------------------------------------------------------
+
+
+def test_codex_quota_refusal_on_stderr_is_a_quota_signature():
+    run = _provider_error_run(
+        stderr=(
+            "ERROR: You've hit your usage limit. Visit "
+            "https://chatgpt.com/codex/settings/usage to purchase more credits "
+            "or try again at Sep 15th, 2026 1:24 AM."
+        )
+    )
+    assert run.executor_quota_signature("codex") == "hit your usage limit"
+
+
+def test_copilot_monthly_quota_refusal_is_a_quota_signature():
+    run = _provider_error_run(
+        exit_code=4, stderr="You have exceeded your monthly quota for premium requests."
+    )
+    assert run.executor_quota_signature("copilot") == "exceeded your monthly quota"
+
+
+def test_a_copilot_rate_limit_is_not_quota_exhaustion():
+    """`rate limit` is a per-minute throttle the next attempt clears -- it is
+    in the broad failover list on purpose, and out of the circuit's list for
+    the same reason: withholding the account for half an hour over a throttle
+    would starve a healthy executor."""
+    run = _provider_error_run(exit_code=4, stderr="rate limit exceeded; slow down")
+    assert run.is_executor_provider_error("copilot") is True
+    assert run.executor_quota_signature("copilot") is None
+
+
+def test_a_transcript_quoting_a_quota_message_never_opens_the_circuit():
+    """The defect this detector was rewritten for (independent review of
+    #705): matching the whole stdout+stderr of a run means any failed attempt
+    whose TRANSCRIPT echoes a quota phrase -- an agent printing
+    `tests/fixtures/fake_codex.py`, a review quoting this file -- withholds a
+    healthy account from every later task on the host. Only the refusal
+    channel may open the circuit."""
+    run = _provider_error_run(
+        stdout=(
+            "I read tests/fixtures/fake_codex.py, which prints "
+            '"usage limit reached; check your quota" for the quota scenario.'
+        ),
+        stderr="pytest exited 1: 3 assertions did not hold",
+    )
+    assert run.executor_quota_signature("codex") is None
+
+
+def test_only_the_tail_of_stderr_can_open_the_circuit():
+    """A CLI prints its terminal refusal last. An unbounded read would let a
+    quota phrase that a long run merely echoed early on -- tool output, a
+    quoted file -- decide the routing of every later task."""
+    refusal = "ERROR: You've hit your usage limit. Try again later."
+    echoed_early = _provider_error_run(
+        stderr="usage limit reached (quoted from the fixture)\n" + "log line\n" * 5000
+    )
+    assert echoed_early.executor_quota_signature("codex") is None
+    printed_last = _provider_error_run(stderr="log line\n" * 5000 + refusal)
+    assert printed_last.executor_quota_signature("codex") == "hit your usage limit"
+
+
+def test_a_completed_run_is_never_a_quota_signature():
+    run = _provider_error_run(
+        status="completed",
+        exit_code=0,
+        stderr="note: the account had exceeded your monthly quota last week",
+    )
+    assert run.executor_quota_signature("copilot") is None
+
+
+def test_an_absent_stderr_is_not_a_crash_in_the_failure_path():
+    """`RunResult` is constructed from whatever the launcher returned, and a
+    routing helper that raises on a missing stream would raise exactly when an
+    executor has already failed (independent review of #872)."""
+    run = agent_runner.RunResult(
+        status="failed",
+        exit_code=1,
+        stdout="",
+        stderr=None,  # type: ignore[arg-type]
+        duration_seconds=1.0,
+        started_at="t0",
+        completed_at="t1",
+    )
+    assert run.executor_quota_signature("codex") is None
+
+
+def test_claude_reads_its_structured_refusal_field_not_free_text():
+    """Claude's session cap arrives as the CLI's own structured payload. Free
+    text carrying the same words, with none of those fields set, is a task
+    transcript and must not open the circuit."""
+    structured = _provider_error_run(
+        stdout=json.dumps(
+            {
+                "is_error": True,
+                "api_error_status": 429,
+                "terminal_reason": "api_error",
+                "result": "You've hit your session limit · resets 4:10pm (UTC)",
+                "type": "result",
+            }
+        )
+    )
+    assert structured.executor_quota_signature("claude") == "hit your session limit"
+
+    free_text = _provider_error_run(
+        stdout="the run died after the account hit your session limit",
+        stderr="You've hit your session limit",
+    )
+    assert free_text.executor_quota_signature("claude") is None
+
+
+def test_a_claude_api_error_that_is_not_a_quota_refusal_stays_an_attempt_failure():
+    """An overloaded/5xx API error is infrastructure for THIS attempt (the
+    existing provider check says so) but says nothing about the account's
+    quota, so it must not withhold Claude from later tasks."""
+    run = _provider_error_run(
+        stdout=json.dumps(
+            {
+                "is_error": True,
+                "api_error_status": 529,
+                "result": "API Error: 529 overloaded_error",
+                "type": "result",
+            }
+        )
+    )
+    assert run.is_executor_provider_error("claude") is True
+    assert run.executor_quota_signature("claude") is None
+
+
+def test_an_executor_with_no_quota_vocabulary_never_matches():
+    run = _provider_error_run(stderr="You've hit your usage limit")
+    assert run.executor_quota_signature("openai_http") is None
+
+
+def test_the_quota_circuit_opens_withholds_and_reopens_on_its_own():
+    opened = datetime(2026, 9, 22, 12, 0, tzinfo=UTC)
+    until = agent_runner.record_executor_exhausted(
+        "codex", cooldown_seconds=1800, now=opened
+    )
+    assert until == opened + timedelta(seconds=1800)
+    assert agent_runner.executor_exhausted_until("codex", now=opened) == until
+    # Self-clearing on read: no timer thread, no operator action.
+    assert (
+        agent_runner.executor_exhausted_until(
+            "codex", now=opened + timedelta(seconds=1801)
+        )
+        is None
+    )
+    assert agent_runner._executor_exhausted_until == {}
+
+
+def test_an_open_circuit_is_extended_never_shortened():
+    """A second refusal inside an open window says the account is still
+    exhausted. Taking the later refusal's shorter deadline would pull the
+    reopening forward into the same exhausted pool."""
+    opened = datetime(2026, 9, 22, 12, 0, tzinfo=UTC)
+    long_window = agent_runner.record_executor_exhausted(
+        "claude", cooldown_seconds=3600, now=opened
+    )
+    short_window = agent_runner.record_executor_exhausted(
+        "claude", cooldown_seconds=60, now=opened + timedelta(seconds=30)
+    )
+    assert short_window == long_window
+    assert agent_runner.executor_exhausted_until("claude", now=opened) == long_window
+
+
+def test_the_circuit_can_be_closed_by_hand_for_one_executor_or_all():
+    now = datetime(2026, 9, 22, 12, 0, tzinfo=UTC)
+    agent_runner.record_executor_exhausted("codex", cooldown_seconds=600, now=now)
+    agent_runner.record_executor_exhausted("copilot", cooldown_seconds=600, now=now)
+    agent_runner.clear_executor_exhaustion("codex")
+    assert agent_runner.executor_exhausted_until("codex", now=now) is None
+    assert agent_runner.executor_exhausted_until("copilot", now=now) is not None
+    agent_runner.clear_executor_exhaustion()
+    assert agent_runner.executor_exhausted_until("copilot", now=now) is None
+
+
+@pytest.mark.parametrize(
+    "configured,expected",
+    [("60", 60.0), ("", 1800.0), ("not-a-number", 1800.0), ("0", 1800.0), ("-5", 1800.0)],
+)
+def test_the_cooldown_env_override_fails_back_to_the_default(
+    monkeypatch, configured, expected
+):
+    """A typo'd or zero override must not silently disable the circuit, nor
+    park an executor on a negative deadline."""
+    monkeypatch.setenv(agent_runner.EXECUTOR_QUOTA_COOLDOWN_ENV, configured)
+    now = datetime(2026, 9, 22, 12, 0, tzinfo=UTC)
+    until = agent_runner.record_executor_exhausted("codex", now=now)
+    assert until == now + timedelta(seconds=expected)
+
+
+def test_a_quota_refusal_during_the_codex_probe_opens_the_quota_circuit(monkeypatch):
+    """The workspace-write probe is a real Codex invocation, and its negative
+    result is deliberately NOT cached for transient failures -- so without
+    this, every later mutating dispatch re-probes into the same exhausted
+    account. The bounded quota circuit is what it opens; the permanent
+    sandbox circuit stays closed, because a quota window cures itself."""
+    monkeypatch.setattr(agent_runner.shutil, "which", lambda _binary: "/usr/bin/codex")
+    monkeypatch.setattr(agent_runner, "_codex_workspace_write_preflight_result", None)
+    monkeypatch.setattr(
+        agent_runner,
+        "run_claude_code",
+        lambda **_kwargs: _provider_error_run(
+            stderr="ERROR: You've hit your usage limit. Try again at Sep 15th."
+        ),
+    )
+
+    ok, reason = agent_runner.codex_workspace_write_preflight()
+
+    assert ok is False
+    assert "preflight failed" in reason
+    assert agent_runner.executor_exhausted_until("codex") is not None
+    assert agent_runner._codex_workspace_write_preflight_result is None, (
+        "an exhausted account must not pin a permanent sandbox negative"
+    )

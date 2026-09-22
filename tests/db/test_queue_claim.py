@@ -1153,6 +1153,98 @@ def test_infra_wait_failure_refunds_attempt_count_and_uses_its_own_budget(
         assert cur.fetchone()[0] == 1
 
 
+def test_infra_wait_merges_the_callers_detail_into_the_audit_row(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """0025: the refund's own counters say an attempt was given back; only the
+    caller can say WHY. A refusal writes no `work_result` row -- `queue_complete`
+    is the only path that does -- so quota-aware routing's evidence (which
+    executor is exhausted, until when this worker withholds it) travels in the
+    audit row's detail. The server-decided counters are applied last and cannot
+    be overwritten by the caller.
+    """
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
+    with psycopg.connect(app_dsn, autocommit=True) as app:
+        item_id = _enqueue(app, "infra-detail", max_attempts=1, backoff_seconds=0)
+
+    quota = json.dumps(
+        {
+            "executor_quota": {
+                "exhausted": [
+                    {
+                        "executor": "codex",
+                        "signature": "hit your usage limit",
+                        "exhausted_until": "2026-09-22T12:30:00+00:00",
+                    }
+                ]
+            },
+            # A caller must not be able to rewrite the counters the server
+            # decided; this key is applied first and then overwritten.
+            "infra_wait_count": 99,
+        }
+    )
+    with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
+        with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+            token, token_hash = _token()
+            verdict = _claim(worker, token_hash)
+            assert _call(
+                worker,
+                "SELECT ok, reason FROM queue_fail_infra_wait(%s, %s, %s, 2, %s::jsonb)",
+                (verdict[3], token, "executor infrastructure failure: out of quota", quota),
+            ) == (True, "infra_wait_requeued")
+
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "SELECT detail FROM work_event WHERE work_item_id = %s AND reason = %s",
+            (item_id, "infra_wait_requeued"),
+        )
+        detail = cur.fetchone()[0]
+    if isinstance(detail, str):
+        detail = json.loads(detail)
+    assert detail["executor_quota"]["exhausted"][0]["exhausted_until"] == (
+        "2026-09-22T12:30:00+00:00"
+    )
+    assert detail["infra_wait_count"] == 1, "the server decides the counters"
+    assert detail["max_infra_waits"] == 2
+
+
+def test_infra_wait_still_audits_without_a_caller_detail(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """The argument defaults to NULL, so a pre-0025 four-argument call (a
+    worker mid-rolling-deploy) resolves to the same function and writes the
+    row it wrote before."""
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
+    with psycopg.connect(app_dsn, autocommit=True) as app:
+        item_id = _enqueue(app, "infra-no-detail", max_attempts=1, backoff_seconds=0)
+
+    with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
+        with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+            token, token_hash = _token()
+            verdict = _claim(worker, token_hash)
+            assert _call(
+                worker,
+                "SELECT ok, reason FROM queue_fail_infra_wait(%s, %s, %s, 2)",
+                (verdict[3], token, "executor infrastructure failure: socket inactive"),
+            ) == (True, "infra_wait_requeued")
+
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "SELECT detail FROM work_event WHERE work_item_id = %s AND reason = %s",
+            (item_id, "infra_wait_requeued"),
+        )
+        detail = cur.fetchone()[0]
+    if isinstance(detail, str):
+        detail = json.loads(detail)
+    assert detail == {
+        "infra_wait_count": 1,
+        "max_infra_waits": 2,
+        "attempt_count": 0,
+    }
+
+
 def test_the_dead_letter_view_preserves_the_cause_and_the_history(
     admin_conn, psycopg, test_dsn, role_passwords
 ):

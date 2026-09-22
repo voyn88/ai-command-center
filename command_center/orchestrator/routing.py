@@ -20,6 +20,17 @@ redrive (``queue_redrive``) widens ``max_attempts`` without resetting
 within one pass through the cascade; the wrap is what makes a redrive's
 fresh attempts walk the cascade again instead of dead-ending on the last
 link every time (VOYN-W0-AICC-REDRIVE-CLAMP-RESETS-TO-LAST-LINK).
+
+This table stays STATIC in the other sense too: an executor whose account is
+out of quota is not withdrawn from it. Quota is a fact about a credential on
+one host at one moment, discovered by running the CLI there and cured by a
+rolling window nobody can observe from the control plane, so it is held where
+it is discovered -- `agent_runner.record_executor_exhausted`, consulted by
+`worker.handlers._executor_preflight`, which skips the exhausted link inside
+a delivery the worker already holds rather than spending an attempt on it
+(VOYN-W0-AICC-EXECUTOR-QUOTA-AWARE-ROUTING). Editing this table to route
+around an exhausted account would outlive the exhaustion and would need a
+second edit to undo; the circuit reopens on its own.
 """
 
 from __future__ import annotations

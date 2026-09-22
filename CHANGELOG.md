@@ -8,6 +8,34 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Added — Quota-aware executor routing (`VOYN-W0-AICC-EXECUTOR-QUOTA-AWARE-ROUTING`)
+- `command_center/agent_runner.py`: `RunResult.executor_quota_signature`
+  recognises an executor's own "this account is out of quota" refusal
+  (Claude's session cap, Codex's usage limit, Copilot's monthly quota /
+  credit pool) and `record_executor_exhausted` opens a bounded, self-clearing
+  worker-local circuit against that executor (30 minutes by default,
+  `AICC_EXECUTOR_QUOTA_COOLDOWN_SECONDS`). The detector is deliberately
+  narrower than the attempt-level `is_executor_provider_error` in both
+  vocabulary and read scope -- Claude's structured refusal field, the tail of
+  stderr for the free-text CLIs -- because it licenses a cross-task action: a
+  transcript that merely quotes a quota message must never withhold a healthy
+  account from every later task on the host.
+- `command_center/worker/handlers.py`: `_executor_preflight` reports an open
+  circuit as unavailability, so the cascade skips the exhausted link INSIDE
+  the delivery the worker already holds. No attempt is spent rediscovering an
+  exhaustion the last refusal established; when no link can run, the refusal
+  routes to the infra-wait refund (0024) rather than to the task's own
+  attempt budget. The Codex workspace-write probe records a quota refusal the
+  same way, instead of re-probing the exhausted account on every mutating
+  dispatch.
+- `0025_infra_wait_quota_detail`: `queue_fail_infra_wait` takes an optional
+  `jsonb` detail, merged into the `work_event` audit row under the counters
+  it cannot overwrite. A refusal writes no result row, so this is how
+  "executor X is out of quota until T" and "these links were skipped without
+  spending an attempt" reach the audit trail. The argument defaults to NULL,
+  so a pre-0025 caller writes exactly the row it wrote before.
+
+
 ### Fixed — Control ticks have their own GitHub quota (`VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS`)
 - `command_center/orchestrator/gh_access.py`: every `gh` call the review,
   merge and PR-window ticks make now runs under the `voyn-aicc-fleet` App's

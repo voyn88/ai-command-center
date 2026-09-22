@@ -46,6 +46,22 @@ os.environ["AICC_DATA_DIR"] = str(_TEST_DATA_DIR)
 
 
 @pytest.fixture(autouse=True)
+def clear_executor_quota_circuit():
+    """The quota circuit (`agent_runner.record_executor_exhausted`) is
+    worker-process-local state that outlives a single dispatch on purpose --
+    that is the whole point of it. A test session is one such process, so a
+    test that exercises a quota refusal would otherwise withhold that
+    executor from every test that ran after it, in file order. Cleared on
+    both sides so neither a leftover circuit nor one this test opened can
+    decide another test's routing."""
+    from command_center import agent_runner
+
+    agent_runner.clear_executor_exhaustion()
+    yield
+    agent_runner.clear_executor_exhaustion()
+
+
+@pytest.fixture(autouse=True)
 def clear_provider_probe_cache():
     """Provider availability is memoized for a short TTL (see
     `runtime.providers._PROBE_CACHE_TTL_SECONDS`). Tests install and remove fake

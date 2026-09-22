@@ -2656,3 +2656,249 @@ def test_read_only_isolated_checkout_packs_refs_after_a_wholesale_pr_fetch(
     loose_dirs = [p for p in loose.iterdir() if p.is_dir()] if loose.exists() else []
     assert loose_dirs == [], loose_dirs
     handlers_module._remove_read_only_isolated_checkout(target)
+
+
+# ---------------------------------------------------------------------------
+# Quota-aware routing (VOYN-W0-AICC-EXECUTOR-QUOTA-AWARE-ROUTING): a quota
+# refusal is a fact about the ACCOUNT, so it must outlive the delivery that
+# discovered it. The next delivery skips the exhausted link at preflight --
+# which is the whole point: the skip happens inside a delivery the worker
+# already holds, so no attempt is spent rediscovering an exhaustion the last
+# refusal already established.
+# ---------------------------------------------------------------------------
+
+
+def _codex_quota_run(**kwargs):
+    return agent_runner.RunResult(
+        status="failed",
+        exit_code=1,
+        stdout="",
+        stderr=(
+            "ERROR: You've hit your usage limit. Visit "
+            "https://chatgpt.com/codex/settings/usage to purchase more credits "
+            "or try again at Sep 15th, 2026 1:24 AM."
+        ),
+        duration_seconds=0.1,
+        started_at="2026-09-22T12:00:00+00:00",
+        completed_at="2026-09-22T12:00:03+00:00",
+    )
+
+
+def test_a_quota_refusal_opens_the_circuit_and_reports_when_it_reopens(
+    handler, monkeypatch
+):
+    run_agent, runs = handler
+
+    def failed_codex(**kwargs):
+        runs.append(kwargs)
+        return _codex_quota_run()
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", failed_codex)
+    payload = _cascade_payload()
+    payload["cascade"] = [{"executor": "codex", "task_type": "review"}]
+
+    outcome = run_agent(payload, _event(), 1)
+
+    assert not outcome.ok and outcome.retryable and outcome.infra_wait
+    assert agent_runner.executor_exhausted_until("codex") is not None
+    exhausted = outcome.detail["executor_quota"]["exhausted"]
+    assert [entry["executor"] for entry in exhausted] == ["codex"]
+    assert exhausted[0]["signature"] == "hit your usage limit"
+    assert (
+        exhausted[0]["exhausted_until"]
+        == agent_runner.executor_exhausted_until("codex").isoformat()
+    )
+    # The same instant is legible without a jsonb reader, in the text the
+    # refund writes to `work_attempt.outcome_reason`.
+    assert f"codex quota exhausted until {exhausted[0]['exhausted_until']}" in (
+        outcome.reason
+    )
+
+
+def test_a_later_task_skips_the_exhausted_link_without_running_it(
+    handler, monkeypatch
+):
+    """The acceptance criterion: the second delivery neither launches the
+    exhausted executor nor spends an attempt on it -- it runs the healthy
+    link inside the delivery it already holds and succeeds."""
+    run_agent, runs = handler
+
+    def codex_quota_then_claude(**kwargs):
+        runs.append(kwargs)
+        if kwargs["executor"] == "codex":
+            return _codex_quota_run()
+        return agent_runner.RunResult(
+            status="completed",
+            exit_code=0,
+            stdout='{"result": "done"}',
+            stderr="",
+            duration_seconds=0.1,
+            started_at="2026-09-22T12:00:04+00:00",
+            completed_at="2026-09-22T12:00:05+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", codex_quota_then_claude)
+    payload = _cascade_payload()
+    payload["cascade"] = [
+        {"executor": "codex", "task_type": "review"},
+        {"executor": "claude", "task_type": "review"},
+    ]
+
+    first = run_agent(payload, _event(), 1)
+    assert first.ok
+    assert [run["executor"] for run in runs] == ["codex", "claude"]
+
+    runs.clear()
+    # A DIFFERENT task, delivered afterwards on this worker: the circuit is
+    # the executor's, not the item's.
+    second_payload = _cascade_payload()
+    second_payload["backlog_task_id"] = "VOYN-W0-OTHER-TASK"
+    second_payload["cascade"] = payload["cascade"]
+    second = run_agent(second_payload, _event(), 1)
+
+    assert second.ok
+    assert [run["executor"] for run in runs] == ["claude"], (
+        "the exhausted executor must not be launched again"
+    )
+    assert second.result["cascade_step"] == 2
+    assert second.result["executor_quota_skips"] == [
+        {
+            "cascade_step": 1,
+            "executor": "codex",
+            "exhausted_until": agent_runner.executor_exhausted_until(
+                "codex"
+            ).isoformat(),
+        }
+    ]
+
+
+def test_a_cascade_of_only_exhausted_links_refunds_the_attempt(handler, monkeypatch):
+    """Every link out of quota is a fact about the substrate, not the task:
+    the refusal routes to the infra-wait refund (`daemon.HandlerOutcome.
+    infra_wait`), so the item's own attempt budget is untouched and the
+    audit row carries the deadline the worker is waiting on."""
+    run_agent, runs = handler
+    monkeypatch.setattr(agent_runner, "run_claude_code", lambda **kwargs: None)
+    until = agent_runner.record_executor_exhausted("codex", cooldown_seconds=1800)
+    agent_runner.record_executor_exhausted("claude", cooldown_seconds=1800)
+
+    payload = _cascade_payload()
+    payload["cascade"] = [
+        {"executor": "codex", "task_type": "review"},
+        {"executor": "claude", "task_type": "review"},
+    ]
+    outcome = run_agent(payload, _event(), 1)
+
+    assert not outcome.ok and outcome.retryable and outcome.infra_wait
+    assert runs == [], "no executor may be launched while every link is exhausted"
+    assert "quota exhausted" in outcome.reason
+    skipped = outcome.detail["executor_quota"]["skipped"]
+    assert {entry["executor"] for entry in skipped} == {"codex", "claude"}
+    assert skipped[0]["exhausted_until"] == until.isoformat()
+
+
+def test_a_lapsed_circuit_puts_the_executor_back_in_the_cascade(handler, monkeypatch):
+    run_agent, runs = handler
+    # Opened with a window that has already closed by the time the delivery
+    # reads it: the preflight's own read is what clears it.
+    agent_runner.record_executor_exhausted(
+        "codex", cooldown_seconds=1, now=datetime(2020, 1, 1, tzinfo=UTC)
+    )
+    payload = _cascade_payload()
+    payload["cascade"] = [{"executor": "codex", "task_type": "review"}]
+
+    outcome = run_agent(payload, _event(), 1)
+
+    assert outcome.ok
+    assert [run["executor"] for run in runs] == ["codex"]
+    assert outcome.result["executor_quota_skips"] == []
+
+
+def test_a_transcript_that_quotes_a_quota_message_never_opens_the_circuit(
+    handler, monkeypatch
+):
+    """The two controls keep their own blast radii.
+
+    A failed attempt whose own transcript echoes a quota phrase still routes
+    as a provider failure for THIS attempt -- that is the pre-existing broad
+    check, and the cost of its false positive is one redundant route switch.
+    It must not also withhold the executor from every later task on this
+    host: the circuit reads the refusal channel only (independent review of
+    #705), so it stays closed here.
+    """
+    run_agent, runs = handler
+
+    def echoing_failure(**kwargs):
+        runs.append(kwargs)
+        return agent_runner.RunResult(
+            status="failed",
+            exit_code=1,
+            stdout=(
+                '{"result": "I printed tests/fixtures/fake_codex.py, which '
+                'contains \\"usage limit reached; check your quota\\"."}'
+            ),
+            stderr="pytest exited 1: 3 assertions did not hold",
+            duration_seconds=0.1,
+            started_at="2026-09-22T12:00:00+00:00",
+            completed_at="2026-09-22T12:00:03+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", echoing_failure)
+    payload = _cascade_payload()
+    payload["cascade"] = [{"executor": "codex", "task_type": "review"}]
+
+    outcome = run_agent(payload, _event(), 1)
+
+    assert [run["executor"] for run in runs] == ["codex"]
+    assert not outcome.ok and outcome.infra_wait  # the attempt-level classification
+    assert agent_runner.executor_exhausted_until("codex") is None, (
+        "an echoed transcript must not withhold the account from later tasks"
+    )
+    assert outcome.detail == {}
+
+
+def test_failover_after_a_quota_refusal_walks_past_an_already_exhausted_link(
+    handler, monkeypatch
+):
+    """The failover search inside the delivery obeys the circuit too: the
+    middle link's account is already known to be out of quota, so it is never
+    launched -- the run moves straight to the link that can serve."""
+    run_agent, runs = handler
+    monkeypatch.setattr(
+        agent_runner, "claude_cli_preflight", lambda binary=None: (True, "ok")
+    )
+    agent_runner.record_executor_exhausted("copilot", cooldown_seconds=1800)
+
+    def codex_quota_then_success(**kwargs):
+        runs.append(kwargs)
+        if kwargs["executor"] == "codex":
+            return _codex_quota_run()
+        return agent_runner.RunResult(
+            status="completed",
+            exit_code=0,
+            stdout='{"result": "done"}',
+            stderr="",
+            duration_seconds=0.1,
+            started_at="2026-09-22T12:00:04+00:00",
+            completed_at="2026-09-22T12:00:05+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", codex_quota_then_success)
+    payload = _cascade_payload()
+    payload["cascade"] = [
+        {"executor": "codex", "task_type": "review"},
+        {"executor": "copilot", "task_type": "review"},
+        {"executor": "claude", "task_type": "review"},
+    ]
+
+    outcome = run_agent(payload, _event(), 1)
+
+    assert outcome.ok
+    assert [run["executor"] for run in runs] == ["codex", "claude"]
+    assert outcome.result["cascade_step"] == 3
+    assert [skip["executor"] for skip in outcome.result["executor_quota_skips"]] == (
+        ["copilot"]
+    )
+    assert [
+        entry["executor"] for entry in outcome.result["executor_quota_exhaustions"]
+    ] == ["codex"]

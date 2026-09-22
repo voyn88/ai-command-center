@@ -64,8 +64,8 @@ class ScriptedStore:
         self.calls.append(("fail_lease_wait", work.attempt_id, reason))
         return True
 
-    def fail_infra_wait(self, work, *, reason):
-        self.calls.append(("fail_infra_wait", work.attempt_id, reason))
+    def fail_infra_wait(self, work, *, reason, detail=None):
+        self.calls.append(("fail_infra_wait", work.attempt_id, reason, detail))
         return True
 
 
@@ -147,8 +147,44 @@ def test_an_infra_wait_failure_routes_to_the_infra_wait_store_method() -> None:
         "fail_infra_wait",
         "wat-1",
         "executor infrastructure failure (agent principal isolation): socket inactive",
+        None,
     ) in store.calls
     assert not any(c[0] == "fail" for c in store.calls)
+
+
+def test_an_infra_wait_carries_the_handlers_detail_to_the_audit_row() -> None:
+    """VOYN-W0-AICC-EXECUTOR-QUOTA-AWARE-ROUTING: the refund itself only
+    records that an attempt was given back. Which executor is out of quota,
+    and until when this worker will withhold it, is the handler's fact, and a
+    refusal writes no result row to carry it -- so it travels with the
+    failure report into `work_event.detail`."""
+    store = ScriptedStore([_work({"kind": "infra"})])
+    quota = {
+        "executor_quota": {
+            "exhausted": [
+                {
+                    "cascade_step": 1,
+                    "executor": "codex",
+                    "signature": "hit your usage limit",
+                    "exhausted_until": "2026-09-22T12:30:00+00:00",
+                }
+            ]
+        }
+    }
+
+    def infra(payload, lease_lost, attempt_no=1):
+        return HandlerOutcome(
+            ok=False,
+            reason="executor infrastructure failure (provider/auth/quota): out of quota",
+            infra_wait=True,
+            detail=quota,
+        )
+
+    daemon = WorkerDaemon(store, {"infra": infra}, WorkerConfig(visibility_seconds=3))
+    _run_until_idle(daemon, store)
+
+    reported = [call for call in store.calls if call[0] == "fail_infra_wait"]
+    assert reported and reported[0][3] == quota
 
 
 def test_a_raising_handler_is_a_retryable_failure() -> None:

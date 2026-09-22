@@ -77,6 +77,14 @@ class HandlerOutcome:
     # broken sandbox, or a provider outage says the work did not get a fair
     # execution slot.
     infra_wait: bool = False
+    # Structured evidence about the REFUSAL, for the audit row rather than
+    # for the result row (VOYN-W0-AICC-EXECUTOR-QUOTA-AWARE-ROUTING: which
+    # executor is out of quota, and until when this worker will withhold it).
+    # `result` is the item's outcome and is only written by `queue_complete`,
+    # so a refusal has no way to carry a fact forward otherwise; this travels
+    # into `work_event.detail` alongside the wait counters. Empty for every
+    # outcome that has nothing extra to say, which is almost all of them.
+    detail: dict[str, Any] = field(default_factory=dict)
 
 
 class Handler(Protocol):
@@ -319,7 +327,9 @@ class WorkerDaemon:
             elif outcome.lease_wait:
                 accepted = self._store.fail_lease_wait(work, reason=outcome.reason)
             elif outcome.infra_wait:
-                accepted = self._store.fail_infra_wait(work, reason=outcome.reason)
+                accepted = self._store.fail_infra_wait(
+                    work, reason=outcome.reason, detail=outcome.detail or None
+                )
             else:
                 accepted = self._store.fail(
                     work, reason=outcome.reason, retryable=outcome.retryable
