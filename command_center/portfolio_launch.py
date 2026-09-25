@@ -56,8 +56,8 @@ Safety model:
   against every other task's registry entry / the rest of the same batch.
 - A small local registry (`data/portfolio_launches.json`, gitignored) records
   every task once successfully launched, purely for fast duplicate rejection
-  and UI history — never the sole authority (git's own state is). Two
-  independent locks guard it, for two different races:
+  and UI history — never the sole authority (git's own state is). Three
+  independent locks guard it, for three different races:
   - The exclusive-publish lock file in `data/portfolio_locks/<task_id>.lock`
     (a fully-written temporary inode atomically published with `os.link`)
     serializes two concurrent launch
@@ -66,12 +66,23 @@ Safety model:
     workspace lock in `runtime.db`, that has no existing atomic primitive
     in this codebase to reuse. Its owner metadata allows a later launch to
     recover it after a process crash, while a live owner is never displaced.
+  - `data/portfolio_locks/workspace-<sha256 of resolved path>.lock`
+    (same publish/recovery mechanics as the task_id lock, via
+    `_workspace_lock_path`/`_claim_workspace`/`_release_workspace`) serializes
+    two concurrent launch attempts that resolve to the *same worktree path*
+    under two *different* task_ids — an explicit-override collision the
+    task_id lock above cannot see, since each such launch holds its own
+    distinct `<task_id>.lock`. Held for the same critical section as the
+    task_id claim (conflict re-check through worktree creation), so it closes
+    the window before `git worktree add`/`attach_worktree` runs, not just
+    after it in the registry (see `launch_portfolio_task`).
   - `_registry_lock` (`data/portfolio_locks/registry.lock`, an OS advisory
     file lock — `fcntl.flock` on POSIX, `msvcrt.locking` on Windows) guards
     the registry file's read-modify-write cycle itself, across *every*
     task_id, in every process. Two concurrent launches of *different*
-    task_ids each hold their own `<task_id>.lock` and so never block each
-    other on it — but both still read-modify-write the same
+    task_ids each hold their own `<task_id>.lock` (and, now, their own
+    `workspace-*.lock` when they target different paths) and so never block
+    each other on those — but both still read-modify-write the same
     `portfolio_launches.json`. Without `_registry_lock`, both could load the
     same pre-write snapshot, each add their own entry, and the second
     `save_registry` call would silently overwrite the first task's entry (a
@@ -85,6 +96,7 @@ Safety model:
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import socket
@@ -367,9 +379,34 @@ def _claim_lock_path(root: Path, task_id: str) -> Path:
     return candidate
 
 
+def _workspace_lock_path(root: Path, worktree_path: Path) -> Path:
+    """The path-keyed claim lock for `worktree_path`'s *resolved* location.
+
+    `_claim_lock_path` above only closes a race between two launches of the
+    same `task_id` — the resource it actually protects downstream (`git
+    worktree add`/`attach_worktree` in `launch_portfolio_task`) is the
+    worktree path, not the task_id. Two different task_ids whose card
+    overrides both resolve to the same worktree path are only caught by the
+    unlocked `_find_conflicting_registration` pre-check and the locked
+    re-check inside `_persist_registry_entry` — which runs *after* the
+    worktree mutation, not before it — so two such launches racing each
+    other still both reach `git worktree add` against the same path. This
+    lock, held for that whole window (see `launch_portfolio_task`), closes
+    it. Hashed rather than embedded verbatim in the filename: an arbitrary
+    absolute path can exceed filesystem name-length limits and contain
+    characters a lock directory should not have to sanitize, unlike a
+    `task_id` (already regex-validated by `_claim_lock_path`)."""
+    resolved = str(Path(worktree_path).expanduser().resolve())
+    digest = hashlib.sha256(resolved.encode("utf-8")).hexdigest()
+    locks_dir = _locks_dir(root)
+    candidate = locks_dir / f"workspace-{digest}.lock"
+    _assert_within_root(candidate, locks_dir, what="lock")
+    return candidate
+
+
 @dataclass(frozen=True)
 class ClaimLockStatus:
-    task_id: str
+    label: str
     path: Path
     exists: bool
     stale: bool
@@ -383,9 +420,12 @@ _owned_claim_tokens: dict[Path, str] = {}
 _owned_claim_tokens_lock = threading.Lock()
 
 
+def _recovery_lock_path(lock_path: Path) -> Path:
+    return lock_path.with_name(lock_path.name + CLAIM_RECOVERY_LOCK_SUFFIX)
+
+
 def _claim_recovery_lock_path(root: Path, task_id: str) -> Path:
-    claim_path = _claim_lock_path(root, task_id)
-    return claim_path.with_name(claim_path.name + CLAIM_RECOVERY_LOCK_SUFFIX)
+    return _recovery_lock_path(_claim_lock_path(root, task_id))
 
 
 def _process_identity(pid: int) -> str | None:
@@ -440,8 +480,11 @@ def _read_claim_metadata(path: Path) -> dict | None:
     return value if isinstance(value, dict) else None
 
 
-def inspect_claim(root: Path, task_id: str, *, now: float | None = None) -> ClaimLockStatus:
-    """Inspect a claim without mutating it.
+def _inspect_claim_at(lock_path: Path, label: str, *, now: float | None = None) -> ClaimLockStatus:
+    """Inspect the claim at `lock_path` without mutating it. Shared core for
+    `inspect_claim` (task_id-keyed) and `inspect_workspace_claim`
+    (worktree-path-keyed) — `label` is purely descriptive (surfaced on the
+    returned `ClaimLockStatus`), never used to derive `lock_path`.
 
     A lock is automatically recoverable only when its structured owner
     metadata proves that the owning local process no longer exists (or that
@@ -455,20 +498,20 @@ def inspect_claim(root: Path, task_id: str, *, now: float | None = None) -> Clai
     between two hosts with the same hostname is out of scope -- the same
     single-host assumption the `flock`/`os.link` primitives already require.
     """
-    path = _claim_lock_path(root, task_id)
+    path = lock_path
     try:
         stat = path.stat()
     except FileNotFoundError:
-        return ClaimLockStatus(task_id, path, False, False, False, "lock отсутствует")
+        return ClaimLockStatus(label, path, False, False, False, "lock отсутствует")
     except OSError as exc:
-        return ClaimLockStatus(task_id, path, True, False, False, f"lock недоступен: {exc}")
+        return ClaimLockStatus(label, path, True, False, False, f"lock недоступен: {exc}")
 
     current_time = time.time() if now is None else now
     age = max(0.0, current_time - stat.st_mtime)
     metadata = _read_claim_metadata(path)
     if not metadata:
         return ClaimLockStatus(
-            task_id, path, True, False, False,
+            label, path, True, False, False,
             "lock создан старой версией или повреждён; владелец не может быть безопасно подтверждён",
             age_seconds=age,
         )
@@ -485,85 +528,109 @@ def inspect_claim(root: Path, task_id: str, *, now: float | None = None) -> Clai
         or not isinstance(hostname, str)
     ):
         return ClaimLockStatus(
-            task_id, path, True, False, False, "метаданные lock неполны; автоматическое снятие небезопасно",
+            label, path, True, False, False, "метаданные lock неполны; автоматическое снятие небезопасно",
             age_seconds=age,
         )
     if hostname != socket.gethostname():
         return ClaimLockStatus(
-            task_id, path, True, False, False,
+            label, path, True, False, False,
             f"lock принадлежит другому хосту ({hostname}); локальная проверка процесса невозможна",
             owner_pid=pid, age_seconds=age,
         )
     if not _pid_is_alive(pid):
         return ClaimLockStatus(
-            task_id, path, True, True, True, f"процесс-владелец PID {pid} не существует",
+            label, path, True, True, True, f"процесс-владелец PID {pid} не существует",
             owner_pid=pid, age_seconds=age,
         )
     current_identity = _process_identity(pid)
     if identity and current_identity and identity != current_identity:
         return ClaimLockStatus(
-            task_id, path, True, True, True, f"PID {pid} был переиспользован другим процессом",
+            label, path, True, True, True, f"PID {pid} был переиспользован другим процессом",
             owner_pid=pid, age_seconds=age,
         )
     return ClaimLockStatus(
-        task_id, path, True, False, False, f"процесс-владелец PID {pid} активен",
+        label, path, True, False, False, f"процесс-владелец PID {pid} активен",
         owner_pid=pid, age_seconds=age,
     )
 
 
-def recover_stale_claim(root: Path, task_id: str) -> bool:
-    """Remove a provably orphaned claim, serialized against claim/release.
+def inspect_claim(root: Path, task_id: str, *, now: float | None = None) -> ClaimLockStatus:
+    """Inspect the per-task_id claim without mutating it."""
+    return _inspect_claim_at(_claim_lock_path(root, task_id), task_id, now=now)
+
+
+def inspect_workspace_claim(root: Path, worktree_path: Path, *, now: float | None = None) -> ClaimLockStatus:
+    """Inspect the per-worktree-path claim without mutating it — see
+    `_workspace_lock_path` for why this is a separate lock from the
+    per-task_id one above."""
+    resolved = str(Path(worktree_path).expanduser().resolve())
+    return _inspect_claim_at(_workspace_lock_path(root, worktree_path), resolved, now=now)
+
+
+def _recover_stale_claim_at(lock_path: Path, label: str) -> bool:
+    """Remove a provably orphaned claim at `lock_path`, serialized against
+    claim/release. Shared core for `recover_stale_claim` (task_id-keyed) and
+    `recover_stale_workspace_claim` (worktree-path-keyed).
 
     The status is re-read while holding the recovery lock and the file token
     is checked again immediately before unlink. This makes recovery safe
     against another process concurrently recovering and acquiring the task.
     """
-    path = _claim_lock_path(root, task_id)
-    guard = _claim_recovery_lock_path(root, task_id)
+    guard = _recovery_lock_path(lock_path)
     try:
         with storage.file_lock(
             guard,
             timeout=CLAIM_RECOVERY_LOCK_TIMEOUT_SECONDS,
             poll_seconds=_CLAIM_RECOVERY_LOCK_POLL_SECONDS,
         ):
-            status = inspect_claim(root, task_id)
+            status = _inspect_claim_at(lock_path, label)
             if not status.recoverable:
                 return False
-            metadata = _read_claim_metadata(path)
-            if not metadata or not inspect_claim(root, task_id).recoverable:
+            metadata = _read_claim_metadata(lock_path)
+            if not metadata or not _inspect_claim_at(lock_path, label).recoverable:
                 return False
             expected_token = metadata.get("token")
-            latest = _read_claim_metadata(path)
+            latest = _read_claim_metadata(lock_path)
             if not latest or latest.get("token") != expected_token:
                 return False
-            path.unlink(missing_ok=True)
+            lock_path.unlink(missing_ok=True)
             return True
     except storage.LockTimeoutError:
         return False
 
 
-def _claim(root: Path, task_id: str) -> bool:
-    """Atomically claim `task_id`, recovering a provably orphaned claim.
+def recover_stale_claim(root: Path, task_id: str) -> bool:
+    return _recover_stale_claim_at(_claim_lock_path(root, task_id), task_id)
+
+
+def recover_stale_workspace_claim(root: Path, worktree_path: Path) -> bool:
+    resolved = str(Path(worktree_path).expanduser().resolve())
+    return _recover_stale_claim_at(_workspace_lock_path(root, worktree_path), resolved)
+
+
+def _claim_at(lock_path: Path, label: str) -> bool:
+    """Atomically claim `lock_path`, recovering a provably orphaned claim.
+    Shared core for `_claim` (task_id-keyed) and `_claim_workspace`
+    (worktree-path-keyed).
 
     Creation and recovery share a short-lived OS advisory guard. The claim
     itself contains owner identity and a random token; a live owner's claim
     is never removed, while a process crash is recovered on the next attempt.
     """
-    lock_path = _claim_lock_path(root, task_id)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         guard_context = storage.file_lock(
-            _claim_recovery_lock_path(root, task_id),
+            _recovery_lock_path(lock_path),
             timeout=CLAIM_RECOVERY_LOCK_TIMEOUT_SECONDS,
             poll_seconds=_CLAIM_RECOVERY_LOCK_POLL_SECONDS,
         )
         with guard_context:
             if lock_path.exists():
-                status = inspect_claim(root, task_id)
+                status = _inspect_claim_at(lock_path, label)
                 if not status.recoverable:
                     return False
                 metadata = _read_claim_metadata(lock_path)
-                if not metadata or not inspect_claim(root, task_id).recoverable:
+                if not metadata or not _inspect_claim_at(lock_path, label).recoverable:
                     return False
                 lock_path.unlink(missing_ok=True)
 
@@ -597,11 +664,19 @@ def _claim(root: Path, task_id: str) -> bool:
         return False
 
 
-def _release(root: Path, task_id: str) -> None:
-    lock_path = _claim_lock_path(root, task_id)
+def _claim(root: Path, task_id: str) -> bool:
+    return _claim_at(_claim_lock_path(root, task_id), task_id)
+
+
+def _claim_workspace(root: Path, worktree_path: Path) -> bool:
+    resolved = str(Path(worktree_path).expanduser().resolve())
+    return _claim_at(_workspace_lock_path(root, worktree_path), resolved)
+
+
+def _release_at(lock_path: Path) -> None:
     try:
         with storage.file_lock(
-            _claim_recovery_lock_path(root, task_id),
+            _recovery_lock_path(lock_path),
             timeout=CLAIM_RECOVERY_LOCK_TIMEOUT_SECONDS,
             poll_seconds=_CLAIM_RECOVERY_LOCK_POLL_SECONDS,
         ):
@@ -615,6 +690,14 @@ def _release(root: Path, task_id: str) -> None:
         # have changed. It will be recovered automatically after this process
         # exits if it genuinely becomes orphaned.
         return
+
+
+def _release(root: Path, task_id: str) -> None:
+    _release_at(_claim_lock_path(root, task_id))
+
+
+def _release_workspace(root: Path, worktree_path: Path) -> None:
+    _release_at(_workspace_lock_path(root, worktree_path))
 
 
 REGISTRY_LOCK_FILE_NAME = "registry.lock"
@@ -1396,8 +1479,9 @@ def launch_portfolio_task(
 
     On any failure prior to the agent actually starting, this function rolls
     back whatever *it* created (worktree, branch, queue entry) — never an
-    existing worktree/branch this launch reused — and never leaves a claim
-    held, so a retry after fixing the reported problem is always possible.
+    existing worktree/branch this launch reused — and never leaves either the
+    task_id claim or the worktree-path claim held, so a retry after fixing
+    the reported problem is always possible.
     Once `execution_queue.launch_ready` reports the run started, nothing is
     rolled back regardless of what happens afterward (the run itself, and
     its own workspace lock, are the system of record from that point on)."""
@@ -1432,6 +1516,24 @@ def launch_portfolio_task(
     worktree_path = Path(plan.worktree)
     branch_created = False
     worktree_created = False
+
+    # The `task.task_id` claim above only serializes two launches of the
+    # *same* task_id — it does nothing for two different task_ids whose card
+    # overrides both resolve to the same `worktree_path` (an explicit-override
+    # collision; see `_workspace_lock_path`). Claim the path itself too,
+    # before the conflict re-check below, so that check and the worktree
+    # mutation that follows it run under a lock actually keyed on the
+    # resource they touch — closing the race `_find_conflicting_registration`
+    # alone cannot (it is only re-checked, locked, inside
+    # `_persist_registry_entry`, which runs *after* the worktree is created).
+    if not _claim_workspace(root, worktree_path):
+        _release(root, task.task_id)
+        return PortfolioLaunchResult(
+            task_id=task.task_id,
+            launched=False,
+            message=f"запуск в этот worktree уже выполняется параллельно: {worktree_path}",
+            plan=plan,
+        )
 
     try:
         # Re-check duplicate/conflict state under the claim — closes the
@@ -1561,6 +1663,7 @@ def launch_portfolio_task(
 
         return PortfolioLaunchResult(task_id=task.task_id, launched=True, run_id=result.run_id, plan=plan)
     finally:
+        _release_workspace(root, worktree_path)
         _release(root, task.task_id)
 
 
