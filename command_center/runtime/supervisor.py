@@ -59,6 +59,7 @@ from typing import TextIO
 from command_center import (
     agent_runner,
     capabilities,
+    emergency_mode,
     project_config,
     provider_route,
     workspace_provisioning,
@@ -991,8 +992,13 @@ class Supervisor:
         # Resolve the executor-capability decision up front (before any task/
         # session/run row is created). An invalid override fails closed here,
         # with nothing persisted — it is a configuration error, not a run.
+        # `emergency_mode.decide` is a transparent pass-through to
+        # `capabilities.decide` unless Emergency Conservative Mode
+        # (`AICC_EMERGENCY_MODE`) is active, in which case it forces every
+        # launch to `PROFILE_READ_ONLY` and names a safe fallback for any
+        # launch that cannot be honored read-only.
         try:
-            decision = capabilities.decide(task_type, prompt, capability_override)
+            decision = emergency_mode.decide(task_type, prompt, capability_override)
         except capabilities.InvalidCapabilityOverrideError as exc:
             raise InvalidCapabilityOverrideError(str(exc)) from exc
 
