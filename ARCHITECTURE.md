@@ -451,8 +451,12 @@ and MyPy type-check steps alongside — for pull requests into `main`, pushes to
 dispatches on Python 3.14. It uses a read-only token, SHA-pinned actions, and cancels superseded runs for the same
 ref.
 
-The workflow does not configure GitHub branch protection. Whether its result is a required merge
-gate remains a repository-setting concern outside this codebase.
+The workflow does not configure GitHub branch protection, and the current private-repository plan
+does not expose branch protection/rulesets to begin with (confirmed via
+`gh api repos/<owner>/<repo>/branches/main/protection`: no required checks, no required review,
+`enforce_admins=false`). See
+[`docs/AUTHORITY_MAP.md`](docs/AUTHORITY_MAP.md#merge-enforcement-authority-voyn-w0-aicc-branch-protection-limit)
+for the evidence and the actual (application-level, not GitHub-level) enforcement point.
 
 ## 13. Current risks and boundaries
 
@@ -463,7 +467,9 @@ gate remains a repository-setting concern outside this codebase.
 - `app.py` and several runtime and Portfolio modules are large, concentrated change surfaces.
 - The MyPy type check is informational and non-blocking: it does not gate merges, and the codebase is not yet fully typed.
 - CI runs automatically, but required-check/branch-protection enforcement is not configured by
-  repository code and cannot be inferred from the workflow alone.
+  repository code and cannot be inferred from the workflow alone; the current plan does not expose
+  GitHub branch protection at all, so the only real enforcement is application-level
+  (`docs/AUTHORITY_MAP.md`).
 - The execution-queue lock is same-host and cooperative; raw queue mutation primitives can bypass
   it, and there is no distributed coordination.
 - Scheduler decisions are point-in-time advice, not persisted claims. Task-id, capacity, and
