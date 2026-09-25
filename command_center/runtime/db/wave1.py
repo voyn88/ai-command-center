@@ -19,14 +19,12 @@ do for the other table-family modules.
 from __future__ import annotations
 
 import json
-import logging
 import sqlite3
 from pathlib import Path
 from typing import Any, Iterable
 
 import command_center.runtime.db as db  # facade (late-bound; see docstring)
-
-_LOG = logging.getLogger(__name__)
+from command_center.db.mirror_support import record_mirror_failure
 
 
 def _exclude_projects_clause(
@@ -161,8 +159,8 @@ def _mirror_advisor_proposal(record: dict) -> None:
         from command_center.db.advisor_store import PostgresAdvisorProposalMirror
 
         PostgresAdvisorProposalMirror().upsert(record)
-    except Exception:  # noqa: BLE001 - the mirror must never break the real write
-        _LOG.debug("Could not mirror advisor_proposal into PostgreSQL", exc_info=True)
+    except Exception as exc:  # noqa: BLE001 - the mirror must never break the real write
+        record_mirror_failure("advisor_proposal", record, exc)
 
 
 
@@ -390,16 +388,19 @@ def _mirror_owner_item(record: dict) -> None:
     would allow the opposite and worse state — a mirror ahead of the system of
     record, which no reconciliation would flag as wrong.
 
-    The mirror's health is reported by `owner_item_store.divergence`, not by
-    exceptions raised here. Imported lazily so the desktop and CLI entry points
-    keep working on a machine with no PostgreSQL client library.
+    Silent does not mean invisible: a rejected write still counts and logs
+    through `record_mirror_failure` (`VOYN-W0-AICC-MIRROR-SILENT-DROP`) so a
+    dropped row is observable without running `owner_item_store.divergence` by
+    hand — divergence remains the only check that names which *columns*
+    disagree. Imported lazily so the desktop and CLI entry points keep working
+    on a machine with no PostgreSQL client library.
     """
     try:
         from command_center.db.owner_item_store import PostgresOwnerItemMirror
 
         PostgresOwnerItemMirror().upsert(record)
-    except Exception:  # noqa: BLE001 — the mirror must never break the real write
-        _LOG.debug("Could not mirror owner_item into PostgreSQL", exc_info=True)
+    except Exception as exc:  # noqa: BLE001 — the mirror must never break the real write
+        record_mirror_failure("owner_item", record, exc)
 
 
 def get_owner_item(db_path: Path, item_id: str) -> dict | None:
@@ -566,8 +567,8 @@ def _mirror_digest_item(record: dict) -> None:
         from command_center.db.digest_item_store import PostgresDigestItemMirror
 
         PostgresDigestItemMirror().upsert(record)
-    except Exception:  # noqa: BLE001 — the mirror must never break the real write
-        _LOG.debug("Could not mirror digest_item into PostgreSQL", exc_info=True)
+    except Exception as exc:  # noqa: BLE001 — the mirror must never break the real write
+        record_mirror_failure("digest_item", record, exc)
 
 
 def _mirror_digest_day_deletion(day: str) -> None:
@@ -584,8 +585,8 @@ def _mirror_digest_day_deletion(day: str) -> None:
         from command_center.db.digest_item_store import PostgresDigestItemMirror
 
         PostgresDigestItemMirror().delete_day(day)
-    except Exception:  # noqa: BLE001 — the mirror must never break the real write
-        _LOG.debug("Could not mirror digest_item day deletion into PostgreSQL", exc_info=True)
+    except Exception as exc:  # noqa: BLE001 — the mirror must never break the real write
+        record_mirror_failure("digest_item", day, exc)
 
 
 def delete_digest_items_for_day(db_path: Path, day: str) -> int:

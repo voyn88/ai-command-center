@@ -36,14 +36,12 @@ for the other table-family modules.
 from __future__ import annotations
 
 import json
-import logging
 import sqlite3
 from pathlib import Path
 from typing import Any
 
 import command_center.runtime.db as db  # facade (late-bound; see docstring)
-
-_LOG = logging.getLogger(__name__)
+from command_center.db.mirror_support import record_mirror_failure
 
 # --------------------------------------------------------------------------
 # Allowlists (mirror ``api.models`` Literals; validated at the boundary)
@@ -196,8 +194,8 @@ def _mirror_model_entry(record: dict) -> None:
         from command_center.db.model_registry_store import PostgresModelEntryMirror
 
         PostgresModelEntryMirror().upsert(record)
-    except Exception:  # noqa: BLE001 - the mirror must never break the real write
-        _LOG.debug("Could not mirror model_entry into PostgreSQL", exc_info=True)
+    except Exception as exc:  # noqa: BLE001 - the mirror must never break the real write
+        record_mirror_failure("model_entry", record, exc)
 
 
 def _mirror_model_event(record: dict) -> None:
@@ -212,8 +210,8 @@ def _mirror_model_event(record: dict) -> None:
         from command_center.db.model_registry_store import PostgresModelEventMirror
 
         PostgresModelEventMirror().upsert(record)
-    except Exception:  # noqa: BLE001 - the mirror must never break the real write
-        _LOG.debug("Could not mirror model_event into PostgreSQL", exc_info=True)
+    except Exception as exc:  # noqa: BLE001 - the mirror must never break the real write
+        record_mirror_failure("model_event", record, exc)
 
 
 def get_model_entry(db_path: Path, model_id: str) -> dict | None:
