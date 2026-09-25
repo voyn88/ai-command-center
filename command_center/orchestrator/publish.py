@@ -11,6 +11,15 @@ key is the opt-in switch for publishing at all and the credential only on
 the SSH fallback. ``gh`` also opens the PR carrying the ``HEAD_SHA:`` trailer
 that result-ingest already parses.
 
+A diff touching ``.github/workflows/**`` needs a `gh` OAuth token scoped
+with ``workflow``, which most worker credentials intentionally do not carry
+(ADR-0012). ``_workflow_scope_gate`` refuses such a push before it burns a
+lease acquire when the active account's own missing scope is legible from
+``gh auth status``; when that preflight can't tell, ``_classify_push_failure``
+still separates a live scope denial from a lease race or a network blip
+after the real push fails, instead of both looking like a bare
+``push_failed``.
+
 That lease has an on-disk shadow, which is why every ``acquire`` here is
 followed by ``install-hooks`` under the identity it just acquired (#351).
 The hook presents repository/owner/session/task/pid/process-start read from
@@ -463,6 +472,162 @@ def _leak_guard_gate(
     )
 
 
+def _target_host(https_target: str) -> str | None:
+    """The hostname `gh auth status` labels a login block with, read from
+    the exact URL `_https_push_target` will push to -- not assumed to be
+    `github.com` just because that is the only host `_https_push_target`
+    itself rewrites onto."""
+    prefix = "https://"
+    if not https_target.startswith(prefix):
+        return None
+    host = https_target[len(prefix) :].split("/", 1)[0]
+    return host or None
+
+
+def _diff_touches_github_workflows(
+    repo_path: Path, base_sha: str, head_sha: str
+) -> bool | None:
+    """None only when the diff itself could not be read (fail-open, defer
+    to the actual push); a readable diff always yields a definite verdict."""
+    diff = _run(["git", "diff", "--name-only", f"{base_sha}..{head_sha}"], repo_path)
+    if diff.returncode != 0:
+        return None
+    return any(
+        path.startswith(".github/workflows/")
+        for path in diff.stdout.splitlines()
+        if path.strip()
+    )
+
+
+def _gh_oauth_workflow_scope_missing(repo_path: Path, host: str) -> bool | None:
+    """Whether the OAuth credential `gh` will actually hand to git's
+    credential helper for `host` -- the account `gh auth status` marks
+    ``Active account: true`` within that host's own block -- is missing
+    `workflow` scope.
+
+    Correlates to the specific account the push will use rather than the
+    first ``Token scopes`` line found anywhere in `gh auth status`'s output
+    (independent-review finding on HEAD_SHA
+    d670c34e4d754d009db6ddcf5a383be7dec85fe1): an environment logged into
+    more than one account -- two `gh auth login` runs against the same host,
+    or a second host entirely -- can otherwise have this read a scope list
+    belonging to a credential the push never touches, misattributing
+    `workflow_scope_missing` onto a push that would have succeeded. Returns
+    ``None`` (fail-open, defer to the actual push) on anything unreadable or
+    ambiguous: no block for `host`, no account in it marked active, or no
+    scopes line for that account.
+    """
+    status = _run(["gh", "auth", "status"], repo_path)
+    lines = (status.stdout + "\n" + status.stderr).splitlines()
+
+    host_starts = [
+        i
+        for i, line in enumerate(lines)
+        if line.strip() == host and not line[:1].isspace()
+    ]
+    if len(host_starts) != 1:
+        return None
+    start = host_starts[0] + 1
+    end = len(lines)
+    for i in range(start, len(lines)):
+        line = lines[i]
+        if line.strip() and not line[:1].isspace():
+            end = i
+            break
+    host_block = lines[start:end]
+
+    account_starts = [
+        i
+        for i, line in enumerate(host_block)
+        if "Logged in to" in line and " account " in line
+    ]
+    if not account_starts:
+        return None
+    account_starts.append(len(host_block))
+
+    for idx in range(len(account_starts) - 1):
+        account_block = host_block[account_starts[idx] : account_starts[idx + 1]]
+        if not any("Active account: true" in line for line in account_block):
+            continue
+        for line in account_block:
+            if "Token scopes:" in line:
+                return "workflow" not in line
+        return None  # the active account's own scopes line is unreadable
+    return None  # no account in this host's block is marked active
+
+
+def _workflow_scope_gate(
+    repo_path: Path,
+    https_target: str | None,
+    base_sha: str,
+    head_sha: str,
+) -> PublishResult | None:
+    """Refuse a push before it burns a lease acquire + push attempt against
+    a token already known to lack `workflow` scope (VOYN-W0-AICC-PUBLISH-
+    WORKFLOW-SCOPE, live 2026-08-30: a guarded push on worker-01 got
+    GitHub's ``! [remote rejected] ... refusing to allow an OAuth App to
+    create or update workflow`` -- `gh`'s OAuth credential there carried
+    `gist, read:org, repo`, no `workflow`). See ADR-0012 for why the token
+    is not simply granted `workflow` outright.
+
+    Fires only when all three hold: the push goes over `gh`'s
+    OAuth-credentialed HTTPS `origin` (`_https_push_target` -- the SSH
+    deploy-key fallback is untouched by `gh` scopes), the diff actually
+    touches `.github/workflows/**`, and the token `gh` will present for
+    that host's active account is confirmed missing `workflow`. Any of the
+    three being merely unreadable defers to the real push --
+    `_classify_push_failure` still separately names a live scope denial
+    there -- rather than risk blocking a push that might have succeeded.
+    """
+    if https_target is None:
+        return None
+    if not _diff_touches_github_workflows(repo_path, base_sha, head_sha):
+        return None
+    host = _target_host(https_target)
+    if host is None:
+        return None
+    if not _gh_oauth_workflow_scope_missing(repo_path, host):
+        return None
+    return PublishResult(
+        ok=False,
+        head_sha=head_sha,
+        reason=(
+            f"workflow_scope_missing: gh OAuth token for {host} lacks "
+            "'workflow', required to push changes under .github/workflows/**"
+        ),
+    )
+
+
+_PUSH_NETWORK_FAILURE_MARKERS = (
+    "could not resolve host",
+    "connection timed out",
+    "connection refused",
+    "network is unreachable",
+    "temporary failure in name resolution",
+    "could not read from remote repository",
+)
+
+
+def _classify_push_failure(stderr: str) -> str:
+    """`push_failed` used to name every rejected push alike -- a live
+    `workflow` scope denial, a `--force-with-lease` race against another
+    writer, and a transient network blip all reported identically, leaving
+    only a human reading the truncated stderr tail able to tell them apart
+    (acceptance criterion 2). Each needs a different operator response --
+    grant `workflow` or reroute, let the lease retry pick up the real tip,
+    or just retry -- so the reason names which one happened whenever the
+    stderr text is recognizable, falling back to the prior generic bucket
+    for anything else so no failure mode goes unreported."""
+    lowered = stderr.lower()
+    if "oauth app" in lowered and "workflow" in lowered:
+        return "workflow_scope_denied"
+    if "stale info" in lowered:
+        return "push_rejected_stale_info"
+    if any(marker in lowered for marker in _PUSH_NETWORK_FAILURE_MARKERS):
+        return "push_network_failure"
+    return "push_failed"
+
+
 def publish_run(
     repo_path: Path,
     cfg: PublishConfig,
@@ -552,6 +717,11 @@ def publish_run(
         leak_failure = _leak_guard_gate(repo_path, head_sha, base_sha_value)
         if leak_failure is not None:
             return leak_failure
+        scope_failure = _workflow_scope_gate(
+            repo_path, _https_push_target(repo_path), base_sha_value, head_sha
+        )
+        if scope_failure is not None:
+            return scope_failure
 
     branch = f"backlog/{cfg.task}"
     if already_durable:
@@ -674,7 +844,11 @@ def publish_run(
                 durable_env = ssh_env
         if push is not None and push.returncode != 0:
             return PublishResult(
-                ok=False, reason=f"push_failed: {push.stderr.strip()[:160]}"
+                ok=False,
+                reason=(
+                    f"{_classify_push_failure(push.stderr)}: "
+                    f"{push.stderr.strip()[:160]}"
+                ),
             )
         if push is not None:
             durable, durable_sha = _remote_branch_sha(
