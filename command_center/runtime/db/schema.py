@@ -22,7 +22,7 @@ import command_center.runtime.db as db  # facade (late-bound; see docstring)
 # full script after a partially-applied migration is always safe)
 # --------------------------------------------------------------------------
 
-SCHEMA_VERSION = 25
+SCHEMA_VERSION = 26
 
 _SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS task (
@@ -1358,6 +1358,22 @@ CREATE INDEX IF NOT EXISTS idx_networking_invitation_status ON networking_invita
 CREATE INDEX IF NOT EXISTS idx_networking_invitation_council_ref ON networking_invitation(council_ref);
 CREATE INDEX IF NOT EXISTS idx_networking_invitation_project ON networking_invitation(project_ref);
 """
+
+
+def _migration_26_add_motion_critical(conn: sqlite3.Connection) -> None:
+    """Adds `motion.critical` (VOYN-MIN-CI, triple-council).
+
+    A critical motion is decided by the fixed three-role independent-review
+    panel (`council.CRITICAL_ROLES` — executor, audit, stress) under its own
+    unanimity/veto consensus rule instead of ordinary majority voting; see
+    `council.service._critical_outcome_and_rationale`. Defaults to `0` so
+    every pre-existing and ordinarily-created motion keeps today's majority
+    rule unchanged. Same idempotent check-then-`ALTER TABLE ADD COLUMN` shape
+    as migration 2."""
+    with db.transaction(conn):
+        existing = {row["name"] for row in conn.execute("PRAGMA table_info(motion)").fetchall()}
+        if "critical" not in existing:
+            conn.execute("ALTER TABLE motion ADD COLUMN critical INTEGER NOT NULL DEFAULT 0")
 
 
 # Each migration is either a raw SQL script (applied via `executescript`, every
