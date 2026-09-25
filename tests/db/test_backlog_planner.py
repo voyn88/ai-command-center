@@ -406,6 +406,39 @@ def test_repeated_no_pr_publish_failure_stays_operational(rig) -> None:
         assert store.get_task("VOYN-W0-N2")["status"] == "OPEN", rows
 
 
+def test_repeated_agent_worktree_dirty_failure_stays_operational(rig) -> None:
+    """VOYN-W0-AICC-PUBLISH-PREP-UNTRACKED-FILES. Live 2026-08-27 addendum: 8
+    dead work_items in 6h all `max_attempts_exhausted` at
+    `agent_worktree_clean` -- the agent's own uncommitted/untracked work
+    (a created migration left untracked, or an edited file never
+    committed), not something an owner can act on. A second occurrence used
+    to hit the two-epoch DEFER_TO_USER circuit breaker exactly like the
+    live incident; migration 0017 exempts it the same way 0012 already
+    exempts `no_pr_published`/`publish_%`."""
+    app_factory, store, worker = rig
+    assert store.upsert_task(_task("VOYN-W0-WD", repo="repo-wd"))[0]
+
+    for round_no in (1, 2):
+        assert _dispatch(app_factory, "VOYN-W0-WD")[0], f"round {round_no}"
+        claimed = worker.claim("execution", visibility_seconds=60)
+        assert isinstance(claimed, ClaimedWork)
+        assert worker.fail(
+            claimed,
+            reason=(
+                "guarded publish preparation failed at agent_worktree_clean: "
+                "uncommitted_changes: ?? "
+                "command_center/db/sql/0015_backlog_insert_seq.up.sql"
+            ),
+            retryable=False,
+        )
+        with app_factory() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM backlog_ingest_results(%s)", ("planner-t",))
+                rows = cur.fetchall()
+        assert len(rows) == 1
+        assert store.get_task("VOYN-W0-WD")["status"] == "OPEN", rows
+
+
 def test_ingest_a_clean_run_with_sha_but_no_pr_still_returns_to_pool(rig) -> None:
     """The exact live shape of the 2026-08-21 incident: status='completed'
     AND a real head_sha (the agent reported its own HEAD_SHA trailer), but
@@ -487,6 +520,36 @@ def test_migration_0012_is_reversible_without_residue(pg_connection_factory) -> 
                 "SELECT prosrc FROM pg_proc WHERE proname = 'backlog_return_to_pool'"
             )
             assert "v_technical" in cur.fetchone()[0]
+
+
+def test_migration_0017_is_reversible_without_residue(pg_connection_factory) -> None:
+    """Live up->down->up pins the agent_worktree_clean exemption to migration
+    0017.  Downgrading to 0016 must restore the plain 0012 classification
+    (still technical, just without this exemption), and the second upgrade
+    must reapply it."""
+    from command_center.db import migrations
+
+    with pg_connection_factory() as conn:
+        migrations.upgrade(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT prosrc FROM pg_proc WHERE proname = 'backlog_return_to_pool'"
+            )
+            assert "agent_worktree_clean" in cur.fetchone()[0]
+        migrations.downgrade(conn, target=16)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT prosrc FROM pg_proc WHERE proname = 'backlog_return_to_pool'"
+            )
+            prosrc = cur.fetchone()[0]
+            assert "v_technical" in prosrc
+            assert "agent_worktree_clean" not in prosrc
+        migrations.upgrade(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT prosrc FROM pg_proc WHERE proname = 'backlog_return_to_pool'"
+            )
+            assert "agent_worktree_clean" in cur.fetchone()[0]
 
 
 def test_migration_0011_is_reversible_without_residue(pg_connection_factory) -> None:

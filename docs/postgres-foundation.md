@@ -147,6 +147,13 @@ Plain SQL files in `command_center/db/sql/`, `NNNN_slug.up.sql` with a matching
   environments that report the same version for different schemas.
 - Every migration must have a downgrade, and the round trip is covered by
   `test_downgrade_removes_everything_and_upgrade_restores_it`.
+- Number a new migration from the highest `NNNN` present on the branch you
+  are about to publish onto (`main`'s latest, not just your own task
+  branch's) — two agents on independent clones can otherwise both claim the
+  same next number. `discover()` rejects duplicate and gapped versions
+  outright, so a collision fails loudly at migrate/test time instead of
+  silently corrupting the ledger; if you hit that, renumber your pair of
+  `.up.sql`/`.down.sql` files to the next free slot and rerun.
 
 ```bash
 python -m command_center.db status
