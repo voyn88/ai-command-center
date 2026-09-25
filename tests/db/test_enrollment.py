@@ -287,6 +287,35 @@ def test_a_ticket_lifetime_is_clamped_by_the_database_not_the_caller(
         assert granted.total_seconds() == 15 * 60, granted
 
 
+def test_a_ticket_with_no_requested_ttl_defaults_to_ten_minutes(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """The default, not just the ceiling, is what zero-touch onboarding
+
+    (VOYN-MIN-UNBOXING) promises: "device ready in 3-10 minutes" is only true
+    if the code an operator prints and hands to a device is itself good for
+    up to ten minutes with no caller having to ask for that. The sibling
+    test above only proves the 15-minute CEILING, by requesting 30 days; it
+    never exercises the path every real mint takes, which passes no ttl at
+    all.
+    """
+    with _cluster(admin_conn, psycopg, test_dsn, role_passwords):
+        _, ticket_hash = _secret()
+        with psycopg.connect(
+            _dsn_for(test_dsn, roles.APP_ROLE, role_passwords), autocommit=True
+        ) as app:
+            minted = _mint(app, _unique(), ticket_hash)
+            assert minted[1] is None, minted
+            with app.cursor() as cur:
+                cur.execute(
+                    "SELECT expires_at - issued_at FROM enrollment_ticket_public "
+                    "WHERE ticket_id = %s",
+                    (minted[0],),
+                )
+                granted = cur.fetchone()[0]
+        assert granted.total_seconds() == 10 * 60, granted
+
+
 def test_a_ticket_produces_only_the_principal_it_named(
     admin_conn, psycopg, test_dsn, role_passwords
 ):
@@ -1539,3 +1568,117 @@ def test_up_down_up_down_leaves_no_enrolment_object(
             with admin_conn.cursor() as cur:
                 cur.execute("SELECT count(*) FROM work_item")
                 assert cur.fetchone()[0] >= 0
+
+
+# ---------------------------------------------------------------------------
+# The operator CLI (VOYN-MIN-UNBOXING): a printed code, not the bare SQL
+# functions above, is what an operator actually runs at unboxing time.
+# ---------------------------------------------------------------------------
+
+
+def test_the_operator_cli_turns_a_printed_code_into_a_working_device_credential(
+    admin_conn, psycopg, test_dsn, role_passwords, monkeypatch, capsys, tmp_path
+):
+    """`enroll-mint` / `enroll-redeem` end to end, through `cli.main()` itself.
+
+    Everything else in this module proves the SQL protocol by calling the
+    functions directly; this proves the thing an operator actually runs
+    reaches that protocol correctly and, within it, produces a device
+    credential that really authenticates -- the whole point of "print a
+    code, device is ready" being that no step in between is manual.
+    """
+    import time
+
+    from psycopg.conninfo import conninfo_to_dict
+
+    from command_center.db import cli, pool
+
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    params = conninfo_to_dict(test_dsn)
+
+    def _run(role: str, argv: list[str]) -> int:
+        monkeypatch.setenv("AICC_PG_HOST", params.get("host", "127.0.0.1"))
+        monkeypatch.setenv("AICC_PG_PORT", str(params.get("port", 5432)))
+        monkeypatch.setenv("AICC_PG_DB", params["dbname"])
+        monkeypatch.setenv("AICC_PG_USER", role)
+        monkeypatch.setenv("AICC_PG_PASSWORD", role_passwords[role])
+        monkeypatch.setenv("AICC_PG_SSLMODE", "prefer")  # loopback, per config policy
+        pool.close_pool()
+        try:
+            return cli.main(argv)
+        finally:
+            pool.close_pool()
+
+    started = time.monotonic()
+    principal = _unique("worker-unboxing")
+
+    exit_code = _run(
+        roles.OPERATOR_ROLE, ["enroll-mint", principal, f"{principal}.local"]
+    )
+    assert exit_code == 0
+    printed = capsys.readouterr().out.strip().splitlines()
+    assert printed[0].startswith("ticket:")
+    code = printed[-1]
+
+    credential_file = tmp_path / "worker.env"
+    exit_code = _run(
+        roles.APP_ROLE,
+        [
+            "enroll-redeem",
+            code,
+            "--hostname",
+            f"{principal}.local",
+            "--out",
+            str(credential_file),
+        ],
+    )
+    assert exit_code == 0
+
+    # The acceptance bound is minutes, not hours; the CLI round trip itself
+    # is the machine-speed portion of "device ready in 3-10 minutes" and
+    # should be seconds, independent of how long a human takes to run it.
+    assert time.monotonic() - started < 30
+
+    contents = dict(
+        line.split("=", 1) for line in credential_file.read_text().splitlines()
+    )
+    assert contents["AICC_PG_USER"].startswith("aicc_w_")
+    assert oct(credential_file.stat().st_mode)[-3:] == "600"
+
+    with psycopg.connect(
+        _as_role(test_dsn, contents["AICC_PG_USER"], contents["AICC_PG_PASSWORD"])
+    ) as device_conn:
+        with device_conn.cursor() as cur:
+            cur.execute("SELECT current_user")
+            assert cur.fetchone()[0] == contents["AICC_PG_USER"]
+
+
+def test_the_operator_cli_never_prints_the_device_credential_when_a_ticket_is_refused(
+    admin_conn, psycopg, test_dsn, role_passwords, monkeypatch, capsys
+):
+    """A redeem the server refuses must not leave a caller believing the
+    device is enrolled: no credential line, no file, and a non-zero exit so
+    a script driving this does not silently continue."""
+    from psycopg.conninfo import conninfo_to_dict
+
+    from command_center.db import cli, pool
+
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    params = conninfo_to_dict(test_dsn)
+    monkeypatch.setenv("AICC_PG_HOST", params.get("host", "127.0.0.1"))
+    monkeypatch.setenv("AICC_PG_PORT", str(params.get("port", 5432)))
+    monkeypatch.setenv("AICC_PG_DB", params["dbname"])
+    monkeypatch.setenv("AICC_PG_USER", roles.APP_ROLE)
+    monkeypatch.setenv("AICC_PG_PASSWORD", role_passwords[roles.APP_ROLE])
+    monkeypatch.setenv("AICC_PG_SSLMODE", "prefer")
+
+    pool.close_pool()
+    try:
+        exit_code = cli.main(["enroll-redeem", "not-a-real-code"])
+    finally:
+        pool.close_pool()
+
+    assert exit_code == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "refused: unknown_ticket" in captured.err
