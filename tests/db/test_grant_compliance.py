@@ -60,6 +60,34 @@ def _provision(admin_conn, psycopg, test_dsn, role_passwords) -> None:
         roles.apply_table_grants(conn)
 
 
+def _migrate_files_directly(admin_conn, psycopg, test_dsn, role_passwords) -> None:
+    """Bootstrap + apply every `.up.sql` file directly, THEN apply table grants.
+
+    Bypasses `migrations.upgrade()` entirely, so the ledger (`schema_migration`)
+    is never created by it — the way a database provisioned by hand (a
+    restore, a script that concatenates the `.up.sql` files) reaches this
+    point. `apply_table_grants()` must still find `schema_migration` to grant,
+    without depending on `migrations.upgrade()` having run first.
+    """
+    roles.apply_bootstrap(admin_conn)
+    with psycopg.connect(
+        _as_role(test_dsn, roles.MIGRATOR_ROLE, role_passwords),
+        autocommit=True,
+    ) as conn:
+        for migration in migrations.discover():
+            conn.execute(migration.up_sql)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT to_regclass('public.schema_migration') IS NULL"
+            )
+            (ledger_absent,) = cur.fetchone()
+        assert ledger_absent, (
+            "test setup is broken: schema_migration already exists before "
+            "apply_table_grants() ran, so this test would pass vacuously"
+        )
+        roles.apply_table_grants(conn)
+
+
 def _actual_table_grants(admin_conn) -> dict[str, dict[str, set[str]]]:
     """Return {role: {table: {privilege, …}}} from the catalog.
 
@@ -326,6 +354,69 @@ def test_compliance_passes_when_grants_are_applied(
     _provision(admin_conn, psycopg, test_dsn, role_passwords)
     violations = _check_compliance(admin_conn)
     assert violations == [], "\n".join(violations)
+
+
+def test_compliance_passes_when_migrated_by_running_files_directly(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """`apply_table_grants()` must not depend on `migrations.upgrade()` having run.
+
+    A database provisioned by executing the `.up.sql` files directly (a
+    restore, a hand-rolled bootstrap script) never gets `schema_migration`
+    from `migrations.upgrade()`'s `ensure_ledger()` call. Before this fix,
+    the grant probe found no `schema_migration` table to grant and silently
+    dropped it from the matrix; `apply_table_grants()` now creates the ledger
+    itself, so the matrix — including `schema_migration` — is still complete.
+    """
+    _migrate_files_directly(admin_conn, psycopg, test_dsn, role_passwords)
+    with admin_conn.cursor() as cur:
+        cur.execute("SELECT to_regclass('public.schema_migration') IS NOT NULL")
+        (ledger_present,) = cur.fetchone()
+    assert ledger_present, (
+        "apply_table_grants() did not create schema_migration for a database "
+        "migrated by running the .up.sql files directly"
+    )
+    violations = _check_compliance(admin_conn)
+    assert violations == [], "\n".join(violations)
+
+
+def test_apply_table_grants_creates_the_ledger_in_the_requested_schema(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """`apply_table_grants(conn, schema=...)` must honor a non-default schema.
+
+    `ensure_ledger()` creates an *unqualified* `schema_migration`, which
+    resolves through the connection's `search_path`. If `apply_table_grants`
+    called it without scoping that resolution to the requested schema, the
+    ledger would land in `public` regardless of what was asked for — wrong
+    for the requested schema, and an unrequested side effect in `public`.
+    """
+    schema = "aicc_alt"
+    roles.apply_bootstrap(admin_conn)
+    with admin_conn.cursor() as cur:
+        cur.execute(f"CREATE SCHEMA {schema} AUTHORIZATION {roles.MIGRATOR_ROLE}")
+    with psycopg.connect(
+        _as_role(test_dsn, roles.MIGRATOR_ROLE, role_passwords),
+        autocommit=True,
+    ) as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"SET search_path TO {schema}")
+        for migration in migrations.discover():
+            conn.execute(migration.up_sql)
+        roles.apply_table_grants(conn, schema=schema)
+    with admin_conn.cursor() as cur:
+        cur.execute("SELECT to_regclass(%s) IS NOT NULL", (f"{schema}.schema_migration",))
+        (in_requested_schema,) = cur.fetchone()
+        cur.execute("SELECT to_regclass('public.schema_migration') IS NULL")
+        (absent_from_public,) = cur.fetchone()
+    assert in_requested_schema, (
+        f"apply_table_grants(conn, schema={schema!r}) did not create "
+        f"{schema}.schema_migration"
+    )
+    assert absent_from_public, (
+        "apply_table_grants() with a non-default schema leaked "
+        "schema_migration into public"
+    )
 
 
 def test_compliance_fails_when_grants_are_not_applied(
