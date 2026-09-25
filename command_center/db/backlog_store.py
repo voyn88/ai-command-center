@@ -15,6 +15,21 @@ moves through ``backlog_transition`` and its machine model. Dependencies are
 NOT imported: the file records them as prose ("Связи: …"), and prose is
 exactly what the no-substring rule forbids acting on; edges enter through
 ``add_dependency`` (cycle-checked) as BO-S2 formalizes them.
+
+Graduation criterion for the exemption above (tracked as
+VOYN-W0-AICC-DOCUMENT-IMPORT-EXEMPTION-GRADUATION): "during the migration
+period" ends, and ``backlog_upsert_task``'s direct status write must be
+removed or narrowed to a documented, queue-scoped contract, once BOTH hold:
+(1) every NEW task is created through ``backlog_dispatch`` (or an equivalent
+queue-native entry point), never first appearing via ``import_markdown``; and
+(2) ``import_markdown`` is only ever reconciling fields that are not
+queue-owned (title/body/wave/priority/kind) on task_ids that already exist in
+``backlog_task`` — i.e. it no longer needs to set ``status`` on a row the
+queue is actively tracking, because the Markdown file is no longer where a
+tracked task's status is decided. At that point the status column can be
+dropped from the upsert's write set (or the function can refuse any call
+whose ``p_status`` disagrees with the current row for an already-tracked
+task) without breaking any caller.
 """
 
 from __future__ import annotations
