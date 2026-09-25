@@ -462,6 +462,186 @@ def test_ingest_queue_succeeded_but_task_failed_returns_to_pool_not_review(rig) 
             assert cur.fetchone()[0] == 0
 
 
+def test_ingest_race_loser_audits_the_refusal_instead_of_erasing_it(rig) -> None:
+    """VOYN-W0-AICC-AUDIT-ROLLBACK-CLASS-REM-REM's own measurement, reproduced
+    live rather than asserted from the source: a refusal via RAISE leaves 0
+    audit rows for the loser; the identical refusal returned as data leaves
+    1. Two concurrent `backlog_ingest_results` calls race the SAME completed
+    task -- the outer scan is an unlocked SELECT, so both pick it up; the
+    loser's per-row `FOR UPDATE` blocks on the winner, then unblocks onto a
+    row already moved past IN_PROGRESS (an illegal_transition). Before this
+    migration that RAISE-d and rolled back the very audit row it had just
+    written about the loss; now the loss is data that survives the call, and
+    neither concurrent call raises."""
+    import threading
+
+    app_factory, store, worker = rig
+    assert store.upsert_task(_task("VOYN-W0-RACE", repo="repo-tt"))[0]
+    assert _dispatch(app_factory, "VOYN-W0-RACE")[0]
+    _complete_latest(
+        app_factory,
+        worker,
+        "VOYN-W0-RACE",
+        {
+            "status": "completed",
+            "pr_url": "https://github.com/o/r/pull/9",
+            "head_sha": "deadbee",
+        },
+    )
+
+    results: list[list[tuple]] = []
+    errors: list[Exception] = []
+    barrier = threading.Barrier(2)
+
+    def call_ingest() -> None:
+        try:
+            with app_factory() as conn:
+                with conn.cursor() as cur:
+                    barrier.wait()
+                    cur.execute(
+                        "SELECT * FROM backlog_ingest_results(%s)", ("planner-t",)
+                    )
+                    results.append(cur.fetchall())
+        except Exception as exc:  # noqa: BLE001 — a raise here IS the old bug
+            errors.append(exc)
+
+    ts = [threading.Thread(target=call_ingest) for _ in range(2)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+
+    assert not errors, f"backlog_ingest_results must never raise on a lost race: {errors}"
+
+    actions = sorted(
+        row[2] for rows in results for row in rows if row[0] == "VOYN-W0-RACE"
+    )
+    assert actions == ["ingest_refused", "ready_to_review"], (
+        "expected exactly one winner and one loser for the same task "
+        f"across both concurrent calls; got {actions}"
+    )
+
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) FROM backlog_event WHERE task_id = %s "
+                "AND event = 'ingest' AND outcome = 'rejected'",
+                ("VOYN-W0-RACE",),
+            )
+            assert cur.fetchone()[0] == 1, (
+                "the loser's refusal must survive as an audit row, not be "
+                "rolled back by a RAISE it never issued"
+            )
+    assert store.get_task("VOYN-W0-RACE")["status"] == "READY_TO_REVIEW"
+
+
+def test_ingest_does_not_release_a_lease_a_sibling_task_still_needs(rig) -> None:
+    """PR #442's 'High' finding: the repo lease is repo-scoped, not
+    task-scoped, and one planner may hold it across several of its own
+    dispatched tasks in the same repo
+    (test_one_writer_per_repository_across_planners). Finishing one of them
+    must not release a lease a sibling, still-IN_PROGRESS, task depends on
+    for its own exclusivity -- that is the second-writer hazard this whole
+    remediation class exists to close."""
+    app_factory, store, worker = rig
+    assert store.upsert_task(_task("VOYN-W0-SB1", repo="repo-shared"))[0]
+    assert store.upsert_task(_task("VOYN-W0-SB2", repo="repo-shared"))[0]
+    assert _dispatch(app_factory, "VOYN-W0-SB1", planner="planner-shared")[0]
+    assert _dispatch(app_factory, "VOYN-W0-SB2", planner="planner-shared")[0]
+
+    _complete_latest(
+        app_factory,
+        worker,
+        "VOYN-W0-SB1",
+        {
+            "status": "completed",
+            "pr_url": "https://github.com/o/r/pull/1",
+            "head_sha": "aaaaaaa",
+        },
+    )
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM backlog_ingest_results(%s)", ("planner-shared",))
+            rows = cur.fetchall()
+    assert [(r[0], r[2]) for r in rows] == [("VOYN-W0-SB1", "ready_to_review")]
+
+    # SB2 is still IN_PROGRESS under the SAME repo lease: it must still be held.
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) FROM backlog_writer_lease WHERE authority = %s",
+                ("repo:repo-shared",),
+            )
+            assert cur.fetchone()[0] == 1, (
+                "releasing repo-shared here abandons SB2's exclusivity "
+                "guarantee while it is still IN_PROGRESS"
+            )
+    assert store.upsert_task(_task("VOYN-W0-SB3", repo="repo-shared"))[0]
+    ok, reason, *_ = _dispatch(app_factory, "VOYN-W0-SB3", planner="planner-other")
+    assert not ok and reason == "repo_busy", "a different planner must still be refused"
+
+    # Finish SB2 too: now nothing in repo-shared needs the lease.
+    _complete_latest(
+        app_factory,
+        worker,
+        "VOYN-W0-SB2",
+        {
+            "status": "completed",
+            "pr_url": "https://github.com/o/r/pull/2",
+            "head_sha": "bbbbbbb",
+        },
+    )
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM backlog_ingest_results(%s)", ("planner-shared",))
+            rows = cur.fetchall()
+    assert [(r[0], r[2]) for r in rows] == [("VOYN-W0-SB2", "ready_to_review")]
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) FROM backlog_writer_lease WHERE authority = %s",
+                ("repo:repo-shared",),
+            )
+            assert cur.fetchone()[0] == 0
+
+
+def test_migration_0018_is_reversible_without_residue(pg_connection_factory) -> None:
+    """Live up->down->up on the exact function bodies of both call sites
+    this migration touches: down restores the pre-0018 RAISE-on-refusal
+    bodies verbatim, up reapplies the return-as-data fix -- pinned so a
+    future no-op down (CREATE FUNCTION, not OR REPLACE) breaks the second up
+    loudly instead of leaving stale behaviour undetected."""
+    from command_center.db import migrations
+
+    def _bodies(conn) -> tuple[str, str]:
+        with conn.cursor() as cur:
+            cur.execute("SELECT prosrc FROM pg_proc WHERE proname = 'backlog_dispatch'")
+            dispatch_body = cur.fetchone()[0]
+            cur.execute(
+                "SELECT prosrc FROM pg_proc WHERE proname = 'backlog_ingest_results'"
+            )
+            ingest_body = cur.fetchone()[0]
+        return dispatch_body, ingest_body
+
+    with pg_connection_factory() as conn:
+        migrations.upgrade(conn)
+        dispatch_body, ingest_body = _bodies(conn)
+        assert "RAISE EXCEPTION" not in dispatch_body
+        assert "RAISE EXCEPTION" not in ingest_body
+        assert "sibling_in_progress" in ingest_body
+
+        migrations.downgrade(conn, target=17)
+        dispatch_body, ingest_body = _bodies(conn)
+        assert "RAISE EXCEPTION" in dispatch_body
+        assert "RAISE EXCEPTION" in ingest_body
+
+        migrations.upgrade(conn)  # must not raise 'already exists'
+        dispatch_body, ingest_body = _bodies(conn)
+        assert "RAISE EXCEPTION" not in dispatch_body
+        assert "RAISE EXCEPTION" not in ingest_body
+        assert "sibling_in_progress" in ingest_body
+
+
 def test_migration_0012_is_reversible_without_residue(pg_connection_factory) -> None:
     """Live up->down->up pins the technical-failure policy to migration
     0012.  Downgrading to 0011 must restore the owner-defer definition, and
