@@ -1605,6 +1605,114 @@ class Supervisor:
         return members
 
     @staticmethod
+    def _live_escaped_descendants(leader_pid: int, *, process_group_id: int) -> list[int] | None:
+        """Return live descendants of `leader_pid` that no longer share its pgid.
+
+        A descendant that calls `setsid()` (or is otherwise re-parented into a
+        new session) leaves the launch-time process group, so `killpg` against
+        `process_group_id` can never reach it — this walks the live `ppid`
+        chain instead. The walk is safe to run for as long as
+        `_live_process_group_members`'s doc-comment already relies on: the
+        unreaped leader keeps `leader_pid` from being recycled, so it remains
+        a stable anchor for descendants (including a since-reparented zombie
+        leader, whose not-yet-reaped children still report it as `ppid`).
+
+        Returns ``None`` if `ps` could not be read, so a caller can fail
+        closed the same way `_live_process_group_members` does. Callers must
+        call this fresh immediately before each signal round rather than
+        reusing a list captured earlier: unlike `killpg`, raw per-pid
+        signalling has no pgid-style pin against the OS recycling an escaped
+        pid for an unrelated process once it exits, so a snapshot kept across
+        a multi-second grace window is a stale-PID hazard.
+        """
+        process = None
+        try:
+            process = _SYSTEM_POPEN(
+                ["ps", "-axo", "pid=,ppid=,pgid=,state="],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                shell=False,
+            )
+            stdout, _stderr = process.communicate(timeout=2)
+            if process.returncode != 0:
+                return None
+        except (OSError, subprocess.SubprocessError, ValueError):
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.wait()
+            return None
+
+        pgid_by_pid: dict[int, int] = {}
+        children_by_ppid: dict[int, list[int]] = {}
+        for line in stdout.splitlines():
+            parts = line.split(None, 3)
+            if len(parts) != 4:
+                continue
+            try:
+                pid = int(parts[0])
+                ppid = int(parts[1])
+                pgid = int(parts[2])
+            except ValueError:
+                continue
+            state = parts[3]
+            if state.startswith("Z"):
+                continue
+            pgid_by_pid[pid] = pgid
+            children_by_ppid.setdefault(ppid, []).append(pid)
+
+        escaped: list[int] = []
+        seen: set[int] = set()
+        stack = list(children_by_ppid.get(leader_pid, []))
+        while stack:
+            pid = stack.pop()
+            if pid in seen:
+                continue
+            seen.add(pid)
+            stack.extend(children_by_ppid.get(pid, []))
+            if pgid_by_pid.get(pid) != process_group_id:
+                escaped.append(pid)
+        return escaped
+
+    def _signal_escaped_descendants(
+        self,
+        leader_pid: int,
+        *,
+        process_group_id: int,
+        sig: signal.Signals,
+    ) -> list[int]:
+        """Discover pgid-escaped descendants and signal them directly.
+
+        Always rediscovers from scratch (see `_live_escaped_descendants`) and,
+        for each candidate, captures and re-verifies its birth identity
+        immediately before the `kill(2)` call via `identity.py` — the same
+        PID-reuse guard the rest of this module already uses for restart
+        reconciliation. This closes both the cross-call staleness a cached
+        pid list would have (a full grace period between discovery and use)
+        and the smaller within-batch window between signalling one candidate
+        pid and the next.
+        """
+        pids = self._live_escaped_descendants(leader_pid, process_group_id=process_group_id)
+        if not pids:
+            return []
+        signalled: list[int] = []
+        for pid in pids:
+            recorded = identity.capture_identity(pid)
+            if recorded is None:
+                continue
+            if not identity.identity_matches(pid, recorded.as_string()):
+                continue
+            try:
+                os.kill(pid, sig)
+                signalled.append(pid)
+            except ProcessLookupError:
+                pass
+            except OSError:
+                logger.exception("Could not send %s directly to escaped pid %s", sig.name, pid)
+        return signalled
+
+    @staticmethod
     def _observe_leader_exit_locked(active: _ActiveRun) -> bool:
         """Observe direct-child exit without reaping the process-group leader."""
         if active.leader_exited_event.is_set():
@@ -1641,77 +1749,126 @@ class Supervisor:
 
         Returns ``(fully_terminated, signal_sent)``. The caller holds
         ``process_control_lock`` throughout, and the leader stays unreaped
-        until every live member is gone, preventing pgid reuse.
+        until every live pgid member is gone, preventing pgid reuse.
+
+        Descendants that escaped the launch-time process group (e.g. via
+        `setsid()`) are drained on the same term/grace/kill timeline as pgid
+        membership, but `_signal_escaped_descendants` always re-discovers
+        them from scratch immediately before each signal rather than being
+        handed a list computed earlier in this method: unlike pgid members,
+        an escaped pid has no equivalent of the unreaped-leader pin, so
+        reusing a list across the grace wait below risks hitting an
+        unrelated process that recycled a since-exited descendant's pid.
         """
         if active.process_exited_event.is_set():
             return True, False
         if not active.leader_exited_event.is_set():
             return False, False
 
+        leader_pid = active.process.pid
         members = self._live_process_group_members(
             active.process_group_id,
-            leader_pid=active.process.pid,
+            leader_pid=leader_pid,
+        )
+        escaped = self._live_escaped_descendants(
+            leader_pid, process_group_id=active.process_group_id
         )
         signal_sent = False
 
-        if members and not group_term_sent:
-            term_sent = self._signal_process_group_locked(active, signal.SIGTERM)
-            signal_sent = signal_sent or term_sent
-            lifecycle = (
-                f"{lifecycle_prefix}_residual_sigterm_sent"
-                if term_sent
-                else f"{lifecycle_prefix}_residual_sigterm_failed"
-            )
-            self._append_lifecycle_event_best_effort(
-                lifecycle,
-                run_id,
-                pid=active.process.pid,
-                descendant_pids=members,
-            )
-            if not term_sent:
+        if (members or escaped) and not group_term_sent:
+            term_sent = False
+            if members:
+                term_sent = self._signal_process_group_locked(active, signal.SIGTERM)
+                signal_sent = signal_sent or term_sent
+                lifecycle = (
+                    f"{lifecycle_prefix}_residual_sigterm_sent"
+                    if term_sent
+                    else f"{lifecycle_prefix}_residual_sigterm_failed"
+                )
+                self._append_lifecycle_event_best_effort(
+                    lifecycle,
+                    run_id,
+                    pid=leader_pid,
+                    descendant_pids=members,
+                )
+            if escaped:
+                escaped_term_sent = self._signal_escaped_descendants(
+                    leader_pid, process_group_id=active.process_group_id, sig=signal.SIGTERM
+                )
+                signal_sent = signal_sent or bool(escaped_term_sent)
+                self._append_lifecycle_event_best_effort(
+                    f"{lifecycle_prefix}_escaped_sigterm_sent"
+                    if escaped_term_sent
+                    else f"{lifecycle_prefix}_escaped_sigterm_failed",
+                    run_id,
+                    pid=leader_pid,
+                    descendant_pids=escaped,
+                )
+            if members and not term_sent:
                 return False, signal_sent
             grace_deadline = time.monotonic() + PROCESS_GROUP_DRAIN_GRACE_SECONDS
 
-        if members and grace_deadline is not None:
-            while members and time.monotonic() < grace_deadline:
+        if (members or escaped) and grace_deadline is not None:
+            while (members or escaped) and time.monotonic() < grace_deadline:
                 time.sleep(0.02)
                 members = self._live_process_group_members(
                     active.process_group_id,
-                    leader_pid=active.process.pid,
+                    leader_pid=leader_pid,
+                )
+                escaped = self._live_escaped_descendants(
+                    leader_pid, process_group_id=active.process_group_id
                 )
                 if members is None:
                     break
 
-        # Unknown membership is handled fail-closed: SIGKILL the still-pinned
-        # group before reaping the leader. Known live descendants are the
-        # normal escalation case.
-        if members is None or members:
-            kill_sent = self._signal_process_group_locked(active, signal.SIGKILL)
-            signal_sent = signal_sent or kill_sent
-            lifecycle = (
-                f"{lifecycle_prefix}_sigkill_sent"
-                if kill_sent
-                else f"{lifecycle_prefix}_sigkill_failed"
-            )
-            self._append_lifecycle_event_best_effort(
-                lifecycle,
-                run_id,
-                pid=active.process.pid,
-                descendant_pids=members,
-            )
-            if not kill_sent:
-                return False, signal_sent
+        # Unknown pgid membership is handled fail-closed: SIGKILL the
+        # still-pinned group before reaping the leader. Known live
+        # descendants (pgid or escaped) are the normal escalation case.
+        if members is None or members or escaped:
+            kill_sent = False
+            if members is None or members:
+                kill_sent = self._signal_process_group_locked(active, signal.SIGKILL)
+                signal_sent = signal_sent or kill_sent
+                lifecycle = (
+                    f"{lifecycle_prefix}_sigkill_sent"
+                    if kill_sent
+                    else f"{lifecycle_prefix}_sigkill_failed"
+                )
+                self._append_lifecycle_event_best_effort(
+                    lifecycle,
+                    run_id,
+                    pid=leader_pid,
+                    descendant_pids=members,
+                )
+                if not kill_sent:
+                    return False, signal_sent
+            if escaped:
+                escaped_kill_sent = self._signal_escaped_descendants(
+                    leader_pid, process_group_id=active.process_group_id, sig=signal.SIGKILL
+                )
+                signal_sent = signal_sent or bool(escaped_kill_sent)
+                self._append_lifecycle_event_best_effort(
+                    f"{lifecycle_prefix}_escaped_sigkill_sent"
+                    if escaped_kill_sent
+                    else f"{lifecycle_prefix}_escaped_sigkill_failed",
+                    run_id,
+                    pid=leader_pid,
+                    descendant_pids=escaped,
+                )
 
             verify_deadline = time.monotonic() + DEFAULT_CANCEL_GRACE_SECONDS
             while time.monotonic() < verify_deadline:
                 members = self._live_process_group_members(
                     active.process_group_id,
-                    leader_pid=active.process.pid,
+                    leader_pid=leader_pid,
                 )
-                if members is None or not members:
+                escaped = self._live_escaped_descendants(
+                    leader_pid, process_group_id=active.process_group_id
+                )
+                if (members is None or not members) and not escaped:
                     break
                 time.sleep(0.02)
-            if members:
+            if members or escaped:
                 return False, signal_sent
 
         if not active.process_reaped_event.is_set():
@@ -2193,6 +2350,22 @@ class Supervisor:
                 )
                 self._append_lifecycle_event_best_effort(term_lifecycle, run_id, pid=pid)
 
+                # `killpg` above only reaches processes still in the launch
+                # pgid. A descendant that called `setsid()` needs a direct
+                # signal, discovered fresh right here (never reused later —
+                # see `_signal_escaped_descendants`'s docstring).
+                escaped_term_sent = self._signal_escaped_descendants(
+                    pid, process_group_id=active.process_group_id, sig=signal.SIGTERM
+                )
+                if escaped_term_sent:
+                    record_first_signal()
+                    self._append_lifecycle_event_best_effort(
+                        f"{lifecycle_prefix}_escaped_sigterm_sent",
+                        run_id,
+                        pid=pid,
+                        descendant_pids=escaped_term_sent,
+                    )
+
                 if term_sent:
                     try:
                         self._wait_for_process_exit(
@@ -2225,6 +2398,22 @@ class Supervisor:
                     else f"{lifecycle_prefix}_sigkill_failed"
                 )
                 self._append_lifecycle_event_best_effort(kill_lifecycle, run_id, pid=pid)
+
+                # Re-discover escaped descendants fresh rather than reusing
+                # `escaped_term_sent` above: that snapshot is now stale by a
+                # full grace period, and an escaped pid has no pgid-style pin
+                # against the OS recycling it for an unrelated process.
+                escaped_kill_sent = self._signal_escaped_descendants(
+                    pid, process_group_id=active.process_group_id, sig=signal.SIGKILL
+                )
+                if escaped_kill_sent:
+                    record_first_signal()
+                    self._append_lifecycle_event_best_effort(
+                        f"{lifecycle_prefix}_escaped_sigkill_sent",
+                        run_id,
+                        pid=pid,
+                        descendant_pids=escaped_kill_sent,
+                    )
 
                 if not first_signal_recorded and on_no_signal is not None:
                     on_no_signal()
