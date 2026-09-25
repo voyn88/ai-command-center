@@ -11,7 +11,7 @@ from pathlib import Path
 
 import streamlit as st
 
-from command_center import execution_queue, recommendation_service
+from command_center import execution_queue, recommendation_service, tasks_repository
 from command_center.runtime import db as runtime_db
 from command_center.ui.launch_feedback import render_skipped_launch
 
@@ -68,6 +68,7 @@ def render_recommendations_panel(
 
     columns = st.columns(len(views))
     for column, view in zip(columns, views, strict=True):
+        task = tasks_by_id.get(view["task_id"])
         with column, st.container(border=True):
             st.markdown(f"**{view['title']}**")
             st.caption(f"{view['project']} · приоритет {view['priority']}")
@@ -93,6 +94,17 @@ def render_recommendations_panel(
             if queued_label:
                 st.caption(queued_label)
 
+            if task is not None and tasks_repository.is_master_projection_task(task):
+                # A master-projection record is a read-only view of the
+                # canonical backlog (`live_board.launch_gate` refuses it for
+                # the same reason): no queue, no launch, the fleet's own
+                # pipeline is its only writer.
+                st.info(
+                    "Задача центрального бэклога (read-only): исполняется "
+                    "флотом, управление — через конвейер, не через консоль."
+                )
+                continue
+
             action_cols = st.columns(2)
             with action_cols[0]:
                 queue_disabled = view["queued_state"] is not None
@@ -102,7 +114,6 @@ def render_recommendations_panel(
                     disabled=queue_disabled,
                     width="stretch",
                 ):
-                    task = tasks_by_id.get(view["task_id"])
                     # Lost-update-safe: re-read and persist under `queue_lock`
                     # rather than saving back the `queue_entries` snapshot loaded
                     # earlier this render, which a concurrent writer may have
@@ -117,7 +128,6 @@ def render_recommendations_panel(
                     type="primary",
                     width="stretch",
                 ):
-                    task = tasks_by_id.get(view["task_id"])
                     working_entries = execution_queue.enqueue_and_persist(root, task, tasks_by_id)
                     new_entry = next(
                         e
