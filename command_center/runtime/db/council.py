@@ -228,9 +228,9 @@ def _mirror_vote(record: dict) -> None:
 def _mirror_decision(record: dict) -> None:
     """Best-effort dual-write of one decision into PostgreSQL (slice 9).
 
-    Takes the **stored** record: `_decode_decision_row` pops `tally_json` and
-    `roles_json`, and mirroring the decoded shape would write both columns'
-    defaults on every row.
+    Takes the **stored** record: `_decode_decision_row` pops `tally_json`,
+    `roles_json` and `impact_json`, and mirroring the decoded shape would write
+    those columns' defaults on every row.
     """
     try:
         from command_center.db.council_store import PostgresCouncilDecisionMirror
@@ -470,6 +470,7 @@ _DECISION_COLUMNS: tuple[str, ...] = (
     "quorum",
     "decided_at",
     "created_at",
+    "impact_json",
 )
 
 
@@ -484,6 +485,7 @@ def record_decision(
     rationale: str,
     quorum: int,
     decision_id: str | None = None,
+    impact: dict | None = None,
 ) -> dict:
     """Write the immutable decision for a motion and move the motion to
     ``decided`` — both in one ``BEGIN IMMEDIATE`` transaction.
@@ -498,8 +500,12 @@ def record_decision(
       — the ``motion_id`` primary key).
 
     ``roles`` is the frozen snapshot of every voter's ``{voter_id, voter_kind,
-    role, choice}`` — the ADR "who decided, and how" record. Returns the decision
-    row (with ``tally``/``roles`` decoded)."""
+    role, choice}`` — the ADR "who decided, and how" record. ``impact``, when
+    given, is the decision's estimated financial/time impact (the Decision P&L
+    pillar of the client-facing proof package, VOYN-MIN-WOW-1) — free-form and
+    optional, since a decision has no update path and most decisions never
+    carry one. Returns the decision row (with ``tally``/``roles``/``impact``
+    decoded)."""
     if outcome not in DECISION_OUTCOMES:
         raise ValueError(
             f"decision.outcome must be one of {sorted(DECISION_OUTCOMES)}, got {outcome!r}"
@@ -515,6 +521,7 @@ def record_decision(
         "quorum": int(quorum),
         "decided_at": now,
         "created_at": now,
+        "impact_json": json.dumps(impact, ensure_ascii=False, sort_keys=True) if impact else None,
     }
     columns = ", ".join(_DECISION_COLUMNS)
     placeholders = ", ".join(f":{name}" for name in _DECISION_COLUMNS)
@@ -759,14 +766,18 @@ def list_events_stored(db_path: Path) -> list[dict]:
 
 
 def _decode_decision_row(row: dict) -> dict:
-    """Return a copy of a ``council_decision`` row with ``tally_json``/``roles_json``
-    decoded to ``tally``/``roles`` (the JSON columns stay internal to the
-    repository)."""
+    """Return a copy of a ``council_decision`` row with ``tally_json``/``roles_json``/
+    ``impact_json`` decoded to ``tally``/``roles``/``impact`` (the JSON columns
+    stay internal to the repository). ``impact`` is ``None`` when no impact was
+    recorded — distinct from an empty dict, which would claim a zero impact was
+    deliberately estimated."""
     out = dict(row)
     tally_raw = out.pop("tally_json", "{}")
     roles_raw = out.pop("roles_json", "[]")
+    impact_raw = out.pop("impact_json", None)
     out["tally"] = json.loads(tally_raw) if tally_raw else {}
     out["roles"] = json.loads(roles_raw) if roles_raw else []
+    out["impact"] = json.loads(impact_raw) if impact_raw else None
     return out
 
 
