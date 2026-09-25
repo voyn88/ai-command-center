@@ -21,6 +21,12 @@ Env vars:
 - `FAKE_CLAUDE_TREE_PARENT_EXIT_AFTER_START`: if "1", the parent exits
   naturally after reporting the tree, leaving its descendants alive unless
   the Supervisor drains the process group before reaping the leader.
+- `FAKE_CLAUDE_TREE_GRANDCHILD_SETSID`: if "1", the grandchild calls
+  `os.setsid()` before sleeping, making it the leader of a brand-new session
+  and process group of its own. It stays a live child of `child` (its `ppid`
+  is untouched), but it no longer shares the parent's pgid, so it is invisible
+  to a cancellation path that only ever inspects "same pgid as the launch
+  leader" — the escape this fixture exists to exercise.
 """
 
 from __future__ import annotations
@@ -41,6 +47,8 @@ def _write_pid(pidfile_base: str, role: str, pid: int) -> None:
 
 
 def _run_grandchild() -> None:
+    if os.environ.get("FAKE_CLAUDE_TREE_GRANDCHILD_SETSID") == "1":
+        os.setsid()
     if os.environ.get("FAKE_CLAUDE_TREE_DESCENDANTS_IGNORE_SIGTERM") == "1":
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
     time.sleep(60)
