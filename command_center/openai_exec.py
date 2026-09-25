@@ -33,6 +33,24 @@ The explicit User-Agent is load-bearing: Groq's edge (Cloudflare) rejects
 python-urllib's default UA with an opaque 403 error 1010 — live-measured
 2026-09-03 while the /models endpoint worked from curl with identical
 credentials.
+
+VOYN-W0-AICC-CHEAP-API-VERDICT-BENCH (owner priority 2026-09-04, revised to
+the free-tier candidates below since direct DeepSeek payment was
+unavailable): the promotion bench itself — groq ``openai/gpt-oss-120b``
+and the openrouter free tier, run through the real chunked envelope against
+the same three known-truth PRs as the prior bench — could not be attempted
+from an agent's task-clone sandbox. That sandbox has outbound network
+reach to both providers (bare ``curl`` to their API hosts succeeds), which
+is exactly what makes the absence of a working credential a real blocker
+rather than a network one: ``GROQ_API_KEY``/``OPENROUTER_API_KEY`` are in
+neither the process environment nor any ``.env`` the sandbox's principal
+can read, the systemd ``CREDENTIALS_DIRECTORY`` for this service carries
+only the lease DB password, and both ``/run/voyn/secrets`` and
+``/etc/voyn/secrets`` refuse with EACCES. This module's own docstring above
+says the keys live in "the fleet's ``.env`` on the control/worker hosts" —
+true, but that host is not this sandbox. The bench needs running from
+wherever that ``.env`` actually loads; no amount of code change here
+substitutes for the credential.
 """
 
 from __future__ import annotations
