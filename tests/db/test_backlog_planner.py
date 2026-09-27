@@ -1327,3 +1327,193 @@ def test_open_monitor_findings_become_pipeline_tasks_once(rig) -> None:
         with conn.cursor() as cur:
             cur.execute("SELECT monitor_clear_finding(%s)", ("worker-01:infra",))
             assert cur.fetchone()[0] == 1
+
+
+# ---------------------------------------------------------------------------
+# The pre-dispatch reuse gate (VOYN-W0-AICC-DISPATCH-REUSE-GATE, 0025): a
+# remediation task whose parent's work is already merged must close as
+# superseded instead of dispatching a run that re-implements it.
+# ---------------------------------------------------------------------------
+
+
+def _superseded(app_factory, task_id, parent, pr="https://gh/pull/624",
+                sha="c" * 40, evidence="commit_title: already on main"):
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM backlog_close_superseded(%s, %s, %s, %s, %s)",
+                (task_id, parent, pr, sha, evidence),
+            )
+            return cur.fetchone()
+
+
+def test_close_superseded_closes_a_remediation_with_the_merge_as_evidence(rig) -> None:
+    """DONE is a claim about the repositories and the machine demands the
+    receipts: the superseding pull request and sha become this task's own
+    `pr`/`sha` evidence, so the closed task carries exactly what every other
+    DONE task carries."""
+    app_factory, store, _worker = rig
+    assert store.upsert_task(_task("VOYN-W0-CS", repo="repo-tt"))[0]
+    assert store.upsert_task(_task("VOYN-W0-CS-REM", repo="repo-tt"))[0]
+
+    ok, reason, revision = _superseded(app_factory, "VOYN-W0-CS-REM", "VOYN-W0-CS")
+
+    assert (ok, reason) == (True, "superseded")
+    assert revision == 2
+    assert store.get_task("VOYN-W0-CS-REM")["status"] == "DONE"
+    evidence = {row["kind"]: row["value"] for row in store.list_evidence("VOYN-W0-CS-REM")}
+    assert evidence["pr"] == "https://gh/pull/624"
+    assert evidence["sha"] == "c" * 40
+    assert evidence["acceptance"] == "commit_title: already on main"
+    granted = [
+        event
+        for event in store.list_events("VOYN-W0-CS-REM")
+        if event["event"] == "close_superseded" and event["outcome"] == "granted"
+    ]
+    assert len(granted) == 1
+    # The durable telemetry: "how many duplicate dispatches did the gate
+    # prevent" is a count over this event, with the evidence attached.
+    assert granted[0]["detail"]["parent"] == "VOYN-W0-CS"
+    assert granted[0]["detail"]["to"] == "DONE"
+
+
+def test_close_superseded_refuses_a_task_that_is_not_a_remediation(rig) -> None:
+    """The narrow authority: no lineage row and no `-REM`/`-RETRY` suffix
+    over the named parent means this is an ordinary task, and no argument the
+    planner passes can close it through this path."""
+    app_factory, store, _worker = rig
+    assert store.upsert_task(_task("VOYN-W0-CO", repo="repo-tt"))[0]
+    assert store.upsert_task(_task("VOYN-W0-CP", repo="repo-tt"))[0]
+
+    ok, reason, _revision = _superseded(app_factory, "VOYN-W0-CO", "VOYN-W0-CP")
+
+    assert (ok, reason) == (False, "not_a_remediation")
+    assert store.get_task("VOYN-W0-CO")["status"] == "OPEN"
+
+
+def test_close_superseded_accepts_a_recorded_lineage_without_the_suffix(rig) -> None:
+    """A remediation task whose id carries no suffix is still a remediation:
+    `backlog_task_remediation` is the other half of the authority."""
+    app_factory, store, _worker = rig
+    assert store.upsert_task(_task("VOYN-W0-CL", repo="repo-tt"))[0]
+    assert store.upsert_task(_task("VOYN-W0-CHILD-OF-CL", repo="repo-tt"))[0]
+    assert store.record_remediation(
+        "VOYN-W0-CHILD-OF-CL", "VOYN-W0-CL", "https://gh/pull/1", "a" * 40
+    )[0]
+
+    ok, reason, _revision = _superseded(app_factory, "VOYN-W0-CHILD-OF-CL", "VOYN-W0-CL")
+
+    assert (ok, reason) == (True, "superseded")
+    assert store.get_task("VOYN-W0-CHILD-OF-CL")["status"] == "DONE"
+
+
+def test_close_superseded_only_ever_touches_an_open_task(rig) -> None:
+    """It may prevent a dispatch that has not happened; it may never truncate
+    a run in flight, nor reach into review or merge."""
+    app_factory, store, _worker = rig
+    assert store.upsert_task(_task("VOYN-W0-CI", repo="repo-tt"))[0]
+    assert store.upsert_task(_task("VOYN-W0-CI-REM", repo="repo-tt"))[0]
+    assert _dispatch(app_factory, "VOYN-W0-CI-REM")[0]  # -> IN_PROGRESS
+
+    ok, reason, _revision = _superseded(app_factory, "VOYN-W0-CI-REM", "VOYN-W0-CI")
+
+    assert (ok, reason) == (False, "not_open")
+    assert store.get_task("VOYN-W0-CI-REM")["status"] == "IN_PROGRESS"
+
+
+def test_close_superseded_refuses_everything_else(rig) -> None:
+    app_factory, store, _worker = rig
+    assert store.upsert_task(_task("VOYN-W0-CX", repo="repo-tt"))[0]
+    assert store.upsert_task(_task("VOYN-W0-CX-REM", repo="repo-tt"))[0]
+    assert store.upsert_task(_task("VOYN-W0-CG", kind="gate", repo="repo-tt"))[0]
+    assert _superseded(app_factory, "VOYN-W0-NOPE", "VOYN-W0-CX")[:2] == (
+        False,
+        "unknown_task",
+    )
+    assert _superseded(app_factory, "VOYN-W0-CX-REM", "VOYN-W0-GONE")[:2] == (
+        False,
+        "unknown_parent_task",
+    )
+    assert _superseded(app_factory, "VOYN-W0-CX-REM", "VOYN-W0-CX-REM")[:2] == (
+        False,
+        "self_reference",
+    )
+    assert _superseded(app_factory, "VOYN-W0-CG", "VOYN-W0-CX")[:2] == (
+        False,
+        "gate_is_control_record",
+    )
+    assert _superseded(app_factory, "VOYN-W0-CX-REM", "VOYN-W0-CX", pr="")[:2] == (
+        False,
+        "empty_value",
+    )
+    assert _superseded(app_factory, "VOYN-W0-CX-REM", "VOYN-W0-CX", sha="")[:2] == (
+        False,
+        "empty_value",
+    )
+    assert _superseded(
+        app_factory, "VOYN-W0-CX-REM", "VOYN-W0-CX", evidence=""
+    )[:2] == (False, "empty_value")
+    assert store.get_task("VOYN-W0-CX-REM")["status"] == "OPEN"
+
+
+def test_migration_0025_is_reversible_without_residue(pg_connection_factory) -> None:
+    """Live up->down->up: the down must actually drop the function, and the
+    second up must recreate it rather than fail with 'already exists'."""
+    from command_center.db import migrations
+
+    def _exists(conn) -> int:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) FROM pg_proc WHERE proname = 'backlog_close_superseded'"
+            )
+            return cur.fetchone()[0]
+
+    with pg_connection_factory() as conn:
+        migrations.upgrade(conn)
+        assert _exists(conn) == 1
+        migrations.downgrade(conn, target=24)
+        assert _exists(conn) == 0
+        migrations.upgrade(conn)
+        assert _exists(conn) == 1
+
+
+def test_the_planner_closes_a_superseded_remediation_instead_of_dispatching(
+    rig, tmp_path
+) -> None:
+    """The whole gate, end to end on the real store: an eligible `-REM` task
+    whose parent's pull request is on the checkout's default branch is closed
+    with evidence, and the execution queue never sees it."""
+    import subprocess
+
+    from command_center.orchestrator.planner import Planner
+
+    app_factory, store, _worker = rig
+    assert store.upsert_task(_task("VOYN-W0-GA", repo="repo-ga"))[0]
+    assert store.upsert_task(_task("VOYN-W0-GA-REM", repo="repo-ga"))[0]
+
+    checkout = tmp_path / "repo-ga"
+    checkout.mkdir()
+    env = {
+        "GIT_AUTHOR_NAME": "Test", "GIT_AUTHOR_EMAIL": "test@example.invalid",
+        "GIT_COMMITTER_NAME": "Test", "GIT_COMMITTER_EMAIL": "test@example.invalid",
+        "PATH": "/usr/bin:/bin:/usr/local/bin", "HOME": str(checkout),
+    }
+    for args in (
+        ["init", "-b", "main", "--quiet"],
+        ["remote", "add", "origin", "https://github.com/voyn88/repo-ga.git"],
+        ["commit", "--quiet", "--allow-empty", "-m", "VOYN-W0-GA: land the work (#624)"],
+    ):
+        subprocess.run(
+            ["git", *args], cwd=checkout, env=env, check=True, capture_output=True
+        )
+
+    report = Planner(app_factory, str(checkout)).plan_once(
+        PlanLimits(planner="planner-t")
+    )
+
+    assert [task for task, _evidence in report.superseded] == ["VOYN-W0-GA-REM"]
+    assert report.prevented_duplicate_dispatches == 1
+    assert "VOYN-W0-GA-REM" not in [task for task, _item in report.dispatched]
+    assert store.get_task("VOYN-W0-GA-REM")["status"] == "DONE"
+    # The parent itself is an ordinary OPEN task and is dispatched as usual.
+    assert ("VOYN-W0-GA", "VOYN-W0-GA") not in report.superseded
