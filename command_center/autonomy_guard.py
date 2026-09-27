@@ -12,6 +12,7 @@ dispatch; in-flight work is left alone.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -109,9 +110,9 @@ def _window_expired(started_at: object, window_seconds: int) -> bool:
     if not isinstance(started_at, str):
         return True
     try:
-        started = models.parse_iso(started_at)
-        now = models.parse_iso(models.iso_now())
-    except (TypeError, ValueError, AttributeError):
+        started = datetime.fromisoformat(started_at)
+        now = datetime.fromisoformat(models.iso_now())
+    except (TypeError, ValueError):
         return True
     return (now - started).total_seconds() >= window_seconds
 
@@ -154,7 +155,6 @@ def pause_for_red_smoke(root: Path, *, sha: str, actor: str = "self_deploy") -> 
 
 
 def check_dispatch(root: Path, repo: str, kind: str = "pr") -> GuardDecision:
-    """May this loop create another PR / rerun / remediation for `repo`?"""
     state = load_state(root)
     if state.get("paused") is True:
         return GuardDecision(
