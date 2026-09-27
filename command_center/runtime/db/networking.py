@@ -145,7 +145,7 @@ def create_contact(
     placeholders = ", ".join(f":{name}" for name in _CONTACT_COLUMNS)
     with db.connect(db_path) as conn:
         with db.transaction(conn):
-            conn.execute(f"INSERT INTO contact ({columns}) VALUES ({placeholders})", record)
+            conn.execute(f"INSERT INTO contact ({columns}) VALUES ({placeholders})", record)  # nosec B608 - columns/placeholders built from the hardcoded _CONTACT_COLUMNS tuple; row values are bound via the `record` params dict
     _mirror_contact(record)
     return record
 
@@ -220,7 +220,7 @@ def list_contacts(
     params.extend([limit, offset])
     with db.connect(db_path) as conn:
         rows = conn.execute(
-            f"SELECT * FROM contact{where} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+            f"SELECT * FROM contact{where} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",  # nosec B608 - `where` is assembled only from hardcoded clause literals ("project_ref = ?", the fixed exclude-projects template) with all values bound as `?` params
             params,
         ).fetchall()
         return [dict(row) for row in rows]
@@ -257,7 +257,7 @@ def update_contact_fields(
             params["contact_id"] = contact_id
             params["expected_version"] = expected_version
             cur = conn.execute(
-                f"UPDATE contact SET {set_clause}, version = version + 1 "
+                f"UPDATE contact SET {set_clause}, version = version + 1 "  # nosec B608 - set_clause keys come from `payload`, whose keys are `fields` already checked against the _UPDATABLE_CONTACT_FIELDS allowlist above; values are bound via named params
                 "WHERE id = :contact_id AND version = :expected_version",
                 params,
             )
@@ -322,7 +322,7 @@ def create_message(
     placeholders = ", ".join(f":{name}" for name in _MESSAGE_COLUMNS)
     with db.connect(db_path) as conn:
         with db.transaction(conn):
-            conn.execute(f"INSERT INTO message ({columns}) VALUES ({placeholders})", record)
+            conn.execute(f"INSERT INTO message ({columns}) VALUES ({placeholders})", record)  # nosec B608 - columns/placeholders built from the hardcoded _MESSAGE_COLUMNS tuple; row values are bound via the `record` params dict
     _mirror_message(record)
     return record
 
@@ -359,7 +359,7 @@ def list_messages(
     params.extend([limit, offset])
     with db.connect(db_path) as conn:
         rows = conn.execute(
-            f"SELECT * FROM message{where} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+            f"SELECT * FROM message{where} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",  # nosec B608 - `where` is assembled only from hardcoded clause literals ("contact_id = ?", "kind = ?", the fixed exclude-projects template) with all values bound as `?` params
             params,
         ).fetchall()
         return [dict(row) for row in rows]
@@ -425,7 +425,7 @@ def create_invitation(
     with db.connect(db_path) as conn:
         with db.transaction(conn):
             conn.execute(
-                f"INSERT INTO networking_invitation ({columns}) VALUES ({placeholders})", record
+                f"INSERT INTO networking_invitation ({columns}) VALUES ({placeholders})", record  # nosec B608 - columns/placeholders built from the hardcoded _INVITATION_COLUMNS tuple; row values are bound via the `record` params dict
             )
     _mirror_invitation(record)
     return record
@@ -489,7 +489,7 @@ def list_invitations(
     params.extend([limit, offset])
     with db.connect(db_path) as conn:
         rows = conn.execute(
-            f"SELECT * FROM networking_invitation{where} "
+            f"SELECT * FROM networking_invitation{where} "  # nosec B608 - `where` is assembled only from hardcoded clause literals ("status = ?", "contact_id = ?", the fixed exclude-projects template) with all values bound as `?` params
             "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
             params,
         ).fetchall()
@@ -533,7 +533,7 @@ def set_invitation_status(
             params["invitation_id"] = invitation_id
             params["expected_version"] = expected_version
             cur = conn.execute(
-                f"UPDATE networking_invitation SET {set_clause}, version = version + 1 "
+                f"UPDATE networking_invitation SET {set_clause}, version = version + 1 "  # nosec B608 - set_clause keys come from the hardcoded `fields` dict literal ({"status", "updated_at", "responded_at"}); values are bound via named params
                 "WHERE id = :invitation_id AND version = :expected_version",
                 params,
             )
