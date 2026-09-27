@@ -429,12 +429,23 @@ if [ -e "$state_dir" ]; then
 else
   install -d -m 0700 -o root -g root "$state_dir"
 fi
+# The snapshot must cover what this host runs TODAY, not only what the
+# incoming generation declares. `--lanes` is the incoming manifest (the lanes
+# the rollout will apply); `--also-lanes` adds the currently INSTALLED
+# registry, so a host-specific lane the new manifest drops is still recorded
+# with its prior unit state and can be restored by rollback. Reading only the
+# incoming registry left exactly those lanes mutable-but-unrestorable
+# (independent review on 988de49). The installed registry does not exist
+# before the first install and then contributes no lanes; one that exists but
+# cannot be read safely still fails the snapshot closed.
+#
 # NOTE: snapshot's own discover_units() additionally folds in every loaded/
 # enabled voyn-aicc-worker@* template instance, so runtime-only lanes are
-# snapshotted even when absent from the installed lane registry. The two
-# legacy units below mirror LEGACY_WORKER_UNITS in
-# ops/aicc_staged_worker_rollout.py -- keep the lists in lockstep.
+# snapshotted even when absent from both registries. The two legacy units
+# below mirror LEGACY_WORKER_UNITS in ops/aicc_staged_worker_rollout.py --
+# keep the lists in lockstep.
 run_rollout snapshot --lanes "$repo_root/deploy/aicc/worker-lanes" \
+  --also-lanes /etc/aicc/worker-lanes \
   --state "$attempt_units" \
   --include-unit aicc-agent-launcher.socket \
   --include-unit aicc-principal-recovery.service \
