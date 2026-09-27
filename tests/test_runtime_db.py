@@ -55,12 +55,25 @@ def _mp_event_writer_worker(path_str: str, run_id: str, process_idx: int, n_even
         _db.append_run_event(path, run_id, "lifecycle", {"process_idx": process_idx, "i": i})
 
 
+def _migrations_through(migrations, version: int) -> list:
+    """Every migration up to and including `version`, selected by version
+    number rather than by list position.
+
+    `MIGRATIONS[:-1]` meant "stop at v24" only for as long as v25 was the last
+    entry. When v26 landed it silently started meaning "stop at v25", and the
+    fixtures that exist to build a *pre-claim-fencing* database quietly built a
+    fenced one instead — the exact failure the module's own comment about
+    `discover()[-1]` warns about, one table over.
+    """
+    return [migration for migration in migrations if migration[0] <= version]
+
+
 def _v24_db_with_run(tmp_path, monkeypatch, *, state: str, finalized: bool):
     """Build the exact pre-claim cutover shape with one controlled run."""
     path = tmp_path / f"runtime-v24-{state.lower()}-{int(finalized)}.db"
     current_migrations = list(db.MIGRATIONS)
     with monkeypatch.context() as pre_claim:
-        pre_claim.setattr(db, "MIGRATIONS", current_migrations[:-1])
+        pre_claim.setattr(db, "MIGRATIONS", _migrations_through(current_migrations, 24))
         pre_claim.setattr(db, "SCHEMA_VERSION", 24)
         db.migrate(path)
         task = db.create_task(
@@ -163,7 +176,7 @@ def test_v25_migration_rolls_back_table_when_ledger_stamp_fails(
     path = tmp_path / "runtime-v24-ledger-failure.db"
     current_migrations = list(db.MIGRATIONS)
     with monkeypatch.context() as pre_claim:
-        pre_claim.setattr(db, "MIGRATIONS", current_migrations[:-1])
+        pre_claim.setattr(db, "MIGRATIONS", _migrations_through(current_migrations, 24))
         pre_claim.setattr(db, "SCHEMA_VERSION", 24)
         db.migrate(path)
 
@@ -197,7 +210,7 @@ def test_v25_migration_rejects_unversioned_preexisting_claim_table(
     path = tmp_path / "runtime-v24-drifted-claim.db"
     current_migrations = list(db.MIGRATIONS)
     with monkeypatch.context() as pre_claim:
-        pre_claim.setattr(db, "MIGRATIONS", current_migrations[:-1])
+        pre_claim.setattr(db, "MIGRATIONS", _migrations_through(current_migrations, 24))
         pre_claim.setattr(db, "SCHEMA_VERSION", 24)
         db.migrate(path)
     with db.connect(path) as conn:
@@ -461,13 +474,17 @@ def test_v25_offline_cutover_rejects_future_schema(tmp_path, monkeypatch):
     )
     with db.connect(path) as conn:
         with db.transaction(conn):
+            # One past the head this binary knows, whatever that head is — a
+            # literal here stopped describing "the future" the moment the real
+            # v26 landed and started describing the present.
             conn.execute(
-                "INSERT INTO schema_version (version, applied_at) VALUES (26, ?)",
-                (db.iso_now(),),
+                "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
+                (db.SCHEMA_VERSION + 1, db.iso_now()),
             )
 
     with pytest.raises(
-        db.FinalizationClaimCutoverRequired, match="only understands v25"
+        db.FinalizationClaimCutoverRequired,
+        match=f"only understands v{db.SCHEMA_VERSION}",
     ):
         db.bootstrap_finalization_claim_cutover(
             path,
@@ -514,21 +531,27 @@ def test_upgrade_from_every_supported_historical_schema(
     # made this test fail on every schema addition for a reason unrelated to
     # what it verifies (that a historical database upgrades cleanly).
     assert db.SCHEMA_VERSION == current_version
-    with pytest.raises(
-        db.FinalizationClaimCutoverRequired, match="explicit offline"
-    ):
-        db.migrate(path)
-    assert db.current_schema_version(path) == 24
-    assert (
-        db.bootstrap_finalization_claim_cutover(
-            path,
-            owner_token="cutover-owner",
-            owner_pid=123,
-            owner_identity="birth|command",
-            offline_confirmed=True,
+    if expected_recorded < 25:
+        # Crossing *into* v25 is the controlled cutover: the migration refuses,
+        # the operator confirms offline, and only then does the upgrade run. A
+        # database that already records v25 or later is past that boundary and
+        # upgrades like any other — which is why this branch exists at all
+        # rather than the cutover being asserted unconditionally.
+        with pytest.raises(
+            db.FinalizationClaimCutoverRequired, match="explicit offline"
+        ):
+            db.migrate(path)
+        assert db.current_schema_version(path) == 24
+        assert (
+            db.bootstrap_finalization_claim_cutover(
+                path,
+                owner_token="cutover-owner",
+                owner_pid=123,
+                owner_identity="birth|command",
+                offline_confirmed=True,
+            )
+            == 0
         )
-        == 0
-    )
     db.migrate(path)
     assert db.current_schema_version(path) == db.SCHEMA_VERSION
     with db.connect(path) as conn:
@@ -540,7 +563,7 @@ def test_v5_historical_runs_migrate_to_claude_provider_default(tmp_path, monkeyp
     path = tmp_path / "runtime-v5-with-run.db"
     current_migrations = list(db.MIGRATIONS)
     with monkeypatch.context() as historical:
-        historical.setattr(db, "MIGRATIONS", current_migrations[:5])
+        historical.setattr(db, "MIGRATIONS", _migrations_through(current_migrations, 5))
         historical.setattr(db, "SCHEMA_VERSION", 5)
         db.migrate(path)
         task = db.create_task(path, project="AIOS", title="historical", task_type="review")
@@ -578,7 +601,7 @@ def test_v5_historical_runs_migrate_to_claude_provider_default(tmp_path, monkeyp
     # old file to v24 while intake is stopped, verify/remediate the historical
     # terminal row, and only then enable claim fencing.
     with monkeypatch.context() as pre_claim:
-        pre_claim.setattr(db, "MIGRATIONS", current_migrations[:-1])
+        pre_claim.setattr(db, "MIGRATIONS", _migrations_through(current_migrations, 24))
         pre_claim.setattr(db, "SCHEMA_VERSION", 24)
         db.migrate(path)
     with db.connect(path) as conn:
@@ -597,6 +620,10 @@ def test_v5_historical_runs_migrate_to_claude_provider_default(tmp_path, monkeyp
         )
         == 0
     )
+    # Past the cutover boundary the remaining migrations apply normally; run
+    # them, so the row count below is against a database at the current head
+    # rather than one parked at v25.
+    db.migrate(path)
     historical_run = db.get_run(path, "historical-run")
     assert historical_run["provider_id"] == "claude_code"
     assert historical_run["provider_metadata_json"] is None
