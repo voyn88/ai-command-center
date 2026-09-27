@@ -23,6 +23,7 @@ from command_center.ops.credential_rotation import (
     CircuitJournal,
     CircuitOpen,
     CircuitState,
+    CredentialExpiry,
     PhaseJournal,
     RotationConfig,
     RotationController,
@@ -42,6 +43,9 @@ from command_center.worker.credential_file import (
 )
 
 OLD_PASSWORD = "a" * 64
+#: Mirrors `enroll_self_grace()` (0029): how long past its ledger expiry a
+#: worker credential may still renew itself.
+RENEWAL_GRACE_SECONDS = 3600.0
 NOW = datetime(2026, 8, 24, 12, 0, tzinfo=UTC)
 LANE_1 = "voyn-aicc-worker@1.service"
 LANE_2 = "voyn-aicc-worker@2.service"
@@ -266,13 +270,18 @@ class FakeAuthority:
         if self.now() >= self.current_expires_at:
             raise RotationError("expired credential")
 
-    def current_expiry(self, config) -> tuple[datetime, float]:
+    def current_expiry(self, config) -> CredentialExpiry:
         self.events.append(("expiry", config.password))
         if config.password != self.current_password:
             raise RotationError("stale credential")
-        return self.current_expires_at, (
-            self.current_expires_at - self.now()
-        ).total_seconds()
+        remaining = (self.current_expires_at - self.now()).total_seconds()
+        # The database answers for an expired credential inside the grace too
+        # (0029): a negative remaining lifetime, a positive renewal window.
+        if remaining + RENEWAL_GRACE_SECONDS <= 0:
+            raise RotationError("credential expiry refused: credential_expired")
+        return CredentialExpiry(
+            self.current_expires_at, remaining, remaining + RENEWAL_GRACE_SECONDS
+        )
 
     def rotate(self, config, new_secret: str, verifier: str):
         self.events.append(("rotate", config.password))
@@ -393,6 +402,63 @@ def test_server_authoritative_threshold_defers_fresh_credential_without_drain(
 
     assert not any(event[0] in {"drain", "rotate", "reload"} for event in events)
     assert any(event[0] == "expiry" for event in events)
+
+
+def test_expired_credential_inside_the_renewal_grace_is_rotated_not_refused(
+    tmp_path: Path,
+) -> None:
+    """VOYN-W0-AICC-CREDENTIAL-ROTATION-DEADLOCKS-AFTER-EXPIRY (remediation).
+
+    Live 2026-09-15 the credential expired while the circuit was open and the
+    rotator then refused itself forever: the expiry proof said "inside the
+    safety margin" of a credential that had none. The pre-mutation attempt is
+    bounded by the RENEWAL deadline the database reports, not by the work
+    expiry, so an expired credential inside the grace rotates at once.
+    """
+    events: list[tuple] = []
+    controller, systemd, authority = _controller(tmp_path, events)
+    authority.current_expires_at = NOW - timedelta(minutes=1)
+
+    controller.rotate()
+
+    assert any(event[0] == "rotate" for event in events)
+    assert authority.current_password != OLD_PASSWORD
+    assert systemd.status == {LANE_1: "aicc-ready", LANE_2: "aicc-ready"}
+    assert not controller.config.phase_file.exists()
+
+
+def test_expired_credential_past_the_renewal_grace_is_refused_before_any_drain(
+    tmp_path: Path,
+) -> None:
+    events: list[tuple] = []
+    controller, systemd, authority = _controller(tmp_path, events)
+    authority.current_expires_at = NOW - timedelta(seconds=RENEWAL_GRACE_SECONDS + 1)
+
+    with pytest.raises(RotationError, match="credential_expired"):
+        controller.rotate()
+
+    assert not any(event[0] in {"drain", "rotate", "reload"} for event in events)
+    assert authority.current_password == OLD_PASSWORD
+    assert systemd.status == {LANE_1: "aicc-ready", LANE_2: "aicc-ready"}
+
+
+def test_renewal_window_inside_the_safety_margin_is_refused_before_any_drain(
+    tmp_path: Path,
+) -> None:
+    """The renewal deadline, not the work expiry, is what a pre-mutation
+    attempt must fit inside: with 4 minutes of renewal left there is no safe
+    budget, however the database phrases the expiry."""
+    events: list[tuple] = []
+    controller, _, authority = _controller(tmp_path, events)
+    authority.current_expires_at = NOW - timedelta(
+        seconds=RENEWAL_GRACE_SECONDS - 240
+    )
+
+    with pytest.raises(RotationError, match="safety margin"):
+        controller.rotate()
+
+    assert not any(event[0] in {"drain", "rotate", "reload"} for event in events)
+    assert authority.current_password == OLD_PASSWORD
 
 
 def test_healthy_not_due_tick_clears_transient_failure_count(tmp_path: Path) -> None:
@@ -622,9 +688,13 @@ def test_batch_failure_fails_closed_for_whole_unproved_generation(tmp_path: Path
         worker_units=lanes,
     )
     controller._set_credential_deadline(
-        authority.current_expires_at,
-        SELF_CREDENTIAL_TTL_SECONDS,
+        CredentialExpiry(
+            authority.current_expires_at,
+            SELF_CREDENTIAL_TTL_SECONDS,
+            SELF_CREDENTIAL_TTL_SECONDS + RENEWAL_GRACE_SECONDS,
+        ),
         "test credential",
+        renewal=False,
     )
     controller._restart_fallback_allowed = True
 
@@ -768,7 +838,12 @@ def test_missed_timer_refuses_when_current_ttl_cannot_cover_mutation_attempt(
     controller.monotonic = lambda: clock[0]
     controller.sleep = lambda seconds: clock.__setitem__(0, clock[0] + seconds)
     authority.now = lambda: NOW + timedelta(seconds=clock[0])
-    authority.current_expires_at = NOW + timedelta(seconds=320)
+    # The bound on a pre-mutation attempt is the RENEWAL deadline (0029): a
+    # credential with 320 s of work life left but two hours of renewal left
+    # rotates fine. One with 320 s of renewal left cannot cover the attempt.
+    authority.current_expires_at = NOW + timedelta(
+        seconds=320 - RENEWAL_GRACE_SECONDS
+    )
 
     with pytest.raises(RotationError, match="pre-mutation attempt"):
         controller.rotate()
