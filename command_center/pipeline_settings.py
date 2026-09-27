@@ -112,7 +112,7 @@ def _concurrency(value: object, default: int) -> int:
 class PipelineSettings:
     enabled: bool = False
     auto_launch: bool = False
-    auto_merge_after_checks: bool = False
+    auto_merge_after_checks: bool = True  # founder 2026-09-27: merge after checks
     auto_rework: bool = False
     auto_remediate_workspace: bool = False
     require_independent_review: bool = False
@@ -172,7 +172,11 @@ class PipelineSettings:
         return cls(
             enabled=_opt_in(data.get("enabled")),
             auto_launch=_opt_in(data.get("auto_launch")),
-            auto_merge_after_checks=_opt_in(data.get("auto_merge_after_checks")),
+            auto_merge_after_checks=(
+                _opt_in(data["auto_merge_after_checks"])
+                if "auto_merge_after_checks" in data
+                else True
+            ),
             max_global_concurrency=_concurrency(
                 data.get("max_global_concurrency"), DEFAULT_MAX_GLOBAL_CONCURRENCY
             ),
