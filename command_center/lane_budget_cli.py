@@ -1,4 +1,4 @@
-"""Operator CLI for lane_budget pause/resume and one pipeline tick."""
+"""Operator CLI for lane_budget pause/resume and one autonomy pass."""
 
 from __future__ import annotations
 
@@ -34,21 +34,11 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(lane_budget.resume(root, actor=ns.actor), ensure_ascii=False, indent=2))
         return 0
     if ns.cmd == "tick-once":
-        from command_center.runtime.api import ExecutionCenterAPI
-        from command_center import project_config, task_pipeline
+        from command_center.autonomy_loop import run_once
 
-        decision = lane_budget.check_dispatch(root, repo="local", kind="pr")
-        if not decision.allowed:
-            print(json.dumps({"status": "skipped", **decision.as_dict()}, ensure_ascii=False))
-            return 0
-        api = ExecutionCenterAPI(root)
-        configs = project_config.load_all(root) if hasattr(project_config, "load_all") else {}
-        if not isinstance(configs, dict):
-            configs = {}
-        result = task_pipeline.tick(root, api, configs)
-        payload = result.as_dict() if hasattr(result, "as_dict") else {"result": str(result)}
+        payload = run_once(root)
         print(json.dumps(payload, ensure_ascii=False, indent=2))
-        return 0
+        return 0 if payload.get("status") in {"ran", "skipped"} else 1
     return 2
 
 
