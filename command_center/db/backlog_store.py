@@ -9,12 +9,14 @@ own: reconciling the Markdown projection into the store.
 
 Import model, recorded: during the migration period the Markdown file is the
 incumbent authority, so ``import_markdown`` reconciles via
-``backlog_upsert_task`` — the ONE path allowed to set status directly,
-because ingest of current truth is not a transition. Everything after import
-moves through ``backlog_transition`` and its machine model. Dependencies are
-NOT imported: the file records them as prose ("Связи: …"), and prose is
-exactly what the no-substring rule forbids acting on; edges enter through
-``add_dependency`` (cycle-checked) as BO-S2 formalizes them.
+``backlog_import_task`` — which wraps ``backlog_upsert_task``, the ONE path
+allowed to set status directly, because ingest of current truth is not a
+transition — and stamps the row's provenance in the same transaction.
+Everything after import moves through ``backlog_transition`` and its machine
+model. Dependencies are NOT imported: the file records them as prose
+("Связи: …"), and prose is exactly what the no-substring rule forbids acting
+on; edges enter through ``add_dependency`` (cycle-checked) as BO-S2
+formalizes them.
 """
 
 from __future__ import annotations
@@ -25,7 +27,27 @@ from typing import Any
 
 from command_center.db.backlog_parser import ParsedTask, parse_backlog
 
-__all__ = ["BacklogStore", "ImportReport"]
+__all__ = ["BacklogStore", "ImportReport", "ProvenanceNotRecorded"]
+
+
+class ProvenanceNotRecorded(RuntimeError):
+    """A row was inserted by the importer and came back without its
+    provenance stamp.
+
+    Raised rather than counted, because there is no partial success to
+    report: the migration gate's "existing records migrated with provenance"
+    criterion is a property of every migrated row, and an import run that
+    returns a cheerful ``inserted`` count covering a row with no audit trail
+    is exactly the silent no-op this class exists to make impossible. The SQL
+    side (0025) refuses to commit such a row at all, so reaching this means
+    the store is talking to something that is not the 0025 function."""
+
+    def __init__(self, task_id: str) -> None:
+        super().__init__(
+            f"{task_id} was inserted without a provenance record; "
+            "the import is not the migration it claims to be"
+        )
+        self.task_id = task_id
 
 
 @dataclass(slots=True)
@@ -112,6 +134,34 @@ class BacklogStore:
             "SELECT * FROM backlog_recover_stuck_ready_to_review(%s)", (task_id,)
         )
         return bool(ok), str(reason or ""), revision
+
+    def import_task(
+        self, task: ParsedTask, source: str, detail: dict[str, Any] | None = None
+    ) -> tuple[bool, str, bool, bool]:
+        """Insert-or-reconcile a record AND stamp its provenance, atomically.
+
+        One call, so one transaction: a newly-inserted row and the event
+        saying where it came from commit together or not at all. Returns
+        ``(ok, reason, changed, provenance_recorded)``; the last flag is true
+        only for the run that actually created the row, since a row already
+        migrated is not migrated again."""
+        ok, reason, changed, _revision, stamped = self._row(
+            "SELECT * FROM backlog_import_task("
+            "%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (
+                task.task_id,
+                task.wave,
+                task.priority,
+                task.status,
+                task.kind,
+                task.title,
+                task.body,
+                task.repo,
+                source,
+                json.dumps(detail) if detail is not None else None,
+            ),
+        )
+        return bool(ok), str(reason), bool(changed), bool(stamped)
 
     def record_provenance(
         self, task_id: str, source: str, detail: dict[str, Any] | None = None
@@ -267,6 +317,31 @@ class BacklogStore:
                 )
                 return [dict(zip(keys, row, strict=True)) for row in cur.fetchall()]
 
+    def tasks_without_provenance(self, task_ids: list[str]) -> list[str]:
+        """Of these ids, the ones present in the store carrying no granted
+        provenance event.
+
+        Scoped to ids the CALLER already knows came from the Markdown file,
+        deliberately: a blanket "every row with no provenance" query would
+        flag every task the planner authored directly in the store, where the
+        absence of a migration stamp is the correct answer, and a control that
+        cries wolf is a control nobody reads. Ids with no row at all are
+        absent from the result rather than reported as unstamped — there is
+        nothing to stamp."""
+        if not task_ids:
+            return []
+        with self._connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT t.task_id FROM backlog_task t "
+                    "WHERE t.task_id = ANY(%s) AND NOT EXISTS ("
+                    "  SELECT 1 FROM backlog_event e WHERE e.task_id = t.task_id "
+                    "  AND e.event = 'provenance' AND e.outcome = 'granted') "
+                    "ORDER BY t.task_id",
+                    (list(task_ids),),
+                )
+                return [str(row[0]) for row in cur.fetchall()]
+
     def list_evidence(self, task_id: str) -> list[dict[str, Any]]:
         keys = ("kind", "value", "recorded_at")
         with self._connection() as conn:
@@ -289,22 +364,54 @@ class BacklogStore:
         Every newly-inserted row is stamped with its provenance (the
         migration gate's "existing records migrated with provenance"
         acceptance criterion): the Markdown line it was read from, recorded
-        once, at the moment the row is created. A later re-import of the
-        same task updates the row through this same path but never restamps
-        it — the row was migrated once, not once per import run."""
+        once, at the moment the row is created, in the SAME transaction as
+        the insert (0025). A later re-import of the same task updates the row
+        through this same path but never restamps it — the row was migrated
+        once, not once per import run.
+
+        The stamp is not merely attempted: a row reported as ``inserted``
+        without one raises ``ProvenanceNotRecorded`` and the run stops.
+        Counting it as a success would report the acceptance criterion met
+        for a row that does not meet it, which is the one outcome an audit
+        control must never produce."""
         parsed = parse_backlog(text)
         report = ImportReport(unparsed=list(parsed.unparsed))
         for task in parsed.tasks:
-            ok, reason, changed = self.upsert_task(task)
+            ok, reason, changed, stamped = self.import_task(
+                task, "markdown_import", {"line_no": task.line_no}
+            )
             if not ok:
                 report.refused.append((task.task_id, reason))
             elif not changed:
                 report.unchanged += 1
             elif reason == "inserted":
+                if not stamped:
+                    raise ProvenanceNotRecorded(task.task_id)
                 report.inserted += 1
-                self.record_provenance(
-                    task.task_id, "markdown_import", {"line_no": task.line_no}
-                )
             else:
                 report.updated += 1
         return report
+
+    def backfill_markdown_provenance(self, text: str) -> list[str]:
+        """Stamp rows this Markdown names that carry no provenance event yet,
+        returning the ids actually stamped (sorted).
+
+        The reconciliation half of the guarantee, for rows 0025 cannot reach
+        retroactively: those inserted before the stamp existed at all, and
+        those inserted during the window when it was a second, separate round
+        trip that a crash between the two could lose. Idempotent — a second
+        run finds nothing left to do and returns ``[]`` — and stamped under
+        its own source, ``markdown_import_backfill``, because a stamp added
+        later by reconciliation is a weaker claim than one written with the
+        insert and must not be readable as the same thing."""
+        parsed = parse_backlog(text)
+        by_id = {task.task_id: task for task in parsed.tasks}
+        stamped: list[str] = []
+        for task_id in self.tasks_without_provenance(list(by_id)):
+            if self.record_provenance(
+                task_id,
+                "markdown_import_backfill",
+                {"line_no": by_id[task_id].line_no},
+            ):
+                stamped.append(task_id)
+        return sorted(stamped)
