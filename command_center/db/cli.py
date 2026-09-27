@@ -55,6 +55,39 @@ def _review_enqueue(store: Any, *, priority: int = 100) -> Any:
     return _enqueue
 
 
+#: The tick journal's name for the PR review-window reconciler. One name per
+#: tick, stable across runs, because the journal is read by name.
+PR_WINDOW_TICK = "pr-window"
+
+
+def _record_pr_window_tick(window: Any) -> None:
+    """Journal one PR-window run: that it happened, and what it did.
+
+    Counts, not PR numbers: the row has to stay one bounded line per tick on
+    a repo with 180+ open PRs, and the numbers are already on stdout (and so
+    in journald) for the run an operator is actually reading.
+    """
+    from command_center.ops.tick_journal import record_tick
+
+    detail: dict[str, Any] = {
+        "active": len(window.active),
+        "waiting": len(window.waiting),
+        "blocked": len(window.blocked),
+        "unchecked": len(window.unchecked),
+        "unreadable": len(window.unreadable),
+        "age_fallback": len(window.age_fallback),
+    }
+    if window.error is not None:
+        detail["error"] = window.error
+    if window.quota is not None:
+        detail["quota"] = window.quota.line()
+    record_tick(
+        PR_WINDOW_TICK,
+        "failed" if window.error is not None else "ok",
+        detail=detail,
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m command_center.db")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -340,6 +373,11 @@ def main(argv: list[str] | None = None) -> int:
         from command_center.orchestrator.review_merge import reconcile_pr_window
 
         window = reconcile_pr_window(args.repo_path)
+        # Before the error branch below, not after it: a tick that failed is
+        # exactly the run an operator cannot otherwise tell apart from a
+        # timer that was never installed
+        # (VOYN-W0-AICC-PR-WINDOW-TIMER-NOT-DEPLOYED-ON-CONTROL).
+        _record_pr_window_tick(window)
         if window.error is not None:
             print(f"pr-window tick failed: {window.error}", file=sys.stderr)
             if window.quota is not None:
