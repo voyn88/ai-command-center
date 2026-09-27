@@ -1,4 +1,4 @@
-"""Operator CLI for lane_budget pause/resume and one autonomy pass."""
+"""Operator CLI for lane_budget pause/resume and one pass."""
 
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(lane_budget.resume(root, actor=ns.actor), ensure_ascii=False, indent=2))
         return 0
     if ns.cmd == "tick-once":
-        from command_center.autonomy_loop import run_once
+        from command_center.lane_pass import run_once
 
         payload = run_once(root)
         print(json.dumps(payload, ensure_ascii=False, indent=2))
