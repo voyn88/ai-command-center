@@ -38,46 +38,40 @@ SETTINGS_LOCK_FILE_NAME = "pipeline_settings.lock"
 SETTINGS_LOCK_TIMEOUT_SECONDS = 30.0
 _SETTINGS_LOCK_POLL_SECONDS = 0.05
 
-# Conservative defaults. Two concurrent agents is what a single developer
-# machine comfortably sustains; the ceiling exists so a typo (`200`) cannot
-# fork-bomb the host.
 DEFAULT_MAX_GLOBAL_CONCURRENCY = 2
 DEFAULT_MAX_AGENT_CONCURRENCY = 2
 MIN_CONCURRENCY = 1
 MAX_CONCURRENCY = 16
 
-# How many times a task whose validation failed may be relaunched
-# automatically before it is left for a human. Deliberately small: an agent
-# that cannot fix its own failure in two further attempts is usually facing a
-# problem the prompt does not describe, and burning attempts costs real money
-# without converging. 0 disables rework even when the switch is on.
 DEFAULT_MAX_REWORK_ATTEMPTS = 2
 MIN_REWORK_ATTEMPTS = 0
 MAX_REWORK_ATTEMPTS = 5
 
-# How many *execution* attempts the scheduler allows a task before it refuses
-# to schedule further ones (`retry_exhausted`). Distinct from the rework budget
-# above: that governs relaunching after a failed validation, this governs
-# relaunching after a failed run. The default matches
-# `scheduler.RetryPolicy.max_attempts`, which this replaces once persisted.
-#
-# Raising it is the honest remedy when attempts were consumed by a condition
-# outside the task — an expired session, an unreachable daemon — because it
-# grants a fresh attempt without rewriting the run history that recorded the
-# failures.
 DEFAULT_MAX_RUN_ATTEMPTS = 3
 MIN_RUN_ATTEMPTS = 1
 MAX_RUN_ATTEMPTS = 10
 
-# How long an autopilot-launched agent may run before the supervisor times it
-# out. `agent_runner.DEFAULT_TIMEOUT_SECONDS` (900s) was written for a single
-# interactive launch; a founder audit reading a whole repository routinely
-# needs more, and hitting the ceiling costs a full run's tokens for nothing.
-# Exposed as a setting rather than raised in code because the right value
-# depends on the work: a review is minutes, an audit is tens of minutes.
 DEFAULT_RUN_TIMEOUT_SECONDS = 2700
 MIN_RUN_TIMEOUT_SECONDS = 300
 MAX_RUN_TIMEOUT_SECONDS = 14_400
+
+# Fields accepted by update_settings. Keep in lockstep with PipelineSettings.
+_UPDATABLE_FIELDS = frozenset(
+    {
+        "enabled",
+        "auto_launch",
+        "auto_merge_after_checks",
+        "auto_rework",
+        "auto_remediate_workspace",
+        "require_independent_review",
+        "max_global_concurrency",
+        "max_agent_concurrency",
+        "max_rework_attempts",
+        "max_run_attempts",
+        "run_timeout_seconds",
+        "max_daily_spend_usd",
+    }
+)
 
 
 def settings_file_path(root: Path) -> Path:
@@ -89,21 +83,10 @@ def settings_lock_path(root: Path) -> Path:
 
 
 def _opt_in(value: object) -> bool:
-    """`True` only for a genuine JSON boolean `true`.
-
-    Deliberately stricter than `bool(value)`: under that, the strings
-    `"false"`, `"no"` and `"0"` are all truthy, so a corrupted or
-    hand-edited settings file could *enable* autopilot. Every gate in this
-    module is a safety gate, so ambiguity resolves to off."""
     return value is True
 
 
 def _bounded_int(value: object, default: int, minimum: int, maximum: int) -> int:
-    """An integer within `[minimum, maximum]`, or `default`. A bool is rejected
-    explicitly (`True` is an `int` in Python and would otherwise silently mean
-    the value 1). Out-of-range falls back to `default` rather than clamping: a
-    hand-edited `200` is a mistake, and silently reading it as the ceiling would
-    hide that."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return default
     number = int(value)
@@ -113,8 +96,6 @@ def _bounded_int(value: object, default: int, minimum: int, maximum: int) -> int
 
 
 def _bounded_float(value: object, default: float, minimum: float, maximum: float) -> float:
-    """A float within `[minimum, maximum]`, or `default`; bools rejected like
-    `_bounded_int`, out-of-range falls back rather than clamping."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return default
     number = float(value)
@@ -124,21 +105,11 @@ def _bounded_float(value: object, default: float, minimum: float, maximum: float
 
 
 def _concurrency(value: object, default: int) -> int:
-    """A concurrency cap within `[MIN_CONCURRENCY, MAX_CONCURRENCY]`."""
     return _bounded_int(value, default, MIN_CONCURRENCY, MAX_CONCURRENCY)
 
 
 @dataclass(frozen=True)
 class PipelineSettings:
-    """The complete persisted opt-in surface for the pipeline.
-
-    `enabled` is the master switch: with it off, no other field can cause any
-    automatic action, which is why the `*_active` properties below — not the
-    raw booleans — are what `task_pipeline` branches on. Storing the two
-    switches separately (rather than collapsing them into one "autopilot"
-    flag) keeps "launch queued work for me" and "merge my pull requests for
-    me" as distinct decisions with distinct blast radii."""
-
     enabled: bool = False
     auto_launch: bool = False
     auto_merge_after_checks: bool = False
@@ -150,62 +121,28 @@ class PipelineSettings:
     max_rework_attempts: int = DEFAULT_MAX_REWORK_ATTEMPTS
     max_run_attempts: int = DEFAULT_MAX_RUN_ATTEMPTS
     run_timeout_seconds: int = DEFAULT_RUN_TIMEOUT_SECONDS
-    # Daily agent-spend ceiling in USD, summed from the providers' own
-    # result-event `total_cost_usd` over the trailing 24h. `0.0` = no budget
-    # (off, the default). Gates NEW launches only — running work finishes.
     max_daily_spend_usd: float = 0.0
     updated_at: str | None = None
     updated_by: str | None = None
 
     @property
     def independent_review_active(self) -> bool:
-        """Whether a blocking independent review must approve a change before
-        any pull request is opened for it.
-
-        Requires only the master switch, not auto-launch: a *closed* gate is
-        meaningful on its own — with auto-launch off the completion simply waits
-        in `AWAITING_REVIEW` for a reviewer the operator starts, which is still
-        stricter than opening a pull request unreviewed."""
         return self.enabled and self.require_independent_review
 
     @property
     def auto_remediate_workspace_active(self) -> bool:
-        """Whether the pipeline may tidy a workspace it owns so a task that
-        would otherwise never start can start.
-
-        Scope is deliberately narrow and non-destructive: leftovers in a *linked
-        worktree of the task's own project repository* are stashed (recoverable
-        via `git stash list`), never discarded. A human's primary working tree,
-        and any repository that is not the project's, are never touched — see
-        `workspace_provisioning.is_pipeline_owned_worktree`. Requires
-        auto-launch, because the only reason to tidy is to launch."""
         return self.auto_launch_active and self.auto_remediate_workspace
 
     @property
     def auto_rework_active(self) -> bool:
-        """Whether a task whose validation failed may be relaunched
-        automatically as a new attempt, carrying the failure output into its
-        prompt. Same both-switches rule as `auto_launch_active` — and rework
-        additionally requires `auto_launch_active`, because a rework *is* a
-        launch: enabling "fix it again" while "start work for me" is off would
-        be a contradiction, and the more restrictive answer is the safe one."""
         return self.auto_launch_active and self.auto_rework
 
     @property
     def auto_launch_active(self) -> bool:
-        """Whether a tick may actually start processes. Requires *both* the
-        master switch and the launch switch — a single `auto_launch=true` left
-        in the file by an earlier experiment can never launch anything on its
-        own."""
         return self.enabled and self.auto_launch
 
     @property
     def auto_merge_active(self) -> bool:
-        """Whether newly-seeded completion rows may be given an auto-merge
-        policy. Same both-switches rule as `auto_launch_active`. Note this only
-        governs *policy assignment*: the checks/review/mergeability gates in
-        `runtime.completion` remain authoritative over whether a merge actually
-        happens."""
         return self.enabled and self.auto_merge_after_checks
 
     def as_dict(self) -> dict:
@@ -228,8 +165,6 @@ class PipelineSettings:
 
     @classmethod
     def from_dict(cls, data: object) -> "PipelineSettings":
-        """Total and fail-closed: anything that is not a dict of recognized,
-        well-typed values yields the all-off defaults."""
         if not isinstance(data, dict):
             return cls()
         updated_at = data.get("updated_at")
@@ -275,8 +210,6 @@ class PipelineSettings:
 
 @contextlib.contextmanager
 def settings_lock(root: Path, *, timeout: float = SETTINGS_LOCK_TIMEOUT_SECONDS):
-    """Cross-process mutual exclusion for the settings read-modify-write cycle
-    — same OS advisory-lock primitive as `execution_queue.queue_lock`."""
     with storage.file_lock(
         settings_lock_path(root), timeout=timeout, poll_seconds=_SETTINGS_LOCK_POLL_SECONDS
     ):
@@ -284,44 +217,17 @@ def settings_lock(root: Path, *, timeout: float = SETTINGS_LOCK_TIMEOUT_SECONDS)
 
 
 def load_settings(root: Path) -> PipelineSettings:
-    """Read the persisted settings, or the all-off defaults if nothing has been
-    saved yet. Unlocked by design (a plain read of an atomically-written file);
-    use `update_settings` for anything that writes."""
     return PipelineSettings.from_dict(storage.read_json(settings_file_path(root), {}))
 
 
 def save_settings(root: Path, settings: PipelineSettings) -> PipelineSettings:
-    """Persist `settings` wholesale under `settings_lock`. Prefer
-    `update_settings` when changing individual fields, so a concurrent writer's
-    unrelated change is not discarded."""
     with settings_lock(root):
         storage.atomic_write_json(settings_file_path(root), settings.as_dict())
     return settings
 
 
 def update_settings(root: Path, *, actor: str | None = None, **changes) -> PipelineSettings:
-    """Lost-update-safe partial update: re-reads the current on-disk settings
-    under `settings_lock`, applies `changes`, stamps `updated_at`/`updated_by`,
-    and writes back — so toggling auto-merge in one session never reverts a
-    concurrency change made in another.
-
-    Unknown field names raise `TypeError` rather than being silently dropped: a
-    typo'd `auto_merge=True` must not read as "auto-merge is enabled" while
-    persisting nothing. Values pass through the same fail-closed coercion as
-    `from_dict`."""
-    unknown = set(changes) - {
-        "enabled",
-        "auto_launch",
-        "auto_merge_after_checks",
-        "auto_rework",
-        "auto_remediate_workspace",
-        "require_independent_review",
-        "max_global_concurrency",
-        "max_agent_concurrency",
-        "max_rework_attempts",
-        "max_run_attempts",
-        "run_timeout_seconds",
-    }
+    unknown = set(changes) - _UPDATABLE_FIELDS
     if unknown:
         raise TypeError(f"Unknown pipeline setting(s): {', '.join(sorted(unknown))}")
 
