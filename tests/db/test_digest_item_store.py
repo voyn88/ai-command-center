@@ -11,7 +11,10 @@ started rather than found inside it:
 
 from __future__ import annotations
 
+import itertools
 import json
+import sqlite3
+import unittest.mock
 from pathlib import Path
 
 import pytest
@@ -335,6 +338,145 @@ def test_reconciliation_is_clean_for_rows_the_application_actually_wrote(
     wave1.create_digest_item(db_path, title="no refs", day="2026-08-14", position=2)
 
     assert divergence(wave1.list_digest_items_stored(db_path), mirror) == []
+
+
+def test_list_digest_items_stored_returns_an_iterator_not_a_list(tmp_path: Path) -> None:
+    """The property `divergence` was written to accept and this reader must
+    not throw away: see `test_mirror_support.
+    test_reconciliation_accepts_a_generator_of_authority_rows`.
+
+    A `list` return would let every test above keep passing while quietly
+    reintroducing the whole-table materialisation this function exists to
+    avoid — this pins the return *type*, not just the return *value*.
+    """
+    import inspect
+
+    db_path = tmp_path / "runtime.db"
+    wave1.db.migrate(db_path)
+    wave1.create_digest_item(db_path, title="one", day="2026-08-14", position=1)
+
+    result = wave1.list_digest_items_stored(db_path)
+    assert not isinstance(result, list)
+    assert inspect.isgenerator(result)
+
+
+def test_list_digest_items_stored_never_materialises_the_table(tmp_path: Path) -> None:
+    """A generator that immediately calls `fetchall()` internally satisfies
+    every test above while reintroducing the exact hazard this function
+    exists to avoid — this is the one that would fail if that regressed.
+
+    `sqlite3.Cursor` is a C-extension type: its methods cannot be monkeypatched
+    directly (`TypeError: cannot set 'fetchall' attribute of immutable type`).
+    Subclassing it and swapping in the subclass via a `factory=` connection
+    override is the supported way to intercept a specific cursor method
+    (https://docs.python.org/3/library/sqlite3.html#sqlite3.Connection.cursor);
+    `sqlite3.connect` is patched (not `command_center.runtime.db.core`'s
+    `connect`) because `core.connect` calls `sqlite3.connect(...)` as a module
+    attribute lookup rather than a bound import (see its source), so this
+    guard engages on the exact call the production code makes rather than
+    hoping some other layer routes through it.
+
+    5,000 rows: comfortably past any buffer a reviewer would wave off as
+    "basically instant to hold in memory anyway" (see the task's acceptance:
+    a table "заведомо больше разумного буфера").
+    """
+
+    class _NoFetchAllCursor(sqlite3.Cursor):
+        def fetchall(self):  # noqa: D102 - guard, not a real reader
+            raise AssertionError("fetchall() called -- the table was materialised")
+
+        def fetchmany(self, size=None):  # noqa: D102 - guard, not a real reader
+            raise AssertionError("fetchmany() called -- the table was materialised")
+
+    class _GuardedConnection(sqlite3.Connection):
+        def execute(self, sql, params=()):  # noqa: D102 - guard, not a real reader
+            cursor = self.cursor(_NoFetchAllCursor)
+            cursor.execute(sql, params)
+            return cursor
+
+    db_path = tmp_path / "runtime.db"
+    wave1.db.migrate(db_path)
+    row_count = 5_000
+    for i in range(row_count):
+        wave1.create_digest_item(db_path, title=f"item {i}", day="2026-08-14", position=i)
+
+    real_connect = sqlite3.connect
+
+    def guarded_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+        kwargs.setdefault("factory", _GuardedConnection)
+        return real_connect(*args, **kwargs)  # type: ignore[arg-type]
+
+    with unittest.mock.patch("sqlite3.connect", guarded_connect):
+        rows = list(wave1.list_digest_items_stored(db_path))
+
+    assert len(rows) == row_count
+
+
+def test_list_digest_items_stored_fetches_rows_one_at_a_time(tmp_path: Path) -> None:
+    """Complements the fetchall guard above: proves the *shape* of the
+    access, not just the absence of one method call. A hypothetical
+    implementation that materialised the table some other way (e.g. building
+    the full row list before wrapping it in `iter(...)`) would still dodge the
+    `fetchall`/`fetchmany` guard while reintroducing the same hazard.
+
+    Counting `Cursor.__next__` calls (the method SQLite's C iterator protocol
+    actually drives -- confirmed against the stdlib, unlike `fetchone`, which
+    the C-level iteration bypasses) pins that consuming 10 rows out of 5,000
+    costs exactly 10 fetches from SQLite, not 5,000.
+    """
+    calls = {"next": 0}
+
+    class _CountingCursor(sqlite3.Cursor):
+        def __next__(self):  # noqa: D105 - guard, not a real reader
+            calls["next"] += 1
+            return super().__next__()
+
+    class _CountingConnection(sqlite3.Connection):
+        def execute(self, sql, params=()):  # noqa: D102 - guard, not a real reader
+            cursor = self.cursor(_CountingCursor)
+            cursor.execute(sql, params)
+            return cursor
+
+    db_path = tmp_path / "runtime.db"
+    wave1.db.migrate(db_path)
+    row_count = 5_000
+    for i in range(row_count):
+        wave1.create_digest_item(db_path, title=f"item {i}", day="2026-08-14", position=i)
+
+    real_connect = sqlite3.connect
+
+    def counting_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+        kwargs.setdefault("factory", _CountingConnection)
+        return real_connect(*args, **kwargs)  # type: ignore[arg-type]
+
+    take = 10
+    with unittest.mock.patch("sqlite3.connect", counting_connect):
+        rows_iter = wave1.list_digest_items_stored(db_path)
+        first_rows = list(itertools.islice(rows_iter, take))
+        rows_iter.close()
+
+    assert len(first_rows) == take
+    assert calls["next"] == take
+
+
+def test_list_digest_items_stored_fails_at_the_call_not_the_first_iteration(
+    tmp_path: Path,
+) -> None:
+    """The rejected version deferred `db.connect()` to the caller's first
+    `next()` (because the whole function body was one generator). A caller
+    that wraps the *call* in `try/except` to fail fast on a bad `db_path`
+    silently stopped observing that failure -- it would only surface later,
+    inside whatever loop happens to consume the rows.
+
+    A directory in place of a database file is a `sqlite3.connect()`-time
+    failure (`unable to open database file`), not a query-time one, so this
+    pins the exception at the call site.
+    """
+    not_a_db_file = tmp_path / "this-is-a-directory"
+    not_a_db_file.mkdir()
+
+    with pytest.raises(sqlite3.OperationalError):
+        wave1.list_digest_items_stored(not_a_db_file)
 
 
 def test_reconciling_against_a_decoded_reader_is_not_clean(
