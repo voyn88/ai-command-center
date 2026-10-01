@@ -11,6 +11,7 @@ started rather than found inside it:
 
 from __future__ import annotations
 
+from datetime import datetime
 import json
 from pathlib import Path
 
@@ -24,6 +25,11 @@ from command_center.db.digest_item_store import (
     divergence,
 )
 from command_center.runtime.db import wave1
+
+#: This test process's own zone -- what `to_instant` attaches with no
+#: explicit zone, so it is also what `list_records`/`divergence` must be
+#: told to render back through (VOYN-W0-AICC-TZ-AWARE-TIMESTAMPS).
+AMBIENT_ZONE = datetime.now().astimezone().tzinfo
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -46,7 +52,7 @@ def _row(item_id: str, **overrides: object) -> dict:
 
 @pytest.fixture
 def mirror(pg_connection_factory) -> PostgresDigestItemMirror:
-    return PostgresDigestItemMirror(connection_factory=pg_connection_factory)
+    return PostgresDigestItemMirror(connection_factory=pg_connection_factory, zone=AMBIENT_ZONE)
 
 
 # --- contract and authority -------------------------------------------------
@@ -184,7 +190,7 @@ def test_a_rebuilt_day_does_not_leave_the_mirror_ahead(
         "PostgresDigestItemMirror",
         lambda: PostgresDigestItemMirror(connection_factory=pg_connection_factory),
     )
-    mirror = PostgresDigestItemMirror(connection_factory=pg_connection_factory)
+    mirror = PostgresDigestItemMirror(connection_factory=pg_connection_factory, zone=AMBIENT_ZONE)
 
     db_path = tmp_path / "runtime.db"
     wave1.db.migrate(db_path)
@@ -325,7 +331,7 @@ def test_reconciliation_is_clean_for_rows_the_application_actually_wrote(
         "PostgresDigestItemMirror",
         lambda: PostgresDigestItemMirror(connection_factory=pg_connection_factory),
     )
-    mirror = PostgresDigestItemMirror(connection_factory=pg_connection_factory)
+    mirror = PostgresDigestItemMirror(connection_factory=pg_connection_factory, zone=AMBIENT_ZONE)
 
     db_path = tmp_path / "runtime.db"
     wave1.db.migrate(db_path)
@@ -357,7 +363,7 @@ def test_reconciling_against_a_decoded_reader_is_not_clean(
         "PostgresDigestItemMirror",
         lambda: PostgresDigestItemMirror(connection_factory=pg_connection_factory),
     )
-    mirror = PostgresDigestItemMirror(connection_factory=pg_connection_factory)
+    mirror = PostgresDigestItemMirror(connection_factory=pg_connection_factory, zone=AMBIENT_ZONE)
 
     db_path = tmp_path / "runtime.db"
     wave1.db.migrate(db_path)

@@ -13,6 +13,7 @@ PostgreSQL generates after a cutover collides with a mirrored row.
 
 from __future__ import annotations
 
+from datetime import datetime
 import json
 from pathlib import Path
 
@@ -29,6 +30,11 @@ from command_center.db.model_registry_store import (
     event_divergence,
 )
 from command_center.runtime.db import model_registry as mr_db
+
+#: This test process's own zone -- what `to_instant` attaches with no
+#: explicit zone, so it is also what `list_records`/`divergence` must be
+#: told to render back through (VOYN-W0-AICC-TZ-AWARE-TIMESTAMPS).
+AMBIENT_ZONE = datetime.now().astimezone().tzinfo
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -71,12 +77,12 @@ def _event(event_id: int, model_id: str, seq: int = 1, **overrides: object) -> d
 
 @pytest.fixture
 def entries(pg_connection_factory) -> PostgresModelEntryMirror:
-    return PostgresModelEntryMirror(connection_factory=pg_connection_factory)
+    return PostgresModelEntryMirror(connection_factory=pg_connection_factory, zone=AMBIENT_ZONE)
 
 
 @pytest.fixture
 def events(pg_connection_factory) -> PostgresModelEventMirror:
-    return PostgresModelEventMirror(connection_factory=pg_connection_factory)
+    return PostgresModelEventMirror(connection_factory=pg_connection_factory, zone=AMBIENT_ZONE)
 
 
 # --- contract and schema ----------------------------------------------------
@@ -279,8 +285,8 @@ def test_reconciliation_is_clean_for_rows_the_application_actually_wrote(
         "PostgresModelEventMirror",
         lambda: PostgresModelEventMirror(connection_factory=pg_connection_factory),
     )
-    entries = PostgresModelEntryMirror(connection_factory=pg_connection_factory)
-    events = PostgresModelEventMirror(connection_factory=pg_connection_factory)
+    entries = PostgresModelEntryMirror(connection_factory=pg_connection_factory, zone=AMBIENT_ZONE)
+    events = PostgresModelEventMirror(connection_factory=pg_connection_factory, zone=AMBIENT_ZONE)
 
     db_path = tmp_path / "runtime.db"
     mr_db.db.migrate(db_path)
@@ -330,7 +336,7 @@ def test_reconciling_against_the_decoded_reader_is_not_clean(
         "PostgresModelEventMirror",
         lambda: PostgresModelEventMirror(connection_factory=pg_connection_factory),
     )
-    events = PostgresModelEventMirror(connection_factory=pg_connection_factory)
+    events = PostgresModelEventMirror(connection_factory=pg_connection_factory, zone=AMBIENT_ZONE)
 
     db_path = tmp_path / "runtime.db"
     mr_db.db.migrate(db_path)

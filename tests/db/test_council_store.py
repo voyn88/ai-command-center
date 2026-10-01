@@ -17,6 +17,7 @@ one is visible.**
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -37,13 +38,18 @@ from tests.db.mirror_probe import each_lost_write_is_noticed
 TALLY = {"approve": 2, "reject": 0}
 ROLES = [{"role": "architect", "choice": "approve"}]
 
+#: This test process's own zone — what `to_instant` attaches with no explicit
+#: zone, so it is also what `list_records`/`*_divergence` must be told to
+#: render back through (VOYN-W0-AICC-TZ-AWARE-TIMESTAMPS).
+AMBIENT_ZONE = datetime.now().astimezone().tzinfo
+
 
 def _mirrors(factory):
     return {
-        "motion": PostgresMotionMirror(connection_factory=factory),
-        "vote": PostgresCouncilVoteMirror(connection_factory=factory),
-        "decision": PostgresCouncilDecisionMirror(connection_factory=factory),
-        "event": PostgresCouncilEventMirror(connection_factory=factory),
+        "motion": PostgresMotionMirror(connection_factory=factory, zone=AMBIENT_ZONE),
+        "vote": PostgresCouncilVoteMirror(connection_factory=factory, zone=AMBIENT_ZONE),
+        "decision": PostgresCouncilDecisionMirror(connection_factory=factory, zone=AMBIENT_ZONE),
+        "event": PostgresCouncilEventMirror(connection_factory=factory, zone=AMBIENT_ZONE),
     }
 
 

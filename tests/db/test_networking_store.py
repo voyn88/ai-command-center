@@ -14,6 +14,7 @@ retract.
 
 from __future__ import annotations
 
+from datetime import datetime
 import ast
 import inspect
 import textwrap
@@ -32,6 +33,11 @@ from command_center.db.networking_store import (
     message_divergence,
 )
 from command_center.runtime.db import networking as net_db
+
+#: This test process's own zone -- what `to_instant` attaches with no
+#: explicit zone, so it is also what `list_records`/`divergence` must be
+#: told to render back through (VOYN-W0-AICC-TZ-AWARE-TIMESTAMPS).
+AMBIENT_ZONE = datetime.now().astimezone().tzinfo
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -92,12 +98,12 @@ def _code_without_prose(function: object) -> str:
 
 @pytest.fixture
 def contacts(pg_connection_factory) -> PostgresContactMirror:
-    return PostgresContactMirror(connection_factory=pg_connection_factory)
+    return PostgresContactMirror(connection_factory=pg_connection_factory, zone=AMBIENT_ZONE)
 
 
 @pytest.fixture
 def messages(pg_connection_factory) -> PostgresMessageMirror:
-    return PostgresMessageMirror(connection_factory=pg_connection_factory)
+    return PostgresMessageMirror(connection_factory=pg_connection_factory, zone=AMBIENT_ZONE)
 
 
 # --- contract and authority -------------------------------------------------
@@ -189,8 +195,8 @@ def test_one_dropped_parent_silently_costs_every_child_after_it(
     """
     from command_center.db import networking_store
 
-    real_contacts = PostgresContactMirror(connection_factory=pg_connection_factory)
-    real_messages = PostgresMessageMirror(connection_factory=pg_connection_factory)
+    real_contacts = PostgresContactMirror(connection_factory=pg_connection_factory, zone=AMBIENT_ZONE)
+    real_messages = PostgresMessageMirror(connection_factory=pg_connection_factory, zone=AMBIENT_ZONE)
 
     class RefusingContacts:
         def upsert(self, record: dict) -> None:
@@ -278,8 +284,8 @@ def test_reconciliation_is_clean_for_rows_the_application_actually_wrote(
         "PostgresMessageMirror",
         lambda: PostgresMessageMirror(connection_factory=pg_connection_factory),
     )
-    contacts = PostgresContactMirror(connection_factory=pg_connection_factory)
-    messages = PostgresMessageMirror(connection_factory=pg_connection_factory)
+    contacts = PostgresContactMirror(connection_factory=pg_connection_factory, zone=AMBIENT_ZONE)
+    messages = PostgresMessageMirror(connection_factory=pg_connection_factory, zone=AMBIENT_ZONE)
 
     db_path = tmp_path / "runtime.db"
     net_db.db.migrate(db_path)

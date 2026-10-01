@@ -16,6 +16,7 @@ asserted in prose.
 
 from __future__ import annotations
 
+from datetime import datetime
 import ast
 import inspect
 import textwrap
@@ -31,6 +32,11 @@ from command_center.db.conflict_store import (
     divergence,
 )
 from command_center.runtime.db import conflict as conflict_db
+
+#: This test process's own zone -- what `to_instant` attaches with no
+#: explicit zone, so it is also what `list_records`/`divergence` must be
+#: told to render back through (VOYN-W0-AICC-TZ-AWARE-TIMESTAMPS).
+AMBIENT_ZONE = datetime.now().astimezone().tzinfo
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -79,7 +85,7 @@ def _code_without_prose(function: object) -> str:
 
 @pytest.fixture
 def mirror(pg_connection_factory) -> PostgresConflictMirror:
-    return PostgresConflictMirror(connection_factory=pg_connection_factory)
+    return PostgresConflictMirror(connection_factory=pg_connection_factory, zone=AMBIENT_ZONE)
 
 
 # --- contract and authority -------------------------------------------------
@@ -297,7 +303,7 @@ def test_reconciliation_is_clean_for_rows_the_application_actually_wrote(
         "PostgresConflictMirror",
         lambda: PostgresConflictMirror(connection_factory=pg_connection_factory),
     )
-    mirror = PostgresConflictMirror(connection_factory=pg_connection_factory)
+    mirror = PostgresConflictMirror(connection_factory=pg_connection_factory, zone=AMBIENT_ZONE)
 
     db_path = tmp_path / "runtime.db"
     conflict_db.db.migrate(db_path)

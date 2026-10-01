@@ -145,7 +145,14 @@ def iso_now() -> str:
     without conversion. Not migrated to a timezone-aware format for v1.2, to avoid a
     mixed-format backward-compatibility hazard against existing `data/tasks.json`
     records — all timestamps in this app should be read as "local time on the machine
-    that wrote them," never assumed to be UTC."""
+    that wrote them," never assumed to be UTC.
+
+    The naive format's cross-process ambiguity is not left to coincidence: the
+    PostgreSQL mirrors this app writes alongside (`command_center/db/mirror_support.py`)
+    require reconciliation to be told which zone a given store's strings are on
+    rather than assuming it matches whatever process runs the check
+    (`VOYN-W0-AICC-TZ-AWARE-TIMESTAMPS`; see `render_authority_timestamp` and
+    `command_center.runtime.db.resolve_timestamp_zone`)."""
     return datetime.now().isoformat(timespec="seconds")
 
 
