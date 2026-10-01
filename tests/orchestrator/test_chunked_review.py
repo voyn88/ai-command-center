@@ -153,6 +153,45 @@ def test_reconcile_enqueues_only_fresh_chunk_retry(monkeypatch):
     assert report.retried == [(TASK, f"{target}:retry:1")]
 
 
+def test_untargeted_reconcile_uses_the_rotating_scan_window(monkeypatch):
+    """A LIMIT max_per_tick ORDER BY task_id page was always the same eight
+    earliest READY_TO_REVIEW rows (usually already marker_already_posted),
+    so later tasks sat on review_chunk_verdict_missing with no retry."""
+    snapshot = snap("diff --git a/a b/a\n" + "x\n" * 40_000)
+    seen = []
+    committed = []
+
+    def fake_scan_tasks(_factory, cursor_name, _sql, _params, scan_cap):
+        seen.append((cursor_name, scan_cap))
+        return [(TASK, PR)], "tok"
+
+    monkeypatch.setattr(review_merge, "_scan_tasks", fake_scan_tasks)
+    monkeypatch.setattr(
+        review_merge,
+        "_scan_commit",
+        lambda *args: committed.append(args),
+    )
+    monkeypatch.setattr(
+        review_merge, "_model_only_review_cascade", lambda: [{"executor": "codex"}]
+    )
+    monkeypatch.setattr(planner, "repo_route", lambda _: ("AICC", "/repo"))
+    monkeypatch.setattr(review_merge, "_pr_diff_and_head", lambda *_: snapshot)
+    monkeypatch.setattr(review_merge, "_has_accept_marker", lambda *_: (False, HEAD))
+    monkeypatch.setattr(review_merge, "_next_retry_key", lambda *_: None)
+
+    report = review_merge.reconcile_review_once(
+        None, lambda *_: None, "/repo"
+    )
+
+    assert seen == [
+        ("scan:reconcile_review_once", review_merge.ReviewConfig().scan_cap)
+    ]
+    assert committed == [
+        (None, "scan:reconcile_review_once", "tok", (TASK, PR))
+    ]
+    assert report.skipped == [(TASK, "no_malformed_review_result_eligible_for_retry")]
+
+
 def test_reconcile_ignores_stale_marker_and_binds_empty_task_id(monkeypatch):
     snapshot = snap("diff --git a/a b/a\n-old\n+new\n")
     observed_params = []
