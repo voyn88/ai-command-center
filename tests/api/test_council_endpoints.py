@@ -178,6 +178,25 @@ def test_close_tallies_records_roles_and_journal(client) -> None:
     assert "decision_recorded" in [e["event_type"] for e in record["journal"]]
 
 
+def test_close_records_optional_impact(client) -> None:
+    m = _motion(client, quorum=1)
+    _vote(client, m["id"], "chair", "yes")
+    r = client.post(
+        f"/api/v1/council/motions/{m['id']}/close",
+        json={"impact": {"amount_usd": 5000, "kind": "cost_avoided"}},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["decision"]["impact"] == {"amount_usd": 5000, "kind": "cost_avoided"}
+
+
+def test_close_without_body_leaves_impact_absent(client) -> None:
+    m = _motion(client, quorum=1)
+    _vote(client, m["id"], "chair", "yes")
+    r = client.post(f"/api/v1/council/motions/{m['id']}/close")
+    assert r.status_code == 200, r.text
+    assert r.json()["decision"]["impact"] is None
+
+
 def test_tie_defers(client) -> None:
     m = _motion(client, quorum=2)
     _vote(client, m["id"], "chair", "yes")

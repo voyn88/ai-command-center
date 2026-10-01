@@ -85,9 +85,11 @@ def cast_vote(motion_id: str, payload: w.VoteCreate) -> models.Vote:
 
 
 @router.post("/council/motions/{motion_id}/close", response_model=w.DecisionRecord)
-def close_motion(motion_id: str) -> w.DecisionRecord:
+def close_motion(motion_id: str, payload: w.MotionClose | None = None) -> w.DecisionRecord:
     try:
-        record = service.close_motion(motion_id)
+        record = service.close_motion(
+            motion_id, impact=payload.impact if payload else None
+        )
     except service.QuorumNotMetError as exc:
         # Not enough votes to decide the motion yet.
         raise HTTPException(status_code=409, detail=str(exc)) from exc

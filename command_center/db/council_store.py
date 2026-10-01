@@ -98,6 +98,7 @@ COUNCIL_DECISION_COLUMNS: tuple[str, ...] = (
     "quorum",
     "decided_at",
     "created_at",
+    "impact_json",
 )
 
 COUNCIL_EVENT_COLUMNS: tuple[str, ...] = (
@@ -138,7 +139,7 @@ COUNCIL_DECISION = MirroredTable(
     columns=COUNCIL_DECISION_COLUMNS,
     codec=ColumnCodec(
         timestamps=frozenset({"decided_at", "created_at"}),
-        json_values=frozenset({"tally_json", "roles_json"}),
+        json_values=frozenset({"tally_json", "roles_json", "impact_json"}),
     ),
     key="motion_id",
     references={"motion_id": "motion"},
