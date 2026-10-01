@@ -391,6 +391,19 @@ _TERMINAL_CAS_MAX_ATTEMPTS = run_finalizer.TERMINAL_CAS_MAX_ATTEMPTS
 # succeeding run out from under its owner and frees its workspace lock.
 _RECONCILE_ABSENCE_GRACE_SECONDS = 5.0
 
+# `start_raw`'s self-heal (see its lock-conflict retry below) polls
+# `reconcile()` at this interval while waiting out `_RECONCILE_ABSENCE_GRACE_SECONDS`
+# for a same-host crashed peer's row to clear, rather than sleeping the full
+# window blindly — most same-host crashes resolve on the very first or second
+# poll (the row is already long gone by the time a human retries the launch).
+_SELF_HEAL_POLL_INTERVAL_SECONDS = 0.25
+
+# Scheduling-jitter margin added on top of the grace window itself: the grace
+# debounce compares `time.monotonic()` deltas, so a poll landing a hair before
+# the window elapses must not be mistaken for "the peer is still alive" and
+# give up one iteration early.
+_SELF_HEAL_GRACE_MARGIN_SECONDS = 0.5
+
 # Bounds on the diagnostic output a provider may attach to a run, so a
 # misbehaving CLI cannot flood the event log.
 MAX_PROVIDER_DIAGNOSTIC_EVENTS = 64
@@ -1099,7 +1112,7 @@ class Supervisor:
         if executor_id == providers.CLAUDE_ID:
             _assert_no_forbidden_flags(command)
 
-        try:
+        def _attempt_create_run() -> dict:
             # Keep creation and in-memory ownership registration atomic with
             # `reconcile()`'s active-id snapshot plus active-row query. Without
             # this shared lock, a dashboard refresh can observe the committed
@@ -1108,7 +1121,7 @@ class Supervisor:
             # The lock covers one short SQLite transaction only; it is released
             # before git inspection or subprocess creation.
             with self._active_lock:
-                run = db.create_run(
+                created = db.create_run(
                     self.db_path,
                     session_id=session_id,
                     task_id=task_id,
@@ -1154,13 +1167,74 @@ class Supervisor:
                     enforce_workspace_lock=True,
                     max_global_concurrency=max_global_concurrency,
                 )
-                self._launching.add(run["id"])
+                self._launching.add(created["id"])
                 with _PROCESS_OWNED_RUNS_GUARD:
-                    _PROCESS_OWNED_RUNS.add(run["id"])
-        except db.WorkspaceLockedError as exc:
-            raise WorkspaceLockedError(exc.conflicting_run) from exc
-        except db.TaskAlreadyActiveError as exc:
-            raise TaskAlreadyActiveError(exc.conflicting_run) from exc
+                    _PROCESS_OWNED_RUNS.add(created["id"])
+                return created
+
+        try:
+            run = _attempt_create_run()
+        except (db.WorkspaceLockedError, db.TaskAlreadyActiveError) as exc:
+            # `enforce_workspace_lock` and the per-task lock above have no expiry
+            # or heartbeat (see `db.create_run`'s own docstring): a row left
+            # PREPARED/QUEUED/RUNNING by a Supervisor that crashed on *this* host
+            # occupies its workspace/task lock until something calls
+            # `reconcile()`, which today only runs opportunistically (once at app
+            # startup, or on an open dashboard's refresh tick — see `app.py`'s
+            # `get_execution_center_api`). Rather than requiring every caller of
+            # `start_raw` to remember to reconcile first, self-heal here.
+            #
+            # A single `reconcile()` call is not enough: its cross-process
+            # debounce (audit P0, see `_RECONCILE_ABSENCE_GRACE_SECONDS`) never
+            # terminalizes a row on the *first* observation that it looks gone —
+            # that call only starts the row's grace-window clock, protecting a
+            # peer that is genuinely mid-launch (pid not yet recorded) or
+            # mid-finalization. A caller that reconciled once and retried
+            # immediately would race that same clock and hit the identical lock
+            # again. So: reconcile once, and only if the conflicting run is now a
+            # live self-heal candidate — `reconcile()` actually suspected it gone
+            # (it's in `self._suspected_gone`, not e.g. matched to a live,
+            # identity-verified pid, which is a genuinely active peer this must
+            # never wait out) — poll `reconcile()` across the rest of that grace
+            # window (bounded by `_SELF_HEAL_GRACE_MARGIN_SECONDS`) until the row
+            # actually clears or the window proves it never will. A genuinely
+            # alive conflict is never a self-heal candidate, so it still fails
+            # exactly as fast as before.
+            #
+            # This does not reach across hosts: `reconcile()` can only prove a
+            # *local* pid is gone, and `repository_path` above is this process's
+            # own resolved path inside its own local `runtime.db`
+            # (`db.resolve_db_path`) — so it cannot detect or clear a lock held
+            # by a Supervisor on a different host against the same repository
+            # checked out at a different path. That requires a shared,
+            # host-aware lease authority (see the `repo_lease` reference in
+            # `command_center/db/sql/0002_queue_claim.up.sql` and the
+            # already-accepted `command_center/worker/worktree_lease.py` pattern
+            # for the queue-dispatch path) and is out of scope for this frozen
+            # local engine (`docs/AIOS_BOUNDARY.md`).
+            conflicting_id = exc.conflicting_run.get("id") if exc.conflicting_run else None
+            self.reconcile()
+            with self._suspected_gone_lock:
+                is_self_heal_candidate = conflicting_id in self._suspected_gone
+            deadline = (
+                time.monotonic()
+                + self._reconcile_absence_grace
+                + _SELF_HEAL_GRACE_MARGIN_SECONDS
+            )
+            while True:
+                try:
+                    run = _attempt_create_run()
+                    break
+                except (db.WorkspaceLockedError, db.TaskAlreadyActiveError) as retry_exc:
+                    exc = retry_exc
+                if not is_self_heal_candidate or time.monotonic() >= deadline:
+                    if isinstance(exc, db.WorkspaceLockedError):
+                        raise WorkspaceLockedError(exc.conflicting_run) from exc
+                    raise TaskAlreadyActiveError(exc.conflicting_run) from exc
+                time.sleep(
+                    min(_SELF_HEAL_POLL_INTERVAL_SECONDS, max(0.0, deadline - time.monotonic()))
+                )
+                self.reconcile()
 
         # Executor capability preflight (Required fix 5). The decision itself is
         # already persisted on the run row's `capability_*`/`command_policy`
