@@ -17,6 +17,9 @@ class RefreshResult:
     head: str | None = None
     upstream: str | None = None
     error: str | None = None
+    #: the clone is not on this host at all, so the periodic tick had nothing
+    #: to do.  Only ``refresh_tick`` ever sets this -- see its docstring.
+    skipped: bool = False
 
 
 def _git(
@@ -125,6 +128,42 @@ def refresh_source_clone(
     )
 
 
+def refresh_tick(repository: Path, *, pr_number: str | None = None) -> RefreshResult:
+    """The PERIODIC host refresh of one clone, whose contract differs from
+    `refresh_source_clone` in exactly one case: a clone this host does not
+    have is nothing a refresh can do, so it is a skip and not a failure.
+
+    The fleet deliberately runs worker hosts without some of these clones --
+    `voyn-aicc-worker-principal-isolation.conf` binds the aios clone with the
+    missing-tolerant `-` prefix precisely so that "a host without that clone
+    still serves ai-command-center tasks" -- and the refresh unit declares
+    the same path missing-tolerant in its own `ReadWritePaths=`. Its
+    ExecStart nevertheless asked for that clone unconditionally, so on every
+    such host the `Type=oneshot` unit ended `failed`, every two minutes,
+    forever. Nothing reaps a failed unit: the host unit-health probe counts
+    units that are failed NOW, so one absent optional clone was a standing
+    `failed_units` finding on worker-01 that no repair of anything else could
+    clear (monitor_finding 2408, after 2051 and 2295 had removed the
+    launcher's per-connection corpses).
+
+    Absence is a provisioning fact, and it is not silent here: a REQUIRED
+    clone that goes missing is refused by the lane's own
+    `BindReadOnlyPaths=` with no `-`, so the lane does not start and the
+    monitor reports `active_workers` -- a far better alarm than a refresh
+    tick that cannot create a clone either way. A clone that IS present and
+    cannot be refreshed stays a failure: that is a fault this tick measures.
+
+    `refresh_source_clone` keeps reporting absence as a failure, because its
+    other caller is the worker's pre-review refresh of the repository a task
+    pins -- there, an absent clone means the review would run against
+    nothing, and it must fail the attempt.
+    """
+    repo = repository.resolve()
+    if not repo.is_dir():
+        return RefreshResult(ok=True, path=str(repo), skipped=True)
+    return refresh_source_clone(repo, pr_number=pr_number)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m command_center.ops.source_clone_refresh"
@@ -132,7 +171,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--repo",
         default=os.environ.get("AICC_SOURCE_CLONE_REPO", "."),
-        help="Local source clone to update. Defaults to $AICC_SOURCE_CLONE_REPO or cwd.",
+        help=(
+            "Local source clone to update. Defaults to $AICC_SOURCE_CLONE_REPO "
+            "or cwd. A clone this host does not have is skipped, not failed "
+            "(see refresh_tick)."
+        ),
     )
     parser.add_argument(
         "--pr-number",
@@ -144,9 +187,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    result = refresh_source_clone(
-        Path(args.repo), pr_number=args.pr_number.strip() or None
-    )
+    result = refresh_tick(Path(args.repo), pr_number=args.pr_number.strip() or None)
     print(json.dumps(asdict(result), sort_keys=True))
     return 0 if result.ok else 1
 
