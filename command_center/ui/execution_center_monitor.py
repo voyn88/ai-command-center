@@ -35,6 +35,7 @@ from command_center import (
     models,
     project_config,
     task_pipeline,
+    tasks_repository,
     workspace_provisioning,
 )
 from command_center.runtime import api as runtime_api
@@ -351,7 +352,9 @@ def _task_detail_dialog(task: dict, tasks_by_id: dict[str, dict]) -> None:
 
     footer = st.columns([2, 2, 3])
     with footer[0]:
-        if st.button("В очередь", icon=":material/playlist_add:", key="task_detail_enqueue", width="stretch"):
+        if tasks_repository.is_master_projection_task(task):
+            st.caption("Задача центрального бэклога (read-only).")
+        elif st.button("В очередь", icon=":material/playlist_add:", key="task_detail_enqueue", width="stretch"):
             execution_queue.enqueue_and_persist(ROOT, task, tasks_by_id)
             st.success("Добавлено в очередь запуска.")
     with footer[1]:
@@ -1417,7 +1420,10 @@ def _render_project_tree_section(
                     _open_task_detail(node.task_id)
                     st.rerun()
             with row[3]:
-                if node.state in (live_board.NODE_READY, live_board.NODE_BLOCKED):
+                if node.state in (
+                    live_board.NODE_READY,
+                    live_board.NODE_BLOCKED,
+                ) and not tasks_repository.is_master_projection_task(task):
                     gate = live_board.launch_gate(
                         task, tasks_by_id=tasks_by_id, active_runs=active_runs
                     )
@@ -1545,6 +1551,11 @@ def _render_launch_board(
         for task in tasks
         if (task.get("status") or "") not in ("Done",)
         and task.get("status") in ("Next", "In Progress", "Backlog", "Blocked")
+        # Master-projection records are a read-only view of the canonical
+        # backlog (`launch_gate` refuses them too) — a launch board exists to
+        # launch tasks, so one it can never launch has no reason to occupy a
+        # row here.
+        and not tasks_repository.is_master_projection_task(task)
     ]
     gated = [
         (task, live_board.launch_gate(task, tasks_by_id=tasks_by_id, active_runs=active_runs))

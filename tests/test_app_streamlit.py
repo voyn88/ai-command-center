@@ -1767,6 +1767,31 @@ def test_recommendations_panel_launch_blocked_by_dirty_tree_shows_reason(fake_cl
     assert report["git_status"]["dirty"] is True
 
 
+def test_recommendations_panel_hides_launch_controls_for_master_projection_task():
+    """A master-projection record (the read-only backlog fallback view,
+    `source: "master"` / `read_only: True`) must never offer "В очередь" or
+    "Запустить" from the Recommended Tasks panel — `execution_queue.enqueue`
+    already refuses to queue one, so an enabled button here would be a
+    promise the queue cannot keep (VOYN-W0-AICC-READONLY-LAUNCH-SURFACES)."""
+    _seed_tasks(
+        [
+            {
+                "id": "master-reco",
+                "title": "Master backlog task",
+                "source": "master",
+                "read_only": True,
+            }
+        ]
+    )
+    at = _at_on_page("kanban")
+    assert not at.exception
+    button_keys = {b.key for b in at.button}
+    assert "kanban_reco_master-reco_launch" not in button_keys
+    assert "kanban_reco_master-reco_enqueue" not in button_keys
+    infos = [i.value for i in at.info]
+    assert any("read-only" in i for i in infos)
+
+
 def test_queue_launch_ready_blocked_by_dirty_tree_shows_reason(fake_claude, tmp_path):
     """Same regression as above, for the "🚀 Запустить готовые" / "Запустить
     следующую готовую задачу" queue-panel buttons: a skipped entry (dirty

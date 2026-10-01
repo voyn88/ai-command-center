@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import tempfile
 import threading
@@ -12,8 +13,10 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
-from command_center import storage
+from command_center import storage, tasks_repository
 from command_center.application import aios_status, tasks_gateway
+
+logger = logging.getLogger(__name__)
 
 _AICC_PRIORITY_TO_INT = {"Low": 1, "Medium": 2, "High": 3, "Critical": 4}
 _INT_TO_AICC_PRIORITY = {value: key for key, value in _AICC_PRIORITY_TO_INT.items()}
@@ -671,6 +674,21 @@ class AIOSTasksRepository:
             self.upsert(task)
 
     def upsert(self, task_dict: dict[str, Any]) -> None:
+        if tasks_repository.is_master_projection_task(task_dict):
+            # Mirrors the structural drop in `tasks_repository.save_tasks`
+            # (VOYN-W0-AICC-WIRE-BACKLOG-API): a master-projection record is
+            # a read-only view of the canonical backlog, never a second task
+            # store — every backend this repository facade can front must
+            # refuse to persist one, not just the default JSON store. Today
+            # no caller routes a master record here (`get_repository` only
+            # returns this class under `AICC_TASKS_BACKEND=aios`, and that
+            # backend never reads the backlog projection), but the guard
+            # keeps "no second task store" true regardless of backend.
+            logger.warning(
+                "AIOSTasksRepository.upsert: ignored master projection record %s",
+                task_dict.get("id"),
+            )
+            return
         aicc_id = str(task_dict.get("id") or "")
         if self._current(aicc_id) is None:
             self.create(task_dict)
