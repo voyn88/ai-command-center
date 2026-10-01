@@ -1526,6 +1526,12 @@ class Supervisor:
             )
             group_termination_confirmed = members == []
             if exited and (members is None or members):
+                if members:
+                    # Reaches a `setsid()` escapee the group-only killpg below
+                    # cannot: it left `process_group_id` for one of its own,
+                    # but `_live_process_group_members` still finds it via the
+                    # live `ppid` chain back to this leader.
+                    Supervisor._signal_pids_directly(members, signal.SIGKILL)
                 try:
                     os.killpg(process_group_id, signal.SIGKILL)
                     group_termination_confirmed = True
@@ -1565,6 +1571,19 @@ class Supervisor:
     ) -> list[int] | None:
         """Return live non-leader members, or ``None`` if inspection failed.
 
+        Membership is the union of two independent signals, because neither
+        alone survives everything a descendant can do:
+
+        - same pgid as the launch leader. This is the only signal left once a
+          descendant has been reparented to init after its immediate parent
+          exited (reparenting changes `ppid`, never `pgid`).
+        - transitively parented under `leader_pid` via live `ppid` links. This
+          is the only signal left once a descendant has called `setsid()` to
+          become the leader of its own session and process group — it leaves
+          the launch pgid entirely, so the pgid check alone would never see
+          it again, and a `killpg` against `process_group_id` would silently
+          stop short of it.
+
         The unreaped leader pins the launch-time pgid while this probe runs, so
         a later signal cannot be redirected to an unrelated reused id. Zombie
         descendants are already non-running and hold no open pipes, so they do
@@ -1573,7 +1592,7 @@ class Supervisor:
         process = None
         try:
             process = _SYSTEM_POPEN(
-                ["ps", "-axo", "pid=,pgid=,state="],
+                ["ps", "-axo", "pid=,ppid=,pgid=,state="],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -1589,20 +1608,41 @@ class Supervisor:
                 process.wait()
             return None
 
-        members = []
+        rows = []
         for line in stdout.splitlines():
-            parts = line.split(None, 2)
-            if len(parts) != 3:
+            parts = line.split(None, 3)
+            if len(parts) != 4:
                 continue
             try:
                 pid = int(parts[0])
-                pgid = int(parts[1])
+                ppid = int(parts[1])
+                pgid = int(parts[2])
             except ValueError:
                 continue
-            state = parts[2]
-            if pgid == process_group_id and pid != leader_pid and not state.startswith("Z"):
-                members.append(pid)
-        return members
+            state = parts[3]
+            if pid != leader_pid and not state.startswith("Z"):
+                rows.append((pid, ppid, pgid))
+
+        members: set[int] = {pid for pid, _ppid, pgid in rows if pgid == process_group_id}
+
+        children_by_ppid: dict[int, list[int]] = {}
+        for pid, ppid, _pgid in rows:
+            children_by_ppid.setdefault(ppid, []).append(pid)
+        # `visited` (not `members`) guards the walk: a pgid-matched member
+        # (e.g. `child`, still in the launch group) must still have its own
+        # children expanded, or a `setsid()` escapee one level further down
+        # (e.g. `grandchild`) is never reached.
+        visited: set[int] = set()
+        stack = list(children_by_ppid.get(leader_pid, []))
+        while stack:
+            pid = stack.pop()
+            if pid in visited:
+                continue
+            visited.add(pid)
+            members.add(pid)
+            stack.extend(children_by_ppid.get(pid, []))
+
+        return list(members)
 
     @staticmethod
     def _observe_leader_exit_locked(active: _ActiveRun) -> bool:
@@ -1656,6 +1696,10 @@ class Supervisor:
 
         if members and not group_term_sent:
             term_sent = self._signal_process_group_locked(active, signal.SIGTERM)
+            # `killpg` only reaches members still in the launch pgid; a member
+            # found only via the `ppid` walk (a `setsid()` escapee) needs its
+            # own direct signal to ever be reached at all.
+            self._signal_pids_directly(members, signal.SIGTERM)
             signal_sent = signal_sent or term_sent
             lifecycle = (
                 f"{lifecycle_prefix}_residual_sigterm_sent"
@@ -1687,6 +1731,8 @@ class Supervisor:
         # normal escalation case.
         if members is None or members:
             kill_sent = self._signal_process_group_locked(active, signal.SIGKILL)
+            if members:
+                self._signal_pids_directly(members, signal.SIGKILL)
             signal_sent = signal_sent or kill_sent
             lifecycle = (
                 f"{lifecycle_prefix}_sigkill_sent"
@@ -1791,6 +1837,24 @@ class Supervisor:
             if self._observe_leader_exit_locked(active):
                 return False
             return self._signal_process_group_locked(active, sig)
+
+    @staticmethod
+    def _signal_pids_directly(pids: list[int], sig: signal.Signals) -> None:
+        """Deliver `sig` to each pid individually, not via the launch pgid.
+
+        `killpg(process_group_id, sig)` only ever reaches processes still in
+        that pgid. A descendant that called `setsid()` has moved itself into a
+        new session and pgid while staying a live member of the launched tree
+        (`_live_process_group_members` still finds it via the `ppid` walk), so
+        it needs a signal addressed to its own pid to ever receive one.
+        """
+        for pid in pids:
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                pass
+            except OSError:
+                logger.exception("Could not send %s directly to pid %s", sig.name, pid)
 
     def _append_lifecycle_event_best_effort(self, lifecycle: str, run_id: str, **payload: object) -> None:
         """Delegates to `run_finalizer.RunFinalizer` (extracted side)."""
@@ -2183,6 +2247,21 @@ class Supervisor:
                         return False
 
                 grace_deadline = time.monotonic() + max(grace_seconds, 0.0)
+
+                # Snapshot tree membership *before* any signal goes out. A
+                # descendant that has called `setsid()` is only reachable via
+                # its live `ppid` chain back to the leader — and that chain is
+                # severed the instant an intermediate ancestor dies (the
+                # kernel reparents it to init right away, not merely once it
+                # is reaped). The leader is about to receive SIGTERM below and
+                # may die within microseconds, so this snapshot has to happen
+                # first or the escapee becomes untraceable before it is ever
+                # seen.
+                escaped_members = self._live_process_group_members(
+                    active.process_group_id,
+                    leader_pid=pid,
+                )
+
                 term_sent = self._signal_process_group_locked(active, signal.SIGTERM)
                 if term_sent:
                     record_first_signal()
@@ -2192,6 +2271,12 @@ class Supervisor:
                     else f"{lifecycle_prefix}_sigterm_failed"
                 )
                 self._append_lifecycle_event_best_effort(term_lifecycle, run_id, pid=pid)
+
+                # `killpg` above only reaches the launch pgid, which this
+                # snapshot's setsid escapees (if any) have already left.
+                if escaped_members:
+                    self._signal_pids_directly(escaped_members, signal.SIGTERM)
+                    record_first_signal()
 
                 if term_sent:
                     try:
@@ -2217,6 +2302,8 @@ class Supervisor:
                 # If TERM itself failed, do not wait for a natural exit that
                 # could be retroactively relabelled. Try KILL immediately.
                 kill_sent = self._signal_process_group_locked(active, signal.SIGKILL)
+                if escaped_members:
+                    self._signal_pids_directly(escaped_members, signal.SIGKILL)
                 if kill_sent:
                     record_first_signal()
                 kill_lifecycle = (
