@@ -145,6 +145,31 @@ def test_stale_checkout_unwind_cannot_touch_a_reincarnated_pool(monkeypatch) -> 
     pool.close_pool()
 
 
+def test_build_pool_carries_the_password_that_a_live_dsn_would_drop(
+    monkeypatch,
+) -> None:
+    """``_build_pool`` must reconnect from the stored `PostgresConfig`, never
+    from a value shaped like ``psycopg``'s `ConnectionInfo.dsn` -- that
+    property explicitly never carries the password (see its own docstring:
+    "The password is never returned"). A rebuild path that reached for a live
+    connection's dsn instead of `config.conninfo()` would still open on the
+    first pool build, then reconnect with an unauthenticated string on every
+    later rotation/retry and fail silently, exactly the failure this test
+    guards (VOYN-W0-AICC-PSYCOPG-DSN-REDACT)."""
+    from command_center.db import adapter
+
+    captured: dict[str, str] = {}
+
+    def fake_open_pool(conninfo: str, **kwargs) -> FakePool:
+        captured["conninfo"] = conninfo
+        return FakePool("built")
+
+    monkeypatch.setattr(adapter, "open_pool", fake_open_pool)
+    password = "s3cr3t-and-plenty-long-enough-01"
+    pool._build_pool(_config(password))
+    assert f"password='{password}'" in captured["conninfo"]
+
+
 def test_replace_pool_refuses_to_resurrect_a_concurrently_closed_pool(
     monkeypatch,
 ) -> None:
