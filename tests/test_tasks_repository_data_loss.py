@@ -9,6 +9,7 @@ the on-disk list is never destroyed by a single failed read.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -102,4 +103,42 @@ def test_a_malformed_example_still_raises_on_the_strict_path(tmp_path, monkeypat
     tr.tasks_file_path(tmp_path).unlink(missing_ok=True)
 
     with pytest.raises((json.JSONDecodeError, ValueError)):
+        tr.load_tasks(tmp_path, example_file=example, strict=True)
+
+
+def _make_example_unreadable(monkeypatch, example: Path) -> None:
+    """Simulate the example passing `.exists()` and then becoming unreadable
+    before the read -- permissions changed, or it was removed in the window
+    `create_json_if_absent` already races on the write side."""
+    original_read_bytes = Path.read_bytes
+
+    def _read_bytes(self, *args, **kwargs):
+        if self == example:
+            raise OSError("simulated unreadable example")
+        return original_read_bytes(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_bytes", _read_bytes)
+
+
+def test_an_unreadable_example_does_not_raise_from_a_lenient_read(tmp_path, monkeypatch):
+    """The other half of `4b058ff`'s finding: not just a malformed example,
+    but one that raises `OSError` on read (unreadable/vanished) must also not
+    escape a `strict=False` call."""
+    monkeypatch.setenv("AICC_DATA_DIR", str(tmp_path / "data"))
+    example = tmp_path / "tasks.example.json"
+    example.write_text("[]", encoding="utf-8")
+    tr.tasks_file_path(tmp_path).unlink(missing_ok=True)
+    _make_example_unreadable(monkeypatch, example)
+
+    assert tr.load_tasks(tmp_path, example_file=example) == []
+
+
+def test_an_unreadable_example_still_raises_on_the_strict_path(tmp_path, monkeypatch):
+    monkeypatch.setenv("AICC_DATA_DIR", str(tmp_path / "data"))
+    example = tmp_path / "tasks.example.json"
+    example.write_text("[]", encoding="utf-8")
+    tr.tasks_file_path(tmp_path).unlink(missing_ok=True)
+    _make_example_unreadable(monkeypatch, example)
+
+    with pytest.raises(OSError):
         tr.load_tasks(tmp_path, example_file=example, strict=True)
