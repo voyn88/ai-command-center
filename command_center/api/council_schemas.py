@@ -90,3 +90,56 @@ class DecisionList(BaseModel):
     decisions: list[DecisionRecord] = Field(default_factory=list)
     limit: int
     offset: int
+
+
+# --------------------------------------------------------------------------
+# Reputation (VOYN-MIN-LINK-REPUTE): trust scores from vote quality + influence
+# --------------------------------------------------------------------------
+
+
+class VoteTrustScoreOut(BaseModel):
+    """The explainable trust score for one cast vote — see
+    :mod:`command_center.council.reputation` for how ``score`` is derived and
+    what ``basis`` means."""
+
+    vote_id: str
+    voter_id: str
+    motion_id: str
+    score: float | None = None
+    basis: str
+    explanation: str
+    votes_considered: int = 0
+
+
+class VoterReputationOut(BaseModel):
+    """A voter's aggregate reputation across every decided motion they voted
+    on — the roll-up :func:`command_center.council.reputation.compute_voter_reputation`
+    produces."""
+
+    voter_id: str
+    score: float | None = None
+    basis: str
+    alignment_rate: float | None = None
+    influence_rate: float | None = None
+    votes_considered: int = 0
+    explanation: str
+
+
+class VoterReputationList(BaseModel):
+    """A page of voter reputations plus the paging echo the client sent."""
+
+    reputations: list[VoterReputationOut] = Field(default_factory=list)
+    limit: int
+    offset: int
+
+
+class ReputationCoverage(BaseModel):
+    """The acceptance metric behind VOYN-MIN-LINK-REPUTE: the fraction of
+    (non-redacted) cast votes that carry an explainable trust score — a vote
+    only fails to count when its motion is undecided *and* its voter has no
+    decided-vote history yet (``basis == "insufficient_data"``). The acceptance
+    bar is ``coverage >= 0.9``."""
+
+    total_votes: int
+    explainable_votes: int
+    coverage: float

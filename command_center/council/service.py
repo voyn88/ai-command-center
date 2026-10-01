@@ -28,10 +28,13 @@ so a test can monkeypatch it, and the runtime db path resolves under the per-tes
 
 from __future__ import annotations
 
+from collections import defaultdict
+from dataclasses import asdict
 from pathlib import Path
 
 from command_center.api import council_schemas as s
 from command_center.api import models
+from command_center.council import reputation as reputation_domain
 from command_center.council.roles import DEFAULT_ROSTER, CouncilRoster
 from command_center.models import SENSITIVE_PROJECT_IDS
 from command_center.project_config import is_sensitive
@@ -360,3 +363,76 @@ def _sensitive_motion_ids(path: Path) -> list[str]:
         rows = db.list_motions(path, project=project, limit=1000, offset=0)
         ids.extend(r["id"] for r in rows)
     return ids
+
+
+# --------------------------------------------------------------------------
+# Reputation (VOYN-MIN-LINK-REPUTE): trust scores from vote quality + influence
+# --------------------------------------------------------------------------
+
+
+def get_vote_trust_score(vote_id: str) -> s.VoteTrustScoreOut | None:
+    """The explainable trust score for one cast vote. Returns ``None`` (→ 404)
+    when the vote does not exist or its motion is sensitive (redaction)."""
+    path = _db_path()
+    vote = db.get_vote(path, vote_id)
+    if vote is None:
+        return None
+    motion = db.get_motion(path, vote["motion_id"])
+    if motion is None or is_sensitive(motion.get("project_ref") or ""):
+        return None
+    history = db.list_votes_with_outcomes(
+        path, voter_id=vote["voter_id"], exclude_projects=_sensitive_projects()
+    )
+    vote_row = next(v for v in history if v["id"] == vote_id)
+    score = reputation_domain.compute_vote_trust_score(vote_row, history)
+    return s.VoteTrustScoreOut(**asdict(score))
+
+
+def get_voter_reputation(voter_id: str) -> s.VoterReputationOut | None:
+    """A voter's aggregate reputation. Returns ``None`` (→ 404) when the voter
+    has never cast a (non-redacted) vote."""
+    path = _db_path()
+    history = db.list_votes_with_outcomes(
+        path, voter_id=voter_id, exclude_projects=_sensitive_projects()
+    )
+    if not history:
+        return None
+    decided = [v for v in history if v.get("decision_outcome") is not None]
+    rep = reputation_domain.compute_voter_reputation(voter_id, decided)
+    return s.VoterReputationOut(**asdict(rep))
+
+
+def list_voter_reputations(*, limit: int = 100, offset: int = 0) -> s.VoterReputationList:
+    """Every voter's aggregate reputation, alphabetically by ``voter_id``,
+    paged."""
+    path = _db_path()
+    excluded = _sensitive_projects()
+    voter_ids = db.list_voter_ids(path, exclude_projects=excluded)
+    page = voter_ids[offset : offset + limit]
+    reputations = []
+    for voter_id in page:
+        history = db.list_votes_with_outcomes(path, voter_id=voter_id, exclude_projects=excluded)
+        decided = [v for v in history if v.get("decision_outcome") is not None]
+        rep = reputation_domain.compute_voter_reputation(voter_id, decided)
+        reputations.append(s.VoterReputationOut(**asdict(rep)))
+    return s.VoterReputationList(reputations=reputations, limit=limit, offset=offset)
+
+
+def reputation_coverage() -> s.ReputationCoverage:
+    """The acceptance metric: the fraction of (non-redacted) cast votes that
+    carry an explainable trust score. Must be ``>= 0.9``."""
+    path = _db_path()
+    votes = db.list_votes_with_outcomes(path, exclude_projects=_sensitive_projects())
+    by_voter: dict[str, list[dict]] = defaultdict(list)
+    for vote in votes:
+        by_voter[vote["voter_id"]].append(vote)
+    scores = [
+        reputation_domain.compute_vote_trust_score(vote, by_voter[vote["voter_id"]])
+        for vote in votes
+    ]
+    explainable = sum(1 for score in scores if score.basis != "insufficient_data")
+    return s.ReputationCoverage(
+        total_votes=len(scores),
+        explainable_votes=explainable,
+        coverage=reputation_domain.reputation_coverage(scores),
+    )

@@ -111,3 +111,37 @@ def list_decisions(
     offset: int = Query(default=0, ge=0),
 ) -> w.DecisionList:
     return service.list_decisions(outcome=outcome, limit=limit, offset=offset)
+
+
+# --------------------------------------------------------------------------
+# Reputation (VOYN-MIN-LINK-REPUTE): trust scores from vote quality + influence
+# --------------------------------------------------------------------------
+
+
+@router.get("/council/votes/{vote_id}/trust-score", response_model=w.VoteTrustScoreOut)
+def get_vote_trust_score(vote_id: str) -> w.VoteTrustScoreOut:
+    found = service.get_vote_trust_score(vote_id)
+    if found is None:
+        raise HTTPException(status_code=404, detail="vote not found")
+    return found
+
+
+@router.get("/council/reputation", response_model=w.VoterReputationList)
+def list_voter_reputations(
+    limit: int = Query(default=100, ge=1, le=_MAX_LIMIT),
+    offset: int = Query(default=0, ge=0),
+) -> w.VoterReputationList:
+    return service.list_voter_reputations(limit=limit, offset=offset)
+
+
+@router.get("/council/reputation/coverage", response_model=w.ReputationCoverage)
+def get_reputation_coverage() -> w.ReputationCoverage:
+    return service.reputation_coverage()
+
+
+@router.get("/council/reputation/{voter_id}", response_model=w.VoterReputationOut)
+def get_voter_reputation(voter_id: str) -> w.VoterReputationOut:
+    found = service.get_voter_reputation(voter_id)
+    if found is None:
+        raise HTTPException(status_code=404, detail="voter not found")
+    return found
