@@ -153,44 +153,62 @@ def test_json_columns_are_compared_as_parsed_values() -> None:
     """`jsonb` is not byte-stable — PostgreSQL returns `{"b":1,"a":2}` with its
     own key order — so text comparison would report every object-valued row as
     different."""
-    assert JSON_CODEC.comparable("refs_json", '{"b": 1, "a": 2}') == {"a": 2, "b": 1}
-    assert JSON_CODEC.comparable("refs_json", {"a": 2, "b": 1}) == {"a": 2, "b": 1}
+    assert JSON_CODEC.comparable("refs_json", '{"b": 1, "a": 2}', side="authority") == {
+        "a": 2,
+        "b": 1,
+    }
+    assert JSON_CODEC.comparable("refs_json", {"a": 2, "b": 1}, side="mirror") == {
+        "a": 2,
+        "b": 1,
+    }
 
 
 def test_only_declared_json_columns_are_parsed() -> None:
     """Parsing a column the target stores as text would make two rows agree on
     a value that differs — a false clean, which is worse than a false
     difference because nothing follows up on it."""
-    assert JSON_CODEC.comparable("title", '{"a": 1}') == '{"a": 1}'
+    assert JSON_CODEC.comparable("title", '{"a": 1}', side="authority") == '{"a": 1}'
 
 
-def test_unparseable_authority_text_compares_as_itself() -> None:
-    """`to_column` refuses such text, so no unparseable value reaches the
-    mirror and the row is reported divergent — which is what an unmirrorable
-    row is."""
-    assert JSON_CODEC.comparable("refs_json", "not json") == "not json"
+def test_the_mirror_side_of_a_json_column_is_never_reparsed() -> None:
+    """The driver already parsed `jsonb` by the time this method sees it —
+    `to_authority` hands the value over untouched. Re-parsing a mirror `str`
+    is exactly the step that made unparseable authority text and a mirrored
+    JSON string scalar indistinguishable (see the collision test below), so
+    the mirror side is passed through regardless of its shape."""
+    assert JSON_CODEC.comparable("refs_json", "not json", side="mirror") == "not json"
+    assert JSON_CODEC.comparable("refs_json", '{"a": 1}', side="mirror") == '{"a": 1}'
 
 
-def test_a_json_string_scalar_collides_with_unparseable_text() -> None:
-    """The counterexample to the flat version of the claim above, pinned.
+def test_unparseable_authority_text_never_compares_equal() -> None:
+    """`to_column` refuses such text, so no unparseable value ever reaches the
+    mirror — meaning no mirror value is ever its counterpart. Reported as
+    divergent unconditionally, rather than by comparing (and possibly
+    matching) the raw text."""
+    unparseable = JSON_CODEC.comparable("refs_json", "not json", side="authority")
 
-    A `jsonb` column may hold a JSON string scalar, which the driver returns as
-    a plain `str`; `comparable` sees two values and no provenance, so mirror
-    `"not json"` — valid `jsonb` — compares equal to authority text `not json`,
-    which is unmirrorable. A false clean, and the docstring used to deny it
-    could happen. Unreachable for every column mirrored today, all of which are
-    written by `json.dumps`; tracked as
-    `VOYN-W0-AICC-MIRROR-JSON-SCALAR-AMBIGUITY`.
+    assert unparseable != "not json"
+    assert unparseable != unparseable  # no accidental match against itself either
 
-    Asserted rather than described so the day it is fixed, this fails and says
-    so instead of quietly agreeing.
+
+def test_a_json_string_scalar_no_longer_collides_with_unparseable_text() -> None:
+    """The regression test for the bug this task fixes.
+
+    A `jsonb` column may hold a JSON string scalar, which the driver returns
+    as a plain `str` identical in content to unparseable authority text of the
+    same characters — `not json` on both sides. The two are provenance, not
+    bytes: a mirrored string scalar is valid `jsonb` an authority write chose
+    to send, while the identical authority text failed to parse and could
+    never have reached the mirror. `comparable` now takes `side` explicitly
+    instead of guessing, so the pair reports a divergence rather than a false
+    clean — `VOYN-W0-AICC-MIRROR-JSON-SCALAR-AMBIGUITY`.
     """
     from_mirror = "not json"  # what psycopg returns for the jsonb value '"not json"'
     from_authority = "not json"  # text that is not JSON at all
 
-    assert JSON_CODEC.comparable("refs_json", from_mirror) == JSON_CODEC.comparable(
-        "refs_json", from_authority
-    )
+    assert JSON_CODEC.comparable(
+        "refs_json", from_mirror, side="mirror"
+    ) != JSON_CODEC.comparable("refs_json", from_authority, side="authority")
 
 
 # --- reconciliation ---------------------------------------------------------
@@ -245,6 +263,23 @@ def test_only_the_named_columns_are_compared() -> None:
     store and the authority gets for free. Comparing it would report a
     difference that exists only because the target needed it."""
     assert divergence([_row("a")], _Mirror([_row("a", position=4)]), COLUMNS) == []
+
+
+def test_divergence_reports_a_json_string_scalar_against_unparseable_authority_text() -> None:
+    """The end-to-end version of
+    `test_a_json_string_scalar_no_longer_collides_with_unparseable_text`: a
+    `jsonb` column holding a valid JSON string scalar must not reconcile clean
+    against authority text of the same characters that failed to parse —
+    `VOYN-W0-AICC-MIRROR-JSON-SCALAR-AMBIGUITY`.
+    """
+    authority_row = _row("a", refs_json="not json")  # unparseable, not written by json.dumps
+    mirror_row = _row("a", refs_json="not json")  # what psycopg returns for jsonb '"not json"'
+
+    reported = divergence(
+        [authority_row], _Mirror([mirror_row]), (*COLUMNS, "refs_json"), JSON_CODEC
+    )
+
+    assert reported and reported[0]["fields"] == ["refs_json"]
 
 
 def test_an_unreadable_mirror_is_reported_not_treated_as_agreement() -> None:
