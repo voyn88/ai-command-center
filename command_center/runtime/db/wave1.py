@@ -22,7 +22,7 @@ import json
 import logging
 import sqlite3
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 import command_center.runtime.db as db  # facade (late-bound; see docstring)
 
@@ -677,7 +677,7 @@ def list_digest_items(
         return [_decode_digest_row(dict(row)) for row in rows]
 
 
-def list_digest_items_stored(db_path: Path) -> list[dict]:
+def list_digest_items_stored(db_path: Path) -> Iterator[dict]:
     """Every digest row in the shape SQLite **stores**, for reconciliation.
 
     Every other reader here returns :func:`_decode_digest_row` output, which
@@ -697,10 +697,20 @@ def list_digest_items_stored(db_path: Path) -> list[dict]:
     Deliberately without ``exclude_projects``: redaction is a read-surface
     policy, and a reconciliation that skipped redacted rows would certify a
     cutover over a subset of the table while reporting it as the whole.
+
+    A generator, not a ``list``: :func:`command_center.db.mirror_support.divergence`
+    takes an iterator of authority rows for exactly this table's sake
+    (``test_reconciliation_accepts_a_generator_of_authority_rows``), and this is
+    the first reader ever fed to it. Returning a ``list`` here would have thrown
+    that design away one call before it started mattering — cheap to miss while
+    ``digest_item`` is small, and the same shape of reader is what ``run`` and
+    ``task`` need next, where materialising the whole table into one process
+    would be the actual, no-longer-theoretical outage this migration exists to
+    avoid.
     """
     with db.connect(db_path) as conn:
-        rows = conn.execute("SELECT * FROM digest_item ORDER BY id").fetchall()
-        return [dict(row) for row in rows]
+        for row in conn.execute("SELECT * FROM digest_item ORDER BY id"):
+            yield dict(row)
 
 
 def _decode_digest_row(row: dict) -> dict:
