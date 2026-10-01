@@ -171,6 +171,12 @@ TICK_BUSY = "pipeline_busy"
 TICK_RAN = "ran"
 LAUNCH_DISABLED = "auto_launch_disabled"
 LAUNCH_BUDGET_EXHAUSTED = "daily_spend_budget_exhausted"
+# Distinct from LAUNCH_BUDGET_EXHAUSTED: this fires when spend could not be
+# measured at all (e.g. the cost query raised), not when it was measured and
+# found to be at/over the cap. New launches are gated the same way in both
+# cases (fail closed — no cost data, no launch) but the *reason* reported to
+# the operator must not claim a budget number that was never read.
+LAUNCH_SPEND_UNKNOWN = "daily_spend_unknown"
 LAUNCH_BATCH_FAILED = "launch_batch_failed"
 
 # Completion audit event appended when this module reconciles a row's merge
@@ -2232,6 +2238,7 @@ def _locked_tick(
     #    budget gates NEW launches exclusively: running work, completions and
     #    merges continue — stopping mid-flight work is the kill switch's job.
     spend_budget_exhausted = False
+    spend_unknown = False
     if settings.auto_launch_active and settings.max_daily_spend_usd > 0:
         try:
             spend_budget_exhausted = (
@@ -2239,15 +2246,17 @@ def _locked_tick(
             )
         except Exception as exc:  # noqa: BLE001 — fail closed: no cost data, no launch
             _record(exc, "daily_spend_budget")
-            spend_budget_exhausted = True
-    if settings.auto_launch_active and not spend_budget_exhausted:
+            spend_unknown = True
+    if settings.auto_launch_active and not spend_budget_exhausted and not spend_unknown:
         decisions, launch_status = _dispatch(
             root, api, tasks, tasks_by_id, project_configs, decisions, settings
         )
+    elif spend_budget_exhausted:
+        launch_status = LAUNCH_BUDGET_EXHAUSTED
+    elif spend_unknown:
+        launch_status = LAUNCH_SPEND_UNKNOWN
     else:
-        launch_status = (
-            LAUNCH_BUDGET_EXHAUSTED if spend_budget_exhausted else LAUNCH_DISABLED
-        )
+        launch_status = LAUNCH_DISABLED
 
     # 9b. Nothing silently stuck: compute, from the post-dispatch state, every
     #     task that has stopped without reaching Done. Read-only.
