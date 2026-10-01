@@ -21,22 +21,21 @@ accepted map, most are optional lifecycle stamps like this one.
 An earlier version of this docstring justified the whole-row upsert by saying
 `resolved_at` returns to `NULL` when a conflict reopens. **That is false**, and
 independent review caught it: `CONFLICT_TRANSITIONS["resolved"]` is empty, so
-`resolved` is terminal and the clearing branch in `_conflict_transition` cannot
-be reached. The claim was written from reading that branch instead of the
-allowlist above it, and the test offered as its evidence upserted two
-hand-built dicts — a sequence the authority cannot produce. It is recorded here
-rather than quietly deleted because "proved against data the writer cannot
-emit" is the same defect class that put a wrong timestamp conversion into
-`main` two slices earlier.
+`resolved` is terminal. The claim was written from reading the (now-removed)
+clearing branch in `_conflict_transition` instead of the allowlist above it,
+and the test offered as its evidence upserted two hand-built dicts — a
+sequence the authority cannot produce. It is recorded here rather than quietly
+deleted because "proved against data the writer cannot emit" is the same
+defect class that put a wrong timestamp conversion into `main` two slices
+earlier. VOYN-W0-AICC-CONFLICT-REOPEN-DECISION has since settled the product
+question this technical finding surfaced: `resolved` stays terminal, so there
+is no `resolved -> open` edge to plan for.
 
-The whole-row upsert stands on reasons that survive checking. `update_conflict_
-fields` changes at most four columns — the one or two the caller named, plus
-`updated_at` and `version` — and mirrors the whole row, because the mirror has
-no other source for the columns it did not touch. The backfill runs more than
-once by design. And if `resolved -> open` is ever added to the allowlist, a
-field-by-field mirror would keep a resolution the authority had withdrawn —
-which is a reason to write whole rows now, not a description of what happens
-today.
+The whole-row upsert stands on reasons that survive checking regardless:
+`update_conflict_fields` changes at most four columns — the one or two the
+caller named, plus `updated_at` and `version` — and mirrors the whole row,
+because the mirror has no other source for the columns it did not touch. The
+backfill also runs more than once by design.
 """
 
 from __future__ import annotations
