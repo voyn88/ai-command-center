@@ -29,6 +29,7 @@ DEFAULT_OWNERS: dict[str, str] = {
     "code-quality": "engineering",
     "deps": "platform",
     "lint": "engineering",
+    "gaming": "qa",
 }
 
 
