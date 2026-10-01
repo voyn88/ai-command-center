@@ -125,6 +125,15 @@ def test_redacted_never_contains_the_password() -> None:
     assert "aicc_app@127.0.0.1:5432/aicc" in config.redacted()
 
 
+def test_repr_never_contains_the_password() -> None:
+    """A bare `str(config)`/`repr(config)` — e.g. from a stray log call or an
+    unhandled exception's locals dump — must not leak the secret. Only
+    `conninfo()` may ever produce it."""
+    config = load_config(_env())
+    assert _STRONG_PASSWORD not in repr(config)
+    assert _STRONG_PASSWORD not in str(config)
+
+
 def test_conninfo_carries_credentials_and_statement_timeout() -> None:
     config = load_config(_env())
     conninfo = config.conninfo()
