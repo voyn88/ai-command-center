@@ -574,3 +574,51 @@ def test_daily_spend_usd_tolerates_dict_and_malformed_payloads(tmp_path, monkeyp
 
     assert total == pytest.approx(5.5)
     assert "unparseable" in caplog.text
+
+
+def test_daily_spend_usd_skips_valid_json_that_is_not_an_object(tmp_path, monkeypatch, caplog):
+    """`payload_json` can decode to well-formed JSON that isn't an object —
+    a list, string, number, bool or null — none of which have `.get`. The
+    fix in VOYN-W0-AICC-SPEND-CAP-ZERO (#418) guards this with an
+    `isinstance(payload, dict)` check before the `.get` call; this test
+    exercises that guard directly against every JSON scalar/collection
+    shape `.get` would otherwise crash on, and confirms a well-formed row
+    among them is still summed rather than the whole batch being dropped."""
+
+    class _FakeCursor:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def fetchall(self):
+            return self._rows
+
+    class _FakeConn:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def execute(self, *_args, **_kwargs):
+            return _FakeCursor(self._rows)
+
+    rows = [
+        {"payload": '[{"total_cost_usd": 1}]'},
+        {"payload": '"total_cost_usd"'},
+        {"payload": "42"},
+        {"payload": "true"},
+        {"payload": "false"},
+        {"payload": "null"},
+        {"payload": '{"type": "result", "total_cost_usd": 2.0}'},
+    ]
+
+    @contextlib.contextmanager
+    def _fake_connect(_db_path):
+        yield _FakeConn(rows)
+
+    monkeypatch.setattr(task_pipeline.runtime_db, "connect", _fake_connect)
+
+    with caplog.at_level("WARNING"):
+        total = task_pipeline.daily_spend_usd(tmp_path / "runtime.db")
+
+    assert total == pytest.approx(2.0)
+    assert caplog.text.count("not an object") == 6
+    for shape in ("list", "str", "int", "bool", "NoneType"):
+        assert shape in caplog.text
