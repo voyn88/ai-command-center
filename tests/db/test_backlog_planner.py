@@ -143,12 +143,20 @@ def test_dispatch_payload_carries_the_specific_task_id() -> None:
     assert payload["backlog_task_id"] == "VOYN-W0-SPECIFIC-TASK"
 
 
-def _dispatch(app_factory, task_id, planner="planner-t", wip=4, payload=None):
+def _dispatch(
+    app_factory, task_id, planner="planner-t", wip=4, payload=None, max_attempts=3
+):
     with app_factory() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT * FROM backlog_dispatch(%s, %s, 3600, %s, %s::jsonb, 3)",
-                (task_id, planner, wip, json.dumps(payload or {"kind": "agent_run"})),
+                "SELECT * FROM backlog_dispatch(%s, %s, 3600, %s, %s::jsonb, %s)",
+                (
+                    task_id,
+                    planner,
+                    wip,
+                    json.dumps(payload or {"kind": "agent_run"}),
+                    max_attempts,
+                ),
             )
             return cur.fetchone()
 
@@ -406,6 +414,50 @@ def test_repeated_no_pr_publish_failure_stays_operational(rig) -> None:
         assert store.get_task("VOYN-W0-N2")["status"] == "OPEN", rows
 
 
+def test_repeated_guarded_publish_prep_failure_stays_operational(rig) -> None:
+    """VOYN-W0-AICC-DEFER-RESUME-COVER-PUBLISH-PREP: a guarded publish
+    preparation failure (worker/handlers.py's WorkspaceVerificationError,
+    e.g. `agent_worktree_clean` finding `uncommitted_changes`) reaches the
+    dead-letter path wrapped in queue_fail's own `max_attempts_exhausted:`
+    label (0002_queue_claim.sql), which reaches backlog_return_to_pool as
+    `cascade_exhausted: max_attempts_exhausted: guarded publish preparation
+    failed at agent_worktree_clean: uncommitted_changes: ...`. Migration
+    0012's allowlist did not name this shape, so a SECOND occurrence used to
+    park the task in DEFER_TO_USER as if it were an owner decision even
+    though it is exactly the same kind of operational retry no_pr_published
+    already gets exempted from. 0017 fixes this by recognizing any
+    `max_attempts_exhausted:` cascade cause as technical."""
+    app_factory, store, worker = rig
+    assert store.upsert_task(_task("VOYN-W0-GP", repo="repo-nm"))[0]
+
+    reason = (
+        "guarded publish preparation failed at agent_worktree_clean: "
+        "uncommitted_changes: M some_file.py"
+    )
+    for round_no in (1, 2):
+        assert _dispatch(app_factory, "VOYN-W0-GP", max_attempts=1)[0], f"round {round_no}"
+        claimed = worker.claim("execution", visibility_seconds=60)
+        assert isinstance(claimed, ClaimedWork)
+        assert worker.fail(claimed, reason=reason, retryable=True)
+        with app_factory() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM backlog_ingest_results(%s)", ("planner-t",))
+                rows = cur.fetchall()
+        assert [(r[0], r[2]) for r in rows] == [("VOYN-W0-GP", "returned_to_pool")]
+        assert store.get_task("VOYN-W0-GP")["status"] == "OPEN", rows
+
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT reason FROM backlog_event WHERE task_id = %s "
+                "AND event = 'return_to_pool' AND outcome = 'granted' ORDER BY event_id",
+                ("VOYN-W0-GP",),
+            )
+            reasons = [r[0] for r in cur.fetchall()]
+    assert len(reasons) == 2
+    assert all(r.startswith("cascade_exhausted: max_attempts_exhausted:") for r in reasons)
+
+
 def test_ingest_a_clean_run_with_sha_but_no_pr_still_returns_to_pool(rig) -> None:
     """The exact live shape of the 2026-08-21 incident: status='completed'
     AND a real head_sha (the agent reported its own HEAD_SHA trailer), but
@@ -460,6 +512,34 @@ def test_ingest_queue_succeeded_but_task_failed_returns_to_pool_not_review(rig) 
                 ("VOYN-W0-QF",),
             )
             assert cur.fetchone()[0] == 0
+
+
+def test_migration_0017_is_reversible_without_residue(pg_connection_factory) -> None:
+    """Live up->down->up pins the broadened technical-park classifier to
+    migration 0017. Downgrading to 0016 must restore 0012's narrower
+    allowlist (no `max_attempts_exhausted:` catch-all), and the second
+    upgrade must reapply it."""
+    from command_center.db import migrations
+
+    with pg_connection_factory() as conn:
+        migrations.upgrade(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT prosrc FROM pg_proc WHERE proname = 'backlog_return_to_pool'"
+            )
+            assert "max_attempts_exhausted" in cur.fetchone()[0]
+        migrations.downgrade(conn, target=16)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT prosrc FROM pg_proc WHERE proname = 'backlog_return_to_pool'"
+            )
+            assert "max_attempts_exhausted" not in cur.fetchone()[0]
+        migrations.upgrade(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT prosrc FROM pg_proc WHERE proname = 'backlog_return_to_pool'"
+            )
+            assert "max_attempts_exhausted" in cur.fetchone()[0]
 
 
 def test_migration_0012_is_reversible_without_residue(pg_connection_factory) -> None:
