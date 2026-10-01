@@ -8,7 +8,13 @@ import subprocess
 
 import pytest
 
-from command_center.orchestrator.publish import PublishConfig, publish_run
+from command_center.orchestrator.publish import (
+    PublishConfig,
+    _classify_push_failure,
+    _diff_touches_github_workflows,
+    _gh_oauth_workflow_scope_missing,
+    publish_run,
+)
 
 
 def _git(cwd, *args):
@@ -807,3 +813,244 @@ def test_candidate_leak_guard_copy_is_never_executed(repo, monkeypatch):
 
     assert r.ok, r.reason
     assert not marker.exists(), "candidate leak_guard executed in publisher"
+
+
+# --- workflow-scope preflight (VOYN-W0-AICC-PUBLISH-WORKFLOW-SCOPE) --------
+# Found live 2026-08-30 publishing PR #502: a candidate touching
+# .github/workflows/** pushed over gh's OAuth credential (gist, read:org,
+# repo -- never workflow) reached GitHub and came back an opaque
+# `push_failed: <stderr>`, indistinguishable from a stale --force-with-lease
+# or a dropped connection. See docs/adr/0011-publish-workflow-scope-preflight.md.
+
+
+def _gh_with_auth_status(bin_, calls, scopes, pr_exists):
+    """Like the `repo` fixture's fake gh, plus a real `gh auth status`
+    reply carrying the given scopes line."""
+    gh = bin_ / "gh"
+    gh.write_text(
+        "#!/bin/sh\n"
+        f'echo "gh $*" >> {calls}\n'
+        'if [ "$1" = "auth" ] && [ "$2" = "status" ]; then\n'
+        f'  echo "  - Token scopes: {scopes}"\n'
+        "  exit 0\n"
+        "fi\n"
+        'case "$2" in\n'
+        f"  view) [ -f {pr_exists} ] || exit 1; "
+        "head=$(git rev-parse HEAD); "
+        'printf \'{"url":"https://github.com/x/y/pull/1",'
+        '"headRefOid":"%s","baseRefName":"main",'
+        '"state":"OPEN"}\\n\' "$head"; exit 0 ;;\n'
+        f"  create) touch {pr_exists}; "
+        "echo 'https://github.com/x/y/pull/1'; exit 0 ;;\n"
+        "esac\n"
+    )
+    gh.chmod(0o755)
+
+
+def test_workflow_scope_gate_refuses_before_lease_when_scope_missing(
+    repo, monkeypatch
+):
+    work, bin_, calls = repo
+    _with_path(bin_, monkeypatch)
+    _git(
+        work,
+        "remote",
+        "set-url",
+        "origin",
+        "git@github.com:voyn88/ai-command-center.git",
+    )
+    workflows = work / ".github" / "workflows"
+    workflows.mkdir(parents=True)
+    (workflows / "ci.yml").write_text("name: ci\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "add workflow")
+    _gh_with_auth_status(
+        bin_, calls, "gist, read:org, repo", work.parent / "pr.exists"
+    )
+
+    r = publish_run(work, _cfg(bin_))
+
+    assert not r.ok and r.reason == "workflow_scope_missing"
+    # Refused before a lease was ever taken -- no wasted push cycle.
+    assert not calls.exists() or " acquire " not in calls.read_text()
+
+
+def test_workflow_scope_gate_allows_when_scope_present(repo, monkeypatch):
+    work, bin_, calls = repo
+    _with_path(bin_, monkeypatch)
+    _git(
+        work,
+        "remote",
+        "set-url",
+        "origin",
+        "git@github.com:voyn88/ai-command-center.git",
+    )
+    workflows = work / ".github" / "workflows"
+    workflows.mkdir(parents=True)
+    (workflows / "ci.yml").write_text("name: ci\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "add workflow")
+    head = _git(work, "rev-parse", "HEAD").stdout.strip()
+    _gh_with_auth_status(
+        bin_, calls, "gist, read:org, repo, workflow", work.parent / "pr.exists"
+    )
+
+    import shutil
+
+    real_git = shutil.which("git")
+    git_shim = bin_ / "git"
+    git_shim.write_text(
+        f"#!/bin/sh\n"
+        f'echo "git $*" >> {calls}\n'
+        'case "$1" in\n'
+        f"  ls-remote) n=$(grep -c '^git ls-remote' {calls}); "
+        f'[ "$n" -gt 1 ] && echo "{head} refs/heads/backlog/VOYN-W0-TEST"; exit 0 ;;\n'
+        "  push) exit 0 ;;\n"
+        f'  *) exec {real_git} "$@" ;;\n'
+        "esac\n"
+    )
+    git_shim.chmod(0o755)
+
+    r = publish_run(work, _cfg(bin_))
+
+    assert r.ok, r.reason
+
+
+def test_workflow_scope_gate_skipped_when_push_target_is_not_oauth(
+    repo, monkeypatch
+):
+    """The gate only applies over gh's OAuth credential (`_https_push_target`
+    non-None). The `repo` fixture's origin is a plain local bare repo, so
+    `_https_push_target` returns None and the deploy-key fallback path is
+    used -- a workflow-touching diff must not be refused there even with a
+    scope-missing `gh auth status`, since there is no OAuth scope to check."""
+    work, bin_, calls = repo
+    _with_path(bin_, monkeypatch)
+    workflows = work / ".github" / "workflows"
+    workflows.mkdir(parents=True)
+    (workflows / "ci.yml").write_text("name: ci\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "add workflow")
+    _gh_with_auth_status(
+        bin_, calls, "gist, read:org, repo", work.parent / "pr.exists"
+    )
+
+    r = publish_run(work, _cfg(bin_))
+
+    assert r.ok, r.reason
+
+
+def test_classify_push_failure_distinguishes_workflow_scope_from_other_rejections(
+    repo, monkeypatch
+):
+    """Safety net for the case the preflight can't cover (unreadable scope
+    list, or a scope that changes between preflight and push): the same
+    `workflow_scope_missing` reason still surfaces from GitHub's own
+    rejection message, not a generic `push_failed`."""
+    work, bin_, calls = repo
+    _with_path(bin_, monkeypatch)
+    _git(
+        work,
+        "remote",
+        "set-url",
+        "origin",
+        "git@github.com:voyn88/ai-command-center.git",
+    )
+    workflows = work / ".github" / "workflows"
+    workflows.mkdir(parents=True)
+    (workflows / "ci.yml").write_text("name: ci\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "add workflow")
+    # gh auth status output is left unreadable (no "Token scopes" line) so
+    # the preflight gate fails open and the push itself is what refuses.
+    import shutil
+
+    real_git = shutil.which("git")
+    git_shim = bin_ / "git"
+    git_shim.write_text(
+        f"#!/bin/sh\n"
+        f'echo "git $*" >> {calls}\n'
+        'case "$1" in\n'
+        "  push) echo '! [remote rejected] HEAD -> backlog/VOYN-W0-TEST"
+        " (refusing to allow an OAuth App to create or update workflow"
+        " `.github/workflows/ci.yml` without `workflow` scope)' >&2; exit 1 ;;\n"
+        f'  *) exec {real_git} "$@" ;;\n'
+        "esac\n"
+    )
+    git_shim.chmod(0o755)
+
+    r = publish_run(work, _cfg(bin_))
+
+    assert not r.ok and r.reason == "workflow_scope_missing"
+
+
+def test_classify_push_failure_reasons():
+    assert (
+        _classify_push_failure(
+            "! [remote rejected] main -> b (refusing to allow an OAuth App"
+            " to create or update workflow `.github/workflows/ci.yml`"
+            " without `workflow` scope)"
+        )
+        == "workflow_scope_missing"
+    )
+    assert (
+        _classify_push_failure(
+            "! [rejected] b -> b (stale info)"
+        )
+        == "push_rejected_stale_lease"
+    )
+    assert (
+        _classify_push_failure("fatal: unable to access ...: Connection timed out")
+        == "push_network_failed"
+    )
+    assert _classify_push_failure("fatal: some other rejection").startswith(
+        "push_failed:"
+    )
+
+
+def test_diff_touches_github_workflows(tmp_path):
+    repo_path = tmp_path / "r"
+    subprocess.run(
+        ["git", "init", "-b", "main", str(repo_path)], check=True, capture_output=True
+    )
+    _git(repo_path, "config", "user.email", "t@t")
+    _git(repo_path, "config", "user.name", "t")
+    (repo_path / "a.txt").write_text("a\n")
+    _git(repo_path, "add", ".")
+    _git(repo_path, "commit", "-m", "base")
+    base = _git(repo_path, "rev-parse", "HEAD").stdout.strip()
+
+    (repo_path / "a.txt").write_text("b\n")
+    _git(repo_path, "add", ".")
+    _git(repo_path, "commit", "-m", "unrelated")
+    head_no_workflow = _git(repo_path, "rev-parse", "HEAD").stdout.strip()
+    assert _diff_touches_github_workflows(repo_path, base, head_no_workflow) is False
+
+    (repo_path / ".github" / "workflows").mkdir(parents=True)
+    (repo_path / ".github" / "workflows" / "ci.yml").write_text("name: ci\n")
+    _git(repo_path, "add", ".")
+    _git(repo_path, "commit", "-m", "workflow")
+    head_workflow = _git(repo_path, "rev-parse", "HEAD").stdout.strip()
+    assert _diff_touches_github_workflows(repo_path, base, head_workflow) is True
+
+    assert _diff_touches_github_workflows(repo_path, "not-a-sha", head_workflow) is None
+
+
+def test_gh_oauth_workflow_scope_missing(tmp_path, monkeypatch):
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
+    monkeypatch.setenv("PATH", f"{bin_}:{__import__('os').environ['PATH']}")
+
+    def _write_gh(output):
+        gh = bin_ / "gh"
+        gh.write_text(f"#!/bin/sh\necho '{output}'\n")
+        gh.chmod(0o755)
+
+    _write_gh("  - Token scopes: gist, read:org, repo")
+    assert _gh_oauth_workflow_scope_missing(tmp_path) is True
+
+    _write_gh("  - Token scopes: gist, read:org, repo, workflow")
+    assert _gh_oauth_workflow_scope_missing(tmp_path) is False
+
+    _write_gh("not a scopes line at all")
+    assert _gh_oauth_workflow_scope_missing(tmp_path) is None
