@@ -727,6 +727,63 @@ def test_run_claude_code_cancellation_kills_the_whole_process_group(
     )
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="process-group semantics are POSIX-specific"
+)
+def test_run_claude_code_cancellation_kills_a_grandchild_that_escaped_via_setsid(
+    monkeypatch, tmp_path, tmp_path_factory
+):
+    """VOYN-W0-AICC-SETSID-ORPHAN: `os.killpg` only reaches processes still in
+    the launch-time pgid. A grandchild that calls `os.setsid()` on itself —
+    what a sandbox wrapper started deeper in the tree can do internally —
+    leaves that pgid and would survive a plain `os.killpg` untouched. This
+    spawns a real grandchild that immediately escapes into its own session,
+    cancels the run, and asserts the grandchild is still dead — proof that
+    termination also reaches descendants `killpg` alone cannot see."""
+    pid_file = tmp_path_factory.mktemp("pidfile") / "child.pid"
+    script = (
+        "import subprocess, sys, time\n"
+        f"pid_file = {str(pid_file)!r}\n"
+        "child = subprocess.Popen(\n"
+        "    [sys.executable, '-c', 'import os, time; os.setsid(); time.sleep(60)']\n"
+        ")\n"
+        "open(pid_file, 'w').write(str(child.pid))\n"
+        "time.sleep(60)\n"
+    )
+    monkeypatch.setattr(
+        agent_runner,
+        "build_command",
+        lambda prompt, *, task_type, model=None, capability_override=None: [
+            sys.executable,
+            "-c",
+            script,
+        ],
+    )
+    cancel_event = threading.Event()
+
+    def _trigger_cancel_once_child_exists() -> None:
+        _wait_until(pid_file.exists, timeout=5.0)
+        cancel_event.set()
+
+    threading.Thread(target=_trigger_cancel_once_child_exists, daemon=True).start()
+
+    result = agent_runner.run_claude_code(
+        repository_path=tmp_path,
+        prompt="hello",
+        task_type="implementation",
+        timeout_seconds=300,
+        cancel_event=cancel_event,
+        termination_grace_seconds=10,
+    )
+    assert result.status == "cancelled"
+    assert pid_file.exists()
+    grandchild_pid = int(pid_file.read_text().strip())
+    assert _wait_until(lambda: not _pid_alive(grandchild_pid), timeout=5.0), (
+        f"grandchild pid {grandchild_pid} escaped its own session via "
+        "os.setsid() and survived process-group cancellation"
+    )
+
+
 # --------------------------------------------------------------------------
 # CLI preflight — the "is `claude` even installed?" probe every launch entry
 # point asks *before* it lets an operator confirm a launch (audit MINOR-2)
