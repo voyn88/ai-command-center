@@ -17,6 +17,8 @@ from command_center.db.mirror_support import (
     MIRROR_UNAVAILABLE,
     ColumnCodec,
     divergence,
+    mirror_failure_counts,
+    record_mirror_failure,
     render_authority_timestamp,
     to_instant,
 )
@@ -268,6 +270,70 @@ def test_reconciliation_accepts_a_generator_of_authority_rows() -> None:
     """The backfill streams; materialising the authority to reconcile it would
     put the table this migration exists to move into one process's memory."""
     assert divergence((_row(str(n)) for n in range(3)), _Mirror([]), COLUMNS) != []
+
+
+# --- observability of a rejected write (VOYN-W0-AICC-MIRROR-SILENT-DROP) ----
+
+
+def test_a_rejected_write_increments_the_tables_failure_count() -> None:
+    """The counter `mirror_failure_counts()` exists for: "is the dual-write
+    silently dropping rows right now", answerable without running
+    `divergence()` by hand."""
+    before = mirror_failure_counts().get("widget", 0)
+
+    record_mirror_failure("widget", {"id": "w1"}, ValueError("boom"))
+
+    assert mirror_failure_counts()["widget"] == before + 1
+
+
+def test_the_failure_count_is_kept_per_table() -> None:
+    """One table's rejected writes must not read as another's — a mirror that
+    is silently dropping `conflict` rows must not be masked by `owner_item`
+    writes succeeding."""
+    before_a = mirror_failure_counts().get("table-a", 0)
+    before_b = mirror_failure_counts().get("table-b", 0)
+
+    record_mirror_failure("table-a", {"id": "1"}, ValueError("boom"))
+
+    counts = mirror_failure_counts()
+    assert counts["table-a"] == before_a + 1
+    assert counts.get("table-b", 0) == before_b
+
+
+def test_a_rejected_write_logs_above_debug_with_the_rows_id(caplog: pytest.LogCaptureFixture) -> None:
+    """`DEBUG` is where this lived before this ticket, and nothing ships a
+    `DEBUG` log to an operator by default. The row's id must be in the line —
+    a log that names only the table tells nobody which row to look at."""
+    with caplog.at_level("WARNING"):
+        record_mirror_failure("widget", {"id": "w-42"}, ValueError("boom"))
+
+    assert caplog.records, "a rejected mirror write must log above DEBUG"
+    message = caplog.records[-1].getMessage()
+    assert caplog.records[-1].levelname == "WARNING"
+    assert "w-42" in message
+    assert "widget" in message
+
+
+def test_a_composite_key_table_still_logs_an_identifying_value(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """`provider_attempt` has no `id` column; it is keyed by `(run_id,
+    attempt_number)`. The fallback in `_row_identity` must still surface
+    something an operator can find the row from."""
+    with caplog.at_level("WARNING"):
+        record_mirror_failure(
+            "run_provider_route", {"run_id": "r1", "attempt_number": 2}, ValueError("boom")
+        )
+
+    message = caplog.records[-1].getMessage()
+    assert "r1" in message and "2" in message
+
+
+def test_recording_a_failure_never_raises_given_a_bare_identifier() -> None:
+    """Called from inside the `except` block it is reporting; a hook with no
+    whole record (a deletion by id or by day) calls this with the bare value,
+    and a check that can break the write it is checking is worse than none."""
+    record_mirror_failure("digest_item", "2026-08-13", ValueError("boom"))  # must not raise
 
 
 def test_importing_the_shared_machinery_needs_no_postgresql_client() -> None:

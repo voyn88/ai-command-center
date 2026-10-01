@@ -357,6 +357,49 @@ def test_a_mirror_failure_cannot_break_the_authoritative_write(tmp_path, monkeyp
     assert updated["owner"] == "ops"
 
 
+def test_a_row_the_target_schema_rejects_is_observed_not_silently_dropped(
+    monkeypatch, caplog
+) -> None:
+    """The acceptance case for `VOYN-W0-AICC-MIRROR-SILENT-DROP`.
+
+    No write path can produce this record today: every mirrored timestamp
+    column is sourced from `db.iso_now()`, which never emits `""` (pinned by
+    `test_an_empty_timestamp_is_not_parsed` in `test_mirror_support.py`). This
+    drives `_mirror_conflict` directly with one anyway, standing in for the
+    day some column is sourced another way — independent review demonstrated
+    the concrete failure this guards against: PostgreSQL raises
+    `InvalidDatetimeFormat` for `resolved_at=""` against a `timestamptz`
+    column, and the bare `except Exception` swallowed it with nothing above
+    `DEBUG` to show for it.
+
+    The fix under test is not a parse rule — `ColumnCodec` deliberately leaves
+    `""` untouched rather than guessing at a case no writer produces — it is
+    that a rejection now increments a counter and logs above `DEBUG` naming
+    the row, instead of vanishing until someone runs `divergence()` by hand.
+    """
+    from command_center.db import conflict_store
+    from command_center.db.mirror_support import mirror_failure_counts
+
+    class RejectsEmptyTimestamp:
+        def upsert(self, record: dict) -> None:
+            if record.get("resolved_at") == "":
+                raise ValueError('invalid input syntax for type timestamp with time zone: ""')
+
+    monkeypatch.setattr(conflict_store, "PostgresConflictMirror", lambda: RejectsEmptyTimestamp())
+
+    before = mirror_failure_counts().get("conflict", 0)
+    record = _row("rejected", status="resolved", resolved_at="")
+
+    with caplog.at_level("WARNING"):
+        conflict_db._mirror_conflict(record)  # must not raise — see the invariant test above
+
+    assert mirror_failure_counts()["conflict"] == before + 1
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert any("rejected" in r.getMessage() for r in warnings), (
+        "the row's id must be in the log line, not just the table name"
+    )
+
+
 def test_every_write_path_mirrors_the_committed_row(tmp_path, monkeypatch) -> None:
     """Ordering and coverage in one, because both failures look identical from
     outside: a mirror that disagrees with the authority.

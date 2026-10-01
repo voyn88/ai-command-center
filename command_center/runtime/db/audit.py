@@ -33,16 +33,14 @@ do for the other table-family modules.
 from __future__ import annotations
 
 import json
-import logging
 import sqlite3
 from pathlib import Path
 from typing import Any, Iterable
 
 import command_center.runtime.db as db  # facade (late-bound; see docstring)
+from command_center.db.mirror_support import record_mirror_failure
 
 from command_center.runtime.db.wave1 import _exclude_projects_clause
-
-_LOG = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------
 # Allowlists (mirror ``api.models`` Literals; validated at the boundary)
@@ -170,8 +168,8 @@ def _mirror_audit_run(record: dict) -> None:
         from command_center.db.audit_store import PostgresAuditRunMirror
 
         PostgresAuditRunMirror().upsert(record)
-    except Exception:  # noqa: BLE001 - the mirror must never break the real write
-        _LOG.debug("Could not mirror audit_run into PostgreSQL", exc_info=True)
+    except Exception as exc:  # noqa: BLE001 - the mirror must never break the real write
+        record_mirror_failure("audit_run", record, exc)
 
 
 def _mirror_audit_finding(record: dict) -> None:
@@ -180,8 +178,8 @@ def _mirror_audit_finding(record: dict) -> None:
         from command_center.db.audit_store import PostgresAuditFindingMirror
 
         PostgresAuditFindingMirror().upsert(record)
-    except Exception:  # noqa: BLE001 - the mirror must never break the real write
-        _LOG.debug("Could not mirror audit_finding into PostgreSQL", exc_info=True)
+    except Exception as exc:  # noqa: BLE001 - the mirror must never break the real write
+        record_mirror_failure("audit_finding", record, exc)
 
 
 
