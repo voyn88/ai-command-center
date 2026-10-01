@@ -426,6 +426,149 @@ def test_ingest_a_clean_run_with_sha_but_no_pr_still_returns_to_pool(rig) -> Non
     assert task["status"] == "OPEN"
 
 
+def test_ingest_keeps_the_lease_a_sibling_task_in_the_same_repo_still_needs(rig) -> None:
+    """VOYN-W0-AICC-AUDIT-ROLLBACK-CLASS-REM, high-severity finding on PR
+    #442: the repo lease is repo-scoped, not task-scoped --
+    `backlog_lease_acquire` renews rather than duplicates when the SAME
+    planner already holds `repo:X`, so two tasks the planner dispatched into
+    the SAME repo share ONE lease row (`backlog_dispatch`'s own WIP-limit
+    query counts LEASES, not tasks, for exactly this reason -- see
+    `test_one_writer_per_repository_across_planners`). A prior fix released
+    that lease unconditionally at the end of every ingested task's iteration;
+    proven only against an otherwise-idle repository, it strips the lease
+    out from under a sibling task still running in the SAME repo and hands
+    the checkout to a second writer -- the exact outcome the lease exists to
+    prevent."""
+    app_factory, store, worker = rig
+    assert store.upsert_task(_task("VOYN-W0-SA", repo="repo-shared"))[0]
+    assert store.upsert_task(_task("VOYN-W0-SB", repo="repo-shared"))[0]
+    assert _dispatch(
+        app_factory, "VOYN-W0-SA", planner="planner-t",
+        payload={"kind": "agent_run", "marker": "SA"},
+    )[0]
+    assert _dispatch(
+        app_factory, "VOYN-W0-SB", planner="planner-t",
+        payload={"kind": "agent_run", "marker": "SB"},
+    )[0]
+
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) FROM backlog_writer_lease WHERE authority = %s",
+                ("repo:repo-shared",),
+            )
+            assert cur.fetchone()[0] == 1, "one lease shared by both tasks"
+
+    claimed = {}
+    for _ in range(2):
+        c = worker.claim("execution", visibility_seconds=60)
+        assert isinstance(c, ClaimedWork), c
+        claimed[c.payload["marker"]] = c
+
+    # SA's run finishes badly (dead-lettered); SB's is still in flight -- no
+    # terminal work item, so it never enters the ingest loop at all.
+    assert worker.fail(claimed["SA"], reason="synthetic failure", retryable=False)
+
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM backlog_ingest_results(%s)", ("planner-t",))
+            rows = cur.fetchall()
+    assert [(r[0], r[2]) for r in rows] == [("VOYN-W0-SA", "returned_to_pool")]
+
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT owner FROM backlog_writer_lease WHERE authority = %s",
+                ("repo:repo-shared",),
+            )
+            row = cur.fetchone()
+            assert row is not None, "SA's ingest released the lease SB still needs"
+            assert row[0] == "planner-t"
+
+    # The shared lease must still refuse a second writer while SB runs.
+    ok, reason, *_ = _dispatch(app_factory, "VOYN-W0-SA", planner="planner-other")
+    assert not ok and reason == "repo_busy", (
+        "a second planner could take the repo while SB was still running", reason,
+    )
+
+
+def test_a_wedged_gate_row_is_refused_per_row_and_keeps_its_audit(rig) -> None:
+    """VOYN-W0-AICC-AUDIT-ROLLBACK-CLASS, the original episode. A `kind =
+    'gate'` record is reachable straight through the importer
+    (`backlog_upsert_task` may set any status directly) and can land
+    IN_PROGRESS with a terminal work item -- `backlog_transition` correctly
+    refuses moving it to READY_TO_REVIEW (`gate_is_control_record`), but
+    before 0017 that refusal RAISED, aborting the WHOLE ingest transaction:
+    every healthy task's ingest in the same tick rolled back with it, tick
+    after tick, because the poisoned row is still there on the next pass.
+    Refusing PER ROW means a sibling healthy task in the SAME call still
+    advances, and the refusal itself leaves an audit row instead of erasing
+    itself."""
+    app_factory, store, worker = rig
+    assert store.upsert_task(_task(
+        "VOYN-W0-GATE", kind="gate", repo="repo-shared", status="IN_PROGRESS",
+    ))[0]
+    assert store.upsert_task(_task("VOYN-W0-HEALTHY", repo="repo-in"))[0]
+
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT queue_enqueue('execution', %s, %s::jsonb, %s, %s)",
+                ("gate-wedge", json.dumps({"marker": "GATE"}),
+                 "VOYN-W0-GATE", "repo-shared"),
+            )
+    assert _dispatch(
+        app_factory, "VOYN-W0-HEALTHY", planner="planner-t",
+        payload={"kind": "agent_run", "marker": "HEALTHY"},
+    )[0]
+
+    claimed = {}
+    for _ in range(2):
+        c = worker.claim("execution", visibility_seconds=60)
+        assert isinstance(c, ClaimedWork), c
+        claimed[c.payload["marker"]] = c
+
+    assert worker.complete(claimed["GATE"], {
+        "status": "completed",
+        "pr_url": "https://github.com/o/r/pull/9",
+        "head_sha": "deadbeef",
+    })
+    assert worker.complete(claimed["HEALTHY"], {
+        "status": "completed",
+        "pr_url": "https://github.com/o/r/pull/10",
+        "head_sha": "cafef00d",
+    })
+
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM backlog_ingest_results(%s)", ("planner-t",))
+            rows = cur.fetchall()
+    by_task = {r[0]: (r[2], r[3]) for r in rows}
+
+    assert by_task["VOYN-W0-HEALTHY"][0] == "ready_to_review", by_task
+    assert store.get_task("VOYN-W0-HEALTHY")["status"] == "READY_TO_REVIEW", (
+        "the gate's refusal must not roll back the healthy task's ingest"
+    )
+
+    action, detail = by_task["VOYN-W0-GATE"]
+    assert action == "ingest_refused"
+    assert detail["refused"] == "gate_is_control_record"
+    assert detail["at"] == "transition_refused"
+
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT outcome, reason FROM backlog_event "
+                "WHERE task_id = %s AND event = 'ingest' "
+                "ORDER BY event_id DESC LIMIT 1",
+                ("VOYN-W0-GATE",),
+            )
+            outcome, reason = cur.fetchone()
+    assert (outcome, reason) == ("rejected", "transition_refused"), (
+        "the refusal must survive as an audit row, not roll itself back"
+    )
+
+
 def test_ingest_queue_succeeded_but_task_failed_returns_to_pool_not_review(rig) -> None:
     """The queue's `succeeded` means only "this attempt is terminal, do not
     redeliver it" (worker/handlers.py: redelivering an already-executed
