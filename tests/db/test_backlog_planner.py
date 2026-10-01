@@ -219,6 +219,77 @@ def test_wip_limit_is_enforced_in_the_database(rig) -> None:
     assert not ok and reason == "wip_exhausted"
 
 
+def test_backlog_eligible_orders_by_created_at_before_insert_seq(rig, admin_conn) -> None:
+    """VOYN-W0-AICC-INSERT-SEQ-RETRY-REM, adversarial review of PR #441:
+    `insert_seq` must be a tiebreaker APPENDED after `created_at`, never a
+    replacement for it. Insert three same-wave/priority tasks in REVERSE
+    timestamp order, so insertion order (and therefore insert_seq) actively
+    disagrees with created_at. If insert_seq ever outranked created_at, the
+    view would come back ORD1, ORD2, ORD3 -- the insertion order -- instead
+    of honoring the timestamps."""
+    app_factory, store, _worker = rig
+    assert store.upsert_task(_task("VOYN-W0-ORD1"))[0]
+    assert store.upsert_task(_task("VOYN-W0-ORD2"))[0]
+    assert store.upsert_task(_task("VOYN-W0-ORD3"))[0]
+
+    # created_at is admin-owned data (no app-role DML path exists for it);
+    # backdating it directly is how this test disentangles insertion order
+    # from timestamp order.
+    with admin_conn.cursor() as cur:
+        # ORD1 was inserted first (lowest insert_seq) but stamped with the
+        # LATEST created_at; ORD3 was inserted last (highest insert_seq)
+        # but stamped with the EARLIEST.
+        cur.execute(
+            "UPDATE backlog_task SET created_at = %s WHERE task_id = %s",
+            ("2026-01-03T00:00:00+00", "VOYN-W0-ORD1"),
+        )
+        cur.execute(
+            "UPDATE backlog_task SET created_at = %s WHERE task_id = %s",
+            ("2026-01-02T00:00:00+00", "VOYN-W0-ORD2"),
+        )
+        cur.execute(
+            "UPDATE backlog_task SET created_at = %s WHERE task_id = %s",
+            ("2026-01-01T00:00:00+00", "VOYN-W0-ORD3"),
+        )
+
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT task_id FROM backlog_eligible")
+            order = [
+                row[0]
+                for row in cur.fetchall()
+                if row[0] in ("VOYN-W0-ORD1", "VOYN-W0-ORD2", "VOYN-W0-ORD3")
+            ]
+            assert order == ["VOYN-W0-ORD3", "VOYN-W0-ORD2", "VOYN-W0-ORD1"]
+
+
+def test_backlog_eligible_insert_seq_breaks_equal_timestamp_ties(rig, admin_conn) -> None:
+    """With created_at tied (an importer batch landing inside one tick),
+    insert_seq must break the tie in true insertion order -- the whole point
+    of adding it as a tiebreaker."""
+    app_factory, store, _worker = rig
+    assert store.upsert_task(_task("VOYN-W0-TIE1"))[0]
+    assert store.upsert_task(_task("VOYN-W0-TIE2"))[0]
+    assert store.upsert_task(_task("VOYN-W0-TIE3"))[0]
+
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "UPDATE backlog_task SET created_at = %s "
+            "WHERE task_id IN ('VOYN-W0-TIE1', 'VOYN-W0-TIE2', 'VOYN-W0-TIE3')",
+            ("2026-01-01T00:00:00+00",),
+        )
+
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT task_id FROM backlog_eligible")
+            order = [
+                row[0]
+                for row in cur.fetchall()
+                if row[0] in ("VOYN-W0-TIE1", "VOYN-W0-TIE2", "VOYN-W0-TIE3")
+            ]
+            assert order == ["VOYN-W0-TIE1", "VOYN-W0-TIE2", "VOYN-W0-TIE3"]
+
+
 def test_the_wave_gate_yields_exactly_when_the_earlier_wave_is_spent(rig) -> None:
     """Approved decision 1, both directions: refused while the earliest
     numeric wave has a dispatchable candidate; admitted the moment it has
@@ -544,6 +615,37 @@ def test_migration_0009_is_reversible_without_residue(pg_connection_factory) -> 
                 "SELECT prosrc FROM pg_proc WHERE proname = 'backlog_ingest_results'"
             )
             assert "v_task_status" in cur.fetchone()[0]
+
+
+def test_migration_0017_is_reversible_without_residue(pg_connection_factory) -> None:
+    """Live up->down->up pins insert_seq to migration 0017: downgrading to
+    0016 must drop the column and restore the created_at-only ordering, the
+    second upgrade must reapply both."""
+    from command_center.db import migrations
+
+    with pg_connection_factory() as conn:
+        migrations.upgrade(conn)
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_get_viewdef('backlog_eligible')")
+            assert "insert_seq" in cur.fetchone()[0]
+        migrations.downgrade(conn, target=16)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) FROM information_schema.columns "
+                "WHERE table_name = 'backlog_task' AND column_name = 'insert_seq'"
+            )
+            assert cur.fetchone()[0] == 0
+            cur.execute("SELECT pg_get_viewdef('backlog_eligible')")
+            assert "insert_seq" not in cur.fetchone()[0]
+        migrations.upgrade(conn)  # must not raise 'already exists'
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) FROM information_schema.columns "
+                "WHERE table_name = 'backlog_task' AND column_name = 'insert_seq'"
+            )
+            assert cur.fetchone()[0] == 1
+            cur.execute("SELECT pg_get_viewdef('backlog_eligible')")
+            assert "insert_seq" in cur.fetchone()[0]
 
 
 def test_second_cascade_exhaustion_parks_for_the_owner(rig) -> None:
