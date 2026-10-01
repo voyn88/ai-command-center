@@ -9,8 +9,16 @@ installed client rejects the snapshot wholesale.
 from __future__ import annotations
 
 import json
+import logging
 
-from native_gateway.redaction import REDACTED, find_violation, sanitize_tree
+from native_gateway.redaction import (
+    REDACTED,
+    REPO_ROOT,
+    PathRedactingFilter,
+    find_violation,
+    relativize_filepaths,
+    sanitize_tree,
+)
 
 from .conftest import auth_headers, fresh_sample
 
@@ -97,3 +105,37 @@ def test_clean_content_is_not_redacted(client, device_token):
     body = response.json()
     assert body["tasks"][0]["title"] == "Example delivery"
     assert body["events"][0]["summary"] == "PR #42 opened"
+
+
+def test_relativize_filepaths_rewrites_repo_paths_to_relative():
+    in_repo = REPO_ROOT / "native_gateway" / "projection_producer.py"
+    text = f'File "{in_repo}", line 312, in build_projection'
+    out = relativize_filepaths(text)
+    assert str(in_repo) not in out
+    assert "native_gateway/projection_producer.py" in out
+
+
+def test_relativize_filepaths_redacts_paths_outside_the_repo():
+    text = 'File "/home/someone/.venv/lib/python3.12/site-packages/x.py", line 1'
+    out = relativize_filepaths(text)
+    assert "/home/someone" not in out
+    assert REDACTED in out
+
+
+def test_path_redacting_filter_scrubs_pathname_message_and_traceback(caplog):
+    logger = logging.getLogger("native_gateway.redaction.test")
+    logger.addFilter(PathRedactingFilter())
+    db_path = REPO_ROOT.parent / "outside-repo" / "runtime.db"
+
+    with caplog.at_level(logging.WARNING, logger=logger.name):
+        try:
+            raise RuntimeError("schema mismatch")
+        except RuntimeError:
+            logger.warning("Run journal unavailable (db=%s)", db_path, exc_info=True)
+
+    assert len(caplog.records) == 1
+    record = caplog.records[0]
+    assert str(db_path) not in record.getMessage()
+    assert REDACTED in record.getMessage()
+    assert not record.pathname.startswith("/")
+    assert record.exc_info is not None
