@@ -1015,7 +1015,31 @@ def apply_table_grants(conn, schema: str = "public") -> int:
     upgrade) re-asserts the matrix for what exists instead of erroring on
     what does not; the #321 compliance checker is the guard against a LIVE
     object missing its declared grant.
+
+    `render_table_grants()` grants `schema_migration` (startup compatibility
+    check) — a table this module does not create.
+    `migrations.upgrade()` does create it, via `ensure_ledger()`, but only
+    when a caller runs migrations through that entry point; a database
+    provisioned by executing the `.up.sql` files directly (a restore, a
+    hand-rolled bootstrap script) never gets it, and the probe below then
+    finds nothing to grant, silently dropping the row from the matrix instead
+    of erroring. `ensure_ledger()` is therefore called here too, so this
+    function alone is sufficient to make the grant matrix match reality
+    regardless of how the schema was built.
     """
+    _require_identifier(schema)
+    from command_center.db import migrations
+
+    with conn.transaction():
+        with conn.cursor() as cur:
+            # `ensure_ledger()` creates an *unqualified* `schema_migration`,
+            # so it lands wherever `search_path` resolves it — normally
+            # "public". Scope that resolution to the schema this call was
+            # asked to grant, with `SET LOCAL` so the change is confined to
+            # this transaction and never leaks onto later statements on this
+            # connection for a different schema.
+            cur.execute(f"SET LOCAL search_path TO {schema}")
+            migrations.ensure_ledger(conn)
     with conn.cursor() as cur:
         cur.execute(
             "SELECT c.relname FROM pg_class c JOIN pg_namespace n "
