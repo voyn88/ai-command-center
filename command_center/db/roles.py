@@ -120,6 +120,7 @@ ALL_TABLES: tuple[str, ...] = (
     "audit_finding",
     "audit_run",
     "backlog_dependency",
+    "backlog_duplicate",
     "backlog_event",
     "backlog_evidence",
     "backlog_task",
@@ -303,6 +304,7 @@ _MONITOR_FINDING_TABLES: dict[str, frozenset[str]] = {
 _APP_BACKLOG_TABLES: dict[str, frozenset[str]] = {
     "backlog_task": _READ,
     "backlog_dependency": _READ,
+    "backlog_duplicate": _READ,
     "backlog_evidence": _READ,
     "backlog_event": _READ,
     "backlog_writer_lease": _READ,
@@ -313,6 +315,7 @@ _APP_BACKLOG_TABLES: dict[str, frozenset[str]] = {
 _WORKER_BACKLOG_TABLES: dict[str, frozenset[str]] = {
     "backlog_task": _NONE,
     "backlog_dependency": _NONE,
+    "backlog_duplicate": _NONE,
     "backlog_evidence": _NONE,
     "backlog_event": _NONE,
     "backlog_writer_lease": _NONE,
@@ -583,6 +586,13 @@ _APP_BACKLOG_FUNCTIONS = (
     "backlog_scan_claim(text, text, text)",
     # Triage of raw findings (0008): UNTRIAGED -> OPEN/NEEDS_REFINEMENT/DONE/DECIDED.
     "backlog_triage(text, text, text)",
+    # The same decision one state over (0025): OPEN -> DECIDED for a task a
+    # dedup scan proved is a duplicate, with the canonical task recorded as a
+    # foreign key. `backlog_triage` reaches 'duplicate' only from UNTRIAGED,
+    # so without this an OPEN duplicate had no exit at all; the mandatory,
+    # existing canonical is the gate, so granting this does not grant a
+    # generic OPEN -> DECIDED.
+    "backlog_mark_duplicate(text, text, text)",
     # 0021: read-only deploy preflight with dispatch's privileges; the task
     # class setter the planner uses for split children and monitor tasks; the
     # monitor-finding record/clear pair (shared with worker hosts, see
