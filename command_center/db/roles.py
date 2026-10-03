@@ -595,6 +595,13 @@ _APP_BACKLOG_FUNCTIONS = (
     # Audit trail for where a record came from (0020); the importer's stamp
     # that a row was migrated rather than authored directly in the store.
     "backlog_record_provenance(text, text, jsonb)",
+    # 0025: declare the authority a task needs beyond an unprivileged
+    # workspace. Granted to the control plane because the OWNER path matters
+    # as much as the discovered one -- marking a task "this needs root"
+    # before it is ever dispatched is what makes the block cost zero model
+    # calls. The closed vocabulary inside the function is the gate, so
+    # granting it does not grant arbitrary task mutation.
+    "backlog_declare_required_authority(text, text[])",
 )
 
 # The enrolment surface (0003), split by who may do what.
