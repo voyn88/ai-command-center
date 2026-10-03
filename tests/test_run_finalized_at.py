@@ -54,6 +54,15 @@ PROBE = Path(__file__).parent / "fixtures" / "finalization_kill_probe.py"
 WIDEN_SECONDS = 2.0
 
 
+def _migrations_through(migrations, version: int) -> list:
+    """Every migration up to and including `version`, by version number rather
+    than by list position — `MIGRATIONS[:-1]` meant "stop at v24" only while
+    v25 was the last entry, and silently meant "stop at v25" once v26 landed.
+    See the twin in `tests/test_runtime_db.py`.
+    """
+    return [migration for migration in migrations if migration[0] <= version]
+
+
 def _run_probe(repo: Path, *, widen: float, poll: float) -> subprocess.CompletedProcess:
     """One supervised run in its own process, killed the moment it goes terminal."""
     root = Path(__file__).resolve().parents[1]
@@ -753,7 +762,7 @@ def test_fork_drops_parent_authority_and_requires_fresh_child_supervisor(
     cold_db_path = tmp_path / "cold-v24.db"
     current_migrations = list(db.MIGRATIONS)
     with monkeypatch.context() as pre_claim:
-        pre_claim.setattr(db, "MIGRATIONS", current_migrations[:-1])
+        pre_claim.setattr(db, "MIGRATIONS", _migrations_through(current_migrations, 24))
         pre_claim.setattr(db, "SCHEMA_VERSION", 24)
         db.migrate(cold_db_path)
     context = multiprocessing.get_context("fork")
