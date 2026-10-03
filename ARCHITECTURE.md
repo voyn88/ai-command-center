@@ -41,9 +41,14 @@ flowchart LR
     Streamlit -. "D1 shell shipped; wiring & packaging planned" .-> Desktop["Native PySide6 client"]
 ```
 
-Streamlit itself serves HTTP and WebSocket traffic. **The application has no authentication layer**
-yet performs privileged git/gh and subprocess operations, so every launch path is constrained to
-keep it off-host unless the operator deliberately opts out:
+Streamlit itself serves HTTP and WebSocket traffic and performs privileged git/gh and subprocess
+operations. Since `VOYN-W0-AICC-CONSOLE-NO-AUTH` the console is **authenticated**: every run is
+blocked behind a signed-in platform identity by `command_center/ui/console_identity.py`, which
+reuses the same identity authority (`command_center/http_auth/identity.py`) and grant map
+(`command_center/http_auth/authz.py`) as the mutating HTTP surface rather than introducing a second
+one. The network-exposure controls below are **not** superseded by that — they are the layer that
+keeps an unauthenticated stranger from reaching the login screen at all, and every launch path is
+still constrained to keep the console off-host unless the operator deliberately opts out:
 
 | Launch path | Control |
 |---|---|
@@ -53,8 +58,9 @@ keep it off-host unless the operator deliberately opts out:
 | `docker compose` | the port is published on `${AML_BIND_HOST:-127.0.0.1}` |
 
 `tests/test_deployment_exposure.py` is the gate for all four. Not being exposed is not the same as
-being authenticated: HTTP authentication is a separate, still-open piece of work, so widening any of
-these controls means putting an unauthenticated privileged console on the network.
+being authenticated, and the two controls are deliberately independent: widening any of these
+controls puts the console's login screen — and the privileged operations behind it — on the
+network, where only the identity gate stands between a stranger and a subprocess launch.
 
 ## 2. UI and service boundaries
 
@@ -62,7 +68,10 @@ these controls means putting an unauthenticated privileged console on the networ
 
 `app.py` is a direct Streamlit script and is re-executed top to bottom on interactions. It:
 
-- configures the page and sidebar;
+- blocks the whole run behind `console_identity.require_identity`, before any data is loaded;
+- configures the page and sidebar (page config is owned by that gate, since Streamlit requires
+  `st.set_page_config` to be the first Streamlit command of a run and both the login screen and the
+  authenticated app need it);
 - applies staged cross-page navigation;
 - loads planning tasks;
 - caches one `ExecutionCenterAPI` and process-local Supervisor per Streamlit server process;
