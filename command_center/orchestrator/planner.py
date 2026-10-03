@@ -22,12 +22,22 @@ import json
 import os
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
+from command_center import git_info
 from command_center.orchestrator.routing import cascade_for
 from command_center.worker.payloads import AGENT_RUN_SCHEMA_VERSION
 
-__all__ = ["PlanLimits", "PlanReport", "plan_once"]
+__all__ = [
+    "MergedAuthority",
+    "PlanLimits",
+    "PlanReport",
+    "acceptance_symbols",
+    "merged_authority",
+    "plan_once",
+    "remediation_parent",
+]
 
 _PLANNER_AUTHORITY = "planner:global"
 
@@ -100,6 +110,18 @@ class PlanReport:
     idle_trickle: bool = False
     #: Functional candidates held back by the fence this tick (count only).
     fenced: int = 0
+    #: (task, evidence) remediation candidates the reuse gate closed as
+    #: superseded instead of dispatching, because the parent's acceptance was
+    #: already satisfied on main (VOYN-W0-AICC-DISPATCH-REUSE-GATE).
+    superseded: list[tuple[str, str]] = field(default_factory=list)
+
+    @property
+    def prevented_duplicate_dispatches(self) -> int:
+        """The gate's telemetry: how many duplicate dispatches this tick did
+        not make. Derived rather than counted separately so the number and
+        the evidence behind it cannot drift apart; the durable count across
+        ticks is the `close_superseded` granted event in `backlog_event`."""
+        return len(self.superseded)
 
 
 # Repo → (canonical project_id, worker-host repository path). The worker's
@@ -161,6 +183,306 @@ _SPLIT_INSTRUCTIONS = (
     "Suffixes are uppercase [A-Z0-9-], unique, 2-40 chars; the orchestrator creates "
     "<this task id>-<suffix> for each entry and closes this task as SPLIT."
 )
+
+
+# --- the pre-dispatch reuse gate (VOYN-W0-AICC-DISPATCH-REUSE-GATE) --------
+#
+# Live case, 2026-09-06: a `-REM` task's run re-implemented
+# `checkpoint_dirty_task_workspace`, a function PR 624 had already merged to
+# main. The colliding signatures made the merged result fail CI with
+# TypeErrors -- a whole run, a whole review and a red main, spent producing
+# something that already existed. The planner could not have known: its
+# candidate query asks what is ELIGIBLE, never what is already DONE ON MAIN.
+#
+# The gate below is that missing question, asked once per remediation
+# candidate, immediately before dispatch. It reads the default branch of the
+# control host's own checkout and closes the task as superseded (with the
+# merged pull request and sha as evidence, `backlog_close_superseded`, 0025)
+# only when it can point at the merged authority. Everything else -- a repo
+# it cannot read, a stale checkout, an ambiguous body, a commit with no pull
+# request number -- abstains and dispatches exactly as before: the gate may
+# only ever prevent provable duplicates, never withhold real work on a guess.
+
+#: Suffixes for "another attempt at an earlier task": `-REM` is what
+#: `review_merge._remediate_rejection` appends, `-RETRY` is the backlog
+#: file's own convention for a hand-written follow-up.
+_REMEDIATION_SUFFIXES = ("-REM", "-RETRY")
+
+#: Symbols an acceptance criterion names, in backticks: lower snake_case with
+#: at least one underscore (`checkpoint_dirty_task_workspace`), which is
+#: specific enough to be a claim about the code rather than an English word.
+_ACCEPTANCE_SYMBOL = re.compile(r"`([a-z_][a-z0-9_]*_[a-z0-9_]+)`")
+
+#: More named symbols than this and the body is describing a landscape, not a
+#: deliverable: the gate abstains rather than guess which ones it must find.
+_MAX_ACCEPTANCE_SYMBOLS = 5
+
+#: `Title of the change (#624)` -- the squash-merge subject GitHub writes.
+#: The number is what makes a commit citable as the merged PULL REQUEST the
+#: acceptance criterion asks for, so a subject without one is not evidence.
+_MERGED_PR_NUMBER = re.compile(r"\(#(\d+)\)")
+
+_ORIGIN_OWNER_REPO = re.compile(
+    r"^(?:https://github\.com/|git@github\.com:)(?P<owner>[^/]+)/(?P<repo>[^/.]+)"
+)
+
+#: The refs a checkout may know the default branch by, most authoritative
+#: first. A checkout that knows none of them is not readable evidence.
+_DEFAULT_BRANCH_REFS = (
+    "refs/remotes/origin/HEAD",
+    "refs/remotes/origin/main",
+    "refs/heads/main",
+)
+
+#: History reads walk the whole log; they get their own budget rather than
+#: `git_info.run_git_command`'s 5 s status-read default.
+_HISTORY_TIMEOUT = 30
+
+
+@dataclass(frozen=True, slots=True)
+class MergedAuthority:
+    """Evidence, read off the default branch, that a parent task's acceptance
+    is already satisfied there — and therefore that dispatching its
+    remediation would re-implement merged work."""
+
+    parent_task_id: str
+    #: The merge commit on the default branch that carries the authority.
+    commit: str
+    subject: str
+    pr_url: str
+    #: Which signal found it: `commit_title` or `symbols`.
+    signal: str
+    #: The symbols the parent named, when the signal is `symbols`.
+    symbols: tuple[str, ...] = ()
+
+    @property
+    def summary(self) -> str:
+        """One line for the audit, the report and the operator."""
+        found = f" [{', '.join(self.symbols)}]" if self.symbols else ""
+        return (
+            f"{self.signal}: {self.parent_task_id} is already on main as "
+            f"{self.commit[:12]} ({self.subject}){found}"
+        )
+
+
+def remediation_parent(task_id: str, linked_parent: str | None = None) -> str | None:
+    """The task this one is another attempt at, or None if it is not one.
+
+    The recorded lineage (`backlog_task_remediation`, written only by
+    `backlog_record_remediation`) wins when it exists; the suffix convention
+    covers the follow-ups that were written into the backlog file by hand and
+    so have no lineage row. `backlog_close_superseded` re-derives exactly
+    this relationship from the same two sources, so the planner cannot talk
+    the store into closing a task the store does not agree is a remediation.
+    """
+    if linked_parent:
+        return linked_parent
+    for suffix in _REMEDIATION_SUFFIXES:
+        if task_id.endswith(suffix) and len(task_id) > len(suffix):
+            return task_id[: -len(suffix)]
+    return None
+
+
+def acceptance_symbols(title: str, body: str) -> tuple[str, ...]:
+    """The symbols a task's acceptance criteria name, in first-seen order.
+
+    Empty when the task names none, or names so many (`> _MAX_ACCEPTANCE_
+    SYMBOLS`) that "all of them are present" stops being a statement about
+    this task's deliverable — both cases make the symbol signal abstain.
+    """
+    seen: list[str] = []
+    for match in _ACCEPTANCE_SYMBOL.finditer(f"{title}\n{body}"):
+        symbol = match.group(1)
+        if symbol not in seen:
+            seen.append(symbol)
+    if not seen or len(seen) > _MAX_ACCEPTANCE_SYMBOLS:
+        return ()
+    return tuple(seen)
+
+
+def _git(repo: Path, args: list[str], timeout: int = 5) -> str | None:
+    """Read-only git through the one shared subprocess primitive; None when
+    the command failed, timed out, or the directory is not a repository."""
+    proc = git_info.run_git_command(repo, args, timeout=timeout)
+    if proc is None or proc.returncode != 0:
+        return None
+    return proc.stdout or ""
+
+
+def repository_name(repo: Path) -> str | None:
+    """The `origin` repository's own name, e.g. `ai-command-center`."""
+    url = _git(repo, ["remote", "get-url", "origin"])
+    if not url:
+        return None
+    match = _ORIGIN_OWNER_REPO.match(url.strip())
+    return match.group("repo") if match else None
+
+
+def _origin_pull_url(repo: Path, number: str) -> str | None:
+    url = _git(repo, ["remote", "get-url", "origin"])
+    if not url:
+        return None
+    match = _ORIGIN_OWNER_REPO.match(url.strip())
+    if not match:
+        return None
+    return f"https://github.com/{match.group('owner')}/{match.group('repo')}/pull/{number}"
+
+
+def default_branch_ref(repo: Path) -> str | None:
+    """The ref this checkout knows the default branch by, or None.
+
+    Deliberately local-only: fetching is the self-deploy unit's job, and a
+    stale checkout must make the gate abstain (it cannot see the merge yet),
+    never dispatch something it would have caught with fresher refs.
+    """
+    for ref in _DEFAULT_BRANCH_REFS:
+        if _git(repo, ["rev-parse", "--verify", "--quiet", ref]):
+            return ref
+    return None
+
+
+def _task_id_in_subject(subject: str, task_id: str) -> bool:
+    """`VOYN-X` is in `VOYN-X: fix` but NOT in `VOYN-X-REM: fix` — the
+    remediation's own merge says nothing about its parent."""
+    return re.search(f"{re.escape(task_id)}(?![A-Za-z0-9._-])", subject) is not None
+
+
+def _log_entries(
+    repo: Path, ref: str, extra: list[str], limit: int
+) -> list[tuple[str, str, int]]:
+    """(sha, subject, commit time) for `git log ref <extra>`, newest first."""
+    out = _git(
+        repo,
+        ["log", ref, f"--max-count={limit}", "--format=%H%x1f%ct%x1f%s", *extra],
+        timeout=_HISTORY_TIMEOUT,
+    )
+    entries: list[tuple[str, str, int]] = []
+    for line in (out or "").splitlines():
+        parts = line.split("\x1f")
+        if len(parts) != 3 or not parts[1].isdigit():
+            continue
+        entries.append((parts[0], parts[2], int(parts[1])))
+    return entries
+
+
+def _merged_by_commit_title(
+    repo: Path, ref: str, parent_task_id: str
+) -> MergedAuthority | None:
+    """Signal one: a merged pull request naming the parent task in its title."""
+    for sha, subject, _when in _log_entries(
+        repo, ref, ["--fixed-strings", f"--grep={parent_task_id}"], 20
+    ):
+        if not _task_id_in_subject(subject, parent_task_id):
+            continue
+        number = _MERGED_PR_NUMBER.search(subject)
+        if number is None:
+            continue
+        pr_url = _origin_pull_url(repo, number.group(1))
+        if pr_url is None:
+            continue
+        return MergedAuthority(
+            parent_task_id=parent_task_id,
+            commit=sha,
+            subject=subject,
+            pr_url=pr_url,
+            signal="commit_title",
+        )
+    return None
+
+
+def _symbol_is_defined(repo: Path, ref: str, symbol: str) -> bool:
+    """A DEFINITION of `symbol` on `ref` — not a mention of it in prose."""
+    pattern = (
+        r"^[[:space:]]*(async def |def |class |CREATE (OR REPLACE )?FUNCTION )"
+        f"{symbol}[ (:]"
+    )
+    return _git(repo, ["grep", "-l", "-E", pattern, ref], timeout=_HISTORY_TIMEOUT) is not None
+
+
+def _symbol_introduced(
+    repo: Path, ref: str, symbol: str
+) -> tuple[str, str, int] | None:
+    """The OLDEST commit on `ref` that changed the symbol's definition count —
+    i.e. the one that put it there."""
+    entries = _log_entries(
+        repo, ref, [f"-S(def|class|FUNCTION) {symbol}", "--pickaxe-regex"], 20
+    )
+    return entries[-1] if entries else None
+
+
+def _merged_by_symbols(
+    repo: Path, ref: str, parent_task_id: str, symbols: tuple[str, ...], since: int
+) -> MergedAuthority | None:
+    """Signal two: every symbol the parent's acceptance names is defined on
+    the default branch, put there AFTER the parent task was written.
+
+    The `since` bound is what keeps this from closing a task for naming
+    something that always existed: a symbol older than the task cannot be
+    evidence that the task's own work landed.
+    """
+    if not symbols:
+        return None
+    newest: tuple[str, str, int] | None = None
+    for symbol in symbols:
+        if not _symbol_is_defined(repo, ref, symbol):
+            return None
+        introduced = _symbol_introduced(repo, ref, symbol)
+        if introduced is None or introduced[2] <= since:
+            continue
+        if newest is None or introduced[2] > newest[2]:
+            newest = introduced
+    if newest is None:
+        return None
+    sha, subject, _when = newest
+    number = _MERGED_PR_NUMBER.search(subject)
+    if number is None:
+        return None
+    pr_url = _origin_pull_url(repo, number.group(1))
+    if pr_url is None:
+        return None
+    return MergedAuthority(
+        parent_task_id=parent_task_id,
+        commit=sha,
+        subject=subject,
+        pr_url=pr_url,
+        signal="symbols",
+        symbols=symbols,
+    )
+
+
+def merged_authority(
+    repo: Path,
+    ref: str,
+    parent_task_id: str,
+    *,
+    title: str,
+    body: str,
+    created_at: int,
+) -> MergedAuthority | None:
+    """Both signals, cheapest first; None means "no proof — dispatch"."""
+    found = _merged_by_commit_title(repo, ref, parent_task_id)
+    if found is not None:
+        return found
+    return _merged_by_symbols(
+        repo, ref, parent_task_id, acceptance_symbols(title, body), created_at
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _ReuseGate:
+    """One tick's answer to "can this host judge what is already on main?"."""
+
+    checkout: Path
+    ref: str
+    repository: str
+    #: task_id -> recorded parent, for every candidate that has lineage.
+    linked: dict[str, str]
+
+
+def _repo_hint_name(repo_hint: str) -> str:
+    """`~/Projects/ai-command-center` and `ai-command-center` are the same
+    repository to the backlog; both must compare equal to `origin`'s name."""
+    return (repo_hint or "").rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
 
 
 def _monitor_task_id(source: str, failure: str) -> str:
@@ -264,8 +586,15 @@ def _payload_for(
 class Planner:
     """Owns nothing but the composition; every decision is the database's."""
 
-    def __init__(self, connection_factory: Any) -> None:
+    def __init__(
+        self, connection_factory: Any, source_path: str | None = None
+    ) -> None:
         self._factory = connection_factory
+        #: The checkout the reuse gate reads the default branch from — this
+        #: control host's own tree (`--repo-path`, the unit's WorkingDirectory
+        #: by default). None disables the gate entirely, which is exactly the
+        #: pre-gate behaviour: every candidate is dispatched.
+        self._source_path = source_path
 
     def _rows(self, sql: str, params: tuple[Any, ...] = ()) -> list[tuple]:
         with self._factory() as conn:
@@ -280,6 +609,88 @@ class Planner:
         with self._factory() as conn:
             with conn.cursor() as cur:
                 cur.execute(sql, params)
+
+    def _reuse_gate(self, candidates: list[tuple]) -> _ReuseGate | None:
+        """This tick's reuse-gate context, or None when the gate cannot run.
+
+        Costs one query and two cheap git reads, and only when a remediation
+        candidate is actually eligible: a tick with none does no git at all.
+        """
+        if not self._source_path or not candidates:
+            return None
+        task_ids = [row[0] for row in candidates]
+        linked = {
+            task_id: parent
+            for task_id, parent in self._rows(
+                "SELECT task_id, parent_task_id FROM backlog_task_remediation "
+                "WHERE task_id = ANY(%s)",
+                (task_ids,),
+            )
+        }
+        if not any(remediation_parent(t, linked.get(t)) for t in task_ids):
+            return None
+        checkout = Path(self._source_path)
+        ref = default_branch_ref(checkout)
+        repository = repository_name(checkout)
+        if ref is None or repository is None:
+            return None
+        return _ReuseGate(
+            checkout=checkout, ref=ref, repository=repository, linked=linked
+        )
+
+    def _close_if_superseded(
+        self, gate: _ReuseGate, task_id: str, repo: str
+    ) -> tuple[bool, str]:
+        """(closed, detail) for one candidate.
+
+        `(True, evidence)` — the task is DONE, superseded by merged work.
+        `(False, "")` — the gate abstained: not a remediation, a repository
+        this host cannot read, or no proof on the default branch. Dispatch
+        proceeds exactly as it did before the gate existed.
+        `(False, reason)` — the evidence stood but the store refused the
+        close, which is the one case the caller must report.
+        """
+        parent_id = remediation_parent(task_id, gate.linked.get(task_id))
+        if parent_id is None:
+            return False, ""
+        # Only the repository this checkout IS may be judged from it. The
+        # worker-host paths in `_DEFAULT_REPO_ROUTES` are not readable from
+        # the control host (the planner unit runs with ProtectHome=true), so
+        # a candidate for another repository abstains rather than being
+        # judged against the wrong history.
+        if _repo_hint_name(repo) != gate.repository:
+            return False, ""
+        parent = self._rows(
+            "SELECT title, body, EXTRACT(EPOCH FROM created_at)::bigint "
+            "FROM backlog_task WHERE task_id = %s",
+            (parent_id,),
+        )
+        if not parent:
+            return False, ""
+        title, body, created_at = parent[0]
+        authority = merged_authority(
+            gate.checkout,
+            gate.ref,
+            parent_id,
+            title=title or "",
+            body=body or "",
+            created_at=int(created_at or 0),
+        )
+        if authority is None:
+            return False, ""
+        ok, reason, _revision = self._row(
+            "SELECT * FROM backlog_close_superseded(%s, %s, %s, %s, %s)",
+            (
+                task_id,
+                parent_id,
+                authority.pr_url,
+                authority.commit,
+                authority.summary,
+            ),
+        )
+        if ok:
+            return True, authority.summary
+        return False, reason or "refused"
 
     def plan_once(self, limits: PlanLimits = PlanLimits()) -> PlanReport:
         report = PlanReport()
@@ -432,11 +843,32 @@ class Planner:
                 "       task_class "
                 "FROM backlog_eligible"
             )
+            gate = self._reuse_gate(candidates)
             for (
                 task_id, wave, priority, title, body, repo, dispatchable, task_class,
             ) in candidates:
                 if len(report.dispatched) >= limits.max_dispatches_per_tick:
                     break
+                # The reuse gate runs BEFORE the review-backlog fence on
+                # purpose: closing a task whose work is already merged adds
+                # nothing to the review queue, it removes work from the
+                # fleet. Holding that behind backpressure would keep proven
+                # duplicates eligible for exactly as long as review is busy,
+                # which is when a wasted run costs the most.
+                if gate is not None:
+                    closed, detail = self._close_if_superseded(gate, task_id, repo)
+                    if closed:
+                        report.superseded.append((task_id, detail))
+                        continue
+                    if detail:
+                        # The store refused the close although the evidence
+                        # stands (a concurrent status change is the only way
+                        # in: the planner re-derives the lineage the same way
+                        # `backlog_close_superseded` does). Report it and
+                        # leave the task OPEN for the next tick rather than
+                        # dispatch a run this tick has proof is redundant.
+                        report.refused.append((task_id, f"supersede_refused:{detail}"))
+                        continue
                 if fence_active and not lanes_idle and task_class != "pipeline":
                     report.fenced += 1
                     continue
@@ -493,5 +925,12 @@ class Planner:
         return report
 
 
-def plan_once(connection_factory: Any, limits: PlanLimits = PlanLimits()) -> PlanReport:
-    return Planner(connection_factory).plan_once(limits)
+def plan_once(
+    connection_factory: Any,
+    limits: PlanLimits = PlanLimits(),
+    *,
+    source_path: str | None = None,
+) -> PlanReport:
+    """One tick. `source_path` is this host's own checkout, which the reuse
+    gate reads the default branch from; omitting it leaves the gate off."""
+    return Planner(connection_factory, source_path).plan_once(limits)

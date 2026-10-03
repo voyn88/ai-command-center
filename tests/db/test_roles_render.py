@@ -310,6 +310,9 @@ def test_the_control_plane_cannot_claim() -> None:
         # VOYN-W0-AICC-BACKLOG-PG-CANONICAL-GATE (0020): the importer's stamp
         # of where a migrated row came from.
         "backlog_record_provenance",
+        # VOYN-W0-AICC-DISPATCH-REUSE-GATE (0025): the planner's pre-dispatch
+        # close of a remediation task whose parent's work is already merged.
+        "backlog_close_superseded",
     }
 
 

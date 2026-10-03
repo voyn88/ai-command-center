@@ -125,6 +125,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     plan.add_argument("--wip-limit", type=int, default=4)
     plan.add_argument(
+        "--repo-path",
+        default=".",
+        help="This host's own checkout. The pre-dispatch reuse gate reads its "
+        "default branch to see whether a remediation task's parent is already "
+        "merged (VOYN-W0-AICC-DISPATCH-REUSE-GATE); an empty value turns the "
+        "gate off and dispatches every candidate.",
+    )
+    plan.add_argument(
         "--dry-run",
         action="store_true",
         help="Report the eligible set without dispatching.",
@@ -560,7 +568,9 @@ def main(argv: list[str] | None = None) -> int:
                             )
                     return 0
                 report = plan_once(
-                    lambda: _nc(conn), PlanLimits(wip_limit=args.wip_limit)
+                    lambda: _nc(conn),
+                    PlanLimits(wip_limit=args.wip_limit),
+                    source_path=args.repo_path or None,
                 )
                 if report.planner_busy:
                     print("planner lease held elsewhere; nothing done")
@@ -582,6 +592,14 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"SPLIT     {task_id}: dispatched in decomposition mode")
                 for task_id, failure in report.monitor_tasks:
                     print(f"MONITOR   {task_id}: task for finding {failure}")
+                for task_id, evidence in report.superseded:
+                    print(f"SUPERSEDED {task_id}: closed, not dispatched -- {evidence}")
+                if report.prevented_duplicate_dispatches:
+                    print(
+                        "reuse gate prevented "
+                        f"{report.prevented_duplicate_dispatches} duplicate "
+                        "dispatch(es) this tick"
+                    )
                 for task_id, work_item in report.dispatched:
                     print(f"DISPATCHED {task_id} -> {work_item}")
                 for task_id, action in report.ingested:
