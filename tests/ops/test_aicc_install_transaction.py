@@ -624,46 +624,122 @@ def test_transaction_host_lock_contends_and_adopts_the_inherited_inode(tmp_path)
         os.close(first)
 
 
+#: Child half of the lock-handoff test. Adopts the inherited descriptor, proves
+#: the adoption shares the parent's OPEN FILE DESCRIPTION (not merely the same
+#: inode), drops the inherited copy, and then holds the adopted one open until
+#: told to exit -- so the parent can close its own copy and let a contender
+#: prove the lock is still held by this process alone.
+_LOCK_HANDOFF_CHILD = """
+import os, runpy, sys
+from pathlib import Path
+
+module = runpy.run_path(sys.argv[1])
+inherited = int(sys.argv[3])
+adopted = module["_install_lock_fd"](
+    Path(sys.argv[2]), inherited, trusted_uid=os.geteuid(), trusted_gid=os.getegid()
+)
+# Two descriptors on the same OFD share one file offset; two independent
+# open()s of the same inode do not. This is what distinguishes an adopted
+# descriptor from a descriptor reopened on the same path -- an inode
+# comparison cannot, and a reopen would silently drop the inherited lock.
+os.lseek(inherited, 4242, os.SEEK_SET)
+assert os.lseek(adopted, 0, os.SEEK_CUR) == 4242, "adoption did not share the OFD"
+assert os.fstat(adopted).st_ino == os.fstat(inherited).st_ino
+# From here the adopted descriptor is the ONLY thing that can be keeping the
+# flock alive in this process.
+os.close(inherited)
+sys.stdout.write("adopted\\n")
+sys.stdout.flush()
+sys.stdin.readline()
+os.close(adopted)
+sys.stdout.write("released\\n")
+sys.stdout.flush()
+"""
+
+#: Contender half: an independent process that must be refused while the lock
+#: is held, and admitted once it is not.
+_LOCK_CONTENDER = """
+import os, runpy, sys
+from pathlib import Path
+
+module = runpy.run_path(sys.argv[1])
+try:
+    descriptor = module["_install_lock_fd"](
+        Path(sys.argv[2]), trusted_uid=os.geteuid(), trusted_gid=os.getegid()
+    )
+except RuntimeError as exc:
+    assert "another install" in str(exc), str(exc)
+    raise SystemExit(7)
+os.close(descriptor)
+raise SystemExit(0)
+"""
+
+
 def test_transaction_host_lock_handoff_is_cross_process_and_same_ofd(tmp_path):
+    """The handoff is what lets the bootstrap exec the installer without ever
+    dropping the host lock, so the property is: the lock survives in the CHILD
+    after the parent closes its own descriptor.
+
+    Proving that requires the child to still be alive and the parent's
+    descriptor to be gone before a contender is allowed to try. Racing a
+    contender while the parent still holds the lock proves nothing -- it
+    passes just as well when inherited-lock adoption is completely broken
+    (independent review on 988de49).
+    """
     module = _module()
     lock = tmp_path / "state" / "install-recovery.lock"
     lock.parent.mkdir(mode=0o700)
     uid, gid = os.geteuid(), os.getegid()
     held = module._install_lock_fd(lock, trusted_uid=uid, trusted_gid=gid)
     script = str(Path(__file__).parents[2] / "ops/aicc_install_transaction.py")
-    child = (
-        "import os,runpy,sys; from pathlib import Path; "
-        "m=runpy.run_path(sys.argv[1]); fd=int(sys.argv[3]); "
-        "adopt=m['_install_lock_fd'](Path(sys.argv[2]),fd,"
-        "trusted_uid=os.geteuid(),trusted_gid=os.getegid()); "
-        "assert os.fstat(adopt).st_ino==os.fstat(fd).st_ino; os.close(adopt)"
+
+    def contend():
+        return subprocess.run(
+            [sys.executable, "-c", _LOCK_CONTENDER, script, str(lock)],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+
+    child = subprocess.Popen(
+        [sys.executable, "-c", _LOCK_HANDOFF_CHILD, script, str(lock), str(held)],
+        pass_fds=(held,),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
     )
-    contender = (
-        "import os,runpy,sys; from pathlib import Path; "
-        "m=runpy.run_path(sys.argv[1]); "
-        "\ntry: m['_install_lock_fd'](Path(sys.argv[2]),"
-        "trusted_uid=os.geteuid(),trusted_gid=os.getegid())"
-        "\nexcept RuntimeError: raise SystemExit(0)"
-        "\nraise SystemExit(9)"
-    )
+    parent_closed = False
     try:
-        adopted = subprocess.run(
-            [sys.executable, "-c", child, script, str(lock), str(held)],
-            pass_fds=(held,),
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        assert adopted.returncode == 0, adopted.stderr
-        blocked = subprocess.run(
-            [sys.executable, "-c", contender, script, str(lock)],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        assert blocked.returncode == 0, blocked.stderr
-    finally:
+        assert child.stdout.readline().strip() == "adopted", child.stderr.read()
+        # The whole point: the parent lets go, and the child's adopted
+        # descriptor is all that is left holding the lock.
         os.close(held)
+        parent_closed = True
+
+        refused = contend()
+        assert refused.returncode == 7, (
+            "a contender was admitted while the child still held the adopted "
+            f"lock: {refused.stdout}{refused.stderr}"
+        )
+
+        child.stdin.write("release\n")
+        child.stdin.flush()
+        assert child.stdout.readline().strip() == "released", child.stderr.read()
+        assert child.wait(timeout=60) == 0, child.stderr.read()
+
+        admitted = contend()
+        assert admitted.returncode == 0, (
+            "the lock was never released by the child: "
+            f"{admitted.stdout}{admitted.stderr}"
+        )
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=60)
+        if not parent_closed:
+            os.close(held)
 
 
 def test_bootstrap_and_transaction_use_one_fixed_host_lock_path():
@@ -848,7 +924,9 @@ def test_boot_recovery_completes_armed_uninstall_from_capsule(monkeypatch, tmp_p
     monkeypatch.setattr(
         module,
         "restore_service_snapshot",
-        lambda path, *, defer_starts=False: restored.append((path, defer_starts)),
+        lambda path, *, defer_starts=False, deferred_journal=None: restored.append(
+            (path, defer_starts, deferred_journal)
+        ),
     )
 
     module.recover_uninstall(state, root=root, boot=True)
@@ -857,7 +935,15 @@ def test_boot_recovery_completes_armed_uninstall_from_capsule(monkeypatch, tmp_p
     assert not current.exists()
     assert not (state / "uninstall.json").exists()
     assert not snapshot.exists()
-    assert restored == [(state / "baseline-units.json", True)]
+    # Boot completion of an uninstall queues its baseline starts too, so it
+    # owes the same durable record of what is still unproven.
+    assert restored == [
+        (
+            state / "baseline-units.json",
+            True,
+            state / module.DEFERRED_STARTS_JOURNAL,
+        )
+    ]
     assert closure_checks == [snapshot, snapshot, snapshot]
 
 
@@ -1333,7 +1419,7 @@ def test_failed_boot_service_restore_keeps_journal_for_retry(monkeypatch, tmp_pa
     monkeypatch.setattr(
         module,
         "restore_service_snapshot",
-        lambda path: (_ for _ in ()).throw(RuntimeError("systemd unavailable")),
+        lambda path, **_kw: (_ for _ in ()).throw(RuntimeError("systemd unavailable")),
     )
 
     with pytest.raises(RuntimeError, match="systemd unavailable"):
@@ -1461,7 +1547,12 @@ def test_boot_restore_queues_active_worker_without_dependency_deadlock(tmp_path)
             return SimpleNamespace(returncode=0, stdout="enabled\n", stderr="")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-    module.restore_service_snapshot(snapshot, run=run, defer_starts=True)
+    module.restore_service_snapshot(
+        snapshot,
+        run=run,
+        defer_starts=True,
+        deferred_journal=tmp_path / module.DEFERRED_STARTS_JOURNAL,
+    )
 
     assert [
         "/usr/bin/systemctl",
@@ -1474,6 +1565,430 @@ def test_boot_restore_queues_active_worker_without_dependency_deadlock(tmp_path)
         "start",
         "voyn-aicc-worker@blue.service",
     ] not in calls
+    # Queueing is not starting. The unit the boot path could only enqueue must
+    # be named in a durable journal, bound to this boot.
+    journal = json.loads(
+        (tmp_path / module.DEFERRED_STARTS_JOURNAL).read_text(encoding="utf-8")
+    )
+    assert journal["units"] == ["voyn-aicc-worker@blue.service"]
+    assert journal["version"] == module.DEFERRED_STARTS_VERSION
+    assert journal["boot_id"] == module._boot_id()
+    assert isinstance(journal["boot_id"], str)
+
+
+def test_deferred_starts_without_a_journal_path_are_refused(tmp_path):
+    """`defer_starts` exists only because the start cannot be proven here. A
+    caller that asks for deferral without somewhere durable to record it is
+    asking for exactly the unfalsifiable state this journal prevents."""
+    module = _module()
+    snapshot = tmp_path / "attempt-units.json"
+    snapshot.write_text(json.dumps({"version": 2, "units": {}}), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="durable journal"):
+        module.restore_service_snapshot(snapshot, defer_starts=True)
+
+
+def test_boot_restore_with_nothing_queued_clears_a_stale_journal(tmp_path):
+    """A journal left by an earlier recovery must not be replayed against this
+    one: a boot restore that queued nothing owes nothing."""
+    module = _module()
+    snapshot = tmp_path / "attempt-units.json"
+    snapshot.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "units": {
+                    "voyn-aicc-worker@blue.service": {
+                        "exists": True,
+                        "enabled": True,
+                        "active": False,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    journal = tmp_path / module.DEFERRED_STARTS_JOURNAL
+    journal.write_text(
+        json.dumps({"version": 1, "boot_id": "stale", "units": ["aicc-worker.service"]}),
+        encoding="utf-8",
+    )
+
+    def run(argv, **kwargs):
+        if "--property=LoadState" in argv:
+            return SimpleNamespace(returncode=0, stdout="loaded\n", stderr="")
+        if "--property=MainPID" in argv:
+            return SimpleNamespace(returncode=0, stdout="0\n", stderr="")
+        if argv[1] == "is-active":
+            return SimpleNamespace(returncode=3, stdout="inactive\n", stderr="")
+        if argv[1] == "is-enabled":
+            return SimpleNamespace(returncode=0, stdout="enabled\n", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    module.restore_service_snapshot(
+        snapshot, run=run, defer_starts=True, deferred_journal=journal
+    )
+
+    assert not journal.exists()
+
+
+def test_a_synchronous_restore_clears_a_superseded_deferred_start_record(tmp_path):
+    """A record from an earlier boot must not outlive a restore that proved
+    the same units synchronously -- otherwise the completion unit refuses on
+    the next boot over starts that are no longer owed."""
+    module = _module()
+    snapshot = tmp_path / "attempt-units.json"
+    snapshot.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "units": {
+                    "voyn-aicc-worker@blue.service": {
+                        "exists": True,
+                        "enabled": True,
+                        "active": True,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    journal = tmp_path / module.DEFERRED_STARTS_JOURNAL
+    journal.write_text(
+        json.dumps(
+            {"version": 1, "boot_id": "earlier", "units": ["aicc-worker.service"]}
+        ),
+        encoding="utf-8",
+    )
+
+    def run(argv, **kwargs):
+        if "--property=LoadState" in argv:
+            return SimpleNamespace(returncode=0, stdout="loaded\n", stderr="")
+        if "--property=MainPID" in argv:
+            return SimpleNamespace(returncode=0, stdout="4242\n", stderr="")
+        if argv[1] == "is-active":
+            return SimpleNamespace(returncode=0, stdout="active\n", stderr="")
+        if argv[1] == "is-enabled":
+            return SimpleNamespace(returncode=0, stdout="enabled\n", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    module.restore_service_snapshot(snapshot, run=run, deferred_journal=journal)
+
+    assert not journal.exists()
+
+
+def test_boot_recovery_keeps_deferred_start_evidence_after_consuming_the_wal(
+    monkeypatch, tmp_path
+):
+    """The regression this journal exists for (independent review on 988de49).
+
+    `recover(boot=True)` deletes the WAL and the service snapshot as soon as
+    `--no-block start` is enqueued. Before this journal, a queued job that
+    failed afterwards left a previously active lane inactive with every piece
+    of recovery evidence already unlinked -- boot recovery silently committing
+    a broken state. Driven through `recover()` rather than
+    `restore_service_snapshot` alone: the defect was in what the CALLER
+    deleted, so a test of the restore helper by itself would not have caught
+    it.
+    """
+    module = _module()
+    root = tmp_path / "root"
+    state = tmp_path / "state"
+    source = tmp_path / "source"
+    source.write_bytes(b"installed")
+    transaction = module.FileTransaction(root, state)
+    transaction.prepare((_spec(module, source, "/etc/new"),))
+    transaction.apply()
+    snapshot = state / "attempt-units.json"
+    snapshot.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "units": {
+                    "voyn-aicc-worker@blue.service": {
+                        "exists": True,
+                        "enabled": True,
+                        "active": True,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        module, "verify_service_snapshot_closure", lambda path, **kwargs: None
+    )
+    monkeypatch.setattr(module, "quiesce_service_snapshot", lambda path, **_kw: None)
+
+    def run(argv, **kwargs):
+        if "--property=LoadState" in argv:
+            return SimpleNamespace(returncode=0, stdout="loaded\n", stderr="")
+        if "--property=MainPID" in argv:
+            return SimpleNamespace(returncode=0, stdout="0\n", stderr="")
+        if argv[1] == "is-active":
+            # The queued job has not run yet, which is precisely the window.
+            return SimpleNamespace(returncode=3, stdout="inactive\n", stderr="")
+        if argv[1] == "is-enabled":
+            return SimpleNamespace(returncode=0, stdout="enabled\n", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    # `restore_service_snapshot` binds `subprocess.run` as a default argument,
+    # so the fake systemctl is injected through a wrapper that still calls the
+    # REAL restore -- the journal write under test happens inside it.
+    real_restore = module.restore_service_snapshot
+    monkeypatch.setattr(
+        module,
+        "restore_service_snapshot",
+        lambda path, **kwargs: real_restore(path, run=run, **kwargs),
+    )
+    monkeypatch.setattr(module, "_boot_id", lambda: "boot-under-test")
+
+    transaction.recover(boot=True)
+
+    assert not transaction.pending.exists(), "the WAL is consumed, as before"
+    assert not snapshot.exists(), "the service snapshot is consumed, as before"
+    journal = state / module.DEFERRED_STARTS_JOURNAL
+    assert journal.exists(), "the queued start must survive its own evidence"
+    recorded = json.loads(journal.read_text(encoding="utf-8"))
+    assert recorded["units"] == ["voyn-aicc-worker@blue.service"]
+    assert recorded["boot_id"] == "boot-under-test"
+
+
+def test_deferred_start_journal_names_match_across_the_two_boot_modules(tmp_path):
+    """The generator consumes what the transaction writes, and cannot import
+    it: PID 1 runs the generator before anything else this repo installs
+    exists. Duplication is deliberate; drift is the failure mode."""
+    module = _module()
+    generator = _generator_module()
+
+    assert module.DEFERRED_STARTS_JOURNAL == generator.DEFERRED_STARTS
+    assert module.DEFERRED_STARTS_VERSION == generator.DEFERRED_STARTS_VERSION
+    assert module.RESTORABLE_UNIT_RE.pattern == generator.DEFERRED_UNIT_RE.pattern
+    assert module._boot_id() == generator._boot_id()
+
+
+def _deferred_journal(generator, state, units, boot_id):
+    state.mkdir(parents=True, exist_ok=True)
+    journal = state / generator.DEFERRED_STARTS
+    journal.write_text(
+        json.dumps(
+            {
+                "version": generator.DEFERRED_STARTS_VERSION,
+                "boot_id": boot_id,
+                "units": units,
+            }
+        ),
+        encoding="utf-8",
+    )
+    journal.chmod(0o600)
+    return journal
+
+
+def _systemctl_recorder(active_units):
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append(argv)
+        if argv[1] == "is-active":
+            live = argv[2] in active_units
+            return SimpleNamespace(
+                returncode=0 if live else 3,
+                stdout=("active\n" if live else "inactive\n"),
+                stderr="",
+            )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    return run, calls
+
+
+def test_deferred_start_completion_joins_the_queued_job_and_consumes_evidence(
+    monkeypatch, tmp_path
+):
+    """The completion half: a synchronous `start` joins the job boot recovery
+    enqueued and reports ITS result, and only proof consumes the journal."""
+    generator = _generator_module()
+    monkeypatch.setattr(generator, "_boot_id", lambda: "boot-under-test")
+    state = tmp_path / "state"
+    journal = _deferred_journal(
+        generator, state, ["voyn-aicc-worker@blue.service"], "boot-under-test"
+    )
+    run, calls = _systemctl_recorder({"voyn-aicc-worker@blue.service"})
+
+    assert (
+        generator.complete_deferred_starts(
+            state, expected_uid=os.getuid(), run=run
+        )
+        == 0
+    )
+
+    assert ["/usr/bin/systemctl", "start", "voyn-aicc-worker@blue.service"] in calls
+    assert not journal.exists()
+
+
+def test_deferred_start_that_never_became_active_fails_loudly_and_keeps_evidence(
+    monkeypatch, tmp_path
+):
+    generator = _generator_module()
+    monkeypatch.setattr(generator, "_boot_id", lambda: "boot-under-test")
+    state = tmp_path / "state"
+    journal = _deferred_journal(
+        generator, state, ["voyn-aicc-worker@blue.service"], "boot-under-test"
+    )
+    run, _calls = _systemctl_recorder(set())
+
+    with pytest.raises(RuntimeError, match="did not reach active"):
+        generator.complete_deferred_starts(state, expected_uid=os.getuid(), run=run)
+
+    assert journal.exists(), "an unproven start must keep naming itself"
+
+
+def test_deferred_starts_from_an_earlier_boot_are_verified_never_replayed(
+    monkeypatch, tmp_path
+):
+    """Across a reboot the queued jobs are gone; what survives is the restored
+    enablement, which systemd acts on by itself. So a journal from another
+    boot is checked, not re-driven: force-starting a unit an operator has
+    since stopped is not recovery. It is still only consumed on proof."""
+    generator = _generator_module()
+    monkeypatch.setattr(generator, "_boot_id", lambda: "this-boot")
+    state = tmp_path / "state"
+    journal = _deferred_journal(
+        generator, state, ["voyn-aicc-worker@blue.service"], "a-previous-boot"
+    )
+    run, calls = _systemctl_recorder({"voyn-aicc-worker@blue.service"})
+
+    assert (
+        generator.complete_deferred_starts(
+            state, expected_uid=os.getuid(), run=run
+        )
+        == 0
+    )
+
+    assert not any(argv[1] == "start" for argv in calls)
+    assert not journal.exists()
+
+    journal = _deferred_journal(
+        generator, state, ["voyn-aicc-worker@blue.service"], "a-previous-boot"
+    )
+    stopped, _calls = _systemctl_recorder(set())
+    with pytest.raises(RuntimeError, match="did not reach active"):
+        generator.complete_deferred_starts(
+            state, expected_uid=os.getuid(), run=stopped
+        )
+    assert journal.exists()
+
+
+def test_deferred_start_completion_is_a_noop_without_a_journal(tmp_path):
+    generator = _generator_module()
+    state = tmp_path / "state"
+    state.mkdir()
+    run, calls = _systemctl_recorder(set())
+
+    assert (
+        generator.complete_deferred_starts(
+            state, expected_uid=os.getuid(), run=run
+        )
+        == 0
+    )
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "corrupt",
+    (
+        {"version": 99, "boot_id": "x", "units": ["aicc-worker.service"]},
+        {"version": 1, "boot_id": "x", "units": ["../../etc/passwd"]},
+        {"version": 1, "boot_id": "x", "units": "aicc-worker.service"},
+        {"version": 1, "units": ["aicc-worker.service"]},
+    ),
+)
+def test_untrusted_deferred_start_journal_is_refused(tmp_path, corrupt):
+    """The journal names units a root oneshot will `systemctl start`. It is
+    validated exactly as hard as every other durable record here."""
+    generator = _generator_module()
+    state = tmp_path / "state"
+    state.mkdir()
+    journal = state / generator.DEFERRED_STARTS
+    journal.write_text(json.dumps(corrupt), encoding="utf-8")
+    journal.chmod(0o600)
+    run, calls = _systemctl_recorder(set())
+
+    with pytest.raises(RuntimeError, match="deferred-start journal is invalid"):
+        generator.complete_deferred_starts(state, expected_uid=os.getuid(), run=run)
+    assert calls == []
+
+
+def test_group_writable_deferred_start_journal_is_refused(monkeypatch, tmp_path):
+    generator = _generator_module()
+    monkeypatch.setattr(generator, "_boot_id", lambda: "boot-under-test")
+    state = tmp_path / "state"
+    journal = _deferred_journal(
+        generator, state, ["aicc-worker.service"], "boot-under-test"
+    )
+    journal.chmod(0o660)
+    run, calls = _systemctl_recorder(set())
+
+    with pytest.raises(RuntimeError, match="untrusted recovery file"):
+        generator.complete_deferred_starts(state, expected_uid=os.getuid(), run=run)
+    assert calls == []
+
+
+def test_deferred_start_completion_refuses_when_the_boot_cannot_be_identified(
+    monkeypatch, tmp_path
+):
+    """Without a boot id neither branch is decidable: `start` might re-drive a
+    unit an operator stopped, and skipping might accept an unproven one.
+    Refuse, keep the journal, and let the unit fail where it can be seen."""
+    generator = _generator_module()
+    monkeypatch.setattr(generator, "_boot_id", lambda: "")
+    state = tmp_path / "state"
+    journal = _deferred_journal(
+        generator, state, ["aicc-worker.service"], "some-recorded-boot"
+    )
+    run, calls = _systemctl_recorder({"aicc-worker.service"})
+
+    with pytest.raises(RuntimeError, match="cannot bind deferred starts"):
+        generator.complete_deferred_starts(state, expected_uid=os.getuid(), run=run)
+
+    assert calls == []
+    assert journal.exists()
+
+
+def test_boot_generator_emits_the_deferred_start_completion_unit(tmp_path):
+    """The completion unit is what turns "queued" into "proven". It is emitted
+    unconditionally, ordered after the boot has settled, and pulled in by
+    `Wants=` so an unproven start fails visibly instead of taking
+    multi-user.target with it."""
+    generator = _generator_module()
+    state = tmp_path / "state"
+    destination = tmp_path / "generator"
+
+    assert generator.generate(destination, state)
+
+    unit = (destination / generator.COMPLETION_UNIT).read_text(encoding="utf-8")
+    assert (
+        f"ExecStart={generator.ANCHOR} --complete-deferred-starts {state}" in unit
+    )
+    assert "After=multi-user.target" in unit
+    assert "Type=oneshot" in unit
+    assert "TimeoutStartSec=" in unit, "joining a queued job must be bounded"
+    assert f"ReadWritePaths={state}" in unit
+    # Ordered AFTER the settled boot, never before sysinit like the barrier.
+    assert "Before=sysinit.target" not in unit
+    wants = destination / "multi-user.target.wants" / generator.COMPLETION_UNIT
+    assert wants.readlink() == Path(f"../{generator.COMPLETION_UNIT}")
+
+
+def test_boot_generator_refuses_a_pre_populated_completion_pull_in(tmp_path):
+    generator = _generator_module()
+    state = tmp_path / "state"
+    destination = tmp_path / "generator"
+    wants = destination / "multi-user.target.wants"
+    wants.mkdir(parents=True)
+    (wants / generator.COMPLETION_UNIT).symlink_to("/dev/null")
+
+    with pytest.raises(RuntimeError, match="completion pull-in"):
+        generator.generate(destination, state)
 
 
 def test_boot_restore_accepts_activating_notify_worker_with_live_main_pid(
@@ -1516,7 +2031,12 @@ def test_boot_restore_accepts_activating_notify_worker_with_live_main_pid(
             return SimpleNamespace(returncode=0, stdout="enabled\n", stderr="")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-    module.restore_service_snapshot(snapshot, run=run, defer_starts=True)
+    module.restore_service_snapshot(
+        snapshot,
+        run=run,
+        defer_starts=True,
+        deferred_journal=tmp_path / module.DEFERRED_STARTS_JOURNAL,
+    )
 
 
 def test_boot_restore_still_refuses_deactivating_expected_inactive_main_pid(
@@ -1558,7 +2078,12 @@ def test_boot_restore_still_refuses_deactivating_expected_inactive_main_pid(
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     with pytest.raises(RuntimeError, match="retains MainPID"):
-        module.restore_service_snapshot(snapshot, run=run, defer_starts=True)
+        module.restore_service_snapshot(
+            snapshot,
+            run=run,
+            defer_starts=True,
+            deferred_journal=tmp_path / module.DEFERRED_STARTS_JOURNAL,
+        )
 
 
 def test_boot_restore_never_synchronously_stops_its_own_recovery_service(
@@ -1595,7 +2120,12 @@ def test_boot_restore_never_synchronously_stops_its_own_recovery_service(
             return SimpleNamespace(returncode=1, stdout="disabled\n", stderr="")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-    module.restore_service_snapshot(snapshot, run=run, defer_starts=True)
+    module.restore_service_snapshot(
+        snapshot,
+        run=run,
+        defer_starts=True,
+        deferred_journal=tmp_path / module.DEFERRED_STARTS_JOURNAL,
+    )
 
     assert [
         "/usr/bin/systemctl",
@@ -1636,7 +2166,12 @@ def test_boot_restore_existing_inactive_recovery_defers_self_stop(tmp_path):
             return SimpleNamespace(returncode=1, stdout="disabled\n", stderr="")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
-    module.restore_service_snapshot(snapshot, run=run, defer_starts=True)
+    module.restore_service_snapshot(
+        snapshot,
+        run=run,
+        defer_starts=True,
+        deferred_journal=tmp_path / module.DEFERRED_STARTS_JOURNAL,
+    )
 
     assert not any(
         argv[1] in {"start", "stop"} and argv[-1] == "aicc-principal-recovery.service"
@@ -1883,7 +2418,7 @@ def test_recover_restores_release_selector_before_any_service_snapshot(
         assert preserve_unsnapshotted_launchers
         order.append("closure")
 
-    def recording_service_restore(path):
+    def recording_service_restore(path, **_kwargs):
         assert path == state / "attempt-units.json"
         order.append("services")
 

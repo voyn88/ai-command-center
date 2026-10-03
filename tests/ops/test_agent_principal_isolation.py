@@ -1147,9 +1147,12 @@ def test_versioned_os_boundary_acceptance_is_fail_closed():
     assert "voyn-aicc-worker-2.service" not in verifier
     assert "lane_registry=/etc/aicc/worker-lanes" in verifier
     assert "/etc/voyn/aicc-worker-lanes.conf" not in verifier
+    # The pre-install snapshot applies the incoming manifest's lanes and
+    # additionally COVERS the installed registry, so a host-specific lane the
+    # new manifest drops still has its prior unit state captured for rollback.
     assert (
-        'run_rollout snapshot --lanes "$repo_root/deploy/aicc/worker-lanes"'
-        in installer
+        'run_rollout snapshot --lanes "$repo_root/deploy/aicc/worker-lanes" \\\n'
+        "  --also-lanes /etc/aicc/worker-lanes" in installer
     )
     uninstall = installer[installer.index('if [ "${1:-}" = "--uninstall" ]') :]
     uninstall = uninstall.split("# Validate the stable authority")[0]

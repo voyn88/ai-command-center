@@ -236,6 +236,96 @@ def test_discovery_combines_configured_and_existing_lanes(tmp_path):
     )
 
 
+def test_snapshot_covers_installed_lanes_the_incoming_manifest_dropped(tmp_path):
+    """Independent review on 988de49.
+
+    The pre-install snapshot used to read lanes from the INCOMING repository
+    only. A lane this host runs today but the new manifest no longer declares
+    is still affected by apply/rollout -- the worker template and its drop-in
+    are replaced under it -- yet its prior unit state was never captured, so
+    rollback could not put it back. `also_lanes` is what closes that: the
+    installed registry is covered even though it is not what the rollout
+    applies.
+    """
+    module = _module()
+    incoming = tmp_path / "incoming-lanes"
+    incoming.write_text("1\n2\n", encoding="utf-8")
+    installed = tmp_path / "installed-lanes"
+    installed.write_text("1\nhost-specific\n", encoding="utf-8")
+    systemd = FakeSystemd(("voyn-aicc-worker@1.service",))
+
+    assert module.discover_units(systemd, incoming) == (
+        "voyn-aicc-worker@1.service",
+        "voyn-aicc-worker@2.service",
+    ), "the incoming manifest alone cannot see the dropped lane"
+    assert module.discover_units(
+        systemd, incoming, also_lanes=(installed,)
+    ) == (
+        "voyn-aicc-worker@1.service",
+        "voyn-aicc-worker@2.service",
+        "voyn-aicc-worker@host-specific.service",
+    )
+
+
+def test_absent_installed_registry_contributes_no_lanes(tmp_path):
+    """A first install has no /etc/aicc/worker-lanes at all. That one case is
+    "no lanes", not a failure -- otherwise the union would make the first
+    install impossible."""
+    module = _module()
+    incoming = tmp_path / "incoming-lanes"
+    incoming.write_text("1\n", encoding="utf-8")
+    systemd = FakeSystemd(("voyn-aicc-worker@1.service",))
+
+    assert module.discover_units(
+        systemd, incoming, also_lanes=(tmp_path / "nothing/worker-lanes",)
+    ) == ("voyn-aicc-worker@1.service",)
+
+
+def test_an_unsafe_installed_registry_still_fails_the_snapshot_closed(tmp_path):
+    """Tolerating absence must not become tolerating unreadable. A registry
+    that EXISTS but is a symlink is an attacker-shaped input, and covering
+    fewer lanes than the host runs is exactly the weakness being fixed."""
+    module = _module()
+    incoming = tmp_path / "incoming-lanes"
+    incoming.write_text("1\n", encoding="utf-8")
+    installed = tmp_path / "installed-lanes"
+    installed.symlink_to(incoming)
+    systemd = FakeSystemd(("voyn-aicc-worker@1.service",))
+
+    with pytest.raises(module.RolloutError, match="is a symlink"):
+        module.discover_units(systemd, incoming, also_lanes=(installed,))
+
+    installed.unlink()
+    installed.write_text("also-invalid lane name\n", encoding="utf-8")
+    with pytest.raises(module.RolloutError, match="invalid worker lane"):
+        module.discover_units(systemd, incoming, also_lanes=(installed,))
+
+
+def test_also_lanes_is_rejected_for_every_mutating_action(tmp_path, monkeypatch):
+    """The extra registries widen what is RECORDED, never what is applied: a
+    rollout that started the lanes a new manifest deliberately dropped would
+    be reviving them, not covering them."""
+    module = _module()
+    lanes = tmp_path / "lanes"
+    lanes.write_text("1\n", encoding="utf-8")
+    for action in ("rollout", "verify"):
+        monkeypatch.setattr(
+            module.sys,
+            "argv",
+            [
+                "aicc-staged-worker-rollout",
+                action,
+                "--lanes",
+                str(lanes),
+                "--also-lanes",
+                str(lanes),
+            ],
+        )
+        with pytest.raises(SystemExit) as refused:
+            module.main()
+        assert refused.value.code == 2
+
+
 def test_uninstall_snapshot_audit_refuses_a_lane_created_after_snapshot():
     module = _module()
     systemd = FakeSystemd(

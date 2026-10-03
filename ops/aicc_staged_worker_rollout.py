@@ -97,6 +97,17 @@ class RolloutError(RuntimeError):
     pass
 
 
+class LaneRegistryMissing(RolloutError):
+    """A lane registry pathname does not exist at all.
+
+    Distinguished from every other registry failure so that -- and ONLY so
+    that -- a registry which may legitimately not exist yet can be treated as
+    "no lanes" instead of aborting. A registry that exists but cannot be read
+    safely (symlink, wrong owner, racing writer) is not this exception and
+    stays fail-closed.
+    """
+
+
 # Test seam: the lane-registry ownership authority. Patched per-module by
 # tests to simulate non-root/root registries WITHOUT mutating the global os
 # module (which leaked suite-wide; review on 7d4391c). Production == os.fstat.
@@ -348,6 +359,13 @@ def _read_lane_registry(path: Path) -> str:
     except OSError as exc:
         if exc.errno == errno.ELOOP:
             raise RolloutError(f"worker lane registry is a symlink: {path}") from exc
+        if exc.errno == errno.ENOENT:
+            # Only "there is nothing here" is separable. Every other error --
+            # including EACCES on a directory an attacker made unreadable --
+            # keeps the generic fail-closed refusal below.
+            raise LaneRegistryMissing(
+                f"worker lane registry does not exist: {path}"
+            ) from exc
         raise RolloutError(
             f"worker lane registry cannot be read safely: {path}"
         ) from exc
@@ -431,10 +449,40 @@ def discover_launcher_units(systemd: Systemd) -> tuple[str, ...]:
     return tuple(sorted(_listed_launcher_units(systemd, check=False)))
 
 
+def _optional_configured_units(path: Path) -> set[str]:
+    """Lanes from a registry whose absence is a legitimate state.
+
+    The installed registry `/etc/aicc/worker-lanes` does not exist before the
+    first install, so a snapshot that unions it in must tolerate that one
+    case -- and only that one. A registry that is present but unsafe still
+    raises.
+    """
+    try:
+        return _configured_units(path)
+    except LaneRegistryMissing:
+        return set()
+
+
 def discover_units(
-    systemd: Systemd, lanes_path: Path = DEFAULT_LANES
+    systemd: Systemd,
+    lanes_path: Path = DEFAULT_LANES,
+    *,
+    also_lanes: tuple[Path, ...] = (),
 ) -> tuple[str, ...]:
+    """Every lane unit this invocation is responsible for.
+
+    `also_lanes` widens the set with registries whose lanes are not what this
+    invocation *applies*, but which it must still cover: the pre-install
+    snapshot has to record the lanes the host runs TODAY (the installed
+    registry) as well as the ones the incoming generation declares, or a
+    host-specific lane dropped by the new manifest is mutated by the install
+    with no prior unit state captured, and rollback cannot put it back
+    (independent review on 988de49). Their absence is tolerated; being
+    present and unreadable is not.
+    """
     units = _configured_units(lanes_path)
+    for extra in also_lanes:
+        units.update(_optional_configured_units(extra))
     units.update(_listed_template_units(systemd, check=False))
     if not units:
         raise RolloutError("no worker lanes discovered")
@@ -1249,6 +1297,18 @@ def main() -> int:
     )
     parser.add_argument("--lanes", type=Path, default=DEFAULT_LANES)
     parser.add_argument(
+        "--also-lanes",
+        type=Path,
+        action="append",
+        default=[],
+        help="An additional lane registry to COVER but not to apply. Used by "
+        "the installer's pre-install snapshot to record the currently "
+        "installed /etc/aicc/worker-lanes alongside the incoming manifest, so "
+        "a lane the new manifest drops is still restorable. A registry that "
+        "does not exist yet contributes no lanes; one that exists but cannot "
+        "be read safely still fails closed.",
+    )
+    parser.add_argument(
         "--privileged-users-file", type=Path, default=DEFAULT_PRIVILEGED_USERS
     )
     parser.add_argument("--state", type=Path)
@@ -1277,7 +1337,12 @@ def main() -> int:
             systemd, json.loads(args.state.read_text(encoding="utf-8"))
         )
         return 0
-    units = discover_units(systemd, args.lanes)
+    if args.also_lanes and args.action != "snapshot":
+        # Widening the set a rollout APPLIES would start lanes the incoming
+        # manifest deliberately dropped. The extra registries exist to widen
+        # what is recorded for rollback, nothing else.
+        parser.error("--also-lanes is only valid for snapshot")
+    units = discover_units(systemd, args.lanes, also_lanes=tuple(args.also_lanes))
     if args.action in {"rollout", "verify"}:
         verify_immutable_release()
     if args.action == "snapshot":
