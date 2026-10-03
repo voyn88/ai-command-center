@@ -92,6 +92,73 @@ def test_the_read_path_reads_the_authority_and_no_mirror() -> None:
         assert mirror_marker not in source.lower(), mirror_marker
 
 
+# --- reachability from the SQLite authority ---------------------------------
+#
+# `queue_entry` mirrors by whole-list replacement rather than the shared
+# `upsert` contract (see `table_mirror.py`), so it is exempt from
+# `test_mirror_contract.py`'s generic `test_every_declared_mirror_has_a_caller`
+# check — the one that exists specifically to catch a fully-built, fully-tested
+# mirror nothing calls. That exemption is why this pair belongs here instead:
+# without it, `PostgresQueueMirror` could lose its only caller and every other
+# test in this file would stay green, because they all construct the mirror
+# directly rather than going through the SQLite authority that is supposed to
+# drive it.
+
+
+def _patch_postgres_queue_mirror(monkeypatch, factory) -> None:
+    from command_center.db import queue_store as pg_queue_store
+
+    # The real class captured before the patch; reading it back through the
+    # module inside the lambda would resolve to the lambda itself.
+    monkeypatch.setattr(
+        pg_queue_store,
+        "PostgresQueueMirror",
+        lambda: PostgresQueueMirror(connection_factory=factory),
+    )
+
+
+def test_replacing_entries_mirrors_into_postgresql(
+    pg_connection_factory, tmp_path, monkeypatch
+) -> None:
+    """The SQLite authority write (`replace_queue_entries`) must actually drive
+    the PostgreSQL mirror declared alongside it — otherwise a mirror can be
+    fully correct and fully tested in isolation while the real target stays
+    empty forever."""
+    from command_center.runtime.db import execution as exec_db
+
+    _patch_postgres_queue_mirror(monkeypatch, pg_connection_factory)
+    db_path = tmp_path / "runtime.db"
+    exec_db.db.migrate(db_path)
+
+    entries = [_entry("q1"), _entry("q2")]
+    exec_db.replace_queue_entries(db_path, entries)
+
+    mirror = PostgresQueueMirror(connection_factory=pg_connection_factory)
+    assert mirror.list_entries() == entries
+
+
+def test_a_queue_mirror_failure_cannot_break_the_authoritative_write(
+    tmp_path, monkeypatch
+) -> None:
+    """As every mirror since slice 2: unreachable PostgreSQL must not take down
+    the SQLite write it rides along with."""
+    from command_center.db import queue_store as pg_queue_store
+    from command_center.runtime.db import execution as exec_db
+
+    class Exploding:
+        def replace_entries(self, entries: list[dict]) -> None:
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(pg_queue_store, "PostgresQueueMirror", lambda: Exploding())
+
+    db_path = tmp_path / "runtime.db"
+    exec_db.db.migrate(db_path)
+
+    exec_db.replace_queue_entries(db_path, [_entry("q1")])
+
+    assert [e["id"] for e in exec_db.list_queue_entries(db_path)] == ["q1"]
+
+
 # --- behaviour against a real PostgreSQL ------------------------------------
 
 
