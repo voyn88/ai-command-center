@@ -886,6 +886,12 @@ def test_main_reports_the_source_clone_probe_when_a_repo_is_given(
 # `is-active` of its own hand-picked units. The host probe reads every service
 # unit's NRestarts and active state so a crash loop anywhere on the host is a
 # finding, not a symptom the owner reports.
+#
+# VOYN-MON-WORKER-01-INFRA-CRASH-LOOP: the first version of that probe judged
+# the LIFETIME counter, so "has this unit ever restarted N times" -- true of
+# every `Restart=` unit on a host that has been up long enough, and permanent
+# once true. The verdict is now the gain across a window of ticks, which is
+# what the word "loop" means and the only shape that can ever clear.
 
 
 def _show_block(unit: str, restarts: int, active: str) -> str:
@@ -913,6 +919,34 @@ Legend: LOAD   → Reflects whether the unit definition was properly loaded.
 5 loaded units listed.
 """
 
+#: The monitor tick (voyn-infra-monitor.timer: OnUnitInactiveSec=2min) and the
+#: defaults the unit runs with: five restarts GAINED in an hour is a loop.
+TICK = 120.0
+WINDOW = 3600.0
+THRESHOLD = 5
+
+
+def _history(
+    *readings: tuple[float, dict[str, int]], window_seconds: float = WINDOW
+) -> infra_monitor.RestartHistory:
+    """Fold `(when, {unit: NRestarts})` readings into a history, tick by tick."""
+    history = infra_monitor.RestartHistory()
+    for when, counters in readings:
+        history = history.observe(counters, now=when, window_seconds=window_seconds)
+    return history
+
+
+def _looping(
+    unit: str, *, per_tick: int, ticks: int, start: int = 0, end: float = 0.0
+) -> infra_monitor.RestartHistory:
+    """A unit restarting `per_tick` times per two-minute tick, ending at `end`."""
+    return _history(
+        *(
+            (end - (ticks - 1 - index) * TICK, {unit: start + index * per_tick})
+            for index in range(ticks)
+        )
+    )
+
 
 def test_unit_health_parses_systemctl_show_blocks() -> None:
     units = infra_monitor.parse_unit_show(SHOW_OUTPUT)
@@ -933,10 +967,17 @@ def test_service_names_survive_headers_markers_and_the_legend() -> None:
 
 
 def test_a_crash_looping_unit_is_a_finding_and_instances_collapse_by_template() -> None:
-    snapshot = infra_monitor.evaluate_unit_health(
-        infra_monitor.parse_unit_show(SHOW_OUTPUT), crash_loop_restarts=5
+    units = infra_monitor.parse_unit_show(SHOW_OUTPUT)
+    # Every 3 s: forty restarts gained between two ticks two minutes apart.
+    history = _history(
+        (0.0, {**infra_monitor.collapse_restart_counters(units), "ollama.service": 315851}),
+        (TICK, infra_monitor.collapse_restart_counters(units)),
     )
-    assert snapshot.crash_loops == (("ollama.service", 315891),)
+    snapshot = infra_monitor.evaluate_unit_health(
+        units, crash_loop_restarts=THRESHOLD, history=history, window_seconds=WINDOW
+    )
+
+    assert snapshot.crash_loops == (("ollama.service", 40),)
     # Per-connection template instances are one failed template with a count,
     # not one finding per connection.
     assert snapshot.failed_units == (("aicc-agent-launcher@*.service", 2),)
@@ -949,7 +990,8 @@ def test_a_crash_looping_unit_is_a_finding_and_instances_collapse_by_template() 
         unit_health=snapshot,
     )
     assert set(report.failures) == {
-        "crash_loop:1:ollama.service=315891",
+        # `+40` is the gain inside the window, not a lifetime total.
+        "crash_loop:1:ollama.service=+40",
         "failed_units:1:aicc-agent-launcher@*.service=2",
     }
     assert {infra_monitor.finding_key(f) for f in report.failures} == {
@@ -958,27 +1000,139 @@ def test_a_crash_looping_unit_is_a_finding_and_instances_collapse_by_template() 
     }
 
 
+def test_a_large_lifetime_counter_is_not_a_loop_once_the_restarting_stops() -> None:
+    """The finding this task exists for.
+
+    A unit that restarted 315 891 times and then stopped is not looping now.
+    Under a lifetime threshold it was a `crash_loop` finding forever -- no
+    later measurement could clear it, so the fail-closed monitor could never
+    report ok again and the open finding could never be closed by a fix.
+    """
+    units = infra_monitor.parse_unit_show(SHOW_OUTPUT)
+    counters = infra_monitor.collapse_restart_counters(units)
+    quiet = _history(*((index * TICK, counters) for index in range(30)))
+
+    snapshot = infra_monitor.evaluate_unit_health(
+        units, crash_loop_restarts=THRESHOLD, history=quiet, window_seconds=WINDOW
+    )
+
+    assert snapshot.crash_loops == ()
+    assert snapshot.window_seconds == WINDOW
+    report = infra_monitor.evaluate(
+        {}, None, minimum_active_workers=0, max_stalled_seconds=900,
+        prometheus_ready=True, unit_health=snapshot,
+    )
+    # The launcher instances are still failed; nothing is crash looping.
+    assert [f for f in report.failures if f.startswith("crash_loop")] == []
+
+
+def test_a_loop_that_stops_clears_itself_once_the_window_has_passed() -> None:
+    """Acceptance for a monitor finding is "ok for 24h", which requires the
+    measurement to fall on its own once the host is healthy."""
+    looping = _looping("ollama.service", per_tick=40, ticks=5, end=0.0)
+    units = {"ollama.service": infra_monitor.UnitState(160, "activating")}
+    assert infra_monitor.evaluate_unit_health(
+        units, crash_loop_restarts=THRESHOLD, history=looping, window_seconds=WINDOW
+    ).crash_loops == (("ollama.service", 160),)
+
+    # The operator stops the loop; the counter stands still from here on.
+    settled = looping
+    for tick in range(1, int(WINDOW / TICK) + 2):
+        settled = settled.observe(
+            {"ollama.service": 160}, now=tick * TICK, window_seconds=WINDOW
+        )
+    snapshot = infra_monitor.evaluate_unit_health(
+        units, crash_loop_restarts=THRESHOLD, history=settled, window_seconds=WINDOW
+    )
+
+    assert snapshot.crash_loops == ()
+    report = infra_monitor.evaluate(
+        {}, None, minimum_active_workers=0, max_stalled_seconds=900,
+        prometheus_ready=True, unit_health=snapshot,
+    )
+    assert report.ok
+
+
+def test_restarts_spread_across_days_are_not_a_loop() -> None:
+    """A tunnel that reconnects now and then, a lane that rides out a database
+    blip: the same total, nowhere near the rate."""
+    day = 86400.0
+    history = _history(
+        *((index * day, {"voyn-aicc-pgtunnel.service": index}) for index in range(40))
+    )
+
+    snapshot = infra_monitor.evaluate_unit_health(
+        {"voyn-aicc-pgtunnel.service": infra_monitor.UnitState(39, "active")},
+        crash_loop_restarts=THRESHOLD,
+        history=history,
+        window_seconds=WINDOW,
+    )
+
+    assert snapshot.crash_loops == ()
+
+
+def test_an_operator_restart_rebaselines_instead_of_reporting_a_negative_gain() -> None:
+    looping = _looping("ollama.service", per_tick=40, ticks=5, end=0.0)
+    # `systemctl restart ollama` zeroes NRestarts; the series before it says
+    # nothing about the series after it.
+    after = looping.observe({"ollama.service": 0}, now=TICK, window_seconds=WINDOW)
+
+    assert after.gained("ollama.service") == 0
+    assert (
+        infra_monitor.evaluate_unit_health(
+            {"ollama.service": infra_monitor.UnitState(0, "active")},
+            crash_loop_restarts=THRESHOLD,
+            history=after,
+            window_seconds=WINDOW,
+        ).crash_loops
+        == ()
+    )
+    # And the loop is found again from the new baseline, not hidden by it.
+    relooping = after.observe({"ollama.service": 40}, now=2 * TICK, window_seconds=WINDOW)
+    assert relooping.gained("ollama.service") == 40
+
+
+def test_the_first_tick_measures_no_rate_and_the_next_one_does() -> None:
+    """One reading is not a rate. The cost is one tick (two minutes); a loop
+    running every 3 s clears any threshold inside that single tick."""
+    first = _history((0.0, {"ollama.service": 315891}))
+    assert first.gained("ollama.service") == 0
+
+    second = first.observe({"ollama.service": 315931}, now=TICK, window_seconds=WINDOW)
+    assert second.gained("ollama.service") == 40
+
+
 def test_crash_looping_template_instances_collapse_to_the_highest_count() -> None:
     show = "\n".join(
         [
             _show_block("aicc-agent-launcher@1-1-984.service", 7, "activating"),
-            _show_block("aicc-agent-launcher@2-2-984.service", 12, "activating"),
+            _show_block("aicc-agent-launcher@2-2-984.service", 40, "activating"),
             _show_block("aicc-agent-launcher@3-3-984.service", 5, "activating"),
         ]
     )
+    units = infra_monitor.parse_unit_show(show)
+    counters = infra_monitor.collapse_restart_counters(units)
+    assert counters == {"aicc-agent-launcher@*.service": 40}
+
+    history = _history((0.0, {"aicc-agent-launcher@*.service": 0}), (TICK, counters))
     snapshot = infra_monitor.evaluate_unit_health(
-        infra_monitor.parse_unit_show(show), crash_loop_restarts=5
+        units, crash_loop_restarts=THRESHOLD, history=history, window_seconds=WINDOW
     )
-    assert snapshot.crash_loops == (("aicc-agent-launcher@*.service", 12),)
+
+    assert snapshot.crash_loops == (("aicc-agent-launcher@*.service", 40),)
 
 
 def test_the_finding_detail_is_capped_not_unbounded() -> None:
-    show = "\n".join(
-        _show_block(f"svc{i}.service", 9, "activating")
-        for i in range(infra_monitor.UNIT_LISTING_CAP + 3)
+    names = [f"svc{i}.service" for i in range(infra_monitor.UNIT_LISTING_CAP + 3)]
+    show = "\n".join(_show_block(name, 25, "activating") for name in names)
+    history = _history(
+        (0.0, {name: 0 for name in names}), (TICK, {name: 25 for name in names})
     )
     snapshot = infra_monitor.evaluate_unit_health(
-        infra_monitor.parse_unit_show(show), crash_loop_restarts=5
+        infra_monitor.parse_unit_show(show),
+        crash_loop_restarts=THRESHOLD,
+        history=history,
+        window_seconds=WINDOW,
     )
     report = infra_monitor.evaluate(
         {}, None, minimum_active_workers=0, max_stalled_seconds=900,
@@ -987,27 +1141,30 @@ def test_the_finding_detail_is_capped_not_unbounded() -> None:
     (failure,) = report.failures
     assert failure.startswith(f"crash_loop:{infra_monitor.UNIT_LISTING_CAP + 3}:")
     assert failure.endswith(",+3_more")
-    assert failure.count("=9") == infra_monitor.UNIT_LISTING_CAP
+    assert failure.count("=+25") == infra_monitor.UNIT_LISTING_CAP
 
 
 def test_the_threshold_boundary_is_inclusive_and_a_few_restarts_are_not_a_loop() -> None:
-    show = "\n".join(
-        [
-            SHOW_HEALTHY,
-            SHOW_FEW_RESTARTS,
-            _show_block("exactly.service", 5, "active"),
-            _show_block("almost.service", 4, "active"),
-        ]
+    history = _history(
+        (0.0, {"exactly.service": 0, "almost.service": 0, "voyn-crm.service": 2}),
+        (TICK, {"exactly.service": 5, "almost.service": 4, "voyn-crm.service": 2}),
     )
+    units = {
+        "exactly.service": infra_monitor.UnitState(5, "active"),
+        "almost.service": infra_monitor.UnitState(4, "active"),
+        "voyn-crm.service": infra_monitor.UnitState(2, "active"),
+    }
     snapshot = infra_monitor.evaluate_unit_health(
-        infra_monitor.parse_unit_show(show), crash_loop_restarts=5
+        units, crash_loop_restarts=THRESHOLD, history=history, window_seconds=WINDOW
     )
     assert snapshot.crash_loops == (("exactly.service", 5),)
     assert snapshot.failed_units == ()
 
     quiet = infra_monitor.evaluate_unit_health(
-        infra_monitor.parse_unit_show(f"{SHOW_HEALTHY}\n{SHOW_FEW_RESTARTS}"),
-        crash_loop_restarts=5,
+        {"voyn-crm.service": infra_monitor.UnitState(2, "active")},
+        crash_loop_restarts=THRESHOLD,
+        history=_history((0.0, {"voyn-crm.service": 2}), (TICK, {"voyn-crm.service": 2})),
+        window_seconds=WINDOW,
     )
     assert quiet.crash_loops == () and quiet.failed_units == ()
     report = infra_monitor.evaluate(
@@ -1017,7 +1174,44 @@ def test_the_threshold_boundary_is_inclusive_and_a_few_restarts_are_not_a_loop()
     assert report.ok
 
     with pytest.raises(ValueError):
-        infra_monitor.evaluate_unit_health({}, crash_loop_restarts=0)
+        infra_monitor.evaluate_unit_health(
+            {},
+            crash_loop_restarts=0,
+            history=infra_monitor.RestartHistory(),
+            window_seconds=WINDOW,
+        )
+    with pytest.raises(ValueError):
+        infra_monitor.evaluate_unit_health(
+            {},
+            crash_loop_restarts=THRESHOLD,
+            history=infra_monitor.RestartHistory(),
+            window_seconds=0,
+        )
+
+
+def test_the_window_bounds_the_comparison_and_the_file_stays_bounded() -> None:
+    history = _history(
+        (0.0, {"svc.service": 0}),
+        (WINDOW, {"svc.service": 100}),
+        (2 * WINDOW, {"svc.service": 130}),
+    )
+
+    # The 0.0 sample is outside the window of the last tick, so the gain is
+    # measured from the only sample still inside it.
+    assert history.gained("svc.service") == 30
+    assert len(history.samples["svc.service"]) == 2
+
+    # A unit that vanished from the host leaves the file with it: per-connection
+    # launcher instances must not accumulate one entry per launch forever.
+    after = history.observe({"other.service": 1}, now=3 * WINDOW, window_seconds=WINDOW)
+    assert set(after.samples) == {"other.service"}
+
+    capped = infra_monitor.RestartHistory()
+    for index in range(infra_monitor.RESTART_SAMPLE_CAP + 50):
+        capped = capped.observe(
+            {"svc.service": index}, now=float(index), window_seconds=WINDOW
+        )
+    assert len(capped.samples["svc.service"]) == infra_monitor.RESTART_SAMPLE_CAP
 
 
 def test_unit_health_probe_failure_fails_closed() -> None:
@@ -1031,8 +1225,192 @@ def test_unit_health_probe_failure_fails_closed() -> None:
     assert any(f.startswith("unit_health_probe_failed:") for f in report.failures)
 
 
+def _systemctl_stub(counters: dict[str, int], calls: list[list[str]] | None = None):
+    """`systemctl list-units` + `show` over a fixed set of units."""
+
+    def _run(args, **_kwargs):
+        if calls is not None:
+            calls.append(args)
+        if args[1] == "list-units":
+            listing = "".join(f"  {unit} loaded active running D\n" for unit in counters)
+            return subprocess.CompletedProcess(args, 0, stdout=listing, stderr="")
+        assert args[1] == "show"
+        requested = args[args.index("--") + 1 :]
+        return subprocess.CompletedProcess(
+            args,
+            0,
+            stdout="\n".join(
+                _show_block(unit, counters[unit], "activating") for unit in requested
+            ),
+            stderr="",
+        )
+
+    return _run
+
+
+def test_the_probe_remembers_the_previous_tick_through_its_state_file(
+    monkeypatch, tmp_path
+) -> None:
+    state = tmp_path / "state" / "unit-restarts.json"
+
+    monkeypatch.setattr(
+        infra_monitor.subprocess, "run", _systemctl_stub({"ollama.service": 315851})
+    )
+    first = infra_monitor.read_unit_health_snapshot(
+        crash_loop_restarts=THRESHOLD, state_path=state, window_seconds=WINDOW, now=0.0
+    )
+    assert first.error is None and first.crash_loops == ()
+    assert json.loads(state.read_text())["units"]["ollama.service"] == [[0.0, 315851]]
+
+    monkeypatch.setattr(
+        infra_monitor.subprocess, "run", _systemctl_stub({"ollama.service": 315891})
+    )
+    second = infra_monitor.read_unit_health_snapshot(
+        crash_loop_restarts=THRESHOLD, state_path=state, window_seconds=WINDOW, now=TICK
+    )
+
+    assert second.crash_loops == (("ollama.service", 40),)
+    assert second.window_seconds == WINDOW
+
+
+def test_a_corrupt_state_file_costs_one_window_but_an_unwritable_one_fails_closed(
+    monkeypatch, tmp_path
+) -> None:
+    state = tmp_path / "unit-restarts.json"
+    state.write_text("{not json")
+    monkeypatch.setattr(
+        infra_monitor.subprocess, "run", _systemctl_stub({"ollama.service": 315891})
+    )
+
+    # Tolerated: this tick rewrites the file, so the next one has a baseline.
+    recovered = infra_monitor.read_unit_health_snapshot(
+        crash_loop_restarts=THRESHOLD, state_path=state, window_seconds=WINDOW, now=0.0
+    )
+    assert recovered.error is None
+    assert json.loads(state.read_text())["units"]["ollama.service"] == [[0.0, 315891]]
+
+    # Not tolerated: a probe that cannot leave a baseline behind would report
+    # "no crash loops" on every future tick and never know it was blind.
+    blocked = tmp_path / "read-only" / "unit-restarts.json"
+    blocked.parent.mkdir()
+    blocked.parent.chmod(0o500)
+    try:
+        snapshot = infra_monitor.read_unit_health_snapshot(
+            crash_loop_restarts=THRESHOLD, state_path=blocked, window_seconds=WINDOW, now=0.0
+        )
+    finally:
+        blocked.parent.chmod(0o700)
+    assert snapshot.error is not None and snapshot.crash_loops == ()
+    report = infra_monitor.evaluate(
+        {}, None, minimum_active_workers=0, max_stalled_seconds=900,
+        prometheus_ready=True, unit_health=snapshot,
+    )
+    assert any(f.startswith("unit_health_probe_failed:") for f in report.failures)
+
+
+def test_the_state_path_comes_from_the_units_state_directory(monkeypatch) -> None:
+    """systemd exports a colon-separated list; the first entry is this unit's
+    own state root, and nothing else on the monitor's filesystem is writable."""
+    monkeypatch.setenv("STATE_DIRECTORY", "/var/lib/voyn-infra-monitor:/var/lib/other")
+    assert (
+        infra_monitor.default_crash_loop_state()
+        == "/var/lib/voyn-infra-monitor/unit-restarts.json"
+    )
+
+    monkeypatch.delenv("STATE_DIRECTORY", raising=False)
+    assert infra_monitor.default_crash_loop_state() == ""
+
+
+def test_a_unit_file_older_than_the_code_does_not_blind_the_whole_monitor(
+    monkeypatch, capsys
+) -> None:
+    """The regression that guards the rate fix's own deploy.
+
+    `--crash-loop-state` does not come from the ExecStart line -- it comes from
+    the unit's `StateDirectory=`, in `/etc/systemd/system`, which self-deploy
+    never touches: it fast-forwards the checkout ExecStart runs from and stops
+    there. So every host runs new code against an old unit file until an
+    operator reinstalls it. Refusing to start there (argparse exit 2, no JSON,
+    no findings recorded) would take the worker, queue, Prometheus, deploy-lag
+    and PR-window probes down with the rate half and leave the host measured by
+    nothing at all -- strictly worse than the lifetime-counter bug this branch
+    set out to fix, and the acceptance it is judged by ("the monitor reports ok
+    for 24h") unreachable either way.
+
+    So: the tick runs, every other probe reports, the failed-unit half still
+    reports (it needs no memory), and the rate half says it did not measure --
+    under its OWN failure code, never `crash_loop`, which an operator reads as
+    a real looping unit.
+    """
+    monkeypatch.delenv("STATE_DIRECTORY", raising=False)
+    monkeypatch.setattr(infra_monitor, "prometheus_is_ready", lambda _url: True)
+    monkeypatch.setattr(
+        infra_monitor.subprocess,
+        "run",
+        _systemctl_stub({"ollama.service": 315891, "voyn-canary.service": 70305}),
+    )
+
+    args = infra_monitor.parse_args(
+        ["--prometheus-url", "http://m/ready", "--unit-health"]
+    )
+    assert args.crash_loop_state == ""
+
+    result = infra_monitor.main(
+        [
+            "--skip-workers", "--skip-queue", "--minimum-active-workers", "0",
+            "--prometheus-url", "http://m/ready",
+            "--unit-health",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert result == 1
+    assert payload["prometheus_ready"] is True
+    # Unmeasured is its own class, and it never masquerades as a measured loop.
+    assert payload["unit_health"]["crash_loops"] == []
+    assert [f.split(":", 1)[0] for f in payload["failures"]] == [
+        "crash_loop_unmeasured"
+    ]
+    assert infra_monitor.finding_key(payload["failures"][0]) == "crash_loop_unmeasured"
+    assert "daemon-reload" in payload["failures"][0]
+
+
+def test_without_a_state_path_the_failed_unit_half_still_reports() -> None:
+    """Failed units need no memory of the previous tick, so a stale unit file
+    must not cost them either."""
+    units = {
+        "ollama.service": infra_monitor.UnitState(restarts=315891, active_state="failed")
+    }
+    snapshot = infra_monitor.evaluate_unit_health(
+        units, crash_loop_restarts=THRESHOLD, history=None, window_seconds=WINDOW
+    )
+
+    assert snapshot.crash_loops == ()
+    assert snapshot.failed_units == (("ollama.service", 1),)
+    assert snapshot.crash_loop_error == infra_monitor.CRASH_LOOP_STATE_UNSET
+
+    report = infra_monitor.evaluate(
+        {}, None, minimum_active_workers=0, max_stalled_seconds=900,
+        prometheus_ready=True, unit_health=snapshot,
+    )
+    assert [f.split(":", 1)[0] for f in report.failures] == [
+        "failed_units",
+        "crash_loop_unmeasured",
+    ]
+
+
+def test_the_monitor_unit_gives_the_crash_loop_probe_somewhere_to_remember() -> None:
+    """ProtectSystem=strict, ProtectHome=read-only and PrivateTmp leave the
+    tick no writable path at all without this."""
+    unit = Path("deploy/systemd/voyn-infra-monitor.service").read_text()
+
+    assert "StateDirectory=voyn-infra-monitor" in unit
+    assert "--unit-health" in unit
+    assert "--crash-loop-restarts 5" in unit
+
+
 def test_unit_health_snapshot_asks_systemctl_for_every_service_and_never_raises(
-    monkeypatch,
+    monkeypatch, tmp_path
 ) -> None:
     calls: list[list[str]] = []
 
@@ -1057,10 +1435,12 @@ def test_unit_health_snapshot_asks_systemctl_for_every_service_and_never_raises(
             args, 0, stdout="\n".join(blocks[u] for u in requested), stderr=""
         )
 
+    state = tmp_path / "unit-restarts.json"
     monkeypatch.setattr(infra_monitor.subprocess, "run", _run)
-    snapshot = infra_monitor.read_unit_health_snapshot(crash_loop_restarts=5)
+    snapshot = infra_monitor.read_unit_health_snapshot(
+        crash_loop_restarts=THRESHOLD, state_path=state, window_seconds=WINDOW
+    )
     assert snapshot.error is None
-    assert snapshot.crash_loops == (("ollama.service", 315891),)
     assert snapshot.failed_units == (("aicc-agent-launcher@*.service", 2),)
     listing, show = calls
     assert listing[:2] == ["systemctl", "list-units"]
@@ -1074,18 +1454,26 @@ def test_unit_health_snapshot_asks_systemctl_for_every_service_and_never_raises(
         raise OSError("no systemctl")
 
     monkeypatch.setattr(infra_monitor.subprocess, "run", _boom)
-    failed = infra_monitor.read_unit_health_snapshot(crash_loop_restarts=5)
+    failed = infra_monitor.read_unit_health_snapshot(
+        crash_loop_restarts=THRESHOLD, state_path=state, window_seconds=WINDOW
+    )
     assert failed.error is not None and "no systemctl" in failed.error
 
 
-def test_a_unit_that_show_silently_drops_is_a_failed_measurement(monkeypatch) -> None:
+def test_a_unit_that_show_silently_drops_is_a_failed_measurement(
+    monkeypatch, tmp_path
+) -> None:
     def _run(args, **_kwargs):
         if args[1] == "list-units":
             return subprocess.CompletedProcess(args, 0, stdout=LIST_UNITS_REAL, stderr="")
         return subprocess.CompletedProcess(args, 0, stdout=SHOW_HEALTHY, stderr="")
 
     monkeypatch.setattr(infra_monitor.subprocess, "run", _run)
-    snapshot = infra_monitor.read_unit_health_snapshot(crash_loop_restarts=5)
+    snapshot = infra_monitor.read_unit_health_snapshot(
+        crash_loop_restarts=THRESHOLD,
+        state_path=tmp_path / "unit-restarts.json",
+        window_seconds=WINDOW,
+    )
     assert snapshot.error is not None and "1 of 5" in snapshot.error
     report = infra_monitor.evaluate(
         {}, None, minimum_active_workers=0, max_stalled_seconds=900,
@@ -1269,14 +1657,21 @@ def test_a_half_configured_deploy_lag_probe_is_a_usage_error() -> None:
         infra_monitor.parse_args(["--prometheus-url", "http://m/ready", "--crash-loop-restarts", "0"])
 
 
-def test_main_reports_the_host_probes_when_enabled(monkeypatch, capsys) -> None:
+def test_main_reports_the_host_probes_when_enabled(monkeypatch, capsys, tmp_path) -> None:
     monkeypatch.setattr(infra_monitor, "prometheus_is_ready", lambda _url: True)
-    monkeypatch.setattr(
-        infra_monitor, "read_unit_health_snapshot",
-        lambda crash_loop_restarts: infra_monitor.UnitHealthSnapshot(
-            crash_loops=(("ollama.service", 315891),), failed_units=()
-        ),
-    )
+    seen: dict[str, object] = {}
+
+    def _unit_health(*, crash_loop_restarts, state_path, window_seconds):
+        seen.update(
+            restarts=crash_loop_restarts, state=state_path, window=window_seconds
+        )
+        return infra_monitor.UnitHealthSnapshot(
+            crash_loops=(("ollama.service", 40),),
+            failed_units=(),
+            window_seconds=window_seconds,
+        )
+
+    monkeypatch.setattr(infra_monitor, "read_unit_health_snapshot", _unit_health)
     monkeypatch.setattr(
         infra_monitor, "read_deploy_lag_snapshot",
         lambda repo, url, branch, grace_seconds: _lag(repo=repo, branch=branch, grace_seconds=grace_seconds),
@@ -1286,12 +1681,19 @@ def test_main_reports_the_host_probes_when_enabled(monkeypatch, capsys) -> None:
             "--skip-workers", "--skip-queue", "--minimum-active-workers", "0",
             "--prometheus-url", "http://m/ready",
             "--unit-health",
+            "--crash-loop-state", str(tmp_path / "unit-restarts.json"),
             "--deploy-lag-repo", "voyn88/voyn-logistics-crm",
             "--deploy-lag-version-url", "http://127.0.0.1:8089/version",
         ]
     )
     payload = json.loads(capsys.readouterr().out)
-    assert payload["unit_health"]["crash_loops"] == [["ollama.service", 315891]]
+    assert seen == {
+        "restarts": 5,
+        "state": Path(tmp_path / "unit-restarts.json"),
+        "window": 3600.0,
+    }
+    assert payload["unit_health"]["crash_loops"] == [["ollama.service", 40]]
+    assert payload["unit_health"]["window_seconds"] == 3600.0
     assert payload["deploy_lag"]["lagging"] is True
     assert payload["deploy_lag"]["undeployed_commits"] == 6
     assert any(f.startswith("crash_loop:") for f in payload["failures"])
