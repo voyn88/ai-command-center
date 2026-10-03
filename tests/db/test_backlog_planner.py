@@ -1327,3 +1327,346 @@ def test_open_monitor_findings_become_pipeline_tasks_once(rig) -> None:
         with conn.cursor() as cur:
             cur.execute("SELECT monitor_clear_finding(%s)", ("worker-01:infra",))
             assert cur.fetchone()[0] == 1
+
+
+# ---------------------------------------------------------------------------
+# VOYN-W0-AICC-AUDIT-ROLLBACK-CLASS — a refusal is data, not an exception
+# ---------------------------------------------------------------------------
+# Migration 0025 removed the `RAISE`s from `backlog_dispatch` and
+# `backlog_ingest_results`. Both were on paths their own comments called
+# unreachable, and both were reachable enough to erase a tick's audit: the
+# exception aborts the caller's transaction, and the refusal row goes with it.
+#
+# Every refusal path below is therefore reached by FAULT INJECTION rather than
+# by argument: `backlog_transition` is replaced, in this test's own throwaway
+# database, with a stub that refuses. That is the only honest way to test a
+# path the row lock otherwise makes unreachable — and "unreachable" is exactly
+# the claim a future edit invalidates without noticing.
+
+
+def _refuse_transitions(admin_conn) -> None:
+    """Replace `backlog_transition` with one that refuses every transition.
+
+    Per-test database (see `conftest`), so there is nothing to restore.
+    """
+    admin_conn.execute(
+        "CREATE OR REPLACE FUNCTION backlog_transition("
+        "    p_task_id text, p_to_status text, p_expected_revision bigint"
+        ") RETURNS backlog_verdict"
+        "    LANGUAGE plpgsql VOLATILE SECURITY DEFINER"
+        "    SET search_path = pg_catalog, public AS $stub$"
+        "DECLARE v backlog_verdict;"
+        "BEGIN"
+        "    v.ok := false; v.reason := 'injected_refusal';"
+        "    RETURN v;"
+        "END"
+        "$stub$;"
+    )
+
+
+def _last_event(app_factory, task_id: str, event: str):
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT outcome, reason, detail FROM backlog_event "
+                "WHERE task_id = %s AND event = %s ORDER BY event_id DESC LIMIT 1",
+                (task_id, event),
+            )
+            return cur.fetchone()
+
+
+def _lease_count(app_factory, repo: str) -> int:
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) FROM backlog_writer_lease WHERE authority = %s",
+                ("repo:" + repo,),
+            )
+            return cur.fetchone()[0]
+
+
+def test_a_refused_dispatch_transition_is_recorded_instead_of_raised(
+    rig, admin_conn
+) -> None:
+    """The measurement, on the dispatch path: 1 audit row, not 0.
+
+    Before 0025 this raised `dispatch transition refused`, which aborted the
+    caller's transaction and took with it the lease-acquire audit, the refusal
+    itself, and anything else the caller had written in the same transaction.
+    """
+    app_factory, store, _worker = rig
+    assert store.upsert_task(_task("VOYN-W0-TR", repo="repo-tr"))[0]
+    _refuse_transitions(admin_conn)
+
+    ok, reason, work_item_id, _revision = _dispatch(app_factory, "VOYN-W0-TR")
+    assert not ok and reason == "transition_refused" and work_item_id is None
+
+    outcome, audit_reason, detail = _last_event(app_factory, "VOYN-W0-TR", "dispatch")
+    assert (outcome, audit_reason) == ("rejected", "transition_refused")
+    assert detail["transition_reason"] == "injected_refusal"
+    # The transition is attempted BEFORE the enqueue, so a refusal leaves no
+    # work item to reap and no queue audit to erase.
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM work_item_public")
+            assert cur.fetchone()[0] == 0
+    assert store.get_task("VOYN-W0-TR")["status"] == "OPEN"
+    # Nothing else in this repository is in flight, so the compensation runs.
+    assert detail["lease_released"] is True
+    assert _lease_count(app_factory, "repo-tr") == 0
+
+
+def test_dispatch_compensation_keeps_a_lease_another_task_is_still_using(
+    rig, admin_conn
+) -> None:
+    """The lease is REPOSITORY-scoped, and one planner may hold it across more
+    than one dispatched task in that repository. Compensating a refused
+    dispatch by releasing it unconditionally would hand the repository of a
+    task that is still running to a second writer -- the exact hazard the
+    lease exists to prevent, reintroduced by the fix for the audit.
+    """
+    app_factory, store, _worker = rig
+    assert store.upsert_task(_task("VOYN-W0-S1", repo="repo-sib"))[0]
+    assert store.upsert_task(_task("VOYN-W0-S2", repo="repo-sib"))[0]
+    assert _dispatch(app_factory, "VOYN-W0-S1", planner="planner-a")[0]
+    assert store.get_task("VOYN-W0-S1")["status"] == "IN_PROGRESS"
+
+    _refuse_transitions(admin_conn)
+    ok, reason, *_ = _dispatch(app_factory, "VOYN-W0-S2", planner="planner-a")
+    assert not ok and reason == "transition_refused"
+
+    _outcome, _reason, detail = _last_event(app_factory, "VOYN-W0-S2", "dispatch")
+    assert detail["lease_released"] is False
+    assert detail["lease_release_reason"] == "repo_has_in_flight_task"
+    assert _lease_count(app_factory, "repo-sib") == 1, "S1 is still running"
+    assert store.get_task("VOYN-W0-S1")["status"] == "IN_PROGRESS"
+    # And the retained lease still refuses a second planner, which is the
+    # property the release would have destroyed.
+    ok, reason, *_ = _dispatch(app_factory, "VOYN-W0-S2", planner="planner-b")
+    assert not ok and reason == "repo_busy"
+
+
+def test_one_poisoned_ingest_row_costs_one_row_and_leaves_its_record(
+    rig, admin_conn
+) -> None:
+    """A refused transition inside the ingest loop used to raise, which rolled
+    back the WHOLE tick: every task already ingested lost its audit and its
+    state change. Now it is one `refused` row, recorded, and the loop goes on.
+    """
+    app_factory, store, worker = rig
+    assert store.upsert_task(_task("VOYN-W0-P1", repo="repo-poison"))[0]
+    assert store.upsert_task(_task("VOYN-W0-P2", repo="repo-clean"))[0]
+
+    assert _dispatch(app_factory, "VOYN-W0-P1")[0]
+    _complete_latest(
+        app_factory, worker, "VOYN-W0-P1",
+        {"status": "completed", "pr_url": "https://github.com/o/r/pull/11",
+         "head_sha": "abc123"},
+    )
+    assert _dispatch(app_factory, "VOYN-W0-P2")[0]
+    _complete_latest(app_factory, worker, "VOYN-W0-P2", {"status": "completed"})
+
+    # Only the PR-bearing task reaches `backlog_transition`; the other one goes
+    # through `backlog_return_to_pool`, so injecting here poisons exactly one
+    # row of the batch.
+    _refuse_transitions(admin_conn)
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM backlog_ingest_results(%s)", ("planner-t",))
+            rows = {r[0]: r[2] for r in cur.fetchall()}
+    assert rows == {"VOYN-W0-P1": "refused", "VOYN-W0-P2": "returned_to_pool"}
+
+    outcome, reason, detail = _last_event(app_factory, "VOYN-W0-P1", "ingest")
+    assert (outcome, reason) == ("rejected", "transition_refused")
+    assert detail["transition_reason"] == "injected_refusal"
+    # The poisoned task keeps its writer: it is still IN_PROGRESS.
+    assert store.get_task("VOYN-W0-P1")["status"] == "IN_PROGRESS"
+    assert detail["lease_released"] is False
+    assert _lease_count(app_factory, "repo-poison") == 1
+    # The clean task in the same batch kept its result AND its audit.
+    assert store.get_task("VOYN-W0-P2")["status"] == "OPEN"
+    assert _last_event(app_factory, "VOYN-W0-P2", "ingest")[0] == "granted"
+    assert _lease_count(app_factory, "repo-clean") == 0
+
+
+def test_ingest_keeps_the_repository_lease_while_a_sibling_is_in_flight(
+    rig,
+) -> None:
+    """Leases are repository-scoped and renewable by the same planner, so a
+    finished task must not release the lease that is protecting a task still
+    running in the same repository -- otherwise a second writer is admitted
+    while the first is mid-run. An idle repository still releases.
+    """
+    app_factory, store, worker = rig
+    assert store.upsert_task(_task("VOYN-W0-F1", repo="repo-two"))[0]
+    assert store.upsert_task(_task("VOYN-W0-F2", repo="repo-two"))[0]
+
+    assert _dispatch(app_factory, "VOYN-W0-F1", planner="planner-a")[0]
+    _complete_latest(app_factory, worker, "VOYN-W0-F1", {"status": "completed"})
+    assert _dispatch(app_factory, "VOYN-W0-F2", planner="planner-a")[0]
+
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM backlog_ingest_results(%s)", ("planner-a",))
+            assert [(r[0], r[2]) for r in cur.fetchall()] == [
+                ("VOYN-W0-F1", "returned_to_pool")
+            ]
+    _outcome, _reason, detail = _last_event(app_factory, "VOYN-W0-F1", "ingest")
+    assert detail["lease_released"] is False
+    assert detail["lease_release_reason"] == "repo_has_in_flight_task"
+    assert _lease_count(app_factory, "repo-two") == 1
+    ok, reason, *_ = _dispatch(app_factory, "VOYN-W0-F1", planner="planner-b")
+    assert not ok and reason == "repo_busy", "F2 is still running in repo-two"
+
+    # F2 finishes: the repository is idle, and now the lease goes.
+    _complete_latest(app_factory, worker, "VOYN-W0-F2", {"status": "completed"})
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM backlog_ingest_results(%s)", ("planner-a",))
+            assert [(r[0], r[2]) for r in cur.fetchall()] == [
+                ("VOYN-W0-F2", "returned_to_pool")
+            ]
+    _outcome, _reason, detail = _last_event(app_factory, "VOYN-W0-F2", "ingest")
+    assert detail["lease_released"] is True
+    assert _lease_count(app_factory, "repo-two") == 0
+
+
+def test_set_task_class_refuses_an_invalid_class_as_data(rig) -> None:
+    """The raise here aborted the planner's whole tick -- including the ingest
+    batch it had just recorded -- to reject one string."""
+    app_factory, store, _worker = rig
+    assert store.upsert_task(_task("VOYN-W0-CL", repo="repo-class"))[0]
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT backlog_set_task_class(%s, %s)", ("VOYN-W0-CL", "nonsense"))
+            assert cur.fetchone()[0] is False
+            # The same connection is still usable: nothing was aborted.
+            cur.execute("SELECT 1")
+            assert cur.fetchone()[0] == 1
+    outcome, reason, detail = _last_event(app_factory, "VOYN-W0-CL", "task_class")
+    assert (outcome, reason) == ("rejected", "invalid_class")
+    assert detail["requested_class"] == "nonsense"
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT task_class FROM backlog_task WHERE task_id = %s", ("VOYN-W0-CL",)
+            )
+            assert cur.fetchone()[0] == "functional"
+
+
+def test_a_refused_dispatch_cannot_release_a_lease_a_concurrent_one_just_took(
+    rig, admin_conn, psycopg, test_dsn, role_passwords
+) -> None:
+    """The compensation, under the concurrency it exists in.
+
+    Two dispatches, two tasks, ONE repository, one planner -- the arrangement
+    the protocol explicitly supports. A flag captured before the acquire ("was
+    this lease already mine?") answers at a moment the acquire then
+    invalidates: under READ COMMITTED both calls can read "not mine", one
+    commits a fresh take, and the other -- still holding a stale `false` --
+    releases the lease out from under a task that is still running.
+
+    Here the running dispatch has NOT committed when the second one starts, so
+    the second is at the point of maximum staleness. It queues on the lease
+    row (the acquire's own `FOR UPDATE`, or the unique index on the row being
+    inserted), and the idle check that decides the compensation runs after that
+    lock, in a fresh snapshot, where the committed sibling is visible.
+    """
+    import threading
+
+    app_factory, store, _worker = rig
+    assert store.upsert_task(_task("VOYN-W0-C1", repo="repo-race"))[0]
+    assert store.upsert_task(_task("VOYN-W0-C2", repo="repo-race"))[0]
+    app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
+
+    holder = psycopg.connect(app_dsn, autocommit=False)
+    try:
+        with holder.cursor() as cur:
+            cur.execute(
+                "SELECT ok FROM backlog_dispatch(%s, %s, 3600, 4, %s::jsonb, 3)",
+                ("VOYN-W0-C1", "planner-race", "{}"),
+            )
+            assert cur.fetchone()[0] is True
+        # C1 holds the lease and its IN_PROGRESS row, both UNCOMMITTED.
+        _refuse_transitions(admin_conn)
+
+        outcome: dict[str, object] = {}
+
+        def dispatch_c2() -> None:
+            try:
+                with psycopg.connect(app_dsn, autocommit=True) as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT ok, reason FROM backlog_dispatch(%s, %s, 3600, 4, %s::jsonb, 3)",
+                            ("VOYN-W0-C2", "planner-race", "{}"),
+                        )
+                        outcome["row"] = cur.fetchone()
+            except Exception as error:  # noqa: BLE001 — reported by the assertions
+                outcome["error"] = error
+
+        second = threading.Thread(target=dispatch_c2, daemon=True)
+        second.start()
+        second.join(timeout=1.0)
+        assert second.is_alive(), (
+            "the second dispatch must queue on the lease row rather than decide "
+            f"anything from a pre-acquire snapshot (outcome so far: {outcome})"
+        )
+
+        holder.commit()
+    finally:
+        holder.close()
+
+    second.join(timeout=30)
+    assert not second.is_alive(), "the second dispatch never unblocked"
+    assert "error" not in outcome, outcome.get("error")
+    assert outcome["row"] == (False, "transition_refused")
+
+    assert store.get_task("VOYN-W0-C1")["status"] == "IN_PROGRESS"
+    assert _lease_count(app_factory, "repo-race") == 1, (
+        "the refused dispatch released the lease the committed one is using"
+    )
+    _outcome, _reason, detail = _last_event(app_factory, "VOYN-W0-C2", "dispatch")
+    assert detail["lease_released"] is False
+    assert detail["lease_release_reason"] == "repo_has_in_flight_task"
+
+
+def test_migration_0025_is_reversible_without_residue(pg_connection_factory) -> None:
+    """Live up -> down -> up on the exact function bodies, the same pin this
+    suite keeps on 0009/0011/0012: the down restores the raising definitions
+    and drops the compensation helper, and the second up removes them again.
+    A no-op down would leave a database that still erases its own refusal
+    audit while the ledger reported 0025 reverted."""
+    from command_center.db import migrations
+
+    def prosrc(conn, name: str) -> str:
+        with conn.cursor() as cur:
+            cur.execute("SELECT prosrc FROM pg_proc WHERE proname = %s", (name,))
+            return cur.fetchone()[0]
+
+    def helpers(conn) -> int:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) FROM pg_proc WHERE proname = %s",
+                ("_backlog_lease_release_if_idle",),
+            )
+            return cur.fetchone()[0]
+
+    with pg_connection_factory() as conn:
+        migrations.upgrade(conn)
+        for name in ("backlog_dispatch", "backlog_ingest_results",
+                     "backlog_split_task", "backlog_set_task_class"):
+            assert "RAISE EXCEPTION" not in prosrc(conn, name), name
+        assert "transition_refused" in prosrc(conn, "backlog_dispatch")
+        assert helpers(conn) == 1
+
+        migrations.downgrade(conn, target=24)
+        for name in ("backlog_dispatch", "backlog_ingest_results",
+                     "backlog_split_task", "backlog_set_task_class"):
+            assert "RAISE EXCEPTION" in prosrc(conn, name), name
+        assert helpers(conn) == 0
+
+        migrations.upgrade(conn)  # must not raise 'already exists'
+        for name in ("backlog_dispatch", "backlog_ingest_results",
+                     "backlog_split_task", "backlog_set_task_class"):
+            assert "RAISE EXCEPTION" not in prosrc(conn, name), name
+        assert helpers(conn) == 1
