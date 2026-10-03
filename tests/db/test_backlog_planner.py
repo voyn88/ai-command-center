@@ -489,6 +489,33 @@ def test_migration_0012_is_reversible_without_residue(pg_connection_factory) -> 
             assert "v_technical" in cur.fetchone()[0]
 
 
+def test_migration_0018_is_reversible_without_residue(pg_connection_factory) -> None:
+    """Live up->down->up pins the publish-prep coverage to migration 0018.
+    Downgrading to 0017 must restore 0012's narrower allowlist, and the
+    second upgrade must reapply the agent_worktree_clean coverage."""
+    from command_center.db import migrations
+
+    with pg_connection_factory() as conn:
+        migrations.upgrade(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT prosrc FROM pg_proc WHERE proname = 'backlog_return_to_pool'"
+            )
+            assert "agent_worktree_clean" in cur.fetchone()[0]
+        migrations.downgrade(conn, target=17)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT prosrc FROM pg_proc WHERE proname = 'backlog_return_to_pool'"
+            )
+            assert "agent_worktree_clean" not in cur.fetchone()[0]
+        migrations.upgrade(conn)  # must not raise 'already exists'
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT prosrc FROM pg_proc WHERE proname = 'backlog_return_to_pool'"
+            )
+            assert "agent_worktree_clean" in cur.fetchone()[0]
+
+
 def test_migration_0011_is_reversible_without_residue(pg_connection_factory) -> None:
     """Live up->down->up on the exact function body, same pin as 0009's own
     test: down restores 0009's (pr-not-required) definition, up reapplies
@@ -573,6 +600,91 @@ def test_second_cascade_exhaustion_parks_for_the_owner(rig) -> None:
             )
             reasons = [r[0] for r in cur.fetchall()]
     assert len(reasons) == 2 and all(r.startswith("cascade_exhausted") for r in reasons)
+
+
+def _classify(app_factory, store, task_id, reason) -> str:
+    """Dispatch, then call `backlog_return_to_pool` directly with `reason`,
+    returning the resulting task status. Isolates the v_technical
+    classifier itself from the full worker/queue exhaustion plumbing --
+    same pattern as `_repark` above, reused across as many rounds as a
+    test needs."""
+    assert _dispatch(app_factory, task_id)[0]
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT ok FROM backlog_return_to_pool(%s, %s)", (task_id, reason))
+            assert cur.fetchone()[0]
+    return store.get_task(task_id)["status"]
+
+
+def test_guarded_publish_prep_exhaustion_stays_operational_every_round(rig) -> None:
+    """A dirty-worktree cascade exhaustion at guarded publish prep
+    (agent_worktree_clean / uncommitted_changes) is an operational retry,
+    never an owner decision (VOYN-W0-AICC-DEFER-RESUME-COVER-PUBLISH-PREP-
+    REM). Unlike a generic exhaustion, it must return to OPEN on every
+    round -- round 3+ included -- because v_technical bypasses the
+    v_prior >= 1 circuit breaker entirely; a test that only checked two
+    rounds could not tell this apart from merely delaying the park by one
+    round (the gap flagged rejecting PR #678 at 0766675e)."""
+    app_factory, store, _worker = rig
+    task_id = "VOYN-W0-GP"
+    assert store.upsert_task(_task(task_id, repo="repo-pk"))[0]
+    reason = (
+        "cascade_exhausted: max_attempts_exhausted: guarded publish "
+        "preparation failed at agent_worktree_clean: uncommitted_changes: "
+        "M command_center/foo.py"
+    )
+    for round_no in range(1, 5):
+        assert _classify(app_factory, store, task_id, reason) == "OPEN", f"round {round_no}"
+
+
+def test_local_checkpoint_exhaustion_stays_operational(rig) -> None:
+    """The local-only-publish variant of the same guard
+    (`local task checkpoint failed at agent_worktree_clean: ...`, raised
+    when AICC_PUBLISH_DEPLOY_KEY is unset) is the identical
+    WorkspaceVerificationError under a different message prefix -- also
+    never an owner decision."""
+    app_factory, store, _worker = rig
+    task_id = "VOYN-W0-LC"
+    assert store.upsert_task(_task(task_id, repo="repo-pk"))[0]
+    reason = (
+        "cascade_exhausted: max_attempts_exhausted: local task checkpoint "
+        "failed at agent_worktree_clean: uncommitted_changes: M foo.py"
+    )
+    for round_no in range(1, 4):
+        assert _classify(app_factory, store, task_id, reason) == "OPEN", f"round {round_no}"
+
+
+def test_visibility_timeout_exhaustion_stays_operational(rig) -> None:
+    """queue_reap's dead-letter (a worker that died or stalled past its
+    lease) is a single fixed literal with no caller content ever
+    interpolated in -- also always operational, never an owner decision."""
+    app_factory, store, _worker = rig
+    task_id = "VOYN-W0-VT"
+    assert store.upsert_task(_task(task_id, repo="repo-pk"))[0]
+    reason = "cascade_exhausted: visibility_timeout_exhausted"
+    for round_no in range(1, 4):
+        assert _classify(app_factory, store, task_id, reason) == "OPEN", f"round {round_no}"
+
+
+def test_unrelated_retryable_exhaustion_still_parks_for_the_owner(rig) -> None:
+    """The circuit breaker must still fire for an exhaustion the allowlist
+    does not name: a task broken for some unrelated reason, whose failure
+    happens to be marked retryable and therefore shares the queue's generic
+    `max_attempts_exhausted:` wrapper with the publish-prep case, must still
+    reach DEFER_TO_USER on its second cascade -- not spin OPEN -> fail ->
+    OPEN forever with no escalation to a human. (Review of PR #678 at
+    0766675e: matching the generic wrapper prefix alone, instead of the
+    specific publish-prep failure signature, would have exempted the
+    queue's entire retryable-failure vocabulary from this breaker.)"""
+    app_factory, store, _worker = rig
+    task_id = "VOYN-W0-UR"
+    assert store.upsert_task(_task(task_id, repo="repo-pk"))[0]
+    reason = (
+        "cascade_exhausted: max_attempts_exhausted: mystery bug: "
+        "'NoneType' object has no attribute 'x'"
+    )
+    assert _classify(app_factory, store, task_id, reason) == "OPEN"
+    assert _classify(app_factory, store, task_id, reason) == "DEFER_TO_USER"
 
 
 def test_return_to_pool_refuses_outside_in_progress(rig) -> None:
