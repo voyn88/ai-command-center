@@ -104,6 +104,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Parse and report without touching the database.",
     )
+    imp.add_argument(
+        "--backfill-provenance",
+        action="store_true",
+        help="Stamp rows this file names that carry no provenance event "
+        "(rows migrated before the stamp was written with the insert); "
+        "reconcile only, no upserts.",
+    )
     sub.add_parser("backlog-status", help="Task counts by status from the store.")
     export = sub.add_parser(
         "backlog-export",
@@ -487,7 +494,10 @@ def main(argv: list[str] | None = None) -> int:
                 from pathlib import Path
 
                 from command_center.db.backlog_parser import parse_backlog
-                from command_center.db.backlog_store import BacklogStore
+                from command_center.db.backlog_store import (
+                    BacklogStore,
+                    ProvenanceNotRecorded,
+                )
 
                 text = Path(args.path).read_text(encoding="utf-8")
                 if args.parse_only:
@@ -497,7 +507,25 @@ def main(argv: list[str] | None = None) -> int:
                         print(f"UNPARSED line {line_no}: {reason} :: {excerpt}")
                     print(f"unparsed: {len(parsed.unparsed)} lines")
                     return 0
-                report = BacklogStore(lambda: nullcontext(conn)).import_markdown(text)
+                store = BacklogStore(lambda: nullcontext(conn))
+                if args.backfill_provenance:
+                    # The operator's lever for rows 0025 cannot reach
+                    # retroactively: an import finds them `unchanged` and so
+                    # never stamps them, however many times it is re-run.
+                    stamped = store.backfill_markdown_provenance(text)
+                    for task_id in stamped:
+                        print(f"STAMPED {task_id}: markdown_import_backfill")
+                    print(f"backfilled {len(stamped)} record(s)")
+                    return 0
+                try:
+                    report = store.import_markdown(text)
+                except ProvenanceNotRecorded as exc:
+                    # Never a partial success: the run stopped at the first
+                    # row that was created without the audit record the
+                    # migration gate requires, and the count printed above
+                    # this line would have claimed otherwise.
+                    print(f"ABORTED at {exc.task_id}: {exc}", file=sys.stderr)
+                    return 1
                 print(
                     f"inserted {report.inserted}, updated {report.updated}, "
                     f"unchanged {report.unchanged}"
