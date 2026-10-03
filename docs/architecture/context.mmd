@@ -1,0 +1,24 @@
+%% C4 context (level 1) — AI Command Center and its external actors/systems.
+%% Source of truth for docs/architecture/README.md's "System context" diagram.
+%% Edit this file, then run `python scripts/generate_architecture_docs.py` to
+%% regenerate the README; `tests/architecture/test_architecture_docs_freshness.py`
+%% fails CI if the two drift apart.
+flowchart TD
+    Engineer["Person<br/><b>Engineer</b><br/>local operator"]
+
+    subgraph Boundary["AI Command Center (this repository)"]
+        AICC["Software System<br/><b>AI Command Center</b><br/>local engineering control plane"]
+    end
+
+    ProviderCLI["External<br/><b>Local provider CLIs</b><br/>Claude Code (default),<br/>Codex / Ollama / Copilot"]
+    GitRepos["External<br/><b>Git repositories</b><br/>local checkouts and worktrees"]
+    GitHub["External<br/><b>GitHub</b><br/>pull requests, merge queue,<br/>via the local gh CLI"]
+    AiosCore["External<br/><b>AIOS Core</b><br/>closed platform engine,<br/>reached only through aios_sdk / aios_db"]
+    Portfolio["External<br/><b>Portfolio checkout</b><br/>separate repository read<br/>for cross-project intelligence"]
+
+    Engineer -->|"uses, via browser (Streamlit)<br/>or the native desktop shell"| AICC
+    AICC -->|"starts and supervises<br/>as local subprocesses"| ProviderCLI
+    AICC -->|"reads, writes, creates worktrees"| GitRepos
+    AICC -->|"opens/updates pull requests"| GitHub
+    AICC -->|"adapter-only: aios_sdk (tasks),<br/>aios_db (Postgres primitives)"| AiosCore
+    AICC -->|"reads only"| Portfolio
