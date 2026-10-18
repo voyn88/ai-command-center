@@ -1,5 +1,6 @@
 import json
 import os
+import signal
 import subprocess
 import threading
 import time
@@ -1323,6 +1324,118 @@ def test_cancel_leaves_no_orphaned_child_process(git_repo, configure_project_rep
     sup.cancel(run["id"], confirmed=True, grace_seconds=1)
     time.sleep(0.3)
     assert identity.process_exists(pid) is False
+
+
+# --------------------------------------------------------------------------
+# setsid-escaped descendants: `killpg` can never reach a pid that left the
+# launch-time process group, so it needs a direct, identity-verified signal.
+# Regression coverage for the PR #786 review defect: a pid list captured once
+# before SIGTERM must never be trusted, unverified, for the later SIGKILL —
+# an escaped pid has no pgid-style pin against the OS recycling it for an
+# unrelated process during the grace window.
+# --------------------------------------------------------------------------
+
+
+def test_signal_escaped_descendants_signals_a_pid_with_matching_identity(monkeypatch):
+    sup = supervisor.Supervisor()
+    pid = 987654
+    recorded = identity.ProcessIdentity(
+        pid=pid, start_time="posix-ps-utc-v1:original", command="agent-worker"
+    )
+    monkeypatch.setattr(
+        supervisor.Supervisor,
+        "_live_escaped_descendants",
+        staticmethod(lambda leader_pid, *, process_group_id: [pid]),
+    )
+    monkeypatch.setattr(
+        supervisor.identity, "capture_identity", lambda p: recorded if p == pid else None
+    )
+    monkeypatch.setattr(
+        supervisor.identity,
+        "identity_matches",
+        lambda p, rec: p == pid and rec == recorded.as_string(),
+    )
+    signalled = []
+    monkeypatch.setattr(supervisor.os, "kill", lambda p, sig: signalled.append((p, sig)))
+
+    result = sup._signal_escaped_descendants(1, process_group_id=1, sig=signal.SIGTERM)
+
+    assert result == [pid]
+    assert signalled == [(pid, signal.SIGTERM)]
+
+
+def test_signal_escaped_descendants_skips_a_pid_whose_identity_no_longer_matches(monkeypatch):
+    """If the discovered pid's current identity does not match what was just
+    captured for it, it must never be signalled — this is the guard a raw
+    `os.kill(pid, sig)` on its own does not provide."""
+    sup = supervisor.Supervisor()
+    pid = 987655
+    monkeypatch.setattr(
+        supervisor.Supervisor,
+        "_live_escaped_descendants",
+        staticmethod(lambda leader_pid, *, process_group_id: [pid]),
+    )
+    monkeypatch.setattr(
+        supervisor.identity,
+        "capture_identity",
+        lambda p: identity.ProcessIdentity(pid=p, start_time="posix-ps-utc-v1:t", command="agent-worker"),
+    )
+    # Simulate the identity having changed between capture and verification.
+    monkeypatch.setattr(supervisor.identity, "identity_matches", lambda p, rec: False)
+    signalled = []
+    monkeypatch.setattr(supervisor.os, "kill", lambda p, sig: signalled.append((p, sig)))
+
+    result = sup._signal_escaped_descendants(1, process_group_id=1, sig=signal.SIGKILL)
+
+    assert result == []
+    assert signalled == []
+
+
+def test_escaped_descendant_sigkill_round_never_trusts_the_sigterm_rounds_snapshot(monkeypatch):
+    """End-to-end shape of the PR #786 review's rejected defect: a pid found
+    escaped on the SIGTERM round exits during the grace period and the OS
+    recycles its number for an unrelated process before the SIGKILL round
+    runs. The SIGKILL round must re-verify identity fresh and skip it, never
+    delivering SIGKILL to the unrelated process that now holds that pid."""
+    sup = supervisor.Supervisor()
+    pid = 987656
+    original = identity.ProcessIdentity(
+        pid=pid, start_time="posix-ps-utc-v1:original", command="agent-worker"
+    )
+    reused = identity.ProcessIdentity(
+        pid=pid, start_time="posix-ps-utc-v1:much-later", command="unrelated-process"
+    )
+    current = {"identity": original}
+
+    monkeypatch.setattr(
+        supervisor.Supervisor,
+        "_live_escaped_descendants",
+        staticmethod(lambda leader_pid, *, process_group_id: [pid]),
+    )
+    monkeypatch.setattr(
+        supervisor.identity, "capture_identity", lambda p: current["identity"] if p == pid else None
+    )
+    monkeypatch.setattr(
+        supervisor.identity,
+        "identity_matches",
+        lambda p, rec: p == pid and current["identity"].as_string() == rec,
+    )
+    signalled = []
+    monkeypatch.setattr(supervisor.os, "kill", lambda p, sig: signalled.append((p, sig)))
+
+    term_result = sup._signal_escaped_descendants(1, process_group_id=1, sig=signal.SIGTERM)
+    assert term_result == [pid]
+
+    # The escaped process honored the SIGTERM and exited; a busy host then
+    # recycled its pid for an unrelated process before the grace period ends.
+    current["identity"] = reused
+
+    kill_result = sup._signal_escaped_descendants(1, process_group_id=1, sig=signal.SIGKILL)
+
+    assert kill_result == []
+    assert signalled == [(pid, signal.SIGTERM)], (
+        "the recycled pid must never receive the SIGKILL meant for the original process"
+    )
 
 
 def test_cancel_preserves_output_received_before_cancellation(git_repo, configure_project_repo, fake_claude):
