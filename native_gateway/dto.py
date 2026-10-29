@@ -99,6 +99,54 @@ class ConnectionDTO(_Frozen):
     projectionAgeSeconds: int | None = None
 
 
+class QueueHealthDTO(_Frozen):
+    """Durable work queue, all queues together."""
+
+    ready: int  # claimable now (available_at <= now)
+    claimed: int
+    dead: int
+    succeededLastHour: int
+    oldestReadyAgeSeconds: int | None = None
+
+
+class PipelineLaneDTO(_Frozen):
+    """A role holding at least one active, unexpired attempt."""
+
+    role: str
+    attempts: int
+    heartbeatAgeSeconds: int
+
+
+class OwnerEscalationDTO(_Frozen):
+    """A DEFER_TO_USER backlog task: it waits on the owner."""
+
+    taskID: str
+    title: str
+    priority: str | None = None
+    updatedAt: str | None = None
+
+
+class MonitorVerdictDTO(_Frozen):
+    """The infra monitor's latest verdict: open failure codes, never detail."""
+
+    verdict: str  # ok | failing
+    openFindings: int
+    failures: list[str]
+    lastSeenAt: str | None = None
+
+
+class PipelineHealthDTO(_Frozen):
+    """Additive in DTO 1.0 — the autonomous pipeline's health for the owner."""
+
+    observedAt: str  # ISO-8601 UTC
+    queue: QueueHealthDTO
+    activeLanes: list[PipelineLaneDTO]
+    executorAuthFailures30m: int
+    backlogByStatus: dict[str, int]
+    ownerEscalations: list[OwnerEscalationDTO]
+    monitor: MonitorVerdictDTO | None = None
+
+
 class SnapshotDTO(_Frozen):
     schemaVersion: str
     revision: str
@@ -110,6 +158,7 @@ class SnapshotDTO(_Frozen):
     projects: list[ProjectDTO]
     connection: ConnectionDTO
     goal: GoalDTO | None = None
+    pipelineHealth: PipelineHealthDTO | None = None
 
 
 class DialogDTO(_Frozen):
