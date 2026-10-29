@@ -33,6 +33,7 @@ SECTION_LABELS: dict[str, str] = {
     "artifacts": "Артефакты",
     "reports": "Отчёты",
     "agents": "Агенты",
+    "pipeline": "Конвейер",
     "settings": "Настройки",
 }
 
@@ -260,6 +261,20 @@ SETTINGS_SELECTED_PROJECT_DESCRIPTION = (
 SETTINGS_SELECTED_PROJECT_PLACEHOLDER = "Например, проект-1"
 SETTINGS_SAVE_WORKSPACE = "Сохранить параметры рабочего пространства"
 SETTINGS_SAVED = "Параметры сохранены"
+SETTINGS_REMOTE_GROUP = "Удалённый шлюз (конвейер)"
+SETTINGS_REMOTE_URL_LABEL = "Адрес шлюза"
+SETTINGS_REMOTE_URL_PLACEHOLDER = "Адрес HTTPS шлюза, порт 8443"
+SETTINGS_REMOTE_URL_DESCRIPTION = "Адрес HTTPS шлюза в частной сети, без пути"
+SETTINGS_REMOTE_TOKEN_LABEL = "Токен устройства"
+SETTINGS_REMOTE_TOKEN_DESCRIPTION = (
+    "Токен только для чтения, выданный при регистрации устройства"
+)
+SETTINGS_REMOTE_PIN_LABEL = "Пин сертификата (SHA-256)"
+SETTINGS_REMOTE_PIN_PLACEHOLDER = "Необязательно"
+SETTINGS_REMOTE_PIN_DESCRIPTION = (
+    "Отпечаток SHA-256 сертификата сервера; оставьте пустым, если пин не нужен"
+)
+SETTINGS_SAVE_REMOTE = "Сохранить параметры шлюза"
 
 # --- First-run wizard (D-1) -----------------------------------------------
 FIRST_RUN_TITLE = "Первый запуск"
@@ -368,3 +383,76 @@ def theme_accessible_name(label: str) -> str:
 
 def density_accessible_name(label: str) -> str:
     return f"Плотность интерфейса: {label}"
+
+
+# --- Remote pipeline page («Конвейер») -------------------------------------
+PIPELINE_TITLE = "Конвейер"
+PIPELINE_SUBTITLE = "Состояние автономного конвейера на управляющем сервере — только чтение."
+PIPELINE_REFRESH = "Обновить"
+PIPELINE_REFRESH_DESCRIPTION = "Запросить свежий снимок у шлюза"
+PIPELINE_NOT_LOADED = "Данные загрузятся при открытии раздела."
+PIPELINE_LOADING = "Запрос к шлюзу…"
+PIPELINE_LEVEL_LABELS = {
+    "ok": "Работает",
+    "attention": "Требует внимания",
+    "down": "Остановлен: нет активных линий",
+}
+PIPELINE_OUTCOME_MESSAGES = {
+    "not_configured": "Шлюз не настроен. Укажите адрес и токен в «Настройках».",
+    "unreachable": "Шлюз недоступен. Проверьте Tailscale и адрес шлюза.",
+    "pin_mismatch": "Сертификат сервера не совпадает с пином. Обновите пин в «Настройках».",
+    "unauthorized": "Токен устройства отклонён. Выпустите новый токен и сохраните его в «Настройках».",
+    "http_error": "Шлюз ответил ошибкой {status}. Повторите позже.",
+    "invalid_response": "Шлюз вернул некорректный ответ.",
+    "degraded": "Снимок устарел или неполон: продюсер не смог прочитать базу.",
+    "no_health": "В снимке нет блока состояния конвейера — обновите шлюз.",
+}
+PIPELINE_FRESHNESS_LABELS = {
+    "fresh": "свежий",
+    "stale": "устаревает",
+    "offline": "не обновляется",
+    "degraded": "неполный",
+}
+PIPELINE_FRESHNESS = "Снимок: {freshness}, создан {generated_at}"
+PIPELINE_METRICS_GROUP = "Очередь"
+PIPELINE_METRIC_LABELS = {
+    "ready": "Готово к работе",
+    "claimed": "В работе",
+    "dead": "Мёртвые",
+    "oldest_ready": "Старейшая готовая",
+    "succeeded_last_hour": "Завершено за час",
+    "active_lanes": "Активные линии",
+}
+PIPELINE_AUTH_WARNING = (
+    "Агенты разлогинены — перелогиньте Claude/Codex на worker-01, "
+    "см. docs/operations/OWNER_NOTIFICATIONS.md"
+)
+PIPELINE_AUTH_COUNT = "Ошибок входа агентов за 30 минут: {count}"
+PIPELINE_MONITOR_FAILING = "Монитор инфраструктуры: сбои — {failures}"
+PIPELINE_MONITOR_OK = "Монитор инфраструктуры: в норме"
+PIPELINE_BACKLOG_GROUP = "Бэклог по статусам"
+PIPELINE_ESCALATIONS_GROUP = "Ждут решения владельца"
+PIPELINE_ESCALATIONS_EMPTY = "Эскалаций нет."
+PIPELINE_ESCALATION_COLUMNS = ("Задача", "Название", "Приоритет", "Обновлено")
+PIPELINE_BACKLOG_COLUMNS = ("Статус", "Задач")
+PIPELINE_BACKLOG_STATUS_LABELS = {
+    "OPEN": "Открыта",
+    "IN_PROGRESS": "В работе",
+    "READY_TO_REVIEW": "На проверке",
+    "DONE": "Готово",
+    "UNTRIAGED": "Не разобрана",
+    "DEFER_TO_USER": "Ждёт владельца",
+    "SPLIT": "Разделена",
+    "NEEDS_REFINEMENT": "Нужно уточнение",
+    "DECIDED": "Решено",
+}
+
+
+def pipeline_age(seconds: int | None) -> str:
+    if seconds is None:
+        return "—"
+    if seconds < 60:
+        return f"{seconds} с"
+    if seconds < 3600:
+        return f"{seconds // 60} мин"
+    return f"{seconds // 3600} ч {seconds % 3600 // 60} мин"

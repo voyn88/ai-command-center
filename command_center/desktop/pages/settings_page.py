@@ -10,7 +10,9 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
+    QFrame,
     QRadioButton,
+    QScrollArea,
     QVBoxLayout,
     QWidget,
 )
@@ -39,6 +41,7 @@ class SettingsForm(QWidget):
     density_mode_changed = Signal(object)
     window_geometry_reset_requested = Signal()
     workspace_save_requested = Signal(object)
+    remote_save_requested = Signal(object)  # (url, token, pin) — never logged
 
     def __init__(
         self,
@@ -46,6 +49,7 @@ class SettingsForm(QWidget):
         current_density: DensityMode,
         selected_project: str | None,
         parent: QWidget | None = None,
+        remote_gateway: tuple[str | None, str | None, str | None] = (None, None, None),
     ) -> None:
         super().__init__(parent)
         self.setObjectName("SettingsForm")
@@ -130,8 +134,78 @@ class SettingsForm(QWidget):
         self.saved_label.setAccessibleName(i18n.SETTINGS_SAVED)
         workspace_box.addRow(self.saved_label)
         root.addWidget(workspace)
+        root.addWidget(self._build_remote_group(remote_gateway))
         root.addStretch(1)
         self.apply_density(current_density)
+
+    def _build_remote_group(
+        self, remote_gateway: tuple[str | None, str | None, str | None]
+    ) -> QGroupBox:
+        url, token, pin = remote_gateway
+        remote = QGroupBox(i18n.SETTINGS_REMOTE_GROUP)
+        box = QFormLayout(remote)
+        self.remote_url_edit = self._remote_field(
+            "RemoteGatewayUrl",
+            url,
+            i18n.SETTINGS_REMOTE_URL_LABEL,
+            i18n.SETTINGS_REMOTE_URL_DESCRIPTION,
+            i18n.SETTINGS_REMOTE_URL_PLACEHOLDER,
+            box,
+        )
+        self.remote_token_edit = self._remote_field(
+            "RemoteGatewayToken",
+            token,
+            i18n.SETTINGS_REMOTE_TOKEN_LABEL,
+            i18n.SETTINGS_REMOTE_TOKEN_DESCRIPTION,
+            "",
+            box,
+        )
+        self.remote_token_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.remote_pin_edit = self._remote_field(
+            "RemoteGatewayPin",
+            pin,
+            i18n.SETTINGS_REMOTE_PIN_LABEL,
+            i18n.SETTINGS_REMOTE_PIN_DESCRIPTION,
+            i18n.SETTINGS_REMOTE_PIN_PLACEHOLDER,
+            box,
+        )
+        self.save_remote_button = QPushButton(i18n.SETTINGS_SAVE_REMOTE)
+        self.save_remote_button.setObjectName("SaveRemoteGatewayButton")
+        self.save_remote_button.clicked.connect(self._save_remote)
+        box.addRow(self.save_remote_button)
+        self.remote_saved_label = QLabel("")
+        self.remote_saved_label.setObjectName("RemoteSettingsSavedStatus")
+        self.remote_saved_label.setAccessibleName(i18n.SETTINGS_SAVED)
+        box.addRow(self.remote_saved_label)
+        return remote
+
+    @staticmethod
+    def _remote_field(
+        object_name: str,
+        value: str | None,
+        label_text: str,
+        description: str,
+        placeholder: str,
+        box: QFormLayout,
+    ) -> QLineEdit:
+        edit = QLineEdit(value or "")
+        edit.setObjectName(object_name)
+        edit.setAccessibleName(label_text)
+        edit.setAccessibleDescription(description)
+        if placeholder:
+            edit.setPlaceholderText(placeholder)
+        label = QLabel(label_text)
+        label.setBuddy(edit)
+        box.addRow(label, edit)
+        return edit
+
+    def _save_remote(self) -> None:
+        values = tuple(
+            edit.text().strip() or None
+            for edit in (self.remote_url_edit, self.remote_token_edit, self.remote_pin_edit)
+        )
+        self.remote_save_requested.emit(values)
+        self.remote_saved_label.setText(i18n.SETTINGS_SAVED)
 
     def _save_workspace(self) -> None:
         value = self.selected_project_edit.text().strip() or None
@@ -168,6 +242,7 @@ class SettingsPage(BasePage):
     density_mode_changed = Signal(object)
     window_geometry_reset_requested = Signal()
     workspace_save_requested = Signal(object)
+    remote_save_requested = Signal(object)
 
     def __init__(
         self,
@@ -175,6 +250,7 @@ class SettingsPage(BasePage):
         current_density: DensityMode = DensityMode.COMFORTABLE,
         selected_project: str | None = None,
         parent: QWidget | None = None,
+        remote_gateway: tuple[str | None, str | None, str | None] = (None, None, None),
     ) -> None:
         super().__init__(
             "settings",
@@ -186,6 +262,7 @@ class SettingsPage(BasePage):
             current_mode,
             current_density,
             selected_project,
+            remote_gateway=remote_gateway,
         )
         self.form.theme_mode_changed.connect(self.theme_mode_changed.emit)
         self.form.density_mode_changed.connect(self.density_mode_changed.emit)
@@ -193,7 +270,15 @@ class SettingsPage(BasePage):
             self.window_geometry_reset_requested.emit
         )
         self.form.workspace_save_requested.connect(self.workspace_save_requested.emit)
-        self.add_content(self.form, stretch=1)
+        self.form.remote_save_requested.connect(self.remote_save_requested.emit)
+        # The form outgrows a 600 px window once the remote group is present:
+        # scroll instead of squeezing the groups.
+        scroll = QScrollArea()
+        scroll.setObjectName("SettingsScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(self.form)
+        self.add_content(scroll, stretch=1)
 
     def set_mode(self, mode: ThemeMode) -> None:
         self.form.set_theme_mode(mode)

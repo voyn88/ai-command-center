@@ -21,12 +21,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from command_center.application.remote_gateway import GatewayConfig
 from command_center.platform import DensityMode
 
 from . import i18n
 from .pages.home import HomePage
 from .pages.operational import OperationalPage
 from .pages.projects import ProjectsPage
+from .pages.remote_pipeline import RemotePipelinePage
 from .pages.settings_page import SettingsPage
 from .settings import SettingsStore
 from .sections import ACTIVE_SECTION_KEYS, DEFAULT_SECTION_KEY
@@ -126,10 +128,14 @@ class AppShell(QWidget):
             self._operational_pages[key] = page
             self._add_page(page)
 
+        self._pipeline_page = RemotePipelinePage(self._remote_config)
+        self._add_page(self._pipeline_page)
+
         settings_page = SettingsPage(
             self._theme.mode,
             self._settings.density_mode(),
             self._settings.selected_project(),
+            remote_gateway=self._settings.remote_gateway(),
         )
         settings_page.theme_mode_changed.connect(self._on_theme_mode_changed)
         settings_page.density_mode_changed.connect(self._on_density_mode_changed)
@@ -139,6 +145,7 @@ class AppShell(QWidget):
         settings_page.workspace_save_requested.connect(
             self._on_workspace_save_requested
         )
+        settings_page.remote_save_requested.connect(self._on_remote_save_requested)
         self._settings_page = settings_page
         self._add_page(settings_page)
 
@@ -166,6 +173,8 @@ class AppShell(QWidget):
         page = self._pages.get(key)
         if page is not None:
             self.stack.setCurrentWidget(page)
+            if key == "pipeline":
+                self._pipeline_page.refresh(cancel_event=self._cancel_event)
             self._load_operational_page(key)
 
     @property
@@ -198,6 +207,17 @@ class AppShell(QWidget):
         self._settings.set_selected_project(project_id)
         self._settings.sync()
 
+    def _on_remote_save_requested(self, values: tuple) -> None:
+        url, token, pin = values
+        self._settings.set_remote_gateway(url, token, pin)
+        self._settings.sync()
+
+    def _remote_config(self) -> GatewayConfig | None:
+        url, token, pin = self._settings.remote_gateway()
+        if not url or not token:
+            return None
+        return GatewayConfig(base_url=url, token=token, pin_sha256=pin)
+
     # --- data / refresh ----------------------------------------------------
     def load_workspace_home(self, adapter: object, operations_adapter: object | None = None) -> None:
         """Wire the Workspace Home data adapter and start the first async load."""
@@ -218,6 +238,8 @@ class AppShell(QWidget):
         current = self.current_section_key
         if current == "home" and self._adapter is not None:
             self._home.load(self._adapter, cancel_event=self._cancel_event)
+        elif current == "pipeline":
+            self._pipeline_page.refresh(cancel_event=self._cancel_event)
         elif current is not None:
             self._load_operational_page(current)
         self.refresh_requested.emit()
@@ -248,6 +270,7 @@ class AppShell(QWidget):
         self._home.shutdown_workers()
         for page in self._operational_pages.values():
             page.shutdown_workers()
+        self._pipeline_page.shutdown_workers()
         drained = QThreadPool.globalInstance().waitForDone(timeout_ms)
         self._persist_state()
         return drained

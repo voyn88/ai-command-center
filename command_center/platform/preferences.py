@@ -15,6 +15,9 @@ _KEY_THEME = "appearance/theme"
 _KEY_DENSITY = "appearance/density"
 _KEY_SELECTED_PROJECT = "workspace/selected_project"
 _KEY_WORKSPACE_ROOT = "workspace/root"
+_KEY_REMOTE_URL = "remote/gateway_url"
+_KEY_REMOTE_TOKEN = "remote/device_token"
+_KEY_REMOTE_PIN = "remote/pin_sha256"
 
 
 class ThemeMode(str, Enum):
@@ -106,6 +109,36 @@ class SettingsStore:
             self._settings.setValue(_KEY_WORKSPACE_ROOT, normalized)
         else:
             self._settings.remove(_KEY_WORKSPACE_ROOT)
+
+    def _optional_text(self, key: str) -> str | None:
+        value = self._settings.value(key)
+        return str(value) if value not in (None, "") else None
+
+    def _set_optional_text(self, key: str, value: str | None) -> None:
+        normalized = value.strip() if value else ""
+        if normalized:
+            self._settings.setValue(key, normalized)
+        else:
+            self._settings.remove(key)
+
+    def remote_gateway(self) -> tuple[str | None, str | None, str | None]:
+        """Remote-mode gateway ``(url, device token, certificate pin)``.
+
+        The token is a read-only device credential kept in the same native
+        preference store as every other setting; callers must never log it.
+        """
+        return (
+            self._optional_text(_KEY_REMOTE_URL),
+            self._optional_text(_KEY_REMOTE_TOKEN),
+            self._optional_text(_KEY_REMOTE_PIN),
+        )
+
+    def set_remote_gateway(
+        self, url: str | None, token: str | None, pin_sha256: str | None
+    ) -> None:
+        self._set_optional_text(_KEY_REMOTE_URL, url)
+        self._set_optional_text(_KEY_REMOTE_TOKEN, token)
+        self._set_optional_text(_KEY_REMOTE_PIN, pin_sha256)
 
     def sync(self) -> None:
         self._settings.sync()

@@ -31,6 +31,8 @@ SECTIONS: tuple[Section, ...] = (
     Section("artifacts", SECTION_LABELS["artifacts"], enabled=True),
     Section("reports", SECTION_LABELS["reports"], enabled=True),
     Section("agents", SECTION_LABELS["agents"], enabled=True),
+    # Remote mode: read-only view of the pipeline via the native gateway.
+    Section("pipeline", SECTION_LABELS["pipeline"], enabled=True),
     Section("settings", SECTION_LABELS["settings"], enabled=True),
 )
 

@@ -10,6 +10,33 @@ This directory converts the reviewed Lightweight Cross-Platform Desktop Architec
 into a canonical, implementation-ready documentation set for a native PySide6/Qt Widgets desktop
 application.
 
+## Удалённый режим: конвейер
+
+Раздел **«Конвейер»** — read-only взгляд на автономный конвейер на control-01
+без ноутбучной сессии. Страница (`command_center/desktop/pages/remote_pipeline.py`)
+читает `GET /v1/snapshot` нативного шлюза (блок `pipelineHealth`, см.
+`docs/operations/NATIVE_GATEWAY_DEPLOY.md`) через Qt-free клиент
+`command_center/application/remote_gateway.py` (stdlib `http.client` + TLS с
+системным хранилищем доверия). Запрос идёт на воркере `QThreadPool`;
+автообновление — каждые 60 с, пока раздел открыт; кнопка «Обновить» и общая
+кнопка верхней панели обновляют сразу.
+
+Настройка — «Настройки» → «Удалённый шлюз (конвейер)»: адрес
+`https://<имя control-01 в tailnet>:8443`, токен устройства (выпускается
+`native_gateway.provision`, отдельный на каждое устройство) и необязательный пин
+— SHA-256 DER-сертификата сервера в hex (двоеточия допустимы); пин сверяется до
+отправки токена. Значения хранятся в том же `QSettings`, что и остальные
+настройки (реестр Windows / `NSUserDefaults`), токен не логируется и не попадает
+в URL. Только `https://`: при другом адресе запрос не отправляется.
+
+Статус: **нет активных линий → «Остановлен»**; ошибки входа агентов за 30 мин,
+сбои монитора (в т. ч. рост dead-letter) или эскалации `DEFER_TO_USER` →
+**«Требует внимания»**; иначе «Работает». При ошибках входа страница подсказывает
+перелогинить Claude/Codex на worker-01 (`docs/operations/OWNER_NOTIFICATIONS.md`).
+Сетевые ошибки показываются отдельными состояниями: шлюз не настроен,
+недоступен, пин не совпал, токен отклонён, снимок неполный/устарел, в снимке
+нет `pipelineHealth`.
+
 ## Reading order
 
 1. **`PRODUCT_VISION.md`** — why this product exists, who it is for, and its boundary relative

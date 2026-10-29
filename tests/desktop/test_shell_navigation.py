@@ -7,12 +7,12 @@ from command_center.desktop.sections import SECTIONS
 
 EXPECTED_ORDER = [
     "home", "projects", "sessions", "execution", "git",
-    "artifacts", "reports", "agents", "settings",
+    "artifacts", "reports", "agents", "pipeline", "settings",
 ]
 ENABLED = set(EXPECTED_ORDER)
 
 
-def test_all_nine_sections_render_in_order(shell):
+def test_all_sections_render_in_order(shell):
     assert list(shell.sidebar.items().keys()) == EXPECTED_ORDER
 
 
