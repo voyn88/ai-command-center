@@ -12,6 +12,7 @@ import http.client
 import json
 import os
 import subprocess
+import sys
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -34,6 +35,26 @@ class QueueSnapshot:
     recent_quota_dead: int = 0
     #: succeeded in the trailing hour (throughput); None when not measured
     recent_succeeded: int | None = None
+    #: work_attempt rows in the last 30 minutes whose outcome looks like logout
+    recent_auth_failed: int = 0
+
+
+#: outcome_reason substrings that mean an agent session on the worker is gone.
+#: Counted in the trailing half-hour; at or above the threshold the owner is
+#: told to re-login (docs/operations/OWNER_NOTIFICATIONS.md).
+_AUTH_FAILURE_REASON_RE = (
+    r"(failed to authenticate|oauth session expired|refresh token)"
+)
+
+#: Failure codes that page the phone at urgent priority.
+_URGENT_NOTIFY_KEYS = frozenset(
+    {
+        "queue_stalled",
+        "active_workers",
+        "executor_auth_failed",
+        "credential_rotation_stalled",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -243,6 +264,16 @@ def read_queue_snapshot() -> QueueSnapshot:
                 recent_quota_dead,
                 recent_succeeded,
             ) = cur.fetchone()
+            cur.execute(
+                """
+                SELECT count(*)
+                FROM work_attempt
+                WHERE created_at > now() - interval '30 minutes'
+                  AND outcome_reason ~* %s
+                """,
+                (_AUTH_FAILURE_REASON_RE,),
+            )
+            (recent_auth_failed,) = cur.fetchone()
     finally:
         pool.close_pool()
     return QueueSnapshot(
@@ -255,6 +286,7 @@ def read_queue_snapshot() -> QueueSnapshot:
         recent_dead=int(recent_dead),
         recent_quota_dead=int(recent_quota_dead),
         recent_succeeded=int(recent_succeeded),
+        recent_auth_failed=int(recent_auth_failed),
     )
 
 
@@ -779,6 +811,7 @@ def evaluate(
     max_stalled_seconds: float,
     prometheus_ready: bool,
     max_recent_dead: int = 0,
+    max_auth_failed_attempts: int = 5,
     pr_window: PrWindowSnapshot | None = None,
     source_clone: SourceCloneSnapshot | None = None,
     unit_health: UnitHealthSnapshot | None = None,
@@ -813,6 +846,11 @@ def evaluate(
         # (quota-aware cascade) and budgets get a task, not a guess.
         if queue.recent_quota_dead > 0:
             failures.append(f"executor_quota_exhausted:{queue.recent_quota_dead}")
+        # Agents logged out on the worker: many auth-looking attempt outcomes
+        # in a short window mean the pipeline will keep failing until a human
+        # re-logins Claude/Codex (OWNER_NOTIFICATIONS.md).
+        if queue.recent_auth_failed >= max_auth_failed_attempts:
+            failures.append(f"executor_auth_failed:{queue.recent_auth_failed}")
         # Throughput: work waiting (past the stall clock) with nothing having
         # succeeded in the trailing hour is a stalled pipeline even when every
         # lane shows active -- the lanes may be spinning on refusals.
@@ -916,6 +954,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=0,
         help="Maximum dead-lettered items allowed in the trailing hour.",
     )
+    parser.add_argument(
+        "--max-auth-failed-attempts",
+        type=int,
+        default=5,
+        help=(
+            "work_attempt auth/logout outcomes in the last 30 minutes at or "
+            "above this count raise executor_auth_failed (default 5)."
+        ),
+    )
     parser.add_argument("--prometheus-url", required=True)
     parser.add_argument(
         "--skip-workers",
@@ -1012,6 +1059,132 @@ def finding_key(failure: str) -> str:
     return failure.split(":", 1)[0].strip()[:200] or failure[:200]
 
 
+def notify_source(record_findings_source: str) -> str:
+    """Host/source segment for ``monitor:<source>:<key>`` notify identities."""
+    source = (record_findings_source or "").strip()
+    if source:
+        return source
+    return (
+        os.environ.get("AICC_OWNER_NOTIFY_SOURCE", "").strip()
+        or os.environ.get("HOSTNAME", "").strip()
+        or "local"
+    )
+
+
+def read_defer_to_user_tasks() -> tuple[tuple[str, str, str, Any], ...]:
+    """Backlog rows waiting on the owner: (task_id, title, priority, updated_at)."""
+    from command_center.db import pool
+    from command_center.db.config import load_config
+
+    pool.open_pool(load_config())
+    try:
+        with pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT task_id, title, priority, updated_at
+                FROM backlog_task
+                WHERE status = 'DEFER_TO_USER'
+                ORDER BY updated_at ASC NULLS LAST, task_id ASC
+                """
+            )
+            rows = cur.fetchall()
+    finally:
+        pool.close_pool()
+    return tuple(
+        (str(task_id), str(title or ""), str(priority or ""), updated_at)
+        for task_id, title, priority, updated_at in rows
+    )
+
+
+def _notify_failure_message(key: str, failure: str) -> str:
+    if key == "executor_auth_failed":
+        return (
+            f"{failure}. Agents on the worker are logged out; re-login steps "
+            "are in docs/operations/OWNER_NOTIFICATIONS.md."
+        )
+    return failure
+
+
+def notify_owner_of_report(
+    report: MonitorReport,
+    *,
+    source: str,
+    defer_tasks: tuple[tuple[str, str, str, Any], ...] = (),
+) -> None:
+    """Push / resolve phone alerts for monitor failures and DEFER_TO_USER rows.
+
+    Never raises into the caller and never mutates ``report.ok`` / failures:
+    a phone outage must not change the fail-closed exit code.
+    """
+    from command_center.ops import owner_notify
+
+    prefix = f"monitor:{source}:"
+    active_monitor: dict[str, str] = {}
+    for failure in report.failures:
+        key = finding_key(failure)
+        active_monitor[key] = failure
+        priority = "urgent" if key in _URGENT_NOTIFY_KEYS else "default"
+        try:
+            owner_notify.notify(
+                f"{prefix}{key}",
+                f"AICC: {key}",
+                _notify_failure_message(key, failure),
+                priority=priority,
+                tags=("warning", key),
+            )
+        except Exception as exc:  # noqa: BLE001 - phone path must not break the monitor
+            print(f"owner_notify failure for {key}: {exc}", file=sys.stderr)
+
+    try:
+        previously_open = owner_notify.open_keys()
+    except Exception as exc:  # noqa: BLE001
+        print(f"owner_notify open_keys failed: {exc}", file=sys.stderr)
+        previously_open = frozenset()
+
+    for open_key in previously_open:
+        if not open_key.startswith(prefix):
+            continue
+        key = open_key[len(prefix) :]
+        if key in active_monitor:
+            continue
+        try:
+            owner_notify.resolve(
+                open_key,
+                f"AICC resolved: {key}",
+                f"{key} cleared on {source}",
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"owner_notify resolve failed for {open_key}: {exc}", file=sys.stderr)
+
+    active_defer = {task_id for task_id, _title, _priority, _updated in defer_tasks}
+    for task_id, title, _priority, _updated in defer_tasks:
+        try:
+            owner_notify.notify(
+                f"defer:{task_id}",
+                f"Нужно решение: {task_id}",
+                title or task_id,
+                priority="high",
+                tags=("speech_balloon", "defer"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"owner_notify defer failed for {task_id}: {exc}", file=sys.stderr)
+
+    for open_key in previously_open:
+        if not open_key.startswith("defer:"):
+            continue
+        task_id = open_key[len("defer:") :]
+        if task_id in active_defer:
+            continue
+        try:
+            owner_notify.resolve(
+                open_key,
+                f"Решено: {task_id}",
+                f"DEFER_TO_USER cleared for {task_id}",
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"owner_notify defer resolve failed for {open_key}: {exc}", file=sys.stderr)
+
+
 def record_findings(
     source: str, failures: tuple[str, ...], detail: dict[str, Any]
 ) -> None:
@@ -1100,11 +1273,27 @@ def main(argv: list[str] | None = None) -> int:
             max_stalled_seconds=args.max_stalled_seconds,
             prometheus_ready=metrics_ready,
             max_recent_dead=args.max_recent_dead,
+            max_auth_failed_attempts=args.max_auth_failed_attempts,
             pr_window=pr_window,
             source_clone=source_clone,
             unit_health=unit_health,
             deploy_lag=deploy_lag,
         )
+        defer_tasks: tuple[tuple[str, str, str, Any], ...] = ()
+        if not args.skip_queue:
+            try:
+                defer_tasks = read_defer_to_user_tasks()
+            except Exception as exc:  # noqa: BLE001 - defer pages must not hide the probe
+                print(f"defer_to_user read failed: {exc}", file=sys.stderr)
+                defer_tasks = ()
+        try:
+            notify_owner_of_report(
+                report,
+                source=notify_source(args.record_findings),
+                defer_tasks=defer_tasks,
+            )
+        except Exception as exc:  # noqa: BLE001 - phone path must not change exit code
+            print(f"owner_notify wiring failed: {exc}", file=sys.stderr)
     except Exception as exc:  # noqa: BLE001 - the monitor itself must fail closed
         print(json.dumps({"ok": False, "failures": [f"monitor_error:{exc}"]}))
         return 1
