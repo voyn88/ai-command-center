@@ -72,7 +72,6 @@ class DeployConfig:
     state_dir: Path = Path("/var/lib/aicc-principal-isolation")
     runtime_venv: Path = Path("/opt/aicc/runtime-venv")
     lane_registry: Path = Path("/etc/voyn/aicc-worker-lanes.conf")
-    source_for_remote_url: Path = Path("/opt/aicc/source")
     remote: str = "origin"
     branch: str = "main"
     remote_url: str | None = None
@@ -141,30 +140,17 @@ def _current_release_sha(aicc_root: Path) -> str | None:
     return match.group(1)
 
 
+#: The release source. Configured in the root-owned unit
+#: (AICC_RELEASE_REMOTE_URL) and never read from the voynadmin-writable
+#: checkout: whoever controls that checkout's git config must not be able to
+#: repoint what root deploys.
+DEFAULT_REMOTE_URL = "https://github.com/voyn88/ai-command-center.git"
+
+
 def _discover_remote_url(cfg: DeployConfig) -> str:
-    if cfg.remote_url:
-        return cfg.remote_url
-    # Read the remote URL as data only -- never execute from the
-    # voynadmin-writable checkout.
-    probed = _run(
-        [
-            "git",
-            "-C",
-            str(cfg.source_for_remote_url),
-            "remote",
-            "get-url",
-            cfg.remote,
-        ],
-        timeout=cfg.git_timeout,
-    )
-    if probed.returncode != 0:
-        raise RuntimeError(
-            f"cannot discover {cfg.remote} URL from {cfg.source_for_remote_url}: "
-            f"{(probed.stderr or probed.stdout).strip()[:120]}"
-        )
-    url = probed.stdout.strip()
-    if not url:
-        raise RuntimeError("origin URL is empty")
+    url = (cfg.remote_url or DEFAULT_REMOTE_URL).strip()
+    if not url.startswith("https://"):
+        raise RuntimeError("release remote must be an https URL")
     return url
 
 
@@ -189,6 +175,17 @@ def ensure_bare_mirror(cfg: DeployConfig) -> None:
                 f"bare mirror remote add failed: "
                 f"{(added.stderr or added.stdout).strip()[:120]}"
             )
+    # Re-assert the configured URL every tick: a mirror created earlier (or
+    # edited by hand) must not keep fetching from somewhere else.
+    reset = _git_mirror(
+        mirror,
+        ["remote", "set-url", cfg.remote, _discover_remote_url(cfg)],
+        timeout=cfg.git_timeout,
+    )
+    if reset.returncode != 0:
+        raise RuntimeError(
+            f"bare mirror set-url failed: {(reset.stderr or reset.stdout).strip()[:120]}"
+        )
     fetched = _git_mirror(
         mirror,
         ["fetch", "--prune", cfg.remote, f"+refs/heads/{cfg.branch}:refs/heads/{cfg.branch}"],
@@ -323,31 +320,26 @@ def stage_release_tree(
     staging.mkdir(mode=0o755)
 
     try:
-        archive = subprocess.Popen(
-            [
-                "git",
-                "--git-dir",
-                str(cfg.bare_mirror),
-                "archive",
-                "--format=tar",
-                release_id,
-            ],
-            stdout=subprocess.PIPE,
+        # Two sequential bounded commands through a private tarball (no
+        # process pipeline): the archive comes only from the root mirror.
+        tarball = cfg.release_root / f".stage-{release_id}.{os.getpid()}.tar"
+        archive = _git_mirror(
+            cfg.bare_mirror,
+            ["archive", "--format=tar", "-o", str(tarball), release_id],
+            timeout=cfg.git_timeout,
         )
-        assert archive.stdout is not None
-        extract = subprocess.run(
-            ["tar", "-xf", "-", "-C", str(staging)],
-            stdin=archive.stdout,
-            capture_output=True,
-            check=False,
+        if archive.returncode != 0:
+            tarball.unlink(missing_ok=True)
+            raise RuntimeError(f"git archive failed with rc={archive.returncode}")
+        extract = _run(
+            ["tar", "-xf", str(tarball), "-C", str(staging)],
+            timeout=cfg.git_timeout,
         )
-        archive_rc = archive.wait(timeout=cfg.git_timeout)
-        if archive_rc != 0:
-            raise RuntimeError(f"git archive failed with rc={archive_rc}")
+        tarball.unlink(missing_ok=True)
         if extract.returncode != 0:
             raise RuntimeError(
                 "tar extract failed: "
-                f"{extract.stderr.decode('utf-8', 'replace')[:160]}"
+                f"{(extract.stderr or extract.stdout)[:160]}"
             )
 
         venv_link = staging / ".venv"
@@ -700,11 +692,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--runtime-venv", type=Path, default=DeployConfig.runtime_venv)
     parser.add_argument("--lane-registry", type=Path, default=DeployConfig.lane_registry)
     parser.add_argument(
-        "--source-for-remote-url",
-        type=Path,
-        default=DeployConfig.source_for_remote_url,
+        "--remote-url", default=os.environ.get("AICC_RELEASE_REMOTE_URL") or None
     )
-    parser.add_argument("--remote-url", default=None)
     parser.add_argument("--remote", default="origin")
     parser.add_argument("--branch", default="main")
     parser.add_argument(
@@ -721,7 +710,6 @@ def main(argv: list[str] | None = None) -> int:
         state_dir=args.state_dir,
         runtime_venv=args.runtime_venv,
         lane_registry=args.lane_registry,
-        source_for_remote_url=args.source_for_remote_url,
         remote_url=args.remote_url,
         remote=args.remote,
         branch=args.branch,

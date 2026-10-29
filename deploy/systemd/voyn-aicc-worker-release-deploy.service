@@ -16,6 +16,7 @@ Type=oneshot
 User=root
 Group=root
 ExecCondition=/usr/bin/test ! -e /run/aicc-staged-rollout.lock
+Environment=AICC_RELEASE_REMOTE_URL=https://github.com/voyn88/ai-command-center.git
 ExecStart=/usr/libexec/aicc-worker-release-deploy
 NoNewPrivileges=yes
 PrivateTmp=yes

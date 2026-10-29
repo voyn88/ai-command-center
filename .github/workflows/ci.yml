@@ -107,7 +107,7 @@ jobs:
           fi
 
           if echo "$changed" | grep -Eqv \
-            '^(command_center/deployment/self_deploy\.py|command_center/db/cli\.py|deploy/systemd/voyn-aicc-merge\.(service|timer)|deploy/systemd/voyn-aicc-pr-window\.service|deploy/systemd/voyn-aicc-review\.(service|timer)|deploy/systemd/voyn-aicc-self-deploy\.service|deploy/systemd/voyn-aicc-worker-release-deploy\.(service|timer)|ops/aicc_worker_release_deploy\.py|tests/ops/test_agent_principal_isolation\.py|tests/orchestrator/test_self_deploy\.py)$'; then
+            '^(command_center/deployment/self_deploy\.py|command_center/db/cli\.py|deploy/systemd/voyn-aicc-merge\.(service|timer)|deploy/systemd/voyn-aicc-pr-window\.service|deploy/systemd/voyn-aicc-review\.(service|timer)|deploy/systemd/voyn-aicc-self-deploy\.service|deploy/systemd/voyn-aicc-self-deploy-worker\.service|tests/ops/test_agent_principal_isolation\.py|tests/orchestrator/test_self_deploy\.py)$'; then
             echo "deploy_only=false" >> "$GITHUB_OUTPUT"
           else
             echo "deploy_only=true" >> "$GITHUB_OUTPUT"

@@ -239,3 +239,28 @@ def test_committed_unit_files_are_root_hardened():
     assert "/usr/libexec/aicc-worker-release-deploy" in service
     assert "ReadWritePaths=/opt/aicc/releases" in service
     assert "/run/aicc-staged-rollout.lock" in service
+
+
+def test_release_remote_never_comes_from_the_operator_checkout(monkeypatch):
+    """The URL root deploys from is the unit's, not a writable checkout's."""
+    import importlib.util
+    import sys
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[2] / "ops" / "aicc_worker_release_deploy.py"
+    spec = importlib.util.spec_from_file_location("_wrd_remote", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["_wrd_remote"] = module
+    spec.loader.exec_module(module)
+
+    cfg = module.DeployConfig()
+    assert module._discover_remote_url(cfg) == module.DEFAULT_REMOTE_URL
+    custom = module.DeployConfig(remote_url="https://example.invalid/r.git")
+    assert module._discover_remote_url(custom) == "https://example.invalid/r.git"
+    bad = module.DeployConfig(remote_url="file:///home/voynadmin/evil")
+    try:
+        module._discover_remote_url(bad)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("non-https remote must be refused")
