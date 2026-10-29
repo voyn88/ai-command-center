@@ -59,7 +59,7 @@ struct AICCNativeShell: View {
                 .tabItem { Label(AppTab.dialogues.title, systemImage: AppTab.dialogues.icon) }.tag(AppTab.dialogues)
             DecisionsView()
                 .tabItem { Label(AppTab.decisions.title, systemImage: AppTab.decisions.icon) }.tag(AppTab.decisions)
-            MoreView(events: model.snapshot.events, connection: model.connection)
+            MoreView(snapshot: model.snapshot, connection: model.connection)
                 .tabItem { Label(AppTab.more.title, systemImage: AppTab.more.icon) }.tag(AppTab.more)
         }
         .tint(AICCTheme.plum)
@@ -469,11 +469,17 @@ private struct DecisionsView: View {
 }
 
 private struct MoreView: View {
-    let events: [TimelineEvent]
+    let snapshot: Snapshot
     let connection: AICCAppModel.ConnectionState
     var body: some View {
         CompanionPage(title: "Ещё", subtitle: "Всё остальное уже предусмотрено, но не мешает вам каждый день.") {
             CompanionCard(title: "Подключение", detail: connection.title, tint: connection == .offline ? .orange : AICCTheme.forest)
+            NavigationLink {
+                PipelineHealthView(snapshot: snapshot, connection: connection)
+            } label: {
+                Label("Конвейер", systemImage: "gearshape.2")
+                    .font(.headline).padding().frame(maxWidth: .infinity, alignment: .leading)
+            }
             CompanionCard(title: "Помощники и память", detail: "Команда AI, объяснения и успешные решения.", tint: AICCTheme.plum)
             CompanionCard(title: "Проверки и происшествия", detail: "Картина качества, рисков и восстановления.", tint: AICCTheme.forest)
             CompanionCard(title: "Сводки, совет и настройки", detail: "Всё для спокойной картины и управления.", tint: .gray)

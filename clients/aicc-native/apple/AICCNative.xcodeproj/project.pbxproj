@@ -10,12 +10,18 @@
 		AA0000010000000000000001 /* Sources/AICCNativeApp/AICCNativeApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000010000000000000002 /* Sources/AICCNativeApp/AICCNativeApp.swift */; };
 		AA0000010000000000000003 /* AICCNativeCore in Frameworks */ = {isa = PBXBuildFile; productRef = AA0000010000000000000004 /* AICCNativeCore */; };
 		AA0000010000000000000020 /* Sources/AICCNativeApp/AICCAppModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000010000000000000019 /* Sources/AICCNativeApp/AICCAppModel.swift */; };
+		AA0000010000000000000030 /* Sources/AICCNativeApp/CriticalEscalationBanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000010000000000000031 /* Sources/AICCNativeApp/CriticalEscalationBanner.swift */; };
+		AA0000010000000000000032 /* Sources/AICCNativeApp/HapticFeedbackPlayer.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000010000000000000033 /* Sources/AICCNativeApp/HapticFeedbackPlayer.swift */; };
+		AA0000010000000000000034 /* Sources/AICCNativeApp/PipelineHealthView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA0000010000000000000035 /* Sources/AICCNativeApp/PipelineHealthView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		AA0000010000000000000002 /* Sources/AICCNativeApp/AICCNativeApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/AICCNativeApp/AICCNativeApp.swift; sourceTree = SOURCE_ROOT; };
 		AA0000010000000000000005 /* AICC.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = AICC.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		AA0000010000000000000019 /* Sources/AICCNativeApp/AICCAppModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/AICCNativeApp/AICCAppModel.swift; sourceTree = SOURCE_ROOT; };
+		AA0000010000000000000031 /* Sources/AICCNativeApp/CriticalEscalationBanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/AICCNativeApp/CriticalEscalationBanner.swift; sourceTree = SOURCE_ROOT; };
+		AA0000010000000000000033 /* Sources/AICCNativeApp/HapticFeedbackPlayer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/AICCNativeApp/HapticFeedbackPlayer.swift; sourceTree = SOURCE_ROOT; };
+		AA0000010000000000000035 /* Sources/AICCNativeApp/PipelineHealthView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Sources/AICCNativeApp/PipelineHealthView.swift; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -43,6 +49,9 @@
 			children = (
 				AA0000010000000000000002 /* Sources/AICCNativeApp/AICCNativeApp.swift */,
 				AA0000010000000000000019 /* Sources/AICCNativeApp/AICCAppModel.swift */,
+				AA0000010000000000000035 /* Sources/AICCNativeApp/PipelineHealthView.swift */,
+				AA0000010000000000000033 /* Sources/AICCNativeApp/HapticFeedbackPlayer.swift */,
+				AA0000010000000000000031 /* Sources/AICCNativeApp/CriticalEscalationBanner.swift */,
 				AA0000010000000000000006 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -114,6 +123,9 @@
 			files = (
 				AA0000010000000000000001 /* Sources/AICCNativeApp/AICCNativeApp.swift in Sources */,
 				AA0000010000000000000020 /* Sources/AICCNativeApp/AICCAppModel.swift in Sources */,
+				AA0000010000000000000034 /* Sources/AICCNativeApp/PipelineHealthView.swift in Sources */,
+				AA0000010000000000000032 /* Sources/AICCNativeApp/HapticFeedbackPlayer.swift in Sources */,
+				AA0000010000000000000030 /* Sources/AICCNativeApp/CriticalEscalationBanner.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

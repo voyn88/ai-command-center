@@ -1,0 +1,46 @@
+name: Apple native
+
+on:
+  pull_request:
+    paths:
+      - 'clients/aicc-native/**'
+      - '.github/workflows/apple-native.yml'
+  push:
+    paths:
+      - 'clients/aicc-native/**'
+      - '.github/workflows/apple-native.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apple-native:
+    name: Apple native build and tests
+    runs-on: macos-15
+    # If unavailable: macos-14 with Xcode 16 can build, but the macOS 15
+    # deployment target requires macOS 15 to execute swift test.
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: clients/aicc-native/apple
+        shell: bash
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Show Apple toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+      - name: Build Swift package
+        run: swift build
+      - name: Test Swift core
+        run: swift test
+      - name: Build iPhone Simulator app (shared AICC scheme)
+        run: xcodebuild -project AICCNative.xcodeproj -scheme AICC -destination 'generic/platform=iOS Simulator' build CODE_SIGNING_ALLOWED=NO

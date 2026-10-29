@@ -18,5 +18,45 @@
       }}
   ],
   "lanes":[{"id":"worker-01","state":"healthy","heartbeatAgeSeconds":3}],
-  "events":[{"id":"evt-001","occurredAt":"2026-08-24T00:00:00Z","summary":"CI completed on exact head","correlationID":"VOYN-EXAMPLE-001"}]
+  "events":[{"id":"evt-001","occurredAt":"2026-08-24T00:00:00Z","summary":"CI completed on exact head","correlationID":"VOYN-EXAMPLE-001"}],
+  "pipelineHealth": {
+  "observedAt": "2026-08-26T00:00:00Z",
+  "queue": {
+    "ready": 3,
+    "claimed": 2,
+    "dead": 1,
+    "succeededLastHour": 7,
+    "oldestReadyAgeSeconds": 95
+  },
+  "activeLanes": [
+    {
+      "role": "aicc_worker",
+      "attempts": 2,
+      "heartbeatAgeSeconds": 14
+    }
+  ],
+  "executorAuthFailures30m": 0,
+  "backlogByStatus": {
+    "DEFER_TO_USER": 1,
+    "DONE": 40,
+    "IN_PROGRESS": 2,
+    "OPEN": 5
+  },
+  "ownerEscalations": [
+    {
+      "taskID": "VOYN-EXAMPLE-002",
+      "title": "Blocked migration",
+      "priority": "P1",
+      "updatedAt": "2026-08-25T22:00:00Z"
+    }
+  ],
+  "monitor": {
+    "verdict": "failing",
+    "openFindings": 1,
+    "failures": [
+      "dead_letter_growth"
+    ],
+    "lastSeenAt": "2026-08-25T23:58:00Z"
+  }
+}
 }

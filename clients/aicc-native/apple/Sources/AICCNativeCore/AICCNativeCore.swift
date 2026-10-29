@@ -257,8 +257,9 @@ public struct Snapshot: Codable, Equatable, Sendable {
     public let projects: [Project]
     public let goal: WaveGoal?
     public let criticalEscalations: [CriticalEscalation]
+    public let pipelineHealth: PipelineHealth?
 
-    public init(schemaVersion: String, revision: String, generatedAt: Date, freshness: Freshness, tasks: [Task], lanes: [AgentLane], events: [TimelineEvent], projects: [Project] = [], goal: WaveGoal? = nil, criticalEscalations: [CriticalEscalation] = []) {
+    public init(schemaVersion: String, revision: String, generatedAt: Date, freshness: Freshness, tasks: [Task], lanes: [AgentLane], events: [TimelineEvent], projects: [Project] = [], goal: WaveGoal? = nil, criticalEscalations: [CriticalEscalation] = [], pipelineHealth: PipelineHealth? = nil) {
         self.schemaVersion = schemaVersion
         self.revision = revision
         self.generatedAt = generatedAt
@@ -269,6 +270,7 @@ public struct Snapshot: Codable, Equatable, Sendable {
         self.projects = projects
         self.goal = goal
         self.criticalEscalations = criticalEscalations
+        self.pipelineHealth = pipelineHealth
     }
 
     public init(from decoder: Decoder) throws {
@@ -283,6 +285,7 @@ public struct Snapshot: Codable, Equatable, Sendable {
         projects = try container.decodeIfPresent([Project].self, forKey: .projects) ?? []
         goal = try? container.decodeIfPresent(WaveGoal.self, forKey: .goal)
         criticalEscalations = try container.decodeIfPresent([CriticalEscalation].self, forKey: .criticalEscalations) ?? []
+        pipelineHealth = try? container.decodeIfPresent(PipelineHealth.self, forKey: .pipelineHealth)
     }
 
     public var overview: OverviewModel {

@@ -5,10 +5,10 @@ import AICCNativeCore
 /// watch complication offers once a WatchKit/WidgetKit target exists
 /// (docs/aicc_native/APPLE_RELEASE_READINESS.md tracks that gap). Tapping the
 /// action never leaves the device: it records a local acknowledgement, not
-/// an AIOS command.
+/// an AIOS command. Omit the callback for persistent read-only pipeline alerts.
 struct CriticalEscalationBanner: View {
     let escalation: CriticalEscalation
-    let onAcknowledge: () -> Void
+    var onAcknowledge: (() -> Void)? = nil
     @State private var acknowledging = false
 
     var body: some View {
@@ -17,16 +17,18 @@ struct CriticalEscalationBanner: View {
                 .font(.caption2.weight(.bold)).tracking(1.1).foregroundStyle(.red)
             Text(escalation.title).font(.title3.weight(.semibold))
             Text(escalation.summary).font(.subheadline).foregroundStyle(.secondary)
-            Button {
-                acknowledging = true
-                onAcknowledge()
-            } label: {
-                Label(escalation.actionLabel, systemImage: "checkmark.circle.fill")
-                    .frame(maxWidth: .infinity)
+            if let onAcknowledge {
+                Button {
+                    acknowledging = true
+                    onAcknowledge()
+                } label: {
+                    Label(escalation.actionLabel, systemImage: "checkmark.circle.fill")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.red)
+                .disabled(acknowledging)
             }
-            .buttonStyle(.borderedProminent)
-            .tint(.red)
-            .disabled(acknowledging)
         }
         .padding(18)
         .frame(maxWidth: .infinity, alignment: .leading)

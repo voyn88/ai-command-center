@@ -140,6 +140,7 @@ import Testing
     let empty = Snapshot(schemaVersion: "1.0", revision: "r", generatedAt: .now, freshness: .fresh, tasks: [], lanes: [], events: [])
     let decisions = empty.widgetSnippets().first { $0.flow == .decisions }
     #expect(decisions?.destination == .flowInbox(.decisions))
+}
 
 @Test func criticalSnapshotExposesExactlyOneOpenEscalation() throws {
     let snapshot = try Fixture.criticalSnapshot()
@@ -162,6 +163,7 @@ import Testing
 
     #expect(acknowledged.contains(escalation.id))
     #expect(snapshot.openCriticalEscalations(acknowledged: acknowledged).isEmpty)
+}
 
 @Test func impactStoryDecodesTimelineChainAndRiskFromFixture() throws {
     let snapshot = try Fixture.healthySnapshot()
@@ -225,7 +227,8 @@ import Testing
     let blocked = AICCNativeCore.Task(id: "1", title: "T", blocker: "Waiting on owner", evidence: evidence)
     #expect(blocked.criticality == .critical)
 
-    let ambiguous = AICCNativeCore.Task(id: "2", title: "T", blocker: nil, evidence: evidence)
+    let missingDeploy = DeliveryEvidence(headSHA: "abc", pullRequest: "#1", ci: .verified, acceptance: .verified, mergedSHA: "def", deployedSHA: nil)
+    let ambiguous = AICCNativeCore.Task(id: "2", title: "T", blocker: nil, evidence: missingDeploy)
     #expect(ambiguous.evidence.derivedStatus == .unknown)
     #expect(ambiguous.criticality == .high)
 
