@@ -5184,8 +5184,8 @@ CONTROL_ONLY_UNITS = (
 CONTROL_ONLY_TIMERS = (
     "voyn-aicc-review.timer",
     "voyn-aicc-merge.timer",
-    "voyn-aicc-credential-rescue.timer",
     "voyn-aicc-remediate.timer",
+    "voyn-aicc-credential-rescue.timer",
     "voyn-aicc-pr-window.timer",
 )
 CONTROL_ONLY_TIMER = "voyn-aicc-pr-window.timer"
