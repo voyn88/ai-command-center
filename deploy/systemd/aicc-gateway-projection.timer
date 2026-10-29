@@ -1,0 +1,14 @@
+[Unit]
+Description=Refresh the AICC Native Gateway projection every minute
+
+[Timer]
+OnBootSec=2min
+# From the END of the last run: a slow database tick cannot queue a second
+# one behind it. ~1 min cadence keeps the artifact inside the gateway's
+# 120 s "fresh" window.
+OnUnitInactiveSec=1min
+AccuracySec=5s
+Unit=aicc-gateway-projection.service
+
+[Install]
+WantedBy=timers.target

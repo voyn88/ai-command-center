@@ -37,7 +37,12 @@ from .dto import (
     EvidenceState,
     Freshness,
     GoalDTO,
+    MonitorVerdictDTO,
+    OwnerEscalationDTO,
+    PipelineHealthDTO,
+    PipelineLaneDTO,
     ProjectDTO,
+    QueueHealthDTO,
     SnapshotDTO,
     TaskDTO,
     TimelineEventDTO,
@@ -180,6 +185,7 @@ def _map_projection(raw: dict, now: datetime, settings: GatewaySettings) -> Proj
         projects=projects,
         connection=ConnectionDTO(state=freshness, projectionAgeSeconds=age),
         goal=_map_goal(raw.get("goal")),
+        pipelineHealth=_map_pipeline_health(raw.get("pipeline_health")),
     )
     return Projection(snapshot=snapshot, dialogs=dialogs, decisions=decisions)
 
@@ -202,6 +208,88 @@ def _map_goal(raw: object) -> GoalDTO | None:
         total=total,
         inProgress=_count("in_progress"),
         review=_count("review"),
+    )
+
+
+# Closed vocabularies for the pipeline_health block.
+_BACKLOG_STATUSES = frozenset(
+    {
+        "OPEN",
+        "IN_PROGRESS",
+        "READY_TO_REVIEW",
+        "DONE",
+        "UNTRIAGED",
+        "DEFER_TO_USER",
+        "SPLIT",
+        "NEEDS_REFINEMENT",
+        "DECIDED",
+    }
+)
+_MONITOR_VERDICTS = frozenset({"ok", "failing"})
+
+
+def _nonneg(value: object) -> int:
+    return value if isinstance(value, int) and value >= 0 else 0
+
+
+def _map_pipeline_health(raw: object) -> PipelineHealthDTO | None:
+    if not isinstance(raw, dict):
+        return None
+    observed = _iso(raw.get("observed_at"))
+    queue = raw.get("queue")
+    if observed is None or not isinstance(queue, dict):
+        return None
+    oldest = queue.get("oldest_ready_age_seconds")
+    by_status = raw.get("backlog_by_status")
+    by_status = by_status if isinstance(by_status, dict) else {}
+    monitor = raw.get("monitor")
+    monitor_dto = None
+    if isinstance(monitor, dict) and monitor.get("verdict") in _MONITOR_VERDICTS:
+        failures = monitor.get("failures")
+        failures = failures if isinstance(failures, list) else []
+        monitor_dto = MonitorVerdictDTO(
+            verdict=monitor["verdict"],
+            openFindings=_nonneg(monitor.get("open_findings")),
+            failures=[code for code in (_clean(f) for f in failures) if code],
+            lastSeenAt=_iso(monitor.get("last_seen_at")),
+        )
+    return PipelineHealthDTO(
+        observedAt=observed,
+        queue=QueueHealthDTO(
+            ready=_nonneg(queue.get("ready")),
+            claimed=_nonneg(queue.get("claimed")),
+            dead=_nonneg(queue.get("dead")),
+            succeededLastHour=_nonneg(queue.get("succeeded_last_hour")),
+            oldestReadyAgeSeconds=(
+                oldest if isinstance(oldest, int) and oldest >= 0 else None
+            ),
+        ),
+        activeLanes=[
+            PipelineLaneDTO(
+                role=_clean_required(lane.get("role"), "unknown"),
+                attempts=_nonneg(lane.get("attempts")),
+                heartbeatAgeSeconds=(
+                    lane["heartbeat_age_seconds"]
+                    if isinstance(lane.get("heartbeat_age_seconds"), int)
+                    else -1
+                ),
+            )
+            for lane in _items(raw.get("active_lanes"))
+        ],
+        executorAuthFailures30m=_nonneg(raw.get("executor_auth_failures_30m")),
+        backlogByStatus={
+            k: _nonneg(v) for k, v in by_status.items() if k in _BACKLOG_STATUSES
+        },
+        ownerEscalations=[
+            OwnerEscalationDTO(
+                taskID=_clean_required(item.get("task_id"), "unknown"),
+                title=_clean_required(item.get("title"), "Untitled"),
+                priority=_clean(item.get("priority")),
+                updatedAt=_iso(item.get("updated_at")),
+            )
+            for item in _items(raw.get("owner_escalations"))
+        ],
+        monitor=monitor_dto,
     )
 
 

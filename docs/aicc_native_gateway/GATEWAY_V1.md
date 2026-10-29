@@ -37,6 +37,17 @@ otherwise age ≤ 120 s → `fresh`, ≤ 900 s → `stale`, else `offline`
 (thresholds configurable via `AICC_GATEWAY_*` env). A missing or corrupt
 artifact yields a calm, empty `offline` snapshot — never an error page.
 
+### Pipeline health (additive)
+
+With `--pipeline-health` the producer adds a `pipeline_health` block read
+from the control database through `native_gateway/delivery_health.py`
+(queue counts and oldest ready age, active lanes, executor login failures in
+the last 30 min, backlog counts by status, `DEFER_TO_USER` owner
+escalations, the infra monitor's open failure codes). It is served as the
+optional `pipelineHealth` object of the snapshot; the gateway still reads
+only the artifact. Deployment on control-01:
+`docs/operations/NATIVE_GATEWAY_DEPLOY.md`.
+
 ## API surface (`/v1`, DTO `1.0`)
 
 - `GET /v1/snapshot` — atomic dashboard snapshot; `ETag`/`If-None-Match`

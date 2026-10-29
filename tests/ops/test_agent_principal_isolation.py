@@ -2204,7 +2204,16 @@ def test_the_control_profile_installs_the_pr_window_tick(tmp_path):
         "voyn-aicc-remediate.timer",
         "voyn-aicc-pr-window.service",
         "voyn-aicc-pr-window.timer",
+        "aicc-native-gateway.service",
+        "aicc-gateway-projection.service",
+        "aicc-gateway-projection.timer",
     )
+    # The gateway pair is installed but operator-enabled (TLS + device tokens
+    # come first), so the installer never auto-starts it.
+    assert not {
+        "aicc-native-gateway.service",
+        "aicc-gateway-projection.timer",
+    } & set(tx.CONTROL_ONLY_TIMERS)
     for unit in tx.CONTROL_ONLY_UNITS:
         assert f"/etc/systemd/system/{unit}" in control
     # A control-only unit is exactly that: the worker profile neither installs

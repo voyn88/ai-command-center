@@ -5176,6 +5176,14 @@ CONTROL_ONLY_UNITS = (
     "voyn-aicc-remediate.timer",
     "voyn-aicc-pr-window.service",
     "voyn-aicc-pr-window.timer",
+    # The owner apps' read-only gateway and its projection producer
+    # (docs/operations/NATIVE_GATEWAY_DEPLOY.md). Installed as files with the
+    # generation, but deliberately NOT in `CONTROL_ONLY_TIMERS`: the gateway
+    # needs operator-provisioned TLS material and device tokens first, and
+    # the operator enables both once those exist.
+    "aicc-native-gateway.service",
+    "aicc-gateway-projection.service",
+    "aicc-gateway-projection.timer",
 )
 #: The timers of `CONTROL_ONLY_UNITS` the installer enables after commit, so
 #: installed units are *running* ticks and not just files on disk.
