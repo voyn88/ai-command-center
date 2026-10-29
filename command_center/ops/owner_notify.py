@@ -52,7 +52,11 @@ def _cooldown_seconds() -> float:
 
 def _topic_url() -> str | None:
     url = os.environ.get("AICC_OWNER_NTFY_URL", "").strip()
-    return url or None
+    # Only an http(s) topic URL is a phone channel; file:/custom schemes from a
+    # mistyped env value are refused rather than opened.
+    if not url.lower().startswith(("https://", "http://")):
+        return None
+    return url
 
 
 def _load_state(path: Path) -> dict[str, Any]:
@@ -129,7 +133,8 @@ def _post(
         url, data=text.encode("utf-8"), headers=headers, method="POST"
     )
     try:
-        with urllib.request.urlopen(request, timeout=_HTTP_TIMEOUT) as response:
+        # Scheme restricted to http(s) in _topic_url.
+        with urllib.request.urlopen(request, timeout=_HTTP_TIMEOUT) as response:  # nosec B310
             response.read(1024)
             return 200 <= int(response.status) < 300
     except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:

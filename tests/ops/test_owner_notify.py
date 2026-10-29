@@ -146,3 +146,10 @@ def test_network_errors_return_false_and_do_not_raise(monkeypatch, tmp_path, cap
     assert owner_notify.notify("k", "t", "m") is False
     err = capsys.readouterr().err
     assert "owner_notify: POST failed" in err
+
+
+def test_non_http_scheme_is_not_a_channel(monkeypatch) -> None:
+    from command_center.ops import owner_notify
+
+    monkeypatch.setenv("AICC_OWNER_NTFY_URL", "file:///etc/passwd")
+    assert owner_notify.notify("k", "t", "m") is False
