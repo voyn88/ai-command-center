@@ -1434,3 +1434,26 @@ def test_notify_owner_of_report_does_not_change_failures(monkeypatch) -> None:
     infra_monitor.notify_owner_of_report(report, source="control-01")
     assert report.failures == before
     assert calls == ["notify"]
+
+
+def test_notify_owner_unknown_defer_backlog_keeps_defer_keys_open(monkeypatch) -> None:
+    """A failed DEFER_TO_USER read (None) must not tell the owner 'resolved'."""
+    from command_center.ops import owner_notify
+
+    resolved: list[str] = []
+    monkeypatch.setattr(owner_notify, "notify", lambda *a, **k: True)
+    monkeypatch.setattr(
+        owner_notify, "resolve", lambda key, *a, **k: resolved.append(key) or True
+    )
+    monkeypatch.setattr(
+        owner_notify, "open_keys", lambda: frozenset({"defer:OPEN-TASK"})
+    )
+    report = evaluate(
+        {"voyn-aicc-worker@1.service": "active"},
+        _queue(),
+        minimum_active_workers=1,
+        max_stalled_seconds=900,
+        prometheus_ready=True,
+    )
+    infra_monitor.notify_owner_of_report(report, source="control-01", defer_tasks=None)
+    assert resolved == []

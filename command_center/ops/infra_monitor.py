@@ -1109,7 +1109,7 @@ def notify_owner_of_report(
     report: MonitorReport,
     *,
     source: str,
-    defer_tasks: tuple[tuple[str, str, str, Any], ...] = (),
+    defer_tasks: tuple[tuple[str, str, str, Any], ...] | None = (),
 ) -> None:
     """Push / resolve phone alerts for monitor failures and DEFER_TO_USER rows.
 
@@ -1156,6 +1156,11 @@ def notify_owner_of_report(
         except Exception as exc:  # noqa: BLE001
             print(f"owner_notify resolve failed for {open_key}: {exc}", file=sys.stderr)
 
+    # None = the DEFER_TO_USER read failed or was skipped on this host: an
+    # unknown backlog is no evidence that an escalation was answered, so open
+    # defer keys stay open instead of being "resolved" on the owner's phone.
+    if defer_tasks is None:
+        return
     active_defer = {task_id for task_id, _title, _priority, _updated in defer_tasks}
     for task_id, title, _priority, _updated in defer_tasks:
         try:
@@ -1279,13 +1284,13 @@ def main(argv: list[str] | None = None) -> int:
             unit_health=unit_health,
             deploy_lag=deploy_lag,
         )
-        defer_tasks: tuple[tuple[str, str, str, Any], ...] = ()
+        defer_tasks: tuple[tuple[str, str, str, Any], ...] | None = None
         if not args.skip_queue:
             try:
                 defer_tasks = read_defer_to_user_tasks()
             except Exception as exc:  # noqa: BLE001 - defer pages must not hide the probe
                 print(f"defer_to_user read failed: {exc}", file=sys.stderr)
-                defer_tasks = ()
+                defer_tasks = None
         try:
             notify_owner_of_report(
                 report,
@@ -1296,6 +1301,19 @@ def main(argv: list[str] | None = None) -> int:
             print(f"owner_notify wiring failed: {exc}", file=sys.stderr)
     except Exception as exc:  # noqa: BLE001 - the monitor itself must fail closed
         print(json.dumps({"ok": False, "failures": [f"monitor_error:{exc}"]}))
+        # A broken monitor is the one failure nobody would otherwise see.
+        try:
+            from command_center.ops import owner_notify
+
+            owner_notify.notify(
+                f"monitor:{notify_source(args.record_findings)}:monitor_error",
+                "AICC: monitor_error",
+                f"monitor_error: {exc}"[:500],
+                priority="urgent",
+                tags=("warning", "monitor_error"),
+            )
+        except Exception as notify_exc:  # noqa: BLE001
+            print(f"owner_notify monitor_error failed: {notify_exc}", file=sys.stderr)
         return 1
     payload = _json_report(report)
     recorded = True
