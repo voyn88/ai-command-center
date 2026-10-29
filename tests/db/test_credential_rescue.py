@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from command_center.ops.credential_rescue import PostgresRepository, RescueConfig, run
+from command_center.ops.credential_rescue import AdminSession, RescueConfig, run
 
 
 @pytest.mark.serial
@@ -39,7 +39,7 @@ def test_rescue_updates_role_ledger_and_audit(pg_connection_factory, admin_conn)
             )
         )
         with pg_connection_factory() as connection:
-            repository = PostgresRepository(connection)
+            repository = AdminSession(connection)
             assert run(repository, RescueConfig(dry_run=True)) == 0
             assert (
                 admin_conn.execute("SELECT count(*) FROM principal_event").fetchone()[0]

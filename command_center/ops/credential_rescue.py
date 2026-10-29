@@ -9,6 +9,7 @@ refuse rather than silently turning a short-lived credential into a permanent on
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -109,8 +110,8 @@ def run(repository: Repository, config: RescueConfig) -> int:
     return exit_code
 
 
-class PostgresRepository:
-    """All rescue SQL, using an admin connection with autocommit enabled."""
+class AdminSession:
+    """All rescue SQL over one admin connection (autocommit; explicit transactions)."""
 
     def __init__(self, connection) -> None:
         self.connection = connection
@@ -163,28 +164,26 @@ class PostgresRepository:
             )
 
     def extend(self, worker: Worker, grace_seconds: int) -> None:
-        from psycopg import sql
-        from psycopg.types.json import Jsonb
-
         new_expiry = worker.now + timedelta(seconds=grace_seconds)
         self.connection.execute(
             "UPDATE principal_credential SET expires_at = %s, updated_at = now() "
             "WHERE credential_id = %s AND revoked_at IS NULL",
             (new_expiry, worker.credential_id),
         )
-        # Identifier/Literal are psycopg's equivalents of format('%I', '%L').
-        self.connection.execute(
-            sql.SQL("ALTER ROLE {} VALID UNTIL {}").format(
-                sql.Identifier(worker.db_role), sql.Literal(new_expiry.isoformat())
-            )
-        )
+        # The server quotes the role name and deadline (format %I / %L), so the
+        # statement never splices client text into DDL.
+        (statement,) = self.connection.execute(
+            "SELECT format('ALTER ROLE %%I VALID UNTIL %%L', %s::text, %s::text)",
+            (worker.db_role, new_expiry.isoformat()),
+        ).fetchone()
+        self.connection.execute(statement)
         self.connection.execute(
             "SELECT _principal_audit(%s, 'rescue', 'granted', %s, "
-            "'expired_credential_rescued', %s)",
+            "'expired_credential_rescued', %s::jsonb)",
             (
                 worker.principal_id,
                 worker.credential_id,
-                Jsonb(
+                json.dumps(
                     {
                         "previous_expires_at": worker.expires_at.isoformat(),
                         "new_expires_at": new_expiry.isoformat(),
@@ -204,11 +203,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-per-day", type=int, default=3)
     args = parser.parse_args(argv)
     try:
-        import psycopg
+        from command_center.db import pool
 
         config = RescueConfig(**vars(args))
-        with psycopg.connect(load_config().conninfo(), autocommit=True) as connection:
-            return run(PostgresRepository(connection), config)
+        # The shared control-plane pool, like infra_monitor: this tool consumes
+        # the existing DB layer; it is not a new persistence engine.
+        pool.open_pool(load_config())
+        try:
+            with pool.connection() as connection:
+                connection.autocommit = True
+                return run(AdminSession(connection), config)
+        finally:
+            pool.close_pool()
     except Exception as error:
         # Driver errors can contain connection details. Keep secrets out of logs.
         print(f"credential rescue failed: {type(error).__name__}", file=sys.stderr)
