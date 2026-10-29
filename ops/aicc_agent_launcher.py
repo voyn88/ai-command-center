@@ -21,6 +21,7 @@ import fcntl
 import grp
 import hashlib
 import json
+import math
 import os
 import pwd
 import re
@@ -34,6 +35,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -447,23 +449,39 @@ def _node_is_immutable_root_owned(info: os.stat_result) -> bool:
     return not (info.st_mode & 0o022)
 
 
-def _write_back_model_auth(executor: str, home: Path) -> bool:
-    """Persist a provider credential the model process refreshed during the
-    run back into the root-owned store the next run is staged from.
+def _model_auth_freshness(executor: str, document: dict) -> int | float | datetime | None:
+    """Return a comparable provider timestamp, or None when it is unknown."""
+    if executor == "claude":
+        oauth = document.get("claudeAiOauth")
+        value = oauth.get("expiresAt") if isinstance(oauth, dict) else None
+        if type(value) is int or (type(value) is float and math.isfinite(value)):
+            return value
+    elif executor == "codex":
+        value = document.get("last_refresh")
+        if isinstance(value, str):
+            try:
+                parsed = datetime.fromisoformat(value)
+            except ValueError:
+                return None
+            if parsed.tzinfo is not None and parsed.utcoffset() is not None:
+                return parsed
+    return None
 
-    Claude and Codex rotate their refresh token when they refresh: the new
-    token lands in the per-run ephemeral home and the old one in the store
-    is revoked. Without this, the FIRST isolated run succeeds and every
-    later one fails with "OAuth session expired and could not be refreshed"
-    (worker-01, 2026-09-08: 48 dead attempts in 25 minutes). The broker,
-    still root, copies the file back only when it is a regular file the run
-    left in place, parses as a JSON object whose top-level keys equal the
-    staged copy's (a token refresh changes values, never the shape -- a
-    different shape is not a refresh and is not trusted), and differs from
-    the store; the write is atomic (temp + rename in the store directory,
-    0600 root). Returns True when the store was updated."""
+
+def _write_back_model_auth(executor: str, home: Path, staged: bytes | None) -> bool:
+    """Persist only credentials this run changed from its exact staged bytes.
+
+    An unchanged run must never overwrite a token rotated by another lane.
+    Hold the store's exclusive .model-auth.lock across read, compare and atomic
+    replacement. If the store changed since staging, require strictly newer
+    Claude claudeAiOauth.expiresAt (milliseconds) or Codex last_refresh (ISO-8601
+    with timezone); unknown/equal/older freshness preserves the store.
+    Require a bounded regular JSON object with the same top-level shape as
+    both the staged copy and the store. Replacement remains atomic, root 0600.
+    Return True only when the store was updated.
+    """
     source = MODEL_AUTH_SOURCES.get(executor)
-    if source is None:
+    if source is None or staged is None:
         return False
     target = home / MODEL_AUTH_TARGETS[executor]
     try:
@@ -472,48 +490,87 @@ def _write_back_model_auth(executor: str, home: Path) -> bool:
         return False
     if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_MODEL_AUTH_BYTES:
         raise LaunchRefused("refreshed model auth is not a plain regular file")
-    refreshed = target.read_bytes()
-    current = _read_exact_protected_file(
-        source, expected_uid=0, expected_gid=0, exact_mode=0o600
-    )
-    if refreshed == current:
+    with target.open("rb") as stream:
+        refreshed = stream.read(MAX_MODEL_AUTH_BYTES + 1)
+    if len(refreshed) > MAX_MODEL_AUTH_BYTES:
+        raise LaunchRefused("refreshed model auth is not a plain regular file")
+    if refreshed == staged:
         return False
     try:
-        refreshed_doc = json.loads(refreshed.decode("utf-8"))
-        current_doc = json.loads(current.decode("utf-8"))
+        refreshed_doc = json.loads(refreshed)
+        staged_doc = json.loads(staged)
     except (UnicodeDecodeError, ValueError) as exc:
         raise LaunchRefused("refreshed model auth is not JSON") from exc
     if (
         not isinstance(refreshed_doc, dict)
-        or not isinstance(current_doc, dict)
-        or set(refreshed_doc) != set(current_doc)
+        or not isinstance(staged_doc, dict)
+        or set(refreshed_doc) != set(staged_doc)
     ):
         raise LaunchRefused("refreshed model auth changed shape; not a token refresh")
-    temporary = source.with_name(f".{source.name}.{os.getpid()}.tmp")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
-    descriptor = os.open(temporary, flags, 0o600)
+    flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    lock = os.open(source.parent / ".model-auth.lock", flags, 0o600)
     try:
-        os.fchmod(descriptor, 0o600)
-        if os.geteuid() == 0:
-            os.fchown(descriptor, 0, 0)
-        with os.fdopen(descriptor, "wb", closefd=False) as stream:
-            stream.write(refreshed)
-            stream.flush()
-            os.fsync(stream.fileno())
+        lock_info = os.fstat(lock)
+        if (
+            not stat.S_ISREG(lock_info.st_mode)
+            or lock_info.st_nlink != 1
+            or lock_info.st_uid != 0
+            or lock_info.st_gid != 0
+            or stat.S_IMODE(lock_info.st_mode) != 0o600
+        ):
+            raise LaunchRefused("model auth lock ownership or mode drifted")
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        current = _read_exact_protected_file(
+            source, expected_uid=0, expected_gid=0, exact_mode=0o600
+        )
+        if refreshed == current:
+            return False
+        try:
+            current_doc = json.loads(current)
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise LaunchRefused("stored model auth is not JSON") from exc
+        if not isinstance(current_doc, dict) or set(refreshed_doc) != set(current_doc):
+            raise LaunchRefused("refreshed model auth changed shape; not a token refresh")
+        if current != staged:
+            refreshed_at = _model_auth_freshness(executor, refreshed_doc)
+            current_at = _model_auth_freshness(executor, current_doc)
+            if refreshed_at is None or current_at is None or refreshed_at <= current_at:
+                print(
+                    f"model auth write-back: {executor} skipped, "
+                    "store is newer or freshness unknown",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return False
+        temporary = source.with_name(f".{source.name}.{os.getpid()}.tmp")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+        descriptor = os.open(temporary, flags, 0o600)
+        try:
+            os.fchmod(descriptor, 0o600)
+            if os.geteuid() == 0:
+                os.fchown(descriptor, 0, 0)
+            with os.fdopen(descriptor, "wb", closefd=False) as stream:
+                stream.write(refreshed)
+                stream.flush()
+                os.fsync(stream.fileno())
+        finally:
+            os.close(descriptor)
+        os.replace(temporary, source)
     finally:
-        os.close(descriptor)
-    os.replace(temporary, source)
+        os.close(lock)
     print(f"model auth write-back: {executor} credential refreshed by the run", file=sys.stderr, flush=True)
     return True
 
 
-def _prepare_agent_home(executor: str, run_id: str) -> Path:
+def _prepare_agent_home(executor: str, run_id: str) -> tuple[Path, bytes]:
     """Create one non-persistent provider home with a private auth copy.
 
     The model process necessarily reads its provider credential, but it must
     not be able to persist plugins, instructions, config or a modified token
     into a later task. The root broker copies only the one allowlisted auth
     file into a per-run tmpfs-backed path and removes it after cgroup exit.
+    Return the home and exact staged bytes, retained only in broker memory
+    for the teardown comparison (never in the agent-writable home).
     """
     try:
         # A DEDICATED group for ephemeral model-credential homes. The shared
@@ -569,7 +626,7 @@ def _prepare_agent_home(executor: str, run_id: str) -> Path:
     except (FileExistsError, OSError) as exc:
         shutil.rmtree(home, ignore_errors=True)
         raise LaunchRefused("cannot prepare ephemeral model home") from exc
-    return home
+    return home, source_payload
 
 
 def _parse_git_index_payload(data: bytes, workspace: Path) -> frozenset[Path]:
@@ -1771,6 +1828,7 @@ def _prepare_reusable_workspace(
 
 def _serve_connected_socket(sock: socket.socket) -> int:
     agent_home: Path | None = None
+    staged_auth: bytes | None = None
     unit: str | None = None
     workspace: Path | None = None
     workspace_lock: int | None = None
@@ -1796,7 +1854,7 @@ def _serve_connected_socket(sock: socket.socket) -> int:
             raise LaunchRefused("workspace is quarantined after an unsealed agent")
         _prepare_reusable_workspace(workspace, workspace_fd)
         _validate_binary(EXECUTOR_BINARIES[manifest["executor"]])
-        agent_home = _prepare_agent_home(manifest["executor"], manifest["run_id"])
+        agent_home, staged_auth = _prepare_agent_home(manifest["executor"], manifest["run_id"])
         unit = f"aicc-agent-{manifest['run_id']}-{os.getpid()}.service"
         workspace_bind = _prepare_workspace_bind(workspace_fd, manifest["run_id"])
         _write_active_workspace_unit(workspace, unit)
@@ -1907,7 +1965,7 @@ def _serve_connected_socket(sock: socket.socket) -> int:
                 }
         if agent_home is not None:
             try:
-                _write_back_model_auth(manifest["executor"], agent_home)
+                _write_back_model_auth(manifest["executor"], agent_home, staged_auth)
             except (LaunchRefused, OSError, ValueError) as exc:
                 print(f"model auth write-back skipped: {exc}", file=sys.stderr, flush=True)
             shutil.rmtree(agent_home, ignore_errors=True)
