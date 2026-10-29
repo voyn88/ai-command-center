@@ -1,0 +1,39 @@
+# Root-owned worker release deploy
+# (VOYN-W0-AICC-WORKER-SELF-DEPLOY-MUST-STAGE-IMMUTABLE-RELEASE).
+#
+# Replaces the voynadmin `voyn-aicc-self-deploy` worker variant: that tick
+# cannot write root-owned immutable releases under /opt/aicc/releases, so
+# worker-01 stayed on a months-old SHA while origin/main advanced. This
+# oneshot fetches into a root-owned bare mirror, stages via the installer
+# publication path, and drain-restarts only currently-active registered lanes.
+[Unit]
+Description=AICC worker release deploy (merged main -> immutable root-owned release)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecCondition=/usr/bin/test ! -e /run/aicc-staged-rollout.lock
+ExecStart=/usr/libexec/aicc-worker-release-deploy
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectControlGroups=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+LockPersonality=yes
+KeyringMode=private
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/opt/aicc/releases /opt/aicc /var/lib/aicc-principal-isolation /run
+UMask=0077
+TimeoutStartSec=900s

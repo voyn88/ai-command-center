@@ -121,9 +121,20 @@ hold_lane_timers() {
     return 0
   fi
   systemctl stop voyn-aicc-credential-rotation.timer || return 1
-  if ! systemctl stop voyn-aicc-self-deploy.timer; then
-    systemctl start voyn-aicc-credential-rotation.timer >/dev/null 2>&1 || true
-    return 1
+  # Worker hosts run voyn-aicc-worker-release-deploy.timer (root-owned
+  # immutable release). Control still uses voyn-aicc-self-deploy.timer.
+  # Stop whichever is loaded; a not-found unit is skipped like the Python
+  # hold_lane_mutating_timers path.
+  if systemctl show voyn-aicc-worker-release-deploy.timer --property=LoadState --value 2>/dev/null | grep -qx loaded; then
+    if ! systemctl stop voyn-aicc-worker-release-deploy.timer; then
+      systemctl start voyn-aicc-credential-rotation.timer >/dev/null 2>&1 || true
+      return 1
+    fi
+  elif systemctl show voyn-aicc-self-deploy.timer --property=LoadState --value 2>/dev/null | grep -qx loaded; then
+    if ! systemctl stop voyn-aicc-self-deploy.timer; then
+      systemctl start voyn-aicc-credential-rotation.timer >/dev/null 2>&1 || true
+      return 1
+    fi
   fi
   lock_tmp="/run/aicc-staged-rollout.lock.$$"
   printf '%s\n' "$$" >"$lock_tmp"
@@ -138,6 +149,7 @@ release_lane_timers() {
   fi
   rm -f -- /run/aicc-staged-rollout.lock
   systemctl start voyn-aicc-credential-rotation.timer >/dev/null 2>&1 || true
+  systemctl start voyn-aicc-worker-release-deploy.timer >/dev/null 2>&1 || true
   systemctl start voyn-aicc-self-deploy.timer >/dev/null 2>&1 || true
   timers_held=0
 }
@@ -601,6 +613,12 @@ systemctl daemon-reload
 if [ "$install_profile" = "worker" ]; then
   systemctl enable --now aicc-agent-launcher.socket
   systemctl enable --now voyn-aicc-source-clone-refresh.timer
+  # Retire the voynadmin worker self-deploy variant (hard-coded lane list,
+  # cannot write root-owned releases) and enable the root-owned release
+  # deploy that stages immutable /opt/aicc/releases/<sha>.
+  systemctl disable --now voyn-aicc-self-deploy.timer >/dev/null 2>&1 || true
+  systemctl disable voyn-aicc-self-deploy.service >/dev/null 2>&1 || true
+  systemctl enable --now voyn-aicc-worker-release-deploy.timer
 fi
 
 # The orchestrator discovers configured plus already-instantiated lanes, then

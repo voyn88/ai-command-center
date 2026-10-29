@@ -1242,6 +1242,9 @@ def test_same_boot_barrier_is_active_before_first_wal_or_claimer_start():
     source_refresh = commands.index(
         "systemctl enable --now voyn-aicc-source-clone-refresh.timer"
     )
+    worker_release = commands.index(
+        "systemctl enable --now voyn-aicc-worker-release-deploy.timer"
+    )
 
     assert (
         anchor
@@ -1251,8 +1254,10 @@ def test_same_boot_barrier_is_active_before_first_wal_or_claimer_start():
         < prepare
         < launcher
         < source_refresh
+        < worker_release
     )
     assert "systemctl enable aicc-principal-recovery.service" not in installer
+    assert "systemctl disable --now voyn-aicc-self-deploy.timer" in installer
 
 
 def test_boot_recovery_restores_dynamic_worker_and_auxiliary_unit_state(tmp_path):
@@ -3466,6 +3471,18 @@ def test_the_control_purge_covers_every_retired_worker_unit():
     )
     assert (
         "/etc/systemd/system/voyn-aicc-source-clone-refresh.timer"
+        in module.WORKER_ONLY_TARGETS
+    )
+    assert (
+        "/usr/libexec/aicc-worker-release-deploy"
+        in module.WORKER_ONLY_TARGETS
+    )
+    assert (
+        "/etc/systemd/system/voyn-aicc-worker-release-deploy.service"
+        in module.WORKER_ONLY_TARGETS
+    )
+    assert (
+        "/etc/systemd/system/voyn-aicc-worker-release-deploy.timer"
         in module.WORKER_ONLY_TARGETS
     )
     # The boot recovery capsule is the one agent-adjacent unit that must keep

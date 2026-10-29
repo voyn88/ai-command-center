@@ -3703,7 +3703,13 @@ class FileTransaction:
         )
 
     def select_release(self, release_id: str, repo_root: Path) -> str:
-        """Arm rollback and atomically activate an exact, re-proven release."""
+        """Arm rollback and atomically activate an exact, re-proven release.
+
+        Allowed during an APPLIED install journal (installer path) OR on a
+        committed host that already has `current.json` (worker release-deploy
+        ticks after the first install). Both arm `pending-release` the same
+        way so crash recovery can restore the previous selector.
+        """
         if RELEASE_ID_RE.fullmatch(release_id) is None:
             raise ReleaseRefused(
                 "release id must be exactly 40 lowercase hex characters"
@@ -3711,10 +3717,11 @@ class FileTransaction:
         selector = f"releases/{release_id}"
         release_dir = self._target("/opt/aicc") / selector
         manifest = self.release_manifest_path(release_id)
-        if not _path_present(self.pending):
-            raise RuntimeError("release selection requires an active install journal")
-        install_journal = _trusted_journal(self.pending)
-        if install_journal.get("phase") != "APPLIED":
+        if _path_present(self.pending):
+            install_journal = _trusted_journal(self.pending)
+            if install_journal.get("phase") != "APPLIED":
+                raise RuntimeError("release selection requires an applied install")
+        elif not _path_present(self.current):
             raise RuntimeError("release selection requires an applied install")
         if _path_present(self.pending_release):
             raise RuntimeError("pending release selector already exists")
@@ -5096,11 +5103,14 @@ WORKER_ONLY_TARGETS = frozenset(
         "/usr/lib/tmpfiles.d/aicc-agent.conf",
         "/usr/libexec/aicc-agent-launcher",
         "/usr/libexec/aicc-staged-worker-rollout",
+        "/usr/libexec/aicc-worker-release-deploy",
         "/etc/systemd/system/aicc-principal-recovery.service",
         "/etc/systemd/system/aicc-agent-launcher.socket",
         "/etc/systemd/system/aicc-agent-launcher@.service",
         "/etc/systemd/system/voyn-aicc-source-clone-refresh.service",
         "/etc/systemd/system/voyn-aicc-source-clone-refresh.timer",
+        "/etc/systemd/system/voyn-aicc-worker-release-deploy.service",
+        "/etc/systemd/system/voyn-aicc-worker-release-deploy.timer",
         "/etc/aicc/agent-workspace-roots",
         "/etc/aicc/worker-lanes",
         "/etc/aicc/gitconfig",
@@ -5341,6 +5351,13 @@ def default_specs(
             root_gid,
         ),
         FileSpec(
+            repo_root / "ops/aicc_worker_release_deploy.py",
+            "/usr/libexec/aicc-worker-release-deploy",
+            0o755,
+            root_uid,
+            root_gid,
+        ),
+        FileSpec(
             repo_root / "deploy/systemd/aicc-principal-recovery.service",
             "/etc/systemd/system/aicc-principal-recovery.service",
             0o644,
@@ -5371,6 +5388,20 @@ def default_specs(
         FileSpec(
             repo_root / "deploy/systemd/voyn-aicc-source-clone-refresh.timer",
             "/etc/systemd/system/voyn-aicc-source-clone-refresh.timer",
+            0o644,
+            root_uid,
+            root_gid,
+        ),
+        FileSpec(
+            repo_root / "deploy/systemd/voyn-aicc-worker-release-deploy.service",
+            "/etc/systemd/system/voyn-aicc-worker-release-deploy.service",
+            0o644,
+            root_uid,
+            root_gid,
+        ),
+        FileSpec(
+            repo_root / "deploy/systemd/voyn-aicc-worker-release-deploy.timer",
+            "/etc/systemd/system/voyn-aicc-worker-release-deploy.timer",
             0o644,
             root_uid,
             root_gid,

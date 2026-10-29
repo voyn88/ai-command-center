@@ -1,0 +1,241 @@
+"""Worker release deploy: merged main -> immutable root-owned /opt/aicc/current.
+
+Symlink/`fcntl`/root-owned publication primitives are Linux-only (same as
+`test_aicc_release_manifest` / `test_aicc_install_transaction`). These tests
+drive `deploy_once` through injectable seams so the orchestration contract
+runs on Windows too.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import sys
+from pathlib import Path
+
+import pytest
+
+pytestmark = pytest.mark.usefixtures("host_shaped_fixture_roots")
+
+
+def _module():
+    path = Path(__file__).parents[2] / "ops" / "aicc_worker_release_deploy.py"
+    spec = importlib.util.spec_from_file_location("aicc_worker_release_deploy", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    # Avoid pulling aicc_install_transaction (fcntl) unless a test asks for it.
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+SHA_A = "a" * 40
+SHA_B = "b" * 40
+LANE_1 = "voyn-aicc-worker@1.service"
+LANE_2 = "voyn-aicc-worker@2.service"
+LANE_3 = "voyn-aicc-worker@3.service"
+
+
+def _cfg(module, tmp_path, **overrides):
+    kwargs = dict(
+        bare_mirror=tmp_path / "mirror.git",
+        aicc_root=tmp_path / "opt" / "aicc",
+        release_root=tmp_path / "opt" / "aicc" / "releases",
+        state_dir=tmp_path / "state",
+        runtime_venv=tmp_path / "runtime-venv",
+        lane_registry=tmp_path / "lanes.conf",
+        rollout_lock_path=tmp_path / "aicc-staged-rollout.lock",
+        readiness_timeout=1.0,
+        poll_interval=0.01,
+        trusted_uid=0,
+        trusted_gid=0,
+    )
+    kwargs.update(overrides)
+    cfg = module.DeployConfig(**kwargs)
+    cfg.aicc_root.mkdir(parents=True, exist_ok=True)
+    cfg.release_root.mkdir(parents=True, exist_ok=True)
+    cfg.state_dir.mkdir(parents=True, exist_ok=True)
+    return cfg
+
+
+def _deploy(module, cfg, *, previous: str | None = SHA_A, **kwargs):
+    (cfg.release_root / (previous or SHA_A)).mkdir(exist_ok=True)
+    defaults = dict(
+        install_tx=object(),  # never load fcntl-bound installer on Windows
+        ensure_mirror=lambda _cfg: None,
+        resolve_sha=lambda _cfg: SHA_B if previous != SHA_B else SHA_A,
+        current_sha=lambda _cfg: previous,
+        dependency_gate=lambda *_a, **_k: None,
+        write_lock=lambda: None,
+        remove_lock=lambda: None,
+        hold_timers=lambda: None,
+        release_timers=lambda: None,
+        clear_pending=lambda: None,
+    )
+    defaults.update(kwargs)
+    return module.deploy_once(cfg, **defaults)
+
+
+def test_noop_when_current_already_at_target(tmp_path):
+    module = _module()
+    cfg = _cfg(module, tmp_path)
+    (cfg.release_root / SHA_A).mkdir()
+
+    report = _deploy(
+        module,
+        cfg,
+        previous=SHA_A,
+        resolve_sha=lambda _cfg: SHA_A,
+        stage=lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("no stage")),
+        select=lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("no select")),
+        rollout=lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("no rollout")),
+    )
+
+    assert report.outcome == "NOOP"
+    assert report.line() == f"NOOP {SHA_A} already_at_target"
+
+
+def test_deploy_calls_publish_verify_select_rollout_in_order(tmp_path):
+    module = _module()
+    cfg = _cfg(module, tmp_path)
+    order: list[str] = []
+
+    def stage(_cfg, sha):
+        order.append(f"publish:{sha}")
+        (cfg.release_root / sha).mkdir(exist_ok=True)
+
+    def select(sha):
+        order.append(f"select:{sha}")
+        return f"releases/{SHA_A}"
+
+    def rollout(units):
+        order.append(f"rollout:{','.join(units)}")
+        return True, "ready:1"
+
+    report = _deploy(
+        module,
+        cfg,
+        stage=stage,
+        select=select,
+        load_lanes=lambda *_a, **_k: (LANE_1,),
+        show=lambda unit, prop: {
+            "ActiveState": "active",
+            "SubState": "running",
+            "StatusText": "aicc-ready",
+            "MainPID": "42",
+        }.get(prop, ""),
+        rollout=rollout,
+        clear_pending=lambda: order.append("clear_pending"),
+        write_lock=lambda: order.append("lock"),
+        remove_lock=lambda: order.append("unlock"),
+        hold_timers=lambda: order.append("hold"),
+        release_timers=lambda: order.append("release"),
+    )
+
+    assert report.outcome == "DEPLOYED"
+    assert report.steps[:4] == ["publish", "verify", "select", "rollout"]
+    assert order == [
+        f"publish:{SHA_B}",
+        f"select:{SHA_B}",
+        "lock",
+        "hold",
+        "rollout:voyn-aicc-worker@1.service",
+        "release",
+        "unlock",
+        "clear_pending",
+    ]
+
+
+def test_stopped_registered_lane_is_untouched(tmp_path):
+    module = _module()
+    cfg = _cfg(module, tmp_path)
+    touched: list[str] = []
+
+    def show(unit: str, prop: str) -> str:
+        if prop == "ActiveState":
+            return "inactive" if unit == LANE_3 else "active"
+        return {
+            "SubState": "running",
+            "StatusText": "aicc-ready",
+            "MainPID": "7",
+        }.get(prop, "")
+
+    def rollout(units):
+        touched.extend(units)
+        return True, f"ready:{len(units)}"
+
+    report = _deploy(
+        module,
+        cfg,
+        stage=lambda _c, sha: (cfg.release_root / sha).mkdir(exist_ok=True),
+        select=lambda sha: f"releases/{SHA_A}",
+        load_lanes=lambda *_a, **_k: (LANE_1, LANE_2, LANE_3),
+        show=show,
+        rollout=rollout,
+    )
+
+    assert report.outcome == "DEPLOYED"
+    assert touched == [LANE_1, LANE_2]
+    assert f"untouched:{LANE_3}" in report.steps
+
+
+def test_rollout_lock_present_refuses(tmp_path):
+    module = _module()
+    cfg = _cfg(module, tmp_path)
+    cfg.rollout_lock_path.write_text("1\n", encoding="utf-8")
+
+    report = module.deploy_once(
+        cfg,
+        install_tx=object(),
+        ensure_mirror=lambda _cfg: (_ for _ in ()).throw(AssertionError("no fetch")),
+    )
+
+    assert report.outcome == "REFUSED"
+    assert report.detail == "staged_rollout_in_progress"
+    assert report.line().startswith("REFUSED")
+
+
+def test_no_lane_ready_rolls_back_to_previous_release(tmp_path):
+    module = _module()
+    cfg = _cfg(module, tmp_path)
+    rolled_back = {"done": False}
+
+    report = _deploy(
+        module,
+        cfg,
+        stage=lambda _c, sha: (cfg.release_root / sha).mkdir(exist_ok=True),
+        select=lambda sha: f"releases/{SHA_A}",
+        load_lanes=lambda *_a, **_k: (LANE_1,),
+        show=lambda unit, prop: "active" if prop == "ActiveState" else "",
+        rollout=lambda units: (False, "not_ready:voyn-aicc-worker@1.service"),
+        restore_previous=lambda: rolled_back.__setitem__("done", True),
+    )
+
+    assert report.outcome == "ROLLED_BACK"
+    assert "not_ready" in report.detail
+    assert rolled_back["done"] is True
+    assert "rollback" in report.steps
+
+
+def test_active_registered_lanes_skips_inactive():
+    module = _module()
+    states = {LANE_1: "active", LANE_2: "inactive", LANE_3: "activating"}
+
+    def show(unit, prop):
+        assert prop == "ActiveState"
+        return states[unit]
+
+    assert module.active_registered_lanes(
+        (LANE_1, LANE_2, LANE_3), show=show
+    ) == (LANE_1, LANE_3)
+
+
+def test_committed_unit_files_are_root_hardened():
+    root = Path(__file__).parents[2]
+    service = (
+        root / "deploy/systemd/voyn-aicc-worker-release-deploy.service"
+    ).read_text(encoding="utf-8")
+    assert "User=root" in service
+    assert "ProtectSystem=strict" in service
+    assert "/usr/libexec/aicc-worker-release-deploy" in service
+    assert "ReadWritePaths=/opt/aicc/releases" in service
+    assert "/run/aicc-staged-rollout.lock" in service

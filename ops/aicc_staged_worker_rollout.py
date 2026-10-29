@@ -71,14 +71,14 @@ RELEASE_ROOT = Path("/opt/aicc/releases")
 # Timers that mutate worker lane units on their own schedule, independent of
 # this rollout. Both must be held for the rollout's entire duration: a
 # credential-rotation tick's reload-then-restart fallback cannot tell "this
-# lane crashed" from "this lane is mid-drain", and a self-deploy tick
-# unconditionally restarts every service in its list. Left running, either
-# can race this script's own stop/start of a lane -- live on worker-01
+# lane crashed" from "this lane is mid-drain", and the worker release-deploy
+# tick drain-restarts every currently-active registered lane. Left running,
+# either can race this script's own stop/start of a lane -- live on worker-01
 # (2026-09-08), self-deploy's restart of the canary collided with this
 # script's own `stop`, and systemd canceled one of the two jobs.
 LANE_MUTATING_TIMERS = (
     "voyn-aicc-credential-rotation.timer",
-    "voyn-aicc-self-deploy.timer",
+    "voyn-aicc-worker-release-deploy.timer",
     "voyn-aicc-source-clone-refresh.timer",
 )
 
