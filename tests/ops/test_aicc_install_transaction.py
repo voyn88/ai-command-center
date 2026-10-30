@@ -2831,6 +2831,12 @@ def _purge_runner(
             if command[3] in disable_fails:
                 return SimpleNamespace(returncode=1, stderr="denied", stdout="")
             return SimpleNamespace(returncode=0, stderr="", stdout="")
+        if verb == "reset-failed":
+            # The post-barrier un-latch. Declared rather than silently
+            # accepted, so a test can assert which units were cleared and
+            # when -- `failed` survives `apply()` removing the unit file, and
+            # the host probe counts what is failed NOW.
+            return SimpleNamespace(returncode=0, stderr="", stdout="")
         raise AssertionError(f"unexpected systemctl call: {command}")
 
     return run
@@ -2855,6 +2861,46 @@ def test_quiesce_worker_only_units_stops_and_disables_what_is_loaded(tmp_path):
         "aicc-agent-launcher.socket",
         "voyn-aicc-worker@a.service",
     }
+
+
+def test_the_control_purge_un_latches_what_it_proved_drained(tmp_path):
+    """VOYN-MON-WORKER-01-INFRA-FAILED-UNITS, control-profile half.
+
+    `_QUIESCED_ACTIVE_STATES` accepts `failed` as drained -- a unit that died
+    is not running -- and `apply()` then deletes its unit file. But `failed`
+    is a latch that only a successful run or `reset-failed` clears, and a
+    unit with no fragment can never run again: the latch becomes permanent
+    state in PID 1's table for a unit that no longer exists, which is exactly
+    what the host unit-health probe reported as `failed_units`. The clear
+    must come AFTER the drain barrier -- on a unit still shutting down it
+    would clear nothing and the stop could latch again behind it.
+    """
+    module = _module()
+    calls = []
+    run = _purge_runner(
+        workers=("voyn-aicc-worker@a.service",),
+        loaded={"aicc-agent-launcher.socket", "voyn-aicc-worker@a.service"},
+        launchers=("aicc-agent-launcher@7-7-9.service",),
+        calls=calls,
+        busy={"voyn-aicc-worker@a.service": 2},
+    )
+
+    module.quiesce_worker_only_units(run=run, sleep=lambda _seconds: None)
+
+    cleared = [call[2] for call in calls if call[1] == "reset-failed"]
+    assert "voyn-aicc-worker@a.service" in cleared
+    assert "aicc-agent-launcher.socket" in cleared
+    assert "aicc-agent-launcher@7-7-9.service" in cleared
+    # After the barrier, not before: the last `show` that proved this unit
+    # drained precedes the clear.
+    verbs = [(call[1], call[2] if len(call) > 2 else "") for call in calls]
+    clear_at = verbs.index(("reset-failed", "voyn-aicc-worker@a.service"))
+    drain_probes = [
+        index
+        for index, (verb, unit) in enumerate(verbs)
+        if verb == "show" and unit == "voyn-aicc-worker@a.service"
+    ]
+    assert drain_probes and max(drain_probes) < clear_at
 
 
 def test_quiesce_worker_only_units_tolerates_a_host_that_never_ran_the_worker_profile(
