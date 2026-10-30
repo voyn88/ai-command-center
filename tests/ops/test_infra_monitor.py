@@ -1078,6 +1078,188 @@ def test_unit_health_snapshot_asks_systemctl_for_every_service_and_never_raises(
     assert failed.error is not None and "no systemctl" in failed.error
 
 
+# --- retired units: a unit this host no longer has is not a failed unit ----
+#
+# VOYN-MON-WORKER-01-INFRA-FAILED-UNITS. `failed` is a LATCH, not a
+# measurement: it records how a unit's last run ended and outlives the
+# condition. For a unit this host still has, the next run clears it, so the
+# latch being set is a live fault. For a unit whose unit FILE is gone it can
+# never be cleared by anything the host does -- there is nothing to start,
+# nothing to repair -- and systemd keeps the unit loaded for no other reason
+# than to remember it.
+#
+# The staged rollout retires `voyn-aicc-worker{,-2}.service` and
+# `aicc-worker.service` by stopping and *disabling* them, which removes the
+# symlink that was their fragment (RETIRED_LEGACY_UNITS in
+# ops/aicc_install_transaction.py exists because quiesce must tolerate that
+# absence). A stop that reached its timeout latched `failed` on the way out.
+# So worker-01 carried three units that were correctly, deliberately gone and
+# permanently `failed`, and this probe reported them as broken infrastructure
+# every two minutes from the day it was added -- a `failed_units` finding that
+# no repair could clear.
+
+
+def _retired_block(unit: str, restarts: int = 0) -> str:
+    """The live shape: no unit file, latched failed, counters frozen."""
+    return (
+        f"Id={unit}\nLoadState=not-found\n"
+        f"NRestarts={restarts}\nActiveState=failed\n"
+    )
+
+
+def _loaded_block(unit: str, restarts: int, active: str) -> str:
+    return f"Id={unit}\nLoadState=loaded\nNRestarts={restarts}\nActiveState={active}\n"
+
+
+def test_a_unit_this_host_no_longer_has_is_not_a_failed_unit() -> None:
+    """worker-01's exact table: the three retired legacy workers and nothing
+    else wrong. The measurement is healthy, and the corpses are still named."""
+    show = "\n".join(
+        _retired_block(unit)
+        for unit in (
+            "aicc-worker.service",
+            "voyn-aicc-worker-2.service",
+            "voyn-aicc-worker.service",
+        )
+    )
+    snapshot = infra_monitor.evaluate_unit_health(
+        infra_monitor.parse_unit_show(show), crash_loop_restarts=5
+    )
+    assert snapshot.failed_units == ()
+    assert snapshot.crash_loops == ()
+    assert snapshot.retired_units == (
+        ("aicc-worker.service", 1),
+        ("voyn-aicc-worker-2.service", 1),
+        ("voyn-aicc-worker.service", 1),
+    )
+
+    report = infra_monitor.evaluate(
+        {}, None, minimum_active_workers=0, max_stalled_seconds=900,
+        prometheus_ready=True, unit_health=snapshot,
+    )
+    assert report.failures == ()
+    assert report.ok
+    # Reclassified, not silenced: the residue rides in the journalled report,
+    # as the tick actually prints it.
+    journalled = json.loads(json.dumps(infra_monitor._json_report(report)))
+    assert journalled["unit_health"]["retired_units"] == [
+        ["aicc-worker.service", 1],
+        ["voyn-aicc-worker-2.service", 1],
+        ["voyn-aicc-worker.service", 1],
+    ]
+    assert journalled["unit_health"]["failed_units"] == []
+
+
+def test_a_retired_units_frozen_restart_count_is_not_a_crash_loop_either() -> None:
+    """Otherwise clearing `failed_units` only re-raises the same corpses as
+    `crash_loop`: a unit with no fragment cannot restart, so its NRestarts is
+    residue by exactly the same argument."""
+    snapshot = infra_monitor.evaluate_unit_health(
+        infra_monitor.parse_unit_show(_retired_block("voyn-canary.service", 70305)),
+        crash_loop_restarts=5,
+    )
+    assert snapshot.crash_loops == ()
+    assert snapshot.failed_units == ()
+    # One entry for the unit, counted like failed_units -- the 70 305 frozen
+    # restarts are not a number anything can act on any more.
+    assert snapshot.retired_units == (("voyn-canary.service", 1),)
+
+
+def test_a_unit_this_host_does_have_is_still_a_fault_when_it_fails() -> None:
+    """The probe must not go blind. A present-but-failing unit is exactly the
+    class this probe exists to see, and a unit file that is present but broken
+    loads as `error`/`bad-setting` -- never `not-found` -- so it stays a
+    finding too."""
+    show = "\n".join(
+        [
+            _retired_block("voyn-aicc-worker-2.service"),
+            _loaded_block("voyn-aicc-source-clone-refresh.service", 0, "failed"),
+            "Id=voyn-aicc-pgtunnel.service\nLoadState=bad-setting\n"
+            "NRestarts=0\nActiveState=failed\n",
+            _loaded_block("ollama.service", 315891, "activating"),
+        ]
+    )
+    snapshot = infra_monitor.evaluate_unit_health(
+        infra_monitor.parse_unit_show(show), crash_loop_restarts=5
+    )
+    assert snapshot.failed_units == (
+        ("voyn-aicc-pgtunnel.service", 1),
+        ("voyn-aicc-source-clone-refresh.service", 1),
+    )
+    assert snapshot.crash_loops == (("ollama.service", 315891),)
+    assert snapshot.retired_units == (("voyn-aicc-worker-2.service", 1),)
+
+    report = infra_monitor.evaluate(
+        {}, None, minimum_active_workers=0, max_stalled_seconds=900,
+        prometheus_ready=True, unit_health=snapshot,
+    )
+    assert any(f.startswith("failed_units:2:") for f in report.failures)
+    assert "voyn-aicc-worker-2.service" not in " ".join(report.failures)
+
+
+def test_a_dangling_dependency_reference_is_not_a_unit_at_all() -> None:
+    """`Wants=prometheus.service` on a host without Prometheus loads as
+    not-found and inactive. systemd holds it only because something names it,
+    there is no latch, and it has never been a finding -- so it is not
+    reported as residue either."""
+    show = (
+        "Id=prometheus.service\nLoadState=not-found\n"
+        "NRestarts=0\nActiveState=inactive\n"
+    )
+    snapshot = infra_monitor.evaluate_unit_health(
+        infra_monitor.parse_unit_show(show), crash_loop_restarts=5
+    )
+    assert snapshot.failed_units == ()
+    assert snapshot.crash_loops == ()
+    assert snapshot.retired_units == ()
+
+
+def test_the_probe_asks_systemd_for_load_state_rather_than_assuming_it(
+    monkeypatch,
+) -> None:
+    """The lesson of 7570626c: a rule the code states but never puts in force
+    is a rule that does nothing. Without LoadState in the `show` argv every
+    unit's `load_state` is empty, no unit is ever residue, and the corpses are
+    counted as faults again -- with every other assertion still passing."""
+    captured: list[list[str]] = []
+    retired = _retired_block("voyn-aicc-worker-2.service")
+
+    def _run(args, **_kwargs):
+        captured.append(args)
+        if args[1] == "list-units":
+            return subprocess.CompletedProcess(
+                args, 0, stdout="voyn-aicc-worker-2.service not-found failed failed\n",
+                stderr="",
+            )
+        properties = next(
+            a for a in args if a.startswith("--property=")
+        ).split("=", 1)[1]
+        assert "LoadState" in properties.split(",")
+        return subprocess.CompletedProcess(args, 0, stdout=retired, stderr="")
+
+    monkeypatch.setattr(infra_monitor.subprocess, "run", _run)
+    snapshot = infra_monitor.read_unit_health_snapshot(crash_loop_restarts=5)
+    assert snapshot.error is None
+    assert snapshot.failed_units == ()
+    assert snapshot.retired_units == (("voyn-aicc-worker-2.service", 1),)
+    show = captured[1]
+    assert "LoadState" in next(
+        a for a in show if a.startswith("--property=")
+    ).split("=", 1)[1].split(",")
+
+
+def test_the_retirement_that_produces_the_corpses_clears_the_latch() -> None:
+    """The other half of the fix, cross-checked here so the two cannot drift:
+    the rollout that removes these units' fragment must un-latch them, or the
+    fleet keeps producing residue for the probe to classify."""
+    rollout = Path("ops/aicc_staged_worker_rollout.py").read_text(encoding="utf-8")
+    retire = rollout.split("def retire_legacy_units", 1)[1].split("\ndef ", 1)[0]
+    for action in ("stop", "disable", "reset-failed"):
+        assert f'systemd.run("{action}", unit, check=False)' in retire
+    verify = rollout.split("def verify_legacy_units_retired", 1)[1].split("\ndef ", 1)[0]
+    assert 'active == "failed"' in verify
+
+
 def test_a_unit_that_show_silently_drops_is_a_failed_measurement(monkeypatch) -> None:
     def _run(args, **_kwargs):
         if args[1] == "list-units":
