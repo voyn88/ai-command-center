@@ -521,15 +521,45 @@ def remove_rollout_lock() -> None:
 
 
 def retire_legacy_units(systemd: Systemd) -> None:
-    """Drain and disable every pre-template worker before lane startup."""
+    """Drain, disable and un-latch every pre-template worker before lane startup.
+
+    `disable` removes the symlink that was these units' fragment, so after
+    this they are deliberately gone from the host for good (see
+    `RETIRED_LEGACY_UNITS` in ops/aicc_install_transaction.py, which exists
+    because quiesce has to tolerate exactly that absence). `reset-failed` is
+    the third step and not a tidy-up: a `stop` that reached its timeout --
+    which a worker daemon holding a task does -- latches `failed` on the way
+    out, and a unit with no fragment can never run again, so it can never
+    reach a successful state that clears the latch. systemd keeps such a
+    unit loaded for no other reason than to remember that latch, which is why
+    the corpses, and only the corpses, outlive a retirement.
+
+    That is what the host unit-health probe then counted, every two minutes,
+    as broken infrastructure on a host whose retirement had in fact succeeded
+    (worker-01 `failed_units`, monitor_finding 2051 and its three
+    successors) -- a finding no repair could clear, because the units it
+    named did not exist. The probe no longer treats a fragment-less unit as a
+    fault (`infra_monitor.evaluate_unit_health`); this is the other half:
+    stop producing them. Clearing the latch here is also what retires the
+    corpses already on hosts that were rolled out before this landed, since
+    every rollout runs this.
+    """
     for unit in LEGACY_WORKER_UNITS:
         systemd.run("stop", unit, check=False)
         systemd.run("disable", unit, check=False)
+        systemd.run("reset-failed", unit, check=False)
     verify_legacy_units_retired(systemd)
 
 
 def verify_legacy_units_retired(systemd: Systemd) -> None:
-    """Prove old claimers cannot coexist with templated worker lanes."""
+    """Prove old claimers cannot coexist with templated worker lanes.
+
+    `failed` is refused alongside `active`/`activating`: a retired unit is
+    expected to be drained AND un-latched, and asserting it proves the
+    `reset-failed` above actually took effect on this host rather than
+    trusting that it was issued -- the lesson of a reaping rule that was
+    written in a section systemd ignores and silently did nothing.
+    """
     for unit in LEGACY_WORKER_UNITS:
         active = systemd.run("is-active", unit, check=False)
         enabled = systemd.run("is-enabled", unit, check=False)
@@ -542,6 +572,10 @@ def verify_legacy_units_retired(systemd: Systemd) -> None:
             or main_pid not in {"", "0"}
         ):
             raise RolloutError(f"legacy worker was not drained and disabled: {unit}")
+        if active == "failed":
+            raise RolloutError(
+                f"legacy worker is retired but still latched failed: {unit}"
+            )
 
 
 def snapshot(systemd: Systemd, units: tuple[str, ...]) -> dict[str, object]:
@@ -1224,6 +1258,18 @@ def rollout(
             for unit in (*units, *LEGACY_WORKER_UNITS):
                 systemd.run("stop", unit, check=False)
                 systemd.run("disable", unit, check=False)
+            # Four consecutive attempts failed here on worker-01 (2026-08-31)
+            # and each one disabled the legacy units again, removing their
+            # fragment while a timed-out stop had latched `failed` on them.
+            # The latch is not the evidence of this failure -- the raised
+            # RolloutError and the journal are -- but it is permanent host
+            # state nothing can clear once the fragment is gone, so the
+            # abandoned path must not leave it behind either. Only the legacy
+            # units: a lane's fragment is the template file, which the outer
+            # transaction restores, so a failed lane can still clear its own
+            # latch by running.
+            for unit in LEGACY_WORKER_UNITS:
+                systemd.run("reset-failed", unit, check=False)
             raise
     finally:
         # Restored on both the success and failure path -- a rollout must
