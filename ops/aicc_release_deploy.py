@@ -16,6 +16,7 @@ drain-restarts only the currently-active lanes from
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import os
 import re
@@ -24,9 +25,9 @@ import stat
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
 
 _OPS_DIR = Path(__file__).resolve().parent
 _RELEASE_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -34,6 +35,16 @@ _DEPENDENCY_MANIFESTS = re.compile(
     r"(^|/)(uv\.lock|pyproject\.toml|requirements[^/]*\.txt|package(-lock)?\.json)$"
 )
 _READY = "aicc-ready"
+
+#: Root helpers installed by the worker isolation profile (FileSpec list in
+#: aicc_install_transaction). Worker release deploy publishes a new tree under
+#: /opt/aicc/releases/<sha> but must also refresh these so merged launcher
+#: fixes reach the socket-activated binary on the host.
+_ROOT_HELPERS: tuple[tuple[str, str], ...] = (
+    ("ops/aicc_agent_launcher.py", "aicc-agent-launcher"),
+    ("ops/aicc_staged_worker_rollout.py", "aicc-staged-worker-rollout"),
+    ("ops/aicc_release_deploy.py", "aicc-worker-release-deploy"),
+)
 
 
 def _load_install_transaction():
@@ -71,6 +82,7 @@ class DeployConfig:
     release_root: Path = Path("/opt/aicc/releases")
     state_dir: Path = Path("/var/lib/aicc-principal-isolation")
     runtime_venv: Path = Path("/opt/aicc/runtime-venv")
+    libexec_dir: Path = Path("/usr/libexec")
     lane_registry: Path = Path("/etc/voyn/aicc-worker-lanes.conf")
     remote: str = "origin"
     branch: str = "main"
@@ -355,8 +367,10 @@ def stage_release_tree(
             [
                 str(cfg.runtime_venv / "bin" / "python"),
                 "-c",
-                "import aios_db, aios_sdk; from command_center import worker; "
-                "assert worker is not None",
+                (
+                    "import aios_db, aios_sdk; from command_center import worker; "
+                    "assert worker is not None"
+                ),
             ],
             timeout=60,
             env={
@@ -461,6 +475,112 @@ def _wait_lane_ready(
             return True
         sleeper(poll_interval)
     return False
+
+
+def _file_sha256(path: Path) -> str | None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(info.st_mode):
+        return None
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _install_helper_bytes(
+    target: Path, payload: bytes, *, mode: int, uid: int, gid: int
+) -> None:
+    """Atomically install a root helper (temp in same dir, fsync, rename)."""
+    parent = target.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    temporary = parent / f".{target.name}.aicc-{os.getpid()}-{time.time_ns()}"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_BINARY"):
+        flags |= os.O_BINARY  # Windows: avoid CRLF translation on helper payloads
+    fd = os.open(str(temporary), flags, mode)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, mode)
+        if hasattr(os, "fchown"):
+            try:
+                os.fchown(fd, uid, gid)
+            except (AttributeError, OSError, PermissionError):
+                pass
+        written = 0
+        while written < len(payload):
+            written += os.write(fd, payload[written:])
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    try:
+        os.chmod(temporary, mode)  # nosec B103 - root helper mode is intentional
+        if hasattr(os, "chown"):
+            try:
+                os.chown(temporary, uid, gid)
+            except (AttributeError, OSError, PermissionError):
+                pass
+        os.replace(str(temporary), str(target))
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    try:
+        dir_fd = os.open(str(parent), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
+
+
+def refresh_root_helpers(
+    cfg: DeployConfig,
+    release_id: str,
+    *,
+    install_tx=None,
+) -> list[str]:
+    """Replace libexec helpers that differ from the newly published release.
+
+    Returns the installed basenames that were rewritten. Does not restart
+    socket-activated `aicc-agent-launcher@*.service` instances — the next
+    accepted connection loads the new binary.
+    """
+    release_dir = cfg.release_root / release_id
+    refreshed: list[str] = []
+    for relative, name in _ROOT_HELPERS:
+        source = release_dir / relative
+        if not source.is_file():
+            continue
+        target = cfg.libexec_dir / name
+        source_digest = _file_sha256(source)
+        if source_digest is None:
+            continue
+        if source_digest == _file_sha256(target):
+            continue
+        payload = source.read_bytes()
+        if install_tx is not None and hasattr(install_tx, "_atomic_bytes"):
+            install_tx._atomic_bytes(
+                target, payload, 0o755, cfg.trusted_uid, cfg.trusted_gid
+            )
+        else:
+            _install_helper_bytes(
+                target,
+                payload,
+                mode=0o755,
+                uid=cfg.trusted_uid,
+                gid=cfg.trusted_gid,
+            )
+        refreshed.append(name)
+    return refreshed
 
 
 def rollout_active_lanes(
@@ -667,7 +787,28 @@ def deploy_once(
         _tx().FileTransaction(Path("/"), cfg.state_dir).pending_release.unlink(
             missing_ok=True
         )
-    return finish("DEPLOYED", detail if to_restart else "selected_no_active_lanes")
+
+    # Only after DEPLOYED (lanes ready). ROLLED_BACK returns above and must
+    # leave the previously installed root helpers alone.
+    helper_tx = None
+    candidate = _install_tx
+    if candidate is None:
+        try:
+            candidate = _tx()
+        except Exception:  # noqa: BLE001 - fall back to portable install
+            candidate = None
+    if candidate is not None and hasattr(candidate, "_atomic_bytes"):
+        helper_tx = candidate
+    refreshed = refresh_root_helpers(cfg, target, install_tx=helper_tx)
+    base = detail if to_restart else "selected_no_active_lanes"
+    if refreshed:
+        report.steps.append("helpers:" + ",".join(refreshed))
+        if "aicc-agent-launcher" in refreshed:
+            # Socket-activated instances keep the old binary until the next
+            # connection; do not kill in-flight agent runs.
+            report.steps.append("launcher_refreshed_next_connection")
+        base = f"{base} helpers:{','.join(refreshed)}"
+    return finish("DEPLOYED", base)
 
 
 def _rollback_selector(

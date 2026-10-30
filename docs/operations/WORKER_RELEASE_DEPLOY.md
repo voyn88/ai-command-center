@@ -28,11 +28,17 @@ Stdout одной строки: `NOOP|DEPLOYED|REFUSED|ROLLED_BACK <sha> <detail
 - **NOOP** — `current` уже указывает на SHA `origin/main`.
 - **DEPLOYED** — release опубликован/выбран, активные lanes из
   `/etc/voyn/aicc-worker-lanes.conf` drain-restarted до `STATUS=aicc-ready`.
-  Зарегистрированный lane в `inactive` **не стартуется**.
+  Зарегистрированный lane в `inactive` **не стартуется**. После готовности
+  lanes root-хелперы в `/usr/libexec` (`aicc-agent-launcher`,
+  `aicc-staged-worker-rollout`, `aicc-worker-release-deploy`) атомарно
+  обновляются из нового release, если sha256 отличается; running launcher
+  sessions не убиваются (socket activation подхватит бинарь на следующем
+  соединении). Имена обновлённых хелперов попадают в detail stdout.
 - **REFUSED** — rollout lock `/run/aicc-staged-rollout.lock`, dependency
   manifest change (нужен полный installer), mirror/fetch failure, и т.п.
 - **ROLLED_BACK** — ни один restarted lane не стал ready; `current` возвращён
-  на предыдущий release (дерево предыдущего SHA сохраняется).
+  на предыдущий release (дерево предыдущего SHA сохраняется). Root-хелперы
+  при rollback **не** трогаются.
 
 ## One-time install on worker-01 (root console)
 

@@ -9,6 +9,7 @@ runs on Windows too.
 from __future__ import annotations
 
 import importlib.util
+import stat
 import sys
 from pathlib import Path
 
@@ -36,41 +37,57 @@ LANE_3 = "voyn-aicc-worker@3.service"
 
 
 def _cfg(module, tmp_path, **overrides):
-    kwargs = dict(
-        bare_mirror=tmp_path / "mirror.git",
-        aicc_root=tmp_path / "opt" / "aicc",
-        release_root=tmp_path / "opt" / "aicc" / "releases",
-        state_dir=tmp_path / "state",
-        runtime_venv=tmp_path / "runtime-venv",
-        lane_registry=tmp_path / "lanes.conf",
-        rollout_lock_path=tmp_path / "aicc-staged-rollout.lock",
-        readiness_timeout=1.0,
-        poll_interval=0.01,
-        trusted_uid=0,
-        trusted_gid=0,
-    )
+    kwargs = {
+        "bare_mirror": tmp_path / "mirror.git",
+        "aicc_root": tmp_path / "opt" / "aicc",
+        "release_root": tmp_path / "opt" / "aicc" / "releases",
+        "state_dir": tmp_path / "state",
+        "runtime_venv": tmp_path / "runtime-venv",
+        "libexec_dir": tmp_path / "usr" / "libexec",
+        "lane_registry": tmp_path / "lanes.conf",
+        "rollout_lock_path": tmp_path / "aicc-staged-rollout.lock",
+        "readiness_timeout": 1.0,
+        "poll_interval": 0.01,
+        "trusted_uid": 0,
+        "trusted_gid": 0,
+    }
     kwargs.update(overrides)
     cfg = module.DeployConfig(**kwargs)
     cfg.aicc_root.mkdir(parents=True, exist_ok=True)
     cfg.release_root.mkdir(parents=True, exist_ok=True)
     cfg.state_dir.mkdir(parents=True, exist_ok=True)
+    cfg.libexec_dir.mkdir(parents=True, exist_ok=True)
     return cfg
+
+
+def _seed_helpers(cfg, release_sha: str, *, release_bodies: dict[str, bytes], installed: dict[str, bytes]):
+    """Place release-tree sources and currently-installed libexec helpers."""
+    release_ops = cfg.release_root / release_sha / "ops"
+    release_ops.mkdir(parents=True, exist_ok=True)
+    for relative, body in release_bodies.items():
+        path = cfg.release_root / release_sha / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(body)
+    for name, body in installed.items():
+        target = cfg.libexec_dir / name
+        target.write_bytes(body)
+        target.chmod(0o755)
 
 
 def _deploy(module, cfg, *, previous: str | None = SHA_A, **kwargs):
     (cfg.release_root / (previous or SHA_A)).mkdir(exist_ok=True)
-    defaults = dict(
-        install_tx=object(),  # never load fcntl-bound installer on Windows
-        ensure_mirror=lambda _cfg: None,
-        resolve_sha=lambda _cfg: SHA_B if previous != SHA_B else SHA_A,
-        current_sha=lambda _cfg: previous,
-        dependency_gate=lambda *_a, **_k: None,
-        write_lock=lambda: None,
-        remove_lock=lambda: None,
-        hold_timers=lambda: None,
-        release_timers=lambda: None,
-        clear_pending=lambda: None,
-    )
+    defaults = {
+        "install_tx": object(),  # never load fcntl-bound installer on Windows
+        "ensure_mirror": lambda _cfg: None,
+        "resolve_sha": lambda _cfg: SHA_B if previous != SHA_B else SHA_A,
+        "current_sha": lambda _cfg: previous,
+        "dependency_gate": lambda *_a, **_k: None,
+        "write_lock": lambda: None,
+        "remove_lock": lambda: None,
+        "hold_timers": lambda: None,
+        "release_timers": lambda: None,
+        "clear_pending": lambda: None,
+    }
     defaults.update(kwargs)
     return module.deploy_once(cfg, **defaults)
 
@@ -238,7 +255,124 @@ def test_committed_unit_files_are_root_hardened():
     assert "ProtectSystem=strict" in service
     assert "/usr/libexec/aicc-worker-release-deploy" in service
     assert "ReadWritePaths=/opt/aicc/releases" in service
+    assert "/usr/libexec" in service
     assert "/run/aicc-staged-rollout.lock" in service
+
+
+def test_changed_helper_is_replaced_with_mode_0755(tmp_path):
+    module = _module()
+    cfg = _cfg(module, tmp_path)
+    new_launcher = b"#!/usr/bin/env python3\n# fixed launcher\n"
+    _seed_helpers(
+        cfg,
+        SHA_B,
+        release_bodies={
+            "ops/aicc_agent_launcher.py": new_launcher,
+            "ops/aicc_staged_worker_rollout.py": b"rollout-same\n",
+            "ops/aicc_release_deploy.py": b"deploy-same\n",
+        },
+        installed={
+            "aicc-agent-launcher": b"#!/usr/bin/env python3\n# stale launcher\n",
+            "aicc-staged-worker-rollout": b"rollout-same\n",
+            "aicc-worker-release-deploy": b"deploy-same\n",
+        },
+    )
+
+    report = _deploy(
+        module,
+        cfg,
+        stage=lambda _c, sha: (cfg.release_root / sha).mkdir(exist_ok=True),
+        select=lambda sha: f"releases/{sha}",
+        load_lanes=lambda *_a, **_k: (LANE_1,),
+        show=lambda unit, prop: {
+            "ActiveState": "active",
+            "SubState": "running",
+            "StatusText": "aicc-ready",
+            "MainPID": "9",
+        }.get(prop, ""),
+        rollout=lambda units: (True, "ready:1"),
+    )
+
+    installed = cfg.libexec_dir / "aicc-agent-launcher"
+    assert report.outcome == "DEPLOYED"
+    assert "helpers:aicc-agent-launcher" in report.detail
+    assert "launcher_refreshed_next_connection" in report.steps
+    assert installed.read_bytes() == new_launcher
+    # Unix mode is the production contract; Windows does not store 0755.
+    if sys.platform != "win32":
+        assert stat.S_IMODE(installed.stat().st_mode) == 0o755
+    # Unchanged siblings left alone.
+    assert (cfg.libexec_dir / "aicc-staged-worker-rollout").read_bytes() == b"rollout-same\n"
+    assert (cfg.libexec_dir / "aicc-worker-release-deploy").read_bytes() == b"deploy-same\n"
+
+
+def test_unchanged_helpers_are_left_alone(tmp_path):
+    module = _module()
+    cfg = _cfg(module, tmp_path)
+    bodies = {
+        "ops/aicc_agent_launcher.py": b"launcher-v1\n",
+        "ops/aicc_staged_worker_rollout.py": b"rollout-v1\n",
+        "ops/aicc_release_deploy.py": b"deploy-v1\n",
+    }
+    installed = {
+        "aicc-agent-launcher": b"launcher-v1\n",
+        "aicc-staged-worker-rollout": b"rollout-v1\n",
+        "aicc-worker-release-deploy": b"deploy-v1\n",
+    }
+    _seed_helpers(cfg, SHA_B, release_bodies=bodies, installed=installed)
+    before = {
+        name: (cfg.libexec_dir / name).stat().st_mtime_ns for name in installed
+    }
+
+    report = _deploy(
+        module,
+        cfg,
+        stage=lambda _c, sha: (cfg.release_root / sha).mkdir(exist_ok=True),
+        select=lambda sha: f"releases/{sha}",
+        load_lanes=lambda *_a, **_k: (LANE_1,),
+        show=lambda unit, prop: {
+            "ActiveState": "active",
+            "SubState": "running",
+            "StatusText": "aicc-ready",
+            "MainPID": "9",
+        }.get(prop, ""),
+        rollout=lambda units: (True, "ready:1"),
+    )
+
+    assert report.outcome == "DEPLOYED"
+    assert "helpers:" not in report.detail
+    for name, body in installed.items():
+        path = cfg.libexec_dir / name
+        assert path.read_bytes() == body
+        assert path.stat().st_mtime_ns == before[name]
+
+
+def test_rollback_leaves_helpers_untouched(tmp_path):
+    module = _module()
+    cfg = _cfg(module, tmp_path)
+    stale = b"stale-launcher-on-host\n"
+    _seed_helpers(
+        cfg,
+        SHA_B,
+        release_bodies={"ops/aicc_agent_launcher.py": b"new-launcher-from-release\n"},
+        installed={"aicc-agent-launcher": stale},
+    )
+
+    report = _deploy(
+        module,
+        cfg,
+        stage=lambda _c, sha: (cfg.release_root / sha).mkdir(exist_ok=True),
+        select=lambda sha: f"releases/{sha}",
+        load_lanes=lambda *_a, **_k: (LANE_1,),
+        show=lambda unit, prop: "active" if prop == "ActiveState" else "",
+        rollout=lambda units: (False, "not_ready:voyn-aicc-worker@1.service"),
+        restore_previous=lambda: None,
+    )
+
+    assert report.outcome == "ROLLED_BACK"
+    assert (cfg.libexec_dir / "aicc-agent-launcher").read_bytes() == stale
+    assert "helpers:" not in report.detail
+    assert "helpers:" not in "".join(report.steps)
 
 
 def test_release_remote_never_comes_from_the_operator_checkout(monkeypatch):

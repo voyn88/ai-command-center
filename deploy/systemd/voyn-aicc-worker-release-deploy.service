@@ -35,6 +35,6 @@ LockPersonality=yes
 KeyringMode=private
 RestrictSUIDSGID=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-ReadWritePaths=/opt/aicc/releases /opt/aicc /var/lib/aicc-principal-isolation /run
+ReadWritePaths=/opt/aicc/releases /opt/aicc /var/lib/aicc-principal-isolation /run /usr/libexec
 UMask=0077
 TimeoutStartSec=900s
