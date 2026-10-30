@@ -152,9 +152,9 @@ def test_deploy_calls_publish_verify_select_rollout_in_order(tmp_path):
     assert report.steps[:4] == ["publish", "verify", "select", "rollout"]
     assert order == [
         f"publish:{SHA_B}",
-        f"select:{SHA_B}",
         "lock",
         "hold",
+        f"select:{SHA_B}",
         "rollout:voyn-aicc-worker@1.service",
         "release",
         "unlock",
@@ -184,7 +184,7 @@ def test_stopped_registered_lane_is_untouched(tmp_path):
         module,
         cfg,
         stage=lambda _c, sha: (cfg.release_root / sha).mkdir(exist_ok=True),
-        select=lambda sha: f"releases/{SHA_A}",
+        select=lambda sha: f"releases/{sha}",
         load_lanes=lambda *_a, **_k: (LANE_1, LANE_2, LANE_3),
         show=show,
         rollout=rollout,
@@ -220,7 +220,7 @@ def test_no_lane_ready_rolls_back_to_previous_release(tmp_path):
         module,
         cfg,
         stage=lambda _c, sha: (cfg.release_root / sha).mkdir(exist_ok=True),
-        select=lambda sha: f"releases/{SHA_A}",
+        select=lambda sha: f"releases/{sha}",
         load_lanes=lambda *_a, **_k: (LANE_1,),
         show=lambda unit, prop: "active" if prop == "ActiveState" else "",
         rollout=lambda units: (False, "not_ready:voyn-aicc-worker@1.service"),
@@ -425,3 +425,18 @@ def test_dependency_refusal_never_selects(tmp_path):
         stage=forbidden, select=forbidden)
     assert report.outcome == "REFUSED"
     assert report.detail == "dependency_changed"
+
+
+def test_contended_lock_does_not_flip_selector(tmp_path):
+    module = _module()
+    cfg = _cfg(module, tmp_path)
+    def locked():
+        raise FileExistsError("another rollout")
+    def forbidden(*a, **k):
+        raise AssertionError("selector and timers must remain untouched")
+    report = _deploy(module, cfg,
+        stage=lambda c, sha: (c.release_root / sha).mkdir(),
+        load_lanes=lambda *a, **k: (), write_lock=locked,
+        select=forbidden, release_timers=forbidden)
+    assert report.outcome == "REFUSED"
+    assert "select" not in report.steps

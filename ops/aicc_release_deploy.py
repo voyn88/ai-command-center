@@ -707,12 +707,6 @@ def deploy_once(
         # stage_release_tree already verifies; record the explicit step for tests.
         report.steps.append("verify")
 
-        if select is not None:
-            select(target)
-        else:
-            transaction = _tx().FileTransaction(Path("/"), cfg.state_dir)
-            transaction.select_release(target, cfg.bare_mirror)
-        report.steps.append("select")
     except Exception as exc:  # noqa: BLE001 - surface as REFUSED, never half-selected
         return finish("REFUSED", f"publish_select_failed:{exc}")
 
@@ -727,13 +721,7 @@ def deploy_once(
             expected_gid=cfg.trusted_gid,
         )
     except Exception as exc:  # noqa: BLE001
-        # Selection already flipped; restore previous release.
-        _rollback_selector(
-            _tx(),
-            cfg,
-            restore_previous=restore_previous,
-        )
-        return finish("ROLLED_BACK", f"lane_registry_failed:{exc}")
+        return finish("REFUSED", f"lane_registry_failed:{exc}")
 
     to_restart = active_registered_lanes(lanes, show=show)
     stopped = [unit for unit in lanes if unit not in to_restart]
@@ -756,6 +744,13 @@ def deploy_once(
                 rollout_mod = _load_staged_rollout()
             rollout_mod.hold_lane_mutating_timers(rollout_mod.Systemd())
 
+        if select is not None:
+            select(target)
+        else:
+            transaction = _tx().FileTransaction(Path("/"), cfg.state_dir)
+            transaction.select_release(target, cfg.bare_mirror)
+        report.steps.append("select")
+
         if rollout is not None:
             ok, detail = rollout(to_restart)
         else:
@@ -774,10 +769,15 @@ def deploy_once(
             )
             report.steps.append("rollback")
             return finish("ROLLED_BACK", detail)
+    except Exception as exc:  # noqa: BLE001
+        if "select" in report.steps:
+            _rollback_selector(_tx(), cfg, restore_previous=restore_previous)
+            return finish("ROLLED_BACK", f"rollout_failed:{exc}")
+        return finish("REFUSED", f"rollout_lock_or_select_failed:{exc}")
     finally:
-        if release_timers is not None:
+        if lock_written and release_timers is not None:
             release_timers()
-        elif rollout_mod is not None:
+        elif lock_written and rollout_mod is not None:
             rollout_mod.release_lane_mutating_timers(rollout_mod.Systemd())
         if lock_written:
             if remove_lock is not None:
