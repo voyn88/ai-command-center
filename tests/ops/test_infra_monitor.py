@@ -1331,6 +1331,7 @@ def test_executor_auth_failed_threshold_is_inclusive_and_configurable() -> None:
 
 
 def test_main_notifies_failures_and_resolves_cleared_keys(monkeypatch, capsys) -> None:
+    monkeypatch.setenv("AICC_OWNER_NOTIFY_SOURCE", "control-01")
     from command_center.ops import owner_notify
 
     notified: list[tuple] = []
@@ -1457,3 +1458,18 @@ def test_notify_owner_unknown_defer_backlog_keeps_defer_keys_open(monkeypatch) -
     )
     infra_monitor.notify_owner_of_report(report, source="control-01", defer_tasks=None)
     assert resolved == []
+
+
+def test_unprobed_queue_alert_is_not_resolved(monkeypatch):
+    from command_center.ops import owner_notify
+    resolved = []
+    monkeypatch.setattr(owner_notify, "open_keys", lambda: {"monitor:host:queue_stalled"})
+    monkeypatch.setattr(owner_notify, "resolve", lambda *a, **k: resolved.append(a))
+    report = evaluate({}, None, minimum_active_workers=0, max_stalled_seconds=900, prometheus_ready=True)
+    infra_monitor.notify_owner_of_report(report, source="host", defer_tasks=None)
+    assert resolved == []
+
+
+def test_notify_identity_does_not_depend_on_recording_flag(monkeypatch):
+    monkeypatch.setenv("AICC_OWNER_NOTIFY_SOURCE", "stable")
+    assert infra_monitor.notify_source("recording-destination") == infra_monitor.notify_source("") == "stable"

@@ -1061,9 +1061,6 @@ def finding_key(failure: str) -> str:
 
 def notify_source(record_findings_source: str) -> str:
     """Host/source segment for ``monitor:<source>:<key>`` notify identities."""
-    source = (record_findings_source or "").strip()
-    if source:
-        return source
     return (
         os.environ.get("AICC_OWNER_NOTIFY_SOURCE", "").strip()
         or os.environ.get("HOSTNAME", "").strip()
@@ -1118,6 +1115,19 @@ def notify_owner_of_report(
     """
     from command_center.ops import owner_notify
 
+    evaluated = {"prometheus_unready", "monitor_error"}
+    if report.discovered_workers:
+        evaluated.add("active_workers")
+    if report.queue is not None:
+        evaluated.update({"queue_stalled", "dead_letter_growth", "executor_quota_exhausted", "executor_auth_failed", "throughput_stalled"})
+    for snapshot, keys in (
+        (report.pr_window, {"pr_window_probe_failed", "pr_window_starved"}),
+        (report.source_clone, {"source_clone_probe_failed", "source_clone_stale"}),
+        (report.unit_health, {"unit_health_probe_failed", "failed_units", "crash_loop"}),
+        (report.deploy_lag, {"deploy_lag_probe_failed", "deploy_lag"}),
+    ):
+        if snapshot is not None and not snapshot.error:
+            evaluated.update(keys)
     prefix = f"monitor:{source}:"
     active_monitor: dict[str, str] = {}
     for failure in report.failures:
@@ -1145,7 +1155,7 @@ def notify_owner_of_report(
         if not open_key.startswith(prefix):
             continue
         key = open_key[len(prefix) :]
-        if key in active_monitor:
+        if key in active_monitor or key not in evaluated:
             continue
         try:
             owner_notify.resolve(
