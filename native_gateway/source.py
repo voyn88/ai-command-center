@@ -122,7 +122,7 @@ class FileProjectionSource:
     def _read(path: Path) -> dict | None:
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-        except OSError, ValueError, UnicodeDecodeError:
+        except (OSError, ValueError, UnicodeDecodeError):
             return None
         return data if isinstance(data, dict) else None
 
