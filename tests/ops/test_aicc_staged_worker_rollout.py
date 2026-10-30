@@ -1797,3 +1797,13 @@ def test_hold_skips_timers_that_are_not_installed_on_the_host():
     module.hold_lane_mutating_timers(systemd)
 
     assert [call for call in systemd.calls if call[0] == "stop"] == []
+
+
+def test_rollout_lock_does_not_overwrite_existing_owner(tmp_path, monkeypatch):
+    module = _module()
+    lock = tmp_path / "rollout.lock"
+    monkeypatch.setattr(module, "ROLLOUT_LOCK_PATH", lock)
+    lock.write_text("other-owner")
+    with pytest.raises(FileExistsError):
+        module.write_rollout_lock()
+    assert lock.read_text() == "other-owner"

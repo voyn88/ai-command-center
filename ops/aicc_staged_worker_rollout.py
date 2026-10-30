@@ -504,14 +504,16 @@ def write_rollout_lock() -> None:
 
     World-readable by design: the rotator and self-deploy run as unprivileged
     service users and only need to observe that the file exists, never its
-    contents. Written via temp-then-rename so a concurrent reader never
-    observes a partially written file.
+    contents. Created exclusively: readers only need existence, and concurrent
+    writers must never replace another rollout marker.
     """
     ROLLOUT_LOCK_PATH.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
-    temporary = ROLLOUT_LOCK_PATH.with_name(f".{ROLLOUT_LOCK_PATH.name}.{os.getpid()}")
-    temporary.write_text(f"{os.getpid()}\n", encoding="utf-8")
-    temporary.chmod(0o644)
-    os.replace(temporary, ROLLOUT_LOCK_PATH)
+    # Exclusive creation prevents another rollout's ownership being overwritten.
+    fd = os.open(ROLLOUT_LOCK_PATH, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(f"{os.getpid()}\n")
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 def remove_rollout_lock() -> None:
