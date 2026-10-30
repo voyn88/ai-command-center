@@ -102,6 +102,19 @@ class UnitHealthSnapshot:
     collapse to one `template@*.service` in both listings -- crash loops carry
     the highest NRestarts among the instances, failed units their count -- so
     a hundred dead connections are one finding, not a hundred.
+
+    The probe's cost must not grow with what the host has leaked, or it goes
+    blind exactly when the host is sickest: worker-01 2026-10-30 (monitor
+    finding #8349, `unit_health_probe_failed`) had tens of thousands of
+    `aicc-agent-launcher@*.service` per-connection instances loaded in
+    `failed` state -- systemd garbage-collects an *inactive* per-connection
+    instance but keeps a *failed* one loaded until `reset-failed`, so that
+    listing only ever grows -- and one `systemctl show` over every name is
+    both an argv the kernel refuses past ~41 000 names (`E2BIG`) and one
+    whole-host `GetAll` per unit inside PID 1 past any fixed timeout. So the
+    listing is the census (one call, every unit, state included) and
+    `systemctl show` is the follow-up question, asked in bounded batches and
+    only where the census has not already produced the unit's finding.
     """
 
     crash_loops: tuple[tuple[str, int], ...]
@@ -113,6 +126,31 @@ class UnitHealthSnapshot:
 #: identity is the class, the listing is for the reader, and an unbounded
 #: listing of instance names is the thing the template collapse exists to stop.
 UNIT_LISTING_CAP = 20
+
+#: How many unit names ride in one `systemctl show` argv. Measured ceiling on
+#: an 8 MiB stack rlimit: ~41 000 names of per-connection instance length
+#: before `execve` refuses the command line with E2BIG, so one call per host
+#: is a command line that grows with the host's leaked units. 250 keeps every
+#: argv near 11 kB -- under 1% of that ceiling -- whatever the host holds.
+UNIT_SHOW_BATCH = 250
+
+#: How many FAILED instances of one template family the probe reads NRestarts
+#: for. The listing already condemns a failed unit (`failed_units` names the
+#: family and counts every instance), and the 41 000th dead per-connection
+#: instance adds a count, never a class; paying a whole-host `GetAll` for each
+#: one is what blinded the probe. Non-template units and the first instances
+#: of a family are always read, so `voyn-canary.service`'s 70 305 restarts
+#: still arrive as a `crash_loop`, not just as a failed unit. Same reasoning
+#: as UNIT_LISTING_CAP, deliberately its own number: one bounds what a reader
+#: is shown, this bounds what PID 1 is asked.
+FAILED_UNIT_SHOW_CAP = 20
+
+#: Wall-clock the whole `systemctl show` phase may spend before the probe
+#: fails closed with what it measured. The monitor tick is every two minutes
+#: (`voyn-infra-monitor.timer`) under systemd's default 90 s start timeout: a
+#: probe that runs past that is killed mid-measurement, which records no
+#: finding at all -- worse than a probe that says how far it got.
+UNIT_SHOW_BUDGET_SECONDS = 60.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -510,23 +548,36 @@ def parse_unit_show(output: str) -> dict[str, UnitState]:
     return units
 
 
-def parse_service_names(output: str) -> list[str]:
-    """Service unit names from `systemctl list-units` output.
+def parse_unit_listing(output: str) -> list[tuple[str, str]]:
+    """`(unit, ACTIVE)` for every service row of `systemctl list-units`.
 
     Tolerates the header, the legend footer and the `*`/`●` state marker a
     non-`--plain` systemd prefixes to failed rows: the row is kept by the
     first token that ends in `.service`, never by column position, so an
     older systemd cannot make the probe skip exactly the units it exists to
-    find.
+    find.  The state is read two columns PAST that token (UNIT LOAD ACTIVE),
+    for the same reason; a row that has no such column reads as an empty
+    state, which keeps the unit on the measured path.  Fail-safe direction:
+    an unparsable state costs a `systemctl show`, it never costs a reading.
     """
-    names: set[str] = set()
+    rows: list[tuple[str, str]] = []
+    seen: set[str] = set()
     for line in output.splitlines():
         tokens = line.split()
-        for token in tokens[:2]:
-            if token.endswith(".service"):
-                names.add(token)
-                break
-    return sorted(names)
+        for index, token in enumerate(tokens[:2]):
+            if not token.endswith(".service"):
+                continue
+            if token not in seen:
+                seen.add(token)
+                state = tokens[index + 2] if len(tokens) > index + 2 else ""
+                rows.append((token, state))
+            break
+    return rows
+
+
+def parse_service_names(output: str) -> list[str]:
+    """Service unit names from `systemctl list-units` output."""
+    return sorted(unit for unit, _state in parse_unit_listing(output))
 
 
 def _template_name(unit: str) -> str:
@@ -563,8 +614,39 @@ def _unit_listing(entries: tuple[tuple[str, int], ...]) -> str:
     return f"{shown},+{hidden}_more" if hidden > 0 else shown
 
 
+def units_to_show(listing: list[tuple[str, str]]) -> list[str]:
+    """Which listed units the probe spends a `systemctl show` on.
+
+    Every unit the listing does not already condemn, plus the first
+    FAILED_UNIT_SHOW_CAP failed instances of each template family: a failed
+    unit is a `failed_units` finding from the listing alone, so reading the
+    NRestarts of dead per-connection instance number 10 000 buys a number
+    nobody reads at the price of the whole measurement. Deterministic order,
+    so two ticks of a quiet host ask the same question.
+    """
+    asked: list[str] = []
+    failed_per_family: dict[str, int] = {}
+    for unit, state in sorted(listing):
+        if state != "failed":
+            asked.append(unit)
+            continue
+        family = _template_name(unit)
+        seen = failed_per_family.get(family, 0)
+        if seen < FAILED_UNIT_SHOW_CAP:
+            failed_per_family[family] = seen + 1
+            asked.append(unit)
+    return asked
+
+
 def read_unit_health_snapshot(*, crash_loop_restarts: int) -> UnitHealthSnapshot:
-    """Two unprivileged systemctl calls for the whole host, never raising."""
+    """One whole-host listing plus bounded `systemctl show` batches.
+
+    Never raises: unprivileged, read-only, and fail-closed on a partial
+    answer.  Both bounds exist because the host's listing grows without
+    bound (see `UnitHealthSnapshot`): the argv is batched so no command line
+    can reach E2BIG, and the phase has one budget so the probe reports how
+    far it got instead of being killed inside its systemd start timeout.
+    """
     try:
         listed = subprocess.run(
             [
@@ -581,30 +663,47 @@ def read_unit_health_snapshot(*, crash_loop_restarts: int) -> UnitHealthSnapshot
             text=True,
             timeout=15,
         )
-        names = parse_service_names(listed.stdout)
-        if not names:
+        listing = parse_unit_listing(listed.stdout)
+        if not listing:
             raise RuntimeError("systemctl listed no service units")
-        shown = subprocess.run(
-            [
-                "systemctl",
-                "show",
-                "--property=Id,NRestarts,ActiveState",
-                "--no-pager",
-                "--",
-                *names,
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        units = parse_unit_show(shown.stdout)
+        asked = units_to_show(listing)
+        shown: dict[str, UnitState] = {}
+        deadline = time.monotonic() + UNIT_SHOW_BUDGET_SECONDS
+        for start in range(0, len(asked), UNIT_SHOW_BATCH):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(
+                    f"systemctl show measured {len(shown)} of {len(asked)} "
+                    f"units in {UNIT_SHOW_BUDGET_SECONDS:.0f}s"
+                )
+            batch = asked[start : start + UNIT_SHOW_BATCH]
+            completed = subprocess.run(
+                [
+                    "systemctl",
+                    "show",
+                    "--property=Id,NRestarts,ActiveState",
+                    "--no-pager",
+                    "--",
+                    *batch,
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=min(30.0, remaining),
+            )
+            shown.update(parse_unit_show(completed.stdout))
         # A unit that `show` silently dropped is a unit the probe did not
         # judge; a partial answer is a failed measurement, not a clean host.
-        if set(units) != set(names):
+        if set(shown) != set(asked):
             raise RuntimeError(
-                f"systemctl show returned {len(units)} of {len(names)} units"
+                f"systemctl show returned {len(shown)} of {len(asked)} units"
             )
+        # The listing judges every unit; `show` overrides the units it was
+        # asked about with the authoritative state and the restart counter.
+        units = {
+            unit: UnitState(restarts=0, active_state=state) for unit, state in listing
+        }
+        units.update(shown)
         return evaluate_unit_health(units, crash_loop_restarts=crash_loop_restarts)
     except Exception as exc:  # noqa: BLE001 - see read_pr_window_snapshot
         return UnitHealthSnapshot(
