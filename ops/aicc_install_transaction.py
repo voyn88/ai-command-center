@@ -5351,7 +5351,7 @@ def default_specs(
             root_gid,
         ),
         FileSpec(
-            repo_root / "ops/aicc_worker_release_deploy.py",
+            repo_root / "ops/aicc_release_deploy.py",
             "/usr/libexec/aicc-worker-release-deploy",
             0o755,
             root_uid,

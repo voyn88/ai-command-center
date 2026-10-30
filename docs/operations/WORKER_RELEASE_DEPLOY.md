@@ -41,7 +41,7 @@ Stdout одной строки: `NOOP|DEPLOYED|REFUSED|ROLLED_BACK <sha> <detail
 ```bash
 # 1) Положить unit-файлы и бинарь (или прогнать worker-профиль installer'а)
 install -m 0755 -o root -g root \
-  /opt/aicc/source/ops/aicc_worker_release_deploy.py \
+  /opt/aicc/source/ops/aicc_release_deploy.py \
   /usr/libexec/aicc-worker-release-deploy
 install -m 0644 -o root -g root \
   /opt/aicc/source/deploy/systemd/voyn-aicc-worker-release-deploy.service \

@@ -18,7 +18,7 @@ pytestmark = pytest.mark.usefixtures("host_shaped_fixture_roots")
 
 
 def _module():
-    path = Path(__file__).parents[2] / "ops" / "aicc_worker_release_deploy.py"
+    path = Path(__file__).parents[2] / "ops" / "aicc_release_deploy.py"
     spec = importlib.util.spec_from_file_location("aicc_worker_release_deploy", path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -247,7 +247,7 @@ def test_release_remote_never_comes_from_the_operator_checkout(monkeypatch):
     import sys
     from pathlib import Path
 
-    path = Path(__file__).resolve().parents[2] / "ops" / "aicc_worker_release_deploy.py"
+    path = Path(__file__).resolve().parents[2] / "ops" / "aicc_release_deploy.py"
     spec = importlib.util.spec_from_file_location("_wrd_remote", path)
     module = importlib.util.module_from_spec(spec)
     sys.modules["_wrd_remote"] = module

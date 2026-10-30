@@ -261,7 +261,9 @@ def _freeze_tree(path: Path, *, uid: int, gid: int) -> None:
         os.lchown(path, uid, gid)
     except AttributeError:
         pass
-    os.chmod(path, 0o555)
+    # Release dirs are dr-xr-xr-x like every existing release: lanes (aicc-worker)
+    # must read/execute them and nobody may write them.
+    os.chmod(path, 0o555)  # nosec B103
 
 
 def _verify_runtime_venv(cfg: DeployConfig) -> None:
