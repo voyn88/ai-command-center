@@ -113,6 +113,18 @@ logger = logging.getLogger(__name__)
 # `timeout=120` is a client-side deadline psycopg has no equivalent of -- so
 # the shape is survivable here and was not there. A tolerance added to this
 # loop would have to say which thread enforces it.
+#
+# AND IT WOULD HAVE TO SAY WHAT THE DEADLINE PROVES, which is the third thing
+# (monitor_finding #41318). A client-side clock measures what the CALLER SAW,
+# not what the authority did: the beat loop's deadline was dated from the last
+# beat the lane saw accepted, and `daemon._execute` read it as "the database
+# has taken this attempt away" -- which an unanswered call cannot establish.
+# This loop is already on the right side of that distinction and for a reason
+# worth keeping: `voyn-lease acquire` is idempotent under an identity that
+# already holds the row, so a renewal whose answer is lost leaves nothing to
+# infer -- the next renewal re-asserts the same lease. A tolerance here would
+# have to name which of the two facts it is measuring before it could decide
+# anything on them.
 _RENEW_FRACTION = 3.0
 _MIN_RENEW_INTERVAL_SECONDS = 1.0
 

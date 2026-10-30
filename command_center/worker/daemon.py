@@ -39,6 +39,18 @@ Design decisions, each traceable to the shipped substrate:
   reason alone; a run cancelled by the writer lease is still reported, which
   is what returns the item to the queue instead of leaving it ``claimed``
   under a lease nothing renews (VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED).
+* **And only the SERVER can say the write is refused.** An unanswered beat is
+  not a refused beat: ``store.heartbeat`` is one autocommit statement, so a
+  call black-holed on a severed tunnel may have reached the server, run and
+  *committed*, with only the reply lost — which leaves the server's lease up
+  to one beat interval beyond the deadline this lane can prove. So the
+  deadline raises ``lease_unproven`` (stop the work, the fail-closed half) and
+  ``queue_heartbeat`` answering ``ok = false`` raises ``queue_lease_lost``
+  (discard the outcome, because ``_queue_owns`` has already refused it).
+  Discarding on the clock instead left the item ``claimed`` under a lease
+  nothing renews and threw away a ``queue_fail`` the database would have
+  accepted (VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED, ``monitor_finding``
+  #41318).
 * **Shutdown finishes the item in hand.** SIGTERM stops *claiming*; the
   current attempt runs to completion inside systemd's stop timeout. A second
   signal — or the timeout's SIGKILL — abandons it, and the lease expiry plus
@@ -183,8 +195,18 @@ class _LeaseDeadline:
     `store.heartbeat` for exactly the failure the deadline exists for. One
     definition, two readers: the beat loop, which reads it to decide whether
     to send another beat, and `_lease_deadline_loop`, which reads it to decide
-    that the attempt is over and can never be blocked on the database while
-    doing so.
+    that this lane can no longer prove the attempt is its own, and can never
+    be blocked on the database while doing so.
+
+    AND WHAT IT PROVES IS A LAPSE, NOT A REFUSAL (monitor_finding #41318).
+    "The last beat the SERVER ACCEPTED" is, from here, "the last beat this
+    LANE SAW accepted", and the two differ by exactly the beats whose answers
+    were lost: `store.heartbeat` is one autocommit statement, so a call
+    black-holed on a severed tunnel may have reached the server, run and
+    COMMITTED. So ``remaining <= 0`` means "this lane cannot show the attempt
+    is still its own" -- enough to stop the work, and not a verdict on whether
+    a report would be accepted. Only `_queue_owns` decides that; see
+    `WorkerDaemon._execute`.
     """
 
     __slots__ = ("_window", "_monotonic", "_lock", "_granted_at")
@@ -618,7 +640,41 @@ class WorkerDaemon:
         # (that loop's own comment says so). The beat loop survives two; the
         # writer lease survives none, and before this change the whole attempt
         # paid for it.
+        #
+        # AND `queue_lease_lost` IS NOT THE SAME FACT AS "THIS LANE CANNOT
+        # PROVE THE LEASE IS LIVE" (VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED,
+        # monitor_finding #41318). That third event is `lease_unproven`, and
+        # the distinction it carries is the same one this comment draws
+        # between the two LEASES, drawn now between two EPISTEMIC states of
+        # ONE lease. `_LeaseDeadline` is dated from the last beat the lane SAW
+        # accepted, which is the only honest thing a client can date it from
+        # -- and AN UNANSWERED BEAT IS NOT A REFUSED BEAT. `store.heartbeat`
+        # is one autocommit `SELECT queue_heartbeat(...)`, so a call
+        # black-holed on a severed `voyn-aicc-pgtunnel.service` socket may
+        # well have REACHED the server, RUN and COMMITTED, with only the reply
+        # lost; `connect_timeout` bounds connecting and `statement_timeout` is
+        # enforced by a server that is no longer reachable, so nothing says
+        # otherwise. The server's `visible_until` is then up to one beat
+        # interval later than this lane's deadline (75s against the deployed
+        # 300s window, `beat_interval_seconds` = V/4), and inside that gap the
+        # attempt IS still ours by the only authority that decides it --
+        # `_queue_owns`.
+        #
+        # So the deadline is evidence to STOP THE WORK, which is fail-closed
+        # and is unchanged. It is not evidence that the WRITE is refused, and
+        # the lane used to treat it as both: `queue_lease_lost` was set from
+        # the clock and the outcome discarded, which left the item `claimed`
+        # under a lease nothing renews -- the phantom attended claim this
+        # comment catalogues above, arriving from the lane's own inference
+        # instead of from a shared cancellation event. `queue_fail` WOULD have
+        # been accepted in that gap, and the rest of the cost is 0029's
+        # catalogue: the run is lost although its outcome was decided and
+        # writable, the handler's side effects re-run under the next delivery,
+        # and `queue_claim` has already charged `attempt_count` -- so on the
+        # default `max_attempts` of 3 the third tunnel restart dead-letters
+        # healthy work as `visibility_timeout_exhausted`.
         queue_lease_lost = threading.Event()
+        lease_unproven = threading.Event()
         cancel = threading.Event()
         beat_stop = threading.Event()
         # THE ATTEMPT'S LEASE CLOCK, OWNED HERE BECAUSE THE ATTEMPT IS OWNED
@@ -628,7 +684,7 @@ class WorkerDaemon:
         deadline = _LeaseDeadline(self._config.visibility_seconds, self._monotonic)
         beat = threading.Thread(
             target=self._heartbeat_loop,
-            args=(work, deadline, queue_lease_lost, cancel, beat_stop),
+            args=(work, deadline, lease_unproven, queue_lease_lost, cancel, beat_stop),
             name=f"heartbeat-{work.attempt_id}",
             daemon=True,
         )
@@ -644,9 +700,14 @@ class WorkerDaemon:
         # executing an item `aicc-queue-reaper.timer` has already handed back.
         # This thread touches no store, so no database fault can delay it; see
         # `_lease_deadline_loop`.
+        #
+        # IT IS HANDED `lease_unproven` AND NOT `queue_lease_lost`, and the
+        # signature is the statement (monitor_finding #41318): a thread that
+        # holds no connection cannot establish what the SERVER thinks of this
+        # attempt, so it must not be able to say so.
         lapse = threading.Thread(
             target=self._lease_deadline_loop,
-            args=(work, deadline, queue_lease_lost, cancel, beat_stop),
+            args=(work, deadline, lease_unproven, cancel, beat_stop),
             name=f"lease-deadline-{work.attempt_id}",
             daemon=True,
         )
@@ -661,51 +722,79 @@ class WorkerDaemon:
             beat.join(timeout=5)
             lapse.join(timeout=5)
 
-        if cancel.is_set() and not queue_lease_lost.is_set():
-            # The writer lease went, the queue lease did not. Report, so the
-            # item returns to the queue NOW instead of after a whole
-            # visibility window of phantom occupancy.
-            logger.warning(
-                "attempt %s: cancelled with the queue lease still live (a lost "
-                "writer lease); reporting the outcome so the item returns to "
-                "the queue instead of waiting out its visibility window",
-                work.attempt_id,
-            )
-            if outcome.ok:
-                # FAIL CLOSED over the handler's own verdict, and only here.
-                # A cancelled run's workspace is whatever a forcibly
-                # terminated agent left behind, so `queue_complete` -- which
-                # is terminal and carries a result -- must not be written from
-                # it. `worker.handlers` already returns a retryable failure on
-                # this path; this covers a handler that honoured `cancel` by
-                # returning anyway, because a daemon must not take a
-                # handler's word for a terminal write.
-                outcome = HandlerOutcome(
-                    ok=False,
-                    reason=(
-                        "cancelled by a lost writer lease after the handler "
-                        f"reported success: {outcome.reason}"
-                    ).strip(),
-                    retryable=True,
-                )
-
+        # THE THREE STATES OF ONE ATTEMPT, IN THE ORDER THEIR CONSEQUENCES
+        # DIFFER (VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED, monitor_finding
+        # #41318). Only the first of them may discard an outcome.
         if queue_lease_lost.is_set():
-            # The database already gave this attempt to someone else (or will,
-            # at reap). Reporting anything would be refused as a stale owner —
-            # and must be: writing a result after losing the lease is exactly
-            # the lost-update this protocol exists to prevent.
+            # THE SERVER SAID SO. `queue_heartbeat` answered `ok = false`,
+            # which is `_queue_owns` reporting `attempt_superseded` or
+            # `claim_expired` -- the attempt is already somebody else's (or
+            # the reaper's). Reporting anything would be refused as a stale
+            # owner and must be: writing a result after losing the lease is
+            # exactly the lost update this protocol exists to prevent.
             #
-            # THIS queue lease, and no other lease: the condition is
-            # `queue_lease_lost` rather than the handler's `cancel` because
-            # only the beat loop can establish that the write is doomed. A
-            # writer-lease cancellation leaves the queue lease live and the
-            # report acceptable, and discarding it there is the phantom
-            # attended claim this function's opening comment measures.
+            # IT IS THE ONLY FACT THAT ESTABLISHES THAT, and that is why the
+            # condition is this event rather than `cancel` or the deadline.
+            # The two other senders are inferences: the repository writer
+            # lease, which says nothing about the queue lease at all, and this
+            # lane's own clock, which says only that it could not SEE a
+            # renewal. Discarding on either of those is the phantom attended
+            # claim this function's opening comment measures.
             logger.warning(
-                "attempt %s: queue lease lost mid-execution; outcome discarded",
+                "attempt %s: the server refused a beat for this attempt; "
+                "outcome discarded",
                 work.attempt_id,
             )
             return
+
+        if cancel.is_set():
+            # CANCELLED BY SOMETHING THAT DID NOT ESTABLISH THE SERVER'S
+            # VERDICT -- the writer lease, or this lane's own lease deadline.
+            # Either way `queue_fail` may well be ACCEPTED, so it is SENT and
+            # the database decides: the item returns to the queue NOW instead
+            # of sitting `claimed` for the rest of a window nothing is
+            # renewing, and a refusal is the protocol working (logged below as
+            # a stale owner) at the cost of one round trip.
+            cause = (
+                "a queue lease this lane could not prove was live"
+                if lease_unproven.is_set()
+                else "a lost writer lease"
+            )
+            logger.warning(
+                "attempt %s: cancelled by %s; reporting the outcome so the "
+                "item returns to the queue instead of waiting out its "
+                "visibility window",
+                work.attempt_id,
+                cause,
+            )
+            # FAIL CLOSED OVER THE HANDLER'S OWN VERDICT, and only here. A
+            # cancelled run's workspace is whatever a forcibly terminated
+            # agent left behind, so NEITHER terminal write may be taken from
+            # it: not `queue_complete`, which carries a result, and not a
+            # non-retryable `queue_fail`, which dead-letters the item on a
+            # verdict about work that never finished. `worker.handlers`
+            # already returns a retryable failure on this path; this covers a
+            # handler that honoured `cancel` by returning its own answer
+            # anyway, because a daemon must not take a handler's word for a
+            # terminal write. Retryability is covered as well as success
+            # because this branch now carries the lapse path too, where a
+            # handler deep in its own refusal logic can return
+            # `retryable=False` for a reason that has nothing to do with the
+            # lease that was just taken away.
+            verdict = (
+                "reported success"
+                if outcome.ok
+                else "reported a non-retryable failure"
+                if not outcome.retryable
+                else ""
+            )
+            if verdict:
+                said = f" ({outcome.reason})" if outcome.reason.strip() else ""
+                outcome = HandlerOutcome(
+                    ok=False,
+                    reason=f"cancelled by {cause} after the handler {verdict}{said}",
+                    retryable=True,
+                )
         try:
             if outcome.ok:
                 accepted = self._store.complete(work, outcome.result)
@@ -776,31 +865,35 @@ class WorkerDaemon:
             return HandlerOutcome(ok=False, reason=repr(error), retryable=True)
 
     @staticmethod
-    def _lose_queue_lease(
-        queue_lease_lost: threading.Event, cancel: threading.Event
-    ) -> None:
-        """Record that THIS queue attempt is gone, then stop the handler.
+    def _stop_the_handler(fact: threading.Event, cancel: threading.Event) -> None:
+        """Record the narrow fact about THIS attempt, then stop the handler.
+
+        ``fact`` is whichever of ``queue_lease_lost`` (the server refused a
+        beat) or ``lease_unproven`` (this lane's own deadline passed) the
+        caller is in a position to establish. ``_execute`` reads them to decide
+        what may be written, and they are not interchangeable -- see its own
+        comment.
 
         The order is load-bearing and is why this is one function rather than
         two calls at each site. ``cancel`` is what the handler waits on, so
         the moment it is set the handler may return and ``_execute`` may read
-        ``queue_lease_lost`` -- which must therefore already be true, or
-        ``_execute`` would mistake a lost QUEUE lease for a lost WRITER lease
-        and write a report the database is bound to refuse.
+        the narrow fact -- which must therefore already be true, or a lost
+        QUEUE lease would be mistaken for a lost WRITER lease and a report the
+        database is bound to refuse would be written anyway.
         """
-        queue_lease_lost.set()
+        fact.set()
         cancel.set()
 
     def _lease_deadline_loop(
         self,
         work: ClaimedWork,
         deadline: "_LeaseDeadline",
-        queue_lease_lost: threading.Event,
+        lease_unproven: threading.Event,
         cancel: threading.Event,
         beat_stop: threading.Event,
     ) -> None:
-        """Stop the handler the moment the lease is provably gone, from a
-        thread nothing in the database can delay.
+        """Stop the handler the moment this lane can no longer prove the lease
+        is live, from a thread nothing in the database can delay.
 
         WHY A WHOLE THREAD FOR ONE SUBTRACTION
         (VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED, monitor_finding #41237).
@@ -854,18 +947,34 @@ class WorkerDaemon:
         useful, and would retire that detector. Pings stay where they prove
         something: the claim loop between claims, the beat thread around a
         call that actually reached the server.
+
+        AND WHAT IT RAISES IS `lease_unproven`, NOT `queue_lease_lost`
+        (monitor_finding #41318). The clock is the honest thing to stop the
+        WORK on: past the deadline this lane cannot show the attempt is still
+        its own, and anything it goes on to produce is unaccountable. It is
+        not a verdict on the WRITE. The deadline is dated from the last beat
+        the lane SAW accepted, and an unanswered beat is not a refused beat --
+        `store.heartbeat` is one autocommit statement, so a black-holed call
+        may have reached the server, run and COMMITTED with only the reply
+        lost, which leaves the server's `visible_until` up to one beat
+        interval beyond this deadline. Inside that gap `queue_fail` is
+        ACCEPTED, and the only thing that can say otherwise is `_queue_owns`.
+        So this thread stops the handler and `_execute` offers the outcome to
+        the server; see `_execute`'s own comment for what discarding it cost
+        the probe.
         """
         while True:
             remaining = deadline.remaining()
             if remaining <= 0:
                 logger.warning(
                     "attempt %s: a whole visibility window has passed with no "
-                    "heartbeat the server accepted; the queue lease has "
-                    "lapsed (detected by the deadline watch, so the handler "
-                    "stops now rather than when the beat thread next answers)",
+                    "heartbeat this lane saw the server accept; the handler "
+                    "stops now (detected by the deadline watch, so not when "
+                    "the beat thread next answers) and the outcome is offered "
+                    "to the server, which is the only thing that can refuse it",
                     work.attempt_id,
                 )
-                self._lose_queue_lease(queue_lease_lost, cancel)
+                self._stop_the_handler(lease_unproven, cancel)
                 return
             # Sleeps to the deadline and no further, then re-reads it: a beat
             # the server accepted in the meantime has moved it, and this wakes
@@ -879,6 +988,7 @@ class WorkerDaemon:
         self,
         work: ClaimedWork,
         deadline: "_LeaseDeadline",
+        lease_unproven: threading.Event,
         queue_lease_lost: threading.Event,
         cancel: threading.Event,
         beat_stop: threading.Event,
@@ -954,12 +1064,20 @@ class WorkerDaemon:
             # costs the whole run (migration 0029).
             remaining = deadline.remaining()
             if remaining <= 0:
+                # `lease_unproven`, NOT `queue_lease_lost` (monitor_finding
+                # #41318). This branch reads a CLOCK, and the clock is dated
+                # from the last beat THIS LANE SAW accepted -- so what it
+                # establishes is that the lane can no longer prove the attempt
+                # is its own, which is reason enough to stop the work and is
+                # not a verdict on the write. The verdict below is: `alive`
+                # false is `_queue_owns` itself answering.
                 logger.warning(
                     "attempt %s: a whole visibility window has passed with no "
-                    "heartbeat the server accepted; the queue lease has lapsed",
+                    "heartbeat this lane saw the server accept; the handler "
+                    "stops and the outcome is offered to the server",
                     work.attempt_id,
                 )
-                self._lose_queue_lease(queue_lease_lost, cancel)
+                self._stop_the_handler(lease_unproven, cancel)
                 return
             # Never sleep PAST the deadline. The cadence is what keeps the
             # lease alive; once less than one interval of it is left, sleeping
@@ -996,6 +1114,12 @@ class WorkerDaemon:
             # on it would push the deadline watch out past a lapse the server
             # has just confirmed.
             if not alive:
-                self._lose_queue_lease(queue_lease_lost, cancel)
+                # THE SERVER'S OWN VERDICT, and the only thing in this module
+                # that may raise `queue_lease_lost`: `queue_heartbeat` returns
+                # `ok = false` only through `_queue_owns`, so this is
+                # `attempt_superseded` or `claim_expired` from the authority
+                # that decides. `_execute` discards the outcome on it and on
+                # nothing else (monitor_finding #41318).
+                self._stop_the_handler(queue_lease_lost, cancel)
                 return
             deadline.renew(answered_at)

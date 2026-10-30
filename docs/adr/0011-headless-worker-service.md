@@ -81,6 +81,21 @@ This is a distinct mechanism from the queue's visibility lease, and the two must
   deliberately does **not** feed the systemd watchdog: it is alive for the whole of a run and does
   no work, so pinging from it would answer "is this process still useful" with "yes" for a wedged
   one and retire the detector `WatchdogSec` exists to be.
+- **And the deadline stops the work without deciding the write, because an unanswered beat is not a
+  refused beat.** `_LeaseDeadline` can only be dated from the last beat the *lane saw* accepted, and
+  `store.heartbeat` is a single autocommit `SELECT queue_heartbeat(...)` — so a call black-holed on a
+  severed tunnel may have reached the server, run and *committed*, with only the reply lost. The
+  server's `visible_until` is then up to one beat interval (75s against the deployed 300s window)
+  beyond the deadline the lane can prove, and inside that gap the attempt is still the lane's by the
+  only authority that decides it: `_queue_owns`. So the deadline raises `lease_unproven` — stop the
+  handler, the fail-closed half — and `queue_heartbeat` answering `ok = false` raises
+  `queue_lease_lost`, which is the only fact that may discard an outcome. `_execute` discarded on the
+  clock until VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED (`monitor_finding` #41318), which threw away a
+  `queue_fail` the database would have accepted and left the item `claimed` under a lease nothing
+  renews — the phantom attended claim of #14016, reached from the lane's own inference. A run
+  cancelled this way is reported as a *retryable* failure whatever the handler said: neither terminal
+  write (`queue_complete`, or a non-retryable `queue_fail`) may be taken from a workspace a
+  terminated agent left behind.
 - A payload's `timeout_seconds` therefore never "outlives" the queue's visibility lease in the sense
   of exceeding a fixed budget that lease enforces — a heartbeating worker can hold the row for as
   long as `agent_runner` lets the agent run, and no longer. The two ceilings coincide at 3600s
@@ -177,7 +192,7 @@ longer-running handler is abandoned at the timeout, which is safe but not free (
 - `command_center/agent_runner.py` — `MIN_TIMEOUT_SECONDS`, `MAX_TIMEOUT_SECONDS`, `resolve_timeout`,
   `timeout_for_task`
 - `command_center/db/work_queue_store.py` — `claim`/`heartbeat`, `visibility_seconds`
-- `command_center/worker/daemon.py` — `WorkerDaemon._heartbeat_loop` and `_lease_deadline_loop` over one `_LeaseDeadline`, the watchdog feed
+- `command_center/worker/daemon.py` — `WorkerDaemon._heartbeat_loop` and `_lease_deadline_loop` over one `_LeaseDeadline`, the `lease_unproven`/`queue_lease_lost` split in `_execute`, the watchdog feed
 - `command_center/worker/writer_lease.py` — `hold`, the full-lifecycle writer lease
   (`VOYN-W0-AICC-LEASE-FULL-LIFECYCLE-FENCE`)
 - `command_center/worker/worktree_lease.py` — `blocking_lease`

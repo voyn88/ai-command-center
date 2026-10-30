@@ -976,27 +976,31 @@ def _beat_through(store: WorkQueueStore, work: ClaimedWork, window: float):
         store, {}, WorkerConfig(queue=QUEUE, visibility_seconds=int(window))
     )
     deadline = _LeaseDeadline(int(window), time.monotonic)
-    # Two events, as `_execute` passes them: the narrow "THIS queue attempt is
-    # gone", which is the only thing that may discard an outcome, and the
-    # cancellation the handler waits on. The beat loop is the only sender of
-    # the first, so it is the one this helper reports.
+    # Three events, as `_execute` passes them: the cancellation the handler
+    # waits on, and the two narrow facts that say WHY -- `queue_lease_lost`
+    # (the server refused a beat, the only thing that may discard an outcome)
+    # and `lease_unproven` (this lane's own deadline passed, which stops the
+    # work and leaves the write to the database; monitor_finding #41318).
+    # Either is "it gave the lease up", which is what this helper reports.
+    lease_unproven = threading.Event()
     queue_lease_lost = threading.Event()
     cancel = threading.Event()
     beat_stop = threading.Event()
     thread = threading.Thread(
         target=daemon._heartbeat_loop,
-        args=(work, deadline, queue_lease_lost, cancel, beat_stop),
+        args=(work, deadline, lease_unproven, queue_lease_lost, cancel, beat_stop),
         daemon=True,
     )
     thread.start()
     cancel.wait(window + beat_interval_seconds(window) + 1.0)
     beat_stop.set()
     thread.join(timeout=5)
-    # `_lose_queue_lease` sets the narrow fact first, so a cancellation from
-    # this loop always carries it -- asserted here so the helper cannot stop
+    # `_stop_the_handler` sets the narrow fact first, so a cancellation from
+    # this loop always carries one -- asserted here so the helper cannot stop
     # measuring what it says it measures.
-    assert queue_lease_lost.is_set() == cancel.is_set()
-    return queue_lease_lost.is_set()
+    gave_up = lease_unproven.is_set() or queue_lease_lost.is_set()
+    assert gave_up == cancel.is_set()
+    return gave_up
 
 
 #: Small enough that a test waits seconds rather than minutes, large enough
@@ -1427,6 +1431,7 @@ def test_the_beat_loop_admits_the_lapse_inside_the_window_it_was_granted(
     # (monitor_finding #41237). Driving the beat loop alone, as this test did
     # when it only had to prove the clock had replaced the beat COUNT, can
     # only ever measure "one window plus the call the thread is parked in".
+    lease_unproven = threading.Event()
     queue_lease_lost = threading.Event()
     cancel = threading.Event()
     beat_stop = threading.Event()
@@ -1435,12 +1440,22 @@ def test_the_beat_loop_admits_the_lapse_inside_the_window_it_was_granted(
     threads = [
         threading.Thread(
             target=daemon._heartbeat_loop,
-            args=(claimed, deadline, queue_lease_lost, cancel, beat_stop),
+            args=(
+                claimed,
+                deadline,
+                lease_unproven,
+                queue_lease_lost,
+                cancel,
+                beat_stop,
+            ),
             daemon=True,
         ),
         threading.Thread(
+            # The deadline watch holds no connection, so it is handed only the
+            # INFERRED fact: it cannot have heard from the server and must not
+            # be able to record the server's verdict (monitor_finding #41318).
             target=daemon._lease_deadline_loop,
-            args=(claimed, deadline, queue_lease_lost, cancel, beat_stop),
+            args=(claimed, deadline, lease_unproven, cancel, beat_stop),
             daemon=True,
         ),
     ]
@@ -1453,9 +1468,19 @@ def test_the_beat_loop_admits_the_lapse_inside_the_window_it_was_granted(
         thread.join(timeout=5)
 
     assert cancelled, f"the handler was never stopped: beats at {attempts}"
-    assert queue_lease_lost.is_set(), (
+    assert lease_unproven.is_set(), (
         "a lapse established by the lease machinery must carry the narrow "
-        "fact, or `_execute` writes a report the database is bound to refuse"
+        "fact, or `_execute` cannot tell it from a lost WRITER lease"
+    )
+    # AND IT IS THE INFERRED FACT, NOT THE SERVER'S (monitor_finding #41318).
+    # Every beat in this walk black-holed; none was refused, so nothing here
+    # establishes that the attempt is no longer ours -- the server's lease may
+    # be up to one beat interval ahead of the deadline the lane can prove, and
+    # inside that gap `queue_fail` is accepted. See
+    # `test_a_beat_that_commits_without_answering_leaves_the_write_acceptable`.
+    assert not queue_lease_lost.is_set(), (
+        "a clock the lane reads on its own was recorded as the server having "
+        "refused this attempt, which discards a writable outcome"
     )
     # WITHIN THE WINDOW, FULL STOP -- not within the window plus whatever the
     # beat thread was parked in. The old bound allowed `BLIP_WINDOW + block`
@@ -1487,3 +1512,213 @@ def test_the_beat_loop_admits_the_lapse_inside_the_window_it_was_granted(
     # nothing can see: the lane stopped, so the next claim is a real one.
     lapsed = measure()
     assert (lapsed.claimed, lapsed.lapsed_claims) == (1, 1)
+
+
+# ---------------------------------------------------------------------------
+# VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED (monitor_finding #41318): an
+# UNANSWERED beat is not a REFUSED beat, and the daemon took the one for the
+# other.
+#
+# `_LeaseDeadline` is dated from the last beat the LANE SAW accepted, which is
+# the only thing a client can honestly date it from. `daemon._execute` then
+# used that clock as the answer to a different question -- "has the database
+# taken this attempt away" -- and DISCARDED the outcome on it.
+#
+# But `store.heartbeat` is one autocommit `SELECT queue_heartbeat(...)`, so a
+# call black-holed on a severed `voyn-aicc-pgtunnel.service` socket may have
+# reached the server, RUN and COMMITTED, with only the reply lost:
+# `connect_timeout` bounds connecting and `statement_timeout` is enforced by a
+# server that is no longer reachable. The server's `visible_until` is then one
+# beat interval beyond the deadline the lane can prove -- 75s against the
+# deployed 300s window -- and the tests below measure what is true inside that
+# gap, against the real `queue_heartbeat` and the real `queue_fail`.
+# ---------------------------------------------------------------------------
+
+#: Wide enough that the gap this finding is about -- one beat interval --
+#: outlasts the five seconds `_execute` spends joining a beat thread that is
+#: not coming back, which is what the report has to fit inside. At the
+#: deployed numbers that gap is 75s against a 5s join; here it is 7s against
+#: the same 5s, so the test measures the same ordering rather than a lucky
+#: one. The RATIO is the deployed one: `beat_interval_seconds` is V/4.
+UNANSWERED_WINDOW = 28
+
+
+def test_a_beat_that_commits_without_answering_leaves_the_write_acceptable(
+    monitor,
+) -> None:
+    """THE REGRESSION, end to end through the real `_execute` and the real
+    protocol: an attempt the lane could not prove was live must have its
+    outcome OFFERED to the database, because the database accepts it.
+
+    The fault is a tunnel whose request path works and whose reply path does
+    not, which is one of the shapes a `voyn-aicc-pgtunnel.service` restart
+    produces and the one that makes this finding: every beat REACHES the
+    server, RUNS and COMMITS -- `store.heartbeat` is a single autocommit
+    `SELECT queue_heartbeat(...)`, so there is nothing to roll back -- and the
+    lane sees none of the answers. `_LeaseDeadline` can only be dated from the
+    last beat the lane SAW accepted, so it fires at the claim's own window
+    while the server's `visible_until` has been renewed past it. (A call that
+    PARKS instead of failing puts one beat in flight rather than all of them,
+    which is the one-interval version of the same gap.)
+
+    `daemon._execute` used to read its own clock as "the database has taken
+    this attempt away" and discard the outcome. It had not: the assertions
+    below are the real `queue_fail` being ACCEPTED after the lane's deadline
+    has passed, and the item landing back on the queue instead of sitting
+    `claimed` under a lease nothing renews for the rest of its window -- the
+    phantom attended claim #14016 catalogued, reached here from the lane's own
+    inference instead of from a shared cancellation event.
+    """
+    import threading
+    import time
+
+    from command_center.worker.daemon import (
+        HandlerOutcome,
+        WorkerConfig,
+        WorkerDaemon,
+        beat_interval_seconds,
+    )
+
+    measure, app, worker, age = monitor
+
+    # The deployed fleet: two lanes holding the fleet's two items, the surplus
+    # dispatched item (`PlanLimits.wip_limit` is 4 against 2 lanes) ready and
+    # due behind them for forty minutes.
+    app.enqueue(QUEUE, idempotency_key="lane-one", payload={"kind": "slow"})
+    # A window wide enough to outlast this test's wall time: lane one is the
+    # healthy neighbour, and a lease that lapsed underneath it would change
+    # what is being measured from "one lane abandoned its item" to "both did".
+    other = _claim(worker, visibility=600)
+    app.enqueue(QUEUE, idempotency_key="lane-two", payload={"kind": "slow"})
+    claimed = _claim(worker, visibility=UNANSWERED_WINDOW)
+    app.enqueue(QUEUE, idempotency_key="queued", payload={"kind": "slow"})
+    age(
+        "UPDATE work_item SET updated_at = now() - interval '40 minutes', "
+        "available_at = now() - interval '40 minutes' WHERE state = 'ready'"
+    )
+    age(
+        "UPDATE work_item SET updated_at = now() - interval '40 minutes' "
+        "WHERE current_attempt_id = %s",
+        (other.attempt_id,),
+    )
+
+    # THE FAULT. The real beat runs against the real server and commits; only
+    # the reply is lost, which the lane cannot tell from a beat that never
+    # arrived.
+    real_heartbeat = worker.heartbeat
+    beats: list[float] = []
+    started = time.monotonic()
+
+    def commits_without_answering(work):
+        assert real_heartbeat(work) is True, "the beat was refused, not lost"
+        beats.append(time.monotonic() - started)
+        raise ConnectionError("the request landed; the reply never came back")
+
+    worker.heartbeat = commits_without_answering  # type: ignore[method-assign]
+
+    stopped = threading.Event()
+
+    def slow(payload, lease_lost, attempt_no=1):
+        assert lease_lost.wait(UNANSWERED_WINDOW * 3), "the handler never stopped"
+        stopped.set()
+        return HandlerOutcome(ok=False, reason="stopped mid-run", retryable=True)
+
+    daemon = WorkerDaemon(
+        worker,
+        {"slow": slow},
+        WorkerConfig(queue=QUEUE, visibility_seconds=UNANSWERED_WINDOW),
+    )
+    run = threading.Thread(target=daemon._execute, args=(claimed,), daemon=True)
+    run.start()
+    run.join(timeout=UNANSWERED_WINDOW * 4)
+    assert not run.is_alive(), f"`_execute` never returned; beats at {beats}"
+    assert stopped.is_set()
+    assert beats, "no beat was ever sent, so nothing committed unanswered"
+
+    # THE DEADLINE WAS THE LANE'S OWN, and it fired on the clock: the handler
+    # stopped one window after the CLAIM, because no beat ever answered.
+    lapsed_at = time.monotonic() - started
+    assert lapsed_at >= UNANSWERED_WINDOW, (
+        f"the handler stopped at {lapsed_at:.1f}s, ahead of its "
+        f"{UNANSWERED_WINDOW}s deadline (beats at {beats})"
+    )
+
+    # THE CLAIM. The outcome was reported and the database ACCEPTED it, after
+    # the lane's own deadline had passed -- which is the whole finding: the
+    # server's lease had been renewed one interval past that deadline by the
+    # beats whose answers were lost, and `_queue_owns` is the only thing that
+    # decides. One `queue_fail`, and the item is back on the queue now instead
+    # of after the rest of a window plus a reaper tick.
+    reported = measure()
+    assert reported.claimed == 1, (
+        "the abandoned item is still `claimed`: the outcome was discarded on "
+        f"a deadline no refusal supports (beats at {beats})"
+    )
+    assert reported.attended_claims == 1
+    assert reported.lapsed_claims == 0
+    # Occupancy is honest -- one lane holds an item, one is free -- and the
+    # fleet clock has moved, because the fleet really did hand work back
+    # (monitor_finding #2471). Before the fix all three of this probe's clocks
+    # said the fleet was fine while a free lane ignored forty-minute-old work;
+    # `test_an_abandoned_attempt_under_a_live_lease_measures_as_an_attended_
+    # lane` measures that state directly.
+    assert reported.fleet_idle_seconds < MAX_STALLED
+    # The surplus dispatched item is still due and still forty minutes old;
+    # the item just handed back is inside its own retry backoff, which is
+    # waiting by design and deliberately not in this class.
+    assert reported.ready_due == 1
+    assert reported.ready_due_age_seconds > MAX_STALLED
+
+    report = infra_monitor.evaluate(
+        {},
+        reported,
+        minimum_active_workers=0,
+        max_stalled_seconds=MAX_STALLED,
+        prometheus_ready=True,
+        claim_capacity=2,
+    )
+    assert report.ok, report.failures
+
+    # And the margin the report needed is the gap, stated as arithmetic so a
+    # change to either number fails here: `_execute` spends up to five seconds
+    # joining the beat thread before it writes, and the gap it writes inside
+    # is one beat interval.
+    assert beat_interval_seconds(UNANSWERED_WINDOW) > 5.0
+
+
+def test_the_servers_refusal_is_a_different_fact_from_the_lanes_deadline(
+    monitor,
+) -> None:
+    """The other half, so the fix cannot become "always report".
+
+    Once the SERVER'S lease has lapsed, `_queue_owns` refuses the write --
+    `claim_expired`, which is `<=` and not `<` -- and the daemon's discard is
+    right for the one reason that was ever right: the database said so. The
+    fix is that the daemon now learns this from the database instead of
+    inferring it from a clock, and the cost of asking is the one refused round
+    trip measured here.
+    """
+    measure, app, worker, age = monitor
+
+    app.enqueue(QUEUE, idempotency_key="lapsed", payload={"kind": "agent_run"})
+    claim = _claim(worker, visibility=UNANSWERED_WINDOW)
+    age(
+        "UPDATE work_attempt SET visible_until = now() - interval '1 second' "
+        "WHERE attempt_id = %s",
+        (claim.attempt_id,),
+    )
+
+    # The probe sees the lapse too -- the same row, the other side of the
+    # deadline -- and this is the class `aicc-queue-reaper.timer` owns.
+    lapsed = measure()
+    assert lapsed.lapsed_claims == 1
+    assert lapsed.attended_claims == 0
+
+    assert worker.fail(claim, reason="stopped mid-run", retryable=True) is False, (
+        "the database accepted a write for an attempt whose lease it had "
+        "already expired; the fence is what makes 'offer it to the server' safe"
+    )
+    # Nothing moved: a refusal is not a write.
+    unchanged = measure()
+    assert unchanged.lapsed_claims == 1
+    assert unchanged.claimed == 1

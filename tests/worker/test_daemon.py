@@ -1234,36 +1234,40 @@ def test_a_cancelled_run_is_never_completed_even_if_the_handler_says_so() -> Non
     assert "after the handler reported success" in failures[0][2]
 
 
-def test_a_lost_queue_lease_is_recorded_before_the_handler_is_released() -> None:
+def test_the_narrow_fact_is_recorded_before_the_handler_is_released() -> None:
     """The ordering the distinction rests on, pinned where it lives.
 
-    `_execute` tells the two senders apart by reading a SECOND event that only
-    the beat loop sets. `cancel` is what the handler waits on, so the moment
-    it is set the handler may return and `_execute` may read that second
-    event -- which must therefore already be true, or a lost QUEUE lease
-    would be mistaken for a lost writer lease and reported anyway, which is
-    the lost update the protocol exists to prevent.
+    `_execute` tells the senders apart by reading a SECOND event beside
+    `cancel`. `cancel` is what the handler waits on, so the moment it is set
+    the handler may return and `_execute` may read that second event -- which
+    must therefore already be true, or a lost QUEUE lease would be mistaken
+    for a lost writer lease and reported anyway, which is the lost update the
+    protocol exists to prevent.
 
-    `WorkerDaemon._lose_queue_lease` is that ordering and nothing else, so
-    this asserts it directly rather than racing two threads for it.
+    `WorkerDaemon._stop_the_handler` is that ordering and nothing else, so
+    this asserts it directly rather than racing two threads for it -- and it
+    asserts it for BOTH narrow facts, because there are two of them now
+    (monitor_finding #41318) and only one of them used to exist.
     """
     import threading
 
-    order: list[str] = []
-    queue_lease_lost = threading.Event()
+    for name in ("queue_lease_lost", "lease_unproven"):
+        order: list[str] = []
+        fact = threading.Event()
 
-    class RecordingCancel(threading.Event):
-        def set(self) -> None:
-            # What the handler would see at the instant it is released.
-            order.append("queue_lease_lost" if queue_lease_lost.is_set() else "cancel")
-            super().set()
+        class RecordingCancel(threading.Event):
+            def set(self) -> None:
+                # What the handler would see at the instant it is released.
+                order.append(name if fact.is_set() else "cancel")
+                super().set()
 
-    WorkerDaemon._lose_queue_lease(queue_lease_lost, RecordingCancel())
+        WorkerDaemon._stop_the_handler(fact, RecordingCancel())
 
-    assert order == ["queue_lease_lost"], (
-        "the handler can be released before the daemon knows which lease went"
-    )
-    assert queue_lease_lost.is_set()
+        assert order == [name], (
+            f"the handler can be released before the daemon knows that {name} "
+            "is the reason it stopped"
+        )
+        assert fact.is_set()
 
 
 def test_a_lost_queue_lease_still_discards_the_outcome() -> None:
@@ -1348,6 +1352,7 @@ def _beat_until_lost(
     clock = _FakeClock()
     attempts: list[float] = []
     lost_at: list[float] = []
+    lease_unproven = threading.Event()
     queue_lease_lost = threading.Event()
     cancel = threading.Event()
     beat_stop = threading.Event()
@@ -1396,11 +1401,24 @@ def _beat_until_lost(
     # constructs it and the loop is the only reader.
     deadline = _LeaseDeadline(window, clock)
     daemon._heartbeat_loop(
-        _work({"kind": "slow"}), deadline, queue_lease_lost, cancel, _WaitForTheBeat()
+        _work({"kind": "slow"}),
+        deadline,
+        lease_unproven,
+        queue_lease_lost,
+        cancel,
+        _WaitForTheBeat(),
     )
-    assert queue_lease_lost.is_set(), (
+    assert lease_unproven.is_set(), (
         f"the loop never gave the lease up in {len(attempts)} beats "
         f"across {clock.now}s of a {window}s lease: {attempts}"
+    )
+    # AND IT IS THE INFERRED FACT, NOT THE SERVER'S (monitor_finding #41318).
+    # Every beat here failed to ANSWER; none of them was refused, so nothing
+    # has established that the attempt is no longer ours and the outcome must
+    # still be offered to the database rather than discarded.
+    assert not queue_lease_lost.is_set(), (
+        "a clock the lane reads on its own was recorded as the server having "
+        "refused this attempt"
     )
     assert lost_at, "the handler was never cancelled"
     return lost_at[0], attempts
@@ -1533,6 +1551,7 @@ def test_a_beat_the_server_accepted_moves_the_deadline() -> None:
     daemon._heartbeat_loop(
         _work({"kind": "slow"}),
         _LeaseDeadline(window, clock),
+        threading.Event(),
         threading.Event(),
         cancel,
         _WaitForTheBeat(),
@@ -1674,15 +1693,26 @@ def test_a_beat_parked_on_a_dead_socket_cannot_outlive_the_lease() -> None:
     finally:
         released.set()
         run.join(timeout=15)
-    # A lapse is the one loss that forbids the report: `_queue_owns` would
-    # refuse it, and writing after losing the lease is the lost update the
-    # protocol exists to prevent. The narrow fact has to have travelled with
-    # the cancellation, or `_execute` would have read this as a lost WRITER
-    # lease and sent `queue_fail`.
-    assert store.calls == [], (
-        "an outcome was written for an attempt whose queue lease had lapsed: "
-        f"{store.calls}"
+    # AND THE OUTCOME IS OFFERED TO THE SERVER, NOT DISCARDED
+    # (monitor_finding #41318). This assertion used to be `store.calls == []`,
+    # which is the defect: nothing here established that the attempt had been
+    # taken away. Every beat failed to ANSWER, and an unanswered beat is not a
+    # refused beat -- `store.heartbeat` is one autocommit statement, so a
+    # black-holed call may have reached the server, run and COMMITTED with
+    # only the reply lost, which leaves the server's lease up to one beat
+    # interval beyond this deadline. `queue_fail` is ACCEPTED inside that gap,
+    # and `_queue_owns` is the only thing that can refuse it.
+    #
+    # Never `queue_complete`, though the handler returned `ok=True`: a
+    # cancelled run's workspace is whatever a terminated agent left behind.
+    assert not any(call[0] == "complete" for call in store.calls), store.calls
+    failures = [call for call in store.calls if call[0] == "fail"]
+    assert len(failures) == 1, (
+        "a decided, writable outcome was discarded on a deadline the server "
+        f"never confirmed; the item stays `claimed`: {store.calls}"
     )
+    assert failures[0][3] is True, "a cancelled run must come back for retry"
+    assert "could not prove was live" in failures[0][2], failures
 
 
 def test_the_lapse_is_bounded_by_the_lease_and_not_by_the_block() -> None:
@@ -1743,4 +1773,157 @@ def test_the_deadline_watch_does_not_feed_the_watchdog() -> None:
         f"{len(pings)} watchdog pings for {len(beats)} beats: something other "
         "than the beat thread is feeding the watchdog during a run whose "
         "database has stopped answering"
+    )
+
+
+# ---------------------------------------------------------------------------
+# VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED (monitor_finding #41318).
+#
+# AN UNANSWERED BEAT IS NOT A REFUSED BEAT, and the daemon treated it as one.
+#
+# `_LeaseDeadline` is dated from the last beat the LANE SAW accepted, which is
+# the only thing a client can honestly date it from. `_execute` then used it
+# as the answer to a different question -- "has the database taken this
+# attempt away" -- and discarded the outcome on it. But `store.heartbeat` is
+# one autocommit `SELECT queue_heartbeat(...)`, so a call black-holed on a
+# severed `voyn-aicc-pgtunnel.service` socket may well have REACHED the
+# server, RUN and COMMITTED, with only the reply lost: `connect_timeout`
+# bounds connecting and `statement_timeout` is enforced by a server that is no
+# longer reachable, so nothing says otherwise. The server's `visible_until` is
+# then up to one beat interval past this lane's deadline (75s against the
+# deployed 300s window, `beat_interval_seconds` = V/4), and inside that gap
+# the attempt IS still ours by the only authority that decides -- `_queue_owns`
+# -- so `queue_fail` is ACCEPTED.
+#
+# Discarding it instead is the phantom attended claim #14016 catalogued,
+# reached from the lane's own inference rather than from a shared cancellation
+# event: the item stays `claimed` with `visible_until` in the FUTURE, which is
+# the probe's own definition of a lane doing its job, while `_execute` has
+# returned and the loop has gone back to claiming. `queue.claimed` is what
+# `--claim-capacity` is weighed against (#13366), so `spare_capacity` goes
+# false and `evaluate` excuses due ready work as backpressure behind occupancy
+# that does not exist -- the fail-OPEN direction a fail-closed monitor must
+# never have. The rest is 0029's catalogue: the run is lost although its
+# outcome was decided and WRITABLE, the handler's side effects re-run under
+# the next delivery, and `queue_claim` has already charged `attempt_count`, so
+# on the default `max_attempts` of 3 the third tunnel restart dead-letters
+# healthy work as `visibility_timeout_exhausted`.
+#
+# So the clock stops the WORK (fail-closed, unchanged) and the SERVER decides
+# the WRITE. These tests pin the two halves against each other, because the
+# fix is the distinction and not either branch on its own.
+# ---------------------------------------------------------------------------
+
+
+def _execute_one(store, handler, window: int = 3) -> None:
+    """Run the real `_execute` over one claim, start to finish."""
+    daemon = WorkerDaemon(
+        store, {"slow": handler}, WorkerConfig(visibility_seconds=window)
+    )
+    daemon._execute(_work({"kind": "slow"}))
+
+
+def test_an_unanswered_beat_is_not_a_refused_beat() -> None:
+    """THE REGRESSION, as the pair of cases the one event used to conflate.
+
+    Same window, same handler, same cancellation -- the only difference is
+    WHO said the attempt was over. A heartbeat that never answers says nothing
+    about ownership, so the outcome has to be offered to the database; a
+    heartbeat the server REFUSED is `_queue_owns` itself answering, so it must
+    not be.
+    """
+    reported: dict[str, list] = {}
+
+    def slow(payload, lease_lost, attempt_no=1):
+        assert lease_lost.wait(timeout=30), "the handler was never stopped"
+        return HandlerOutcome(ok=False, reason="stopped mid-run", retryable=True)
+
+    # (a) THE BEAT NEVER ANSWERS. It raises here rather than parking, so the
+    # case is the ORDINARY unanswered beat -- a lapse admitted on the clock
+    # with no refusal anywhere in it -- and the test needs no black hole to
+    # make the point.
+    silent = ScriptedStore([])
+
+    def raising_heartbeat(work):
+        silent.calls.append(("heartbeat", work.attempt_id))
+        raise ConnectionError("tunnel black-holed")
+
+    silent.heartbeat = raising_heartbeat  # type: ignore[method-assign]
+    _execute_one(silent, slow)
+    reported["unanswered"] = [c for c in silent.calls if c[0] != "heartbeat"]
+
+    # (b) THE SERVER REFUSED THE BEAT. `queue_heartbeat` returns ok=false only
+    # through `_queue_owns`, so this is `attempt_superseded`/`claim_expired`.
+    refused = ScriptedStore([])
+    refused.heartbeat_alive = False
+    _execute_one(refused, slow)
+    reported["refused"] = [c for c in refused.calls if c[0] != "heartbeat"]
+
+    assert reported["unanswered"] == [
+        ("fail", "wat-1", "stopped mid-run", True)
+    ], (
+        "a decided, writable outcome was discarded on a deadline no refusal "
+        f"supports: {reported['unanswered']}"
+    )
+    assert reported["refused"] == [], (
+        "the server said this attempt is not ours and the daemon wrote "
+        f"anyway: {reported['refused']}"
+    )
+
+
+def test_a_cancelled_run_is_never_terminal_however_the_handler_reported_it() -> None:
+    """Fail closed over BOTH terminal writes, not just `queue_complete`.
+
+    A cancelled run's workspace is whatever a terminated agent left behind, so
+    the daemon may take neither terminal verdict from it: not a completion,
+    and not a NON-RETRYABLE failure, which dead-letters the item on a verdict
+    about work that never finished. The second half matters now that the lapse
+    path reaches this branch (monitor_finding #41318) -- a handler deep in its
+    own refusal logic can return `retryable=False` for a reason that has
+    nothing to do with the lease that was just taken away.
+    """
+    for verdict in (
+        HandlerOutcome(ok=True, result={"published": "maybe"}),
+        HandlerOutcome(ok=False, reason="payload refused", retryable=False),
+    ):
+        store = ScriptedStore([])
+
+        def heartbeat_that_never_answers(work, _store=store):
+            _store.calls.append(("heartbeat", work.attempt_id))
+            raise ConnectionError("tunnel black-holed")
+
+        store.heartbeat = heartbeat_that_never_answers  # type: ignore[method-assign]
+
+        def slow(payload, lease_lost, attempt_no=1, _verdict=verdict):
+            assert lease_lost.wait(timeout=30), "the handler was never stopped"
+            return _verdict
+
+        _execute_one(store, slow)
+
+        assert not any(c[0] == "complete" for c in store.calls), store.calls
+        failures = [c for c in store.calls if c[0] == "fail"]
+        assert len(failures) == 1, store.calls
+        assert failures[0][3] is True, (
+            f"a run cancelled by a lapse was reported as terminal ({verdict}); "
+            "the item dead-letters on a verdict about work that never finished"
+        )
+        assert "could not prove was live" in failures[0][2], failures
+
+
+def test_the_deadline_watch_cannot_say_what_the_server_thinks() -> None:
+    """The signature is the guarantee, so it is asserted as one.
+
+    `_lease_deadline_loop` holds no connection: it cannot have heard from the
+    server, so it must not be able to record the server's verdict. Handing it
+    `queue_lease_lost` was how a clock came to discard a writable outcome.
+    """
+    import inspect
+
+    parameters = list(
+        inspect.signature(WorkerDaemon._lease_deadline_loop).parameters
+    )
+    assert "lease_unproven" in parameters, parameters
+    assert "queue_lease_lost" not in parameters, (
+        "the thread that holds no connection can once again record the "
+        f"server's verdict: {parameters}"
     )
