@@ -263,4 +263,67 @@ rm -rf /etc/systemd/system/aicc-launcher-reap-control@.service /etc/systemd/syst
   /etc/systemd/system/aicc-agent-launcher@.service.d
 systemctl daemon-reload
 
-echo "INSTALLER-INTEGRATION PASS: lane 1 isolated next to a live legacy lane; release traversable; runtime roots distinct; canary + flag + reaping checks pass"
+log "a retired legacy unit does not survive as an unreapable failed_units corpse"
+# VOYN-MON-WORKER-01-INFRA-FAILED-UNITS. Retirement stops and *disables* the
+# pre-template workers, and disabling removes the symlink that was their
+# fragment -- so they are deliberately gone for good. A stop that reached its
+# timeout latched `failed` on the way out, and a unit with no fragment can
+# never run again, so nothing it does will ever clear that latch: PID 1 keeps
+# the unit loaded for no other reason than to remember it. Those were the
+# `failed_units` worker-01 reported for four finding cycles, on a host whose
+# retirement had in fact succeeded.
+#
+# Only PID 1 can answer whether the latch is really gone -- `reset-failed` is
+# issued best-effort, and "the code calls it" is exactly the kind of claim
+# that was wrong the last time (a reaping rule written into a section systemd
+# ignores). The control is a unit retired the way the rollout used to retire
+# them, stop-then-disable with no clear: if the control vanishes too, this
+# check cannot see the defect and says so.
+install -d -m 0755 /opt/aicc-legacy-harness
+for name in voyn-aicc-worker-2 aicc-legacy-corpse-control; do
+  cat > "/opt/aicc-legacy-harness/$name.service" <<CORPSE
+[Unit]
+Description=Legacy worker retirement harness ($name)
+
+[Service]
+Type=oneshot
+ExecStart=/bin/false
+
+[Install]
+WantedBy=multi-user.target
+CORPSE
+  # A SYMLINK fragment, which is the live shape the rollout retires: `disable`
+  # removes it, and the unit is then unrunnable as well as failed.
+  ln -sf "/opt/aicc-legacy-harness/$name.service" "/etc/systemd/system/$name.service"
+done
+systemctl daemon-reload
+for name in voyn-aicc-worker-2 aicc-legacy-corpse-control; do
+  systemctl start "$name.service" >/dev/null 2>&1 || true
+  [ "$(systemctl is-active "$name.service")" = failed ] \
+    || fail "$name.service did not latch failed (test shape: a failing ExecStart must)"
+done
+systemctl stop aicc-legacy-corpse-control.service >/dev/null 2>&1 || true
+systemctl disable aicc-legacy-corpse-control.service >/dev/null 2>&1 || true
+# voyn-aicc-worker-2.service is one of LEGACY_WORKER_UNITS, so this is the
+# shipped retirement path run against PID 1, not a re-implementation of it.
+# The other two names are absent here, which retirement tolerates.
+python3 -c "
+import sys
+sys.path.insert(0, '$REPO/ops')
+import aicc_staged_worker_rollout as rollout
+rollout.retire_legacy_units(rollout.Systemd())
+" || fail "retirement refused to leave the legacy units drained, disabled and un-latched"
+# `is-active`, not the unit table, because that is the exact property the host
+# probe reads: a fragment-less unit systemd has already garbage-collected
+# answers `inactive`, one it is still holding onto answers `failed`.
+[ "$(systemctl is-active aicc-legacy-corpse-control.service)" = failed ] \
+  || fail "the control corpse cleared itself -- this check cannot see the defect it exists for"
+[ "$(systemctl is-active voyn-aicc-worker-2.service)" != failed ] \
+  || fail "a retired legacy unit stayed latched failed; the host probe counts it as failed_units"
+[ "$(systemctl show voyn-aicc-worker-2.service --property=LoadState --value)" = not-found ] \
+  || fail "retirement left the legacy unit's fragment in place (test shape: disable must remove the symlink)"
+systemctl reset-failed aicc-legacy-corpse-control.service >/dev/null 2>&1 || true
+rm -rf /etc/systemd/system/aicc-legacy-corpse-control.service /opt/aicc-legacy-harness
+systemctl daemon-reload
+
+echo "INSTALLER-INTEGRATION PASS: lane 1 isolated next to a live legacy lane; release traversable; runtime roots distinct; canary + flag + reaping + retirement checks pass"

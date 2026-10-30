@@ -2413,6 +2413,32 @@ def quiesce_worker_only_units(*, run=subprocess.run, sleep=time.sleep) -> None:
                 jobs.add(fields[1])
         return frozenset(jobs)
 
+    def clear_latched_failures(units: set[str]) -> None:
+        """Un-latch every unit this purge has proven drained.
+
+        `_QUIESCED_ACTIVE_STATES` accepts `failed` as drained, and rightly so
+        -- a unit that died is a unit that is not running. But `failed` is a
+        LATCH: it records how the last run ended and only a successful run or
+        a `reset-failed` clears it, and `apply()` is about to delete the unit
+        file of everything purged here. A unit with no fragment can never run
+        again, so the latch becomes permanent state in PID 1's table that
+        nothing on the host can clear, on a unit that no longer exists --
+        which the host unit-health probe then reported as `failed_units`
+        (worker-01, monitor_finding 2051 and its three successors; the
+        worker-profile half of this is `retire_legacy_units` in
+        ops/aicc_staged_worker_rollout.py).
+
+        After the barrier, never before: on a unit still shutting down this
+        would clear nothing and the stop could latch again behind it. Nothing
+        reads the latch -- `ActiveState` is not in `SNAPSHOT_PROPERTIES` and
+        the snapshot records `active`, which is False either way -- so
+        rollback is unaffected. Best-effort, like every other mutation here:
+        the authoritative state is probed, and a purge is not failed by a
+        tidy-up.
+        """
+        for unit in sorted(units):
+            systemctl("reset-failed", unit)
+
     def wait_drained(units: set[str], *, message: str) -> None:
         for attempt in range(DRAIN_ATTEMPTS):
             outstanding = [
@@ -2422,6 +2448,7 @@ def quiesce_worker_only_units(*, run=subprocess.run, sleep=time.sleep) -> None:
                 if not is_drained
             ]
             if not outstanding:
+                clear_latched_failures(units)
                 return
             if attempt == DRAIN_ATTEMPTS - 1:
                 raise RuntimeError(f"{message}: {outstanding}")
@@ -2484,6 +2511,7 @@ def quiesce_worker_only_units(*, run=subprocess.run, sleep=time.sleep) -> None:
         ):
             stable_passes += 1
             if stable_passes == 2:
+                clear_latched_failures(launchers)
                 return
         else:
             stable_passes = 0
