@@ -8,6 +8,124 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Fixed — the lease deadline was read only by the thread the fault parks, so it was not a deadline (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
+- `control-01:queue` carried `queue_stalled` as `monitor_finding` #41237. The
+  previous fix (#41136, below) replaced a count of failed beats with a clock,
+  and the clock is right. What it could not do is be **read at the deadline**:
+  `_heartbeat_loop` evaluates it at the top of its loop, and the step before
+  that top is `store.heartbeat`. The failure the whole tolerance exists for is
+  a beat that never comes back — the credential rotation restarts
+  `voyn-aicc-pgtunnel.service` on its own timer, a severed forwarded socket
+  BLACK-HOLES the call, `connect_timeout` (10s) bounds only connecting and
+  `statement_timeout` is enforced by a server that is no longer reachable — so
+  the one event the deadline was for was also the one event that postponed the
+  verdict on itself. That residual was stated by the fix that created it
+  ("one window plus the one call it was parked in") and deferred to a
+  transport change.
+
+  **It is not a transport problem.** The lapse is a statement about a CLOCK,
+  and a clock can be read somewhere the socket cannot reach. The rule now has
+  one definition (`_LeaseDeadline` — the window from the last beat the server
+  ACCEPTED, dated from when that beat ANSWERED, by a monotonic clock) and two
+  readers: `_heartbeat_loop`, which can be parked, and `_lease_deadline_loop`,
+  which touches no store, holds no connection, and whose only operations are a
+  subtraction and `Event.wait`. `_execute` owns the deadline, because `_execute`
+  owns the attempt, and starts both threads over it.
+
+  **MEASURED at the deployed ratio**, which is where the overrun lives:
+  `lease_client.run_lease` already allows a hung subprocess 120s against the
+  fleet's 300s window, and `beat_interval_seconds` is `V / 4`. With the
+  deadline read only at the top of the beat loop:
+
+      t=75   beat sent, parks           t=195  returns, 105s of lease left
+      t=270  beat sent, parks           t=390  returns, the lapse admitted
+
+  Ninety seconds of a lane executing an item `aicc-queue-reaper.timer` handed
+  back at t=300, and the overrun grows with the block rather than with
+  anything about the lease. Scaled onto the 8s window the real-server test
+  uses (block 3.2s), the same walk gives 10.4s against an 8s lease — 2.4s, the
+  same 30% — and it is 0.0s with the deadline watch running.
+
+  **WHAT THE OVERRUN COSTS IS THE PROBE'S OCCUPANCY**, the one thing a
+  fail-closed monitor cannot survive being lied to about, and it is the same
+  lie #41136 catalogued: the lane keeps executing an item it no longer owns,
+  the reaper hands that item back within the minute, and the fleet holds TWO
+  lanes' worth of work while `work_item` records ONE claim. `claimed` is what
+  `--claim-capacity` is weighed against (#13366), so `spare_capacity` goes
+  true against a fleet with no free lane, the due-ready clock runs in full,
+  and `fleet_idle_seconds` cannot bound it because the surviving claim is an
+  hour old. No fleet action reaches it — the lapsed-claim class is empty, a
+  lane restart only arranges for the next tunnel blip to do it again, and
+  `queue_redrive` reaches only items already dead. Meanwhile the lane that
+  claims the handed-back item re-runs the handler's side effects (`git push`
+  and PR creation included) against a workspace the first lane is still
+  writing to.
+- **The deadline watch does not feed the systemd watchdog, deliberately.** It
+  is alive for the whole of a run and does no work; pinging from it would
+  answer "is this process still useful" with "yes" for a process that has
+  wedged, and retire the detector `aicc-worker.service` sizes `WatchdogSec`
+  to be. Pings stay where they prove something — the claim loop between
+  claims, the beat thread around a call that actually reached the server —
+  and `test_the_deadline_watch_does_not_feed_the_watchdog` pins it.
+- **One ordering detail is load-bearing and changed with it.** A beat the
+  server REFUSES (`alive` is false) is an answer, but it is the answer "this
+  attempt is not yours"; the loop re-dated the lease on it before returning,
+  which was invisible while one thread owned the clock and would now push the
+  watch's deadline out past a lapse the server had just confirmed. Only an
+  accepted beat renews, and it renews to the instant the answer ARRIVED,
+  captured before the loop does anything else.
+- **WHAT REMAINS, bounded and stated.** The parked beat thread still cannot
+  return until its call does, so a lapsed attempt leaves one thread (and the
+  pool connection it checked out) outstanding until the socket gives up. It
+  costs nothing the probe can see: the attempt is already cancelled, the item
+  already recovered, and the lane already back in `run_forever`. Bounding the
+  call itself is still the transport's job (libpq `tcp_user_timeout` and
+  friends) and is still a fleet-wide connection change with no measurement
+  here — it is simply no longer what the lapse depends on.
+
+### Verified — the measurement behind the deadline-watch fix (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
+- A local PostgreSQL 16 cluster was available this session, so the real-server
+  half was RUN rather than reported: `tests/db/test_infra_monitor_queue_
+  snapshot.py` is 23 passed, and `test_queue_claim.py`, `test_reap_bound.py`,
+  `test_monitor_finding_clear.py` and `test_work_queue_admin.py` are 82 passed
+  together with it. `tests/worker/` and `tests/ops/test_infra_monitor.py` are
+  283 passed.
+- Re-verified by MUTATION, not by its own green. Making `_lease_deadline_loop`
+  return immediately — the pre-fix world, where only the beat loop reads the
+  clock — takes `test_the_beat_loop_admits_the_lapse_inside_the_window_it_was_
+  granted` red at exactly the predicted number ("the lane ran 2.4s past an 8s
+  lease while a beat sat in a 3.2s black hole", the deployed 30%), and both
+  server-free regressions red as a handler that is never stopped at all
+  (their black hole does not answer inside the test, so a bound that depends
+  on it cannot be met at any tolerance). Adding a `WATCHDOG=1` ping to the
+  watch takes `test_the_deadline_watch_does_not_feed_the_watchdog` red at 6
+  pings for 1 beat.
+- The real-server test now drives the attempt's threads EXACTLY as `_execute`
+  starts them — both loops over one shared `_LeaseDeadline` — because the
+  bound is a property of the pair. Driving the beat loop alone, which is what
+  it did when it only had to prove the clock had replaced the beat count, can
+  measure nothing better than "one window plus the parked call". Its block is
+  scaled from the deployed 120s-against-300s rather than left at one beat
+  interval: at a whole interval the two clocks happen to coincide and the old
+  code overruns by zero, so the previous shape could not have caught this.
+- `test_a_blip_of_the_tolerated_length_does_not_stop_the_work` is the
+  no-false-cancellation side and runs through `run_forever`/`_execute`, so it
+  exercises the new thread against a store that keeps the lease the way the
+  server keeps it: an accepted beat moves the shared deadline and the watch
+  does not fire.
+- The whole of `tests/db` against that cluster is 4 failed / 1006 passed / 44
+  skipped, and none of the four is this change: two enrolment tests assert a
+  password refusal the sandbox cluster cannot produce (it was `initdb
+  --auth=trust`), the backup drill wants a password in the DSN for the same
+  reason (`KeyError: 'password'`), and the readyz test has no `fastapi`
+  installed here. `tests/ops` is 41 failed, and the failing set is IDENTICAL
+  — compared name by name — on a pristine `git worktree` of HEAD, so it is
+  the sandbox's static gates and `/proc` restrictions, not this change.
+- `ruff check` passes on every file touched. The venv's `ruff` binary is not
+  executable in this sandbox; it was copied to a writable path and run from
+  there, as the previous session did.
+
+
 ### Fixed — the lease tolerance was a COUNT OF BEATS, so a lane kept running an item the reaper had already handed back (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
 - `control-01:queue` carried `queue_stalled` as `monitor_finding` #41136.
   `WorkerDaemon._heartbeat_loop` decided that the queue lease was gone when

@@ -963,12 +963,19 @@ def _beat_through(store: WorkQueueStore, work: ClaimedWork, window: float):
     """Run the production beat loop over one claim for a whole window plus a
     beat, and report whether it gave the lease up."""
     import threading
+    import time
 
-    from command_center.worker.daemon import WorkerConfig, WorkerDaemon, beat_interval_seconds
+    from command_center.worker.daemon import (
+        WorkerConfig,
+        WorkerDaemon,
+        _LeaseDeadline,
+        beat_interval_seconds,
+    )
 
     daemon = WorkerDaemon(
         store, {}, WorkerConfig(queue=QUEUE, visibility_seconds=int(window))
     )
+    deadline = _LeaseDeadline(int(window), time.monotonic)
     # Two events, as `_execute` passes them: the narrow "THIS queue attempt is
     # gone", which is the only thing that may discard an outcome, and the
     # cancellation the handler waits on. The beat loop is the only sender of
@@ -978,7 +985,7 @@ def _beat_through(store: WorkQueueStore, work: ClaimedWork, window: float):
     beat_stop = threading.Event()
     thread = threading.Thread(
         target=daemon._heartbeat_loop,
-        args=(work, queue_lease_lost, cancel, beat_stop),
+        args=(work, deadline, queue_lease_lost, cancel, beat_stop),
         daemon=True,
     )
     thread.start()
@@ -1238,6 +1245,14 @@ def test_an_abandoned_attempt_under_a_live_lease_measures_as_an_attended_lane(
 # and the lane ran on for `(F + 2)` of them. `tests/worker/test_daemon.py`
 # pins the loop's own arithmetic on an injected clock; this pins what the
 # overrun does to the measurement, through the real protocol.
+#
+# AND IT WAS STILL REACHABLE AFTER THE CLOCK REPLACED THE COUNT
+# (monitor_finding #41237), by a shorter route: the clock was correct and was
+# read at the top of the beat loop, so the black-holed call postponed the
+# verdict on ITSELF -- the lapse landed at `window + block` with nothing
+# client-side bounding `block`. The deadline is now watched by a second
+# thread holding no connection, and the test below runs the pair exactly as
+# `_execute` starts them.
 # ---------------------------------------------------------------------------
 
 
@@ -1334,10 +1349,11 @@ def test_a_lane_running_past_its_lease_hides_the_fleets_real_occupancy(
     # after every measurement fix. The reaper has done its job; restarting
     # lane A only arranges for the next tunnel blip to do this again; and
     # `queue_redrive` reaches only items that are already dead. The exit is
-    # the lane admitting the lapse WITHIN the window, which is what the
-    # deadline in `_heartbeat_loop` now guarantees -- after which lane A is
-    # back in `run_forever` claiming, so the item it gave back is taken and
-    # the fleet clock moves.
+    # the lane admitting the lapse WITHIN the window, which is what
+    # `_LeaseDeadline` and the thread that watches it now guarantee -- the
+    # beat loop alone could promise only the window plus whatever call it was
+    # parked in (#41237) -- after which lane A is back in `run_forever`
+    # claiming, so the item it gave back is taken and the fleet clock moves.
     taken_back = _claim(worker)
     assert taken_back.work_item_id == lane_a.work_item_id
     recovered = measure()
@@ -1350,21 +1366,32 @@ def test_the_beat_loop_admits_the_lapse_inside_the_window_it_was_granted(
     monitor,
 ) -> None:
     """The fix's own half, through the real `queue_claim`/`queue_heartbeat`
-    and the real beat loop: a heartbeat that HANGS and then fails -- the shape
-    a severed tunnel socket produces, and the one the old count-based
-    tolerance mis-timed -- must still stop the handler within the window the
-    server granted.
+    and the real lease machinery: a heartbeat that HANGS and then fails --
+    the shape a severed tunnel socket produces, and the one every version of
+    this tolerance has mis-timed -- must stop the handler within the window
+    the server granted, and within THAT window alone.
 
-    The block is a whole beat interval, so the old rule needed
-    `TOLERATED_FAILED_BEATS + 2` cycles of `interval + block`: twice the
-    window at this ratio, and four times it at the 120s a hung `voyn-lease`
-    subprocess is already allowed."""
+    AT THE DEPLOYED RATIO, because the overrun is a function of it and
+    nothing else. `lease_client.run_lease` already allows a hung subprocess
+    120s against the fleet's 300s visibility window, so the block here is
+    `0.4 * BLIP_WINDOW`; `beat_interval_seconds` is `V / 4` in both. Walked
+    through for the deployed numbers, with the deadline evaluated only at the
+    top of the beat loop:
+
+        t=75   beat sent, parks          t=195  returns, 105s of lease left
+        t=270  beat sent, parks          t=390  returns, the lapse admitted
+
+    -- 90 seconds of a lane executing an item `aicc-queue-reaper.timer` gave
+    back at t=300. The deadline watch holds no connection, so it answers at
+    t=300 whatever the beat thread is sitting in
+    (monitor_finding #41237)."""
     import threading
     import time
 
     from command_center.worker.daemon import (
         WorkerConfig,
         WorkerDaemon,
+        _LeaseDeadline,
         beat_interval_seconds,
     )
 
@@ -1373,45 +1400,87 @@ def test_the_beat_loop_admits_the_lapse_inside_the_window_it_was_granted(
     claimed = _claim(worker, visibility=BLIP_WINDOW)
 
     interval = beat_interval_seconds(BLIP_WINDOW)
+    # The 120s `lease_client.run_lease` allows a hung subprocess, scaled to
+    # this window the way every other number in this test is: 0.4 of it.
+    block = BLIP_WINDOW * 0.4
+    # Longer than a beat interval, which is what makes the parked call SPAN
+    # the deadline instead of merely delaying one renewal -- true of the
+    # deployed numbers it is scaled from (120s against 75s) and the reason
+    # the overrun exists at all.
+    assert block > interval
     attempts: list[float] = []
 
     def black_holed(_work):
         attempts.append(time.monotonic() - started)
-        # The call does not answer: it parks on a dead socket for a whole beat
-        # interval and then reports the failure it was sitting on.
-        time.sleep(interval)
+        # The call does not answer: it parks on a dead socket and then reports
+        # the failure it was sitting on all along.
+        time.sleep(block)
         raise ConnectionError("tunnel black-holed")
 
     worker.heartbeat = black_holed  # type: ignore[method-assign]
     daemon = WorkerDaemon(
         worker, {}, WorkerConfig(queue=QUEUE, visibility_seconds=BLIP_WINDOW)
     )
+    # The attempt's threads EXACTLY AS `_execute` STARTS THEM -- the beat
+    # loop and the deadline watch over one shared `_LeaseDeadline` -- because
+    # the bound under test is a property of the pair and not of either one
+    # (monitor_finding #41237). Driving the beat loop alone, as this test did
+    # when it only had to prove the clock had replaced the beat COUNT, can
+    # only ever measure "one window plus the call the thread is parked in".
     queue_lease_lost = threading.Event()
     cancel = threading.Event()
     beat_stop = threading.Event()
     started = time.monotonic()
-    thread = threading.Thread(
-        target=daemon._heartbeat_loop,
-        args=(claimed, queue_lease_lost, cancel, beat_stop),
-        daemon=True,
-    )
-    thread.start()
+    deadline = _LeaseDeadline(BLIP_WINDOW, time.monotonic)
+    threads = [
+        threading.Thread(
+            target=daemon._heartbeat_loop,
+            args=(claimed, deadline, queue_lease_lost, cancel, beat_stop),
+            daemon=True,
+        ),
+        threading.Thread(
+            target=daemon._lease_deadline_loop,
+            args=(claimed, deadline, queue_lease_lost, cancel, beat_stop),
+            daemon=True,
+        ),
+    ]
+    for thread in threads:
+        thread.start()
     cancelled = cancel.wait(BLIP_WINDOW * 4)
     lost_at = time.monotonic() - started
     beat_stop.set()
-    thread.join(timeout=5)
+    for thread in threads:
+        thread.join(timeout=5)
 
     assert cancelled, f"the handler was never stopped: beats at {attempts}"
     assert queue_lease_lost.is_set(), (
-        "a lapse established by the beat loop must carry the narrow fact, or "
-        "`_execute` writes a report the database is bound to refuse"
+        "a lapse established by the lease machinery must carry the narrow "
+        "fact, or `_execute` writes a report the database is bound to refuse"
     )
-    # Within the window plus the one call the thread was parked in -- it
-    # cannot act while inside `store.heartbeat`, and bounding that needs a
-    # deadline on the transport rather than on this loop.
-    assert lost_at <= BLIP_WINDOW + interval + 1.0, (
+    # WITHIN THE WINDOW, FULL STOP -- not within the window plus whatever the
+    # beat thread was parked in. The old bound allowed `BLIP_WINDOW + block`
+    # and the walk-through in the docstring spends all of it; the deadline
+    # watch holds no connection and so cannot be delayed by the fault that
+    # stopped the beat. The one second is scheduling slack, and it is slack
+    # against the BLOCK (0.4 of the window), so a lapse that still waits on
+    # the parked call fails here rather than fitting inside the tolerance.
+    assert lost_at <= BLIP_WINDOW + 1.0, (
         f"the lane ran {lost_at - BLIP_WINDOW:.1f}s past a {BLIP_WINDOW}s "
-        f"lease; beats attempted at {attempts}"
+        f"lease while a beat sat in a {block:.1f}s black hole; beats "
+        f"attempted at {attempts}"
+    )
+    assert lost_at >= BLIP_WINDOW, (
+        f"the lease was given up at {lost_at:.1f}s, ahead of its "
+        f"{BLIP_WINDOW}s deadline -- an attempt taken away with time left on "
+        "its lease costs the whole run (0029)"
+    )
+    # The beat thread really was still inside the black-holed call when the
+    # lapse was declared, which is what makes the bound above a measurement
+    # of the fix rather than of a beat that happened to fail fast enough.
+    assert attempts and attempts[-1] + block > lost_at, (
+        "the parked beat had already returned by the time the lease was "
+        f"given up at {lost_at:.1f}s, so this run did not exercise the "
+        f"deadline watch at all (beats attempted at {attempts})"
     )
 
     # And the row it leaves behind is the one the reaper owns, not the one

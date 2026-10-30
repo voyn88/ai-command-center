@@ -103,6 +103,16 @@ logger = logging.getLogger(__name__)
 # divides. A tolerance expressed as "N renewals may fail" would therefore mean
 # anything between N intervals and N * (interval + 120s) of real time, and only
 # the second of those is what the lease has left.
+#
+# AND A DEADLINE IS ONLY AS GOOD AS THE THREAD THAT READS IT, which is the
+# second thing to copy (monitor_finding #41237). The beat loop's clock was
+# correct and still mis-timed, because it was evaluated at the top of the loop
+# and the step before that top was the call that had stopped answering; the
+# lapse is now watched by a thread holding no connection at all. This loop's
+# block is at least BOUNDED where the beat's was not -- `subprocess.run`'s own
+# `timeout=120` is a client-side deadline psycopg has no equivalent of -- so
+# the shape is survivable here and was not there. A tolerance added to this
+# loop would have to say which thread enforces it.
 _RENEW_FRACTION = 3.0
 _MIN_RENEW_INTERVAL_SECONDS = 1.0
 

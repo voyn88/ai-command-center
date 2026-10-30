@@ -70,6 +70,17 @@ This is a distinct mechanism from the queue's visibility lease, and the two must
   an unreachable server fails the beat quickly; a severed `voyn-aicc-pgtunnel.service` socket
   black-holes the call instead, so the lane kept executing an item the reaper had already handed
   back and the queue probe read the fleet as having a free lane it did not have.
+- **And that deadline is evaluated where the database cannot delay it.** The rule above is correct
+  and was still mis-timed, because it was read at the top of the beat loop and the step before that
+  top is the heartbeat call: the one failure the tolerance exists for — a black-holed socket — was
+  also the one failure that postponed the verdict on itself, by however long the call sat there
+  (`lease_client.run_lease` already allows a hung subprocess 120s; a socket read nothing bounds can
+  sit longer). `_LeaseDeadline` now holds the rule and two threads read it: `_heartbeat_loop`, which
+  can be parked, and `_lease_deadline_loop`, which touches no store and therefore cannot be
+  (VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED, `monitor_finding` #41237). The deadline watch
+  deliberately does **not** feed the systemd watchdog: it is alive for the whole of a run and does
+  no work, so pinging from it would answer "is this process still useful" with "yes" for a wedged
+  one and retire the detector `WatchdogSec` exists to be.
 - A payload's `timeout_seconds` therefore never "outlives" the queue's visibility lease in the sense
   of exceeding a fixed budget that lease enforces — a heartbeating worker can hold the row for as
   long as `agent_runner` lets the agent run, and no longer. The two ceilings coincide at 3600s
@@ -166,7 +177,7 @@ longer-running handler is abandoned at the timeout, which is safe but not free (
 - `command_center/agent_runner.py` — `MIN_TIMEOUT_SECONDS`, `MAX_TIMEOUT_SECONDS`, `resolve_timeout`,
   `timeout_for_task`
 - `command_center/db/work_queue_store.py` — `claim`/`heartbeat`, `visibility_seconds`
-- `command_center/worker/daemon.py` — `WorkerDaemon._heartbeat_loop`, the watchdog feed
+- `command_center/worker/daemon.py` — `WorkerDaemon._heartbeat_loop` and `_lease_deadline_loop` over one `_LeaseDeadline`, the watchdog feed
 - `command_center/worker/writer_lease.py` — `hold`, the full-lifecycle writer lease
   (`VOYN-W0-AICC-LEASE-FULL-LIFECYCLE-FENCE`)
 - `command_center/worker/worktree_lease.py` — `blocking_lease`

@@ -23,6 +23,14 @@ Design decisions, each traceable to the shipped substrate:
   left a lane executing an item ``aicc-queue-reaper.timer`` had already
   handed back (VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED; see
   ``_heartbeat_loop``).
+* **And the deadline is watched where the database cannot reach it.** A rule
+  is only as good as the thread that evaluates it: the deadline above lived
+  at the top of the beat loop, so the black-holed call *also* postponed the
+  verdict on itself, and the lapse arrived one unbounded block late. The rule
+  now has one definition (``_LeaseDeadline``) and two readers, one of which
+  (``_lease_deadline_loop``) touches no store at all and so cannot be delayed
+  by any database fault (VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED,
+  monitor_finding #41237).
 * **Cancelling the handler and refusing to report are different decisions.**
   Two leases cover one attempt — this queue lease, and the repository writer
   lease ``worker.handlers`` holds through the run — and either one going must
@@ -151,6 +159,65 @@ def beat_interval_seconds(
     if watchdog_seconds is not None:
         interval = min(interval, max(watchdog_seconds, 1.0))
     return interval
+
+
+class _LeaseDeadline:
+    """How much of THIS attempt's queue lease is left, as one rule in one
+    place -- and, deliberately, as a plain clock with no I/O in it, so that
+    the fact it states can be read by a thread the database cannot park.
+
+    The rule itself is `daemon._heartbeat_loop`'s and is unchanged: a window
+    of ``visibility_seconds`` from the last beat the SERVER accepted, by a
+    MONOTONIC clock (the quantity is an elapsed duration, and a wall clock
+    stepped by NTP would move the lease with it), dated from when that beat
+    ANSWERED rather than from when it was sent (the server grants the renewal
+    somewhere inside the round trip, so the answer's arrival is at or after
+    the grant -- which makes `remaining` PROVE the lapse instead of estimating
+    it, and an attempt taken away with time left on its lease costs the whole
+    run; see migration 0029).
+
+    WHY IT IS AN OBJECT RATHER THAN A LOCAL
+    (VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED, monitor_finding #41237). It was
+    a `granted_at` local in the beat loop, which made the beat thread the only
+    thread that could read it -- and that thread is parked inside
+    `store.heartbeat` for exactly the failure the deadline exists for. One
+    definition, two readers: the beat loop, which reads it to decide whether
+    to send another beat, and `_lease_deadline_loop`, which reads it to decide
+    that the attempt is over and can never be blocked on the database while
+    doing so.
+    """
+
+    __slots__ = ("_window", "_monotonic", "_lock", "_granted_at")
+
+    def __init__(self, window: float, monotonic: Callable[[], float]) -> None:
+        self._window = float(window)
+        self._monotonic = monotonic
+        # Plain assignment of a float is atomic under the GIL, but the lock is
+        # cheap and the invariant -- a reader never sees a half-written grant
+        # -- is the one this type exists to hold across threads.
+        self._lock = threading.Lock()
+        # `queue_claim` has just granted a window, and this is constructed
+        # before the attempt's threads start, so construction is a
+        # conservative stand-in for that grant: the real one is no later.
+        self._granted_at = monotonic()
+
+    def renew(self, answered_at: float | None = None) -> None:
+        """Re-date the lease to when a beat the server ACCEPTED answered.
+
+        ``answered_at`` is passed by the beat loop as the instant the call
+        returned, so the timestamp is the answer's and not that of whatever
+        the loop did next.
+        """
+        with self._lock:
+            self._granted_at = (
+                self._monotonic() if answered_at is None else answered_at
+            )
+
+    def remaining(self) -> float:
+        """Seconds of lease left. ``<= 0`` means the attempt is no longer
+        ours and anything it goes on to do is unaccountable."""
+        with self._lock:
+            return self._window - (self._monotonic() - self._granted_at)
 
 
 @dataclass(frozen=True, slots=True)
@@ -554,18 +621,45 @@ class WorkerDaemon:
         queue_lease_lost = threading.Event()
         cancel = threading.Event()
         beat_stop = threading.Event()
+        # THE ATTEMPT'S LEASE CLOCK, OWNED HERE BECAUSE THE ATTEMPT IS OWNED
+        # HERE, and read by both of the threads below. Constructed before
+        # either starts, so the window is dated from the claim rather than
+        # from whenever a thread happened to be scheduled.
+        deadline = _LeaseDeadline(self._config.visibility_seconds, self._monotonic)
         beat = threading.Thread(
             target=self._heartbeat_loop,
-            args=(work, queue_lease_lost, cancel, beat_stop),
+            args=(work, deadline, queue_lease_lost, cancel, beat_stop),
             name=f"heartbeat-{work.attempt_id}",
             daemon=True,
         )
+        # A SECOND THREAD THAT DOES NOTHING BUT WATCH A CLOCK
+        # (VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED, monitor_finding #41237).
+        # The deadline was enforced only at the top of the beat loop, so the
+        # one failure it exists for -- a heartbeat black-holed on a severed
+        # `voyn-aicc-pgtunnel.service` socket -- was also the one failure that
+        # stopped it being enforced: the beat thread cannot test a clock while
+        # it is parked inside `store.heartbeat`, and nothing client-side
+        # bounds that call. The lapse therefore arrived at `window + block`
+        # with `block` unbounded, and every second of that overrun is a lane
+        # executing an item `aicc-queue-reaper.timer` has already handed back.
+        # This thread touches no store, so no database fault can delay it; see
+        # `_lease_deadline_loop`.
+        lapse = threading.Thread(
+            target=self._lease_deadline_loop,
+            args=(work, deadline, queue_lease_lost, cancel, beat_stop),
+            name=f"lease-deadline-{work.attempt_id}",
+            daemon=True,
+        )
         beat.start()
+        lapse.start()
         try:
             outcome = self._dispatch(work, cancel)
         finally:
+            # One stop signal for the attempt's whole lease machinery: both
+            # threads wait on it, so both wake the moment the handler is done.
             beat_stop.set()
             beat.join(timeout=5)
+            lapse.join(timeout=5)
 
         if cancel.is_set() and not queue_lease_lost.is_set():
             # The writer lease went, the queue lease did not. Report, so the
@@ -697,9 +791,94 @@ class WorkerDaemon:
         queue_lease_lost.set()
         cancel.set()
 
+    def _lease_deadline_loop(
+        self,
+        work: ClaimedWork,
+        deadline: "_LeaseDeadline",
+        queue_lease_lost: threading.Event,
+        cancel: threading.Event,
+        beat_stop: threading.Event,
+    ) -> None:
+        """Stop the handler the moment the lease is provably gone, from a
+        thread nothing in the database can delay.
+
+        WHY A WHOLE THREAD FOR ONE SUBTRACTION
+        (VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED, monitor_finding #41237).
+        `_heartbeat_loop` already held the right rule and already measured it
+        against a clock -- the previous finding (#41136) replaced a count of
+        failed beats with exactly that. What it could not do is EVALUATE the
+        rule at the deadline, because it evaluates it at the top of its loop
+        and the step before that top is `store.heartbeat`. The failure the
+        tolerance exists for is a beat that does not come back: the credential
+        rotation restarts `voyn-aicc-pgtunnel.service` on its own timer, a
+        severed forwarded socket BLACK-HOLES the call, `connect_timeout` (10s)
+        bounds only connecting and `statement_timeout` is enforced by a server
+        that is no longer reachable. So the thread that owned the deadline was
+        parked, without a client-side bound, by the very event the deadline
+        was for -- "one window plus the one call it was parked in", which the
+        previous fix stated as its own residual and left to a transport
+        change. It is not a transport problem. The lapse is a statement about
+        a CLOCK, and a clock can be read somewhere the socket cannot reach.
+
+        WHAT THE OVERRUN COSTS, every second of it, is the probe's occupancy.
+        The lane keeps executing an item it no longer owns;
+        `aicc-queue-reaper.timer` does exactly its job within the minute and
+        hands that item back; and now the fleet holds TWO lanes' worth of work
+        while `work_item` records ONE claim. `claimed` is what
+        `--claim-capacity` is weighed against (monitor_finding #13366), so
+        `spare_capacity` goes true against a fleet with no free lane at all,
+        the due-ready clock runs in full, and `fleet_idle_seconds` cannot
+        bound it because the surviving claim is an hour old. `control-01:
+        queue` opens `queue_stalled` and NO FLEET ACTION REACHES IT: the
+        lapsed-claim class is empty (the reaper has already recovered the
+        item), restarting the lane only arranges for the next tunnel blip to
+        do it again, and `queue_redrive` reaches only items already dead.
+        `tests/db/test_infra_monitor_queue_snapshot.py::test_a_lane_running_
+        past_its_lease_hides_the_fleets_real_occupancy` measures that whole
+        chain against a real server. The second lane that claims the
+        handed-back item meanwhile re-runs the handler's side effects --
+        `git push` and PR creation included -- against a workspace the first
+        lane is still writing to.
+
+        IT TOUCHES NO STORE, AND THAT IS THE ENTIRE POINT. No heartbeat, no
+        report, no pool checkout: a database that is unreachable, slow, or
+        gone cannot add a microsecond to the instant this fires. The only
+        calls here are a subtraction on a monotonic clock and
+        `threading.Event.wait`.
+
+        AND IT DOES NOT FEED THE WATCHDOG, deliberately. `aicc-worker.service`
+        sizes `WatchdogSec` so that a wedged process -- a handler that hangs
+        AND takes the beat thread with it -- misses ping after ping and is
+        restarted; a thread that pings while doing nothing would answer "is
+        the process alive" with "yes" for a process that has stopped being
+        useful, and would retire that detector. Pings stay where they prove
+        something: the claim loop between claims, the beat thread around a
+        call that actually reached the server.
+        """
+        while True:
+            remaining = deadline.remaining()
+            if remaining <= 0:
+                logger.warning(
+                    "attempt %s: a whole visibility window has passed with no "
+                    "heartbeat the server accepted; the queue lease has "
+                    "lapsed (detected by the deadline watch, so the handler "
+                    "stops now rather than when the beat thread next answers)",
+                    work.attempt_id,
+                )
+                self._lose_queue_lease(queue_lease_lost, cancel)
+                return
+            # Sleeps to the deadline and no further, then re-reads it: a beat
+            # the server accepted in the meantime has moved it, and this wakes
+            # exactly to find that out. `beat_stop` is `_execute`'s "the
+            # handler is done", so an attempt that finishes normally cancels
+            # this wait instead of waiting the rest of its lease out.
+            if beat_stop.wait(remaining):
+                return
+
     def _heartbeat_loop(
         self,
         work: ClaimedWork,
+        deadline: "_LeaseDeadline",
         queue_lease_lost: threading.Event,
         cancel: threading.Event,
         beat_stop: threading.Event,
@@ -713,15 +892,15 @@ class WorkerDaemon:
         interval = beat_interval_seconds(
             self._config.visibility_seconds, sdnotify.watchdog_interval_seconds()
         )
-        # WHEN THE LEASE WE HOLD WAS LAST GRANTED, BY A CLOCK. `queue_claim`
-        # has just granted a window of `visibility_seconds`, and this loop
-        # starts immediately after it returned, so loop entry is a
-        # conservative stand-in for that grant: the real one is no later.
-        # Every renewal the SERVER accepts re-dates it, and the deadline test
-        # at the top of the loop is the only thing that reads it.
-        granted_at = self._monotonic()
         while True:
-            # HOW MUCH LEASE IS LEFT, AND THE ONLY PLACE IT IS DECIDED.
+            # HOW MUCH LEASE IS LEFT. The rule has ONE definition
+            # (`_LeaseDeadline`) and TWO readers, and this is the one that can
+            # be parked: `_lease_deadline_loop` is the other, and it exists
+            # because being parked here is what the deadline is for
+            # (monitor_finding #41237). The test is kept here as well because
+            # a loop that can prove its lease is gone must not go on sending
+            # beats for it -- and because this function must still be correct
+            # when it is the only thing running.
             #
             # IT USED TO BE A COUNT OF FAILED BEATS
             # (VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED). The test was
@@ -773,9 +952,7 @@ class WorkerDaemon:
             # Timing it from the send would give the lease up to a round trip
             # early, and an attempt taken away with time left on its lease
             # costs the whole run (migration 0029).
-            remaining = self._config.visibility_seconds - (
-                self._monotonic() - granted_at
-            )
+            remaining = deadline.remaining()
             if remaining <= 0:
                 logger.warning(
                     "attempt %s: a whole visibility window has passed with no "
@@ -801,16 +978,24 @@ class WorkerDaemon:
                 alive = self._store.heartbeat(work)
             except Exception:
                 # Errors are not refusals, and they are not a verdict either:
-                # the deadline test above owns that decision, and a blip
-                # inside the window costs nothing but this beat. Review found
-                # the interleaving the deadline closes: DB down through the
-                # lapse, recovered before the handler finished, result refused
-                # as stale with no trace.
+                # the deadline owns that decision, and a blip inside the
+                # window costs nothing but this beat. Review found the
+                # interleaving the deadline closes: DB down through the lapse,
+                # recovered before the handler finished, result refused as
+                # stale with no trace.
                 logger.exception("heartbeat error for attempt %s", work.attempt_id)
                 continue
-            # Only a beat the SERVER accepted moves the deadline, and `alive`
-            # is how `queue_heartbeat` says so.
-            granted_at = self._monotonic()
+            # The instant the answer arrived, captured before anything else
+            # this loop does, because that instant is the quantity: the server
+            # granted the renewal somewhere inside the round trip, so this is
+            # at or after the grant.
+            answered_at = self._monotonic()
+            # Only a beat the SERVER ACCEPTED moves the deadline, and `alive`
+            # is how `queue_heartbeat` says so. A refusal is an answer, but it
+            # is the answer "this attempt is not yours" -- re-dating the lease
+            # on it would push the deadline watch out past a lapse the server
+            # has just confirmed.
             if not alive:
                 self._lose_queue_lease(queue_lease_lost, cancel)
                 return
+            deadline.renew(answered_at)

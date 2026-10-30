@@ -20,6 +20,7 @@ from command_center.worker.daemon import (
     HandlerOutcome,
     WorkerConfig,
     WorkerDaemon,
+    _LeaseDeadline,
 )
 
 
@@ -1389,8 +1390,13 @@ def _beat_until_lost(
         original_set()
 
     cancel.set = record_and_set  # type: ignore[method-assign]
+    # The deadline the attempt was granted, on the same injected clock. It is
+    # `_execute`'s to own in production (both the beat thread and the deadline
+    # watch read it); here the beat loop is driven on its own, so the test
+    # constructs it and the loop is the only reader.
+    deadline = _LeaseDeadline(window, clock)
     daemon._heartbeat_loop(
-        _work({"kind": "slow"}), queue_lease_lost, cancel, _WaitForTheBeat()
+        _work({"kind": "slow"}), deadline, queue_lease_lost, cancel, _WaitForTheBeat()
     )
     assert queue_lease_lost.is_set(), (
         f"the loop never gave the lease up in {len(attempts)} beats "
@@ -1408,17 +1414,27 @@ def test_the_lease_is_given_up_within_its_window_however_slowly_a_beat_fails() -
     A fast failure was always handled: four cycles of `interval` are exactly
     one window at `beat_interval_seconds`. The black-holed call was not, and
     it is the one the tolerance is for.
+
+    THIS IS THE BEAT LOOP ON ITS OWN, and so is the weaker of the two bounds
+    the attempt actually has. `_execute` runs `_lease_deadline_loop` beside
+    it over the same `_LeaseDeadline`, which removes the `+ block` below
+    entirely (monitor_finding #41237); that is measured at the bottom of this
+    file, by the tests that run the pair. What is pinned here is the property
+    of this function alone -- that it fires on the CLOCK rather than on a
+    count of beats -- so a future change to either thread still has the
+    other's statement to fail against.
     """
     window = WorkerConfig().visibility_seconds
 
     for block in (0.0, 1.0, 10.0, 120.0, 900.0):
         lost_at, attempts = _beat_until_lost(window, block)
         # ONE WINDOW PLUS AT MOST THE ONE CALL THE LOOP WAS PARKED IN, which
-        # is the whole of what this thread can promise: while it is inside
-        # `store.heartbeat` it cannot act, and bounding that needs a deadline
-        # on the TRANSPORT (libpq `tcp_user_timeout` and friends) rather than
-        # on this loop. The point is that the bound is now the WINDOW plus one
-        # call instead of `TOLERATED_FAILED_BEATS + 2` of them.
+        # is the whole of what THIS THREAD can promise: while it is inside
+        # `store.heartbeat` it cannot act. The attempt's own bound is one
+        # window flat, and it is held by the thread that holds no connection;
+        # see `test_a_beat_parked_on_a_dead_socket_cannot_outlive_the_lease`.
+        # The point here is that the bound is the WINDOW plus one call instead
+        # of `TOLERATED_FAILED_BEATS + 2` of them.
         assert lost_at <= window + block, (
             f"a beat that hangs {block}s let the handler run "
             f"{lost_at - window:.0f}s past a {window}s lease, more than the "
@@ -1515,7 +1531,11 @@ def test_a_beat_the_server_accepted_moves_the_deadline() -> None:
         FlakyStore(), {}, WorkerConfig(visibility_seconds=window), monotonic=clock
     )
     daemon._heartbeat_loop(
-        _work({"kind": "slow"}), threading.Event(), cancel, _WaitForTheBeat()
+        _work({"kind": "slow"}),
+        _LeaseDeadline(window, clock),
+        threading.Event(),
+        cancel,
+        _WaitForTheBeat(),
     )
 
     # The successful beat landed at 2 * interval and renewed the lease there,
@@ -1525,4 +1545,202 @@ def test_a_beat_the_server_accepted_moves_the_deadline() -> None:
     assert lost_at and lost_at[0] >= accepted_at + window, (
         f"the lease was given up at {lost_at}s; the beat the server accepted "
         f"at {accepted_at}s renews it to {accepted_at + window}s"
+    )
+
+
+# ---------------------------------------------------------------------------
+# VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED (monitor_finding #41237).
+#
+# A DEADLINE IS ONLY AS GOOD AS THE THREAD THAT EVALUATES IT. #41136 replaced
+# the beat COUNT with a clock, and the clock is right; what it could not do is
+# be READ at the deadline, because the step before the top of the beat loop is
+# `store.heartbeat`. The failure the whole tolerance exists for is a beat that
+# never comes back -- the credential rotation restarts
+# `voyn-aicc-pgtunnel.service` on its own timer, a severed forwarded socket
+# BLACK-HOLES the call, `connect_timeout` bounds only connecting and
+# `statement_timeout` is enforced by a server that is no longer reachable --
+# so the one event the deadline is for was also the one event that postponed
+# it. The lapse arrived at `window + block`, with `block` unbounded, and the
+# previous fix stated that residual as its own ("one window plus the one call
+# it was parked in") and deferred it to a transport change.
+#
+# It is not a transport problem. The lapse is a statement about a CLOCK, and a
+# clock can be read somewhere the socket cannot reach: `_lease_deadline_loop`
+# runs beside the beat, shares its `_LeaseDeadline`, and touches no store.
+#
+# Every second of the overrun is a lane executing an item
+# `aicc-queue-reaper.timer` has already handed back: the fleet holds two
+# lanes' worth of work while `work_item` records one claim, `spare_capacity`
+# goes true against a fleet with no free lane, and `control-01:queue` opens
+# `queue_stalled` with no exit any fleet action reaches.
+# `tests/db/test_infra_monitor_queue_snapshot.py` measures that half against a
+# real server; these need none and so run in every gate.
+# ---------------------------------------------------------------------------
+
+
+def _execute_against_a_black_hole(
+    window: int, *, notifications: list[str] | None = None
+) -> tuple:
+    """Run the real `_execute` over one claim whose heartbeat parks on a dead
+    socket and stays there.
+
+    Returns ``(when the handler was released, when each beat was sent, the
+    event that finally lets the parked call answer, the store, the thread
+    `_execute` is running on)``. The caller must set the event and join the
+    thread.
+    """
+    import threading
+
+    started = time.monotonic()
+    released = threading.Event()
+    beats: list[float] = []
+    stopped_at: list[float] = []
+    handler_done = threading.Event()
+
+    class BlackHoledStore:
+        def __init__(self) -> None:
+            self.calls: list[tuple] = []
+
+        def heartbeat(self, work):
+            beats.append(time.monotonic() - started)
+            # Nothing client-side bounds this read, so the call is still
+            # outstanding long after the lease it was renewing has died.
+            released.wait(30)
+            raise ConnectionError("tunnel black-holed")
+
+        def complete(self, work, result):
+            self.calls.append(("complete", work.attempt_id, result))
+            return True
+
+        def fail(self, work, *, reason, retryable=True):
+            self.calls.append(("fail", work.attempt_id, reason, retryable))
+            return True
+
+        def fail_lease_wait(self, work, *, reason, max_lease_waits=20):
+            self.calls.append(("fail_lease_wait", work.attempt_id, reason))
+            return True
+
+    def slow(payload, lease_lost, attempt_no=1):
+        lease_lost.wait(window * 10)
+        stopped_at.append(time.monotonic() - started)
+        handler_done.set()
+        return HandlerOutcome(ok=True, result={"ok": True})
+
+    store = BlackHoledStore()
+    daemon = WorkerDaemon(
+        store, {"slow": slow}, WorkerConfig(visibility_seconds=window)
+    )
+    if notifications is not None:
+        daemon._notify = notifications.append  # type: ignore[method-assign]
+    run = threading.Thread(
+        target=daemon._execute, args=(_work({"kind": "slow"}),), daemon=True
+    )
+    run.start()
+    assert handler_done.wait(window * 6), (
+        f"the handler was never stopped at all; beats sent at {beats}"
+    )
+    return stopped_at[0], beats, released, store, run
+
+
+def test_a_beat_parked_on_a_dead_socket_cannot_outlive_the_lease() -> None:
+    """THE REGRESSION. The handler stops within the window the server
+    granted, measured while the beat thread is STILL inside the call that
+    stopped reaching the server.
+
+    Under the previous rule this run cancels when the parked call finally
+    answers -- a bound set by the fault rather than by the lease. Here the
+    call never answers at all inside the test, so any dependence on it shows
+    up as a timeout rather than as a tolerable overrun.
+    """
+    window = 2
+    stopped_at, beats, released, store, run = _execute_against_a_black_hole(window)
+    try:
+        # THE BEAT IS STILL PARKED. `released` is what lets that call return
+        # and the test has not set it, so whatever declared the lapse, it was
+        # not the beat loop coming back from `store.heartbeat`.
+        assert beats, "no beat was ever sent, so nothing was parked"
+        assert not released.is_set()
+        assert stopped_at <= window + 1.0, (
+            f"the lane ran {stopped_at - window:.1f}s past a {window}s lease "
+            f"while a beat sat in a black hole that has not answered yet "
+            f"(beats sent at {beats})"
+        )
+        # Not early either: an attempt taken away with time left on its lease
+        # costs the whole run (migration 0029).
+        assert stopped_at >= window - 0.05, (
+            f"the lease was given up at {stopped_at:.2f}s, ahead of its "
+            f"{window}s deadline"
+        )
+    finally:
+        released.set()
+        run.join(timeout=15)
+    # A lapse is the one loss that forbids the report: `_queue_owns` would
+    # refuse it, and writing after losing the lease is the lost update the
+    # protocol exists to prevent. The narrow fact has to have travelled with
+    # the cancellation, or `_execute` would have read this as a lost WRITER
+    # lease and sent `queue_fail`.
+    assert store.calls == [], (
+        "an outcome was written for an attempt whose queue lease had lapsed: "
+        f"{store.calls}"
+    )
+
+
+def test_the_lapse_is_bounded_by_the_lease_and_not_by_the_block() -> None:
+    """The defect stated as the arithmetic it was, so the fix cannot quietly
+    revert to it.
+
+    The old bound was `window + block`: the deadline was read at the top of
+    the beat loop, and the step before it was the blocked call. `block` has no
+    client-side bound -- `lease_client.run_lease` already allows a hung
+    subprocess 120s against the fleet's 300s window, and a black-holed socket
+    read is not bounded at all -- so the overrun grew with the fault rather
+    than with anything about the lease.
+
+    So the BLOCK is held fixed here, far longer than either lease, and the
+    WINDOW is varied. Under the old bound both runs end when the same parked
+    call answers, which is the same instant for both and tracks neither
+    window; under this one each ends at its own lease.
+    """
+    windows = (2, 3)
+    measured = []
+    for window in windows:
+        stopped_at, beats, released, _store, run = _execute_against_a_black_hole(
+            window
+        )
+        released.set()
+        run.join(timeout=15)
+        measured.append(stopped_at)
+        assert beats, f"no beat was sent at a {window}s window"
+    for window, stopped_at in zip(windows, measured, strict=True):
+        assert abs(stopped_at - window) <= 1.0, (
+            f"a {window}s lease was given up at {stopped_at:.2f}s; the lapse "
+            f"tracks the WINDOW, not the blocked call (measured {measured} "
+            f"for windows {windows})"
+        )
+
+
+def test_the_deadline_watch_does_not_feed_the_watchdog() -> None:
+    """It watches a clock and nothing else, and a thread that pings while
+    doing nothing would retire the wedge detector it pings into.
+
+    `aicc-worker.service` sizes `WatchdogSec` so that a handler that hangs AND
+    takes the beat thread with it misses ping after ping and is restarted. The
+    deadline watch is alive for exactly that run, so if it fed the watchdog it
+    would answer "is this process still useful" with "yes" for a process that
+    has stopped being so. Pings stay where they prove something: the claim
+    loop between claims, and the beat thread around a call that actually
+    reached the server.
+    """
+    window = 2
+    notifications: list[str] = []
+    _stopped_at, beats, released, _store, run = _execute_against_a_black_hole(
+        window, notifications=notifications
+    )
+    released.set()
+    run.join(timeout=15)
+    pings = [note for note in notifications if "WATCHDOG=1" in note]
+    assert len(pings) == len(beats), (
+        f"{len(pings)} watchdog pings for {len(beats)} beats: something other "
+        "than the beat thread is feeding the watchdog during a run whose "
+        "database has stopped answering"
     )
