@@ -15,6 +15,7 @@ condition clears.
 from __future__ import annotations
 
 import json
+from email.header import Header
 import os
 import sys
 import tempfile
@@ -75,7 +76,7 @@ def _load_state(path: Path) -> dict[str, Any]:
         if not isinstance(key, str) or not isinstance(entry, dict):
             continue
         cleaned[key] = entry
-    return {"open": cleaned}
+    return {"open": cleaned, "history": data.get("history", {}) if isinstance(data.get("history"), dict) else {}}
 
 
 def _atomic_write(path: Path, payload: dict[str, Any]) -> None:
@@ -103,6 +104,11 @@ def open_keys() -> frozenset[str]:
     return frozenset(_load_state(_state_path())["open"])
 
 
+def _header(value: str) -> str:
+    value = " ".join(value.splitlines())
+    return value if value.isascii() else Header(value, "utf-8").encode()
+
+
 def _post(
     *,
     title: str,
@@ -118,7 +124,7 @@ def _post(
         priority = "default"
     text = (message or "")[:_MESSAGE_LIMIT]
     headers = {
-        "Title": title[:250],
+        "Title": _header(title[:250]),
         "Priority": priority,
         "Content-Type": "text/plain; charset=utf-8",
     }
@@ -126,9 +132,9 @@ def _post(
     if token:
         headers["Authorization"] = f"Bearer {token}"
     if tags:
-        headers["Tags"] = ",".join(tag for tag in tags if tag)
+        headers["Tags"] = _header(",".join(tag for tag in tags if tag))
     if click_url:
-        headers["Click"] = click_url
+        headers["Click"] = _header(click_url)
     request = urllib.request.Request(
         url, data=text.encode("utf-8"), headers=headers, method="POST"
     )
@@ -162,13 +168,19 @@ def notify(
     state = _load_state(path)
     open_map: dict[str, Any] = state["open"]
     now = time.time()
-    existing = open_map.get(key)
+    history = state.setdefault("history", {})
+    existing = open_map.get(key) or history.get(key)
     if isinstance(existing, dict):
         try:
             last_sent = float(existing.get("last_sent") or 0.0)
         except (TypeError, ValueError):
             last_sent = 0.0
         if now - last_sent < _cooldown_seconds():
+            open_map[key] = existing
+            try:
+                _atomic_write(path, state)
+            except OSError:
+                pass
             return False
     if not _post(
         title=title,
@@ -179,8 +191,9 @@ def notify(
     ):
         return False
     open_map[key] = {"last_sent": now}
+    history[key] = {"last_sent": now}
     try:
-        _atomic_write(path, {"open": open_map})
+        _atomic_write(path, state)
     except OSError as exc:
         print(f"owner_notify: state write failed: {exc}", file=sys.stderr)
         # The phone already got the message; still report success.
@@ -210,7 +223,7 @@ def resolve(key: str, title: str, message: str) -> bool:
         return False
     open_map.pop(key, None)
     try:
-        _atomic_write(path, {"open": open_map})
+        _atomic_write(path, state)
     except OSError as exc:
         print(f"owner_notify: state write failed: {exc}", file=sys.stderr)
     return True

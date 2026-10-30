@@ -153,3 +153,32 @@ def test_non_http_scheme_is_not_a_channel(monkeypatch) -> None:
 
     monkeypatch.setenv("AICC_OWNER_NTFY_URL", "file:///etc/passwd")
     assert owner_notify.notify("k", "t", "m") is False
+
+
+def test_unicode_title_is_encoded_without_header_newlines(monkeypatch, tmp_path):
+    from email.header import decode_header, make_header
+    _configure(monkeypatch, tmp_path)
+    captured = {}
+    def send(request, timeout=0):
+        captured.update({k.title(): v for k, v in request.header_items()})
+        return _FakeResponse()
+    monkeypatch.setattr(owner_notify.urllib.request, "urlopen", send)
+    assert owner_notify.notify("unicode", "Авария — очередь\r\nпроверка", "body")
+    title = captured["Title"]
+    title.encode("ascii")
+    assert "\r" not in title and "\n" not in title
+    assert str(make_header(decode_header(title))) == "Авария — очередь проверка"
+
+
+def test_resolved_alert_reopens_without_flapping_push(monkeypatch, tmp_path):
+    _configure(monkeypatch, tmp_path)
+    sent = []
+    def send(request, timeout=0):
+        sent.append(request.data)
+        return _FakeResponse()
+    monkeypatch.setattr(owner_notify.urllib.request, "urlopen", send)
+    assert owner_notify.notify("flap", "alert", "bad")
+    assert owner_notify.resolve("flap", "clear", "good")
+    assert not owner_notify.notify("flap", "alert", "bad again")
+    assert "flap" in owner_notify.open_keys()
+    assert len(sent) == 2
