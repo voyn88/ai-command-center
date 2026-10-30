@@ -16,7 +16,14 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Protocol
 
-from command_center.db.config import load_config
+
+def load_config():
+    """Control-plane DB config, imported lazily like infra_monitor: importing
+    ``command_center.db`` pulls the AIOS DB adapter, which test collection
+    hosts (the CI manifest step) do not have installed."""
+    from command_center.db.config import load_config as _load_config
+
+    return _load_config()
 
 
 @dataclass(frozen=True, slots=True)
