@@ -777,15 +777,22 @@ def _run_agent(
         # return until the process group is either its own natural exit or
         # confirmed terminated (SIGTERM -> bounded grace -> SIGKILL, see
         # `agent_runner._terminate_process_group`) — so by the time this call
-        # returns, `daemon._execute`'s `lease_lost.is_set()` check (which
-        # discards the outcome without writing it back) is looking at an
-        # attempt whose subprocess is provably no longer running, not one
-        # still mutating state the daemon can no longer account for. This
-        # does not by itself change *when* the queue considers the attempt
-        # free for redelivery — that remains the lease's own
-        # visibility-window expiry / supersession in `work_queue_store`,
-        # unaffected by this change — it closes the narrower, previously-open
-        # gap that the OS process kept running regardless of that decision.
+        # returns, `daemon._execute`'s decision is being made about an attempt
+        # whose subprocess is provably no longer running, not one still
+        # mutating state the daemon can no longer account for.
+        #
+        # WHICH DECISION DEPENDS ON WHICH LEASE WENT, and this comment used to
+        # name only one of them ("the `lease_lost.is_set()` check, which
+        # discards the outcome without writing it back ... that remains the
+        # lease's own visibility-window expiry / supersession"). That is the
+        # QUEUE lease's answer. When the event was set by
+        # `writer_lease._renew_loop` instead, the queue lease is live and
+        # `_execute` now REPORTS this function's outcome, so the item returns
+        # to the queue immediately rather than sitting `claimed` for a whole
+        # visibility window under a lease nothing renews
+        # (VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED, monitor_finding #14016).
+        # What this event means to THIS function is unchanged either way:
+        # stop, and publish nothing.
         route_failovers: list[dict[str, Any]] = []
         while True:
             run = agent_runner.run_claude_code(
@@ -939,12 +946,18 @@ def _run_agent(
             # worktree itself is deliberately left in place (matching every
             # other "do not delete on an ambiguous outcome" branch below) so
             # a later attempt can inspect or reuse it.
-            # `daemon._execute` discards whatever `HandlerOutcome` is
-            # returned here (its own `lease_lost.is_set()` check, checked
-            # again after this handler returns) -- this early return is for
-            # this function's own legibility and to keep `publish_run` from
-            # ever running against a killed-mid-flight worktree, not to
-            # change what the daemon does with the result.
+            # THE RETURNED OUTCOME IS NOT ALWAYS DISCARDED, and this comment
+            # used to say it always was ("`daemon._execute` discards whatever
+            # `HandlerOutcome` is returned here ... not to change what the
+            # daemon does with the result"). It is discarded when the QUEUE
+            # lease went -- the write would be refused -- and REPORTED when
+            # this event came from `writer_lease._renew_loop`, because then
+            # the queue lease is live and `queue_fail` is accepted
+            # (VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED, monitor_finding
+            # #14016). So the `reason` and `retryable=True` below are load-
+            # bearing on that path rather than decoration, and the early
+            # return is still what keeps `publish_run` from ever running
+            # against a killed-mid-flight worktree.
             return HandlerOutcome(
                 ok=False,
                 reason="lease lost mid-execution; agent process group was forcibly terminated",

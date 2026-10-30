@@ -969,18 +969,27 @@ def _beat_through(store: WorkQueueStore, work: ClaimedWork, window: float):
     daemon = WorkerDaemon(
         store, {}, WorkerConfig(queue=QUEUE, visibility_seconds=int(window))
     )
-    lease_lost = threading.Event()
+    # Two events, as `_execute` passes them: the narrow "THIS queue attempt is
+    # gone", which is the only thing that may discard an outcome, and the
+    # cancellation the handler waits on. The beat loop is the only sender of
+    # the first, so it is the one this helper reports.
+    queue_lease_lost = threading.Event()
+    cancel = threading.Event()
     beat_stop = threading.Event()
     thread = threading.Thread(
         target=daemon._heartbeat_loop,
-        args=(work, lease_lost, beat_stop),
+        args=(work, queue_lease_lost, cancel, beat_stop),
         daemon=True,
     )
     thread.start()
-    lease_lost.wait(window + beat_interval_seconds(window) + 1.0)
+    cancel.wait(window + beat_interval_seconds(window) + 1.0)
     beat_stop.set()
     thread.join(timeout=5)
-    return lease_lost.is_set()
+    # `_lose_queue_lease` sets the narrow fact first, so a cancellation from
+    # this loop always carries it -- asserted here so the helper cannot stop
+    # measuring what it says it measures.
+    assert queue_lease_lost.is_set() == cancel.is_set()
+    return queue_lease_lost.is_set()
 
 
 #: Small enough that a test waits seconds rather than minutes, large enough
@@ -1077,3 +1086,132 @@ def test_a_blip_past_the_tolerance_still_hands_the_item_back(monitor) -> None:
     recovered = measure()
     assert recovered.claimed == 0
     assert recovered.lapsed_claims == 0
+
+
+def test_an_abandoned_attempt_under_a_live_lease_measures_as_an_attended_lane(
+    monitor,
+) -> None:
+    """THE REGRESSION (monitor_finding #14016), measured where it is visible:
+    a lane that gave up on a run without REPORTING it leaves behind a claim
+    this probe cannot tell from a lane doing its job.
+
+    `worker.handlers` hands the daemon's own cancellation event to
+    `writer_lease.hold`, so a failed REPOSITORY-writer-lease renewal used to
+    reach `daemon._execute`'s "lease lost -- outcome discarded" branch, which
+    was written for a lost QUEUE lease. The difference is this snapshot. A
+    lost queue lease means `visible_until` is already in the past, so the row
+    is a LAPSED claim and `aicc-queue-reaper.timer` owns it. A lost writer
+    lease leaves the queue lease exactly as the last beat left it -- a full
+    `visibility_seconds` in the FUTURE -- while the lane returns from
+    `_execute` and claims again.
+
+    What the measurement then reports is the state built below, and every
+    clause of it is wrong about the fleet:
+
+      * `attended_claims` counts the row, because `attended` IS
+        `state = 'claimed' AND work_attempt.state = 'active' AND
+        visible_until > now()` -- the definition of "a lane is holding this
+        and proving it alive". No lane is holding it.
+      * `claimed` counts it, and `claimed` is what `--claim-capacity` is
+        weighed against (monitor_finding #13366), so `spare_capacity` goes
+        false and `evaluate` excuses due ready work as backpressure behind a
+        busy fleet. Two abandonments on two lanes pin it false while both
+        lanes are free -- a fail-OPEN reading, which is the one direction a
+        fail-closed monitor must never have (see `_QUEUE_SNAPSHOT_SQL`'s note
+        on monitor_finding #2766).
+      * `lapsed_claim_age_seconds` -- the one clock weighed
+        unconditionally -- stays None for the whole window, so the
+        measurement that is supposed to catch an unattended item says there
+        is nothing to catch.
+
+    `daemon._execute` now reports a run the writer lease cancelled, so the
+    item is `ready` instead of this. The probe is unchanged and is the
+    instrument here, not the subject: it reports the truth about the row it
+    is given, and the row was a lie.
+    """
+    measure, app, worker, age = monitor
+    # Two lanes hold the fleet's two items; the surplus dispatched item waits.
+    claims = []
+    for key in ("lane-one", "lane-two"):
+        app.enqueue(QUEUE, idempotency_key=key, payload={"kind": "agent_run"})
+        claims.append(_claim(worker))
+    app.enqueue(QUEUE, idempotency_key="queued", payload={"kind": "agent_run"})
+    age(
+        "UPDATE work_item SET updated_at = now() - interval '40 minutes', "
+        "available_at = now() - interval '40 minutes' WHERE state = 'ready'"
+    )
+    age("UPDATE work_attempt SET created_at = now() - interval '40 minutes'")
+
+    # Lane two's writer lease fails to renew. Its QUEUE lease is untouched and
+    # was last renewed a moment ago, which is what the real beat loop leaves
+    # behind: `_execute` sets `beat_stop` and returns, so nothing renews it
+    # again and nothing reports the outcome either.
+    assert worker.heartbeat(claims[1]) is True
+
+    abandoned = measure()
+    # Nothing is lapsed, so the unconditional clock has nothing to measure.
+    assert abandoned.lapsed_claims == 0
+    assert abandoned.lapsed_claim_age_seconds is None
+    # And the abandoned row is counted as a lane doing its job.
+    assert abandoned.claimed == 2
+    assert abandoned.attended_claims == 2
+    assert abandoned.ready_due == 1
+    assert abandoned.ready_due_age_seconds > MAX_STALLED
+
+    report = infra_monitor.evaluate(
+        {}, abandoned, minimum_active_workers=0, max_stalled_seconds=MAX_STALLED,
+        prometheus_ready=True, claim_capacity=2,
+    )
+    # Green, on a fleet where one of two lanes is free and a due item has
+    # been waiting forty minutes. That is the cost of the discarded report.
+    assert report.ok, report.failures
+
+    # AND NO CLOCK IN THE PROBE CAN EVER SEE IT, which is what makes the
+    # discarded report worse than a slow one. The lapsed clock is None; the
+    # due-ready clock is excused by the phantom occupancy; and the FLEET clock
+    # is frozen too, because `fleet_idle_seconds` moves only when an attempt
+    # is created or leaves 'active' -- and the abandoned attempt did neither.
+    # Forty minutes of a free lane ignoring due work, and all three of the
+    # measurement's clocks say the fleet is fine.
+    assert abandoned.fleet_idle_seconds > MAX_STALLED
+
+    # WHAT THE FIX PRODUCES INSTEAD, through the same protocol: the outcome is
+    # reported while the lease is live, so `queue_fail` is ACCEPTED -- which is
+    # the whole claim. One call, and both of the things the probe was lied to
+    # about become true at once.
+    assert worker.fail(claims[1], reason="writer lease renewal failed",
+                       retryable=True) is True
+
+    reported = measure()
+    # Occupancy is honest: one lane holds an item, one is free.
+    assert reported.claimed == 1
+    assert reported.attended_claims == 1
+    # And the fleet clock has moved, because the fleet really did give an item
+    # back. The probe is green here HONESTLY -- a fleet that handed work back a
+    # second ago is serving this queue (monitor_finding #2471) -- where before
+    # it was green on the strength of a lane that had stopped working.
+    assert reported.fleet_idle_seconds < MAX_STALLED
+    after = infra_monitor.evaluate(
+        {}, reported, minimum_active_workers=0, max_stalled_seconds=MAX_STALLED,
+        prometheus_ready=True, claim_capacity=2,
+    )
+    assert after.ok, after.failures
+
+    # THE FAIL-CLOSED HALF, and the point of the whole fix: the reported state
+    # is one the probe CAN read. Let the fleet stand still from here -- the
+    # free lane claims nothing for a whole stall window -- and `queue_stalled`
+    # fires. From the abandoned state above it never could, because occupancy
+    # stayed full until the lease lapsed and the fleet clock never restarted.
+    age("UPDATE work_attempt SET created_at = now() - interval '40 minutes', "
+        "updated_at = now() - interval '40 minutes' WHERE state = 'failed'")
+    standing_still = measure()
+    assert standing_still.claimed == 1
+    assert standing_still.fleet_idle_seconds > MAX_STALLED
+    stalled = infra_monitor.evaluate(
+        {}, standing_still, minimum_active_workers=0,
+        max_stalled_seconds=MAX_STALLED, prometheus_ready=True, claim_capacity=2,
+    )
+    assert "queue_stalled" in stalled.failures, (
+        "with occupancy told honestly the probe can finally report the free "
+        "lane that has been ignoring due work"
+    )

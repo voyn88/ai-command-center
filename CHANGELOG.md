@@ -8,6 +8,151 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Fixed — one event carried two different lease losses, and the daemon read both as "do not report" (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
+- `control-01:queue` carried `queue_stalled` as `monitor_finding` #14016. TWO
+  LEASES COVER ONE ATTEMPT: the queue's visibility lease, renewed by
+  `WorkerDaemon._heartbeat_loop`, and the repository writer lease that
+  `worker.handlers` holds through provisioning, the agent run and
+  `publish_run`. Either going must stop the handler, so the writer lease was
+  deliberately given the daemon's own cancellation event — "a renewal failure
+  sets the SAME `lease_lost` event this function already wires into
+  `run_claude_code` as `cancel_event`", by that call site's own comment.
+
+  Sharing the CANCELLATION channel was right. Sharing it with the daemon's
+  **do not report** decision was not, and `writer_lease.py`'s module docstring
+  stated the conflation as though it were a design: "`daemon._execute` already
+  discards any outcome once `lease_lost` is set, so a lease lost to this cause
+  is handled exactly like one lost to the other." The two losses have opposite
+  consequences for the queue:
+
+      QUEUE lease lapsed   `_queue_owns` refuses the write, and must
+                           (`claim_expired`/`attempt_superseded`). The item is
+                           already the reaper's to recover.
+      WRITER lease lost    the queue lease is LIVE and renewing. `queue_fail`
+                           would be ACCEPTED. Discarding the outcome leaves the
+                           item `claimed` under a lease nothing renews.
+
+  **And that second state is the fail-OPEN reading a fail-closed monitor must
+  never have** — the direction #2766 named explicitly. While the abandoned
+  lease is still in the future the probe classifies the row as an ATTENDED
+  claim: `work_item.state = 'claimed'` with `work_attempt.state = 'active'`
+  and `visible_until > now()` is the measurement's own definition of "a lane
+  doing its job", and `_execute` has already returned to claiming. MEASURED
+  against a real PostgreSQL 16 server through `queue_claim`/`queue_heartbeat`
+  and the production snapshot statement — two lanes, the surplus dispatched
+  item due for forty minutes behind them, lane two's writer lease gone:
+
+      claimed=2  attended=2  lapsed=0  lapse_age=None
+      ready_due=1  due_age=2400  fleet_idle=2400   -> ok
+
+  Every clock the probe owns is blind to it at once. `lapsed_claim_age_seconds`
+  — the one weighed unconditionally and unbounded by the fleet clock — is
+  `None`, because the lease has not lapsed yet. The due-ready clock is excused
+  by the phantom occupancy, because `queue.claimed` is what `--claim-capacity`
+  is weighed against (#13366) and a lane that stopped working still fills it.
+  And `fleet_idle_seconds` is frozen too, because it moves only when an
+  attempt is created or leaves `active` and the abandoned attempt did neither.
+  Two such abandonments pin a two-lane fleet "full" while both lanes are free.
+
+  The rest of the cost is 0029's catalogue for a lease taken away at the finish
+  line, for the same reason: the run is lost although its outcome was DECIDED
+  and writable, the handler's side effects re-run under the next delivery, and
+  `queue_claim` has already charged `attempt_count` — so on the default
+  `max_attempts` of 3 the third blip dead-letters healthy work as
+  `visibility_timeout_exhausted`.
+
+  **It is a blip the fleet meets on a schedule it runs itself**, the same one
+  `TOLERATED_FAILED_BEATS` exists for: `voyn-lease` reaches its authority over
+  `/etc/aicc/lease.env`'s DSN and the credential rotation restarts that tunnel
+  on its own timer. The beat loop survives two of them; `_renew_loop` gives up
+  on the first, and the whole attempt used to pay for it.
+
+  **The fix: separate the two decisions, not the two cancellations.**
+  `_execute` now owns `queue_lease_lost` — set only by the beat loop, through
+  `_lose_queue_lease`, which sets it BEFORE the handler's `cancel` so the
+  handler can never be released before the daemon can tell which lease went —
+  and discards an outcome on that event alone. A run the writer lease cancelled
+  is REPORTED, which is what returns the item to the queue at once instead of
+  after a whole visibility window of occupancy that is not real. One `queue_fail`
+  makes both of the things the probe was lied to about true together: occupancy
+  becomes honest, and the fleet clock moves because the fleet really did give
+  an item back.
+
+  One place fails closed over the handler's own verdict, and only one: a
+  cancelled run reporting `ok` is reported as a retryable FAILURE instead.
+  `worker.handlers` already returns a retryable failure on that path, but
+  `queue_complete` is terminal and carries a result, and a cancelled agent's
+  workspace is whatever a forcibly terminated process left behind — a daemon
+  must not take a handler's word for that write.
+
+### Fixed — the lease tool is a subprocess, and three sites read only its exit code (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
+- `lease_client.run_lease` is `subprocess.run(..., timeout=120)` and does not
+  catch its own `TimeoutExpired`, so a `voyn-lease` that HANGS — the ordinary
+  shape of an unreachable authority, since it is reached over the DSN whose
+  tunnel the credential rotation restarts — raised straight through code
+  written as if the tool had always answered. A missing or unexecutable binary
+  (`OSError`) takes the same path.
+
+  **`writer_lease._renew_loop` is a thread target**, so the exception ended the
+  thread and nothing anywhere observed it: `lease_lost` was never set, so the
+  agent kept running; nothing renewed the lease again, so the row expired
+  server-side at `ttl` with this process still holding it — and `lease_argv`'s
+  own comment records what that costs the next claimant ("every later acquire
+  for that repository refused forever with `VOYN_LEASE_REFUSED expired requires
+  dead-process confirmation`", which `--auto-takeover` cannot clear while the
+  holder is alive); and the module's whole promise — a lease held "through
+  provisioning, the agent run ... and `publish_run`" — quietly stopped being
+  true for the rest of a run that may last `request.timeout_seconds`, with no
+  log line. It now fails closed as the failed renewal it is. Whether this loop
+  should absorb a transient blip the way the beat loop does is still the open
+  question stated above `_RENEW_FRACTION`; failing closed needs no new
+  measurement, and costs an attempt far less now that `_execute` reports a run
+  this lease cancelled instead of discarding it.
+
+  **`writer_lease._release` is documented best-effort** — "a release that fails
+  (authority unreachable, lease already expired server-side) leaves nothing
+  worse than the lease's own TTL expiry" — and ignoring the `CompletedProcess`
+  made it best-effort against a REFUSAL only. The first failure that comment
+  names does not arrive that way. `_release` runs from `_Handle.__exit__`, which
+  is the `ExitStack` `worker.handlers` closes in its own `finally`, so the
+  raise escaped INTO the handler's exit path and replaced whatever it had
+  already decided — **including a run that had finished and PUBLISHED**.
+  `_dispatch` catches it and returns a retryable failure, so `queue_fail`
+  requeues finished work, the next delivery re-runs the whole attempt (`git
+  push` and PR creation included) and `queue_claim` charges another attempt for
+  it. A release is cleanup of a lease whose lifecycle has already ended; it
+  cannot be allowed to decide the outcome of the work it was protecting. Found
+  by the renewal test above, not by inspection.
+
+### Verified — the branch's real-server proofs, actually run (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
+- Every previous session on this branch recorded that `tests/db` SKIPS without
+  PostgreSQL credentials, so the real-server halves of this branch stood on a
+  checkpoint's reported measurement. A local PostgreSQL 16 cluster was
+  available this session, so they were run: `tests/db` is **1001 passed, 44
+  skipped**, with 6 failures that are this sandbox and not this branch (no
+  `fastapi`, and the enrolment/`pg_hba` and `pg_dump` round-trip drills).
+  `tests/db/test_infra_monitor_queue_snapshot.py` — including the two tests
+  #14016's checkpoint added and could not run — is 21 passed.
+- Two of those tests drove `_heartbeat_loop` directly and so had to follow the
+  event split above; `_beat_through` now passes both events and asserts that a
+  cancellation from the beat loop always carries the narrow fact, so the helper
+  cannot stop measuring what it says it measures.
+- The probe itself was additionally exercised end to end against that server —
+  two real `WorkerDaemon` lanes, the real `WorkQueueAdmin.reap`, the real
+  snapshot statement, at the deployed ratios (`V`, `3V` stall window, `V/5`
+  reaper, `0.4V` probe) and under injected lane restarts, killed reaper ticks,
+  heartbeat bursts and duplicate enqueues of in-flight keys. 108 probe samples
+  across two runs, no `queue_stalled`, and the queue drained in both. That
+  harness was exploratory and is not committed; what it established is that the
+  measurement does not produce this finding on its own, which is why the fix
+  above is in the fleet and not in `evaluate`.
+- Stale restatements corrected where this change falsified them, which is the
+  same discipline the beat-cadence fix applied to its own: `writer_lease.py`'s
+  module docstring ("handled exactly like one lost to the other"), and two in
+  `worker/handlers.py` that told the reader the daemon discards whatever this
+  path returns.
+
+
 ### Fixed — the lease had no renewal margin, so the fleet manufactured its own lapses (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
 - `control-01:queue` reported `queue_stalled` again (`monitor_finding` #13420).
   The three commits before this one taught the MEASUREMENT to read a fleet

@@ -1145,3 +1145,144 @@ def test_a_blip_of_the_tolerated_length_does_not_stop_the_work() -> None:
     assert any(call[0] == "complete" for call in store.calls), (
         "the attempt was thrown away by a blip it was sized to survive"
     )
+
+
+# ---------------------------------------------------------------------------
+# VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED (monitor_finding #14016).
+#
+# TWO LEASES COVER ONE ATTEMPT and only one of them forbids the report. The
+# queue's visibility lease is this daemon's; the repository WRITER lease is
+# held by `worker.handlers` through `writer_lease.hold(repository, lease_cfg,
+# lease_lost)` -- handed THIS loop's event on purpose, so that one cancellation
+# path serves both ("a renewal failure sets the SAME `lease_lost` event this
+# function already wires into `run_claude_code` as `cancel_event`").
+#
+# Sharing the cancellation channel is right. Sharing it with "do not report"
+# was not: `_execute` read any set event as "the database already gave this
+# attempt to someone else", which is true of exactly one of the two senders.
+# ---------------------------------------------------------------------------
+
+
+def test_a_run_cancelled_by_the_writer_lease_is_reported_not_discarded() -> None:
+    """THE REGRESSION. The writer lease goes; the queue lease is live and
+    renewing. `queue_fail` would be ACCEPTED, so it must be sent.
+
+    Discarding it instead left the item `claimed` under a lease nothing renews
+    any more -- and `visible_until` is still in the FUTURE, so for the rest of
+    that window `control-01:queue` reads the row as an ATTENDED claim (the
+    measurement's own words for "a lane doing its job") while `_execute` has
+    returned and the loop has gone back to claiming. That inflates
+    `queue.claimed`, which is what `--claim-capacity` is weighed against
+    (monitor_finding #13366), so `evaluate` excuses due ready work as
+    backpressure behind occupancy that does not exist -- the fail-OPEN
+    direction a fail-closed monitor must never have.
+
+    The blip is one the fleet runs itself: `voyn-lease` reaches its authority
+    over `/etc/aicc/lease.env`'s DSN, the credential rotation restarts that
+    tunnel on its own timer, and `writer_lease._renew_loop` gives up on the
+    FIRST failed renewal where the beat loop survives
+    `TOLERATED_FAILED_BEATS`.
+    """
+    store = ScriptedStore([_work({"kind": "slow"})])
+    store.heartbeat_alive = True  # the QUEUE lease is healthy throughout
+
+    def slow(payload, lease_lost, attempt_no=1):
+        # What `writer_lease._renew_loop` does on a failed renewal: set the
+        # event the handler was handed, which cancels the agent.
+        lease_lost.set()
+        return HandlerOutcome(
+            ok=False, reason="writer lease renewal failed", retryable=True
+        )
+
+    daemon = WorkerDaemon(store, {"slow": slow}, WorkerConfig(visibility_seconds=3))
+    _run_until_idle(daemon, store)
+
+    failures = [call for call in store.calls if call[0] == "fail"]
+    assert failures == [("fail", "wat-1", "writer lease renewal failed", True)], (
+        "a decided, writable outcome was discarded; the item stays `claimed` "
+        f"for a whole visibility window: {store.calls}"
+    )
+    # And no heartbeat ever said the queue lease was gone, which is the whole
+    # point -- nothing about THIS lease changed.
+    assert store.heartbeat_alive is True
+
+
+def test_a_cancelled_run_is_never_completed_even_if_the_handler_says_so() -> None:
+    """Fail closed over the handler's own verdict, and only here.
+
+    Reporting a cancelled run is correct; reporting it as SUCCESS is not. A
+    cancelled agent's workspace is whatever a forcibly terminated process left
+    behind, and `queue_complete` is terminal and carries a result. The daemon
+    must not take a handler's word for that write -- `worker.handlers` already
+    returns a retryable failure on this path, and a handler that honours
+    `lease_lost` by returning anyway must not be able to ack the item.
+    """
+    store = ScriptedStore([_work({"kind": "slow"})])
+
+    def slow(payload, lease_lost, attempt_no=1):
+        lease_lost.set()
+        return HandlerOutcome(ok=True, result={"published": "maybe"})
+
+    daemon = WorkerDaemon(store, {"slow": slow}, WorkerConfig(visibility_seconds=3))
+    _run_until_idle(daemon, store)
+
+    assert not any(call[0] == "complete" for call in store.calls), store.calls
+    failures = [call for call in store.calls if call[0] == "fail"]
+    assert len(failures) == 1, store.calls
+    assert failures[0][3] is True, "a cancelled run must come back for retry"
+    assert "after the handler reported success" in failures[0][2]
+
+
+def test_a_lost_queue_lease_is_recorded_before_the_handler_is_released() -> None:
+    """The ordering the distinction rests on, pinned where it lives.
+
+    `_execute` tells the two senders apart by reading a SECOND event that only
+    the beat loop sets. `cancel` is what the handler waits on, so the moment
+    it is set the handler may return and `_execute` may read that second
+    event -- which must therefore already be true, or a lost QUEUE lease
+    would be mistaken for a lost writer lease and reported anyway, which is
+    the lost update the protocol exists to prevent.
+
+    `WorkerDaemon._lose_queue_lease` is that ordering and nothing else, so
+    this asserts it directly rather than racing two threads for it.
+    """
+    import threading
+
+    order: list[str] = []
+    queue_lease_lost = threading.Event()
+
+    class RecordingCancel(threading.Event):
+        def set(self) -> None:
+            # What the handler would see at the instant it is released.
+            order.append("queue_lease_lost" if queue_lease_lost.is_set() else "cancel")
+            super().set()
+
+    WorkerDaemon._lose_queue_lease(queue_lease_lost, RecordingCancel())
+
+    assert order == ["queue_lease_lost"], (
+        "the handler can be released before the daemon knows which lease went"
+    )
+    assert queue_lease_lost.is_set()
+
+
+def test_a_lost_queue_lease_still_discards_the_outcome() -> None:
+    """The half that must not change, restated against the new split: when the
+    BEAT LOOP is the one that gives up, the attempt is already somebody else's
+    (or the reaper's) and `_queue_owns` would refuse the write. Nothing is
+    reported -- not even the retryable failure a writer-lease cancellation now
+    gets."""
+    store = ScriptedStore([_work({"kind": "slow"})])
+    store.heartbeat_alive = False  # the first beat discovers the lease is gone
+
+    def slow(payload, lease_lost, attempt_no=1):
+        assert lease_lost.wait(timeout=10), "heartbeat never signalled loss"
+        return HandlerOutcome(
+            ok=False, reason="stopped on a lost lease", retryable=True
+        )
+
+    daemon = WorkerDaemon(store, {"slow": slow}, WorkerConfig(visibility_seconds=3))
+    _run_until_idle(daemon, store)
+
+    assert not any(call[0] == "complete" for call in store.calls), store.calls
+    assert not any(call[0] == "fail" for call in store.calls), store.calls
+    assert not any(call[0] == "fail_lease_wait" for call in store.calls), store.calls

@@ -14,6 +14,14 @@ Design decisions, each traceable to the shipped substrate:
   ``TOLERATED_FAILED_BEATS`` consecutive failures (see
   ``beat_interval_seconds``) and raises a stop flag the moment the database
   says ``attempt_superseded``.
+* **Cancelling the handler and refusing to report are different decisions.**
+  Two leases cover one attempt — this queue lease, and the repository writer
+  lease ``worker.handlers`` holds through the run — and either one going must
+  stop the handler. Only the QUEUE one makes the outcome unwritable, so
+  ``_execute`` keeps them on separate events and discards an outcome for that
+  reason alone; a run cancelled by the writer lease is still reported, which
+  is what returns the item to the queue instead of leaving it ``claimed``
+  under a lease nothing renews (VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED).
 * **Shutdown finishes the item in hand.** SIGTERM stops *claiming*; the
   current attempt runs to completion inside systemd's stop timeout. A second
   signal — or the timeout's SIGKILL — abandons it, and the lease expiry plus
@@ -158,12 +166,23 @@ class HandlerOutcome:
 
 class Handler(Protocol):
     """One payload executor. It receives the payload, a ``lease_lost`` event
-    it must honour (when set, the lease is gone and any further effect the
+    it must honour (when set, one of its leases is gone and any further effect the
     handler produces is unaccountable), and ``attempt_no`` — the queue's own
     delivery count for this item. The attempt number is an explicit
     parameter rather than a smuggled payload key because it is DELIVERY
     metadata: the executor-cascade (BO-S2a) selects its link from it, and a
-    contract a handler can see is one a test can pin."""
+    contract a handler can see is one a test can pin.
+
+    ``lease_lost`` IS A CANCELLATION SIGNAL AND NOT A STATEMENT ABOUT WHICH
+    lease went, deliberately: ``worker.handlers`` passes this same event into
+    ``writer_lease.hold`` so a lost repository writer lease cancels the agent
+    through one path rather than two. Whichever lease it was, the handler's
+    duty is identical -- stop, and return a retryable failure. Which lease it
+    was decides something else entirely, and it is the DAEMON's to decide:
+    only a lost QUEUE lease makes the outcome unwritable (see ``_execute``).
+    A handler must therefore not read this event as "the queue will redeliver
+    me anyway"; the daemon reports what the handler returns whenever the
+    queue lease is still live."""
 
     def __call__(
         self,
@@ -455,28 +474,124 @@ class WorkerDaemon:
         self._notify("STOPPING=1")
 
     def _execute(self, work: ClaimedWork) -> None:
-        lease_lost = threading.Event()
+        # TWO EVENTS, BECAUSE TWO DIFFERENT LEASES CAN BE LOST AND ONLY ONE OF
+        # THEM FORBIDS THE REPORT (VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED,
+        # monitor_finding #14016).
+        #
+        # `cancel` is what the HANDLER is handed: "stop, any further effect you
+        # produce is unaccountable". `queue_lease_lost` is the narrower fact
+        # that THIS queue attempt is no longer ours, and it is the only one
+        # that may discard an outcome -- see the branch below.
+        #
+        # They used to be one event, and the handler is the second thing that
+        # sets it. `worker.handlers` passes the daemon's event straight into
+        # `writer_lease.hold(repository, lease_cfg, lease_lost)`, whose renewal
+        # thread sets it when the REPOSITORY WRITER lease is lost -- "a renewal
+        # failure sets the SAME `lease_lost` event this function already wires
+        # into `run_claude_code` as `cancel_event`", by that call site's own
+        # comment, and deliberately so: one cancellation path, not two.
+        #
+        # Sharing the CANCELLATION channel was right. Sharing it with the
+        # daemon's "do not write" decision was not, because the two losses have
+        # opposite consequences for the queue:
+        #
+        #   * the QUEUE lease lapsed -> `_queue_owns` refuses the write, and
+        #     must (`claim_expired`/`attempt_superseded`); the item is already
+        #     the reaper's to recover.
+        #   * the WRITER lease was lost -> the queue lease is LIVE and
+        #     renewing. `queue_fail` would be ACCEPTED. Discarding the outcome
+        #     instead leaves the item `claimed` under a lease nothing is
+        #     renewing any more, for the rest of its visibility window.
+        #
+        # AND THAT SECOND STATE IS A FAIL-OPEN READING ON A FAIL-CLOSED
+        # MONITOR, which is the one direction `control-01:queue` must never
+        # have. While the abandoned lease is still in the future the probe
+        # classifies the row as an ATTENDED claim -- `work_item.state =
+        # 'claimed'` with `work_attempt.state = 'active'` and `visible_until >
+        # now()`, which is the measurement's own definition of "a lane doing
+        # its job" -- when no lane is holding it at all: `_execute` has
+        # returned and the loop has gone back to claiming. So `queue.claimed`
+        # counts a lane that is free, and `queue.claimed` is exactly what
+        # `--claim-capacity` is weighed against (#13366), so
+        # `spare_capacity` goes false and `evaluate` excuses due ready work as
+        # backpressure behind occupancy that does not exist. Two such
+        # abandonments on a two-lane fleet pin it false while both lanes are
+        # free.
+        #
+        # The rest of the cost is the same one 0029 catalogued for a lease the
+        # reaper expired early, and for the same reason -- an attempt taken
+        # away at the finish line: the run is lost although its outcome was
+        # DECIDED and writable, the handler's side effects re-run under the
+        # next delivery, and `queue_claim` has already charged `attempt_count`
+        # for it, so on the default `max_attempts` of 3 the third such blip
+        # dead-letters healthy work as `visibility_timeout_exhausted`.
+        #
+        # IT IS A BLIP THE FLEET MEETS ON A SCHEDULE IT RUNS ITSELF, the same
+        # one `TOLERATED_FAILED_BEATS` exists for: `voyn-lease` reaches its
+        # authority over a DSN (`/etc/aicc/lease.env`), the credential rotation
+        # restarts the tunnel on its own timer, and `writer_lease._renew_loop`
+        # has no tolerance at all -- it gives up on the FIRST failed renewal
+        # (that loop's own comment says so). The beat loop survives two; the
+        # writer lease survives none, and before this change the whole attempt
+        # paid for it.
+        queue_lease_lost = threading.Event()
+        cancel = threading.Event()
         beat_stop = threading.Event()
         beat = threading.Thread(
             target=self._heartbeat_loop,
-            args=(work, lease_lost, beat_stop),
+            args=(work, queue_lease_lost, cancel, beat_stop),
             name=f"heartbeat-{work.attempt_id}",
             daemon=True,
         )
         beat.start()
         try:
-            outcome = self._dispatch(work, lease_lost)
+            outcome = self._dispatch(work, cancel)
         finally:
             beat_stop.set()
             beat.join(timeout=5)
 
-        if lease_lost.is_set():
+        if cancel.is_set() and not queue_lease_lost.is_set():
+            # The writer lease went, the queue lease did not. Report, so the
+            # item returns to the queue NOW instead of after a whole
+            # visibility window of phantom occupancy.
+            logger.warning(
+                "attempt %s: cancelled with the queue lease still live (a lost "
+                "writer lease); reporting the outcome so the item returns to "
+                "the queue instead of waiting out its visibility window",
+                work.attempt_id,
+            )
+            if outcome.ok:
+                # FAIL CLOSED over the handler's own verdict, and only here.
+                # A cancelled run's workspace is whatever a forcibly
+                # terminated agent left behind, so `queue_complete` -- which
+                # is terminal and carries a result -- must not be written from
+                # it. `worker.handlers` already returns a retryable failure on
+                # this path; this covers a handler that honoured `cancel` by
+                # returning anyway, because a daemon must not take a
+                # handler's word for a terminal write.
+                outcome = HandlerOutcome(
+                    ok=False,
+                    reason=(
+                        "cancelled by a lost writer lease after the handler "
+                        f"reported success: {outcome.reason}"
+                    ).strip(),
+                    retryable=True,
+                )
+
+        if queue_lease_lost.is_set():
             # The database already gave this attempt to someone else (or will,
             # at reap). Reporting anything would be refused as a stale owner —
             # and must be: writing a result after losing the lease is exactly
             # the lost-update this protocol exists to prevent.
+            #
+            # THIS queue lease, and no other lease: the condition is
+            # `queue_lease_lost` rather than the handler's `cancel` because
+            # only the beat loop can establish that the write is doomed. A
+            # writer-lease cancellation leaves the queue lease live and the
+            # report acceptable, and discarding it there is the phantom
+            # attended claim this function's opening comment measures.
             logger.warning(
-                "attempt %s: lease lost mid-execution; outcome discarded",
+                "attempt %s: queue lease lost mid-execution; outcome discarded",
                 work.attempt_id,
             )
             return
@@ -549,10 +664,27 @@ class WorkerDaemon:
             logger.exception("handler for %r raised", kind)
             return HandlerOutcome(ok=False, reason=repr(error), retryable=True)
 
+    @staticmethod
+    def _lose_queue_lease(
+        queue_lease_lost: threading.Event, cancel: threading.Event
+    ) -> None:
+        """Record that THIS queue attempt is gone, then stop the handler.
+
+        The order is load-bearing and is why this is one function rather than
+        two calls at each site. ``cancel`` is what the handler waits on, so
+        the moment it is set the handler may return and ``_execute`` may read
+        ``queue_lease_lost`` -- which must therefore already be true, or
+        ``_execute`` would mistake a lost QUEUE lease for a lost WRITER lease
+        and write a report the database is bound to refuse.
+        """
+        queue_lease_lost.set()
+        cancel.set()
+
     def _heartbeat_loop(
         self,
         work: ClaimedWork,
-        lease_lost: threading.Event,
+        queue_lease_lost: threading.Event,
+        cancel: threading.Event,
         beat_stop: threading.Event,
     ) -> None:
         # The renewal cadence, derived from the tolerance rather than guessed
@@ -584,10 +716,10 @@ class WorkerDaemon:
                 # DB down through the lapse, recovered before the handler
                 # finished, result refused as stale with no trace.
                 if consecutive_errors * interval >= self._config.visibility_seconds:
-                    lease_lost.set()
+                    self._lose_queue_lease(queue_lease_lost, cancel)
                     return
                 continue
             consecutive_errors = 0
             if not alive:
-                lease_lost.set()
+                self._lose_queue_lease(queue_lease_lost, cancel)
                 return

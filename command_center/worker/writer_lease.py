@@ -50,9 +50,20 @@ the row expired -- sets the *same* `lease_lost` threading.Event the caller
 already wires into `agent_runner.run_claude_code` as `cancel_event`
 (VOYN-W0-AICC-FORCED-AGENT-CANCELLATION, #349). There is deliberately no new
 cancellation path: a lost writer lease forcibly terminates the running agent
-through the identical mechanism a lost queue-visibility lease already uses,
-and `daemon._execute` already discards any outcome once `lease_lost` is set,
-so a lease lost to this cause is handled exactly like one lost to the other.
+through the identical mechanism a lost queue-visibility lease already uses.
+
+THE TWO LEASES ARE NOT INTERCHANGEABLE PAST THAT POINT, and this paragraph
+used to say they were: "`daemon._execute` already discards any outcome once
+`lease_lost` is set, so a lease lost to this cause is handled exactly like
+one lost to the other". It is no longer true and should never have been
+(VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED, monitor_finding #14016). Discarding
+an outcome is correct only when the QUEUE lease went, because only then is the
+write refused. When THIS lease goes the queue lease is live and renewing, so
+`queue_fail` is accepted -- and discarding it instead left the item `claimed`
+under a lease nothing renews, which `control-01:queue` reads for the rest of
+that window as an ATTENDED claim held by a lane that has already moved on.
+`_execute` now keeps the two on separate events and reports a run this lease
+cancelled; see its own comment for what the phantom occupancy cost the probe.
 """
 
 from __future__ import annotations
@@ -148,7 +159,34 @@ def _release(repo_path: Path, cfg: WriterLeaseConfig) -> None:
     # already expired server-side) leaves nothing worse than the lease's own
     # TTL expiry would already produce, and there is no caller left to
     # report the failure to once the lifecycle this lease covers has ended.
-    lease_client.run_lease(lease_client.lease_argv(identity, "release", repo_path), repo_path)
+    #
+    # AND IT HAS TO BE BEST-EFFORT FOR A RAISE TOO, NOT ONLY FOR A NON-ZERO
+    # EXIT (VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED). Ignoring the
+    # `CompletedProcess` made this best-effort against a REFUSAL; the first
+    # failure the comment above names -- "authority unreachable" -- does not
+    # arrive that way. `lease_client.run_lease` is
+    # `subprocess.run(..., timeout=120)` and does not catch its own
+    # `TimeoutExpired`, so a hung lease tool raised out of `_Handle.__exit__`,
+    # which is the ExitStack `worker.handlers` closes IN ITS `finally`.
+    #
+    # So the exception replaced whatever that handler had already decided --
+    # including a run that had finished and PUBLISHED. `_dispatch` catches it
+    # and turns it into a retryable failure, so `queue_fail` requeues finished
+    # work, the next delivery re-runs the whole attempt (`git push` and PR
+    # creation included) and `queue_claim` charges another attempt for it. A
+    # release is a cleanup of a lease whose lifecycle has already ended; it
+    # cannot be allowed to decide the outcome of the work it was protecting.
+    try:
+        lease_client.run_lease(
+            lease_client.lease_argv(identity, "release", repo_path), repo_path
+        )
+    except Exception:  # noqa: BLE001 - the release is cleanup, never a verdict
+        logger.warning(
+            "writer lease release for task %s did not complete; the row is "
+            "left to its own TTL expiry",
+            cfg.task,
+            exc_info=True,
+        )
 
 
 class _Handle:
@@ -190,7 +228,58 @@ class _Handle:
                 # for, and calling into the lease tool now would only race
                 # `__exit__`'s own release.
                 return
-            failure = _acquire_and_provision_hooks(self._repo_path, self._cfg)
+            try:
+                failure = _acquire_and_provision_hooks(self._repo_path, self._cfg)
+            except Exception as error:  # noqa: BLE001 - see below
+                # A RENEWAL THAT RAISES MUST NOT KILL THIS THREAD SILENTLY
+                # (VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED).
+                #
+                # `_acquire_and_provision_hooks` reads a RETURN CODE, so
+                # every branch below it assumes `voyn-lease` ran and
+                # answered. `lease_client.run_lease` is
+                # `subprocess.run(..., timeout=120)` and does not catch its
+                # own `TimeoutExpired`, so a lease tool that HANGS raises
+                # straight through here -- and so does a missing or
+                # unexecutable binary (`OSError`). This loop is a thread
+                # target, so the exception ended the thread, and nothing
+                # anywhere observed it:
+                #
+                #   * `_lease_lost` was never set, so the agent kept running;
+                #   * nothing renewed the lease again, so the row expired
+                #     server-side at `ttl` while this process still held it
+                #     -- `lease_argv`'s own comment records what that does to
+                #     the next claimant ("every later acquire for that
+                #     repository refused forever with `VOYN_LEASE_REFUSED
+                #     expired requires dead-process confirmation`", and
+                #     `--auto-takeover` cannot help while the holder is
+                #     alive);
+                #   * and the module's whole promise -- a writer lease held
+                #     "through provisioning, the agent run ... and
+                #     `publish_run`" -- quietly stopped being true for the
+                #     rest of a run that may last `request.timeout_seconds`.
+                #
+                # IT IS REACHED BY THE SAME BLIP THE QUEUE BEAT IS SIZED FOR.
+                # `voyn-lease` talks to its authority over a DSN
+                # (`/etc/aicc/lease.env`) and the credential rotation restarts
+                # that tunnel on its own timer; a hung connect is exactly what
+                # a restarting tunnel produces, and 120s of it is this
+                # function's own default.
+                #
+                # Answered as a FAILED RENEWAL, which is what it is, rather
+                # than with a new tolerance: `WorkerDaemon._heartbeat_loop`
+                # absorbs `TOLERATED_FAILED_BEATS` of these because it can
+                # prove how much lease it has left, and whether this loop
+                # should do the same is the open question stated above
+                # `_RENEW_FRACTION`. Failing closed is the answer that needs
+                # no new measurement -- and it costs an attempt far less than
+                # it used to, because `daemon._execute` now REPORTS a run
+                # cancelled by this lease instead of discarding it.
+                logger.exception(
+                    "writer lease renewal raised for task %s -- forcing agent "
+                    "cancellation",
+                    self._cfg.task,
+                )
+                failure = f"renewal_raised: {error!r}"[:200]
             if failure is not None:
                 logger.warning(
                     "writer lease renewal failed for task %s: %s -- "
