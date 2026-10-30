@@ -28,7 +28,7 @@ EnvironmentFile=-/etc/aicc/native-gateway-projection.env
 # The control DB settings (AICC_PG_*) come from the same preprod .env every
 # control tick sources; it lives in the running user's home, so the path is
 # resolved by the shell, overridable with AICC_PREPROD_ENV.
-ExecStart=/bin/bash -c 'set -a && . "$${AICC_PREPROD_ENV:-$$HOME/aicc-preprod/.env}" && set +a && exec /opt/aicc/current/.venv/bin/python -m native_gateway.projection_producer --root /opt/aicc/current --out "$${AICC_GATEWAY_PROJECTION}" --pipeline-health --no-run-journal'
+ExecStart=/bin/bash -c 'projection="$${AICC_GATEWAY_PROJECTION}"; data="$${AICC_DATA_DIR}"; set -a && . "$${AICC_PREPROD_ENV:-$$HOME/aicc-preprod/.env}" && set +a && AICC_DATA_DIR="$$data" exec /opt/aicc/current/.venv/bin/python -m native_gateway.projection_producer --root /opt/aicc/current --out "$$projection" --pipeline-health --no-run-journal'
 TimeoutStartSec=50s
 UMask=0027
 NoNewPrivileges=true

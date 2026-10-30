@@ -122,7 +122,7 @@ class FileProjectionSource:
     def _read(path: Path) -> dict | None:
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError, UnicodeDecodeError):
+        except OSError, ValueError, UnicodeDecodeError:
             return None
         return data if isinstance(data, dict) else None
 
@@ -225,7 +225,7 @@ _BACKLOG_STATUSES = frozenset(
         "DECIDED",
     }
 )
-_MONITOR_VERDICTS = frozenset({"ok", "failing"})
+_MONITOR_VERDICTS = frozenset({"ok", "failing", "unknown"})
 
 
 def _nonneg(value: object) -> int:
@@ -271,7 +271,7 @@ def _map_pipeline_health(raw: object) -> PipelineHealthDTO | None:
                 heartbeatAgeSeconds=(
                     lane["heartbeat_age_seconds"]
                     if isinstance(lane.get("heartbeat_age_seconds"), int)
-                    else -1
+                    else None
                 ),
             )
             for lane in _items(raw.get("active_lanes"))

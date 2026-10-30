@@ -28,6 +28,7 @@ SELECT on (see `command_center/db/roles.py`); this module issues no write.
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -98,7 +99,7 @@ _QUEUE_SQL = (
 
 _LANES_SQL = (
     "SELECT claimed_by_role, count(*) AS attempts,"
-    " EXTRACT(EPOCH FROM (now() - max(coalesce(heartbeat_at, created_at))))"
+    " EXTRACT(EPOCH FROM (now() - min(coalesce(heartbeat_at, created_at))))"
     "   AS heartbeat_age_seconds"
     " FROM work_attempt_public"
     " WHERE state = 'active' AND visible_until > now()"
@@ -248,7 +249,8 @@ def _code(failure: object) -> str | None:
     """A monitor failure's stable code (before ':'), never its measurement."""
     if not isinstance(failure, str):
         return None
-    return _text(failure.split(":", 1)[0], 80)
+    code = failure.split(":", 1)[0]
+    return code if re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,79}", code) else None
 
 
 def build_pipeline_health(rows: PipelineRows, now: datetime | None = None) -> dict:
@@ -280,7 +282,7 @@ def build_pipeline_health(rows: PipelineRows, now: datetime | None = None) -> di
                 "heartbeat_age_seconds": (
                     lane.get("heartbeat_age_seconds")
                     if isinstance(lane.get("heartbeat_age_seconds"), int)
-                    else -1
+                    else None
                 ),
             }
             for lane in rows.lanes
@@ -309,7 +311,7 @@ def build_pipeline_health(rows: PipelineRows, now: datetime | None = None) -> di
             {code for r in open_rows if (code := _code(r.get("failure")))}
         )[:_MONITOR_FAILURE_LIMIT]
         block["monitor"] = {
-            "verdict": "failing" if open_rows else "ok",
+            "verdict": "failing" if open_rows else "unknown",
             "open_findings": len(open_rows),
             "failures": failures,
             "last_seen_at": _text(rows.monitor.get("last_seen_at"), 40),

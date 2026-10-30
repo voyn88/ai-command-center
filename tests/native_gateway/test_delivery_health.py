@@ -8,6 +8,7 @@ shape), so no database is needed and the gateway is shown never to touch one.
 from __future__ import annotations
 
 import json
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -115,12 +116,12 @@ def test_block_shapes_rows_through_the_allowlist():
     assert "54>0" not in json.dumps(block)
 
 
-def test_monitor_is_omitted_when_unavailable_and_ok_when_clear():
+def test_monitor_is_omitted_when_unavailable_and_unknown_when_clear():
     assert "monitor" not in build_pipeline_health(_rows(monitor=None), _NOW)
     clear = build_pipeline_health(
         _rows(monitor={"open": [], "last_seen_at": "2026-10-30T11:00:00Z"}), _NOW
     )
-    assert clear["monitor"]["verdict"] == "ok"
+    assert clear["monitor"]["verdict"] == "unknown"
     assert clear["monitor"]["open_findings"] == 0
 
 
@@ -168,8 +169,22 @@ def test_db_failure_degrades_and_omits_block(tmp_path, monkeypatch, caplog):
 
 def test_revision_ignores_the_observation_clock(tmp_path, monkeypatch):
     root = _seed_root(tmp_path, monkeypatch)
+
+    class Clock(datetime):
+        current = _NOW
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.current
+
+    monkeypatch.setattr(projection_producer, "datetime", Clock)
     first = build_projection(root, pipeline_source=_FakeSource(), run_journal=False)
+    Clock.current = datetime(2026, 10, 30, 12, 1, tzinfo=UTC)
     second = build_projection(root, pipeline_source=_FakeSource(), run_journal=False)
+    assert (
+        first["pipeline_health"]["observed_at"]
+        != second["pipeline_health"]["observed_at"]
+    )
     assert first["revision"] == second["revision"]
     changed = build_projection(
         root,
@@ -335,8 +350,10 @@ def test_postgres_source_reads_only_the_public_views():
     assert rows.monitor["open"][0]["failure"] == "dead_letter_growth"
     sql = " ".join(statement for statement, _ in conn.log)
     # The redacted views only — `work_attempt` itself holds claim_token_hash.
-    assert "FROM work_attempt " not in sql and "FROM work_item " not in sql
-    assert not any(word in sql.upper() for word in ("INSERT", "UPDATE ", "DELETE"))
+    assert not re.search(r"\bfrom\s+(work_attempt|work_item)\b", sql, re.I)
+    assert not re.search(
+        r"\b(INSERT|UPDATE|DELETE|TRUNCATE|DROP|ALTER|COPY|GRANT)\b", sql, re.I
+    )
     assert (AUTH_FAILURE_PATTERN,) in [params for _, params in conn.log]
 
 
@@ -372,3 +389,33 @@ def test_cli_flags_wire_the_postgres_source(tmp_path, monkeypatch):
     assert written["pipeline_health"]["executor_auth_failures_30m"] == 3
     assert written["degraded"] is False
     assert closed == [True]
+
+
+def test_unknown_heartbeat_and_monitor_details_are_not_healthy():
+    rows = _rows(
+        lanes=[{"role": "worker", "attempts": 1}],
+        monitor={"open": [{"failure": "measured secret path"}], "last_seen_at": None},
+    )
+    block = build_pipeline_health(rows, _NOW)
+    assert block["active_lanes"][0]["heartbeat_age_seconds"] is None
+    assert block["monitor"]["failures"] == []
+    assert block["monitor"]["verdict"] == "failing"
+
+
+def test_valid_monitor_verdict_still_redacts_hostile_failure(
+    client, device_token, projection_path
+):
+    data = fresh_sample(projection_path)
+    data["pipeline_health"]["monitor"]["verdict"] = "failing"
+    data["pipeline_health"]["monitor"]["failures"] = ["token expired for ghp_abcdef123"]
+    projection_path.write_text(json.dumps(data), encoding="utf-8")
+    response = client.get("/v1/snapshot", headers=auth_headers(device_token))
+    assert response.status_code == 200
+    assert response.json()["pipelineHealth"]["monitor"]["verdict"] == "failing"
+    assert "ghp_" not in response.text
+
+
+def test_lane_age_query_uses_oldest_attempt():
+    from native_gateway.delivery_health import _LANES_SQL
+
+    assert "min(coalesce(heartbeat_at, created_at))" in _LANES_SQL

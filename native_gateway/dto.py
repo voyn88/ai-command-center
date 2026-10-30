@@ -114,7 +114,7 @@ class PipelineLaneDTO(_Frozen):
 
     role: str
     attempts: int
-    heartbeatAgeSeconds: int
+    heartbeatAgeSeconds: int | None
 
 
 class OwnerEscalationDTO(_Frozen):
@@ -129,7 +129,7 @@ class OwnerEscalationDTO(_Frozen):
 class MonitorVerdictDTO(_Frozen):
     """The infra monitor's latest verdict: open failure codes, never detail."""
 
-    verdict: str  # ok | failing
+    verdict: str  # ok | failing | unknown
     openFindings: int
     failures: list[str]
     lastSeenAt: str | None = None
