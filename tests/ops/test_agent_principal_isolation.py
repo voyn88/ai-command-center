@@ -24,6 +24,7 @@ pytestmark = pytest.mark.usefixtures("host_shaped_fixture_roots")
 
 
 def _launcher_module():
+    pytest.importorskip("fcntl", reason="launcher requires POSIX flock")
     path = Path(__file__).parents[2] / "ops" / "aicc_agent_launcher.py"
     spec = importlib.util.spec_from_file_location("aicc_agent_launcher", path)
     assert spec and spec.loader
@@ -2081,6 +2082,15 @@ def _auth_store(tmp_path, monkeypatch, launcher, payload: bytes):
     )
     home = tmp_path / "home"
     (home / ".claude").mkdir(parents=True)
+    real_fstat = launcher.os.fstat
+
+    def root_owned_fstat(fd):
+        info = real_fstat(fd)
+        fields = list(info)
+        fields[4:6] = [0, 0]
+        return os.stat_result(fields)
+
+    monkeypatch.setattr(launcher.os, "fstat", root_owned_fstat)
     return store, home
 
 
@@ -2092,7 +2102,7 @@ def test_refreshed_model_auth_is_written_back_to_the_store(tmp_path, monkeypatch
     new = json.dumps({"claudeAiOauth": {"accessToken": "b", "refreshToken": "r2", "expiresAt": 2}}).encode()
     store, home = _auth_store(tmp_path, monkeypatch, launcher, old)
     (home / ".claude" / ".credentials.json").write_bytes(new)
-    assert launcher._write_back_model_auth("claude", home) is True
+    assert launcher._write_back_model_auth("claude", home, old) is True
     assert store.read_bytes() == new
     assert stat.S_IMODE(store.stat().st_mode) == 0o600
     assert not list(store.parent.glob(".*.tmp"))
@@ -2101,9 +2111,9 @@ def test_refreshed_model_auth_is_written_back_to_the_store(tmp_path, monkeypatch
 def test_unchanged_or_missing_model_auth_is_not_written_back(tmp_path, monkeypatch, launcher):
     old = json.dumps({"claudeAiOauth": {"accessToken": "a", "refreshToken": "r1"}}).encode()
     store, home = _auth_store(tmp_path, monkeypatch, launcher, old)
-    assert launcher._write_back_model_auth("claude", home) is False
+    assert launcher._write_back_model_auth("claude", home, old) is False
     (home / ".claude" / ".credentials.json").write_bytes(old)
-    assert launcher._write_back_model_auth("claude", home) is False
+    assert launcher._write_back_model_auth("claude", home, old) is False
     assert store.read_bytes() == old
 
 
@@ -2115,14 +2125,147 @@ def test_model_auth_that_changed_shape_or_is_not_json_is_refused(tmp_path, monke
     target = home / ".claude" / ".credentials.json"
     target.write_bytes(b"not json")
     with pytest.raises(launcher.LaunchRefused, match="not JSON"):
-        launcher._write_back_model_auth("claude", home)
+        launcher._write_back_model_auth("claude", home, old)
     target.write_bytes(json.dumps({"claudeAiOauth": {"accessToken": "a"}, "extra": 1}).encode())
     with pytest.raises(launcher.LaunchRefused, match="changed shape"):
-        launcher._write_back_model_auth("claude", home)
+        launcher._write_back_model_auth("claude", home, old)
     target.unlink()
     target.symlink_to(store)
     with pytest.raises(launcher.LaunchRefused, match="plain regular file"):
-        launcher._write_back_model_auth("claude", home)
+        launcher._write_back_model_auth("claude", home, old)
+    assert store.read_bytes() == old
+
+
+
+@pytest.mark.parametrize("executor", ["claude", "codex"])
+def test_unchanged_run_does_not_clobber_another_lanes_token(
+    tmp_path, monkeypatch, launcher, executor
+):
+    old = b'{"token":"old"}'
+    newer = b'{"token":"new"}'
+    store, home = _auth_store(tmp_path, monkeypatch, launcher, old)
+    monkeypatch.setitem(launcher.MODEL_AUTH_SOURCES, executor, store)
+    target = home / launcher.MODEL_AUTH_TARGETS[executor]
+    target.parent.mkdir(exist_ok=True)
+    target.write_bytes(old)
+    store.write_bytes(newer)
+    assert launcher._write_back_model_auth(executor, home, old) is False
+    assert store.read_bytes() == newer
+    assert not (store.parent / ".model-auth.lock").exists()
+
+
+@pytest.mark.parametrize(
+    "executor,run_time,store_time,updated",
+    [
+        ("claude", 20, 30, False),
+        ("claude", 30, 20, True),
+        ("claude", 20, 20, False),
+        ("claude", None, 20, False),
+        ("claude", 20, "invalid", False),
+        ("claude", True, 20, False),
+        ("claude", float("nan"), 20, False),
+        ("claude", 20, float("inf"), False),
+        ("codex", "2026-10-30T12:00:00Z", "2026-10-30T13:00:00Z", False),
+        ("codex", "2026-10-30T14:00:00Z", "2026-10-30T13:00:00Z", True),
+        ("codex", "2026-10-30T14:00:00+03:00", "2026-10-30T12:00:00Z", False),
+        ("codex", "2026-10-30T14:00:00+03:00", "2026-10-30T11:00:00Z", False),
+        ("codex", "2026-10-30T14:00:00", "2026-10-30T11:00:00Z", False),
+        ("codex", "invalid", "2026-10-30T11:00:00Z", False),
+        ("codex", "2026-10-30T14:00:00Z", None, False),
+    ],
+)
+def test_model_auth_concurrent_refresh_requires_strictly_newer_timestamp(
+    tmp_path, monkeypatch, launcher, capsys, executor, run_time, store_time, updated
+):
+    def payload(token, timestamp):
+        if executor == "claude":
+            value = {"claudeAiOauth": {"accessToken": token, "expiresAt": timestamp}}
+        else:
+            value = {"tokens": {"access_token": token}, "last_refresh": timestamp}
+        return json.dumps(value).encode()
+
+    old = payload("staged", None)
+    refreshed = payload("run", run_time)
+    current = payload("other-lane", store_time)
+    store, home = _auth_store(tmp_path, monkeypatch, launcher, old)
+    monkeypatch.setitem(launcher.MODEL_AUTH_SOURCES, executor, store)
+    target = home / launcher.MODEL_AUTH_TARGETS[executor]
+    target.parent.mkdir(exist_ok=True)
+    target.write_bytes(refreshed)
+    store.write_bytes(current)
+    assert launcher._write_back_model_auth(executor, home, old) is updated
+    assert store.read_bytes() == (refreshed if updated else current)
+    if not updated:
+        assert (
+            f"model auth write-back: {executor} skipped, "
+            "store is newer or freshness unknown"
+        ) in capsys.readouterr().err
+
+
+def test_model_auth_lock_is_private_and_held_through_read_and_replace(
+    tmp_path, monkeypatch, launcher
+):
+    old = b'{"token":"old"}'
+    new = b'{"token":"new"}'
+    store, home = _auth_store(tmp_path, monkeypatch, launcher, old)
+    (home / launcher.MODEL_AUTH_TARGETS["claude"]).write_bytes(new)
+    lock_path = store.parent / ".model-auth.lock"
+    checked = []
+
+    def assert_locked():
+        assert stat.S_IMODE(lock_path.stat().st_mode) == 0o600
+        with lock_path.open("rb") as competing:
+            with pytest.raises(BlockingIOError):
+                launcher.fcntl.flock(
+                    competing.fileno(), launcher.fcntl.LOCK_EX | launcher.fcntl.LOCK_NB
+                )
+
+    def read_locked(path, **kwargs):
+        assert_locked()
+        checked.append("read")
+        return path.read_bytes()
+
+    real_replace = launcher.os.replace
+
+    def replace_locked(source, destination):
+        assert_locked()
+        checked.append("replace")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(launcher, "_read_exact_protected_file", read_locked)
+    monkeypatch.setattr(launcher.os, "replace", replace_locked)
+    assert launcher._write_back_model_auth("claude", home, old) is True
+    assert checked == ["read", "replace"]
+    assert store.read_bytes() == new
+    with lock_path.open("rb") as released:
+        launcher.fcntl.flock(released.fileno(), launcher.fcntl.LOCK_EX | launcher.fcntl.LOCK_NB)
+
+
+
+def test_prepare_home_retains_exact_staged_bytes(tmp_path, monkeypatch, launcher):
+    old = b'{ "token": "staged" }\n'
+    store, _ = _auth_store(tmp_path, monkeypatch, launcher, old)
+    homes = tmp_path / "runs"
+    homes.mkdir()
+    monkeypatch.setattr(launcher, "EPHEMERAL_HOME_ROOT", homes)
+    monkeypatch.setattr(launcher.grp, "getgrnam", lambda name: SimpleNamespace(gr_gid=0))
+    monkeypatch.setattr(launcher.os, "fchown", lambda *args: None)
+    monkeypatch.setattr(launcher.os, "chown", lambda *args: None)
+    home, staged = launcher._prepare_agent_home("claude", "a" * 32)
+    target = home / launcher.MODEL_AUTH_TARGETS["claude"]
+    assert target.read_bytes() == staged == old
+    store.write_bytes(b'{"token":"other-lane"}')
+    assert launcher._write_back_model_auth("claude", home, staged) is False
+    assert store.read_bytes() == b'{"token":"other-lane"}'
+
+
+def test_model_auth_size_limit_is_preserved(tmp_path, monkeypatch, launcher):
+    old = b'{"token":"old"}'
+    store, home = _auth_store(tmp_path, monkeypatch, launcher, old)
+    monkeypatch.setattr(launcher, "MAX_MODEL_AUTH_BYTES", len(old))
+    (home / launcher.MODEL_AUTH_TARGETS["claude"]).write_bytes(old + b" ")
+    with pytest.raises(launcher.LaunchRefused, match="plain regular file"):
+        launcher._write_back_model_auth("claude", home, old)
     assert store.read_bytes() == old
 
 
