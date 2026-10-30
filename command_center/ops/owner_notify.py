@@ -130,7 +130,8 @@ def _post(
     }
     token = os.environ.get("AICC_OWNER_NTFY_TOKEN", "").strip()
     if token:
-        headers["Authorization"] = f"Bearer {token}"
+        if not url.lower().startswith("https://"):
+            return False
     if tags:
         headers["Tags"] = _header(",".join(tag for tag in tags if tag))
     if click_url:
@@ -138,6 +139,8 @@ def _post(
     request = urllib.request.Request(
         url, data=text.encode("utf-8"), headers=headers, method="POST"
     )
+    if token:
+        request.add_unredirected_header("Authorization", f"Bearer {token}")
     try:
         # Scheme restricted to http(s) in _topic_url.
         with urllib.request.urlopen(request, timeout=_HTTP_TIMEOUT) as response:  # nosec B310

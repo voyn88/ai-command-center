@@ -48,7 +48,7 @@ def test_notify_is_noop_without_url(monkeypatch, tmp_path) -> None:
 
 
 def test_notify_posts_headers_and_truncates_body(monkeypatch, tmp_path) -> None:
-    state = _configure(monkeypatch, tmp_path)
+    state = _configure(monkeypatch, tmp_path, url="https://ntfy.test/t")
     monkeypatch.setenv("AICC_OWNER_NTFY_TOKEN", "sekrit")
     captured: dict[str, object] = {}
 
@@ -71,7 +71,7 @@ def test_notify_posts_headers_and_truncates_body(monkeypatch, tmp_path) -> None:
         click_url="https://example.test/x",
     )
 
-    assert captured["url"] == "http://ntfy.test/t"
+    assert captured["url"] == "https://ntfy.test/t"
     assert captured["method"] == "POST"
     assert captured["timeout"] == 10
     assert captured["data"] == ("x" * 1000).encode("utf-8")
@@ -182,3 +182,23 @@ def test_resolved_alert_reopens_without_flapping_push(monkeypatch, tmp_path):
     assert not owner_notify.notify("flap", "alert", "bad again")
     assert "flap" in owner_notify.open_keys()
     assert len(sent) == 2
+
+
+def test_token_is_not_sent_over_plaintext(monkeypatch, tmp_path):
+    _configure(monkeypatch, tmp_path)
+    monkeypatch.setenv("AICC_OWNER_NTFY_TOKEN", "secret")
+    monkeypatch.setattr(owner_notify.urllib.request, "urlopen", lambda *a, **k: (_ for _ in ()).throw(AssertionError("must refuse")))
+    assert not owner_notify.notify("k", "title", "body")
+
+
+def test_authorization_is_not_copied_to_redirect(monkeypatch, tmp_path):
+    _configure(monkeypatch, tmp_path, url="https://ntfy.test/t")
+    monkeypatch.setenv("AICC_OWNER_NTFY_TOKEN", "secret")
+    def send(request, timeout=0):
+        redirected = owner_notify.urllib.request.HTTPRedirectHandler().redirect_request(
+            request, None, 302, "found", {}, "https://other.test/t"
+        )
+        assert not redirected.has_header("Authorization")
+        return _FakeResponse()
+    monkeypatch.setattr(owner_notify.urllib.request, "urlopen", send)
+    assert owner_notify.notify("k", "title", "body")
