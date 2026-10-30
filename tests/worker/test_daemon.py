@@ -1286,3 +1286,243 @@ def test_a_lost_queue_lease_still_discards_the_outcome() -> None:
     assert not any(call[0] == "complete" for call in store.calls), store.calls
     assert not any(call[0] == "fail" for call in store.calls), store.calls
     assert not any(call[0] == "fail_lease_wait" for call in store.calls), store.calls
+
+
+# ---------------------------------------------------------------------------
+# VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED: the beat loop's tolerance was a
+# COUNT OF BEATS wearing a clock's clothes.
+#
+# `_heartbeat_loop` gave up on the queue lease when
+# `consecutive_errors * interval >= visibility_seconds`. That product is
+# elapsed time only if a heartbeat that cannot reach the server fails in
+# roughly nothing -- and the failure the tolerance exists for does the
+# opposite. The beat crosses `voyn-aicc-pgtunnel.service`, which the credential
+# rotation restarts on its own timer; a severed forwarded socket BLACK-HOLES
+# the call, and nothing client-side bounds the read (`connect_timeout` bounds
+# connecting, `statement_timeout` is enforced by the server that is no longer
+# reachable). Each failed cycle therefore cost `interval + block` while the
+# counter still demanded `F + 2` of them.
+#
+# The cost of overrunning is the lane executing an item it no longer owns,
+# which is the probe's occupancy lied to from a third direction (after
+# monitor_finding #13366 and #14016): `aicc-queue-reaper.timer` hands the item
+# back, the fleet holds two lanes' worth of work, `work_item` records one
+# claim, `spare_capacity` goes true and `queue_stalled` opens against a fleet
+# with no free lane. `tests/db/test_infra_monitor_queue_snapshot.py` measures
+# that half against a real server; these need none and so run in every gate.
+#
+# They drive the loop through the INJECTED clock rather than waiting the
+# window out, because the property is about the deployed 300s window and a
+# test that has to sleep through it would have to pick a different one.
+# ---------------------------------------------------------------------------
+
+
+class _FakeClock:
+    """A monotonic clock a test advances, and a `beat_stop.wait` that advances
+    it by the beat interval -- so the loop's own pacing moves time exactly as
+    it does in production, and only the blocked call has to be scripted."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def _beat_until_lost(
+    window: int, block: float, beats: int = 40
+) -> tuple[float, list[float]]:
+    """Run the real `_heartbeat_loop` against a heartbeat that hangs for
+    `block` seconds of clock time and then fails, for ever.
+
+    Returns ``(when the queue lease was declared lost, when each beat was
+    attempted)`` on the injected clock. `beats` bounds the run so a loop that
+    never gives up fails as a timeout-free assertion instead of hanging.
+    """
+    import threading
+
+    clock = _FakeClock()
+    attempts: list[float] = []
+    lost_at: list[float] = []
+    queue_lease_lost = threading.Event()
+    cancel = threading.Event()
+    beat_stop = threading.Event()
+
+    class HangingStore:
+        def heartbeat(self, work):
+            attempts.append(clock.now)
+            if len(attempts) >= beats:
+                beat_stop.set()
+            # The call does not answer; it parks on a dead socket and then
+            # reports the failure it has been sitting on all along.
+            clock.advance(block)
+            raise ConnectionError("tunnel black-holed")
+
+    class _WaitForTheBeat:
+        """`beat_stop.wait(interval)`: real pacing on the fake clock."""
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def wait(self, seconds: float) -> bool:
+            if beat_stop.is_set():
+                return True
+            clock.advance(seconds)
+            return False
+
+        def is_set(self) -> bool:
+            return beat_stop.is_set()
+
+    daemon = WorkerDaemon(
+        HangingStore(),
+        {},
+        WorkerConfig(visibility_seconds=window),
+        monotonic=clock,
+    )
+    original_set = cancel.set
+
+    def record_and_set() -> None:
+        lost_at.append(clock.now)
+        original_set()
+
+    cancel.set = record_and_set  # type: ignore[method-assign]
+    daemon._heartbeat_loop(
+        _work({"kind": "slow"}), queue_lease_lost, cancel, _WaitForTheBeat()
+    )
+    assert queue_lease_lost.is_set(), (
+        f"the loop never gave the lease up in {len(attempts)} beats "
+        f"across {clock.now}s of a {window}s lease: {attempts}"
+    )
+    assert lost_at, "the handler was never cancelled"
+    return lost_at[0], attempts
+
+
+def test_the_lease_is_given_up_within_its_window_however_slowly_a_beat_fails() -> None:
+    """THE REGRESSION. The loop must stop the handler within one visibility
+    window of the last beat the server accepted -- no matter how long each
+    failing beat takes to admit it.
+
+    A fast failure was always handled: four cycles of `interval` are exactly
+    one window at `beat_interval_seconds`. The black-holed call was not, and
+    it is the one the tolerance is for.
+    """
+    window = WorkerConfig().visibility_seconds
+
+    for block in (0.0, 1.0, 10.0, 120.0, 900.0):
+        lost_at, attempts = _beat_until_lost(window, block)
+        # ONE WINDOW PLUS AT MOST THE ONE CALL THE LOOP WAS PARKED IN, which
+        # is the whole of what this thread can promise: while it is inside
+        # `store.heartbeat` it cannot act, and bounding that needs a deadline
+        # on the TRANSPORT (libpq `tcp_user_timeout` and friends) rather than
+        # on this loop. The point is that the bound is now the WINDOW plus one
+        # call instead of `TOLERATED_FAILED_BEATS + 2` of them.
+        assert lost_at <= window + block, (
+            f"a beat that hangs {block}s let the handler run "
+            f"{lost_at - window:.0f}s past a {window}s lease, more than the "
+            f"one call it was parked in (beats attempted at {attempts})"
+        )
+        # Not early either: an attempt taken away with time left on its lease
+        # costs the whole run (migration 0029), so the loop may only give up
+        # once the lapse is PROVEN -- which is at the window, not before it.
+        assert lost_at >= window, (
+            f"a beat that hangs {block}s gave the lease up at {lost_at}s, "
+            f"ahead of its {window}s deadline"
+        )
+
+
+def test_counting_beats_is_not_measuring_the_window() -> None:
+    """The defect stated as the arithmetic it was, so the fix cannot quietly
+    revert to it.
+
+    `consecutive_errors * interval >= visibility_seconds` needs
+    `TOLERATED_FAILED_BEATS + 2` failures at the derived cadence. Each costs
+    `interval` PLUS however long the call sat there, so the old test fired at
+    `(F + 2) * (interval + block)` -- four times the window at the 120s block
+    `lease_client`'s own subprocess timeout allows, and the overrun grows
+    without bound as the block does.
+    """
+    from command_center.worker.daemon import (
+        TOLERATED_FAILED_BEATS,
+        beat_interval_seconds,
+    )
+
+    window = WorkerConfig().visibility_seconds
+    interval = beat_interval_seconds(window)
+    required_failures = TOLERATED_FAILED_BEATS + 2
+
+    for block in (10.0, 120.0):
+        counted = required_failures * (interval + block)
+        assert counted > window, (
+            "this test no longer describes the old defect: counting "
+            f"{required_failures} failures at a {block}s block gives "
+            f"{counted}s, which is inside the {window}s window"
+        )
+        measured, _attempts = _beat_until_lost(window, block)
+        assert measured < counted, (
+            f"the loop still fires on the beat COUNT ({counted}s) rather than "
+            f"on the window ({window}s): it gave up at {measured}s"
+        )
+
+
+def test_a_beat_the_server_accepted_moves_the_deadline() -> None:
+    """The other half: the window is measured from the last beat the SERVER
+    accepted, so a fleet whose database comes back keeps its attempt.
+
+    One failure, one success, then silence -- the successful beat has to
+    re-date the deadline, or the next failure would be judged against a window
+    that started before it and the lease would be given up with most of it
+    left.
+    """
+    import threading
+
+    from command_center.worker.daemon import beat_interval_seconds
+
+    window = 300
+    clock = _FakeClock()
+    interval = beat_interval_seconds(window)
+    answers = [None, True]  # None raises; True is `queue_heartbeat` ok
+    lost_at: list[float] = []
+
+    class FlakyStore:
+        def heartbeat(self, work):
+            if answers:
+                answer = answers.pop(0)
+                if answer is None:
+                    raise ConnectionError("one blip")
+                return answer
+            raise ConnectionError("gone for good")
+
+    class _WaitForTheBeat:
+        def wait(self, seconds: float) -> bool:
+            clock.advance(seconds)
+            return False
+
+        def is_set(self) -> bool:
+            return False
+
+    cancel = threading.Event()
+    original_set = cancel.set
+
+    def record_and_set() -> None:
+        lost_at.append(clock.now)
+        original_set()
+
+    cancel.set = record_and_set  # type: ignore[method-assign]
+    daemon = WorkerDaemon(
+        FlakyStore(), {}, WorkerConfig(visibility_seconds=window), monotonic=clock
+    )
+    daemon._heartbeat_loop(
+        _work({"kind": "slow"}), threading.Event(), cancel, _WaitForTheBeat()
+    )
+
+    # The successful beat landed at 2 * interval and renewed the lease there,
+    # so the lapse is proven only a whole window after THAT -- not a window
+    # after the claim.
+    accepted_at = 2 * interval
+    assert lost_at and lost_at[0] >= accepted_at + window, (
+        f"the lease was given up at {lost_at}s; the beat the server accepted "
+        f"at {accepted_at}s renews it to {accepted_at + window}s"
+    )

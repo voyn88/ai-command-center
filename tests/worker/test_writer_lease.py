@@ -10,6 +10,7 @@ stubbed out."""
 from __future__ import annotations
 
 import subprocess
+import time
 import threading
 
 import pytest
@@ -335,4 +336,72 @@ def test_a_release_that_hangs_cannot_overturn_the_work_it_protected(
     # survives its cleanup.
     assert published
     assert not lease_lost.is_set()
+    assert " release " in calls.read_text(), "the release was never attempted"
+
+
+def test_a_renewal_in_flight_when_the_hold_exits_cannot_cancel_the_finished_run(
+    tmp_path, impatient_lease_tool
+):
+    """A lease whose lifecycle has ENDED has no verdict left to give -- the
+    same lesson `_release` carries, applied to the renewal that outlived it
+    (VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED).
+
+    `_renew_loop` tests `_stop` only at the TOP of its wait. A renewal already
+    inside `lease_client.run_lease` when the hold exits outlives it:
+    `__exit__` sets `_stop`, joins this thread for ten seconds, then releases
+    the lease and returns. So the in-flight renewal comes back LATE and fails
+    -- in the ordinary case BECAUSE `__exit__` released the row it was
+    renewing -- and set `lease_lost` on a run that had already finished.
+
+    That event is `worker.handlers`' cancellation event, and
+    `daemon._execute` now REPORTS a run this lease cancelled rather than
+    discarding it, so a late failure turns a completed, PUBLISHED attempt into
+    `queue_fail(retryable => true)`: the item is requeued, the next delivery
+    re-runs the whole handler -- `git push` and PR creation included -- and
+    `queue_claim` charges another attempt for it, three of which dead-letter
+    healthy work.
+    """
+    calls = tmp_path / "calls.log"
+    # The initial acquire answers. The first RENEWAL hangs past the fixture's
+    # one-second `run_lease` timeout, so it is still in flight when the hold
+    # exits -- and `release`, which runs after the join gives up, answers at
+    # once so nothing else delays the exit.
+    tool = _install_lease_tool(
+        tmp_path,
+        f'echo "$*" >> {calls}\n'
+        'case " $* " in\n'
+        f'  *" release "*) exit 0 ;;\n'
+        "esac\n"
+        f"n=$(grep -c ' acquire ' {calls} 2>/dev/null || echo 0)\n"
+        'if [ "$n" -le 1 ]; then exit 0; fi\nsleep 30\n',
+    )
+    lease_lost = threading.Event()
+
+    handle = hold(tmp_path, _cfg(str(tool), ttl=3), lease_lost)
+    with handle:
+        # ttl=3 -> the renew interval is the module's 1s floor. Wait until the
+        # renewal that will fail is actually in flight, so the exit below
+        # really does race it rather than happening before it starts.
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if calls.read_text().count(" acquire ") >= 2:
+                break
+            time.sleep(0.05)
+        else:  # pragma: no cover - the fixture's tool did not renew
+            pytest.fail(f"no renewal was attempted: {calls.read_text()!r}")
+        published = "the work this lease was protecting finished and published"
+
+    # The hold has exited: the lease is released and the run is over. The
+    # renewal that was in flight is still running -- `__exit__` joined it for
+    # ten seconds and gave up -- so wait for it to come back and give it every
+    # chance to cancel something.
+    handle._thread.join(timeout=40)
+    assert not handle._thread.is_alive(), "the late renewal never came back"
+
+    assert published
+    assert not lease_lost.is_set(), (
+        "a renewal that failed after the hold was released cancelled a run "
+        "that had already finished; `daemon._execute` reports that as a "
+        "retryable failure and requeues published work"
+    )
     assert " release " in calls.read_text(), "the release was never attempted"

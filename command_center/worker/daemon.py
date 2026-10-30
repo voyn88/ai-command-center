@@ -14,6 +14,15 @@ Design decisions, each traceable to the shipped substrate:
   ``TOLERATED_FAILED_BEATS`` consecutive failures (see
   ``beat_interval_seconds``) and raises a stop flag the moment the database
   says ``attempt_superseded``.
+* **The tolerance is a deadline, not a number of beats.** How many renewals
+  may fail is a consequence of the cadence; what decides that the attempt is
+  gone is a clock against the window the server granted. Counting beats
+  instead made the lapse arrive late by however long each failed beat took to
+  admit it — and a beat that cannot reach a restarted
+  ``voyn-aicc-pgtunnel.service`` does not fail fast, it black-holes — which
+  left a lane executing an item ``aicc-queue-reaper.timer`` had already
+  handed back (VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED; see
+  ``_heartbeat_loop``).
 * **Cancelling the handler and refusing to report are different decisions.**
   Two leases cover one attempt — this queue lease, and the repository writer
   lease ``worker.handlers`` holds through the run — and either one going must
@@ -213,6 +222,7 @@ class WorkerDaemon:
         sleep: Callable[[float], None] | None = None,
         notify: Callable[[str], object] | None = None,
         reload_credentials: Callable[[], None] | None = None,
+        monotonic: Callable[[], float] | None = None,
     ) -> None:
         self._store = store
         self._handlers = dict(handlers)
@@ -234,6 +244,13 @@ class WorkerDaemon:
         # systemd (sd_notify returns quietly without NOTIFY_SOCKET).
         self._notify = notify if notify is not None else sdnotify.sd_notify
         self._reload_credentials = reload_credentials or (lambda: None)
+        # Injectable for the same reason `sleep` is: `_heartbeat_loop`'s
+        # tolerance is a span of real time against the lease window, and a
+        # test that has to WAIT that span out can only measure the deployed
+        # window by not using it. MONOTONIC on purpose -- the quantity is an
+        # elapsed duration, and a wall clock stepped by NTP or by the
+        # credential rotation's own host would move the lease deadline with it.
+        self._monotonic = monotonic if monotonic is not None else time.monotonic
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -696,30 +713,104 @@ class WorkerDaemon:
         interval = beat_interval_seconds(
             self._config.visibility_seconds, sdnotify.watchdog_interval_seconds()
         )
-        consecutive_errors = 0
-        while not beat_stop.wait(interval):
+        # WHEN THE LEASE WE HOLD WAS LAST GRANTED, BY A CLOCK. `queue_claim`
+        # has just granted a window of `visibility_seconds`, and this loop
+        # starts immediately after it returned, so loop entry is a
+        # conservative stand-in for that grant: the real one is no later.
+        # Every renewal the SERVER accepts re-dates it, and the deadline test
+        # at the top of the loop is the only thing that reads it.
+        granted_at = self._monotonic()
+        while True:
+            # HOW MUCH LEASE IS LEFT, AND THE ONLY PLACE IT IS DECIDED.
+            #
+            # IT USED TO BE A COUNT OF FAILED BEATS
+            # (VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED). The test was
+            # `consecutive_errors * interval >= visibility_seconds` on the
+            # error path, which is elapsed time only if a heartbeat that
+            # cannot reach the server FAILS FAST. The failure this tolerance
+            # exists for does the opposite: the beat crosses
+            # `voyn-aicc-pgtunnel.service`, which the credential rotation
+            # restarts on its own timer, and a severed forwarded socket
+            # BLACK-HOLES the call -- `connect_timeout` (10s) bounds
+            # connecting, and `statement_timeout` is enforced by a server
+            # that is no longer reachable, so nothing client-side bounds the
+            # read. Each failed cycle therefore cost `interval + block` while
+            # the counter still demanded `TOLERATED_FAILED_BEATS + 2` of them,
+            # and the loop gave the lease up at `(F + 2) * (interval + block)`
+            # instead of at `visibility_seconds`. MEASURED through this loop:
+            # at a 6s window with a 1.5s block it declared the lease lost at
+            # 12.0s, a whole extra window; at the deployed 300s window with
+            # the 120s `lease_client` already allows a hung subprocess, 1560s.
+            #
+            # WHAT THE OVERRUN COSTS IS THE PROBE'S OCCUPANCY, which is the
+            # one thing `control-01:queue` cannot survive being lied to
+            # about. The lane keeps executing an item it no longer owns;
+            # `aicc-queue-reaper.timer` does exactly its job and hands that
+            # item back; and now the fleet holds TWO lanes' worth of work
+            # while `work_item` records ONE claim. `claimed` is what
+            # `--claim-capacity` is weighed against (monitor_finding #13366),
+            # so `spare_capacity` goes true, the due-ready clock runs in full
+            # against a fleet with no free lane at all, and `fleet_idle_
+            # seconds` cannot bound it because the surviving claim is hours
+            # old. MEASURED against a real PostgreSQL 16 server through the
+            # production snapshot statement -- two lanes 70 minutes into
+            # attempts, the two surplus dispatched items due behind them,
+            # lane A's lease lapsed and reaped while lane A runs on:
+            #
+            #     both leases live  claimed=2 attended=2 fleet_idle=4200 -> ok
+            #     lane A runs on    claimed=1 attended=1 fleet_idle=1200
+            #                                             -> queue_stalled
+            #
+            # Nothing about the work changed between those two lines, and no
+            # fleet action reaches the second: the reaper has already
+            # recovered the item, and restarting the lane only arranges for
+            # the next tunnel blip to do it again.
+            #
+            # DATED FROM WHEN A BEAT ANSWERED, NOT FROM WHEN IT WAS SENT. The
+            # server grants the renewal somewhere inside the round trip, so
+            # the instant the answer arrives is at or after the grant --
+            # which makes this test PROVE the lapse rather than estimate it.
+            # Timing it from the send would give the lease up to a round trip
+            # early, and an attempt taken away with time left on its lease
+            # costs the whole run (migration 0029).
+            remaining = self._config.visibility_seconds - (
+                self._monotonic() - granted_at
+            )
+            if remaining <= 0:
+                logger.warning(
+                    "attempt %s: a whole visibility window has passed with no "
+                    "heartbeat the server accepted; the queue lease has lapsed",
+                    work.attempt_id,
+                )
+                self._lose_queue_lease(queue_lease_lost, cancel)
+                return
+            # Never sleep PAST the deadline. The cadence is what keeps the
+            # lease alive; once less than one interval of it is left, sleeping
+            # a whole interval would park this thread -- and the handler --
+            # beyond the moment the attempt stopped being ours. Capping the
+            # wait is what makes the bound above one window rather than one
+            # window plus a sleep.
+            if beat_stop.wait(min(interval, remaining)):
+                return
             # Fed even when the database is unreachable: the watchdog answers
             # "is the process alive", not "is PostgreSQL up" — restarting the
             # unit cures a wedged process and cures nothing about a DB outage,
-            # which the lease-lapse logic below already handles.
+            # which the lease-lapse logic above already handles.
             self._notify("WATCHDOG=1")
             try:
                 alive = self._store.heartbeat(work)
             except Exception:
-                consecutive_errors += 1
+                # Errors are not refusals, and they are not a verdict either:
+                # the deadline test above owns that decision, and a blip
+                # inside the window costs nothing but this beat. Review found
+                # the interleaving the deadline closes: DB down through the
+                # lapse, recovered before the handler finished, result refused
+                # as stale with no trace.
                 logger.exception("heartbeat error for attempt %s", work.attempt_id)
-                # Errors are not refusals, but they are not free either: after
-                # a full visibility window without one successful beat the
-                # lease has provably lapsed on the server, whatever the reason
-                # here — and the handler must stop before its outcome becomes
-                # a stale write. Review found the interleaving this closes:
-                # DB down through the lapse, recovered before the handler
-                # finished, result refused as stale with no trace.
-                if consecutive_errors * interval >= self._config.visibility_seconds:
-                    self._lose_queue_lease(queue_lease_lost, cancel)
-                    return
                 continue
-            consecutive_errors = 0
+            # Only a beat the SERVER accepted moves the deadline, and `alive`
+            # is how `queue_heartbeat` says so.
+            granted_at = self._monotonic()
             if not alive:
                 self._lose_queue_lease(queue_lease_lost, cancel)
                 return

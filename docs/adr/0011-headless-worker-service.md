@@ -63,6 +63,13 @@ This is a distinct mechanism from the queue's visibility lease, and the two must
   lease and the whole run with it. A run many multiples of 300 seconds long
   survives on live heartbeats exactly as well as a 60-second one; only a *lapsed* heartbeat (the
   process wedged, the database unreachable) ends the lease early.
+- The number of tolerated failures is a consequence of that cadence, and is deliberately **not** how
+  the lapse is decided: `_heartbeat_loop` holds a deadline — one window from the last beat the
+  server *accepted*, by a monotonic clock — and gives the attempt up when it passes. It counted
+  failed beats instead until VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED, which is elapsed time only if
+  an unreachable server fails the beat quickly; a severed `voyn-aicc-pgtunnel.service` socket
+  black-holes the call instead, so the lane kept executing an item the reaper had already handed
+  back and the queue probe read the fleet as having a free lane it did not have.
 - A payload's `timeout_seconds` therefore never "outlives" the queue's visibility lease in the sense
   of exceeding a fixed budget that lease enforces — a heartbeating worker can hold the row for as
   long as `agent_runner` lets the agent run, and no longer. The two ceilings coincide at 3600s

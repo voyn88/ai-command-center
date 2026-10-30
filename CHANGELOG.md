@@ -8,6 +8,169 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Fixed — the lease tolerance was a COUNT OF BEATS, so a lane kept running an item the reaper had already handed back (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
+- `control-01:queue` carried `queue_stalled` as `monitor_finding` #41136.
+  `WorkerDaemon._heartbeat_loop` decided that the queue lease was gone when
+
+      consecutive_errors * interval >= visibility_seconds
+
+  which is elapsed time **only if a heartbeat that cannot reach the server
+  fails fast**. The failure this tolerance exists for does the opposite. The
+  beat crosses `voyn-aicc-pgtunnel.service` — the tunnel the credential
+  rotation restarts on its own 25-minute timer — and a severed forwarded
+  socket BLACK-HOLES the call: `connect_timeout` (10s) bounds connecting, and
+  `statement_timeout` is enforced by a server that is no longer reachable, so
+  nothing client-side bounds the read. Each failed cycle therefore cost
+  `interval + block` while the counter still demanded `TOLERATED_FAILED_BEATS
+  + 2` of them, and the loop gave the attempt up at `(F + 2) * (interval +
+  block)` instead of at `visibility_seconds`. MEASURED through the real loop:
+
+      window  block   old (count)   new (clock)
+        6s     1.5s        12.0s          6.0s
+      300s      10s       340.0s        310.0s
+      300s     120s       780.0s        390.0s
+      300s     900s      3900.0s        975.0s
+
+  The 120s row is not hypothetical: it is the timeout `lease_client.run_lease`
+  already allows a hung subprocess, and the same tunnel is what both reach
+  their authority over.
+
+  **WHAT THE OVERRUN COSTS IS THE PROBE'S OCCUPANCY**, which is the one thing
+  a fail-closed monitor cannot survive being lied to about. The lane keeps
+  executing an item it no longer owns; `aicc-queue-reaper.timer` does exactly
+  its job and hands that item back; and now the fleet is holding TWO lanes'
+  worth of work while `work_item` records ONE claim.
+
+  It is the third direction the same lie arrives from, and the first one the
+  probe cannot see at all. #13366 was occupancy counting ATTENDANCE (a lane
+  whose lease slipped is still holding its lane); #14016 was a lane that had
+  STOPPED working still filling it. Both are a claim the probe counts and
+  should not. This is the inverse — a lane working with no claim to show for
+  it — so every clock the measurement owns is consistent with the rows it was
+  given and all of them are wrong about the fleet. MEASURED against a real
+  PostgreSQL 16 server through `queue_claim`, the real `WorkQueueAdmin.reap`
+  and the production snapshot statement — two lanes 70 minutes into
+  legitimate attempts, the two surplus dispatched items due behind them
+  (`PlanLimits.wip_limit` is 4 against these 2 lanes), lane A's lease lapsed
+  and reaped while lane A runs on:
+
+      both leases live  claimed=2 attended=2 lapsed=0 fleet_idle=4200 -> ok
+      lane A runs on    claimed=1 attended=1 lapsed=0 fleet_idle=1200
+                                                      -> queue_stalled
+
+  Nothing about the work changed between those two lines. `claimed` is what
+  `--claim-capacity` is weighed against (#13366), so `spare_capacity` goes
+  true against a fleet with no free lane at all, the due-ready clock runs in
+  full, and `fleet_idle_seconds` cannot bound it because the surviving claim
+  is seventy minutes old. **And no fleet action reaches it**, which is why the
+  finding kept returning after every measurement fix: the lapsed-claim class
+  is empty (the reaper has already recovered the item, so no reaper fix
+  applies), restarting the lane only arranges for the next tunnel blip to do
+  it again, and `queue_redrive` reaches only items that are already dead.
+
+  The rest of the cost is 0029's catalogue, for the same reason — an attempt
+  taken away mid-run: the item is `ready` again and any lane may take it while
+  the first is still working, so the side effects run twice, and
+  `queue_claim` has already charged `attempt_count` for the delivery that was
+  taken away.
+
+  **The fix: a deadline, not a count.** `_heartbeat_loop` now holds
+  `granted_at` — one window from the last beat the SERVER accepted, by a
+  MONOTONIC clock, since the quantity is an elapsed duration and a wall clock
+  stepped by NTP would move the lease with it — and that single test at the
+  top of the loop is the only place the lapse is decided. An error is no
+  longer a verdict, just a beat that did not land. Two details are
+  load-bearing:
+  - **Dated from when a beat ANSWERED, not from when it was sent.** The server
+    grants the renewal somewhere inside the round trip, so the instant the
+    answer arrives is at or after the grant — which makes the test PROVE the
+    lapse rather than estimate it. Timing it from the send would give the
+    lease up to a round trip early, and an attempt taken away with time left
+    on its lease costs the whole run (0029).
+  - **The wait never sleeps past the deadline** (`min(interval, remaining)`).
+    Otherwise the loop parks a whole interval beyond the moment the attempt
+    stopped being ours, which is a sleep's worth of the same overrun.
+  What remains is bounded and stated: the thread cannot act while it is inside
+  `store.heartbeat`, so the handler stops within one window plus the one call
+  it was parked in. Bounding THAT needs a deadline on the transport (libpq
+  `tcp_user_timeout` and friends) rather than on this loop, and it is a
+  fleet-wide connection change this finding has no measurement for.
+- `TOLERATED_FAILED_BEATS` and `beat_interval_seconds` are unchanged and still
+  mean what they say: the cadence is what keeps a lease alive through a blip.
+  What changed is that the number of survivable failures is now a CONSEQUENCE
+  of that cadence rather than the thing that decides the attempt is gone.
+  `aicc-worker.service`'s 240s `WatchdogSec` and ADR-0011 are unaffected, and
+  the ADR's heartbeat section records the distinction — the same discipline
+  the cadence fix applied to its own restatements.
+
+### Fixed — a writer-lease renewal still in flight when the hold exited cancelled the run it had already protected (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
+- `writer_lease._renew_loop` tests `_stop` only at the top of its wait. A
+  renewal already inside `lease_client.run_lease` when the hold exits
+  outlives it: `_Handle.__exit__` sets `_stop`, joins the thread for TEN
+  seconds, then releases the lease and returns — while `run_lease` is
+  `subprocess.run(..., timeout=120)`. So the in-flight renewal comes back
+  late and fails, in the ordinary case BECAUSE `__exit__` released the row it
+  was renewing, and set `lease_lost` on a run that had already finished.
+- That event is `worker.handlers`' cancellation event, and `daemon._execute`
+  now REPORTS a run this lease cancelled instead of discarding it (the
+  #14016 fix, immediately above in this file). So a late renewal failure no
+  longer merely loses an outcome — it turns a completed, PUBLISHED attempt
+  into `queue_fail(retryable => true)`: the item is requeued, the next
+  delivery re-runs the whole handler (`git push` and PR creation included),
+  and `queue_claim` charges another attempt for it, three of which
+  dead-letter healthy work as `max_attempts_exhausted`.
+- Same lesson as `_release` in the entry below, which may not decide the
+  outcome of the work it was protecting: a lease whose lifecycle has ended has
+  no verdict left to give. Found by writing the deadline test above, not by
+  inspection.
+- `_RENEW_FRACTION`'s open question — whether this loop should absorb a
+  transient authority blip the way the beat loop does — is still open and
+  still unmeasured. One constraint on answering it is now written down beside
+  it: a tolerance expressed as "N renewals may fail" would mean anything
+  between N intervals and N * (interval + 120s) of real time here, and only
+  the second is what the lease has left. That is the defect the beat loop just
+  stopped making.
+
+### Verified — the measurements behind both fixes (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
+- A local PostgreSQL 16 cluster was available this session, so the real-server
+  halves were RUN rather than reported: `tests/db/test_infra_monitor_queue_
+  snapshot.py` is 23 passed (21 before this change), and
+  `test_queue_claim.py`, `test_reap_bound.py`, `test_monitor_finding_clear.py`
+  and `test_work_queue_admin.py` are 80 passed together.
+- Each fix was re-verified by MUTATION, not by its own green: restoring the
+  beat COUNT rule takes `test_the_lease_is_given_up_within_its_window_however_
+  slowly_a_beat_fails`, `test_counting_beats_is_not_measuring_the_window` and
+  the real-server `test_the_beat_loop_admits_the_lapse_inside_the_window_it_
+  was_granted` red (the last one measuring a 16.0s cancellation on an 8s
+  lease, a 100% overrun), and removing the `_stop` re-check takes
+  `test_a_renewal_in_flight_when_the_hold_exits_cannot_cancel_the_finished_
+  run` red through the REAL `subprocess.TimeoutExpired`.
+- `test_a_lane_running_past_its_lease_hides_the_fleets_real_occupancy` is
+  deliberately a CHARACTERISATION of the measurement rather than a test that
+  the fix turns green: the probe reports the truth about the rows it is given,
+  and the rows were a lie. It pins the whole chain — healthy `ok`, the reap,
+  the `queue_stalled` it produces, and the exit the deadline restores, which
+  is the lane returning to `run_forever` so the item it gave back is claimed
+  and the fleet clock moves.
+- The full suite in this sandbox is 376 failed / 4747 passed / 180 errors, and
+  NONE of it is this change: no failing test imports either module touched
+  here, and the same selection is identical (44 failed, 59 passed) on a
+  pristine `git worktree` of HEAD. Two environmental causes account for it --
+  `command_center.runtime.supervisor` cannot establish a process identity
+  under this sandbox's `/proc` restrictions (the `runtime_*`, `codex_*`,
+  `launch_*`, `portfolio_*` and `task_pipeline*` families), and the venv's
+  `ruff` binary is not executable here (the publish/manifest static gates).
+  `ruff check .` was run from a writable copy instead and passes, as do the
+  whitespace, byte-compile and leak-guard preflight steps.
+- A soak harness (two real `WorkerDaemon` lanes, the real `WorkQueueAdmin.reap`
+  on its timer, a real enqueuer and the production snapshot statement sampled
+  at the deployed ratios — `V`, `3V` stall window, `V/5` reaper, `0.4V`
+  probe — under injected lane restarts) was used to search for the shape
+  before it was found by reading, and reports no `queue_stalled`. It was
+  exploratory and is not committed; what it establishes is the same thing the
+  previous session's did, that the measurement does not produce this finding
+  on its own.
+
 ### Fixed — one event carried two different lease losses, and the daemon read both as "do not report" (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
 - `control-01:queue` carried `queue_stalled` as `monitor_finding` #14016. TWO
   LEASES COVER ONE ATTEMPT: the queue's visibility lease, renewed by

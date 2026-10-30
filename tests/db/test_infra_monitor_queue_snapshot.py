@@ -1215,3 +1215,206 @@ def test_an_abandoned_attempt_under_a_live_lease_measures_as_an_attended_lane(
         "with occupancy told honestly the probe can finally report the free "
         "lane that has been ignoring due work"
     )
+
+
+# ---------------------------------------------------------------------------
+# VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED: the probe's occupancy lied to from
+# a THIRD direction -- a lane still executing an item the queue has already
+# handed back.
+#
+# #13366 fixed occupancy counting attendance (a lane whose lease slipped is
+# still holding its lane). #14016 fixed a lane that had stopped working still
+# filling it (the abandoned attempt under a live lease). Both are a claim the
+# probe counts as occupancy it should not. This is the inverse and the probe
+# cannot see it at all: `work_item` records ONE claim while the fleet is
+# holding TWO lanes' worth of work, so `spare_capacity` goes true and the
+# due-ready clock runs in full against a fleet with no free lane.
+#
+# It was reachable because `_heartbeat_loop` measured its tolerance by
+# COUNTING FAILED BEATS -- `consecutive_errors * interval >=
+# visibility_seconds` -- which is elapsed time only if a heartbeat that cannot
+# reach the server fails fast. A severed `voyn-aicc-pgtunnel.service` socket
+# black-holes the call instead, so each failed cycle cost `interval + block`
+# and the lane ran on for `(F + 2)` of them. `tests/worker/test_daemon.py`
+# pins the loop's own arithmetic on an injected clock; this pins what the
+# overrun does to the measurement, through the real protocol.
+# ---------------------------------------------------------------------------
+
+
+def test_a_lane_running_past_its_lease_hides_the_fleets_real_occupancy(
+    monitor,
+) -> None:
+    """THE REGRESSION, measured where the finding is read.
+
+    Two lanes 70 minutes into legitimate attempts with the two surplus
+    dispatched items due behind them (`PlanLimits.wip_limit` is 4 against
+    these 2 lanes) is the healthy shape this branch spent four commits
+    teaching the probe to read: occupancy is full, so the due-ready clock is
+    correctly excused as backpressure.
+
+    Then lane A's beats stop reaching the server, its lease lapses, and
+    `aicc-queue-reaper.timer` does exactly its job -- while lane A is STILL
+    EXECUTING, because the old tolerance would not admit the lapse for another
+    three blocked calls. Now `claimed` is 1 of a declared capacity of 2, and
+    not one lane is free: lane A is running an item it no longer owns and lane
+    B is running a legitimate one. `--claim-capacity` is weighed against
+    `claimed` (#13366), so `evaluate` times the due-ready work in full, and
+    `fleet_idle_seconds` cannot bound it because the surviving claim is
+    seventy minutes old.
+    """
+    from command_center.db.work_queue_admin import WorkQueueAdmin
+
+    measure, app, worker, age = monitor
+    for key in ("lane-a", "lane-b", "surplus-one", "surplus-two"):
+        app.enqueue(QUEUE, idempotency_key=key, payload={"kind": "agent_run"})
+    lane_a = _claim(worker)
+    _claim(worker)
+
+    # Both attempts are 70 minutes old -- `voyn-aicc-worker@.service` allows
+    # one 3660s and `--max-claim-seconds` 5400s -- and the surplus items have
+    # been ready and due behind them all along.
+    age(
+        "UPDATE work_attempt SET created_at = now() - interval '70 minutes', "
+        "updated_at = now() - interval '70 minutes'"
+    )
+    age(
+        "UPDATE work_item SET updated_at = now() - interval '70 minutes', "
+        "available_at = now() - interval '70 minutes'"
+    )
+
+    def report(snapshot):
+        return infra_monitor.evaluate(
+            {}, snapshot, minimum_active_workers=0, max_stalled_seconds=MAX_STALLED,
+            prometheus_ready=True, claim_capacity=2,
+        )
+
+    healthy = measure()
+    assert (healthy.claimed, healthy.attended_claims) == (2, 2)
+    assert healthy.ready_due == 2
+    assert healthy.ready_due_age_seconds > MAX_STALLED
+    assert report(healthy).ok, report(healthy).failures
+
+    # Lane A's lease lapses, and the reaper recovers the item. Nothing about
+    # the fleet changed: lane A has not stopped, it has only stopped being the
+    # owner of what it is running.
+    age(
+        "UPDATE work_attempt SET visible_until = now() - interval '1 second' "
+        "WHERE attempt_id = %s",
+        (lane_a.attempt_id,),
+    )
+    assert WorkQueueAdmin(app._factory).reap() == 1
+
+    # The overrun, aged: the reap was twenty minutes ago and lane A is still
+    # in its handler, so nothing has claimed the item it gave back.
+    age(
+        "UPDATE work_item SET updated_at = now() - interval '70 minutes', "
+        "available_at = now() - interval '70 minutes' WHERE state = 'ready'"
+    )
+    age(
+        "UPDATE work_attempt SET updated_at = now() - interval '20 minutes' "
+        "WHERE state = 'expired'"
+    )
+
+    running_on = measure()
+    # ONE claim, and TWO occupied lanes. Every clock the probe owns is
+    # consistent with the rows it was given, and all of them are wrong about
+    # the fleet.
+    assert (running_on.claimed, running_on.attended_claims) == (1, 1)
+    assert running_on.lapsed_claims == 0, (
+        "the reaper has already recovered the lapse -- this is not the "
+        "lapsed-claim class, which is why no reaper fix reaches it"
+    )
+    assert running_on.ready_due == 3
+    assert running_on.fleet_idle_seconds > MAX_STALLED
+
+    stalled = report(running_on)
+    assert "queue_stalled" in stalled.failures, stalled.failures
+
+    # AND NO FLEET ACTION REACHES IT, which is what made the finding return
+    # after every measurement fix. The reaper has done its job; restarting
+    # lane A only arranges for the next tunnel blip to do this again; and
+    # `queue_redrive` reaches only items that are already dead. The exit is
+    # the lane admitting the lapse WITHIN the window, which is what the
+    # deadline in `_heartbeat_loop` now guarantees -- after which lane A is
+    # back in `run_forever` claiming, so the item it gave back is taken and
+    # the fleet clock moves.
+    taken_back = _claim(worker)
+    assert taken_back.work_item_id == lane_a.work_item_id
+    recovered = measure()
+    assert (recovered.claimed, recovered.attended_claims) == (2, 2)
+    assert recovered.fleet_idle_seconds < MAX_STALLED
+    assert report(recovered).ok, report(recovered).failures
+
+
+def test_the_beat_loop_admits_the_lapse_inside_the_window_it_was_granted(
+    monitor,
+) -> None:
+    """The fix's own half, through the real `queue_claim`/`queue_heartbeat`
+    and the real beat loop: a heartbeat that HANGS and then fails -- the shape
+    a severed tunnel socket produces, and the one the old count-based
+    tolerance mis-timed -- must still stop the handler within the window the
+    server granted.
+
+    The block is a whole beat interval, so the old rule needed
+    `TOLERATED_FAILED_BEATS + 2` cycles of `interval + block`: twice the
+    window at this ratio, and four times it at the 120s a hung `voyn-lease`
+    subprocess is already allowed."""
+    import threading
+    import time
+
+    from command_center.worker.daemon import (
+        WorkerConfig,
+        WorkerDaemon,
+        beat_interval_seconds,
+    )
+
+    measure, app, worker, _age = monitor
+    app.enqueue(QUEUE, idempotency_key="black-holed", payload={"kind": "agent_run"})
+    claimed = _claim(worker, visibility=BLIP_WINDOW)
+
+    interval = beat_interval_seconds(BLIP_WINDOW)
+    attempts: list[float] = []
+
+    def black_holed(_work):
+        attempts.append(time.monotonic() - started)
+        # The call does not answer: it parks on a dead socket for a whole beat
+        # interval and then reports the failure it was sitting on.
+        time.sleep(interval)
+        raise ConnectionError("tunnel black-holed")
+
+    worker.heartbeat = black_holed  # type: ignore[method-assign]
+    daemon = WorkerDaemon(
+        worker, {}, WorkerConfig(queue=QUEUE, visibility_seconds=BLIP_WINDOW)
+    )
+    queue_lease_lost = threading.Event()
+    cancel = threading.Event()
+    beat_stop = threading.Event()
+    started = time.monotonic()
+    thread = threading.Thread(
+        target=daemon._heartbeat_loop,
+        args=(claimed, queue_lease_lost, cancel, beat_stop),
+        daemon=True,
+    )
+    thread.start()
+    cancelled = cancel.wait(BLIP_WINDOW * 4)
+    lost_at = time.monotonic() - started
+    beat_stop.set()
+    thread.join(timeout=5)
+
+    assert cancelled, f"the handler was never stopped: beats at {attempts}"
+    assert queue_lease_lost.is_set(), (
+        "a lapse established by the beat loop must carry the narrow fact, or "
+        "`_execute` writes a report the database is bound to refuse"
+    )
+    # Within the window plus the one call the thread was parked in -- it
+    # cannot act while inside `store.heartbeat`, and bounding that needs a
+    # deadline on the transport rather than on this loop.
+    assert lost_at <= BLIP_WINDOW + interval + 1.0, (
+        f"the lane ran {lost_at - BLIP_WINDOW:.1f}s past a {BLIP_WINDOW}s "
+        f"lease; beats attempted at {attempts}"
+    )
+
+    # And the row it leaves behind is the one the reaper owns, not the one
+    # nothing can see: the lane stopped, so the next claim is a real one.
+    lapsed = measure()
+    assert (lapsed.claimed, lapsed.lapsed_claims) == (1, 1)

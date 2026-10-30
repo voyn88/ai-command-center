@@ -94,6 +94,15 @@ logger = logging.getLogger(__name__)
 # absorb a transient authority blip the way the beat loop does is a real
 # question about SRV-04a's takeover rules, and it is not this finding's to
 # answer unmeasured.
+#
+# ONE THING THE BEAT LOOP DOES THAT THIS ONE WOULD HAVE TO COPY, when that
+# question is answered: its tolerance is a DEADLINE and not a count of failed
+# renewals (`daemon._heartbeat_loop`, VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED).
+# `lease_client.run_lease` is `subprocess.run(..., timeout=120)`, so a failure
+# HERE can take two minutes to arrive -- a third of the 600s TTL this fraction
+# divides. A tolerance expressed as "N renewals may fail" would therefore mean
+# anything between N intervals and N * (interval + 120s) of real time, and only
+# the second of those is what the lease has left.
 _RENEW_FRACTION = 3.0
 _MIN_RENEW_INTERVAL_SECONDS = 1.0
 
@@ -281,6 +290,39 @@ class _Handle:
                 )
                 failure = f"renewal_raised: {error!r}"[:200]
             if failure is not None:
+                if self._stop.is_set():
+                    # THE HOLD IS ALREADY OVER, SO THERE IS NOTHING LEFT TO
+                    # CANCEL (VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED). The
+                    # `_stop` test at the top of the loop is not enough on its
+                    # own: `_acquire_and_provision_hooks` runs
+                    # `subprocess.run(..., timeout=120)`, and `__exit__` joins
+                    # this thread for only 10 seconds before releasing the
+                    # lease and returning. So a renewal already in flight when
+                    # the hold exits outlives it -- and then fails, BECAUSE
+                    # `__exit__` released the row it was renewing.
+                    #
+                    # Setting `_lease_lost` there reaches a run that has
+                    # already finished: this is `worker.handlers`' own
+                    # cancellation event, and `daemon._execute` now REPORTS a
+                    # run this lease cancelled rather than discarding it, so a
+                    # late renewal failure turns a completed, PUBLISHED attempt
+                    # into `queue_fail(retryable => true)`. The item is
+                    # requeued, the next delivery re-runs the whole handler --
+                    # `git push` and PR creation included -- and `queue_claim`
+                    # charges another attempt for it, three of which
+                    # dead-letter healthy work.
+                    #
+                    # Same lesson as `_release` above, which may not decide the
+                    # outcome of the work it was protecting: a lease whose
+                    # lifecycle has ended has no verdict left to give.
+                    logger.warning(
+                        "writer lease renewal for task %s failed after the "
+                        "hold was released (%s); not cancelling -- the run it "
+                        "protected has already finished",
+                        self._cfg.task,
+                        failure,
+                    )
+                    return
                 logger.warning(
                     "writer lease renewal failed for task %s: %s -- "
                     "forcing agent cancellation",
