@@ -71,7 +71,7 @@ def _seed_helpers(cfg, release_sha: str, *, release_bodies: dict[str, bytes], in
     for name, body in installed.items():
         target = cfg.libexec_dir / name
         target.write_bytes(body)
-        target.chmod(0o755)
+        target.chmod(0o644)
 
 
 def _deploy(module, cfg, *, previous: str | None = SHA_A, **kwargs):
@@ -122,7 +122,7 @@ def test_deploy_calls_publish_verify_select_rollout_in_order(tmp_path):
 
     def select(sha):
         order.append(f"select:{sha}")
-        return f"releases/{SHA_A}"
+        return f"releases/{sha}"
 
     def rollout(units):
         order.append(f"rollout:{','.join(units)}")
@@ -398,3 +398,30 @@ def test_release_remote_never_comes_from_the_operator_checkout(monkeypatch):
         pass
     else:
         raise AssertionError("non-https remote must be refused")
+
+
+def test_noop_retries_failed_helper_refresh(tmp_path):
+    module = _module()
+    cfg = _cfg(module, tmp_path)
+    _seed_helpers(cfg, SHA_A,
+        release_bodies={"ops/aicc_agent_launcher.py": b"new"},
+        installed={"aicc-agent-launcher": b"old"})
+    target = cfg.libexec_dir / "aicc-agent-launcher"
+    inode = target.stat().st_ino
+    report = _deploy(module, cfg, resolve_sha=lambda _: SHA_A)
+    assert report.outcome == "NOOP"
+    assert target.read_bytes() == b"new"
+    if sys.platform != "win32":
+        assert target.stat().st_ino != inode
+        assert stat.S_IMODE(target.stat().st_mode) == 0o755
+
+
+def test_dependency_refusal_never_selects(tmp_path):
+    module = _module()
+    cfg = _cfg(module, tmp_path)
+    def forbidden(*a, **k):
+        raise AssertionError("must refuse before publication or selection")
+    report = _deploy(module, cfg, dependency_gate=lambda *a: "dependency_changed",
+        stage=forbidden, select=forbidden)
+    assert report.outcome == "REFUSED"
+    assert report.detail == "dependency_changed"

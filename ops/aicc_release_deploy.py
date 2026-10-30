@@ -405,7 +405,7 @@ def stage_release_tree(
             trusted_uid=cfg.trusted_uid,
             trusted_gid=cfg.trusted_gid,
         )
-        staging = Path()  # published; do not rmtree
+        staging = None  # published; do not remove the working directory
     except BaseException:
         if staging and staging.exists():
             shutil.rmtree(staging, ignore_errors=True)
@@ -683,6 +683,12 @@ def deploy_once(
     report.previous_sha = previous or ""
 
     if previous == target and (cfg.release_root / target).is_dir():
+        try:
+            refreshed = refresh_root_helpers(cfg, target, install_tx=_install_tx)
+        except OSError as exc:
+            return finish("REFUSED", f"helper_refresh_failed:{exc}")
+        if refreshed:
+            report.steps.append("helpers:" + ",".join(refreshed))
         return finish("NOOP", "already_at_target")
 
     gate = dependency_gate or _dependency_change_refuses
