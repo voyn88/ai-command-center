@@ -2566,6 +2566,8 @@ def test_the_control_profile_installs_the_pr_window_tick(tmp_path):
         "voyn-aicc-review.timer",
         "voyn-aicc-merge.service",
         "voyn-aicc-merge.timer",
+        "voyn-aicc-credential-rescue.service",
+        "voyn-aicc-credential-rescue.timer",
         "voyn-aicc-remediate.service",
         "voyn-aicc-remediate.timer",
         "voyn-aicc-pr-window.service",
