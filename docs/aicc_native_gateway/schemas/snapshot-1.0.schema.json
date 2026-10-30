@@ -321,8 +321,15 @@
           "type": "integer"
         },
         "heartbeatAgeSeconds": {
-          "title": "Heartbeatageseconds",
-          "type": "integer"
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Heartbeatageseconds"
         },
         "role": {
           "title": "Role",
