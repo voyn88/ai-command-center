@@ -403,6 +403,69 @@ def test_per_connection_units_are_reaped_and_the_old_corpses_are_cleared():
     assert "systemctl reset-failed 'aicc-agent-launcher@*.service'" in installer
 
 
+def test_a_corpse_latched_before_the_reaping_rule_is_cleared_by_the_next_connection():
+    """`CollectMode=` is forward-only and the installer's clear is one-off.
+
+    A per-connection instance that latched `failed` before the reaping rule
+    reached the host is outside it forever: the instance names a consumed
+    connection, so systemd will never start that name again, no run can clear
+    the latch, and PID 1 keeps the unit loaded only to remember it. One is
+    enough to hold `failed_units` open. The repository's only clear was a
+    one-time `reset-failed` in the installer, so a host that received a new
+    broker any other way -- a generation committed by
+    `aicc-install-transaction`, boot recovery, an out-of-band replacement of
+    /usr/libexec/aicc-agent-launcher -- kept every corpse it already had.
+    worker-01 is that host: 16 corpses latched in the five minutes after its
+    2026-10-30 15:15 reboot, every connection since served without a failure,
+    and the finding standing with nothing left to repair (41104).
+
+    So the broker clears its dead SIBLINGS on teardown. It is the only thing
+    on the host that runs as root on every connection, and it runs even when
+    ExecStart never did -- the 226/NAMESPACE class that produces corpses.
+    """
+    root = Path(__file__).parents[2]
+    launcher_unit = (root / "deploy/systemd/aicc-agent-launcher@.service").read_text()
+    sections = _unit_sections(launcher_unit)
+    clear = "-/usr/bin/systemctl reset-failed aicc-agent-launcher@*.service"
+    # In [Service], where ExecStopPost= is parsed, and as a teardown command:
+    # ExecStopPost runs for an instance whose ExecStart never started, which
+    # is precisely the failure class that leaves corpses behind.
+    assert f"ExecStopPost={clear}" in sections["Service"]
+    # Leading `-`: tidying PID 1's unit table must never turn a connection
+    # that WAS served into the very corpse this exists to stop producing.
+    assert clear.startswith("-")
+    # The glob over siblings, never `%n`/`%i`: a corpse cannot clear itself,
+    # and `reset-failed` touches only units that are failed right now, so a
+    # sibling still serving a connection is left alone.
+    assert "aicc-agent-launcher@*.service" in clear
+    assert "%n" not in clear and "%i" not in clear
+    # Both halves, not alternatives: the rule that keeps PID 1 from ever
+    # holding a new corpse, and the clear that drains the backlog predating it.
+    assert "CollectMode=inactive-or-failed" in sections["Unit"]
+
+    # And it is proven in PID 1, not in the file: the harness pins a corpse
+    # out of CollectMode's reach with a per-instance drop-in, serves one
+    # connection, and keeps an out-of-glob control that must survive -- or the
+    # check cannot see the defect it exists for.
+    harness = (root / "ops/ci/installer-integration/run.sh").read_text()
+    assert (
+        "clear_harness_dropin aicc-agent-launcher@stale.service /bin/false inactive"
+        in harness
+    )
+    assert (
+        "clear_harness_dropin aicc-launcher-clear-control@corpse.service"
+        " /bin/false inactive" in harness
+    )
+    assert (
+        '[ "$(systemctl is-active aicc-agent-launcher@stale.service)" != failed ]'
+        in harness
+    )
+    assert (
+        '[ "$(systemctl is-active aicc-launcher-clear-control@corpse.service)" = failed ]'
+        in harness
+    )
+
+
 def test_shipped_unit_files_keep_unit_directives_in_the_unit_section(tmp_path):
     """The whole class, not just the one directive that got caught: a misplaced
     [Unit] key is silently ignored, so the repo asserting it is not evidence the
