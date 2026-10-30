@@ -411,11 +411,13 @@ def test_spinning_lanes_with_no_success_in_an_hour_are_a_throughput_stall() -> N
     assert healthy.ok
 
 
-def test_findings_are_recorded_and_cleared_through_the_definer_functions(
-    monkeypatch,
-) -> None:
-    from command_center.ops import infra_monitor
+def _stub_findings_pool(monkeypatch) -> list[tuple]:
+    """Stand in for `command_center.db.pool`, recording (sql, params).
 
+    The monitor imports the pool lazily inside `record_findings` precisely so
+    the worker-host probes never need a database; the stub keeps that true
+    for the test that checks what it writes when it does have one.
+    """
     calls: list[tuple] = []
 
     class _Cur:
@@ -464,6 +466,15 @@ def test_findings_are_recorded_and_cleared_through_the_definer_functions(
     monkeypatch.setitem(sys.modules, "command_center.db", fake_db)
     monkeypatch.setitem(sys.modules, "command_center.db.pool", _Pool)
     monkeypatch.setitem(sys.modules, "command_center.db.config", fake_cfg)
+    return calls
+
+
+def test_findings_are_recorded_and_cleared_through_the_definer_functions(
+    monkeypatch,
+) -> None:
+    from command_center.ops import infra_monitor
+
+    calls = _stub_findings_pool(monkeypatch)
     infra_monitor.record_findings("worker-01:infra", ("active_workers:2<4",), {"x": 1})
     recorded = [c for c in calls if "monitor_record_finding" in c[0]]
     # Identity is the failure code, the measurement rides in the detail: the
@@ -477,7 +488,45 @@ def test_findings_are_recorded_and_cleared_through_the_definer_functions(
     )
     calls.clear()
     infra_monitor.record_findings("worker-01:infra", (), {})
-    assert any("monitor_clear_finding" in c[0] for c in calls)
+    cleared = [c for c in calls if "monitor_clear_findings_except" in c[0]]
+    # A tick with no failures keeps an empty keep-list, which clears the
+    # whole source exactly as 0021's monitor_clear_finding(source) did.
+    assert cleared and cleared[0][1] == ("worker-01:infra", [])
+
+
+def test_a_class_that_is_green_again_clears_while_another_probe_is_red(
+    monkeypatch,
+) -> None:
+    """VOYN-MON-WORKER-01-INFRA-DEPLOY-LAG-5ABD205763.
+
+    0021 cleared a source's findings only on a tick with NO failures, so
+    every probe on a host shared one clearing gate. worker-01:infra runs
+    five, and `--unit-health` is red there as a standing fact -- it exists
+    because that host carries units with six-figure NRestarts -- so a
+    `deploy_lag` that had recovered stayed an OPEN finding, and therefore a
+    live P1 task, until something unrelated went green. Clearing is per
+    class: the keep-list is exactly what this tick measured RED.
+    """
+    from command_center.ops import infra_monitor
+
+    calls = _stub_findings_pool(monkeypatch)
+    infra_monitor.record_findings(
+        "worker-01:infra",
+        ("crash_loop:1:ollama.service=315891", "failed_units:2:a.service,b.service"),
+        {"x": 1},
+    )
+    recorded = [c[1][1] for c in calls if "monitor_record_finding" in c[0]]
+    assert recorded == ["crash_loop", "failed_units"]
+    cleared = [c for c in calls if "monitor_clear_findings_except" in c[0]]
+    assert len(cleared) == 1
+    assert cleared[0][1] == ("worker-01:infra", ["crash_loop", "failed_units"])
+    # The recording comes FIRST and the clearing names what is still red, so
+    # a standing finding keeps its row -- its id, its opened_at and the task
+    # the planner linked to it. Clearing first would close and re-open every
+    # standing finding every two minutes.
+    assert [c[0] for c in calls].index(
+        next(c[0] for c in calls if "monitor_record_finding" in c[0])
+    ) < [c[0] for c in calls].index(cleared[0][0])
 
 
 def test_main_exits_non_zero_when_findings_cannot_be_recorded_even_if_healthy(

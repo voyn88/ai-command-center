@@ -1084,34 +1084,58 @@ def record_findings(
     source: str, failures: tuple[str, ...], detail: dict[str, Any]
 ) -> None:
     """Write the measurement to the database through the SECURITY DEFINER
-    functions of migration 0021 (granted to aicc_app and aicc_worker). A red
-    monitor becomes a task the fleet fixes; a healthy one clears its rows.
-    Never lets a recording problem mask the measurement: raises, and main()
-    reports monitor_error while still exiting non-zero."""
+    functions of migrations 0021 and 0029 (granted to aicc_app and
+    aicc_worker). A red class becomes a task the fleet fixes; a class that is
+    green again clears its own row. Never lets a recording problem mask the
+    measurement: raises, and main() reports monitor_error while still exiting
+    non-zero.
+
+    Clearing is PER CLASS, not per tick. 0021 cleared a source's findings
+    only on a tick with no failures at all, so every probe on a host shared
+    one clearing gate: on worker-01:infra, where `--unit-health` is red as a
+    standing fact (the host carries units with six-figure NRestarts -- that
+    is why the probe exists), a `deploy_lag` that had recovered stayed an
+    open finding, and therefore a live P1 task, until something unrelated
+    went green. The planner selects `state = 'open'`, so a row that outlives
+    its measurement is indistinguishable from the outage it described
+    (VOYN-MON-WORKER-01-INFRA-DEPLOY-LAG-5ABD205763).
+    """
     from command_center.db import pool
     from command_center.db.config import load_config
 
     pool.open_pool(load_config())
     try:
         with pool.connection() as conn, conn.cursor() as cur:
-            if failures:
-                for failure in failures:
-                    # Identity is the failure CODE (before the first ':'),
-                    # never the measurement: "dead_letter_growth:53>0" and
-                    # "dead_letter_growth:54>0" are one open finding and one
-                    # task, not one per tick (control-01, 2026-09-08: four
-                    # tasks in ten minutes for the same red probe). The
-                    # measured text travels in the detail.
-                    cur.execute(
-                        "SELECT monitor_record_finding(%s, %s, %s::jsonb)",
-                        (
-                            source,
-                            finding_key(failure),
-                            json.dumps({**detail, "failure": failure}, sort_keys=True),
-                        ),
-                    )
-            else:
-                cur.execute("SELECT monitor_clear_finding(%s)", (source,))
+            measured_red: list[str] = []
+            for failure in failures:
+                # Identity is the failure CODE (before the first ':'),
+                # never the measurement: "dead_letter_growth:53>0" and
+                # "dead_letter_growth:54>0" are one open finding and one
+                # task, not one per tick (control-01, 2026-09-08: four
+                # tasks in ten minutes for the same red probe). The
+                # measured text travels in the detail.
+                key = finding_key(failure)
+                measured_red.append(key)
+                cur.execute(
+                    "SELECT monitor_record_finding(%s, %s, %s::jsonb)",
+                    (
+                        source,
+                        key,
+                        json.dumps({**detail, "failure": failure}, sort_keys=True),
+                    ),
+                )
+            # Recording first and clearing the COMPLEMENT second, never the
+            # other way round: a class that is still red keeps the row it
+            # already has, and with it its finding id, its opened_at and the
+            # task the planner linked to it. Clearing first would close and
+            # re-open every standing finding on every tick -- a new id, a new
+            # task link, and a planner that re-files the same outage every
+            # two minutes. An empty `failures` clears the whole source, which
+            # is what 0021 did on a green tick.
+            cur.execute(
+                "SELECT monitor_clear_findings_except(%s, %s)",
+                (source, measured_red),
+            )
             conn.commit()
     finally:
         pool.close_pool()

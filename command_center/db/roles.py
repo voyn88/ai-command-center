@@ -537,6 +537,9 @@ _WORKER_FUNCTIONS = (
     # 0021: the worker-host fail-closed probe records what it measured.
     "monitor_record_finding(text, text, jsonb)",
     "monitor_clear_finding(text)",
+    # 0029: and clears the classes it measured GREEN, without waiting for
+    # every other probe on the same host to go green too.
+    "monitor_clear_findings_except(text, text[])",
     # A second, narrower fail path for a refusal that names no fault in the
     # work itself (VOYN-W0-AICC-PUBLISH-LEASE-CONTENTION-BURNS-ATTEMPT) --
     # see 0022_queue_fail_lease_wait.
@@ -591,6 +594,9 @@ _APP_BACKLOG_FUNCTIONS = (
     "backlog_set_task_class(text, text)",
     "monitor_record_finding(text, text, jsonb)",
     "monitor_clear_finding(text)",
+    # 0029: per-class clearing, shared with worker hosts for the same reason
+    # as the record/clear pair above.
+    "monitor_clear_findings_except(text, text[])",
     "monitor_link_task(bigint, text)",
     # Audit trail for where a record came from (0020); the importer's stamp
     # that a row was migrated rather than authored directly in the store.
@@ -1060,7 +1066,15 @@ def _require_function_signature(signature: str) -> None:
     for argument in (a.strip() for a in rest[:-1].split(",")):
         if not argument:
             continue
-        _require_identifier(argument)
+        # An array type is `text[]`, which is not a bare identifier and must
+        # not be rejected as one: 0029's per-class finding clear takes the
+        # keep-list as `text[]`. Only the brackets are allowed through, and
+        # only as a suffix, so nothing but `[` and `]` ever reaches the
+        # interpolated statement beyond what the identifier rule permits.
+        element = argument
+        while element.endswith("[]"):
+            element = element[:-2]
+        _require_identifier(element)
 
 
 def _require_identifier(name: str) -> None:

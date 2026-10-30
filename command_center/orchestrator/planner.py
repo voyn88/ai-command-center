@@ -89,6 +89,11 @@ class PlanReport:
     #: (task, failure) pipeline tasks created this tick from open monitor
     #: findings (0021 monitor_finding).
     monitor_tasks: list[tuple[str, str]] = field(default_factory=list)
+    #: (task, failure) re-opened findings linked this tick to a task that was
+    #: already carrying their fix -- reported separately from `monitor_tasks`
+    #: because nothing about the task changed: see
+    #: `_MONITOR_TASK_REFILED_FROM`.
+    monitor_relinked: list[tuple[str, str]] = field(default_factory=list)
     #: Pipeline-class tasks dispatched THROUGH the review-backlog fence this
     #: tick: work that repairs CI, review, merge train, planner or queue must
     #: never wait behind the backlog it exists to drain
@@ -174,6 +179,32 @@ def _monitor_task_id(source: str, failure: str) -> str:
     slug = re.sub(r"[^A-Z0-9]+", "-", f"{source}-{failure}".upper()).strip("-")[:70]
     digest = hashlib.sha256(f"{source}\x00{failure}".encode("utf-8")).hexdigest()[:10].upper()
     return f"VOYN-MON-{slug}-{digest}"
+
+
+#: The statuses from which a RE-OPENED monitor finding may re-file its task.
+#: `backlog_upsert_task` is the importer's reconciliation path and is the one
+#: function allowed to set a status directly, so upserting an existing monitor
+#: task with 'OPEN' does not "re-use" it -- it yanks it back to OPEN. Every
+#: monitor finding re-opens while its own fix is still travelling (a probe
+#: only measures healthy once the fix is merged AND deployed), so that upsert
+#: discarded the run or the review PR carrying the fix and bumped the revision
+#: the in-flight run would later present to `backlog_transition`, which
+#: `backlog_ingest_results` raises on -- taking the whole ingest tick with it.
+#: DONE is the one state where re-filing is the right answer: the fix shipped,
+#: the measurement came back, and that is a new cycle of work.
+_MONITOR_TASK_REFILED_FROM = frozenset({"DONE"})
+
+
+def _monitor_task_is_in_flight(status: str | None) -> bool:
+    """True when a re-opened finding must leave its task exactly as it is.
+
+    Not just the executable states: a task parked with the owner
+    (DEFER_TO_USER), split into children (SPLIT) or waiting on triage
+    (UNTRIAGED, NEEDS_REFINEMENT) is equally not the planner's to reset, and
+    an already-OPEN one needs nothing done to it. A finding whose task does
+    not exist yet (`status is None`) is filed, which is the ordinary path.
+    """
+    return status is not None and status not in _MONITOR_TASK_REFILED_FROM
 
 
 def _split_requested(rows: Any, task_id: str) -> bool:
@@ -366,6 +397,26 @@ class Planner:
                 (),
             ):
                 task_id_for_finding = _monitor_task_id(source, failure)
+                existing = self._rows(
+                    "SELECT status FROM backlog_task WHERE task_id = %s",
+                    (task_id_for_finding,),
+                )
+                status = str(existing[0][0]) if existing else None
+                if _monitor_task_is_in_flight(status):
+                    # The finding re-opened while the work that answers it is
+                    # still in flight. Link the new row to the task that
+                    # already carries that work and touch nothing else -- not
+                    # the status, not the body, not the revision. Linking is
+                    # what keeps this loop from re-reading the same finding
+                    # every tick; see _MONITOR_TASK_REFILED_FROM for what the
+                    # upsert used to do to an IN_PROGRESS or READY_TO_REVIEW
+                    # task instead (VOYN-MON-WORKER-01-INFRA-DEPLOY-LAG).
+                    self._exec(
+                        "SELECT monitor_link_task(%s, %s)",
+                        (finding_id, task_id_for_finding),
+                    )
+                    report.monitor_relinked.append((task_id_for_finding, failure))
+                    continue
                 ok, reason, _changed, _rev = self._row(
                     "SELECT * FROM backlog_upsert_task(%s, %s, %s, %s, %s, %s, %s, %s)",
                     (
