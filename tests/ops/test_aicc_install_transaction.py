@@ -6761,13 +6761,20 @@ def test_an_unknown_staleness_proof_is_refused_rather_than_removed_unproven(
 
 @pytest.mark.parametrize("action", ("validate", "prepare", "apply", "install"))
 def test_every_mutating_cli_action_proves_the_declared_absent_targets_stale(
-    action, tmp_path
+    action, tmp_path, monkeypatch
 ):
     """Both ends of the generation: staging one against an unaccounted-for
     host and applying one whose declared path went live between prepare and
     apply are refused alike. Recovery is deliberately not on this list -- a
     rollback exists to put that very link back."""
     module = _module()
+    # Exercise the real spec construction in a synthetic root. The CI host
+    # does not have the production aicc-agent account or group installed.
+    original_specs = module.default_specs
+    monkeypatch.setattr(
+        module, "default_specs",
+        lambda *args, **kwargs: original_specs(*args, **{**kwargs, "resolve_identities": False}),
+    )
     root = tmp_path / "root"
     state = tmp_path / "state"
     state.mkdir(mode=0o700)
