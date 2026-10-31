@@ -292,6 +292,13 @@ _MONITOR_FINDING_TABLES: dict[str, frozenset[str]] = {
 # execution host has no business reading the programme's plan, and a
 # compromised one must not learn it.
 #
+# The catalog-diff tests in test_grant_compliance.py already cover these
+# tables/functions generically (ALL_TABLES/PRIVILEGES/FUNCTION_PRIVILEGES
+# include them since BO-S1, #326); the behavioural proof this comment
+# deferred to "the next BO slice" — connect as aicc_worker, run the query,
+# observe the denial — landed in BO-S4 as
+# test_worker_cannot_read_backlog_task_when_grants_are_applied.
+
 # #321's grant compliance checker verifies this matrix against the live
 # catalog, and the generic MISSING/EXTRA diff already covers every table and
 # function declared below. VOYN-W0-AICC-GRANTS-ARE-CORRECTNESS-NOT-HYGIENE

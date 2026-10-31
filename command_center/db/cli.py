@@ -25,6 +25,28 @@ from command_center.db import migrations, pool, roles
 from command_center.db.config import ConfigError, load_config
 
 
+def _non_empty_path(value: str) -> str:
+    """Reject an empty ``--output``, the shape an unset systemd
+    ``EnvironmentFile=`` variable produces.
+
+    Braced ``${VAR}`` substitution in a systemd unit always yields exactly
+    one argument, even when ``VAR`` is unset or blank -- it is not
+    word-split away like a shell ``$VAR`` would be. So an unset
+    ``AICC_MASTER_BACKLOG`` does not make ``--output`` go missing (which
+    ``required=True`` alone would catch); it makes it empty, and
+    ``argparse`` accepts an empty string as a supplied value. Left
+    unchecked, ``Path("")`` resolves to ``.``, and
+    ``projection_writer.write_atomically`` then tries to atomically replace
+    the current working directory with a file -- an ``OSError`` with no
+    hint that the real problem is an unset environment variable.
+    """
+    if not value:
+        raise argparse.ArgumentTypeError(
+            "must not be empty (is $AICC_MASTER_BACKLOG set?)"
+        )
+    return value
+
+
 def _review_enqueue(store: Any, *, priority: int = 100) -> Any:
     """Build the ``enqueue(queue, key, payload, task_id, max_attempts)``
     writer that ``review_once``/``publish_review_verdicts`` call.
@@ -108,14 +130,16 @@ def build_parser() -> argparse.ArgumentParser:
     export = sub.add_parser(
         "backlog-export",
         help=(
-            "Render the canonical store as the master-file markdown "
-            "projection (the read format of backlog_client / the console's "
-            "Master Backlog panel)."
+            "One export tick (BO-S4): render the canonical store as the "
+            "master-file markdown projection (the read format of "
+            "backlog_client / the console's Master Backlog panel), run by "
+            "aicc-backlog-export.timer."
         ),
     )
     export.add_argument(
         "--output",
         required=True,
+        type=_non_empty_path,
         help="Destination path; written atomically (tmp + rename), whole file.",
     )
     plan = sub.add_parser(
@@ -486,10 +510,34 @@ def main(argv: list[str] | None = None) -> int:
             if args.command == "backlog-import":
                 from pathlib import Path
 
+                from command_center.db import backlog_export
                 from command_center.db.backlog_parser import parse_backlog
                 from command_center.db.backlog_store import BacklogStore
 
                 text = Path(args.path).read_text(encoding="utf-8")
+                # The bridge's one unenforced precondition, now enforced
+                # (ADR-0011): import reads the AUTHORED file, export writes
+                # the rendering, and the two must never be pointed at each
+                # other. Aimed at a rendering, this command would otherwise
+                # succeed loudly and do nothing at all -- the exporter emits
+                # `- VOYN_RECOMMENDATION | ...` lines, which `parse_backlog`
+                # does not recognise as tasks even to report as `unparsed`
+                # (tests/db/test_backlog_export.py proves that no-op), so
+                # every run would print "inserted 0, updated 0, unchanged 0"
+                # and exit 0 while nothing the owner typed ever reached the
+                # store. A misconfigured path must fail, not look healthy.
+                if backlog_export.is_generated_projection(text):
+                    print(
+                        f"refused: {args.path} is a backlog-export rendering "
+                        "(its header names it a generated projection), not an "
+                        "authored backlog; importing it would report success "
+                        "and change nothing. Point backlog-import at the "
+                        "authored file -- $AICC_MASTER_BACKLOG is this "
+                        "pipeline's output, never its input. See "
+                        "docs/adr/0011-backlog-projection-bidirectional-bridge.md",
+                        file=sys.stderr,
+                    )
+                    return 1
                 if args.parse_only:
                     parsed = parse_backlog(text)
                     print(f"parsed: {len(parsed.tasks)} tasks")
@@ -520,18 +568,23 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
 
             if args.command == "backlog-export":
+                import datetime as _dt
                 from pathlib import Path as _Path
 
                 from command_center import projection_writer
                 from command_center.db import backlog_export
 
                 rows = backlog_export.fetch_rows(conn)
+                # The renderer takes its clock as an argument so it stays a
+                # pure function of its inputs; the tick is what owns "now".
+                generated_at = _dt.datetime.now(_dt.UTC)
                 # Atomic whole-file replace lives in projection_writer — a
                 # reader (the console) must never see a half-written
                 # projection, and durable-write calls must stay out of this
                 # frozen-category module (AIOS boundary gate).
                 projection_writer.write_atomically(
-                    _Path(args.output), backlog_export.render_projection(rows)
+                    _Path(args.output),
+                    backlog_export.render_projection(rows, generated_at=generated_at),
                 )
                 print(f"rendered {len(rows)} records -> {args.output}")
                 return 0

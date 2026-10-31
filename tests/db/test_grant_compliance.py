@@ -603,3 +603,23 @@ def test_compliance_fails_for_function_outside_the_policy(
         "Expected a violation for worker reaching 'undeclared_helper', "
         "but got none.\nAll violations:\n" + "\n".join(violations)
     )
+
+
+def test_worker_cannot_read_backlog_task_when_grants_are_applied(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """A compromised execution host must not be able to read the programme's
+    plan: `_WORKER_BACKLOG_TABLES` declares `backlog_task` (and its siblings)
+    as `_NONE` for `aicc_worker`. Unlike function EXECUTE, PostgreSQL grants
+    no table privilege to PUBLIC by default, so there is no "without grants"
+    mirror here — the worker has no path to this table under any state.
+    """
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+
+    with psycopg.connect(
+        _as_role(test_dsn, roles.WORKER_ROLE, role_passwords),
+        autocommit=True,
+    ) as conn:
+        with conn.cursor() as cur:
+            with pytest.raises(Exception, match="permission denied"):
+                cur.execute("SELECT task_id FROM backlog_task LIMIT 1")
