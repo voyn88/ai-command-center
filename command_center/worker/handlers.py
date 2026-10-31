@@ -92,6 +92,29 @@ _TAIL_CHARS = 4000
 _provision_locks: dict[str, threading.Lock] = {}
 _provision_locks_guard = threading.Lock()
 
+# Lease-authority substrate failures (wrong/missing pgpass, unreachable DSN,
+# tool crash before a contention answer). These name no fault in the work
+# item: burning max_attempts on a broken voyn_lease_client secret is what
+# VOYN-W0-AICC-LEASE-PGPASS-OVERWRITTEN-ON-WORKER-01 did to every
+# implementation attempt until the secret was restored. Contention with
+# another live writer is NOT infra -- that stays on the lease_wait /
+# ordinary retryable path.
+_LEASE_AUTH_INFRA_MARKERS = (
+    "password authentication failed",
+    "writer-lease authority unreachable",
+    "authority unreachable",
+    "could not connect to server",
+    "connection refused",
+    "no password supplied",
+    "fe_sendauth",
+)
+
+
+def _lease_authority_is_infra_failure(reason: str) -> bool:
+    """True when a lease-tool failure is host/secret substrate, not contention."""
+    lowered = reason.lower()
+    return any(marker in lowered for marker in _LEASE_AUTH_INFRA_MARKERS)
+
 
 def _isolated_workspace_path(repository: Path, branch: str) -> Path:
     if agent_runner.principal_isolation_required():
@@ -835,7 +858,15 @@ def _run_agent(
             # substrate, not contention -- `infra_wait`.
             held = blocking_lease(isolated_workspace)
             if held is not None:
-                contention = held.startswith("worktree ")
+                # A held worktree is contention (`lease_wait`). Anything else
+                # the preflight reports is substrate (`infra_wait`). An auth
+                # failure is substrate even if its text also contains a
+                # contention word: a wrong lease pgpass must not spend the
+                # lease-wait budget or dead-letter the item
+                # (VOYN-W0-AICC-LEASE-PGPASS-OVERWRITTEN-ON-WORKER-01).
+                contention = held.startswith("worktree ") and not (
+                    _lease_authority_is_infra_failure(held)
+                )
                 return HandlerOutcome(
                     ok=False,
                     reason=held,
@@ -915,21 +946,22 @@ def _run_agent(
                 except writer_lease.WriterLeaseUnavailable as exc:
                     # Another writer already holds this task's lease, or the
                     # authority refused/could not be reached: a data refusal,
-                    # not a defect in the work. Routing through the ordinary
-                    # retryable path spent `max_attempts` on contention (or
-                    # on a down authority) -- the same burn the publish-side
-                    # `lease_unavailable` path used to inflict on finished
-                    # work (live 2026-09-06 wki_55f316db / wki_e0695c3d).
-                    # Contention refunds via `lease_wait`; an authority /
-                    # tool failure refunds via `infra_wait`.
-                    detail = str(exc).lower()
-                    contention = any(
+                    # not a defect in the work. Contention refunds via
+                    # `lease_wait`; an authority / tool failure refunds via
+                    # `infra_wait`. Auth text is substrate even when it also
+                    # contains "active" or "held"
+                    # (VOYN-W0-AICC-LEASE-PGPASS-OVERWRITTEN-ON-WORKER-01).
+                    reason = f"writer lease unavailable: {exc}"
+                    detail = reason.lower()
+                    contention = not _lease_authority_is_infra_failure(
+                        reason
+                    ) and any(
                         marker in detail
                         for marker in ("held", "active", "lease_unavailable")
                     )
                     return HandlerOutcome(
                         ok=False,
-                        reason=f"writer lease unavailable: {exc}",
+                        reason=reason,
                         retryable=True,
                         lease_wait=contention,
                         infra_wait=not contention,

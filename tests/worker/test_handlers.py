@@ -1787,6 +1787,61 @@ def test_writer_lease_authority_failure_at_dispatch_is_an_infra_wait(
     assert runs == []
 
 
+def test_lease_authority_auth_failure_on_list_is_infra_wait_not_a_spent_attempt(
+    handler, monkeypatch, tmp_path
+) -> None:
+    """VOYN-W0-AICC-LEASE-PGPASS-OVERWRITTEN-ON-WORKER-01: a wrong lease
+    pgpass makes ``voyn-lease list`` die with password authentication
+    failed. That is host substrate, not a task defect -- refund via
+    infra_wait instead of burning max_attempts on every mutating item."""
+    run_agent, runs = handler
+    binary = tmp_path / "fake-voyn-lease"
+    binary.write_text(
+        "#!/bin/sh\n"
+        'echo "password authentication failed for user voyn_lease_client" >&2\n'
+        "exit 1\n"
+    )
+    binary.chmod(0o755)
+    monkeypatch.setenv("VOYN_LEASE_TOOL", str(binary))
+    monkeypatch.setenv("VOYN_LEASE_DSN", "postgresql://authority/present")
+
+    outcome = run_agent(_payload(task_type="implementation"), _event())
+    assert not outcome.ok and outcome.retryable is True
+    assert outcome.lease_wait is False
+    assert outcome.infra_wait is True
+    assert "password authentication failed" in outcome.reason
+    assert runs == []
+
+
+def test_lease_authority_auth_failure_on_acquire_is_infra_wait(
+    handler, monkeypatch, tmp_path
+) -> None:
+    """Same incident class on the acquire path: list succeeds (empty),
+    acquire dies on the broken secret -- still infra, not contention."""
+    run_agent, runs = handler
+    binary = tmp_path / "fake-voyn-lease"
+    binary.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "list" ]; then echo "[]"; exit 0; fi\n'
+        'case "$3" in\n'
+        "  acquire) echo 'password authentication failed for user "
+        "voyn_lease_client' >&2; exit 1 ;;\n"
+        "  *) exit 0 ;;\n"
+        "esac\n"
+    )
+    binary.chmod(0o755)
+    monkeypatch.setenv("VOYN_LEASE_TOOL", str(binary))
+    monkeypatch.setenv("VOYN_LEASE_DSN", "postgresql://authority/present")
+
+    outcome = run_agent(_payload(task_type="implementation"), _event())
+    assert not outcome.ok and outcome.retryable is True
+    assert outcome.lease_wait is False
+    assert outcome.infra_wait is True
+    assert "writer lease unavailable" in outcome.reason
+    assert "password authentication failed" in outcome.reason
+    assert runs == []
+
+
 def test_no_configured_authority_leaves_the_writer_lease_inert_too(
     handler, tmp_path
 ) -> None:

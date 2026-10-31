@@ -22,7 +22,24 @@
 # wrong; both are checked explicitly now and exit nonzero with a logged
 # reason.
 set -euo pipefail
-export PGPASSFILE=/run/voyn-aicc-worker/pgpass
+# Durable lease secret (LoadCredential= source on worker lanes; recovery copy
+# on control-01). The legacy path /run/voyn-aicc-worker/pgpass only exists on
+# a host that still runs a legacy worker lane under that runtime root --
+# control-01 runs this reaper without that unit, so hard-coding it made every
+# reap fail closed with a missing PGPASSFILE
+# (VOYN-W0-AICC-LEASE-PGPASS-OVERWRITTEN-ON-WORKER-01). Prefer the durable
+# root-owned secret; fall back to an active lane materialisation when the
+# durable file is not readable from this principal.
+if [ -r /etc/voyn/secrets/voyn_lease_pgpass ]; then
+  export PGPASSFILE=/etc/voyn/secrets/voyn_lease_pgpass
+elif [ -r /run/aicc-worker-lanes/1/pgpass ]; then
+  export PGPASSFILE=/run/aicc-worker-lanes/1/pgpass
+elif [ -r /run/voyn-aicc-worker/pgpass ]; then
+  export PGPASSFILE=/run/voyn-aicc-worker/pgpass
+else
+  echo "$(date -u +%FT%TZ) FATAL: no readable lease PGPASSFILE (tried /etc/voyn/secrets/voyn_lease_pgpass, /run/aicc-worker-lanes/1/pgpass, /run/voyn-aicc-worker/pgpass)" >&2
+  exit 1
+fi
 export VOYN_LEASE_DSN="host=10.20.0.2 port=5432 dbname=voyn_control user=voyn_lease_client connect_timeout=5"
 REPO=/home/voynadmin/aicc-preprod/repo
 LOG=/home/voynadmin/aicc-preprod/lease_reap.log

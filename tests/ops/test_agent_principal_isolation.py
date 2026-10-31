@@ -1385,6 +1385,9 @@ def test_versioned_os_boundary_acceptance_is_fail_closed():
     assert "aicc-agent-launcher.socket" in verifier
     assert "ProtectControlGroups" in rollout
     assert "AICC_AGENT_PRINCIPAL_BOUNDARY_OK" in verifier
+    assert "aicc_lease_secret.py" in verifier
+    assert "lease secret provenance check failed" in verifier
+    assert "LANE_LEASE_OK" in rollout
     assert "load_workspace_authority_environment" in installer
     assert "/etc/aicc/workspace-authority.env" in installer
     assert "voyn-aicc-worker@.service.d/20-principal-isolation.conf" in transaction

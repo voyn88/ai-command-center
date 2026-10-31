@@ -135,7 +135,27 @@ chown root:aicc-publisher /etc/aicc/workspace-authority.env; chmod 0640 /etc/aic
 for i in 1 2; do printf 'AICC_PUBLISH_OWNER=lane-%s\nVOYN_LEASE_SESSION=lane-%s\n' "$i" "$i" > /etc/aicc/worker-$i.env; chmod 0644 /etc/aicc/worker-$i.env; done
 printf 'AICC_PG_HOST=127.0.0.1\nAICC_PG_PORT=5433\nAICC_PG_USER=aicc_w_wrk_test\nAICC_PG_PASSWORD=secret\n' > /var/lib/voyn-aicc-credential-rotation/worker.env
 chown aicc-rotator:aicc-worker /var/lib/voyn-aicc-credential-rotation/worker.env; chmod 0640 /var/lib/voyn-aicc-credential-rotation/worker.env
-printf '127.0.0.1:5433:*:aicc_w_wrk_test:secret\n' > /etc/voyn/secrets/voyn_lease_pgpass; chmod 0600 /etc/voyn/secrets/voyn_lease_pgpass
+# Lease secret is DISTINCT from worker.env. Seeding this path with the
+# aicc_w_* worker-DB line was the exact shape that overwrote worker-01's
+# live lease secret on 2026-09-10 (VOYN-W0-AICC-LEASE-PGPASS-OVERWRITTEN-
+# ON-WORKER-01). Install via the only supported writer so provenance is
+# recorded and worker-role usernames are refused.
+python3 "$REPO/ops/aicc_lease_secret.py" install \
+  --host 10.20.0.2 --port 5432 --dbname voyn_control \
+  --user voyn_lease_client --password lease-harness-secret \
+  --installed-by installer-integration-harness
+# Stub voyn-lease so the rollout lane-lease probe can list without a live
+# control-plane database (same shape as the stub worker above).
+cat > /usr/local/bin/voyn-lease <<'LEASE'
+#!/bin/sh
+# Integration harness stand-in: proves the lane can invoke the lease tool
+# under its PGPASSFILE / VOYN_LEASE_DSN, not the authority itself.
+case "$1" in
+  list) echo '[]'; exit 0 ;;
+  *) echo "stub voyn-lease: unsupported $*" >&2; exit 1 ;;
+esac
+LEASE
+chmod 0755 /usr/local/bin/voyn-lease
 install -m 0644 "$REPO/deploy/aicc/worker-lanes" /etc/aicc/worker-lanes
 install -m 0644 "$REPO/deploy/aicc/privileged-principals" /etc/aicc/privileged-principals
 install -m 0644 "$REPO/deploy/aicc/agent-workspace-roots" /etc/aicc/agent-workspace-roots
