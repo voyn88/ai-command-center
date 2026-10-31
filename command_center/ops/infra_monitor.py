@@ -84,6 +84,97 @@ class SourceCloneSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class UnitState:
+    restarts: int
+    active_state: str
+    #: ``systemctl show --property=LoadState``: whether this host still has a
+    #: unit file for the name at all.  ``not-found`` means it does not -- see
+    #: ``RETIRED_LOAD_STATE`` and ``evaluate_unit_health``.  Empty when the
+    #: property was not asked for, which is never a retirement.
+    load_state: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class UnitHealthSnapshot:
+    """Every service unit on the host, judged by restarts and failed state.
+
+    worker-01 2026-09-02..14: `ollama.service` restarted every 3 s for twelve
+    days (315 891 restarts) and `voyn-canary.service` every 15 s for eighteen
+    (70 305) while every monitor stayed green, because each probe asked
+    `is-active` of its own hand-picked units and a `Restart=always` unit is
+    `activating` again by the time anyone looks. NRestarts is the number that
+    cannot be hidden. Template instances (per-connection launcher units)
+    collapse to one `template@*.service` in both listings -- crash loops carry
+    the highest NRestarts among the instances, failed units their count -- so
+    a hundred dead connections are one finding, not a hundred.
+
+    A unit this host no longer HAS is reported separately (`retired_units`)
+    and is not a finding: see `evaluate_unit_health`.
+    """
+
+    crash_loops: tuple[tuple[str, int], ...]
+    failed_units: tuple[tuple[str, int], ...]
+    #: Units whose last run latched `failed` and whose unit file this host no
+    #: longer has -- the only reason PID 1 still holds them. Measured and
+    #: reported, deliberately not a failure.
+    retired_units: tuple[tuple[str, int], ...] = ()
+    error: str | None = None
+
+
+#: `systemctl show --property=LoadState` for a name systemd has no unit file
+#: for. Such a unit is kept in PID 1's table only to remember that its last
+#: run failed; see `evaluate_unit_health`.
+RETIRED_LOAD_STATE = "not-found"
+
+#: How many units a finding's detail names before it says `+N more`: the
+#: identity is the class, the listing is for the reader, and an unbounded
+#: listing of instance names is the thing the template collapse exists to stop.
+UNIT_LISTING_CAP = 20
+
+
+@dataclass(frozen=True, slots=True)
+class DeployLagSnapshot:
+    """What production reports versus the branch head it should be running.
+
+    worker-01 2026-09-13 14:48 .. 09-14 18:49: six merged PRs sat behind a
+    refused promotion for 28 hours while test and preprod advanced. A green
+    branch says nothing about what customers run; only comparing the two
+    SHAs does. The clock is the age of the OLDEST undeployed commit as the
+    BRANCH gained it -- not the head's age, which every new merge resets, so
+    a busy branch could stay a day behind and never report, and not the
+    commit object's own date either (worker-01 2026-10-29, monitor_finding
+    #38959: a feature branch written days earlier and merged minutes ago
+    landed commits whose committer dates were already past the grace period,
+    so the probe opened `deploy_lag` the instant any such PR merged and
+    stayed red until production matched the head exactly -- the promotion
+    pipeline was healthy throughout). What the branch gained, and when, is
+    its first-parent chain: see `_first_parent_chain_times`. That oldest
+    undeployed commit is allowed a grace period (CI plus the merge queue
+    plus the promotion tick) before its absence is a finding -- a budget
+    that can only start once the code is ON the branch. A red branch older
+    than the grace period is a finding too, deliberately: a branch that
+    stays red that long is a delivery outage.
+    """
+
+    repo: str
+    branch: str
+    branch_head: str | None
+    deployed_sha: str | None
+    undeployed_commits: int | None
+    lag_seconds: float | None
+    grace_seconds: float
+    error: str | None = None
+
+    @property
+    def lagging(self) -> bool:
+        if self.error is not None or self.branch_head is None or self.deployed_sha is None:
+            return False
+        if not self.undeployed_commits:
+            return False
+        return (self.lag_seconds or 0.0) > self.grace_seconds
+
+
+@dataclass(frozen=True, slots=True)
 class MonitorReport:
     ok: bool
     active_workers: int
@@ -93,6 +184,8 @@ class MonitorReport:
     failures: tuple[str, ...]
     pr_window: PrWindowSnapshot | None = None
     source_clone: SourceCloneSnapshot | None = None
+    unit_health: UnitHealthSnapshot | None = None
+    deploy_lag: DeployLagSnapshot | None = None
 
 
 def parse_worker_units(output: str) -> dict[str, str]:
@@ -419,6 +512,379 @@ def read_source_clone_snapshot(repo_path: str) -> SourceCloneSnapshot:
         )
 
 
+def parse_unit_show(output: str) -> dict[str, UnitState]:
+    """Parse blank-line separated `systemctl show` blocks into unit states."""
+    units: dict[str, UnitState] = {}
+    for block in output.strip().split("\n\n"):
+        fields: dict[str, str] = {}
+        for line in block.splitlines():
+            key, sep, value = line.partition("=")
+            if sep:
+                fields[key.strip()] = value.strip()
+        unit = fields.get("Id")
+        if not unit:
+            continue
+        try:
+            restarts = int(fields.get("NRestarts", "0") or 0)
+        except ValueError:
+            restarts = 0
+        units[unit] = UnitState(
+            restarts=restarts,
+            active_state=fields.get("ActiveState", ""),
+            load_state=fields.get("LoadState", ""),
+        )
+    return units
+
+
+def parse_service_names(output: str) -> list[str]:
+    """Service unit names from `systemctl list-units` output.
+
+    Tolerates the header, the legend footer and the `*`/`●` state marker a
+    non-`--plain` systemd prefixes to failed rows: the row is kept by the
+    first token that ends in `.service`, never by column position, so an
+    older systemd cannot make the probe skip exactly the units it exists to
+    find.
+    """
+    names: set[str] = set()
+    for line in output.splitlines():
+        tokens = line.split()
+        for token in tokens[:2]:
+            if token.endswith(".service"):
+                names.add(token)
+                break
+    return sorted(names)
+
+
+def _template_name(unit: str) -> str:
+    """`aicc-agent-launcher@2079-27636-984.service` -> `aicc-agent-launcher@*.service`."""
+    name, at, rest = unit.partition("@")
+    if not at:
+        return unit
+    suffix = rest[rest.rfind(".") :] if "." in rest else ""
+    return f"{name}@*{suffix}"
+
+
+def evaluate_unit_health(
+    units: dict[str, UnitState], *, crash_loop_restarts: int
+) -> UnitHealthSnapshot:
+    """Split the host's units into faults and residue.
+
+    systemd's `failed` is a LATCH, not a measurement: it records how a unit's
+    last run ended and it survives the condition indefinitely. For a unit this
+    host still has, that latch is actionable -- the next run clears it, and a
+    unit that keeps failing keeps it set, which is the fault this probe exists
+    to see. For a unit this host no longer HAS it is residue: there is no unit
+    file, so it can never run again, can never reach a successful state, and
+    only a privileged `systemctl reset-failed` will ever clear it. Nothing to
+    restart, nothing to repair, nothing measured about the present.
+
+    Those two cases are indistinguishable in `ActiveState` alone, which is why
+    this probe asks for `LoadState` as well. They are not hypothetical: the
+    staged isolated-lane rollout retires `voyn-aicc-worker.service`,
+    `voyn-aicc-worker-2.service` and `aicc-worker.service` by stopping and
+    *disabling* them, and disabling removes the symlink that was their
+    fragment -- so after a rollout those units are deliberately gone
+    (`RETIRED_LEGACY_UNITS` in ops/aicc_install_transaction.py says so in as
+    many words). A stop that reached its timeout latched `failed` on the way
+    out, and `verify_legacy_units_retired` accepted that as drained. systemd
+    garbage-collects a fragment-less unit the moment it is inactive and
+    unreferenced, so the ONLY retired units still in PID 1's table are exactly
+    the ones latched `failed` -- and this probe counted them from the day it
+    was added (worker-01, monitor_finding 2051 and its three successors). No
+    repair could clear that finding, because the units it named no longer
+    existed on the host.
+
+    Residue is not silenced, it is reclassified: `retired_units` carries it
+    into the journalled measurement so an operator can still see what is
+    there. Nor does this blind the probe. A unit file that goes missing while
+    the service matters is not quiet -- the lanes are `active_workers`, the
+    monitor's other classes cover the ticks -- and a unit file that is present
+    but broken loads as `error`/`bad-setting`, not `not-found`, so it stays a
+    fault here.
+
+    NRestarts is residue on the same unit for the same reason (a frozen
+    counter on something that cannot restart), and is excluded with it: were
+    it not, clearing the `failed_units` finding would merely re-raise the same
+    corpses as `crash_loop`.
+    """
+    if crash_loop_restarts < 1:
+        raise ValueError("crash_loop_restarts must be at least 1")
+    loops: dict[str, int] = {}
+    failed: dict[str, int] = {}
+    retired: dict[str, int] = {}
+    for unit, state in units.items():
+        key = _template_name(unit)
+        if state.load_state == RETIRED_LOAD_STATE:
+            # Only the latched ones are residue worth reporting. A
+            # fragment-less unit that is merely inactive is a dangling
+            # dependency reference -- `Wants=prometheus.service` on a host
+            # without Prometheus, `After=postgresql@16-main.service` on a
+            # host whose database is elsewhere -- which is not a unit at all
+            # and has never been a finding. Counted like failed_units (one
+            # entry per template, instances summed), because the launcher's
+            # per-connection corpses reach this branch too once the template
+            # file is removed.
+            if state.active_state == "failed":
+                retired[key] = retired.get(key, 0) + 1
+            continue
+        if state.restarts >= crash_loop_restarts:
+            loops[key] = max(loops.get(key, 0), state.restarts)
+        if state.active_state == "failed":
+            failed[key] = failed.get(key, 0) + 1
+    return UnitHealthSnapshot(
+        crash_loops=tuple(sorted(loops.items())),
+        failed_units=tuple(sorted(failed.items())),
+        retired_units=tuple(sorted(retired.items())),
+    )
+
+
+def _unit_listing(entries: tuple[tuple[str, int], ...]) -> str:
+    shown = ",".join(f"{unit}={count}" for unit, count in entries[:UNIT_LISTING_CAP])
+    hidden = len(entries) - UNIT_LISTING_CAP
+    return f"{shown},+{hidden}_more" if hidden > 0 else shown
+
+
+def read_unit_health_snapshot(*, crash_loop_restarts: int) -> UnitHealthSnapshot:
+    """Two unprivileged systemctl calls for the whole host, never raising."""
+    try:
+        listed = subprocess.run(
+            [
+                "systemctl",
+                "list-units",
+                "--type=service",
+                "--all",
+                "--plain",
+                "--no-legend",
+                "--no-pager",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        names = parse_service_names(listed.stdout)
+        if not names:
+            raise RuntimeError("systemctl listed no service units")
+        shown = subprocess.run(
+            [
+                "systemctl",
+                "show",
+                # LoadState is not decoration: without it every unit's
+                # `load_state` is empty, the residue branch in
+                # `evaluate_unit_health` never fires, and the retired corpses
+                # are counted as faults again. A unit test asserts this argv.
+                "--property=Id,LoadState,NRestarts,ActiveState",
+                "--no-pager",
+                "--",
+                *names,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        units = parse_unit_show(shown.stdout)
+        # A unit that `show` silently dropped is a unit the probe did not
+        # judge; a partial answer is a failed measurement, not a clean host.
+        if set(units) != set(names):
+            raise RuntimeError(
+                f"systemctl show returned {len(units)} of {len(names)} units"
+            )
+        return evaluate_unit_health(units, crash_loop_restarts=crash_loop_restarts)
+    except Exception as exc:  # noqa: BLE001 - see read_pr_window_snapshot
+        return UnitHealthSnapshot(
+            crash_loops=(),
+            failed_units=(),
+            error=f"{type(exc).__name__}: {exc}"[:200],
+        )
+
+
+def _fetch_json(url: str, timeout: int = 5) -> dict[str, Any]:
+    """GET a small loopback/LAN JSON document with the same URL hygiene as
+    the Prometheus probe (no credentials in the URL, http(s) only)."""
+    parsed = urlsplit(url)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise RuntimeError("version url must be a plain http(s) url")
+    client = (
+        http.client.HTTPSConnection
+        if parsed.scheme == "https"
+        else http.client.HTTPConnection
+    )
+    connection = client(parsed.hostname, parsed.port, timeout=timeout)
+    try:
+        target = parsed.path or "/"
+        if parsed.query:
+            target = f"{target}?{parsed.query}"
+        connection.request("GET", target)
+        response = connection.getresponse()
+        body = response.read(64 * 1024).decode("utf-8", errors="replace")
+        if response.status != 200:
+            raise RuntimeError(f"version url returned {response.status}")
+        document = json.loads(body)
+    finally:
+        connection.close()
+    if not isinstance(document, dict):
+        raise TypeError("version url returned no object")
+    return document
+
+
+def _gh_api_json(path: str) -> Any:
+    completed = subprocess.run(
+        ["gh", "api", path],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=60,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(f"gh api failed: {(completed.stderr or '').strip()[:120]}")
+    return json.loads(completed.stdout or "{}")
+
+
+def _committer_time(commit: Any) -> float | None:
+    if not isinstance(commit, dict):
+        return None
+    inner = commit.get("commit")
+    if not isinstance(inner, dict):
+        return None
+    committer = inner.get("committer")
+    if not isinstance(committer, dict):
+        return None
+    return _parse_iso8601(str(committer.get("date") or ""))
+
+
+def _first_parent_chain_times(commits: list[Any], head: str) -> list[float]:
+    """Committer dates of the undeployed commits that LANDED on the branch:
+    its first-parent chain, walked from the head down to the first parent
+    outside the compared range.
+
+    A commit object's committer date is when someone wrote it, which is when
+    the branch gained it only for commits pushed, squashed or rebased onto
+    it. A merge commit carries its whole feature branch at the branch's own
+    ages, so dating the range by the oldest commit OBJECT in it charges the
+    promotion pipeline for everything that happened before the code was
+    mergeable at all. The first-parent chain is exactly what the branch
+    itself gained, each entry dated when it was gained (GitHub stamps the
+    merge/squash/rebase commit at merge time), so the oldest date on it is
+    when the branch first held something production does not run.
+
+    Returns [] when the chain cannot be walked end to end -- a compare page
+    truncated at its 250-commit cap (which keeps the OLDEST commits, so the
+    head is not in the payload at all), a payload without `parents`, a
+    cycle, or a commit without a date -- so the caller falls back to dating
+    the commit objects rather than trusting a partial walk.
+    """
+    by_sha: dict[str, dict[str, Any]] = {}
+    for commit in commits:
+        if isinstance(commit, dict):
+            sha = str(commit.get("sha") or "")
+            if sha:
+                by_sha[sha] = commit
+    times: list[float] = []
+    sha, seen = head, set()
+    while sha in by_sha and sha not in seen:
+        seen.add(sha)
+        commit = by_sha[sha]
+        when = _committer_time(commit)
+        if when is None:
+            return []
+        times.append(when)
+        parents = commit.get("parents")
+        first = parents[0] if isinstance(parents, list) and parents else None
+        sha = str(first.get("sha") or "") if isinstance(first, dict) else ""
+    # A complete walk leaves the range through a real first parent (the merge
+    # base side). Anything else -- an empty `parents`, a cycle, a head the
+    # truncated page never carried -- is not a chain to date the lag from.
+    if not times or not sha or sha in by_sha:
+        return []
+    return times
+
+
+def read_deploy_lag_snapshot(
+    repo: str, version_url: str, *, branch: str, grace_seconds: float
+) -> DeployLagSnapshot:
+    """One GET of what runs, one `gh api` for the branch head, and -- only
+    when they differ -- one `gh api` compare to count the undeployed commits
+    and date the oldest one by when the branch gained it. Never raises.
+
+    `gh` authenticates from the unit's GH_CONFIG_DIR (the fleet's GitHub App
+    store on the worker), never from a token in arguments or logs.
+    """
+    try:
+        deployed = _fetch_json(version_url)
+        deployed_sha = str(deployed.get("release_sha") or "").strip()
+        if not deployed_sha:
+            raise RuntimeError("version document carries no release_sha")
+        commit = _gh_api_json(f"repos/{repo}/commits/{branch}")
+        head = str(commit.get("sha") or "").strip() if isinstance(commit, dict) else ""
+        if not head:
+            raise RuntimeError("gh api returned no branch head sha")
+        if deployed_sha == head:
+            return DeployLagSnapshot(
+                repo=repo,
+                branch=branch,
+                branch_head=head,
+                deployed_sha=deployed_sha,
+                undeployed_commits=0,
+                lag_seconds=0.0,
+                grace_seconds=grace_seconds,
+            )
+        compared = _gh_api_json(f"repos/{repo}/compare/{deployed_sha}...{head}")
+        if not isinstance(compared, dict):
+            raise TypeError("gh api compare returned no object")
+        status = str(compared.get("status") or "")
+        commits = compared.get("commits")
+        if not isinstance(commits, list):
+            raise TypeError("gh api compare returned no commit list")
+        if status in {"identical", "behind"}:
+            # Production runs the head or something newer than it (a rolled
+            # forward hotfix, a branch swap): nothing is waiting to deploy.
+            undeployed, lag = 0, 0.0
+        else:
+            # The clock is when the BRANCH gained its oldest undeployed
+            # commit, not when that commit was written; the commit objects
+            # are the fallback for a range this probe cannot walk.
+            times = _first_parent_chain_times(commits, head) or [
+                t for t in (_committer_time(c) for c in commits) if t is not None
+            ]
+            if not times:
+                raise RuntimeError("gh api compare listed commits without dates")
+            total = compared.get("total_commits")
+            # `total_commits` counts the whole range; `commits` stops at one
+            # page, so a long stall must not report a smaller backlog.
+            undeployed = (
+                int(total)
+                if isinstance(total, int) and not isinstance(total, bool) and total > 0
+                else len([c for c in commits if isinstance(c, dict)])
+            )
+            lag = max(time.time() - min(times), 0.0)
+        return DeployLagSnapshot(
+            repo=repo,
+            branch=branch,
+            branch_head=head,
+            deployed_sha=deployed_sha,
+            undeployed_commits=undeployed,
+            lag_seconds=lag,
+            grace_seconds=grace_seconds,
+        )
+    except Exception as exc:  # noqa: BLE001 - see read_pr_window_snapshot
+        return DeployLagSnapshot(
+            repo=repo,
+            branch=branch,
+            branch_head=None,
+            deployed_sha=None,
+            undeployed_commits=None,
+            lag_seconds=None,
+            grace_seconds=grace_seconds,
+            error=f"{type(exc).__name__}: {exc}"[:200],
+        )
+
+
 def prometheus_is_ready(url: str) -> bool:
     connection: http.client.HTTPConnection | None = None
     try:
@@ -460,6 +926,8 @@ def evaluate(
     max_recent_dead: int = 0,
     pr_window: PrWindowSnapshot | None = None,
     source_clone: SourceCloneSnapshot | None = None,
+    unit_health: UnitHealthSnapshot | None = None,
+    deploy_lag: DeployLagSnapshot | None = None,
 ) -> MonitorReport:
     active_workers = sum(state == "active" for state in worker_states.values())
     failures: list[str] = []
@@ -478,8 +946,13 @@ def evaluate(
         )
         if queue.ready + queue.claimed > 0 and pending_is_stale:
             failures.append("queue_stalled")
-        if queue.recent_dead > max_recent_dead:
-            failures.append(f"dead_letter_growth:{queue.recent_dead}>{max_recent_dead}")
+        # Quota/spend refusals are counted below under their own class; the
+        # same death must not also raise dead_letter_growth (live 2026-09-15:
+        # every hour with a Codex-quota preflight death opened a growth
+        # finding on control-01 -- one cause, two tasks).
+        unexplained_dead = max(queue.recent_dead - queue.recent_quota_dead, 0)
+        if unexplained_dead > max_recent_dead:
+            failures.append(f"dead_letter_growth:{unexplained_dead}>{max_recent_dead}")
         # Executor quota/spend/rate refusals are a capacity fact the fleet
         # cannot retry through; surface them as their own class so routing
         # (quota-aware cascade) and budgets get a task, not a guess.
@@ -519,6 +992,34 @@ def evaluate(
             remote = (source_clone.remote_head or "unknown")[:12]
             failures.append(f"source_clone_stale:{local}!={remote}")
 
+    if unit_health is not None:
+        if unit_health.error is not None:
+            failures.append(f"unit_health_probe_failed:{unit_health.error}")
+        else:
+            # One finding per class, every unit in the detail: the identity
+            # is the code before the first ':' (`finding_key`).
+            if unit_health.crash_loops:
+                failures.append(
+                    f"crash_loop:{len(unit_health.crash_loops)}"
+                    f":{_unit_listing(unit_health.crash_loops)}"
+                )
+            if unit_health.failed_units:
+                failures.append(
+                    f"failed_units:{len(unit_health.failed_units)}"
+                    f":{_unit_listing(unit_health.failed_units)}"
+                )
+
+    if deploy_lag is not None:
+        if deploy_lag.error is not None:
+            failures.append(f"deploy_lag_probe_failed:{deploy_lag.error}")
+        elif deploy_lag.lagging:
+            failures.append(
+                f"deploy_lag:{deploy_lag.repo}:{(deploy_lag.deployed_sha or '')[:8]}"
+                f"!={(deploy_lag.branch_head or '')[:8]}"
+                f"_{deploy_lag.undeployed_commits}_commits"
+                f"_{int(deploy_lag.lag_seconds or 0)}s>{int(deploy_lag.grace_seconds)}s"
+            )
+
     return MonitorReport(
         ok=not failures,
         active_workers=active_workers,
@@ -528,7 +1029,26 @@ def evaluate(
         failures=tuple(failures),
         pr_window=pr_window,
         source_clone=source_clone,
+        unit_health=unit_health,
+        deploy_lag=deploy_lag,
     )
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return parsed
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse and cross-validate: a half-configured deploy-lag probe is a
+    usage error argparse reports, not a monitoring failure that pages."""
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if bool(args.deploy_lag_repo) != bool(args.deploy_lag_version_url):
+        parser.error("--deploy-lag-repo and --deploy-lag-version-url must be given together")
+    return args
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -600,6 +1120,34 @@ def build_parser() -> argparse.ArgumentParser:
             "a red monitor into a pipeline task instead of a failed unit."
         ),
     )
+    parser.add_argument(
+        "--unit-health",
+        action="store_true",
+        help="Read every service unit on the host: NRestarts crash loops and failed units.",
+    )
+    parser.add_argument(
+        "--crash-loop-restarts",
+        type=_positive_int,
+        default=5,
+        help="NRestarts at or above which a unit is a crash loop (default 5, minimum 1).",
+    )
+    parser.add_argument(
+        "--deploy-lag-repo",
+        default=None,
+        help="GitHub owner/name whose branch head production must run (off by default).",
+    )
+    parser.add_argument(
+        "--deploy-lag-version-url",
+        default=None,
+        help="URL of the deployed service's /version document carrying release_sha.",
+    )
+    parser.add_argument("--deploy-lag-branch", default="main")
+    parser.add_argument(
+        "--deploy-lag-grace-seconds",
+        type=float,
+        default=2700.0,
+        help="How old the branch head may be before its absence from production is a finding.",
+    )
     return parser
 
 
@@ -649,11 +1197,14 @@ def record_findings(
 def _json_report(report: MonitorReport) -> dict[str, Any]:
     payload = asdict(report)
     payload["failures"] = list(report.failures)
+    if report.deploy_lag is not None:
+        # `asdict` serialises fields only; the verdict is a property.
+        payload["deploy_lag"]["lagging"] = report.deploy_lag.lagging
     return payload
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    args = parse_args(argv)
     try:
         workers = {} if args.skip_workers else discover_worker_units()
         queue = None if args.skip_queue else read_queue_snapshot()
@@ -672,6 +1223,21 @@ def main(argv: list[str] | None = None) -> int:
             if args.source_clone_repo
             else None
         )
+        unit_health = (
+            read_unit_health_snapshot(crash_loop_restarts=args.crash_loop_restarts)
+            if args.unit_health
+            else None
+        )
+        deploy_lag = (
+            read_deploy_lag_snapshot(
+                args.deploy_lag_repo,
+                args.deploy_lag_version_url,
+                branch=args.deploy_lag_branch,
+                grace_seconds=args.deploy_lag_grace_seconds,
+            )
+            if args.deploy_lag_repo
+            else None
+        )
         report = evaluate(
             workers,
             queue,
@@ -681,6 +1247,8 @@ def main(argv: list[str] | None = None) -> int:
             max_recent_dead=args.max_recent_dead,
             pr_window=pr_window,
             source_clone=source_clone,
+            unit_health=unit_health,
+            deploy_lag=deploy_lag,
         )
     except Exception as exc:  # noqa: BLE001 - the monitor itself must fail closed
         print(json.dumps({"ok": False, "failures": [f"monitor_error:{exc}"]}))

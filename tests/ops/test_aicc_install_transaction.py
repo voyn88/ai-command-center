@@ -1191,6 +1191,24 @@ def test_release_selection_arms_pending_selector_without_clobber(monkeypatch, tm
         transaction.select_release(release_id, tmp_path)
 
 
+def test_grok_driver_installs_from_release_as_worker_only_helper(tmp_path):
+    module = _module()
+    repo = Path(__file__).parents[2]
+    kwargs = {
+        "authority_env": tmp_path / "authority.env",
+        "claude_auth": tmp_path / "claude.json",
+        "codex_auth": tmp_path / "codex.json",
+        "resolve_identities": False,
+    }
+    specs = {s.target: s for s in module.default_specs(repo, **kwargs)}
+    driver = specs["/usr/libexec/aicc-grok-agent"]
+    assert driver.source == repo / "ops/aicc_grok_agent.py"
+    assert (driver.mode, driver.uid, driver.gid) == (0o755, 0, 0)
+    assert driver.target in module.WORKER_ONLY_TARGETS
+    targets = list(specs)
+    assert targets.index(driver.target) < targets.index("/usr/libexec/aicc-agent-launcher")
+
+
 def test_recovery_generator_is_a_permanent_pretransaction_anchor(tmp_path):
     module = _module()
     repo = Path(__file__).parents[2]
@@ -1242,6 +1260,9 @@ def test_same_boot_barrier_is_active_before_first_wal_or_claimer_start():
     source_refresh = commands.index(
         "systemctl enable --now voyn-aicc-source-clone-refresh.timer"
     )
+    worker_release = commands.index(
+        "systemctl enable --now voyn-aicc-worker-release-deploy.timer"
+    )
 
     assert (
         anchor
@@ -1251,8 +1272,10 @@ def test_same_boot_barrier_is_active_before_first_wal_or_claimer_start():
         < prepare
         < launcher
         < source_refresh
+        < worker_release
     )
     assert "systemctl enable aicc-principal-recovery.service" not in installer
+    assert "systemctl disable --now voyn-aicc-self-deploy.timer" in installer
 
 
 def test_boot_recovery_restores_dynamic_worker_and_auxiliary_unit_state(tmp_path):
@@ -2831,6 +2854,12 @@ def _purge_runner(
             if command[3] in disable_fails:
                 return SimpleNamespace(returncode=1, stderr="denied", stdout="")
             return SimpleNamespace(returncode=0, stderr="", stdout="")
+        if verb == "reset-failed":
+            # The post-barrier un-latch. Declared rather than silently
+            # accepted, so a test can assert which units were cleared and
+            # when -- `failed` survives `apply()` removing the unit file, and
+            # the host probe counts what is failed NOW.
+            return SimpleNamespace(returncode=0, stderr="", stdout="")
         raise AssertionError(f"unexpected systemctl call: {command}")
 
     return run
@@ -2855,6 +2884,46 @@ def test_quiesce_worker_only_units_stops_and_disables_what_is_loaded(tmp_path):
         "aicc-agent-launcher.socket",
         "voyn-aicc-worker@a.service",
     }
+
+
+def test_the_control_purge_un_latches_what_it_proved_drained(tmp_path):
+    """VOYN-MON-WORKER-01-INFRA-FAILED-UNITS, control-profile half.
+
+    `_QUIESCED_ACTIVE_STATES` accepts `failed` as drained -- a unit that died
+    is not running -- and `apply()` then deletes its unit file. But `failed`
+    is a latch that only a successful run or `reset-failed` clears, and a
+    unit with no fragment can never run again: the latch becomes permanent
+    state in PID 1's table for a unit that no longer exists, which is exactly
+    what the host unit-health probe reported as `failed_units`. The clear
+    must come AFTER the drain barrier -- on a unit still shutting down it
+    would clear nothing and the stop could latch again behind it.
+    """
+    module = _module()
+    calls = []
+    run = _purge_runner(
+        workers=("voyn-aicc-worker@a.service",),
+        loaded={"aicc-agent-launcher.socket", "voyn-aicc-worker@a.service"},
+        launchers=("aicc-agent-launcher@7-7-9.service",),
+        calls=calls,
+        busy={"voyn-aicc-worker@a.service": 2},
+    )
+
+    module.quiesce_worker_only_units(run=run, sleep=lambda _seconds: None)
+
+    cleared = [call[2] for call in calls if call[1] == "reset-failed"]
+    assert "voyn-aicc-worker@a.service" in cleared
+    assert "aicc-agent-launcher.socket" in cleared
+    assert "aicc-agent-launcher@7-7-9.service" in cleared
+    # After the barrier, not before: the last `show` that proved this unit
+    # drained precedes the clear.
+    verbs = [(call[1], call[2] if len(call) > 2 else "") for call in calls]
+    clear_at = verbs.index(("reset-failed", "voyn-aicc-worker@a.service"))
+    drain_probes = [
+        index
+        for index, (verb, unit) in enumerate(verbs)
+        if verb == "show" and unit == "voyn-aicc-worker@a.service"
+    ]
+    assert drain_probes and max(drain_probes) < clear_at
 
 
 def test_quiesce_worker_only_units_tolerates_a_host_that_never_ran_the_worker_profile(
@@ -3466,6 +3535,18 @@ def test_the_control_purge_covers_every_retired_worker_unit():
     )
     assert (
         "/etc/systemd/system/voyn-aicc-source-clone-refresh.timer"
+        in module.WORKER_ONLY_TARGETS
+    )
+    assert (
+        "/usr/libexec/aicc-worker-release-deploy"
+        in module.WORKER_ONLY_TARGETS
+    )
+    assert (
+        "/etc/systemd/system/voyn-aicc-worker-release-deploy.service"
+        in module.WORKER_ONLY_TARGETS
+    )
+    assert (
+        "/etc/systemd/system/voyn-aicc-worker-release-deploy.timer"
         in module.WORKER_ONLY_TARGETS
     )
     # The boot recovery capsule is the one agent-adjacent unit that must keep
