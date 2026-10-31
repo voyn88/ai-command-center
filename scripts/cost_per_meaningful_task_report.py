@@ -23,12 +23,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from command_center.cost_report import (
-    cost_per_meaningful_task,
-    render_markdown,
-)
-from command_center.runtime import db as runtime_db
-
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -44,6 +38,12 @@ def main(argv: list[str] | None = None) -> int:
         help="Print a JSON array of agent reports instead of a markdown table.",
     )
     args = parser.parse_args(argv)
+
+    from command_center.cost_report import (
+        cost_per_meaningful_task,
+        render_markdown,
+    )
+    from command_center.runtime import db as runtime_db
 
     db_path = args.db_path or runtime_db.resolve_db_path()
     reports = cost_per_meaningful_task(db_path)
