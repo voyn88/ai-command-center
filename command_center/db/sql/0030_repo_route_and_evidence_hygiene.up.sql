@@ -1,125 +1,5 @@
--- VOYN-W0-AICC-REPO-ROUTE-AND-EVIDENCE-HYGIENE.
---
--- Two independent sources of a task stuck forever, neither ever escalated:
---
--- 1. **A repo the planner can never route.** `unknown_repo_route` (and
---    `no_repo`) are report lines only (planner.py) -- correct, in that an
---    unroutable repo must never dispatch into a guaranteed dead-letter, but
---    incomplete, in that nothing ever moves the task off OPEN either. A repo
---    typo or a genuinely repo-less task (an idea, a decision record filed as
---    an executable task by mistake) sits reported, identically, forever.
---    `backlog_park_unroutable` is the machine's answer: the planner calls it
---    on every tick it cannot route a candidate, and once the SAME OPEN spell
---    has been unroutable continuously for `p_grace_seconds` (default 24h --
---    long enough for an operator to add a missing route without a task
---    flapping into NEEDS_REFINEMENT for what was really a two-minute
---    config gap), it parks the task NEEDS_REFINEMENT instead of reporting
---    it again next tick. Editing the task (repo field included), or any
---    other granted mutation, buys a fresh grace window -- an old streak
---    from before a fix must never park a task the fix already resolved.
---
--- 2. **'pr' evidence that was never a real, resolvable PR.** Every
---    downstream gate (review_once, publish_review_verdicts, merge_once)
---    resolves 'pr' evidence through the live GitHub API; a value that can
---    never resolve -- a self-reported URL an agent garbled in its own
---    result text (not the trusted `gh pr list`-derived path
---    `reconcile_pr_evidence` already uses), or a hand-inserted one from an
---    operator recovering a stuck task by hand -- produces the exact same
---    `pr_view_failed`/`pr_diff_fetch_failed` skip line every tick,
---    permanently, because nothing ever removes it. Two closes:
---    * At record time: `backlog_ingest_results` now refuses to record a
---      `pr_url` that is not shaped like a real GitHub PR URL
---      (`https://github.com/<owner>/<repo>/pull/<digits>`) -- treated
---      exactly like "no PR published", an exhausted cascade attempt, never
---      evidence.
---    * On each tick: `backlog_clear_evidence` lets the orchestrator (which
---      has the `gh` access to actually resolve a URL) remove a value it has
---      PROVEN can never become a review -- never one it merely failed to
---      look up this one time, which stays exactly as retryable as before.
---      Clearing the LAST 'pr' row on a READY_TO_REVIEW task would otherwise
---      trade one dead end for another -- no work_item is running for a
---      READY_TO_REVIEW task, so nothing would ever ingest it a fresh pr_url,
---      and it would sit invisible (no evidence to join on) instead of merely
---      skipped. `backlog_clear_evidence` closes that too: the same call that
---      empties a task's 'pr' evidence also sends it back for a fresh
---      attempt -- OPEN the first time, DEFER_TO_USER on a repeat (the same
---      escalation `backlog_return_to_pool` already uses for IN_PROGRESS
---      exhaustion), so a task that keeps producing bad evidence stops
---      silently re-dispatching into the same failure.
---
--- This migration is numbered 0030 because 0017 was already consumed by
--- backlog_resume_window on current main; the prior closed PR673 patch is
--- reused here against the 0021 split-aware ingest body, not against 0011.
-
--- ---------------------------------------------------------------------------
--- backlog_park_unroutable -- OPEN -> NEEDS_REFINEMENT for a repo the
--- planner has been unable to route for a sustained period.
--- ---------------------------------------------------------------------------
-CREATE FUNCTION backlog_park_unroutable(
-    p_task_id text, p_reason text, p_grace_seconds integer DEFAULT 86400
-) RETURNS backlog_verdict
-    LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, public AS $$
-DECLARE
-    t backlog_task%ROWTYPE;
-    v backlog_verdict;
-    v_first_seen timestamptz;
-BEGIN
-    v.ok := false;
-    SELECT * INTO t FROM backlog_task b WHERE b.task_id = p_task_id FOR UPDATE;
-    IF NOT FOUND THEN
-        PERFORM _backlog_audit(NULL, 'repo_route', 'rejected', 'unknown_task',
-                               jsonb_build_object('requested_task_id', p_task_id));
-        v.reason := 'unknown_task';
-        RETURN v;
-    END IF;
-    IF t.kind = 'gate' THEN
-        PERFORM _backlog_audit(p_task_id, 'repo_route', 'rejected', 'gate_is_control_record');
-        v.reason := 'gate_is_control_record'; v.revision := t.revision;
-        RETURN v;
-    END IF;
-    IF t.status <> 'OPEN' THEN
-        PERFORM _backlog_audit(p_task_id, 'repo_route', 'rejected', 'not_open',
-                               jsonb_build_object('status', t.status));
-        v.reason := 'not_open'; v.revision := t.revision;
-        RETURN v;
-    END IF;
-
-    -- The current streak's start: the earliest 'repo_route' rejection on
-    -- record since the last GRANTED mutation that could plausibly have
-    -- fixed it (the repo field changing via upsert, or the task moving at
-    -- all). Without this boundary a task fixed and re-broken later would
-    -- inherit its first, long-expired streak and park on the very next
-    -- tick instead of getting its own fresh grace window.
-    SELECT min(e.created_at) INTO v_first_seen
-      FROM backlog_event e
-     WHERE e.task_id = p_task_id
-       AND e.event = 'repo_route' AND e.outcome = 'rejected'
-       AND NOT EXISTS (
-           SELECT 1 FROM backlog_event e2
-            WHERE e2.task_id = p_task_id AND e2.outcome = 'granted'
-              AND e2.event IN ('upsert', 'transition', 'triage',
-                               'dispatch', 'return_to_pool', 'resume_deferred')
-              AND e2.event_id > e.event_id);
-
-    PERFORM _backlog_audit(p_task_id, 'repo_route', 'rejected', p_reason);
-
-    IF v_first_seen IS NULL
-       OR now() - v_first_seen < make_interval(secs => greatest(p_grace_seconds, 0)) THEN
-        v.ok := true; v.reason := 'observed'; v.revision := t.revision;
-        RETURN v;
-    END IF;
-
-    UPDATE backlog_task b
-       SET status = 'NEEDS_REFINEMENT', revision = b.revision + 1, updated_at = now()
-     WHERE b.task_id = p_task_id
-    RETURNING b.revision INTO v.revision;
-    PERFORM _backlog_audit(p_task_id, 'repo_route', 'granted', p_reason,
-                           jsonb_build_object('target', 'NEEDS_REFINEMENT',
-                                              'unrouted_since', v_first_seen));
-    v.ok := true; v.reason := 'NEEDS_REFINEMENT';
-    RETURN v;
-END
-$$;
+-- Bounded cleanup of malformed PR evidence. Route gaps are reported only:
+-- the planner must not infer a continuous outage from stale task events.
 
 -- ---------------------------------------------------------------------------
 -- backlog_clear_evidence -- remove one evidence row the caller has already
@@ -185,15 +65,15 @@ END
 $$;
 
 -- ---------------------------------------------------------------------------
--- Treat a shape-invalid self-reported pr_url like no_pr_published: technical,
--- stays OPEN, never triggers a pipeline split for what was never real work.
+-- Give a malformed self-reported PR one retry, then defer; never split it.
+-- Transient infrastructure failures retain their existing operational behavior.
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION backlog_return_to_pool(p_task_id text, p_reason text)
     RETURNS backlog_verdict
     LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, public AS $$
 DECLARE t backlog_task%ROWTYPE; v backlog_verdict; v_target text; v_prior integer;
         v_split_requested boolean := false;
-        v_technical boolean;
+        v_technical boolean; v_malformed boolean; v_bad_returns integer;
 BEGIN
     v.ok := false;
     SELECT * INTO t FROM backlog_task b WHERE b.task_id = p_task_id FOR UPDATE;
@@ -212,18 +92,24 @@ BEGIN
      WHERE e.task_id = p_task_id AND e.event = 'return_to_pool'
        AND e.outcome = 'granted';
     v_technical := p_reason LIKE 'cascade_exhausted: no_pr_published%'
-        OR p_reason LIKE 'cascade_exhausted: malformed_pr_url%'
         OR p_reason LIKE 'cascade_exhausted: task_status_failed%'
         OR p_reason LIKE 'cascade_exhausted: executor infrastructure failure%'
         OR p_reason LIKE 'cascade_exhausted: publish_%';
+    v_malformed := p_reason LIKE 'cascade_exhausted: malformed_pr_url%';
+    SELECT count(*) INTO v_bad_returns FROM backlog_event e
+     WHERE e.task_id = p_task_id AND e.event = 'return_to_pool'
+       AND e.outcome = 'granted'
+       AND e.reason LIKE 'cascade_exhausted: malformed_pr_url%';
     v_target := CASE
+        WHEN v_malformed AND v_bad_returns >= 1 THEN 'DEFER_TO_USER'
+        WHEN v_malformed THEN 'OPEN'
         WHEN v_technical THEN 'OPEN'
         WHEN t.task_class = 'pipeline' AND v_prior >= 3 THEN 'DEFER_TO_USER'
         WHEN t.task_class = 'pipeline' AND v_prior >= 1 THEN 'OPEN'
         WHEN v_prior >= 1 THEN 'DEFER_TO_USER'
         ELSE 'OPEN'
     END;
-    v_split_requested := (NOT v_technical) AND t.task_class = 'pipeline'
+    v_split_requested := (NOT v_technical) AND (NOT v_malformed) AND t.task_class = 'pipeline'
                          AND v_prior >= 1 AND v_target = 'OPEN';
 
     UPDATE backlog_task b
@@ -318,7 +204,7 @@ BEGIN
         -- READY_TO_REVIEW and strand it there, invisible to every gate,
         -- forever.
         v_pr_shape_ok := v_pr IS NULL
-            OR v_pr ~ '^https://github\.com/[^/]+/[^/]+/pull/[1-9][0-9]*$';
+            OR v_pr ~ '^https://github\.com/[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+/pull/[1-9][0-9]*$';
 
         IF r.q_state = 'succeeded' AND v_task_status = 'completed'
            AND v_pr IS NOT NULL AND v_pr_shape_ok THEN

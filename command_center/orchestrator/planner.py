@@ -72,14 +72,6 @@ class PlanLimits:
     #: sibling field's convention would otherwise get a silently different
     #: meaning for the same sentinel value on this field).
     review_backlog_limit: int = 20
-    #: How long a candidate must have been continuously unroutable (no repo,
-    #: or a repo with no route table entry) before `backlog_park_unroutable`
-    #: parks it NEEDS_REFINEMENT instead of just reporting it again this tick
-    #: (VOYN-W0-AICC-REPO-ROUTE-AND-EVIDENCE-HYGIENE). Long enough that an
-    #: operator adding a missing route within the day never races a park;
-    #: short enough that a genuinely repo-less task does not sit silently
-    #: unrouted forever.
-    unroutable_grace_seconds: int = 86400
     #: An owner request may narrow dispatch, never broaden eligibility.
     only_task_id: str | None = None
     #: Distinct tick identity; repository leases keep the canonical planner id.
@@ -96,13 +88,6 @@ class PlanReport:
     #: (task, original park reason) — DEFER_TO_USER technical parks the 0014
     #: gate returned to OPEN this tick (VOYN-W0-AICC-DEFER-AUTO-RESUME).
     resumed: list[tuple[str, str]] = field(default_factory=list)
-    #: (task, undispatchable reason) — a candidate `backlog_park_unroutable`
-    #: moved OPEN -> NEEDS_REFINEMENT this tick, having been continuously
-    #: unroutable past the grace period (VOYN-W0-AICC-REPO-ROUTE-AND-
-    #: EVIDENCE-HYGIENE). Distinct from `undispatchable`: every unroutable
-    #: candidate lands there every tick, but only the ones that cross the
-    #: grace period also land here.
-    parked: list[tuple[str, str]] = field(default_factory=list)
     planner_busy: bool = False
     #: The review backlog count that tripped `PlanLimits.review_backlog_
     #: limit` this tick (None when the fence never fired). Ingest and the
@@ -306,21 +291,6 @@ class Planner:
             with conn.cursor() as cur:
                 cur.execute(sql, params)
 
-    def _note_unroutable(
-        self, task_id: str, reason: str, limits: PlanLimits, report: PlanReport
-    ) -> None:
-        """Record one more unroutable observation and, past the grace
-        period, let `backlog_park_unroutable` move the task OPEN ->
-        NEEDS_REFINEMENT (VOYN-W0-AICC-REPO-ROUTE-AND-EVIDENCE-HYGIENE) —
-        so a repo that never gets a route stops being reported, identically,
-        forever."""
-        ok, verdict_reason, _revision = self._row(
-            "SELECT * FROM backlog_park_unroutable(%s, %s, %s)",
-            (task_id, reason, limits.unroutable_grace_seconds),
-        )
-        if ok and verdict_reason == "NEEDS_REFINEMENT":
-            report.parked.append((task_id, reason))
-
     def plan_once(self, limits: PlanLimits = PlanLimits()) -> PlanReport:
         report = PlanReport()
         ok, reason, *_ = self._row(
@@ -496,7 +466,6 @@ class Planner:
                 }
                 if not dispatchable:
                     report.undispatchable.append((task_id, "no_repo"))
-                    self._note_unroutable(task_id, "no_repo", limits, report)
                     continue
                 route = repo_route(repo)
                 if route is None:
@@ -504,9 +473,6 @@ class Planner:
                     # a guaranteed dead-letter (the first live tick proved the
                     # worker refuses unknown projects three times, honestly).
                     report.undispatchable.append((task_id, "unknown_repo_route"))
-                    self._note_unroutable(
-                        task_id, "unknown_repo_route", limits, report
-                    )
                     continue
                 mode = "split" if _split_requested(self._rows, task_id) else "implement"
                 payload, budget = _payload_for(task, limits, route, mode=mode)
@@ -547,11 +513,7 @@ def plan_once(connection_factory: Any, limits: PlanLimits = PlanLimits()) -> Pla
 
 @dataclass(slots=True)
 class RepoRouteAudit:
-    """Report-only: see `audit_repo_routes`. Never changes a task's status —
-    OPEN candidates missing a route are `plan_once`'s job (which, past the
-    grace period, parks them NEEDS_REFINEMENT); a READY_TO_REVIEW task
-    already carries real work product, so a route gap there is an operator
-    fact (add the route) rather than something to park."""
+    """Read-only route inventory; gaps require configuration reconciliation."""
 
     #: (task_id, repo or "") — OPEN, kind='task', repo missing or unrouted.
     open_unrouted: list[tuple[str, str]] = field(default_factory=list)
@@ -568,20 +530,19 @@ def audit_repo_routes(connection_factory: Any) -> RepoRouteAudit:
     "which routes are actually missing," across both statuses in one pass,
     without waiting for either tick's own report to surface it."""
     audit = RepoRouteAudit()
-    with connection_factory() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT task_id, repo FROM backlog_task "
-                "WHERE kind = 'task' AND status = 'OPEN' "
-                "ORDER BY task_id"
-            )
-            open_rows = cur.fetchall()
-            cur.execute(
-                "SELECT task_id, repo FROM backlog_task "
-                "WHERE kind = 'task' AND status = 'READY_TO_REVIEW' "
-                "ORDER BY task_id"
-            )
-            review_rows = cur.fetchall()
+    with connection_factory() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT task_id, repo FROM backlog_task "
+            "WHERE kind = 'task' AND status = 'OPEN' "
+            "ORDER BY task_id"
+        )
+        open_rows = cur.fetchall()
+        cur.execute(
+            "SELECT task_id, repo FROM backlog_task "
+            "WHERE kind = 'task' AND status = 'READY_TO_REVIEW' "
+            "ORDER BY task_id"
+        )
+        review_rows = cur.fetchall()
     for task_id, repo in open_rows:
         if not repo or repo_route(repo) is None:
             audit.open_unrouted.append((task_id, repo or ""))

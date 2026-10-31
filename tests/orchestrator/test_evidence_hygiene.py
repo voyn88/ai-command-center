@@ -9,8 +9,11 @@ available.
 
 from __future__ import annotations
 
-from command_center.orchestrator import planner, review_merge
+from pathlib import Path
 
+import pytest
+
+from command_center.orchestrator import planner, review_merge
 
 BAD_PR = "not-a-github-pr-url"
 GOOD_PR = "https://github.com/voyn88/ai-command-center/pull/969"
@@ -190,39 +193,6 @@ def test_merged_without_acceptance_is_not_done_and_not_cleared(monkeypatch):
     assert report.skipped == [("VOYN-W0-M", "merged_without_acceptance_evidence")]
 
 
-def test_note_unroutable_parks_past_grace(monkeypatch):
-    calls: list[tuple] = []
-
-    class FakePlanner(planner.Planner):
-        def _row(self, sql, params=()):  # noqa: ANN001
-            calls.append((sql, params))
-            if "backlog_park_unroutable" in sql:
-                return (True, "NEEDS_REFINEMENT", 2)
-            raise AssertionError(sql)
-
-    report = planner.PlanReport()
-    FakePlanner(lambda: None)._note_unroutable(
-        "VOYN-W0-UR",
-        "unknown_repo_route",
-        planner.PlanLimits(unroutable_grace_seconds=10),
-        report,
-    )
-    assert report.parked == [("VOYN-W0-UR", "unknown_repo_route")]
-    assert calls[0][1] == ("VOYN-W0-UR", "unknown_repo_route", 10)
-
-
-def test_note_unroutable_observation_inside_grace_does_not_park():
-    class FakePlanner(planner.Planner):
-        def _row(self, sql, params=()):  # noqa: ANN001
-            return (True, "observed", 1)
-
-    report = planner.PlanReport()
-    FakePlanner(lambda: None)._note_unroutable(
-        "VOYN-W0-UR", "no_repo", planner.PlanLimits(), report
-    )
-    assert report.parked == []
-
-
 def test_audit_repo_routes_is_report_only(monkeypatch):
     rows = {
         "OPEN": [("A", "ai-command-center"), ("B", "missing-repo"), ("C", "")],
@@ -233,7 +203,7 @@ def test_audit_repo_routes_is_report_only(monkeypatch):
         def __init__(self) -> None:
             self._status = ""
 
-        def execute(self, sql, params=()):  # noqa: ANN001
+        def execute(self, sql, params=()):
             if "status = 'OPEN'" in sql:
                 self._status = "OPEN"
             else:
@@ -265,8 +235,6 @@ def test_audit_repo_routes_is_report_only(monkeypatch):
 
 
 def test_migration_0030_keeps_shape_gate_and_does_not_reuse_0017():
-    from pathlib import Path
-
     sql_dir = Path(planner.__file__).resolve().parents[1] / "db" / "sql"
     assert (sql_dir / "0030_repo_route_and_evidence_hygiene.up.sql").is_file()
     assert (sql_dir / "0030_repo_route_and_evidence_hygiene.down.sql").is_file()
@@ -276,8 +244,19 @@ def test_migration_0030_keeps_shape_gate_and_does_not_reuse_0017():
     up = (sql_dir / "0030_repo_route_and_evidence_hygiene.up.sql").read_text(
         encoding="utf-8"
     )
-    assert "backlog_park_unroutable" in up
     assert "backlog_clear_evidence" in up
     assert "malformed_pr_url" in up
     assert "SPLIT_TASKS_JSON" in up  # preserves 0021 split-aware ingest
-    assert "cascade_exhausted: malformed_pr_url%" in up
+    assert "v_malformed AND v_bad_returns >= 1" in up
+
+
+@pytest.mark.parametrize("url", [
+    "https://github.com/owner?x/ai-command-center/pull/1",
+    "https://github.com/owner/ai command center/pull/1",
+    "https://github.com/owner/repo/pull/0",
+    "https://github.com/owner/repo/pull/\u0661",
+    "https://github.com/owner/repo/pull/1\n",
+])
+def test_pr_shape_rejects_unresolvable_urls(url):
+    assert review_merge._repo_from_pr_url(url) is None
+    assert review_merge._owner_repo_number_from_pr_url(url) is None

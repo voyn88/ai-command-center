@@ -668,7 +668,7 @@ _REVIEW_INPUT_MARKER = "\nINPUT_ENVELOPE_JSON:\n"
 _MAX_REVIEW_PROMPT_BYTES = 16_000
 _MAX_REVIEW_DIFF_BYTES = 8 * 1024 * 1024
 
-_PR_URL = re.compile(r"^https://github\.com/([^/]+)/([^/]+)/pull/(\d+)$")
+_PR_URL = re.compile(r"https://github\.com/([A-Za-z0-9][A-Za-z0-9-]*)/([A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)")
 
 # Bumped whenever _REVIEW_PROMPT's contract changes in a way that makes an
 # old verdict untrustworthy under the new policy (e.g. what the agent is
@@ -709,7 +709,7 @@ def _verification_review_cascade() -> list[dict[str, Any]]:
 
 
 def _repo_from_pr_url(pr_url: str) -> str | None:
-    match = _PR_URL.match(pr_url)
+    match = _PR_URL.fullmatch(pr_url)
     return match.group(2) if match else None
 
 
@@ -717,7 +717,7 @@ def _owner_repo_number_from_pr_url(pr_url: str) -> tuple[str, str, str] | None:
     """(owner, repo, pr_number) for the GitHub REST API path -- unlike
     `_repo_from_pr_url` (only the repo name, for the review-cycle key), the
     bot-identity marker post below needs the owner too."""
-    match = _PR_URL.match(pr_url)
+    match = _PR_URL.fullmatch(pr_url)
     if match is None:
         return None
     return match.group(1), match.group(2), match.group(3)
@@ -775,7 +775,7 @@ def _review_key(task_id: str, pr_url: str, snapshot: _PRSnapshot) -> str | None:
     overwritten. Returns None if `pr_url` doesn't parse (caller already
     validates this via `_repo_from_pr_url` before reaching here in
     practice, but a malformed URL must never produce a malformed key)."""
-    match = _PR_URL.match(pr_url)
+    match = _PR_URL.fullmatch(pr_url)
     if (match is None or not re.fullmatch(r"[0-9a-f]{40}", snapshot.base)
             or not re.fullmatch(r"[0-9a-f]{40}", snapshot.head)
             or not re.fullmatch(r"[0-9a-f]{64}", snapshot.digest)):

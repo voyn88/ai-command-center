@@ -1,5 +1,4 @@
 DROP FUNCTION IF EXISTS backlog_clear_evidence(text, text, text, text);
-DROP FUNCTION IF EXISTS backlog_park_unroutable(text, text, integer);
 
 -- Restore 0021's return_to_pool (no malformed_pr_url technical class).
 CREATE OR REPLACE FUNCTION backlog_return_to_pool(p_task_id text, p_reason text)
