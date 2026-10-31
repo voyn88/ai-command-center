@@ -31,7 +31,17 @@ SOURCE = Path(__file__).resolve().parents[2] / "command_center/db/work_queue_rea
 #: The store's whole read surface. `work_item_public` and `work_attempt_public`
 #: are the redacted views; `work_result` is a granted base-table read (the
 #: coordination record the control plane exists to consume).
-ALLOWED_RELATIONS = {"work_item_public", "work_attempt_public", "work_result"}
+#: `executor_availability` / `executor_availability_event` (0018, VOYN-W0-AICC-
+#: EXECUTOR-QUOTA-VISIBILITY) are plain base-table reads too, not redacted
+#: views — `roles.py`'s own `_APP_EXECUTOR_TABLES` docstring is what argues
+#: that: neither table holds a secret or a capability, unlike `work_attempt`.
+ALLOWED_RELATIONS = {
+    "work_item_public",
+    "work_attempt_public",
+    "work_result",
+    "executor_availability",
+    "executor_availability_event",
+}
 
 _WRITE_OR_PROTOCOL = re.compile(
     r"\b(INSERT\s+INTO|UPDATE\s+\w+\s+SET|DELETE\s+FROM|TRUNCATE\s+|CALL\s+|queue_\w+\s*\()",

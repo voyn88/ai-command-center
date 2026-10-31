@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh the AICC fleet GitHub token every 30 minutes (tokens live 60)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=30min
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
