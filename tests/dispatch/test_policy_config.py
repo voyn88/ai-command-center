@@ -12,8 +12,10 @@ from command_center.dispatch import policy_config
 from command_center.http_auth.identity import Principal
 from command_center.dispatch.models import (
     DEFAULT_PRIORITY_WEIGHTS,
+    DEFAULT_TAIL_RISK_SCENARIOS,
     AgentLimit,
     DispatchPolicy,
+    TailRiskScenario,
 )
 
 ROOT = Path("/unused-because-AICC_DATA_DIR-overrides")
@@ -48,6 +50,55 @@ def test_from_dict_is_fail_closed_on_garbage():
         assert policy.prefer_local is True
         assert policy.priority_weights == DEFAULT_PRIORITY_WEIGHTS
         assert policy.per_agent_limits == {}
+        # ...but the tail-risk registry falls back to the top-5 default
+        # scenarios, not an empty gate — a garbled policy file must not
+        # silently disable tail-risk protection.
+        assert set(policy.tail_risk_scenarios) == {
+            s.id for s in DEFAULT_TAIL_RISK_SCENARIOS
+        }
+
+
+def test_tail_risk_scenarios_roundtrip_through_dict():
+    scenario = TailRiskScenario(
+        id="custom",
+        label="Custom scenario",
+        business_path="AICC",
+        probability=0.25,
+        impact_usd=400.0,
+        assumptions="a documented assumption",
+        limit_usd=50.0,
+    )
+    policy = DispatchPolicy(tail_risk_scenarios={"custom": scenario})
+    restored = DispatchPolicy.from_dict(policy.as_dict())
+
+    assert restored.tail_risk_scenarios == {"custom": scenario}
+
+
+def test_tail_risk_scenarios_empty_dict_falls_back_to_default_registry():
+    # An explicit `{}` (e.g. from a bootstrap file) is indistinguishable from
+    # "uninitialized" here — same treatment `priority_weights` gets — so the
+    # protective baseline is what ships, not a silently disabled gate.
+    policy = DispatchPolicy.from_dict({"tail_risk_scenarios": {}})
+    assert set(policy.tail_risk_scenarios) == {
+        s.id for s in DEFAULT_TAIL_RISK_SCENARIOS
+    }
+
+
+def test_tail_risk_scenarios_drops_unparseable_entries():
+    policy = DispatchPolicy.from_dict(
+        {
+            "tail_risk_scenarios": {
+                "good": {
+                    "business_path": "AICC",
+                    "probability": 0.1,
+                    "impact_usd": 10.0,
+                    "limit_usd": 5.0,
+                },
+                "bad": "not-a-dict",
+            }
+        }
+    )
+    assert set(policy.tail_risk_scenarios) == {"good"}
 
 
 def test_from_dict_drops_non_numeric_costs():
