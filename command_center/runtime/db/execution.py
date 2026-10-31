@@ -1239,6 +1239,30 @@ def replace_queue_entries(db_path: Path, entries: list[dict]) -> None:
                 conn.executemany(
                     f"INSERT INTO queue_entry ({columns}) VALUES ({placeholders})", rows
                 )
+    _mirror_queue_entries(entries)
+
+
+def _mirror_queue_entries(entries: list[dict]) -> None:
+    """Best-effort dual-write of the whole queue into PostgreSQL (SRV-01B slice 1).
+
+    Every other table's authority write in this module follows its commit with
+    a `_mirror_X` PostgreSQL hook; this one had `PostgresQueueMirror` declared
+    and fully tested in isolation (`test_queue_store.py`) but never called from
+    here, so the target stayed empty no matter how much the SQLite mirror above
+    agreed with JSON. `queue_entry` mirrors by whole-list replacement rather
+    than the shared `upsert` contract, so it is exempt from the generic
+    mirror-contract suite that would otherwise have caught a caller-less mirror
+    — which is exactly why the omission needed its own check instead.
+
+    After the authoritative commit and silent on failure, as every mirror since
+    slice 2: a queue write must never fail because PostgreSQL is unreachable.
+    """
+    try:
+        from command_center.db.queue_store import PostgresQueueMirror
+
+        PostgresQueueMirror().replace_entries(entries)
+    except Exception:  # noqa: BLE001 - the mirror must never break the real write
+        _LOG.debug("Could not mirror queue entries into PostgreSQL", exc_info=True)
 
 
 def list_queue_entries(db_path: Path) -> list[dict]:
