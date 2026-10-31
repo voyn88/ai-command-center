@@ -9,7 +9,7 @@ import pytest
 pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="requires bash")
 
 
-def _run(tmp_path, commands):
+def _run(tmp_path, commands, active_state="inactive"):
     source = (Path(__file__).parents[2] / "deploy/install-agent-principal-isolation.sh").read_text()
     functions = "\n".join(
         re.search(rf"^{name}\(\) \{{.*?^\}}", source, re.MULTILINE | re.DOTALL).group()
@@ -20,14 +20,17 @@ systemctl() {
   printf '%s\\n' "$*" >> "$CALL_LOG"
   case "$1" in
     is-enabled) [ "$3" != voyn-aicc-self-deploy.timer ] ;;
-    show) printf 'loaded\\n' ;;
+    show) if [ "$3" = --property=ActiveState ]; then
+            printf '%s\\n' "$DEPLOY_STATE"; return 0
+          fi
+          printf 'loaded\\n' ;;
     *) return 0 ;;
   esac
 }
 timers_held=0
 '''
     return subprocess.run(["bash", "-c", stub + functions + "\n" + commands],
-                          env={"PATH": "/usr/bin:/bin", "CALL_LOG": str(tmp_path / "calls")},
+                          env={"PATH": "/usr/bin:/bin", "CALL_LOG": str(tmp_path / "calls"), "DEPLOY_STATE": active_state},
                           capture_output=True, text=True, check=False)
 
 
@@ -59,3 +62,12 @@ def test_installer_release_preserves_foreign_lock(tmp_path):
 def test_deploy_unit_cannot_access_production_checkout():
     unit = (Path(__file__).parents[2] / "deploy/systemd/voyn-aicc-worker-release-deploy.service").read_text()
     assert "InaccessiblePaths=-/opt/aicc/source" in unit
+
+
+@pytest.mark.parametrize("active_state", ["active", "activating", "deactivating"])
+def test_installer_refuses_live_deploy_before_timer_changes(tmp_path, active_state):
+    result = _run(tmp_path, "hold_lane_timers; result=$?; release_lane_timers; exit $result", active_state)
+    assert result.returncode != 0
+    calls = (tmp_path / "calls").read_text().splitlines()
+    assert not any(call.startswith("stop ") for call in calls)
+    assert not (tmp_path / "lock").exists()

@@ -674,69 +674,6 @@ def deploy_once(
     if cfg.rollout_lock_path.exists():
         return finish("REFUSED", "staged_rollout_in_progress")
 
-    try:
-        (ensure_mirror or ensure_bare_mirror)(cfg)
-        target = (resolve_sha or resolve_target_sha)(cfg)
-    except (OSError, RuntimeError) as exc:
-        return finish("REFUSED", f"mirror_failed:{exc}")
-    report.target_sha = target
-
-    try:
-        previous = (
-            current_sha(cfg)
-            if current_sha is not None
-            else _current_release_sha(cfg.aicc_root)
-        )
-    except RuntimeError as exc:
-        return finish("REFUSED", f"current_selector_failed:{exc}")
-    report.previous_sha = previous or ""
-
-    if previous == target and (cfg.release_root / target).is_dir():
-        try:
-            refreshed = refresh_root_helpers(cfg, target, install_tx=_install_tx)
-        except OSError as exc:
-            return finish("REFUSED", f"helper_refresh_failed:{exc}")
-        if refreshed:
-            report.steps.append("helpers:" + ",".join(refreshed))
-        return finish("NOOP", "already_at_target")
-
-    gate = dependency_gate or _dependency_change_refuses
-    refused = gate(cfg, previous, target)
-    if refused:
-        return finish("REFUSED", refused)
-
-    # Publish -> verify -> select -> rollout (order is the acceptance contract).
-    try:
-        if stage is not None:
-            stage(cfg, target)
-            report.steps.append("publish")
-        else:
-            stage_release_tree(cfg, target, install_tx=_tx())
-            report.steps.append("publish")
-        # stage_release_tree already verifies; record the explicit step for tests.
-        report.steps.append("verify")
-
-    except Exception as exc:  # noqa: BLE001 - surface as REFUSED, never half-selected
-        return finish("REFUSED", f"publish_select_failed:{exc}")
-
-    if load_lanes is None:
-        from command_center.ops.credential_rotation import load_lane_registry
-
-        load_lanes = load_lane_registry
-    try:
-        lanes = load_lanes(
-            cfg.lane_registry,
-            expected_uid=cfg.trusted_uid,
-            expected_gid=cfg.trusted_gid,
-        )
-    except Exception as exc:  # noqa: BLE001
-        return finish("REFUSED", f"lane_registry_failed:{exc}")
-
-    to_restart = active_registered_lanes(lanes, show=show)
-    stopped = [unit for unit in lanes if unit not in to_restart]
-    for unit in stopped:
-        report.steps.append(f"untouched:{unit}")
-
     rollout_mod = None
     lock_written = False
     try:
@@ -746,84 +683,152 @@ def deploy_once(
             rollout_mod = _load_staged_rollout()
             rollout_mod.write_rollout_lock()
         lock_written = True
-        if hold_timers is not None:
-            hold_timers()
-        else:
-            if rollout_mod is None:
-                rollout_mod = _load_staged_rollout()
-            rollout_mod.hold_lane_mutating_timers(rollout_mod.Systemd())
+    except Exception as exc:  # noqa: BLE001 - fail closed before any mutation
+        return finish("REFUSED", f"rollout_lock_failed:{exc}")
 
-        if select is not None:
-            select(target)
-        else:
-            transaction = _tx().FileTransaction(Path("/"), cfg.state_dir)
-            transaction.select_release(target, cfg.bare_mirror)
-        report.steps.append("select")
-
-        if rollout is not None:
-            ok, detail = rollout(to_restart)
-        else:
-            ok, detail = rollout_active_lanes(
-                to_restart,
-                readiness_timeout=cfg.readiness_timeout,
-                poll_interval=cfg.poll_interval,
-                show=show,
-            )
-        report.steps.append("rollout")
-        if not ok:
-            _rollback_selector(
-                _tx(),
-                cfg,
-                restore_previous=restore_previous,
-            )
-            report.steps.append("rollback")
-            return finish("ROLLED_BACK", detail)
-    except Exception as exc:  # noqa: BLE001
-        if "select" in report.steps:
-            _rollback_selector(_tx(), cfg, restore_previous=restore_previous)
-            return finish("ROLLED_BACK", f"rollout_failed:{exc}")
-        return finish("REFUSED", f"rollout_lock_or_select_failed:{exc}")
-    finally:
-        if lock_written and release_timers is not None:
-            release_timers()
-        elif lock_written and rollout_mod is not None:
-            rollout_mod.release_lane_mutating_timers(rollout_mod.Systemd())
-        if lock_written:
-            if remove_lock is not None:
-                remove_lock()
-            elif rollout_mod is not None:
-                rollout_mod.remove_rollout_lock()
-            else:
-                cfg.rollout_lock_path.unlink(missing_ok=True)
-
-    if clear_pending is not None:
-        clear_pending()
-    else:
-        _tx().FileTransaction(Path("/"), cfg.state_dir).pending_release.unlink(
-            missing_ok=True
-        )
-
-    # Only after DEPLOYED (lanes ready). ROLLED_BACK returns above and must
-    # leave the previously installed root helpers alone.
-    helper_tx = None
-    candidate = _install_tx
-    if candidate is None:
+    # Serialize mirror, publication, selector, rollback and helper refresh,
+    # including NOOP retries, against the installer and other deploys.
+    try:
         try:
-            candidate = _tx()
-        except Exception:  # noqa: BLE001 - fall back to portable install
-            candidate = None
-    if candidate is not None and hasattr(candidate, "_atomic_bytes"):
-        helper_tx = candidate
-    refreshed = refresh_root_helpers(cfg, target, install_tx=helper_tx)
-    base = detail if to_restart else "selected_no_active_lanes"
-    if refreshed:
-        report.steps.append("helpers:" + ",".join(refreshed))
-        if "aicc-agent-launcher" in refreshed:
-            # Socket-activated instances keep the old binary until the next
-            # connection; do not kill in-flight agent runs.
-            report.steps.append("launcher_refreshed_next_connection")
-        base = f"{base} helpers:{','.join(refreshed)}"
-    return finish("DEPLOYED", base)
+            (ensure_mirror or ensure_bare_mirror)(cfg)
+            target = (resolve_sha or resolve_target_sha)(cfg)
+        except (OSError, RuntimeError) as exc:
+            return finish("REFUSED", f"mirror_failed:{exc}")
+        report.target_sha = target
+
+        try:
+            previous = (
+                current_sha(cfg)
+                if current_sha is not None
+                else _current_release_sha(cfg.aicc_root)
+            )
+        except RuntimeError as exc:
+            return finish("REFUSED", f"current_selector_failed:{exc}")
+        report.previous_sha = previous or ""
+
+        if previous == target and (cfg.release_root / target).is_dir():
+            try:
+                refreshed = refresh_root_helpers(cfg, target, install_tx=_install_tx)
+            except OSError as exc:
+                return finish("REFUSED", f"helper_refresh_failed:{exc}")
+            if refreshed:
+                report.steps.append("helpers:" + ",".join(refreshed))
+            return finish("NOOP", "already_at_target")
+
+        gate = dependency_gate or _dependency_change_refuses
+        refused = gate(cfg, previous, target)
+        if refused:
+            return finish("REFUSED", refused)
+
+        # Publish -> verify -> select -> rollout (order is the acceptance contract).
+        try:
+            if stage is not None:
+                stage(cfg, target)
+                report.steps.append("publish")
+            else:
+                stage_release_tree(cfg, target, install_tx=_tx())
+                report.steps.append("publish")
+            # stage_release_tree already verifies; record the explicit step for tests.
+            report.steps.append("verify")
+
+        except Exception as exc:  # noqa: BLE001 - surface as REFUSED, never half-selected
+            return finish("REFUSED", f"publish_select_failed:{exc}")
+
+        if load_lanes is None:
+            from command_center.ops.credential_rotation import load_lane_registry
+
+            load_lanes = load_lane_registry
+        try:
+            lanes = load_lanes(
+                cfg.lane_registry,
+                expected_uid=cfg.trusted_uid,
+                expected_gid=cfg.trusted_gid,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return finish("REFUSED", f"lane_registry_failed:{exc}")
+
+        to_restart = active_registered_lanes(lanes, show=show)
+        stopped = [unit for unit in lanes if unit not in to_restart]
+        for unit in stopped:
+            report.steps.append(f"untouched:{unit}")
+
+        try:
+            if hold_timers is not None:
+                hold_timers()
+            else:
+                if rollout_mod is None:
+                    rollout_mod = _load_staged_rollout()
+                rollout_mod.hold_lane_mutating_timers(rollout_mod.Systemd())
+
+            if select is not None:
+                select(target)
+            else:
+                transaction = _tx().FileTransaction(Path("/"), cfg.state_dir)
+                transaction.select_release(target, cfg.bare_mirror)
+            report.steps.append("select")
+
+            if rollout is not None:
+                ok, detail = rollout(to_restart)
+            else:
+                ok, detail = rollout_active_lanes(
+                    to_restart,
+                    readiness_timeout=cfg.readiness_timeout,
+                    poll_interval=cfg.poll_interval,
+                    show=show,
+                )
+            report.steps.append("rollout")
+            if not ok:
+                _rollback_selector(
+                    _tx(),
+                    cfg,
+                    restore_previous=restore_previous,
+                )
+                report.steps.append("rollback")
+                return finish("ROLLED_BACK", detail)
+        except Exception as exc:  # noqa: BLE001
+            if "select" in report.steps:
+                _rollback_selector(_tx(), cfg, restore_previous=restore_previous)
+                return finish("ROLLED_BACK", f"rollout_failed:{exc}")
+            return finish("REFUSED", f"rollout_lock_or_select_failed:{exc}")
+        finally:
+            if lock_written and release_timers is not None:
+                release_timers()
+            elif lock_written and rollout_mod is not None:
+                rollout_mod.release_lane_mutating_timers(rollout_mod.Systemd())
+
+        if clear_pending is not None:
+            clear_pending()
+        else:
+            _tx().FileTransaction(Path("/"), cfg.state_dir).pending_release.unlink(
+                missing_ok=True
+            )
+
+        # Only after DEPLOYED (lanes ready). ROLLED_BACK returns above and must
+        # leave the previously installed root helpers alone.
+        helper_tx = None
+        candidate = _install_tx
+        if candidate is None:
+            try:
+                candidate = _tx()
+            except Exception:  # noqa: BLE001 - fall back to portable install
+                candidate = None
+        if candidate is not None and hasattr(candidate, "_atomic_bytes"):
+            helper_tx = candidate
+        refreshed = refresh_root_helpers(cfg, target, install_tx=helper_tx)
+        base = detail if to_restart else "selected_no_active_lanes"
+        if refreshed:
+            report.steps.append("helpers:" + ",".join(refreshed))
+            if "aicc-agent-launcher" in refreshed:
+                # Socket-activated instances keep the old binary until the next
+                # connection; do not kill in-flight agent runs.
+                report.steps.append("launcher_refreshed_next_connection")
+            base = f"{base} helpers:{','.join(refreshed)}"
+        return finish("DEPLOYED", base)
+    finally:
+        if remove_lock is not None:
+            remove_lock()
+        elif rollout_mod is not None:
+            rollout_mod.remove_rollout_lock()
 
 
 def _rollback_selector(

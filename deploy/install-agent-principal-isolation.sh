@@ -125,6 +125,12 @@ hold_lane_timers() {
     return 1
   fi
   timers_held=1
+  # Refuse overlap with an older deploy already running before this lock.
+  deploy_state=$(systemctl show voyn-aicc-worker-release-deploy.service --property=ActiveState --value) || return 1
+  case "$deploy_state" in
+    inactive|failed|"") ;;
+    *) return 1 ;;
+  esac
   systemctl stop voyn-aicc-credential-rotation.timer || return 1
   # Worker hosts run voyn-aicc-worker-release-deploy.timer (root-owned
   # immutable release). Control still uses voyn-aicc-self-deploy.timer.

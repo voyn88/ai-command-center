@@ -174,14 +174,14 @@ def test_deploy_calls_publish_verify_select_rollout_in_order(tmp_path):
     assert report.outcome == "DEPLOYED"
     assert report.steps[:4] == ["publish", "verify", "select", "rollout"]
     assert order == [
-        f"publish:{SHA_B}",
         "lock",
+        f"publish:{SHA_B}",
         "hold",
         f"select:{SHA_B}",
         "rollout:voyn-aicc-worker@1.service",
         "release",
-        "unlock",
         "clear_pending",
+        "unlock",
     ]
 
 
@@ -463,3 +463,48 @@ def test_contended_lock_does_not_flip_selector(tmp_path):
         select=forbidden, release_timers=forbidden)
     assert report.outcome == "REFUSED"
     assert "select" not in report.steps
+
+
+@pytest.mark.parametrize("noop", [False, True])
+def test_lock_covers_mirror_publication_and_helper_refresh(tmp_path, monkeypatch, noop):
+    module = _module()
+    cfg = _cfg(module, tmp_path)
+    held = []
+    observed = []
+
+    def check(phase):
+        assert held == [True]
+        observed.append(phase)
+
+    def refresh(*args, **kwargs):
+        check("refresh")
+        return []
+
+    monkeypatch.setattr(module, "refresh_root_helpers", refresh)
+    report = _deploy(
+        module, cfg, previous=SHA_A,
+        resolve_sha=lambda c: SHA_A if noop else SHA_B,
+        write_lock=lambda: held.append(True), remove_lock=lambda: held.clear(),
+        ensure_mirror=lambda c: check("mirror"),
+        stage=lambda *args: check("publish"),
+        load_lanes=lambda *args, **kwargs: (), select=lambda sha: check("select"),
+        rollout=lambda units: (True, "ready:0"),
+    )
+    assert report.outcome == ("NOOP" if noop else "DEPLOYED")
+    assert observed == (["mirror", "refresh"] if noop else ["mirror", "publish", "select", "refresh"])
+    assert held == []
+
+
+def test_mirror_failure_releases_early_lock(tmp_path):
+    module = _module()
+    cfg = _cfg(module, tmp_path)
+    held = []
+
+    def fail(c):
+        assert held == [True]
+        raise OSError("mirror unavailable")
+
+    report = _deploy(module, cfg, write_lock=lambda: held.append(True),
+                     remove_lock=lambda: held.clear(), ensure_mirror=fail)
+    assert report.outcome == "REFUSED"
+    assert held == []
