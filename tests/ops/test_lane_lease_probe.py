@@ -48,7 +48,7 @@ def test_lane_lease_probe_runs_voyn_lease_list(monkeypatch, tmp_path):
     env = (
         "VOYN_LEASE_DSN=host=10.20.0.2 port=5432 dbname=voyn_control "
         "user=voyn_lease_client",
-        "PGPASSFILE=/run/aicc-worker-lanes/1/pgpass",
+        "PGPASSFILE=/run/aicc-worker-lanes/1/pgpass",  # pragma: allowlist secret
     )
     assert module._lane_lease_authority_reachable(4242, 1002, env) is None
     assert calls and calls[0][-2:] == ["voyn-lease", "list"]
@@ -74,7 +74,7 @@ def test_lane_lease_probe_surfaces_auth_failure(monkeypatch):
         1002,
         (
             "VOYN_LEASE_DSN=host=10.20.0.2",
-            "PGPASSFILE=/run/aicc-worker-lanes/1/pgpass",
+            "PGPASSFILE=/run/aicc-worker-lanes/1/pgpass",  # pragma: allowlist secret
         ),
     )
     assert failure is not None

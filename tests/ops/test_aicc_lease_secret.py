@@ -29,7 +29,7 @@ def _line(module, *, user="voyn_lease_client"):
         port="5432",
         database="voyn_control",
         user=user,
-        password="lease-secret",
+        password="lease-secret",  # pragma: allowlist secret
     )
 
 
@@ -39,7 +39,7 @@ def test_install_and_verify_round_trip(tmp_path):
     provenance = tmp_path / "voyn_lease_pgpass.provenance"
     worker_env = tmp_path / "worker.env"
     worker_env.write_text(
-        "AICC_PG_USER=aicc_w_wrk_voyn_worker_01\nAICC_PG_PASSWORD=x\n",
+        "AICC_PG_USER=aicc_w_wrk_voyn_worker_01\nAICC_PG_PASSWORD=x\n",  # pragma: allowlist secret
         encoding="utf-8",
     )
 
