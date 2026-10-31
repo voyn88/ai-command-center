@@ -545,18 +545,30 @@ def test_backup_restore_drill_round_trips_data(
     assert Path(f"{archives[0]}.sha256").exists()
 
     restored_db = f"{pg_database}_restored"
+    rto_out = tmp_path / "rto.json"
     try:
         subprocess.run(
             [
                 str(repo_root / "scripts" / "aicc_pg_restore.sh"),
                 "--archive", str(archives[0]),
                 "--target-db", restored_db,
+                "--measure-out", str(rto_out),
             ],
             check=True,
             env=env,
             capture_output=True,
             text=True,
         )
+
+        # The RTO claim this drill exists to back up is only as good as the
+        # artifact it leaves behind — assert the script actually wrote one.
+        import json
+
+        measurement = json.loads(rto_out.read_text())
+        assert measurement["target_db"] == restored_db
+        assert measurement["tables_restored"] == len(roles.ALL_TABLES) + len(roles.ALL_VIEWS)
+        assert isinstance(measurement["elapsed_seconds"], int)
+        assert measurement["elapsed_seconds"] >= 0
 
         from psycopg.conninfo import make_conninfo
 
