@@ -292,6 +292,27 @@ def build_parser() -> argparse.ArgumentParser:
         "--reason", required=True, help="Audited reason for the suspension."
     )
 
+    # The control-plane reconciler (VOYN-W0-AICC-CONTROL-PLANE-RESILIENCE).
+    # Two distinct commands for two distinct hosts/roles -- see
+    # command_center.orchestrator.control_plane_reconciler's module docstring
+    # for why they must not collapse into one.
+    sub.add_parser(
+        "control-reconcile",
+        help="One control-plane reconciler tick: re-assert every declared "
+        "timer active, quarantine known-sabotaging leftover units, restart "
+        "a service whose heartbeat has gone stale despite an active timer, "
+        "and record this tick's own heartbeat "
+        "(aicc-control-reconciler.timer, control-01, aicc_app).",
+    )
+    sub.add_parser(
+        "control-watchdog",
+        help="Independent cross-check of every declared tick's heartbeat: "
+        "read-only, touches no systemd unit, and runs on a DIFFERENT host "
+        "than the reconciler so a reconciler that silently stopped ticking "
+        "cannot hide its own stall the way the planner's timer did on "
+        "2026-08-29 (aicc-control-watchdog.timer, worker-01, aicc_worker).",
+    )
+
     down = sub.add_parser("downgrade", help="Revert migrations down to a version.")
     down.add_argument(
         "--to",
@@ -416,9 +437,20 @@ def main(argv: list[str] | None = None) -> int:
 
             if args.command == "queue-reap":
                 from command_center.db.work_queue_admin import WorkQueueAdmin
+                from command_center.orchestrator.control_plane_reconciler import (
+                    record_heartbeat,
+                )
 
                 reaped = WorkQueueAdmin(lambda: nullcontext(conn)).reap()
                 print(f"reaped {reaped} lapsed attempt(s)")
+                # Heartbeat every completed tick, not only one that reaped
+                # something -- the reconciler's staleness check needs to
+                # distinguish "the tick stopped running" from "the tick ran
+                # and found nothing to do" (VOYN-W0-AICC-CONTROL-PLANE-
+                # RESILIENCE).
+                record_heartbeat(
+                    lambda: nullcontext(conn), "queue-reap", detail=f"reaped={reaped}"
+                )
                 return 0
 
             if args.command == "queue-dlq":
@@ -560,6 +592,9 @@ def main(argv: list[str] | None = None) -> int:
             if args.command == "backlog-plan":
                 from contextlib import nullcontext as _nc
 
+                from command_center.orchestrator.control_plane_reconciler import (
+                    record_heartbeat,
+                )
                 from command_center.orchestrator.planner import PlanLimits, plan_once
 
                 if args.smoke:
@@ -585,6 +620,12 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 if report.planner_busy:
                     print("planner lease held elsewhere; nothing done")
+                    # A lease held by a sibling control host is this tick
+                    # completing correctly, not the planner going quiet --
+                    # heartbeat it the same as a normal pass, or the
+                    # reconciler would mistake healthy lease contention for
+                    # the 2026-08-29 stall it exists to catch.
+                    record_heartbeat(lambda: _nc(conn), "backlog-plan", detail="busy")
                     return 0
                 if report.review_window_full is not None:
                     print(
@@ -615,12 +656,22 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"REFUSED   {task_id}: {reason}")
                 for task_id, reason in report.undispatchable:
                     print(f"NO-REPO   {task_id}: {reason}")
+                record_heartbeat(
+                    lambda: _nc(conn),
+                    "backlog-plan",
+                    detail=f"dispatched={len(report.dispatched)} "
+                    f"ingested={len(report.ingested)}",
+                )
                 return 0
 
             if args.command == "backlog-review":
                 from contextlib import nullcontext as _nc
 
                 from command_center.db.work_queue_store import WorkQueueStore
+                from command_center.orchestrator.control_plane_reconciler import (
+                    record_heartbeat,
+                )
+
                 from command_center.orchestrator import watchdog as _watchdog
 
                 from command_center.orchestrator import gh_access
@@ -720,10 +771,20 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"SKIP      {task_id}: {reason}")
                 if report.quota is not None:
                     print(report.quota.line())
+                record_heartbeat(
+                    lambda: _nc(conn),
+                    "backlog-review",
+                    detail=f"reviewed={len(report.reviewed)} "
+                    f"markers={len(marker_report.reviewed)}",
+                )
                 return 0
 
             if args.command == "backlog-merge":
                 from contextlib import nullcontext as _nc
+
+                from command_center.orchestrator.control_plane_reconciler import (
+                    record_heartbeat,
+                )
 
                 from command_center.orchestrator import watchdog as _watchdog
                 from command_center.orchestrator.review_merge import merge_once
@@ -733,6 +794,11 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"MERGED    {task_id} -> {head}")
                 for task_id, reason in report.skipped:
                     print(f"SKIP      {task_id}: {reason}")
+                record_heartbeat(
+                    lambda: _nc(conn),
+                    "backlog-merge",
+                    detail=f"merged={len(report.merged)}",
+                )
                 _watchdog.record_skips(
                     conn, "merge", _watchdog.new_tick_id(), report.skipped
                 )
@@ -799,6 +865,73 @@ def main(argv: list[str] | None = None) -> int:
                 # Non-zero exit surfaces a real finding to a human/CI without
                 # ever touching the database -- report-only stays report-only.
                 return 1 if report.suspect else 0
+
+            if args.command == "control-reconcile":
+                from contextlib import nullcontext as _nc
+
+                from command_center.orchestrator.control_plane_reconciler import (
+                    ESCALATION_EXIT_CODE,
+                    ReconcileConfig,
+                    SubprocessSystemctl,
+                    reconcile_once,
+                )
+
+                # `command_timeout` governs both how long each `sudo -n
+                # systemctl` call is allowed to hang (SubprocessSystemctl)
+                # and the bounded-backoff circuit breaker inside the tick
+                # itself (reconcile_once) -- one ReconcileConfig, not two
+                # values that could drift apart.
+                recon_config = ReconcileConfig()
+                report = reconcile_once(
+                    SubprocessSystemctl(timeout=recon_config.command_timeout),
+                    lambda: _nc(conn),
+                    config=recon_config,
+                )
+                for name in report.ok:
+                    print(f"OK         {name}")
+                for name in report.restarted:
+                    print(f"RESTARTED  {name}")
+                for name in report.reenabled:
+                    print(f"REENABLED  {name}")
+                for name in report.quarantined:
+                    print(f"QUARANTINE {name}")
+                # A bounded retry still in flight exits 0 on purpose -- it is
+                # not yet an escalation -- but it must not be SILENT, which
+                # is the whole failure class this task exists to close.
+                for name in report.retrying:
+                    print(f"RETRY      {name}")
+                for name in report.circuit_open_skipped:
+                    print(f"COOLDOWN   {name}")
+                for name, reason in report.escalated:
+                    print(f"ESCALATE   {name}: {reason}")
+                # ESCALATION_EXIT_CODE, not 1: the unit pins this exact code
+                # in `RestartPreventExitStatus=` so a designed escalation
+                # goes straight to `failed` and fires `OnFailure=` (the
+                # owner-visible alert), while an unhandled crash -- which
+                # Python exits 1 for -- still gets `Restart=on-failure`'s
+                # bounded retry. Both are "non-zero"; only the exit code
+                # tells systemd which one happened.
+                return 0 if report.healthy else ESCALATION_EXIT_CODE
+
+            if args.command == "control-watchdog":
+                from contextlib import nullcontext as _nc
+
+                from command_center.orchestrator.control_plane_reconciler import (
+                    ESCALATION_EXIT_CODE,
+                    check_heartbeats_once,
+                )
+
+                report = check_heartbeats_once(lambda: _nc(conn))
+                for name in report.ok:
+                    print(f"OK    {name}")
+                for name, age in report.stale:
+                    age_desc = "never recorded" if age == float("inf") else f"{age:.0f}s old"
+                    print(f"STALE {name}: {age_desc}")
+                # Same code as control-reconcile for the same reason, even
+                # though aicc-control-watchdog.service sets no `Restart=`:
+                # one escalation code across both ticks means an operator
+                # (or a log shipper) reads one number, not two.
+                return 0 if report.healthy else ESCALATION_EXIT_CODE
 
             if args.command == "downgrade":
                 if not args.confirmed:
