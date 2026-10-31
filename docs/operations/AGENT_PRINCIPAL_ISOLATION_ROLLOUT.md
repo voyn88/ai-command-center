@@ -131,3 +131,25 @@ This is a fail-closed deployment gate. Do not set
 9. Drain and roll every remaining discovered lane, one at a time, only after the previous lane stays ready. Record
    exact deployed SHA and unit hashes. Roll back the unit/code to the previous
    merged SHA if any boundary or readiness check fails; do not disable isolation.
+
+## Model-auth write-back across worker lanes
+
+The launcher retains the exact credential bytes staged into each run's ephemeral
+home in broker memory. At teardown, an unchanged copy is never written back,
+even if another lane has rotated the store's token in the meantime. This prevents
+a lane still holding T1 from overwriting T2 after T1's refresh token was consumed.
+
+For a changed copy, the broker holds an exclusive `fcntl.flock` on
+`<store directory>/.model-auth.lock` (root:root, `0600`) across the store read,
+comparison and atomic replacement. If the store still matches the staged bytes,
+the refresh may be persisted. If the store changed, the run's credential must be
+strictly newer by Claude's `claudeAiOauth.expiresAt` (milliseconds since epoch) or
+Codex's `last_refresh` (ISO-8601 with timezone). Equal, older, missing or
+unparseable freshness preserves the store and logs
+`model auth write-back: <executor> skipped, store is newer or freshness unknown`.
+A failed refresh that leaves the staged file unchanged therefore cannot roll back
+a successful refresh from another lane.
+
+The regular-file and size checks still apply, and the JSON top-level keys must
+match both the staged credential and the current store. Successful write-back
+uses an atomic temporary-file rename with root:root ownership and mode `0600`.
