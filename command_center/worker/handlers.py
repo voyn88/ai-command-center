@@ -90,6 +90,29 @@ _TAIL_CHARS = 4000
 _provision_locks: dict[str, threading.Lock] = {}
 _provision_locks_guard = threading.Lock()
 
+# Lease-authority substrate failures (wrong/missing pgpass, unreachable DSN,
+# tool crash before a contention answer). These name no fault in the work
+# item: burning max_attempts on a broken voyn_lease_client secret is what
+# VOYN-W0-AICC-LEASE-PGPASS-OVERWRITTEN-ON-WORKER-01 did to every
+# implementation attempt until the secret was restored. Contention with
+# another live writer is NOT infra -- that stays on the lease_wait /
+# ordinary retryable path.
+_LEASE_AUTH_INFRA_MARKERS = (
+    "password authentication failed",
+    "writer-lease authority unreachable",
+    "authority unreachable",
+    "could not connect to server",
+    "connection refused",
+    "no password supplied",
+    "fe_sendauth",
+)
+
+
+def _lease_authority_is_infra_failure(reason: str) -> bool:
+    """True when a lease-tool failure is host/secret substrate, not contention."""
+    lowered = reason.lower()
+    return any(marker in lowered for marker in _LEASE_AUTH_INFRA_MARKERS)
+
 
 def _isolated_workspace_path(repository: Path, branch: str) -> Path:
     if agent_runner.principal_isolation_required():
@@ -814,7 +837,16 @@ def _run_agent(
             # once it is released, bounded by the item's own max_attempts.
             held = blocking_lease(isolated_workspace)
             if held is not None:
-                return HandlerOutcome(ok=False, reason=held, retryable=True)
+                # Auth/reachability against the lease authority is infra
+                # (refund via queue_fail_infra_wait). A live foreign holder
+                # of the worktree stays an ordinary retryable refusal -- it
+                # is contention, not a broken substrate.
+                return HandlerOutcome(
+                    ok=False,
+                    reason=held,
+                    retryable=True,
+                    infra_wait=_lease_authority_is_infra_failure(held),
+                )
 
             # Full-lifecycle writer lease. `blocking_lease` above is a
             # deliberately read-only preflight (its own docstring: "it never
@@ -889,11 +921,16 @@ def _run_agent(
                     # or the authority refused/could not be reached: a data
                     # refusal, not a defect -- the attempt returns to the
                     # pool and a later delivery retries once the lease
-                    # clears, bounded by max_attempts.
+                    # clears. Auth failures against the authority are
+                    # infra (no attempt burn): a wrong lease pgpass must
+                    # not dead-letter every mutating item
+                    # (VOYN-W0-AICC-LEASE-PGPASS-OVERWRITTEN-ON-WORKER-01).
+                    reason = f"writer lease unavailable: {exc}"
                     return HandlerOutcome(
                         ok=False,
-                        reason=f"writer lease unavailable: {exc}",
+                        reason=reason,
                         retryable=True,
+                        infra_wait=_lease_authority_is_infra_failure(reason),
                     )
 
             base_branch = (

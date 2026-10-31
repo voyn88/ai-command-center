@@ -823,6 +823,54 @@ def _process_gid(pid: int) -> int:
     raise RolloutError(f"MainPID {pid} has no Gid field")
 
 
+def _lane_lease_authority_reachable(
+    pid: int, uid: int, environment: tuple[str, ...] = ()
+) -> str | None:
+    """Prove the lane can list leases under its own PGPASSFILE / DSN.
+
+    A lane that is otherwise ready but whose lease secret was overwritten
+    with worker-DB credentials (VOYN-W0-AICC-LEASE-PGPASS-OVERWRITTEN-ON-
+    WORKER-01) accepts every claim and then burns every mutating attempt on
+    ``password authentication failed for user voyn_lease_client``. Rollout
+    must refuse before that shape ships: ``voyn-lease list`` succeeding
+    inside the lane namespace is the measured gate; configuration text alone
+    is not accepted as evidence. Returns None on success, a reason otherwise.
+    """
+    env_map = {}
+    for item in environment:
+        if "=" not in item:
+            continue
+        key, _, value = item.partition("=")
+        env_map[key] = value
+    if not env_map.get("VOYN_LEASE_DSN"):
+        return "VOYN_LEASE_DSN is absent from the lane environment"
+    pgpass = env_map.get("PGPASSFILE", "")
+    if not pgpass.startswith("/"):
+        return "PGPASSFILE is absent from the lane environment"
+    gid = _process_gid(pid)
+    enter = ["nsenter", "-t", str(pid), "-m", "-S", str(uid), "-G", str(gid), "--"]
+    tool = env_map.get("VOYN_LEASE_TOOL", "voyn-lease")
+    result = subprocess.run(
+        [*enter, "env", "-i", *environment, tool, "list"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip().splitlines()
+        return "voyn-lease list failed inside the lane" + (
+            f": {detail[0][:160]}" if detail else ""
+        )
+    try:
+        rows = json.loads(result.stdout or "[]")
+    except json.JSONDecodeError as exc:
+        return f"voyn-lease list returned unreadable output: {exc}"
+    if not isinstance(rows, list):
+        return "voyn-lease list did not return a JSON array"
+    return None
+
+
 def _lane_inputs_visible(
     pid: int, uid: int, data_dir: str, environment: tuple[str, ...] = ()
 ) -> str | None:
@@ -1001,11 +1049,15 @@ def verify_unit(
     process_uid=None,
     process_environment=None,
     lane_inputs_visible=None,
+    lane_lease_authority_reachable=None,
 ) -> None:
     uid_for_user = uid_for_user or _uid_for_user
     process_uid = process_uid or _process_uid
     process_environment = process_environment or _process_environment
     lane_inputs_visible = lane_inputs_visible or _lane_inputs_visible
+    lane_lease_authority_reachable = (
+        lane_lease_authority_reachable or _lane_lease_authority_reachable
+    )
     verify_unit_configuration(systemd, unit)
     expected = {
         "ActiveState": "active",
@@ -1047,6 +1099,14 @@ def verify_unit(
     failure = lane_inputs_visible(int(raw_pid), unit_uid, data_dirs[0], environment)
     if failure is not None:
         raise RolloutError(f"{unit} cannot read its task inputs: {failure}")
+    lease_failure = lane_lease_authority_reachable(
+        int(raw_pid), unit_uid, environment
+    )
+    if lease_failure is not None:
+        raise RolloutError(
+            f"{unit} cannot list leases under its PGPASSFILE: {lease_failure}"
+        )
+    print(f"LANE_LEASE_OK {unit}")
 
 
 def verify_all(
@@ -1059,11 +1119,15 @@ def verify_all(
     process_uid=None,
     process_environment=None,
     lane_inputs_visible=None,
+    lane_lease_authority_reachable=None,
 ) -> None:
     uid_for_user = uid_for_user or _uid_for_user
     process_uid = process_uid or _process_uid
     process_environment = process_environment or _process_environment
     lane_inputs_visible = lane_inputs_visible or _lane_inputs_visible
+    lane_lease_authority_reachable = (
+        lane_lease_authority_reachable or _lane_lease_authority_reachable
+    )
     verify_legacy_units_retired(systemd)
     agent_uid = uid_for_user(agent_user)
     privileged_uids = frozenset(uid_for_user(user) for user in privileged_users)
@@ -1079,6 +1143,7 @@ def verify_all(
             process_uid=process_uid,
             process_environment=process_environment,
             lane_inputs_visible=lane_inputs_visible,
+            lane_lease_authority_reachable=lane_lease_authority_reachable,
         )
 
 
@@ -1140,11 +1205,15 @@ def rollout(
     process_environment=None,
     timers_already_held: bool = False,
     lane_inputs_visible=None,
+    lane_lease_authority_reachable=None,
 ) -> None:
     uid_for_user = uid_for_user or _uid_for_user
     process_uid = process_uid or _process_uid
     process_environment = process_environment or _process_environment
     lane_inputs_visible = lane_inputs_visible or _lane_inputs_visible
+    lane_lease_authority_reachable = (
+        lane_lease_authority_reachable or _lane_lease_authority_reachable
+    )
     # Validate the complete discovered fleet before the first mutation.
     # In particular, do not retire a healthy legacy fleet and then learn that
     # a configured/live template lane is masked or fail-open.
@@ -1212,6 +1281,7 @@ def rollout(
                     process_uid=process_uid,
                     process_environment=process_environment,
                     lane_inputs_visible=lane_inputs_visible,
+                    lane_lease_authority_reachable=lane_lease_authority_reachable,
                 )
         except BaseException:
             # Never restart from a service snapshot while the failed file

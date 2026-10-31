@@ -103,7 +103,13 @@ recovery always runs before the circuit is consulted.
    root-owned `/etc/aicc/pgtunnel.env` and `/etc/aicc/lease.env`; no internal
    addresses or secrets belong in Git. Create a non-secret `worker-N.env` for
    every registry entry, each containing distinct `AICC_PUBLISH_OWNER` and
-   `VOYN_LEASE_SESSION` values.
+   `VOYN_LEASE_SESSION` values. The writer-lease `PGPASSFILE` source
+   (`/etc/voyn/secrets/voyn_lease_pgpass`) is a **separate** secret for
+   `voyn_lease_client` against `voyn_control` on control-01 — never derive it
+   from `worker.env` / `AICC_PG_*`. Install it only via
+   `python3 ops/aicc_lease_secret.py install ...` so the provenance sidecar is
+   recorded; the rotator and bootstrap must not write that path
+   (VOYN-W0-AICC-LEASE-PGPASS-OVERWRITTEN-ON-WORKER-01).
 4. Enable every `voyn-aicc-worker@N.service` named by the lane registry. Require
    each to show `STATUS=aicc-ready` and complete a database claim/auth smoke
    before disabling the legacy worker services.
