@@ -1,7 +1,11 @@
 """Pre-flight checks for a mirror slice — the ones acceptance kept having to run.
 
 Eight slices produced five rejections, and four of them were caught by two
-mechanical probes the writer could have run before pushing:
+mechanical probes the writer could have run before pushing. A third probe was
+added after three slices in a row shipped dual-write hooks that no test ran —
+the shared contract enrols mirror *classes* and is silent on whether the
+authority ever calls them. The three probes together are the pre-flight set;
+`all` runs them in order and prints what belongs in the PR body.
 
 * **statements** — the SQL each mirror generates, diffed against a base SHA.
   Green test suites cannot distinguish a changed `ON CONFLICT` target, a
@@ -13,6 +17,12 @@ mechanical probes the writer could have run before pushing:
 * **counts** — how many tests actually need PostgreSQL. Two slices shipped a
   transposed figure in a commit message, which is a false claim in a document
   that goes into history.
+* **sweep** — drop each `_mirror…(` call site in an authority module and ask
+  whether anything in the suite notices. Measured on the three slices that
+  shipped hooks with no covering test: provenance 0/5, completion 0/4,
+  proposal 0/11 unnoticed. After their family suites landed: 5/5, 4/4, 11/11
+  caught, each failure naming the stage. A mirror nothing writes to is a
+  different gap (no hook to remove) and lives in the shared contract instead.
 
 Run before `git push`, paste the output into the PR. The point is not
 discipline; it is that a check written down is a check that survives the end of
@@ -22,9 +32,13 @@ Usage
 -----
     uv run python scripts/mirror_slice_checks.py statements --base origin/main
     uv run python scripts/mirror_slice_checks.py counts tests/db/test_batch_stores.py
-    uv run python scripts/mirror_slice_checks.py all --base origin/main tests/db/...
+    uv run python scripts/mirror_slice_checks.py sweep command_center/runtime/db/completion.py
+    uv run python scripts/mirror_slice_checks.py all --base origin/main \\
+        --module command_center/runtime/db/completion.py tests/db/test_completion_store.py
 
-`statements` needs no database: it records what would be sent.
+`statements` needs no database: it records what would be sent. `sweep` needs
+the suite's ordinary database fixture; without one every perturbation looks
+unnoticed because the covering tests skip.
 """
 
 from __future__ import annotations
@@ -62,6 +76,24 @@ def _root() -> Path:
 
 
 ROOT = _root()
+
+
+# Authority modules the family suites exist to cover. Named here so `all` can
+# resolve a store test path to the module whose hooks that suite is supposed
+# to notice — the battery that closed VOYN-W0-AICC-MIRROR-HOOK-SWEEP — without
+# the writer having to remember the mapping at the end of a long slice.
+#
+# One module per family, matching the sweep that measured 0/N then N/N:
+# provenance.py, completion.py, proposal.py. Hooks that live elsewhere
+# (`create_run`'s `_mirror_run_provenance` in `execution.py`) are swept when
+# that file's own store path or an explicit `--module` is passed; folding
+# them into the provenance entry would re-measure every run/task/session
+# hook on every provenance slice.
+FAMILY_SWEEP_MODULES: dict[str, tuple[str, ...]] = {
+    "provenance": ("command_center/runtime/db/provenance.py",),
+    "completion": ("command_center/runtime/db/completion.py",),
+    "proposal": ("command_center/runtime/db/proposal.py",),
+}
 
 
 # --- recording connection ----------------------------------------------------
@@ -422,6 +454,92 @@ def cmd_sweep(args: argparse.Namespace) -> int:
     return 1 if unnoticed else 0
 
 
+# --- the whole battery -------------------------------------------------------
+
+
+def modules_for_store_paths(paths: list[str]) -> list[str]:
+    """Authority modules whose hooks a store-test path is responsible for.
+
+    `tests/db/test_completion_store.py` → the completion family's modules.
+    Families listed in `FAMILY_SWEEP_MODULES` are the ones the hook-sweep
+    task pinned; anything else resolves to
+    `command_center/runtime/db/<family>.py` when that file exists. Guessed
+    names that point nowhere are dropped, because a wrong module would let
+    `all` claim a sweep it did not run.
+    """
+    resolved: list[str] = []
+    seen: set[str] = set()
+
+    def _add(module: str) -> None:
+        if module not in seen:
+            seen.add(module)
+            resolved.append(module)
+
+    for path in paths:
+        match = re.match(r"test_([a-z0-9_]+)_store\.py$", Path(path).name)
+        if match is None:
+            continue
+        family = match.group(1)
+        if family in FAMILY_SWEEP_MODULES:
+            for module in FAMILY_SWEEP_MODULES[family]:
+                _add(module)
+            continue
+        candidate = f"command_center/runtime/db/{family}.py"
+        if (ROOT / candidate).is_file():
+            _add(candidate)
+    return resolved
+
+
+def cmd_all(args: argparse.Namespace) -> int:
+    """Run statements, counts and sweep — the pre-flight set — and print it all.
+
+    The three probes are independent, so a failure in one does not skip the
+    others: a PR body that only shows the statements half of a red sweep is
+    how the gap this file exists for gets pasted as if it had been checked.
+    Exit non-zero when any probe refuses; statements' non-zero for NEW/CHANGED
+    tables still means "read this" rather than "broken", and that meaning is
+    preserved here so `&& git push` cannot run past unread SQL.
+    """
+    modules = list(args.module or ())
+    if not modules:
+        modules = modules_for_store_paths(list(args.paths or ()))
+    if not modules:
+        print(
+            "all: no authority module to sweep — pass --module or a "
+            "tests/db/test_<family>_store.py path that resolves to "
+            "command_center/runtime/db/<family>.py"
+        )
+        return 1
+
+    print("== statements ==")
+    statements_rc = cmd_statements(
+        argparse.Namespace(base=args.base, emit_json=False, root=None)
+    )
+
+    print("\n== counts ==")
+    if args.paths:
+        counts_rc = cmd_counts(argparse.Namespace(paths=list(args.paths)))
+    else:
+        print("(no test paths given; counts skipped)")
+        counts_rc = 0
+
+    print("\n== sweep ==")
+    sweep_rc = 0
+    for module in modules:
+        print()
+        one = cmd_sweep(argparse.Namespace(module=module, suite=args.suite))
+        if one:
+            sweep_rc = one
+
+    print(
+        "\n-- paste above into the PR body "
+        f"(statements={'read' if statements_rc else 'clean'}, "
+        f"counts={'fail' if counts_rc else 'ok'}, "
+        f"sweep={'fail' if sweep_rc else 'ok'}) --"
+    )
+    return 1 if (statements_rc or counts_rc or sweep_rc) else 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -440,6 +558,29 @@ def main() -> int:
     sweep.add_argument("module", help="authority module, e.g. command_center/runtime/db/proposal.py")
     sweep.add_argument("--suite", default="tests/db", help="suite to re-run per perturbation")
     sweep.set_defaults(func=cmd_sweep)
+
+    all_cmd = sub.add_parser(
+        "all",
+        help="statements + counts + sweep — the pre-flight set; paste into the PR",
+    )
+    all_cmd.add_argument("--base", help="git ref for the statements diff (e.g. origin/main)")
+    all_cmd.add_argument(
+        "--module",
+        action="append",
+        default=[],
+        help="authority module to sweep (repeatable); derived from store-test paths when omitted",
+    )
+    all_cmd.add_argument(
+        "--suite",
+        default="tests/db",
+        help="suite the sweep re-runs per perturbation (default: tests/db)",
+    )
+    all_cmd.add_argument(
+        "paths",
+        nargs="*",
+        help="store-test paths for counts and, when --module is omitted, family → module resolution",
+    )
+    all_cmd.set_defaults(func=cmd_all)
 
     args = parser.parse_args()
     return args.func(args)
