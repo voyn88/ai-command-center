@@ -1,7 +1,7 @@
 """Python surface over the fleet-wide executor availability protocol (0018,
 VOYN-W0-AICC-EXECUTOR-QUOTA-VISIBILITY).
 
-Migration ``0018_executor_availability`` shipped the whole protocol as
+Migration ``0033_executor_availability`` shipped the whole protocol as
 PL/pgSQL — ``executor_mark_unavailable``, ``executor_mark_available``, and the
 ``executor_availability`` / ``executor_availability_event`` tables — and until
 this module, nothing in Python called any of it. This wrapper is deliberately

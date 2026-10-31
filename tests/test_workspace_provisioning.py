@@ -679,6 +679,50 @@ def test_prune_repository_refuses_a_missing_path(tmp_path):
     assert wp.prune_repository(tmp_path / "does-not-exist") == "not_a_repository"
 
 
+# --------------------------------------------------------------------------
+# force_remove_worktree (single ephemeral-worktree removal site)
+# --------------------------------------------------------------------------
+
+
+def test_force_remove_worktree_removes_a_clean_worktree_and_prunes_metadata(
+    tmp_path,
+):
+    repo = _make_repo(tmp_path / "repo")
+    workspace = tmp_path / "wt" / "task-f"
+    _git(repo, "worktree", "add", "-b", "task/f", str(workspace), "main")
+
+    wp.force_remove_worktree(repo, workspace)
+
+    assert not workspace.exists()
+    assert all(
+        entry.get("branch") != "task/f" for entry in git_info.get_worktrees(repo)
+    )
+
+
+def test_force_remove_worktree_falls_back_to_rmtree_when_git_refuses(tmp_path):
+    """A locked worktree makes a single `--force` refuse the removal outright
+    -- exactly the refusal that, at each of the eight hand-rolled call sites
+    this function replaced, could leave the directory (and some of the time
+    its `.git/worktrees/<name>` entry) behind forever."""
+    repo = _make_repo(tmp_path / "repo")
+    workspace = tmp_path / "wt" / "task-g"
+    _git(repo, "worktree", "add", "-b", "task/g", str(workspace), "main")
+    _git(repo, "worktree", "lock", str(workspace))
+
+    wp.force_remove_worktree(repo, workspace)
+
+    assert not workspace.exists()
+    assert all(
+        entry.get("branch") != "task/g" for entry in git_info.get_worktrees(repo)
+    )
+
+
+def test_force_remove_worktree_on_an_already_removed_path_does_not_raise(tmp_path):
+    repo = _make_repo(tmp_path / "repo")
+
+    wp.force_remove_worktree(repo, tmp_path / "never-existed")
+
+
 def test_read_agent_head_refuses_symlinked_head_without_leaking_secret(tmp_path):
     """A symlinked .git/HEAD must not let the publisher read (and echo) a file
     outside the workspace. The agent owns .git, so an lstat-then-read HEAD let
@@ -846,3 +890,92 @@ def test_open_relative_regular_closes_pinned_fd_when_component_is_missing(
         assert closed == duplicated
     finally:
         real_close(base_fd)
+
+
+# -- quarantine_task_workspace ------------------------------------------------
+
+
+def test_quarantine_task_workspace_moves_clone_and_marker_aside(tmp_path) -> None:
+    from command_center import workspace_provisioning as wp
+
+    parent = tmp_path / "root"
+    clone = parent / "backlog-TASK-abc"
+    (clone / "src").mkdir(parents=True)
+    (clone / ".git").mkdir()
+    (clone / "src" / "file.py").write_text("x = 1\n")
+    marker_dir = parent / ".aicc-task-metadata"
+    marker_dir.mkdir()
+    marker = marker_dir / "backlog-TASK-abc.aicc-task-workspace.json"
+    marker.write_text("{}")
+
+    target = wp.quarantine_task_workspace(clone)
+
+    assert target is not None
+    moved = Path(target)
+    assert moved.parent == parent / ".aicc-quarantine"
+    assert moved.name.startswith("backlog-TASK-abc.uncheckpointed.")
+    assert (moved / "src" / "file.py").read_text() == "x = 1\n"
+    assert not clone.exists()
+    assert not marker.exists()
+    assert (
+        parent / ".aicc-quarantine" / f"{moved.name}.aicc-task-workspace.json"
+    ).exists()
+    import stat as _stat
+
+    assert _stat.S_IMODE((parent / ".aicc-quarantine").stat().st_mode) == 0o700
+
+
+def test_quarantine_task_workspace_refuses_symlinks_and_missing_paths(tmp_path) -> None:
+    from command_center import workspace_provisioning as wp
+
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    assert wp.quarantine_task_workspace(link) is None
+    assert real.exists()
+    assert wp.quarantine_task_workspace(tmp_path / "absent") is None
+
+
+def test_quarantine_task_workspace_never_raises(tmp_path, monkeypatch) -> None:
+    from command_center import workspace_provisioning as wp
+
+    clone = tmp_path / "clone"
+    clone.mkdir()
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("marker path computation exploded")
+
+    monkeypatch.setattr(wp, "_task_local_marker_path", boom)
+    assert wp.quarantine_task_workspace(clone) is None
+    assert clone.exists()
+
+
+def test_quarantine_task_workspace_refuses_a_registered_worktree(tmp_path) -> None:
+    """A worktree carries a `.git` pointer file; renaming it would leave the
+    repository's `.git/worktrees/<name>` entry pointing at the old path."""
+    from command_center import workspace_provisioning as wp
+
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    (worktree / ".git").write_text("gitdir: /somewhere/.git/worktrees/wt\n")
+    assert wp.quarantine_task_workspace(worktree) is None
+    assert worktree.exists()
+
+
+def test_restore_quarantined_task_workspace_puts_clone_and_marker_back(
+    tmp_path,
+) -> None:
+    from command_center import workspace_provisioning as wp
+
+    parent = tmp_path / "root"
+    clone = parent / "backlog-TASK-abc"
+    (clone / ".git").mkdir(parents=True)
+    (parent / ".aicc-task-metadata").mkdir()
+    marker = parent / ".aicc-task-metadata" / "backlog-TASK-abc.aicc-task-workspace.json"
+    marker.write_text("{}")
+    target = wp.quarantine_task_workspace(clone)
+    assert target is not None and not clone.exists() and not marker.exists()
+    assert wp.restore_quarantined_task_workspace(target, clone)
+    assert (clone / ".git").is_dir() and marker.is_file()
+    assert not Path(target).exists()

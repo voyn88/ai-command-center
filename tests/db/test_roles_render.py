@@ -122,6 +122,49 @@ def test_the_blanket_default_never_widens_a_narrowed_table() -> None:
     )
 
 
+def test_merge_column_privileges_keeps_both_contributions() -> None:
+    """`COLUMN_PRIVILEGES` carries the same risk one level deeper: role -> table
+    -> privilege -> columns. Two contributions naming different tables for the
+    same role must both survive the merge."""
+    first = {"first_table": {"INSERT": ("a", "b")}}
+    second = {"second_table": {"UPDATE": ("c",)}}
+
+    merged = roles.merge_column_privileges(first, second)
+
+    assert merged["first_table"] == {"INSERT": ("a", "b")}
+    assert merged["second_table"] == {"UPDATE": ("c",)}
+
+
+def test_a_later_column_contribution_cannot_silently_replace_an_earlier_one() -> None:
+    """The regression, one level deeper than `merge_privileges`' own.
+
+    A second contribution narrowing a table another contribution already
+    narrowed must add to it, not replace its whole per-privilege dict — which
+    is what the obvious `dict(first) | second` does.
+    """
+    first = {"shared_table": {"INSERT": ("a",)}}
+    second = {"shared_table": {"UPDATE": ("b",)}}
+
+    naive = dict(first) | second
+    assert naive["shared_table"] == {"UPDATE": ("b",)}, "the mistake, reproduced"
+    assert "INSERT" not in naive["shared_table"]
+
+    merged = roles.merge_column_privileges(first, second)
+    assert merged["shared_table"] == {"INSERT": ("a",), "UPDATE": ("b",)}
+
+
+def test_merge_column_privileges_unions_columns_for_the_same_privilege() -> None:
+    """Two contributions can each widen the same table's *same* privilege
+    carve-out — the column list must union, not have the second replace the
+    first's columns outright."""
+    first = {"completion": {"UPDATE": ("review_verdict",)}}
+    second = {"completion": {"UPDATE": ("review_summary",)}}
+
+    merged = roles.merge_column_privileges(first, second)
+
+    assert merged["completion"]["UPDATE"] == ("review_verdict", "review_summary")
+
+
 def test_the_rendered_matrix_covers_every_declared_privilege() -> None:
     """End to end: nothing declared may be missing from the rendered SQL.
 
@@ -159,13 +202,19 @@ def test_no_role_holds_a_table_privilege_on_the_claim_protocol() -> None:
         assert roles.PRIVILEGES[role]["work_attempt"] == frozenset()
 
 
-def test_the_worker_reaches_the_queue_only_through_the_four_protocol_steps() -> None:
+def test_the_worker_reaches_the_queue_only_through_the_six_protocol_steps() -> None:
     """Two assertions rather than one, because the role now carries two layers.
 
-    The queue half must stay exactly four steps, and the whole set must stay
+    The queue half must stay exactly six steps, and the whole set must stay
     exactly what both tasks declared. A single equality would have to be edited
     by every later task that adds a function, and editing it is indistinguishable
     from widening it.
+
+    `queue_fail_lease_wait` (VOYN-W0-AICC-PUBLISH-LEASE-CONTENTION-BURNS-
+    ATTEMPT) is the fifth: a narrower fail path for a refusal that names no
+    fault in the work itself, kept separate from `queue_fail` so the
+    attempt-count refund it performs can never be reached by a genuine
+    handler failure.
     """
     granted = {s.split("(")[0] for s in roles.FUNCTION_PRIVILEGES[roles.WORKER_ROLE]}
     assert {name for name in granted if name.startswith("queue_")} == {
@@ -173,6 +222,8 @@ def test_the_worker_reaches_the_queue_only_through_the_four_protocol_steps() -> 
         "queue_heartbeat",
         "queue_complete",
         "queue_fail",
+        "queue_fail_lease_wait",
+        "queue_fail_infra_wait",
     }
     # And the enrolment layer: prove its own identity, read only the
     # server-authoritative expiry of that proved credential, rotate its own
@@ -187,11 +238,24 @@ def test_the_worker_reaches_the_queue_only_through_the_four_protocol_steps() -> 
         "queue_heartbeat",
         "queue_complete",
         "queue_fail",
+        "queue_fail_lease_wait",
+        "queue_fail_infra_wait",
         "identity_assert",
         "identity_current_credential",
         "enroll_rotate_self",
         "executor_mark_unavailable",
         "executor_mark_available",
+
+        # 0021: the worker-host fail-closed probe records what it measured
+        # (a finding row keyed by source+failure, and its clearing); neither
+        # reads the backlog nor the queue, and the planner -- not the worker
+        # -- turns a finding into a task.
+        "monitor_record_finding",
+        "monitor_clear_finding",
+        # 0031: and clears the classes it measured GREEN this tick, so a
+        # recovered class stops being an open finding without waiting for
+        # every other probe on the same host.
+        "monitor_clear_findings_except",
     }
     assert roles.VIEW_PRIVILEGES[roles.WORKER_ROLE] == {}
 
@@ -228,6 +292,9 @@ def test_the_control_plane_cannot_claim() -> None:
         "backlog_transition",
         "backlog_record_evidence",
         "backlog_record_remediation",
+        # VOYN-W0-AICC-REVIEW-FULLCONTEXT-TRIAGE (0032): the minor-findings
+        # follow-up lineage, alongside the remediation lineage above.
+        "backlog_record_followup",
         "backlog_add_dependency",
         "backlog_lease_acquire",
         "backlog_lease_heartbeat",
@@ -239,10 +306,31 @@ def test_the_control_plane_cannot_claim() -> None:
         # VOYN-W0-AICC-DEFER-AUTO-RESUME (0014): the machine exit from
         # DEFER_TO_USER for technical parks.
         "backlog_resume_deferred",
+        # VOYN-W0-AICC-NO-RECOVERY-PATH-STUCK-READY-TO-REVIEW (0018): the
+        # machine exit from READY_TO_REVIEW for a task stuck there with no
+        # `pr` evidence.
+        "backlog_recover_stuck_ready_to_review",
         # VOYN-OPS-AICC-PUBLISH-WINDOW-STARVATION (0015): the persisted
         # scan cursor for the tick windows.
         "backlog_scan_claim",
         "backlog_triage",
+        # 0030: clear proven malformed evidence through the audited function.
+        "backlog_clear_evidence",
+        # 0021: read-only deploy preflight with dispatch's privileges; the
+        # task-class setter (split children, monitor tasks); and the
+        # monitor-finding pair the control-host probe uses.
+        "backlog_dispatch_smoke",
+        "backlog_set_task_class",
+        "monitor_record_finding",
+        "monitor_clear_finding",
+        "monitor_clear_findings_except",
+        "monitor_link_task",
+        # VOYN-W0-AICC-BACKLOG-PG-CANONICAL-GATE (0020): the importer's stamp
+        # of where a migrated row came from.
+        "backlog_record_provenance",
+        # 0029: bounded row lock and audited owner decision, no table UPDATE.
+        "backlog_owner_lock",
+        "backlog_owner_decision",
     }
 
 
@@ -272,11 +360,33 @@ def test_function_grants_are_revoked_before_they_are_reapplied() -> None:
 
 
 @pytest.mark.parametrize(
-    "bad", ["queue_claim(text; DROP TABLE task)", "queue_claim(text"]
+    "bad",
+    [
+        "queue_claim(text; DROP TABLE task)",
+        "queue_claim(text",
+        # An array suffix is allowed, but only as a suffix and only on an
+        # otherwise plain identifier.
+        "monitor_clear_findings_except(text, te xt[])",
+        "monitor_clear_findings_except(text, []text)",
+    ],
 )
 def test_function_signature_guard_rejects_injection(bad: str) -> None:
     with pytest.raises(ValueError):
         roles._require_function_signature(bad)
+
+
+def test_function_signature_guard_accepts_an_array_argument() -> None:
+    """0031 takes the keep-list of still-red failure classes as `text[]`,
+    which is not a bare identifier and must not be rejected as one."""
+    roles._require_function_signature("monitor_clear_findings_except(text, text[])")
+    assert (
+        "monitor_clear_findings_except(text, text[])"
+        in roles.FUNCTION_PRIVILEGES[roles.WORKER_ROLE]
+    )
+    assert (
+        "GRANT EXECUTE ON FUNCTION public.monitor_clear_findings_except(text, text[]) "
+        "TO aicc_worker;" in roles.render_table_grants()
+    )
 
 
 def test_a_worker_host_role_is_a_login_member_of_the_worker_group() -> None:

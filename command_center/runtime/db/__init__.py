@@ -68,6 +68,7 @@ from command_center.runtime.db.core import (  # noqa: F401
     _retry_on_busy,
     _row_to_dict,
     _stamp_timestamp_zone,
+    _table_exists,
     _validate_updatable_fields,
     LEDGER_TIMESTAMP_TZ_COLUMN,
     RETENTION_TZ_ENV,
