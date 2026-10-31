@@ -396,7 +396,7 @@ def test_real_sigterm_boundary_then_bounded_sigkill_allows_lease_redelivery(
             )
             daemon.install_signal_handlers()
             daemon.run_forever()
-        except BaseException:
+        except BaseException:  # noqa: BLE001 - child test reports any failure to parent
             os._exit(1)
         os._exit(0)
 
