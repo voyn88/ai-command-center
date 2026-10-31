@@ -845,15 +845,16 @@ def _rollback_selector(
 
 
 def main(argv: list[str] | None = None) -> int:
+    defaults = DeployConfig()
     parser = argparse.ArgumentParser(
         description="Stage an immutable root-owned worker release for origin/main"
     )
-    parser.add_argument("--bare-mirror", type=Path, default=DeployConfig.bare_mirror)
-    parser.add_argument("--aicc-root", type=Path, default=DeployConfig.aicc_root)
-    parser.add_argument("--release-root", type=Path, default=DeployConfig.release_root)
-    parser.add_argument("--state-dir", type=Path, default=DeployConfig.state_dir)
-    parser.add_argument("--runtime-venv", type=Path, default=DeployConfig.runtime_venv)
-    parser.add_argument("--lane-registry", type=Path, default=DeployConfig.lane_registry)
+    parser.add_argument("--bare-mirror", type=Path, default=defaults.bare_mirror)
+    parser.add_argument("--aicc-root", type=Path, default=defaults.aicc_root)
+    parser.add_argument("--release-root", type=Path, default=defaults.release_root)
+    parser.add_argument("--state-dir", type=Path, default=defaults.state_dir)
+    parser.add_argument("--runtime-venv", type=Path, default=defaults.runtime_venv)
+    parser.add_argument("--lane-registry", type=Path, default=defaults.lane_registry)
     parser.add_argument(
         "--remote-url", default=os.environ.get("AICC_RELEASE_REMOTE_URL") or None
     )
@@ -862,7 +863,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--rollout-lock",
         type=Path,
-        default=DeployConfig.rollout_lock_path,
+        default=defaults.rollout_lock_path,
     )
     parser.add_argument("--readiness-timeout", type=float, default=120.0)
     args = parser.parse_args(argv)
