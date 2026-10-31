@@ -56,8 +56,8 @@ Safety model:
   against every other task's registry entry / the rest of the same batch.
 - A small local registry (`data/portfolio_launches.json`, gitignored) records
   every task once successfully launched, purely for fast duplicate rejection
-  and UI history — never the sole authority (git's own state is). Two
-  independent locks guard it, for two different races:
+  and UI history — never the sole authority (git's own state is). Three
+  independent locks guard it, for three different races:
   - The exclusive-publish lock file in `data/portfolio_locks/<task_id>.lock`
     (a fully-written temporary inode atomically published with `os.link`)
     serializes two concurrent launch
@@ -66,6 +66,19 @@ Safety model:
     workspace lock in `runtime.db`, that has no existing atomic primitive
     in this codebase to reuse. Its owner metadata allows a later launch to
     recover it after a process crash, while a live owner is never displaced.
+  - A second claim of the same shape, keyed on the *resolved* worktree path
+    rather than task_id (`data/portfolio_locks/workspace-<sha256 of the
+    resolved path>.lock` — hashed rather than the literal path so an
+    arbitrary absolute card-override path can never collide with the
+    fixed-length lock filename convention or exceed a filesystem's
+    path-component length limit), built on the exact same crash-recovery
+    core as the task_id claim (`_claim_at`/`_release_at`, shared by both).
+    This closes a narrower race the task_id claim alone cannot: two
+    *different* task_ids whose card overrides both resolve to the same
+    worktree_path could otherwise both pass `_find_conflicting_registration`
+    before it is re-verified under lock. `launch_portfolio_task` acquires it
+    after the task_id claim and releases it before that claim, so a failure
+    partway through acquiring either always leaves neither held.
   - `_registry_lock` (`data/portfolio_locks/registry.lock`, an OS advisory
     file lock — `fcntl.flock` on POSIX, `msvcrt.locking` on Windows) guards
     the registry file's read-modify-write cycle itself, across *every*
@@ -85,6 +98,7 @@ Safety model:
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import socket
@@ -367,9 +381,29 @@ def _claim_lock_path(root: Path, task_id: str) -> Path:
     return candidate
 
 
+def _resolved_workspace_label(worktree_path: str | Path) -> str:
+    return str(Path(worktree_path).expanduser().resolve())
+
+
+def _workspace_lock_path(root: Path, worktree_path: str | Path) -> Path:
+    """The worktree-path claim lock path for `worktree_path`, keyed on its
+    *resolved* form (symlinks and relative segments included) so that two
+    different spellings of the same on-disk location collide on the same
+    lock file — the entire point of this lock is to serialize two different
+    task_ids whose card overrides both resolve to the same worktree. The
+    filename is a hash of the resolved path rather than the path itself: an
+    arbitrary absolute card-override path can contain separators or exceed a
+    filesystem's path-component length limit, neither of which is safe to
+    embed literally in a single lock filename the way a validated `task_id`
+    is above."""
+    resolved = _resolved_workspace_label(worktree_path)
+    digest = hashlib.sha256(resolved.encode("utf-8")).hexdigest()
+    return _locks_dir(root) / f"workspace-{digest}.lock"
+
+
 @dataclass(frozen=True)
 class ClaimLockStatus:
-    task_id: str
+    label: str
     path: Path
     exists: bool
     stale: bool
@@ -383,9 +417,12 @@ _owned_claim_tokens: dict[Path, str] = {}
 _owned_claim_tokens_lock = threading.Lock()
 
 
+def _recovery_lock_path_for(lock_path: Path) -> Path:
+    return lock_path.with_name(lock_path.name + CLAIM_RECOVERY_LOCK_SUFFIX)
+
+
 def _claim_recovery_lock_path(root: Path, task_id: str) -> Path:
-    claim_path = _claim_lock_path(root, task_id)
-    return claim_path.with_name(claim_path.name + CLAIM_RECOVERY_LOCK_SUFFIX)
+    return _recovery_lock_path_for(_claim_lock_path(root, task_id))
 
 
 def _process_identity(pid: int) -> str | None:
@@ -440,8 +477,11 @@ def _read_claim_metadata(path: Path) -> dict | None:
     return value if isinstance(value, dict) else None
 
 
-def inspect_claim(root: Path, task_id: str, *, now: float | None = None) -> ClaimLockStatus:
-    """Inspect a claim without mutating it.
+def _inspect_claim_at(lock_path: Path, label: str, *, now: float | None = None) -> ClaimLockStatus:
+    """Inspect a claim without mutating it. Shared core for both the
+    per-task_id claim (`inspect_claim`) and the per-worktree-path claim
+    (`inspect_workspace_claim`) — what a claim is keyed on differs, but the
+    crash/PID-reuse/cross-host recovery semantics below are identical.
 
     A lock is automatically recoverable only when its structured owner
     metadata proves that the owning local process no longer exists (or that
@@ -455,20 +495,19 @@ def inspect_claim(root: Path, task_id: str, *, now: float | None = None) -> Clai
     between two hosts with the same hostname is out of scope -- the same
     single-host assumption the `flock`/`os.link` primitives already require.
     """
-    path = _claim_lock_path(root, task_id)
     try:
-        stat = path.stat()
+        stat = lock_path.stat()
     except FileNotFoundError:
-        return ClaimLockStatus(task_id, path, False, False, False, "lock отсутствует")
+        return ClaimLockStatus(label, lock_path, False, False, False, "lock отсутствует")
     except OSError as exc:
-        return ClaimLockStatus(task_id, path, True, False, False, f"lock недоступен: {exc}")
+        return ClaimLockStatus(label, lock_path, True, False, False, f"lock недоступен: {exc}")
 
     current_time = time.time() if now is None else now
     age = max(0.0, current_time - stat.st_mtime)
-    metadata = _read_claim_metadata(path)
+    metadata = _read_claim_metadata(lock_path)
     if not metadata:
         return ClaimLockStatus(
-            task_id, path, True, False, False,
+            label, lock_path, True, False, False,
             "lock создан старой версией или повреждён; владелец не может быть безопасно подтверждён",
             age_seconds=age,
         )
@@ -485,85 +524,108 @@ def inspect_claim(root: Path, task_id: str, *, now: float | None = None) -> Clai
         or not isinstance(hostname, str)
     ):
         return ClaimLockStatus(
-            task_id, path, True, False, False, "метаданные lock неполны; автоматическое снятие небезопасно",
+            label, lock_path, True, False, False, "метаданные lock неполны; автоматическое снятие небезопасно",
             age_seconds=age,
         )
     if hostname != socket.gethostname():
         return ClaimLockStatus(
-            task_id, path, True, False, False,
+            label, lock_path, True, False, False,
             f"lock принадлежит другому хосту ({hostname}); локальная проверка процесса невозможна",
             owner_pid=pid, age_seconds=age,
         )
     if not _pid_is_alive(pid):
         return ClaimLockStatus(
-            task_id, path, True, True, True, f"процесс-владелец PID {pid} не существует",
+            label, lock_path, True, True, True, f"процесс-владелец PID {pid} не существует",
             owner_pid=pid, age_seconds=age,
         )
     current_identity = _process_identity(pid)
     if identity and current_identity and identity != current_identity:
         return ClaimLockStatus(
-            task_id, path, True, True, True, f"PID {pid} был переиспользован другим процессом",
+            label, lock_path, True, True, True, f"PID {pid} был переиспользован другим процессом",
             owner_pid=pid, age_seconds=age,
         )
     return ClaimLockStatus(
-        task_id, path, True, False, False, f"процесс-владелец PID {pid} активен",
+        label, lock_path, True, False, False, f"процесс-владелец PID {pid} активен",
         owner_pid=pid, age_seconds=age,
     )
 
 
-def recover_stale_claim(root: Path, task_id: str) -> bool:
+def inspect_claim(root: Path, task_id: str, *, now: float | None = None) -> ClaimLockStatus:
+    """Inspect the per-task_id claim for `task_id`. See `_inspect_claim_at`."""
+    return _inspect_claim_at(_claim_lock_path(root, task_id), task_id, now=now)
+
+
+def inspect_workspace_claim(root: Path, worktree_path: str | Path, *, now: float | None = None) -> ClaimLockStatus:
+    """Inspect the worktree-path claim for `worktree_path`. See `_inspect_claim_at`."""
+    return _inspect_claim_at(
+        _workspace_lock_path(root, worktree_path), _resolved_workspace_label(worktree_path), now=now
+    )
+
+
+def _recover_stale_claim_at(lock_path: Path, label: str) -> bool:
     """Remove a provably orphaned claim, serialized against claim/release.
+    Shared core for `recover_stale_claim` and `recover_stale_workspace_claim`.
 
     The status is re-read while holding the recovery lock and the file token
     is checked again immediately before unlink. This makes recovery safe
     against another process concurrently recovering and acquiring the task.
     """
-    path = _claim_lock_path(root, task_id)
-    guard = _claim_recovery_lock_path(root, task_id)
+    guard = _recovery_lock_path_for(lock_path)
     try:
         with storage.file_lock(
             guard,
             timeout=CLAIM_RECOVERY_LOCK_TIMEOUT_SECONDS,
             poll_seconds=_CLAIM_RECOVERY_LOCK_POLL_SECONDS,
         ):
-            status = inspect_claim(root, task_id)
+            status = _inspect_claim_at(lock_path, label)
             if not status.recoverable:
                 return False
-            metadata = _read_claim_metadata(path)
-            if not metadata or not inspect_claim(root, task_id).recoverable:
+            metadata = _read_claim_metadata(lock_path)
+            if not metadata or not _inspect_claim_at(lock_path, label).recoverable:
                 return False
             expected_token = metadata.get("token")
-            latest = _read_claim_metadata(path)
+            latest = _read_claim_metadata(lock_path)
             if not latest or latest.get("token") != expected_token:
                 return False
-            path.unlink(missing_ok=True)
+            lock_path.unlink(missing_ok=True)
             return True
     except storage.LockTimeoutError:
         return False
 
 
-def _claim(root: Path, task_id: str) -> bool:
-    """Atomically claim `task_id`, recovering a provably orphaned claim.
+def recover_stale_claim(root: Path, task_id: str) -> bool:
+    return _recover_stale_claim_at(_claim_lock_path(root, task_id), task_id)
+
+
+def recover_stale_workspace_claim(root: Path, worktree_path: str | Path) -> bool:
+    return _recover_stale_claim_at(
+        _workspace_lock_path(root, worktree_path), _resolved_workspace_label(worktree_path)
+    )
+
+
+def _claim_at(lock_path: Path, label: str) -> bool:
+    """Atomically claim `lock_path`, recovering a provably orphaned claim.
+    Shared core for `_claim` (per-task_id) and `_claim_workspace`
+    (per-worktree-path).
 
     Creation and recovery share a short-lived OS advisory guard. The claim
     itself contains owner identity and a random token; a live owner's claim
     is never removed, while a process crash is recovered on the next attempt.
     """
-    lock_path = _claim_lock_path(root, task_id)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         guard_context = storage.file_lock(
-            _claim_recovery_lock_path(root, task_id),
+            _recovery_lock_path_for(lock_path),
             timeout=CLAIM_RECOVERY_LOCK_TIMEOUT_SECONDS,
             poll_seconds=_CLAIM_RECOVERY_LOCK_POLL_SECONDS,
         )
         with guard_context:
             if lock_path.exists():
-                status = inspect_claim(root, task_id)
+                status = _inspect_claim_at(lock_path, label)
                 if not status.recoverable:
                     return False
                 metadata = _read_claim_metadata(lock_path)
-                if not metadata or not inspect_claim(root, task_id).recoverable:
+                if not metadata or not _inspect_claim_at(lock_path, label).recoverable:
                     return False
                 lock_path.unlink(missing_ok=True)
 
@@ -597,11 +659,24 @@ def _claim(root: Path, task_id: str) -> bool:
         return False
 
 
-def _release(root: Path, task_id: str) -> None:
-    lock_path = _claim_lock_path(root, task_id)
+def _claim(root: Path, task_id: str) -> bool:
+    return _claim_at(_claim_lock_path(root, task_id), task_id)
+
+
+def _claim_workspace(root: Path, worktree_path: str | Path) -> bool:
+    """Atomically claim `worktree_path` (keyed on its resolved form),
+    closing the race where two different task_ids whose card overrides
+    resolve to the same worktree could both pass
+    `_find_conflicting_registration` before it is re-verified: whichever of
+    them claims this lock first proceeds, the other is rejected outright
+    rather than racing to create the same worktree/branch."""
+    return _claim_at(_workspace_lock_path(root, worktree_path), _resolved_workspace_label(worktree_path))
+
+
+def _release_at(lock_path: Path) -> None:
     try:
         with storage.file_lock(
-            _claim_recovery_lock_path(root, task_id),
+            _recovery_lock_path_for(lock_path),
             timeout=CLAIM_RECOVERY_LOCK_TIMEOUT_SECONDS,
             poll_seconds=_CLAIM_RECOVERY_LOCK_POLL_SECONDS,
         ):
@@ -615,6 +690,14 @@ def _release(root: Path, task_id: str) -> None:
         # have changed. It will be recovered automatically after this process
         # exits if it genuinely becomes orphaned.
         return
+
+
+def _release(root: Path, task_id: str) -> None:
+    _release_at(_claim_lock_path(root, task_id))
+
+
+def _release_workspace(root: Path, worktree_path: str | Path) -> None:
+    _release_at(_workspace_lock_path(root, worktree_path))
 
 
 REGISTRY_LOCK_FILE_NAME = "registry.lock"
@@ -1434,132 +1517,142 @@ def launch_portfolio_task(
     worktree_created = False
 
     try:
-        # Re-check duplicate/conflict state under the claim — closes the
-        # race window between building `plan` above and holding the claim
-        # (two concurrent callers could have both passed the earlier,
-        # unlocked check).
-        registry = load_registry(root)
-        if task.task_id in registry:
-            return PortfolioLaunchResult(
-                task_id=task.task_id, launched=False, message="задача уже была запущена ранее", plan=plan
-            )
-        conflict_owner = _find_conflicting_registration(
-            registry, branch=plan.branch, worktree=plan.worktree, exclude_task_id=task.task_id
-        )
-        if conflict_owner:
+        if not _claim_workspace(root, worktree_path):
             return PortfolioLaunchResult(
                 task_id=task.task_id,
                 launched=False,
-                message=f"конфликт: ветка/worktree уже используется задачей {conflict_owner}",
+                message=f"рабочая директория уже используется другим одновременным запуском: {worktree_path}",
                 plan=plan,
             )
-
-        if plan.worktree_mode == WORKTREE_MODE_EXISTING:
-            # Never call `git worktree add` here — re-validate the existing
-            # worktree fresh (it could have changed since the dry-run plan
-            # was built) and launch directly into it if it still checks out.
-            status = git_info.get_status(worktree_path)
-            if not worktree_path.is_dir() or not status.get("is_repo"):
+        try:
+            # Re-check duplicate/conflict state under the claim — closes the
+            # race window between building `plan` above and holding the claim
+            # (two concurrent callers could have both passed the earlier,
+            # unlocked check).
+            registry = load_registry(root)
+            if task.task_id in registry:
                 return PortfolioLaunchResult(
-                    task_id=task.task_id, launched=False, message=f"существующий worktree недоступен: {worktree_path}", plan=plan
+                    task_id=task.task_id, launched=False, message="задача уже была запущена ранее", plan=plan
                 )
-            if status.get("branch") != plan.branch:
+            conflict_owner = _find_conflicting_registration(
+                registry, branch=plan.branch, worktree=plan.worktree, exclude_task_id=task.task_id
+            )
+            if conflict_owner:
                 return PortfolioLaunchResult(
                     task_id=task.task_id,
                     launched=False,
-                    message=f"существующий worktree сменил ветку: ожидалась «{plan.branch}», сейчас «{status.get('branch')}»",
+                    message=f"конфликт: ветка/worktree уже используется задачей {conflict_owner}",
                     plan=plan,
                 )
-            if status.get("dirty"):
-                return PortfolioLaunchResult(
-                    task_id=task.task_id, launched=False, message=f"существующий worktree не чист: {worktree_path}", plan=plan
+
+            if plan.worktree_mode == WORKTREE_MODE_EXISTING:
+                # Never call `git worktree add` here — re-validate the existing
+                # worktree fresh (it could have changed since the dry-run plan
+                # was built) and launch directly into it if it still checks out.
+                status = git_info.get_status(worktree_path)
+                if not worktree_path.is_dir() or not status.get("is_repo"):
+                    return PortfolioLaunchResult(
+                        task_id=task.task_id, launched=False, message=f"существующий worktree недоступен: {worktree_path}", plan=plan
+                    )
+                if status.get("branch") != plan.branch:
+                    return PortfolioLaunchResult(
+                        task_id=task.task_id,
+                        launched=False,
+                        message=f"существующий worktree сменил ветку: ожидалась «{plan.branch}», сейчас «{status.get('branch')}»",
+                        plan=plan,
+                    )
+                if status.get("dirty"):
+                    return PortfolioLaunchResult(
+                        task_id=task.task_id, launched=False, message=f"существующий worktree не чист: {worktree_path}", plan=plan
+                    )
+            else:
+                if worktree_path.exists():
+                    return PortfolioLaunchResult(
+                        task_id=task.task_id, launched=False, message=f"путь worktree уже существует: {worktree_path}", plan=plan
+                    )
+                branch_exists = plan.branch in git_info.get_branches(repo_root)
+                try:
+                    if branch_exists:
+                        attach_worktree(repo_root, branch=plan.branch, worktree_path=worktree_path)
+                    else:
+                        if not plan.base_branch:
+                            return PortfolioLaunchResult(
+                                task_id=task.task_id, launched=False, message="не удалось создать worktree: base_branch не определён", plan=plan
+                            )
+                        create_worktree(repo_root, branch=plan.branch, worktree_path=worktree_path, base_branch=plan.base_branch)
+                        branch_created = True
+                    worktree_created = True
+                except PortfolioLaunchError as exc:
+                    return PortfolioLaunchResult(task_id=task.task_id, launched=False, message=str(exc), plan=plan)
+
+            prompt = build_agent_prompt(task, plan)
+            synthetic_task = _synthetic_task(task, plan, worktree_path=worktree_path, prompt=prompt)
+            synthetic_tasks_by_id = {synthetic_task["id"]: synthetic_task}
+
+            entries = execution_queue.enqueue_and_persist(root, synthetic_task, synthetic_tasks_by_id)
+            new_entry = next(
+                (e for e in entries if e.get("task_id") == task.task_id and e.get("state") in execution_queue.OPEN_STATES),
+                None,
+            )
+            if new_entry is None:
+                _rollback_worktree(
+                    repo_root, worktree_path, worktree_created=worktree_created, branch=plan.branch, branch_created=branch_created
                 )
-        else:
-            if worktree_path.exists():
                 return PortfolioLaunchResult(
-                    task_id=task.task_id, launched=False, message=f"путь worktree уже существует: {worktree_path}", plan=plan
+                    task_id=task.task_id, launched=False, message="не удалось создать запись очереди запуска", plan=plan
                 )
-            branch_exists = plan.branch in git_info.get_branches(repo_root)
-            try:
-                if branch_exists:
-                    attach_worktree(repo_root, branch=plan.branch, worktree_path=worktree_path)
-                else:
-                    if not plan.base_branch:
-                        return PortfolioLaunchResult(
-                            task_id=task.task_id, launched=False, message="не удалось создать worktree: base_branch не определён", plan=plan
-                        )
-                    create_worktree(repo_root, branch=plan.branch, worktree_path=worktree_path, base_branch=plan.base_branch)
-                    branch_created = True
-                worktree_created = True
-            except PortfolioLaunchError as exc:
-                return PortfolioLaunchResult(task_id=task.task_id, launched=False, message=str(exc), plan=plan)
-
-        prompt = build_agent_prompt(task, plan)
-        synthetic_task = _synthetic_task(task, plan, worktree_path=worktree_path, prompt=prompt)
-        synthetic_tasks_by_id = {synthetic_task["id"]: synthetic_task}
-
-        entries = execution_queue.enqueue_and_persist(root, synthetic_task, synthetic_tasks_by_id)
-        new_entry = next(
-            (e for e in entries if e.get("task_id") == task.task_id and e.get("state") in execution_queue.OPEN_STATES),
-            None,
-        )
-        if new_entry is None:
-            _rollback_worktree(
-                repo_root, worktree_path, worktree_created=worktree_created, branch=plan.branch, branch_created=branch_created
+            _, results = execution_queue.launch_ready(
+                root,
+                entries,
+                [synthetic_task],
+                synthetic_tasks_by_id,
+                {
+                    task.project: {
+                        "repository_path": str(repo_root),
+                        "base_branch": plan.base_branch,
+                    }
+                },
+                execution_center_api,
+                entry_ids=[new_entry["id"]],
             )
-            return PortfolioLaunchResult(
-                task_id=task.task_id, launched=False, message="не удалось создать запись очереди запуска", plan=plan
-            )
-        _, results = execution_queue.launch_ready(
-            root,
-            entries,
-            [synthetic_task],
-            synthetic_tasks_by_id,
-            {
-                task.project: {
-                    "repository_path": str(repo_root),
-                    "base_branch": plan.base_branch,
-                }
-            },
-            execution_center_api,
-            entry_ids=[new_entry["id"]],
-        )
-        result = next((r for r in results if r.entry_id == new_entry["id"]), None)
+            result = next((r for r in results if r.entry_id == new_entry["id"]), None)
 
-        if result is None or not result.launched:
-            execution_queue.dequeue_and_persist(root, new_entry["id"])
-            _rollback_worktree(
-                repo_root, worktree_path, worktree_created=worktree_created, branch=plan.branch, branch_created=branch_created
-            )
-            message = result.message if result else "запуск не выполнен"
-            return PortfolioLaunchResult(task_id=task.task_id, launched=False, message=message, plan=plan)
+            if result is None or not result.launched:
+                execution_queue.dequeue_and_persist(root, new_entry["id"])
+                _rollback_worktree(
+                    repo_root, worktree_path, worktree_created=worktree_created, branch=plan.branch, branch_created=branch_created
+                )
+                message = result.message if result else "запуск не выполнен"
+                return PortfolioLaunchResult(task_id=task.task_id, launched=False, message=message, plan=plan)
 
-        entry = {
-            "task_id": task.task_id,
-            "project": task.project,
-            "branch": plan.branch,
-            "worktree": str(worktree_path),
-            "worktree_mode": plan.worktree_mode,
-            "repository_root": str(repo_root),
-            "base_branch": plan.base_branch,
-            "base_sha": plan.base_sha,
-            "run_id": result.run_id,
-            "queue_entry_id": new_entry["id"],
-            "launched_at": models.iso_now(),
-            "source_path": str(task.source_path),
-        }
-        # The agent run has already started (`result.launched` above) — from
-        # here on nothing is rolled back regardless of what happens (see
-        # module docstring), so a registry conflict at this point (someone
-        # else registered this exact task_id/branch/worktree in the window
-        # between our `_claim` and here) is reported but the live run stands.
-        conflict_message = _persist_registry_entry(root, task.task_id, entry)
-        if conflict_message is not None:
-            return PortfolioLaunchResult(
-                task_id=task.task_id, launched=True, run_id=result.run_id, message=conflict_message, plan=plan
-            )
+            entry = {
+                "task_id": task.task_id,
+                "project": task.project,
+                "branch": plan.branch,
+                "worktree": str(worktree_path),
+                "worktree_mode": plan.worktree_mode,
+                "repository_root": str(repo_root),
+                "base_branch": plan.base_branch,
+                "base_sha": plan.base_sha,
+                "run_id": result.run_id,
+                "queue_entry_id": new_entry["id"],
+                "launched_at": models.iso_now(),
+                "source_path": str(task.source_path),
+            }
+            # The agent run has already started (`result.launched` above) — from
+            # here on nothing is rolled back regardless of what happens (see
+            # module docstring), so a registry conflict at this point (someone
+            # else registered this exact task_id/branch/worktree in the window
+            # between our `_claim` and here) is reported but the live run stands.
+            conflict_message = _persist_registry_entry(root, task.task_id, entry)
+            if conflict_message is not None:
+                return PortfolioLaunchResult(
+                    task_id=task.task_id, launched=True, run_id=result.run_id, message=conflict_message, plan=plan
+                )
 
-        return PortfolioLaunchResult(task_id=task.task_id, launched=True, run_id=result.run_id, plan=plan)
+            return PortfolioLaunchResult(task_id=task.task_id, launched=True, run_id=result.run_id, plan=plan)
+        finally:
+            _release_workspace(root, worktree_path)
     finally:
         _release(root, task.task_id)
 
