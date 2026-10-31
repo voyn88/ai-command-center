@@ -46,6 +46,7 @@ _PROHIBITED: tuple[re.Pattern[str], ...] = tuple(
         r"credential",
         r"ghp_[A-Za-z0-9]",
         r"github_pat_",
+        r"\bxai-[A-Za-z0-9_-]{16,}",
         r"\bsk-[A-Za-z0-9]{8,}",
         r"prompt",
         r"raw[_-]?log",
