@@ -1061,15 +1061,55 @@ def test_codex_runs_exec_the_non_interactive_subcommand():
     assert command[1] == "exec", command
 
 
-def test_command_builders_table_covers_every_wired_executor():
+def test_command_builders_table_covers_every_wired_executor(monkeypatch):
     """The worker gates on this table (`handlers._run_agent`), and the routing
     matrix's own test derives its allowed set from it, so an entry here is the
     single act that makes an executor real."""
-    assert set(agent_runner.COMMAND_BUILDERS) == {"claude", "codex", "copilot"}
+    monkeypatch.setenv(agent_runner.PRINCIPAL_ISOLATION_REQUIRED_ENV, "required")
+    assert set(agent_runner.COMMAND_BUILDERS) == {
+        "grok",
+        "cursor",
+        "claude",
+        "codex",
+        "copilot",
+        "openai_http",
+    }
     for name in agent_runner.COMMAND_BUILDERS:
-        command = agent_runner._command_builder(name)("x", task_type="review")
+        builder = agent_runner._command_builder(name)
+        if name == "openai_http":
+            # The bridge is model-only by construction and demands an
+            # explicit provider/model; "review" would rightly be refused.
+            command = builder(
+                "x", task_type="independent_review", model="groq/m"
+            )
+        else:
+            command = builder("x", task_type="review")
         assert isinstance(command, list) and command, name
         assert all(isinstance(part, str) for part in command), name
+
+
+@pytest.mark.parametrize("executor", ["grok", "cursor"])
+def test_alternative_executors_refuse_unisolated_launch(monkeypatch, executor):
+    monkeypatch.delenv(agent_runner.PRINCIPAL_ISOLATION_REQUIRED_ENV, raising=False)
+    with pytest.raises(agent_runner.RunnerError, match="isolation"):
+        agent_runner._command_builder(executor)("task", task_type="implementation")
+
+
+def test_alternative_model_only_review_capability(monkeypatch, tmp_path):
+    monkeypatch.setenv(agent_runner.PRINCIPAL_ISOLATION_REQUIRED_ENV, "required")
+    manifest = agent_runner.build_principal_isolation_manifest(
+        repository_path=tmp_path, prompt="review", task_type="independent_review",
+        timeout_seconds=60, executor="grok", model=None,
+    )
+    assert manifest["profile"] == "model_only"
+    assert "--no-tools" in agent_runner.build_grok_command("review", task_type="independent_review")
+    with pytest.raises(agent_runner.RunnerError, match="model-only"):
+        agent_runner.build_cursor_command("review", task_type="independent_review")
+    with pytest.raises(agent_runner.RunnerError, match="model-only"):
+        agent_runner.build_principal_isolation_manifest(
+            repository_path=tmp_path, prompt="review", task_type="independent_review",
+            timeout_seconds=60, executor="cursor", model=None,
+        )
 
 
 @pytest.mark.parametrize("task_type", sorted(agent_runner.READ_ONLY_TASK_TYPES))
@@ -1128,3 +1168,170 @@ def test_independent_review_is_model_only_for_both_review_providers():
     assert "--available-tools=" in copilot
     assert "--allow-tool" not in copilot
     assert "--allow-all-tools" not in copilot
+
+
+def test_review_key_reaches_only_the_verdict_tier(monkeypatch, tmp_path):
+    """The metered review key (VOYN-W0-SERVER-OWN-BILLING) is injected as
+    ANTHROPIC_API_KEY only for claude runs of the review task classes —
+    implementation stays on the subscription, other executors untouched,
+    and without the env var nothing changes at all."""
+    captured = {}
+
+    class _Proc:
+        pid = 4242
+        stdout = None
+        returncode = 0
+
+        def poll(self):
+            return 0
+
+        def communicate(self, input=None, timeout=None):
+            return ("", "")
+
+        def wait(self, timeout=None):
+            return 0
+
+    def fake_popen(command, **kwargs):
+        captured["env"] = kwargs.get("env")
+        captured["command"] = command
+        return _Proc()
+
+    monkeypatch.setattr(agent_runner.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        agent_runner, "principal_isolation_required", lambda: False
+    )
+    monkeypatch.setenv("AICC_REVIEW_ANTHROPIC_API_KEY", "sk-ant-meter")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    def run(task_type, executor="claude"):
+        agent_runner.run_claude_code(
+            repository_path=tmp_path,
+            prompt="p",
+            task_type=task_type,
+            timeout_seconds=5,
+            executor=executor,
+            model="claude-sonnet-5" if executor != "claude" else None,
+        )
+        return captured["env"]
+
+    env = run("independent_review")
+    assert env.get("ANTHROPIC_API_KEY") == "sk-ant-meter"
+    assert "AICC_REVIEW_ANTHROPIC_API_KEY" not in env
+    assert run("verification_review").get("ANTHROPIC_API_KEY") == "sk-ant-meter"
+    for task_type in ("implementation", "remediation", "review"):
+        env = run(task_type)
+        assert "ANTHROPIC_API_KEY" not in env
+        # The raw name must be scrubbed from EVERY child, or a mutating
+        # run could read the metered key under its own name.
+        assert "AICC_REVIEW_ANTHROPIC_API_KEY" not in env
+    env = run("independent_review", executor="codex")
+    assert "ANTHROPIC_API_KEY" not in env
+    assert "AICC_REVIEW_ANTHROPIC_API_KEY" not in env
+
+    monkeypatch.delenv("AICC_REVIEW_ANTHROPIC_API_KEY")
+    assert "ANTHROPIC_API_KEY" not in run("independent_review")
+
+
+def test_codex_development_sandbox_is_danger_full_access_only_under_principal_isolation(monkeypatch):
+    """Owner decision 2026-09-09: inside the isolated unit the boundary is
+    systemd's; Codex's inner bubblewrap mounted .git read-only. Outside
+    isolation the inner sandbox stays; read-only stays read-only either way."""
+    from command_center import agent_runner as ar
+
+    monkeypatch.delenv(ar.PRINCIPAL_ISOLATION_REQUIRED_ENV, raising=False)
+    assert _sandbox_argument(ar.build_codex_command("p", task_type="implementation")) == "workspace-write"
+    monkeypatch.setenv(ar.PRINCIPAL_ISOLATION_REQUIRED_ENV, "required")
+    assert _sandbox_argument(ar.build_codex_command("p", task_type="implementation")) == "danger-full-access"
+    assert _sandbox_argument(ar.build_codex_command("p", task_type="review")) == "read-only"
+
+
+def _provider_error_run(status="failed", exit_code=1, stdout="", stderr=""):
+    return agent_runner.RunResult(
+        status=status,
+        exit_code=exit_code,
+        stdout=stdout,
+        stderr=stderr,
+        duration_seconds=1.0,
+        started_at="t0",
+        completed_at="t1",
+    )
+
+
+@pytest.mark.parametrize("code", [401, 403, 429, 500, 502, 503, 504])
+def test_grok_provider_refusal_allows_bounded_fallback(code):
+    run = _provider_error_run(stderr=f"provider HTTP {code}\n")
+    assert run.is_executor_provider_error("grok")
+
+
+def test_quota_circuit_expires_and_never_shortens_an_existing_window():
+    from datetime import UTC, datetime, timedelta
+    now = datetime(2026, 10, 31, tzinfo=UTC)
+    until = agent_runner.record_executor_exhausted("cursor", now=now)
+    assert agent_runner.executor_exhausted_until("cursor", now=now) == until
+    assert agent_runner.record_executor_exhausted("cursor", now=now, cooldown_seconds=1) == until
+    assert agent_runner.executor_exhausted_until("cursor", now=until) is None
+    capped = agent_runner.record_executor_exhausted("grok", now=now, cooldown_seconds=1000000)
+    assert capped == now + timedelta(hours=1)
+
+
+@pytest.mark.parametrize("seconds", [float("inf"), float("nan"), 0, -1])
+def test_quota_circuit_refuses_invalid_deadlines(seconds):
+    with pytest.raises(ValueError, match="finite and positive"):
+        agent_runner.record_executor_exhausted("cursor", cooldown_seconds=seconds)
+
+
+def test_quota_signature_ignores_success_and_quoted_stdout():
+    assert _provider_error_run(stderr="provider HTTP 429").executor_quota_signature("grok")
+    assert _provider_error_run(stderr="provider HTTP 401").executor_quota_signature("grok") is None
+    assert _provider_error_run(stdout="usage limit reached", stderr="tests failed").executor_quota_signature("cursor") is None
+    assert _provider_error_run(status="completed", exit_code=0, stderr="usage limit reached").executor_quota_signature("cursor") is None
+
+
+@pytest.mark.parametrize("status,exit_code,stdout,stderr", [
+    ("completed", 0, "provider HTTP 429", ""),
+    ("failed", 1, "provider HTTP 429", "tests failed"),
+    ("failed", 1, "", "provider HTTP 422"),
+    ("failed", 1, "", "agent budget exhausted"),
+])
+def test_grok_task_failures_and_reports_do_not_trigger_fallback(status, exit_code, stdout, stderr):
+    run = _provider_error_run(status, exit_code, stdout, stderr)
+    assert not run.is_executor_provider_error("grok")
+
+
+def test_codex_usage_limit_is_a_provider_error_not_a_result():
+    """Live incident 2026-09-02 / 2026-09-11: Codex exited 1 with "You've hit
+    your usage limit" and an empty result, the review work item completed
+    successfully with that error as its entire payload, and every review
+    stalled until the quota window. The account failed, not the task."""
+    run = _provider_error_run(
+        stderr=(
+            "ERROR: You've hit your usage limit. Visit "
+            "https://chatgpt.com/codex/settings/usage to purchase more credits "
+            "or try again at Sep 15th, 2026 1:24 AM."
+        )
+    )
+    assert run.is_executor_provider_error("codex") is True
+
+
+def test_a_successful_codex_review_discussing_limits_is_not_a_provider_error():
+    """Free text is consulted only for a failed, non-zero process, so a
+    completed review whose findings mention a usage limit cannot be
+    reclassified as infrastructure."""
+    run = _provider_error_run(
+        status="completed",
+        exit_code=0,
+        stdout="FINDING: the retry loop ignores the API usage limit entirely.",
+    )
+    assert run.is_executor_provider_error("codex") is False
+
+
+def test_a_codex_task_failure_without_a_signature_stays_a_task_failure():
+    """A run that failed on its own merits must never be retried as
+    infrastructure -- retrying a mutating run re-applies its side effects."""
+    run = _provider_error_run(stderr="tests failed: 3 assertions did not hold")
+    assert run.is_executor_provider_error("codex") is False
+
+
+def test_an_unknown_executor_never_matches_free_text_signatures():
+    run = _provider_error_run(stderr="unauthorized")
+    assert run.is_executor_provider_error("claude") is False

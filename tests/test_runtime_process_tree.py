@@ -22,10 +22,29 @@ def _wait_for_tree_pids(pidfile_base: str, timeout: float = 10.0) -> dict[str, i
             pids = {}
             for role, path in paths.items():
                 with open(path) as handle:
-                    pids[role] = int(handle.read().strip())
-            return pids
+                    value = handle.read().strip()
+                # Creation precedes the fixture's PID write. An existing but
+                # empty file is not a readiness signal under parallel CI load.
+                if not value:
+                    break
+                pids[role] = int(value)
+            if len(pids) == len(paths):
+                return pids
         time.sleep(0.05)
     raise TimeoutError(f"process tree pid files never all appeared: {pidfile_base}")
+
+
+def test_pid_waiter_waits_for_content_after_file_creation(tmp_path, monkeypatch):
+    base = tmp_path / "pid"
+    for role, value in (("parent", "101"), ("child", "102"), ("grandchild", "")):
+        (tmp_path / f"pid.{role}").write_text(value)
+    waits = []
+    def finish_write(_seconds):
+        waits.append(1)
+        (tmp_path / "pid.grandchild").write_text("103")
+    monkeypatch.setattr(time, "sleep", finish_write)
+    assert _wait_for_tree_pids(str(base)) == {"parent": 101, "child": 102, "grandchild": 103}
+    assert waits == [1]
 
 
 def test_grandchild_process_tree_terminates_on_process_group_cancellation(
