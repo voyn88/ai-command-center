@@ -35,20 +35,27 @@ stays on the worker host's journal.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import shutil
 import threading
+import uuid
 from contextlib import ExitStack
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 from command_center import agent_runner, project_config, workspace_provisioning
+from command_center.ops.source_clone_refresh import refresh_source_clone
 from command_center.orchestrator.publish import PublishConfig, publish_run
+from command_center.orchestrator.routing import cascade_for
 from command_center.worker import writer_lease
 from command_center.worker.daemon import Handler, HandlerOutcome
 from command_center.worker.payloads import PayloadError, parse_agent_run
 from command_center.worker.worktree_lease import blocking_lease
+
+log = logging.getLogger(__name__)
 
 __all__ = ["build_handlers"]
 
@@ -153,13 +160,254 @@ def _review_head_checkout(
     return target, None
 
 
-def _remove_review_head_checkout(repository: Path, target: Path) -> None:
-    removed = agent_runner._run_git(
-        ["worktree", "remove", "--force", str(target)], repository, timeout=60
+# Seam for tests; the real removal is shutil's.
+_rmtree = shutil.rmtree
+
+_PERMANENT_CLONE_FAILURES = (
+    "dubious ownership",
+    "not a git repository",
+    "does not exist",
+    "No such file or directory",
+)
+
+
+def _refresh_read_only_source(
+    repository: Path, *, pr_number: str | None = None
+) -> tuple[bool, str | None]:
+    """Bring the bound source clone current before a read-only checkout uses it.
+
+    The isolated reviewer clones from this source, not from GitHub.  A stale
+    source therefore means every review runs against yesterday's tree.  The
+    worker namespace binds the Projects clone read-only, so this must not
+    write FETCH_HEAD: host `voyn-aicc-source-clone-refresh` is the writer,
+    and a read-only fetch is skipped (VOYN-W0-AICC-ISOLATED-WORKER-FETCHES-
+    READONLY-SOURCE-CLONE).
+    """
+    result = refresh_source_clone(repository, pr_number=pr_number)
+    return result.ok, result.error
+
+
+def _source_ref_pointing_at(repository: Path, sha: str) -> str | None:
+    """The mirrored pull-request ref (preferred) or branch in ``repository``
+    whose tip is exactly ``sha``, or None when nothing points at it."""
+    listed = agent_runner._run_git(
+        [
+            "for-each-ref",
+            "--format=%(refname)",
+            f"--points-at={sha}",
+            "refs/remotes/origin/pr/",
+            "refs/heads/",
+        ],
+        repository,
     )
-    if removed is None or removed.returncode != 0:
-        shutil.rmtree(target, ignore_errors=True)
-        agent_runner._run_git(["worktree", "prune"], repository)
+    if listed is None or listed.returncode != 0:
+        return None
+    refs = [line.strip() for line in listed.stdout.splitlines() if line.strip()]
+    for prefix in ("refs/remotes/origin/pr/", "refs/heads/"):
+        for ref in refs:
+            if ref.startswith(prefix):
+                return ref
+    return None
+
+
+def _read_only_isolated_checkout(
+    repository: Path, pin_sha: str | None = None
+) -> tuple[Path | None, str | None, bool]:
+    """A throwaway DETACHED clone of ``repository`` under the principal
+    workspace root, for a read-only run under principal isolation.
+
+    Why not the shared clone: the launcher admits a workspace only inside the
+    principal root (``aicc_agent_launcher._validated_workspace``) and its own
+    unit hides /home, while the shared clone lives under /home/voynadmin and
+    is bound read-only into the WORKER's namespace only -- every review died
+    with ``[Errno 2] No such file or directory: '/home/voynadmin'``
+    (worker-01, 2026-09-08). Why not ``git worktree add``: it writes into the
+    bound clone's .git, which is read-only here.
+
+    Ownership and mode are NOT this helper's job: the broker normalises the
+    whole workspace tree to the agent's dynamic uid and the aicc-workspace
+    group (2770 directories, 660/770 files) before it binds it as
+    ``/workspace`` (``aicc_agent_launcher``, the ``os.fchown``/``os.fchmod``
+    walk), exactly as it does for a provisioned mutating workspace; the lane
+    reads the result through that group.
+
+    Order: rev-parse the source HEAD first, clone ``--no-checkout`` (the
+    upload-pack child needs the lane's system gitconfig for the source's
+    safe.directory trust), fetch source-held PR refs into the throwaway clone
+    when a pin needs them, ``checkout --detach <sha>`` -- so a source that
+    moves mid-clone or sits on a detached HEAD cannot produce a spurious
+    mismatch -- then drop ``origin``: it named the hidden /home path, and a
+    ``git fetch`` the agent attempted would have resurrected the very ENOENT
+    this exists to remove; a missing remote is a legible refusal instead.
+
+    ``pin_sha`` (a verification review's exact PR head) is honoured the same
+    way: the clone is detached at that sha instead of the source HEAD, so
+    isolation isolates the pinned review rather than disabling it (review
+    of 5361b78a). The object must already be in the bound clone -- the lane
+    has no credential to fetch ``refs/pull/<n>/head`` -- and its absence is a
+    retryable condition: the source mirror catches up between deliveries.
+
+    Returns ``(path, None, False)`` on success, or ``(None, reason,
+    retryable)``: a missing root, a source git refuses (ownership, not a
+    repository, absent) are permanent -- another delivery cannot cure them
+    -- everything else is retryable.
+    """
+    try:
+        root = agent_runner.principal_workspace_root()
+    except (OSError, agent_runner.RunnerError) as exc:
+        return None, f"isolated workspace root is unavailable: {exc}", False
+    if not repository.is_dir():
+        return (
+            None,
+            f"read-only isolated checkout source is absent: {repository}",
+            False,
+        )
+    source_head = agent_runner._run_git(["rev-parse", "HEAD"], repository)
+    if (
+        source_head is None
+        or source_head.returncode != 0
+        or not source_head.stdout.strip()
+    ):
+        detail = (
+            source_head.stderr.strip() if source_head is not None else "git unavailable"
+        )
+        permanent = any(marker in detail for marker in _PERMANENT_CLONE_FAILURES)
+        return (
+            None,
+            f"read-only isolated checkout source is unreadable: {detail[-300:]}",
+            not permanent,
+        )
+    sha = source_head.stdout.strip()
+    if pin_sha is not None:
+        present = agent_runner._run_git(
+            ["cat-file", "-e", f"{pin_sha}^{{commit}}"], repository
+        )
+        if present is None or present.returncode != 0:
+            return (
+                None,
+                (f"review_head {pin_sha} is not in the bound clone yet "
+                 "(the lane cannot fetch; the source mirror catches up)"),
+                True,
+            )
+        sha = pin_sha
+        pin_ref = _source_ref_pointing_at(repository, pin_sha)
+    target = root / f"ro-{repository.name}-{uuid.uuid4().hex[:12]}"
+    steps = [
+        (
+            [
+                "clone",
+                "--no-local",
+                "--no-checkout",
+                "--quiet",
+                str(repository),
+                str(target),
+            ],
+            root,
+        ),
+    ]
+    if pin_sha is not None:
+        # `git clone` copies the source's branches and tags only; a review
+        # head mirrored under refs/remotes/origin/pr/N/head has to be
+        # fetched into the throwaway clone explicitly. Fetch exactly the one
+        # ref that points at the pin when there is one: the wholesale
+        # `+refs/remotes/origin/pr/*` fetch wrote ~900 loose refs as
+        # `.git/refs/remotes/source-pr/<N>/head`, one directory each, and
+        # the launcher's workspace walk refused the clone with "workspace
+        # directory fan-out exceeds supported budget" (max 256 pending
+        # directories) -- every review of ai-command-center on worker-01
+        # died that way on 2026-09-14. When no ref points at the pin
+        # exactly (an older head still reachable from a pr ref) fall back to
+        # the wholesale fetch, then `pack-refs --all` so the loose ref
+        # directories are gone before the launcher ever walks the tree.
+        if pin_ref is not None:
+            steps.append(
+                (
+                    [
+                        "fetch",
+                        "--quiet",
+                        "--no-tags",
+                        "origin",
+                        f"+{pin_ref}:refs/remotes/source-pr/pinned",
+                    ],
+                    target,
+                )
+            )
+        else:
+            steps.append(
+                (
+                    [
+                        "fetch",
+                        "--quiet",
+                        "--no-tags",
+                        "origin",
+                        "+refs/remotes/origin/pr/*:refs/remotes/source-pr/*",
+                    ],
+                    target,
+                )
+            )
+        steps.append((["pack-refs", "--all"], target))
+    steps.extend(
+        [
+            (["checkout", "--quiet", "--detach", sha], target),
+            (["remote", "remove", "origin"], target),
+        ]
+    )
+    for argv, cwd in steps:
+        result = agent_runner._run_git(argv, cwd, timeout=600)
+        if result is None or result.returncode != 0:
+            detail = result.stderr.strip() if result is not None else "git unavailable"
+            _remove_read_only_isolated_checkout(target)
+            permanent = any(marker in detail for marker in _PERMANENT_CLONE_FAILURES)
+            return (
+                None,
+                f"read-only isolated checkout {argv[0]} failed: {detail[-300:]}",
+                not permanent,
+            )
+    at = agent_runner._run_git(["rev-parse", "HEAD"], target)
+    attached = agent_runner._run_git(["symbolic-ref", "--quiet", "HEAD"], target)
+    if (
+        at is None
+        or at.stdout.strip() != sha
+        or attached is None
+        or attached.returncode == 0
+    ):
+        _remove_read_only_isolated_checkout(target)
+        observed = at.stdout.strip() if at is not None else "unknown"
+        return (
+            None,
+            (f"read-only isolated checkout verification failed: HEAD is {observed}"
+             f" (expected detached {sha})"),
+            True,
+        )
+    return target, None, False
+
+
+def _remove_read_only_isolated_checkout(target: Path) -> None:
+    """Remove the throwaway clone and say so when that fails: a silent leak
+    of a full repository copy per review would fill the principal root
+    (review of 3d22e50d). Not `force_remove_worktree`: this is a standalone
+    clone, not a worktree of any repository, so there is nothing to
+    `git worktree remove` or `prune`."""
+    failures: list[str] = []
+
+    def _record(function, path, exc_info):
+        failures.append(f"{path}: {exc_info[1]}")
+
+    _rmtree(target, onerror=_record)
+    if failures or target.exists():
+        log.error(
+            "read-only isolated checkout %s was not fully removed: %s",
+            target,
+            "; ".join(failures[:3]) or "still present",
+        )
+
+
+def _remove_review_head_checkout(repository: Path, target: Path) -> None:
+    """Delegates to the shared force-removal site (VOYN-W0-AICC-WORKTREE-
+    LEAK-RETRY) rather than hand-rolling `remove` + `rmtree` fallback +
+    `prune` here -- this checkout is always a throwaway detached worktree
+    this call itself created, exactly the case that shared site is for."""
+    workspace_provisioning.force_remove_worktree(repository, target)
 
 
 def _task_lease_scope(request: Any) -> str:
@@ -233,24 +481,43 @@ def _tail(text: str) -> str:
     return text[-_TAIL_CHARS:] if len(text) > _TAIL_CHARS else text
 
 
+def _cascade_step(attempt_no: int, cascade_len: int) -> int:
+    """The 1-indexed cascade step for this delivery's attempt number.
+
+    ``queue_redrive`` (0002_queue_claim.up.sql) widens ``max_attempts``
+    without resetting ``attempt_count`` — deliberately, so the attempt
+    history stays an honest audit trail across redrives
+    (VOYN-W0-AICC-REDRIVE-CLAMP-RESETS-TO-LAST-LINK). That means
+    ``attempt_no`` keeps climbing past the cascade's own length on every
+    redrive. Wrapping modulo the cascade length, instead of clamping to the
+    last index, is what makes a redrive's fresh attempts walk the cascade
+    again — a redriven item with 3 extra attempts on a 3-link cascade tries
+    all three executors, not just whichever one happened to be last."""
+    return ((attempt_no - 1) % cascade_len) + 1
+
+
 def _cascade_link(request, attempt_no: int) -> dict[str, Any] | None:
     """BO-S2a: the cascade link for this delivery, selected by the queue's own
     attempt number — no new state, so failover rides the existing retry/reap
-    machinery. Clamped at the tail: once the cascade is exhausted the last
-    link keeps serving until the attempt budget (its length) dead-letters."""
+    machinery. See `_cascade_step` for why this wraps rather than clamps."""
     if not request.cascade:
         return None
-    return request.cascade[min(attempt_no, len(request.cascade)) - 1]
+    return request.cascade[_cascade_step(attempt_no, len(request.cascade)) - 1]
 
 
 def _same_mutability_class(current_task_type: str, candidate_task_type: str) -> bool:
     """A route switch may change providers, never the workspace safety model."""
-    return (
-        current_task_type in agent_runner.MUTATING_TASK_TYPES
-    ) == (candidate_task_type in agent_runner.MUTATING_TASK_TYPES)
+    return (current_task_type in agent_runner.MUTATING_TASK_TYPES) == (
+        candidate_task_type in agent_runner.MUTATING_TASK_TYPES
+    )
 
 
 def _executor_preflight(executor: str, task_type: str) -> tuple[bool, str, str]:
+    exhausted_until = agent_runner.executor_exhausted_until(executor)
+    if exhausted_until is not None:
+        return False, f"quota exhausted until {exhausted_until.isoformat()}", f"{executor} quota exhausted"
+    if executor == "cursor" and task_type in agent_runner.MODEL_ONLY_TASK_TYPES:
+        return False, "Cursor cannot guarantee zero tools", "model-only executor unavailable"
     if executor == "openai_http":
         # No CLI to probe and no principal to isolate: the bridge is this
         # checkout's own module. Availability is exactly "a provider key is
@@ -306,8 +573,21 @@ def _run_agent(
             ok=False, reason=request.reason, retryable=request.retryable
         )
 
+    # Explicit operator profile also covers already queued subscription work.
+    # Preserve the requested capability class, prompt, task and idempotency key.
+    if os.environ.get("AICC_EXECUTOR_PROFILE") == "owner-alternatives":
+        requested_type = request.task_type
+        request = replace(request, cascade=tuple(
+            {**entry, "task_type": requested_type}
+            for entry in cascade_for("implementation")
+            if requested_type not in agent_runner.MODEL_ONLY_TASK_TYPES
+            or entry["executor"] == "grok"
+        ))
+
     link = _cascade_link(request, attempt_no)
-    cascade_step = attempt_no if link is not None else None
+    cascade_step = (
+        _cascade_step(attempt_no, len(request.cascade)) if link is not None else None
+    )
     task_type = request.task_type
     model = request.model
     # A payload with no cascade at all (pre-BO-S2a shape, or a direct
@@ -323,7 +603,7 @@ def _run_agent(
             # into the dead letter, where the reason names the route.
             return HandlerOutcome(
                 ok=False,
-                reason=f"executor_unavailable: {executor!r} (cascade step {attempt_no})",
+                reason=f"executor_unavailable: {executor!r} (cascade step {cascade_step})",
                 retryable=True,
             )
         task_type = str(link.get("task_type", task_type))
@@ -342,15 +622,36 @@ def _run_agent(
         return HandlerOutcome(ok=False, reason=str(exc), retryable=True)
 
     available, detail, unavailable_reason = _executor_preflight(executor, task_type)
+    unknown_executors: list[str] = []
     if not available and link is not None:
         # An open Codex circuit is a routing fact, not a consumed model
         # attempt. Select the next healthy cascade link inside this already
         # claimed delivery instead of returning it just to increment the
         # queue attempt counter.
-        for candidate_step in range(attempt_no + 1, len(request.cascade) + 1):
+        #
+        # Walk EVERY other link, starting after this delivery's own and
+        # wrapping to the head of the cascade: attempt 2 lands on the second
+        # link by construction (`_cascade_step`), and when that executor is
+        # the one that is down (Codex out of quota / logged out for days on
+        # worker-01, 2026-09-14) a later-links-only search finds nothing.
+        # Wrapping to an earlier, healthy link is deliberate even though it
+        # may have served attempt 1: an attempt's failure is overwhelmingly a
+        # fact about the run (checkpoint mismatch, launch refusal, a wrong
+        # diff), not about the executor, and the queue's own single-executor
+        # retry re-runs the same executor for exactly that reason. Waiting
+        # out a dead link instead would park the task for days.
+        # Eligibility: the delivery's own executor was membership-checked
+        # above; candidates must have a command builder and share the
+        # mutability class. A different-class link is not a misconfiguration
+        # -- review cascades legitimately mix classes -- it is simply not a
+        # substitute for this delivery.
+        cascade_len = len(request.cascade)
+        for offset in range(1, cascade_len):
+            candidate_step = ((cascade_step - 1 + offset) % cascade_len) + 1
             candidate = request.cascade[candidate_step - 1]
             candidate_executor = str(candidate.get("executor"))
             if candidate_executor not in agent_runner.COMMAND_BUILDERS:
+                unknown_executors.append(candidate_executor)
                 continue
             candidate_task_type = str(candidate.get("task_type", request.task_type))
             if not _same_mutability_class(task_type, candidate_task_type):
@@ -376,8 +677,30 @@ def _run_agent(
             )
             break
     if not available:
+        # No link of the cascade can run right now. When every link named a
+        # real executor that merely failed preflight (auth, quota, sandbox,
+        # missing CLI) that is a fact about the substrate, not about this
+        # task: refund the attempt through the bounded infra-wait budget so
+        # the item is retried once an executor is back, instead of being
+        # dead-lettered after `max_attempts` provider outages
+        # (VOYN-W0-AICC-INFRA-FAILURES-BURN-TASK-ATTEMPTS). A cascade that
+        # names an executor nobody can build is a fact about the task's own
+        # payload that no waiting cures -- that one keeps spending the
+        # attempt budget so the misconfiguration surfaces.
+        if unknown_executors:
+            return HandlerOutcome(
+                ok=False,
+                reason=(
+                    f"{unavailable_reason}: {detail}; cascade names unknown "
+                    f"executor(s) {sorted(set(unknown_executors))!r}"
+                ),
+                retryable=True,
+            )
         return HandlerOutcome(
-            ok=False, reason=f"{unavailable_reason}: {detail}", retryable=True
+            ok=False,
+            reason=f"{unavailable_reason}: {detail}",
+            retryable=True,
+            infra_wait=True,
         )
 
     if lease_lost.is_set():
@@ -452,16 +775,59 @@ def _run_agent(
                     ),
                     retryable=False,
                 )
-            checkout, failure = _review_head_checkout(
-                repository,
-                request.review_head_pr_number or "",
-                request.review_head_sha,
-            )
+            if agent_runner.principal_isolation_required():
+                # Under isolation the pinned checkout is the same detached
+                # clone a plain read-only run gets, detached at the exact PR
+                # head instead of the source HEAD: a `git worktree add` would
+                # write into the read-only bound clone and a fetch has no
+                # credential.  The worker refreshes the bound source first,
+                # while it still has the deployment-managed Git authority.
+                ok, failure = _refresh_read_only_source(
+                    repository, pr_number=request.review_head_pr_number
+                )
+                if not ok:
+                    return HandlerOutcome(
+                        ok=False, reason=failure or "?", retryable=True
+                    )
+                checkout, failure, retryable = _read_only_isolated_checkout(
+                    repository, pin_sha=request.review_head_sha
+                )
+                if checkout is None:
+                    return HandlerOutcome(
+                        ok=False, reason=failure or "?", retryable=retryable
+                    )
+                stack.callback(_remove_read_only_isolated_checkout, checkout)
+                run_repository = checkout
+            else:
+                checkout, failure = _review_head_checkout(
+                    repository,
+                    request.review_head_pr_number or "",
+                    request.review_head_sha,
+                )
             if checkout is None:
                 # Fetch/worktree trouble is repository or network state a
                 # later delivery (or another host) can genuinely cure.
                 return HandlerOutcome(ok=False, reason=failure or "?", retryable=True)
             stack.callback(_remove_review_head_checkout, repository, checkout)
+            run_repository = checkout
+        if (
+            task_type not in agent_runner.MUTATING_TASK_TYPES
+            and request.review_head_sha is None
+            and agent_runner.principal_isolation_required()
+        ):
+            # VOYN-W0-AICC-READ-ONLY-RUNS-NEED-AN-ISOLATED-WORKSPACE: a
+            # read-only run under isolation gets its own detached clone
+            # inside the principal root -- see the helper for why the
+            # shared clone cannot be handed to the launcher.
+            ok, failure = _refresh_read_only_source(repository)
+            if not ok:
+                return HandlerOutcome(ok=False, reason=failure or "?", retryable=True)
+            checkout, failure, retryable = _read_only_isolated_checkout(repository)
+            if checkout is None:
+                return HandlerOutcome(
+                    ok=False, reason=failure or "?", retryable=retryable
+                )
+            stack.callback(_remove_read_only_isolated_checkout, checkout)
             run_repository = checkout
         if task_type in agent_runner.MUTATING_TASK_TYPES:
             expected_branch = f"backlog/{backlog_task}"
@@ -483,11 +849,21 @@ def _run_agent(
             # `repository`. Checked before provisioning: the path is
             # computed deterministically above with no filesystem access, so
             # this can run whether or not the worktree exists yet.
-            # Retryable: a lease is a temporary claim, so redelivery lands
-            # once it is released, bounded by the item's own max_attempts.
+            # A held worktree is contention with no fault in this item's
+            # work -- refund via `lease_wait` (same budget as a publish
+            # `lease_unavailable`, VOYN-W0-AICC-PUBLISH-LEASE-CONTENTION-
+            # BURNS-ATTEMPT-REM). Authority unreachable/refused is the
+            # substrate, not contention -- `infra_wait`.
             held = blocking_lease(isolated_workspace)
             if held is not None:
-                return HandlerOutcome(ok=False, reason=held, retryable=True)
+                contention = held.startswith("worktree ")
+                return HandlerOutcome(
+                    ok=False,
+                    reason=held,
+                    retryable=True,
+                    lease_wait=contention,
+                    infra_wait=not contention,
+                )
 
             # Full-lifecycle writer lease. `blocking_lease` above is a
             # deliberately read-only preflight (its own docstring: "it never
@@ -569,15 +945,26 @@ def _run_agent(
                     # own `finally`.
                     full_lifecycle_lease_held = True
                 except writer_lease.WriterLeaseUnavailable as exc:
-                    # Another writer already holds the repository's lease,
-                    # or the authority refused/could not be reached: a data
-                    # refusal, not a defect -- the attempt returns to the
-                    # pool and a later delivery retries once the lease
-                    # clears, bounded by max_attempts.
+                    # Another writer already holds this task's lease, or the
+                    # authority refused/could not be reached: a data refusal,
+                    # not a defect in the work. Routing through the ordinary
+                    # retryable path spent `max_attempts` on contention (or
+                    # on a down authority) -- the same burn the publish-side
+                    # `lease_unavailable` path used to inflict on finished
+                    # work (live 2026-09-06 wki_55f316db / wki_e0695c3d).
+                    # Contention refunds via `lease_wait`; an authority /
+                    # tool failure refunds via `infra_wait`.
+                    detail = str(exc).lower()
+                    contention = any(
+                        marker in detail
+                        for marker in ("held", "active", "lease_unavailable")
+                    )
                     return HandlerOutcome(
                         ok=False,
                         reason=f"writer lease unavailable: {exc}",
                         retryable=True,
+                        lease_wait=contention,
+                        infra_wait=not contention,
                     )
 
             base_branch = (
@@ -608,8 +995,66 @@ def _run_agent(
                 with _provision_lock(str(isolated_workspace)):
                     evidence = workspace_provisioning.provision_and_verify(spec)
             except workspace_provisioning.WorkspaceVerificationError as exc:
-                # A verification failure here (branch already checked out
-                # elsewhere, base branch missing, dirty leftover worktree
+                if exc.failed_step == "task_workspace_checkpoint":
+                    # The saved clone ran ahead of its signed checkpoint: an
+                    # earlier delivery committed and was then killed before
+                    # `checkpoint_task_workspace` (launcher refusal, timeout,
+                    # lane restart -- worker-01, 2026-09-11..14 left 6 such
+                    # clones and every resume died here twice, burning both
+                    # attempts). This lane holds the only claim on the item,
+                    # so nobody is writing that clone now: preserve it for
+                    # inspection under `.aicc-quarantine` and let the next
+                    # delivery provision a fresh clone. The attempt is
+                    # refunded -- the task never got to run.
+                    if lease_lost.is_set():
+                        return HandlerOutcome(
+                            ok=False,
+                            reason=(
+                                f"workspace isolation failed at {exc.failed_step}: "
+                                f"{exc.detail}; lease lost, clone left in place"
+                            ),
+                            retryable=True,
+                        )
+                    # Same per-path lock as the provisioning above: a sibling
+                    # caller racing to (re)provision this path must never
+                    # have its in-progress clone moved out from under it.
+                    with _provision_lock(str(isolated_workspace)):
+                        quarantined = workspace_provisioning.quarantine_task_workspace(
+                            isolated_workspace
+                        )
+                        # The lease is an async fact: re-check it after the
+                        # move. If it went away meanwhile a successor lane
+                        # may already own this item, so put the clone back
+                        # rather than strand whatever it commits next.
+                        if quarantined is not None and lease_lost.is_set():
+                            workspace_provisioning.restore_quarantined_task_workspace(
+                                quarantined, isolated_workspace
+                            )
+                            return HandlerOutcome(
+                                ok=False,
+                                reason=(
+                                    f"workspace isolation failed at {exc.failed_step}: "
+                                    f"{exc.detail}; lease lost during quarantine, "
+                                    "clone restored"
+                                ),
+                                retryable=True,
+                            )
+                    return HandlerOutcome(
+                        ok=False,
+                        reason=(
+                            f"workspace isolation failed at {exc.failed_step}: "
+                            f"{exc.detail}; uncheckpointed clone "
+                            + (
+                                f"quarantined at {quarantined}"
+                                if quarantined
+                                else "could not be quarantined"
+                            )
+                        ),
+                        retryable=True,
+                        infra_wait=quarantined is not None,
+                    )
+                # Any other verification failure here (branch already checked
+                # out elsewhere, base branch missing, dirty leftover worktree
                 # under a stricter policy, ...) is a fact about repository
                 # state that a later moment can genuinely cure -- redelivery
                 # retries once whatever blocked it clears, bounded by
@@ -658,7 +1103,12 @@ def _run_agent(
                 and not lease_lost.is_set()
             ):
                 result_text = agent_runner.extract_result_text(run.stdout)
-                provider_failure = run.is_executor_provider_error(executor) or (
+                quota_signature = run.executor_quota_signature(executor)
+                if quota_signature is not None:
+                    agent_runner.record_executor_exhausted(
+                        executor, cooldown_seconds=60 if executor == "grok" else 1800,
+                    )
+                provider_failure = quota_signature is not None or run.is_executor_provider_error(executor) or (
                     executor == "copilot"
                     and task_type not in agent_runner.MUTATING_TASK_TYPES
                     and run.status != "completed"
@@ -675,17 +1125,19 @@ def _run_agent(
                     and not safe_to_fail_over
                     and isolated_workspace is not None
                 ):
-                    safe_to_fail_over = workspace_provisioning.task_workspace_is_unchanged(
-                        run_repository,
-                        expected_branch=evidence.expected_branch,
-                        remote_url=evidence.remote_url,
-                        start_sha=evidence.start_sha,
-                        trusted_base_sha=evidence.base_sha,
-                        expected_remote_sha=evidence.remote_task_sha,
-                        expected_inode=(
-                            evidence.workspace_device,
-                            evidence.workspace_inode,
-                        ),
+                    safe_to_fail_over = (
+                        workspace_provisioning.task_workspace_is_unchanged(
+                            run_repository,
+                            expected_branch=evidence.expected_branch,
+                            remote_url=evidence.remote_url,
+                            start_sha=evidence.start_sha,
+                            trusted_base_sha=evidence.base_sha,
+                            expected_remote_sha=evidence.remote_task_sha,
+                            expected_inode=(
+                                evidence.workspace_device,
+                                evidence.workspace_inode,
+                            ),
+                        )
                     )
                 fallback_selected = False
                 if (
@@ -912,6 +1364,7 @@ def _run_agent(
                 ok=False,
                 reason=_tail(run.stderr) or "runner failed to start",
                 retryable=True,
+                infra_wait=True,
             )
         if run.is_principal_isolation_error:
             # The separate-UID launcher failed before it could return a
@@ -930,6 +1383,7 @@ def _run_agent(
                     f"isolation): {_tail(run.stderr or result_text)}"
                 ),
                 retryable=True,
+                infra_wait=True,
             )
         non_mutating_copilot_failure = (
             executor == "copilot"
@@ -956,6 +1410,7 @@ def _run_agent(
                     f"(provider/auth/quota): {_tail(result_text or run.stderr)}"
                 ),
                 retryable=True,
+                infra_wait=True,
             )
         if run.is_executor_sandbox_error:
             # bwrap failed before Codex could enter the sandbox or run tools.
@@ -973,6 +1428,7 @@ def _run_agent(
                     f"sandbox): {_tail(run.stderr or result_text)}"
                 ),
                 retryable=True,
+                infra_wait=True,
             )
         # BO-S3b: a successful mutating run publishes its commits as a PR so
         # the autonomous loop closes without a human. Opt-in by env
@@ -1038,13 +1494,15 @@ def _run_agent(
                 # The checkpoint helper reads HEAD without invoking Git against
                 # agent-owned metadata.  Read it once more immediately before
                 # validation so a late writer cannot substitute the candidate.
-                observed_candidate_sha = workspace_provisioning.task_workspace_candidate_sha(
-                    run_repository,
-                    expected_branch=evidence.expected_branch,
-                    expected_inode=(
-                        evidence.workspace_device,
-                        evidence.workspace_inode,
-                    ),
+                observed_candidate_sha = (
+                    workspace_provisioning.task_workspace_candidate_sha(
+                        run_repository,
+                        expected_branch=evidence.expected_branch,
+                        expected_inode=(
+                            evidence.workspace_device,
+                            evidence.workspace_inode,
+                        ),
+                    )
                 )
                 if observed_candidate_sha != candidate_sha:
                     raise workspace_provisioning.WorkspaceVerificationError(
@@ -1158,10 +1616,23 @@ def _run_agent(
                 # ok=True here used to make the queue mark `pr_create_failed`
                 # as succeeded even though no PR existed, permanently
                 # disconnecting a pushed branch from review.
+                #
+                # `lease_unavailable` names no fault in this run's own work --
+                # another writer's lane won the race for this repository's
+                # single writer-lease row (live 2026-09-06, wki_55f316db:
+                # sibling publishes succeeded 04:57-04:58Z while this one lost
+                # the race). Routing it through the ordinary retryable path
+                # spent this item's `max_attempts` on contention it had no
+                # part in causing, dead-lettering already-finished work.
+                # `lease_wait=True` instead refunds the attempt and bounds
+                # retries against a separate lease-wait budget (see
+                # `queue_fail_lease_wait`,
+                # VOYN-W0-AICC-PUBLISH-LEASE-CONTENTION-BURNS-ATTEMPT).
                 return HandlerOutcome(
                     ok=False,
                     reason=f"publish failed: {pub.reason}",
                     retryable=True,
+                    lease_wait=pub.reason.startswith("lease_unavailable"),
                     result=result,
                 )
         elif isolated_workspace is not None:
