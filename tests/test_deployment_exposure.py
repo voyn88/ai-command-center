@@ -1,8 +1,8 @@
 """Network-exposure invariants for every launch path (VOYN-W0-AICC-STREAMLIT-EXPOSED-NO-AUTH).
 
-The application has no authentication layer yet performs privileged git/gh and
-subprocess operations, so *no* launch artifact may put it on a reachable
-interface without the operator explicitly asking for that.
+The application performs privileged git/gh and subprocess operations, so *no*
+launch artifact may put it on a reachable interface without the operator
+explicitly asking for that.
 
 Four launch paths exist and each needs its own guard, because a fix applied to
 one of them has already failed to protect the others:
@@ -17,9 +17,12 @@ covered by a test; paths 3 and 4 then reintroduced the exact same exposure.
 This module owns the invariant for all four so that a regression in any one of
 them fails the gate.
 
-Scope note: these tests assert only that the surface is not *exposed*. They do
-not — and cannot — assert that it is *authenticated*, because it is not. HTTP
-authentication is designed separately (AUTH-HTTP-01).
+Scope note: these tests assert only that the surface is not *exposed*. Whether
+it is *authenticated* is a separate invariant with a separate owner — the
+console sign-in gate (`tests/test_console_identity.py`,
+VOYN-W0-AICC-CONSOLE-NO-AUTH) and the HTTP boundary (`tests/http_auth/`,
+AUTH-HTTP-01). Neither makes the guards here redundant: authentication decides
+who gets in, exposure decides who can knock.
 """
 
 from __future__ import annotations

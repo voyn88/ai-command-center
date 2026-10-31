@@ -46,6 +46,41 @@ os.environ["AICC_DATA_DIR"] = str(_TEST_DATA_DIR)
 
 
 @pytest.fixture(autouse=True)
+def bypass_console_identity_gate(request, monkeypatch):
+    """Every AppTest-driven UI test in this suite (~150 call sites across
+    tests/test_*_ui.py etc.) exercises page *behavior*, not the identity gate
+    itself: `app.py`'s top-level `console_identity.require_identity()` call
+    (VOYN-W0-AICC-CONSOLE-NO-AUTH) would otherwise dead-end every one of them
+    on the sign-in form before any page content renders.
+
+    Scope note: this covers the *script-run* path only, which is the only one
+    that needs covering. A bare `import app` (this file's
+    `isolated_generated_dir`, or a test module importing `app` at collection
+    time, before any fixture has run) executes the same top-level call with no
+    `ScriptRunContext`, and `require_identity` is a no-op there by design — so
+    no bypass can be, or needs to be, in place for it.
+
+    The gate's own behaviour (login form, re-verification, deny/fail-closed
+    paths) is covered for real, with this bypass switched off via the
+    `console_identity_gate` marker, by `tests/test_console_identity.py`.
+    """
+    if request.node.get_closest_marker("console_identity_gate"):
+        yield
+        return
+    try:
+        from command_center.ui import console_identity
+    except ImportError:
+        yield
+        return
+    from command_center.http_auth.identity import Principal
+
+    fake_principal = Principal(principal_id="test-operator", tenant_id="test-tenant", capabilities=())
+    monkeypatch.setattr(console_identity, "require_identity", lambda **_kwargs: fake_principal)
+    monkeypatch.setattr(console_identity, "require_console_operation", lambda _operation: fake_principal)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def clear_provider_probe_cache():
     """Provider availability is memoized for a short TTL (see
     `runtime.providers._PROBE_CACHE_TTL_SECONDS`). Tests install and remove fake
@@ -373,7 +408,14 @@ def isolated_generated_dir(isolated_data_dir, monkeypatch):
     hard-imports streamlit at line 10, so on a headless worker machine this
     autouse fixture would fail setup for every test in the tree — including
     the worker-daemon tests whose whole point is running where the desktop
-    does not. No streamlit means no `app`, means nothing here to isolate."""
+    does not. No streamlit means no `app`, means nothing here to isolate.
+
+    The `import app` here needs no identity-gate bypass even though `app.py`
+    calls `console_identity.require_identity()` at module level: that call is
+    a documented no-op outside a Streamlit script run, which a bare import is
+    (`command_center.ui.console_identity.require_identity`). The gate is not
+    weakened by that — it is the privileged-action gate,
+    `require_console_operation`, that refuses there, by raising."""
     try:
         import app
     except ImportError:

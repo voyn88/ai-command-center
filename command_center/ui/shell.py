@@ -1,23 +1,24 @@
-"""AppShell (UX-1): composes page config, TopCommandBar, and Sidebar into
-one entry point so `app.py` stays thin. Content Area/Inspector are handled
-separately by `command_center.ui.content_area` around the page-routing
-dispatch, since that dispatch is per-page, not shell-level.
+"""AppShell (UX-1): composes the TopCommandBar and Sidebar into one entry
+point so `app.py` stays thin. Content Area/Inspector are handled separately
+by `command_center.ui.content_area` around the page-routing dispatch, since
+that dispatch is per-page, not shell-level.
+
+Page config is *not* configured here (VOYN-W0-AICC-CONSOLE-NO-AUTH): it must
+be the first Streamlit command of a run if called at all, and the identity
+gate (`command_center.ui.console_identity.require_identity`) now runs before
+this function, on both the login and the authenticated branch, so it owns
+that single call instead.
 """
 
 from __future__ import annotations
 
 from typing import Callable
 
-import streamlit as st
-
 from command_center.ui import accessibility, sidebar, theme, top_bar
 
 
 def render_shell(
     *,
-    page_title: str,
-    page_icon: str,
-    sidebar_collapsed: bool,
     title: str,
     caption: str,
     nav: dict[str, tuple[str, str]],
@@ -26,17 +27,10 @@ def render_shell(
     tasks_by_id: dict[str, dict] | None = None,
     api=None,
 ) -> str:
-    """Render page config, the top command bar, and the sidebar.
+    """Render the top command bar and the sidebar.
 
     Returns the active page key (`nav_page` session-state value).
     """
-    st.set_page_config(
-        page_title=page_title,
-        page_icon=page_icon,
-        layout="wide",
-        initial_sidebar_state="collapsed" if sidebar_collapsed else "expanded",
-    )
-
     # App-wide CSS (UX-2a): fragment fade-in + card hover transitions. Emitted
     # every run so it survives reruns (see theme.inject_global_css docstring).
     theme.inject_global_css()
