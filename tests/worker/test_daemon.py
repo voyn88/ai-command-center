@@ -1929,3 +1929,228 @@ def test_the_deadline_watch_cannot_say_what_the_server_thinks() -> None:
         "the thread that holds no connection can once again record the "
         f"server's verdict: {parameters}"
     )
+
+
+# ---------------------------------------------------------------------------
+# VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED (monitor_finding #41949).
+#
+# THE CLOCK STARTS WHEN THE LANE ASKS, NOT WHEN THE SERVER ANSWERS.
+#
+# #41136 replaced the beat COUNT with a clock, #41237 gave that clock a reader
+# the database cannot park, and #41318 separated "this lane cannot prove the
+# lease" from "the server refused it". All three left the same half untouched:
+# WHICH INSTANT the window is measured from. `queue_claim`/`queue_heartbeat`
+# grant `visible_until` from the server's own `now()`, somewhere inside a call
+# the lane is still waiting on, so with the send at `S`, the grant at `G` and
+# the answer at `A` the lane knows only `S <= G <= A`:
+#
+#     dated from A:   lane deadline = A + V  >=  G + V = the server's
+#     dated from S:   lane deadline = S + V  <=  G + V = the server's
+#
+# The daemon dated from `A`, and the comment that chose it argued -- correctly
+# -- that this makes `remaining <= 0` PROVE a lapse. But the test the handler
+# RUNS UNDER is `remaining > 0`, and from `A` that proves nothing: the lane
+# keeps executing for `A - G` past a lease the server has already let go.
+# `A - G` is the reply's own delay, nothing on this side bounds it, and it is
+# largest in exactly the fault this machinery exists for -- a
+# `voyn-aicc-pgtunnel.service` restart whose request path still works and
+# whose reply path does not (`lease_client.run_lease` already allows a hung
+# subprocess 120s against the fleet's 300s window).
+#
+# Every second of that overrun is the overrun #41237 catalogues, reached by a
+# different route: `aicc-queue-reaper.timer` hands the item back inside it, so
+# the fleet holds two lanes' worth of work against one recorded claim,
+# `spare_capacity` goes true against a fleet with no free lane, and
+# `control-01:queue` opens a `queue_stalled` no fleet action reaches.
+#
+# Dating from `S` costs at most one round trip of lease per beat, against a
+# cadence sized with a whole beat interval of margin on purpose, and it is
+# affordable only because of #41318: a lapse no longer discards the outcome,
+# it offers it, and `_queue_owns` decides.
+#
+# These tests need no server and so run in every gate;
+# `tests/db/test_infra_monitor_queue_snapshot.py` measures the same two
+# instants against the real `queue_claim`/`queue_heartbeat`.
+# ---------------------------------------------------------------------------
+
+
+def test_a_beat_whose_reply_is_held_is_dated_from_when_it_was_sent() -> None:
+    """THE REGRESSION. One beat that REACHES the server and is ACCEPTED, whose
+    reply is then held on the way back, must renew the lane's deadline to the
+    instant it was SENT -- not to the instant the answer finally arrived.
+
+    The arithmetic is exact because the clock is injected: the beat is sent at
+    one interval, the server grants there, and the lane's deadline is one
+    window after that. Dating from the answer puts it a whole `hold` later,
+    which is the defect, so the two numbers cannot be confused for scheduling
+    noise.
+    """
+    import threading
+
+    from command_center.worker.daemon import beat_interval_seconds
+
+    window = 300
+    interval = beat_interval_seconds(window)
+    # The 120s `lease_client.run_lease` already allows a hung subprocess,
+    # which is this fleet's own measure of how long a reply can be held by a
+    # tunnel that is half gone.
+    hold = 120.0
+    clock = _FakeClock()
+    sent: list[float] = []
+    lost_at: list[float] = []
+
+    class HeldReplyStore:
+        def heartbeat(self, work):
+            sent.append(clock.now)
+            if len(sent) > 1:
+                # Nothing renews again: the first beat's answer is the last
+                # one this lane ever sees, which is what leaves the deadline
+                # under test as the one the lapse is measured against.
+                raise ConnectionError("the reply path is gone for good")
+            # `queue_heartbeat` runs and COMMITS here -- the grant is at or
+            # after the send -- and then the reply is held on the way back.
+            clock.advance(hold)
+            return True
+
+    class _WaitForTheBeat:
+        """`beat_stop.wait(interval)`: real pacing on the fake clock."""
+
+        def wait(self, seconds: float) -> bool:
+            clock.advance(seconds)
+            return False
+
+        def is_set(self) -> bool:
+            return False
+
+    cancel = threading.Event()
+    original_set = cancel.set
+
+    def record_and_set() -> None:
+        lost_at.append(clock.now)
+        original_set()
+
+    cancel.set = record_and_set  # type: ignore[method-assign]
+    daemon = WorkerDaemon(
+        HeldReplyStore(), {}, WorkerConfig(visibility_seconds=window), monotonic=clock
+    )
+    daemon._heartbeat_loop(
+        _work({"kind": "slow"}),
+        _LeaseDeadline(window, clock, clock()),
+        threading.Event(),
+        threading.Event(),
+        cancel,
+        _WaitForTheBeat(),
+    )
+
+    assert sent, "no beat was ever sent, so nothing was accepted or held"
+    assert sent[0] == interval, f"the accepted beat went out at {sent}"
+    assert lost_at, "the loop never gave the lease up"
+    # THE SERVER'S OWN DEADLINE, as close as the lane can know it: the grant
+    # is at or after this send, so a window from the send is at or before the
+    # window the server granted.
+    assert lost_at[0] == sent[0] + window, (
+        f"the lease was given up at {lost_at[0]}s; a beat sent at {sent[0]}s "
+        f"and accepted there is good until {sent[0] + window}s"
+    )
+    # The defect stated as the arithmetic it was, so the fix cannot quietly
+    # revert to it: dating from the answer adds the whole held reply, and the
+    # overrun grows with the fault rather than with anything about the lease.
+    assert lost_at[0] < sent[0] + hold + window, (
+        f"the deadline is still dated from the ANSWER: {lost_at[0]}s is the "
+        f"send ({sent[0]}s) plus the {hold}s held reply plus the {window}s "
+        "window, every second of which is a lane executing an item whose "
+        "lease the server has let go"
+    )
+
+
+def test_the_lease_clock_starts_when_the_claim_was_asked_for() -> None:
+    """The other instant, through the real `run_forever` -> `_execute` path:
+    the attempt's clock starts before `store.claim`, so a claim whose REPLY is
+    held does not hand the lane lease the server never granted.
+
+    The beat path above is the one that repeats; this one is the one that is
+    never renewed if the handler outlives its first interval, and it is the
+    plumbing half of the fix -- `run_forever` captures the instant, `_execute`
+    takes it as an argument, and nothing on the way may re-read the clock.
+    """
+    window = 2
+    # Held long enough that the two datings are further apart than any
+    # scheduling noise, and shorter than the window so the handler really
+    # starts before the lapse (the claim's own reply is unbounded in the
+    # fault, so this is the mild version of it).
+    hold = 1.5
+    sent: list[float] = []
+    stopped_at: list[float] = []
+
+    class HeldClaimStore(ScriptedStore):
+        def claim(self, queue, *, visibility_seconds):
+            # The lane's own capture is just BEFORE this line; the server's
+            # grant is inside the call. Both are at or before the answer.
+            sent.append(time.monotonic())
+            answer = super().claim(queue, visibility_seconds=visibility_seconds)
+            if isinstance(answer, ClaimedWork):
+                # `queue_claim` committed the claim and dated the window from
+                # its own `now()`; only the reply is held.
+                time.sleep(hold)
+            return answer
+
+        def heartbeat(self, work):
+            # The same half-severed tunnel: nothing renews, so the attempt
+            # lives exactly as long as the window it was granted.
+            raise ConnectionError("the reply path is gone")
+
+    store = HeldClaimStore([_work({"kind": "slow"})])
+
+    def slow(payload, lease_lost, attempt_no=1):
+        assert lease_lost.wait(window * 10), "the handler was never stopped"
+        stopped_at.append(time.monotonic())
+        return HandlerOutcome(ok=True, result={"ok": True})
+
+    daemon = WorkerDaemon(
+        store, {"slow": slow}, WorkerConfig(visibility_seconds=window)
+    )
+    _run_until_idle(daemon, store)
+
+    assert stopped_at, "the handler never ran"
+    ran_for = stopped_at[0] - sent[0]
+    assert ran_for <= window + 0.5, (
+        f"the lane ran {ran_for - window:.2f}s past a {window}s lease because "
+        f"its clock started when a claim held {hold}s ANSWERED instead of "
+        "when it was asked for"
+    )
+    # Not early either: dating from the send gives up at most one round trip
+    # of lease, and an attempt taken away with time left on it costs the whole
+    # run (migration 0029).
+    assert ran_for >= window - 0.25, (
+        f"the attempt was stopped {window - ran_for:.2f}s inside its own "
+        f"{window}s window"
+    )
+
+
+def test_the_lease_clock_cannot_be_dated_from_the_instant_it_is_read() -> None:
+    """The signature is the guarantee, so it is asserted as one.
+
+    `_LeaseDeadline` is constructed AFTER `queue_claim` has answered and
+    `renew` is called AFTER the beat has, so every instant available at either
+    call site is already past the grant. A default would not be a convenience:
+    it would silently restore the skew this finding is about, at whichever
+    call site forgot to pass the instant.
+    """
+    import inspect
+
+    empty = inspect.Parameter.empty
+    construct = inspect.signature(_LeaseDeadline.__init__).parameters
+    assert construct["requested_at"].default is empty, (
+        "the lease clock can once again default to the instant it is "
+        "constructed, which is already past the server's grant"
+    )
+    renew = inspect.signature(_LeaseDeadline.renew).parameters
+    assert renew["sent_at"].default is empty, (
+        "a renewal can once again default to the instant it is recorded, "
+        "which is the answer's and not the send's"
+    )
+    execute = inspect.signature(WorkerDaemon._execute).parameters
+    assert "claim_sent_at" in execute and execute["claim_sent_at"].default is empty, (
+        "`_execute` no longer requires the instant its caller asked for the "
+        f"claim: {list(execute)}"
+    )

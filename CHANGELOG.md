@@ -8,6 +8,60 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Fixed — the lease clock started when the server answered, so the lane outran the lease by the reply's own delay (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
+- `control-01:queue` carried `queue_stalled` as `monitor_finding` #41949. The
+  three fixes below (#41136, #41237, #41318) replaced the beat count with a
+  clock, gave that clock a reader the database cannot park, and separated "this
+  lane cannot prove the lease" from "the server refused it". All three left
+  the same half untouched: **which instant** the window is measured from.
+  `queue_claim` / `queue_heartbeat` grant `visible_until` from the server's
+  own `now()`, somewhere inside a call the lane is still waiting on, so with
+  the send at `S`, the grant at `G` and the answer at `A` the lane knows only
+  `S <= G <= A`:
+
+      dated from A:   lane deadline = A + V  >=  G + V = the server's
+      dated from S:   lane deadline = S + V  <=  G + V = the server's
+
+  The daemon dated from `A`, and the comment that chose it argued — correctly
+  — that this makes `remaining <= 0` prove a lapse. But the test the handler
+  actually runs under is `remaining > 0`, and from `A` that proves nothing:
+  the lane keeps executing for `A - G` past a lease the server has already
+  let go. `A - G` is the reply's own delay, nothing on this side bounds it,
+  and it is largest in exactly the fault this machinery exists for — a
+  `voyn-aicc-pgtunnel.service` restart whose request path still works and
+  whose reply path does not (`lease_client.run_lease` already allows a hung
+  subprocess 120s against the fleet's 300s window).
+
+  **WHAT THE OVERRUN COSTS IS THE PROBE'S OCCUPANCY**, the same lie from the
+  same direction as #41136 / #41237: every second of that overrun is a lane
+  executing an item `aicc-queue-reaper.timer` has handed back, so the fleet
+  holds TWO lanes' worth of work while `work_item` records ONE claim,
+  `spare_capacity` goes true against a fleet with no free lane, the due-ready
+  clock runs in full, and `control-01:queue` opens a `queue_stalled` no fleet
+  action reaches.
+
+  Dating from `S` costs at most one round trip of lease per beat, against a
+  cadence sized with a whole beat interval of margin on purpose
+  (`beat_interval_seconds`), and it is affordable only because of #41318: a
+  lapse no longer discards the outcome, it offers it, and `_queue_owns`
+  decides. Before that split this direction would have thrown away writable
+  runs on a slow reply — 0029's cost — which is why the order these findings
+  were fixed in is the order they had to be fixed in.
+
+  `_LeaseDeadline` now takes the request instant as a required argument
+  (`requested_at` / `sent_at` / `claim_sent_at`); a default would silently
+  restore the skew at whichever call site forgot to pass it. `run_forever`
+  captures the instant before `store.claim`, and `_heartbeat_loop` captures
+  it before `store.heartbeat`.
+- **Tests.** `test_a_beat_whose_reply_is_held_is_dated_from_when_it_was_sent`
+  and `test_the_lease_clock_starts_when_the_claim_was_asked_for` pin both
+  instants without a server; `test_the_lease_clock_cannot_be_dated_from_the_
+  instant_it_is_read` pins the signatures. The real-server
+  `test_a_beat_whose_reply_is_held_gives_the_lease_up_at_or_before_the_
+  servers` measures the same two instants against the real
+  `queue_claim` / `queue_heartbeat` and asserts the lane gives up at or before
+  the server's own `visible_until`.
+
 ### Fixed — the lease deadline was read only by the thread the fault parks, so it was not a deadline (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
 - `control-01:queue` carried `queue_stalled` as `monitor_finding` #41237. The
   previous fix (#41136, below) replaced a count of failed beats with a clock,
@@ -26,7 +80,8 @@ functional application milestones of `app.py`.
   **It is not a transport problem.** The lapse is a statement about a CLOCK,
   and a clock can be read somewhere the socket cannot reach. The rule now has
   one definition (`_LeaseDeadline` — the window from the last beat the server
-  ACCEPTED, dated from when that beat ANSWERED, by a monotonic clock) and two
+  ACCEPTED, dated from when that beat was SENT, by a monotonic clock; see
+  #41949 above for why the send and not the answer) and two
   readers: `_heartbeat_loop`, which can be parked, and `_lease_deadline_loop`,
   which touches no store, holds no connection, and whose only operations are a
   subtraction and `Event.wait`. `_execute` owns the deadline, because `_execute`

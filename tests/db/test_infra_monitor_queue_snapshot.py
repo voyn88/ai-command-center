@@ -980,7 +980,7 @@ def _beat_through(
     # Dated from before the claim this helper is handed, which is the
     # conservative stand-in `_execute` gets from its own caller: the server
     # granted the window inside that call, so any instant before it is at or
-    # before the grant (monitor_finding #41477).
+    # before the grant (monitor_finding #41949).
     deadline = _LeaseDeadline(int(window), time.monotonic, claim_sent_at)
     # Three events, as `_execute` passes them: the cancellation the handler
     # waits on, and the two narrow facts that say WHY -- `queue_lease_lost`
@@ -1043,7 +1043,7 @@ def test_a_tunnel_restart_of_the_tolerated_length_keeps_the_lane_attended(
     measure, app, worker, age = monitor
     app.enqueue(QUEUE, idempotency_key="long-run", payload={"kind": "agent_run"})
     # The claim's own send instant: the lease clock starts at or before the
-    # grant, never after it (monitor_finding #41477), which is what `_execute`
+    # grant, never after it (monitor_finding #41949), which is what `_execute`
     # does with the value `run_forever` hands it.
     claim_sent_at = time.monotonic()
     claimed = _claim(worker, visibility=BLIP_WINDOW)
@@ -1097,7 +1097,7 @@ def test_a_blip_past_the_tolerance_still_hands_the_item_back(monitor) -> None:
     measure, app, worker, _age = monitor
     app.enqueue(QUEUE, idempotency_key="long-blip", payload={"kind": "agent_run"})
     # The claim's own send instant: the lease clock starts at or before the
-    # grant, never after it (monitor_finding #41477), which is what `_execute`
+    # grant, never after it (monitor_finding #41949), which is what `_execute`
     # does with the value `run_forever` hands it.
     claim_sent_at = time.monotonic()
     claimed = _claim(worker, visibility=BLIP_WINDOW)
@@ -1420,7 +1420,7 @@ def test_the_beat_loop_admits_the_lapse_inside_the_window_it_was_granted(
     measure, app, worker, _age = monitor
     app.enqueue(QUEUE, idempotency_key="black-holed", payload={"kind": "agent_run"})
     # The claim's own send instant: the lease clock starts at or before the
-    # grant, never after it (monitor_finding #41477), which is what `_execute`
+    # grant, never after it (monitor_finding #41949), which is what `_execute`
     # does with the value `run_forever` hands it.
     claim_sent_at = time.monotonic()
     claimed = _claim(worker, visibility=BLIP_WINDOW)
@@ -1613,7 +1613,7 @@ def test_a_beat_that_commits_without_answering_leaves_the_write_acceptable(
     other = _claim(worker, visibility=600)
     app.enqueue(QUEUE, idempotency_key="lane-two", payload={"kind": "slow"})
     # The claim's own send instant, as `run_forever` takes it: the lease clock
-    # starts at or before the server's grant (monitor_finding #41477).
+    # starts at or before the server's grant (monitor_finding #41949).
     claim_sent_at = time.monotonic()
     claimed = _claim(worker, visibility=UNANSWERED_WINDOW)
     app.enqueue(QUEUE, idempotency_key="queued", payload={"kind": "slow"})
@@ -1749,3 +1749,143 @@ def test_the_servers_refusal_is_a_different_fact_from_the_lanes_deadline(
     unchanged = measure()
     assert unchanged.lapsed_claims == 1
     assert unchanged.claimed == 1
+
+
+# ---------------------------------------------------------------------------
+# VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED (monitor_finding #41949): the lease
+# clock started when the server ANSWERED, so the lane outran the lease by the
+# reply's own delay.
+#
+# `queue_claim`/`queue_heartbeat` grant `visible_until` from the server's
+# `now()`, somewhere inside a call the lane is still waiting on. Dating the
+# lane's copy from the answer put it AFTER the server's by that reply delay;
+# dating from the send puts it at or before. The unit tests pin the arithmetic
+# without a server; this one measures both instants against the real grant.
+# ---------------------------------------------------------------------------
+
+
+def test_a_beat_whose_reply_is_held_gives_the_lease_up_at_or_before_the_servers(
+    monitor,
+) -> None:
+    """THE REGRESSION, through the real `queue_heartbeat`: one beat that
+    REACHES the server and COMMITS, whose reply is then held on the way back,
+    must stop the lane at or before the server's own `visible_until`.
+
+    The hold is three seconds -- long enough that dating from the answer would
+    overrun by a measurable amount, short enough to fit inside a beat interval
+    of this window, and the shape `lease_client.run_lease` already allows a
+    hung subprocess 120s against the fleet's 300s window. The server's grant
+    is taken from the `visible_until` `queue_heartbeat` itself returns, so the
+    assertion is against the authority and not against a client estimate.
+    """
+    import threading
+    import time
+    from datetime import datetime, timedelta, timezone
+
+    from command_center.worker.daemon import (
+        WorkerConfig,
+        WorkerDaemon,
+        _LeaseDeadline,
+        beat_interval_seconds,
+    )
+
+    measure, app, worker, _age = monitor
+    window = BLIP_WINDOW
+    hold = 3.0
+    interval = beat_interval_seconds(window)
+    assert hold < interval, (
+        f"a held reply of {hold}s would span a beat interval of {interval}s "
+        "and change what is being measured"
+    )
+
+    app.enqueue(QUEUE, idempotency_key="held-reply", payload={"kind": "agent_run"})
+    claim_sent_at = time.monotonic()
+    claimed = _claim(worker, visibility=window)
+
+    sent_at: list[float] = []
+    granted_until: list[datetime] = []
+
+    def commits_then_holds(work):
+        # Only the FIRST beat is accepted-and-held: that is the renewal the
+        # lapse is measured against. Later beats raise, the same way a tunnel
+        # whose reply path is gone for good does, so nothing moves the
+        # deadline past the grant under test.
+        if sent_at:
+            raise ConnectionError("the reply path is gone for good")
+        # The real protocol, not `store.heartbeat`: we need the grant the
+        # server just wrote, and `queue_heartbeat` returns it. `work_attempt`
+        # itself is granted to nobody (it holds `claim_token_hash`).
+        sent_at.append(time.monotonic())
+        row = worker._call(
+            "SELECT ok, visible_until FROM queue_heartbeat(%s, %s)",
+            (work.attempt_id, work.claim_token),
+        )
+        assert row["ok"] is True, "the beat was refused, not held"
+        until = row["visible_until"]
+        if getattr(until, "tzinfo", None) is None:
+            until = until.replace(tzinfo=timezone.utc)
+        granted_until.append(until)
+        time.sleep(hold)
+        return True
+
+    worker.heartbeat = commits_then_holds  # type: ignore[method-assign]
+    daemon = WorkerDaemon(
+        worker, {}, WorkerConfig(queue=QUEUE, visibility_seconds=window)
+    )
+    lease_unproven = threading.Event()
+    queue_lease_lost = threading.Event()
+    cancel = threading.Event()
+    beat_stop = threading.Event()
+    deadline = _LeaseDeadline(window, time.monotonic, claim_sent_at)
+    # Both readers, as `_execute` starts them: the bound under test is that
+    # the lane's deadline lands at or before the server's, which either reader
+    # may fire.
+    threads = [
+        threading.Thread(
+            target=daemon._heartbeat_loop,
+            args=(
+                claimed,
+                deadline,
+                lease_unproven,
+                queue_lease_lost,
+                cancel,
+                beat_stop,
+            ),
+            daemon=True,
+        ),
+        threading.Thread(
+            target=daemon._lease_deadline_loop,
+            args=(claimed, deadline, lease_unproven, cancel, beat_stop),
+            daemon=True,
+        ),
+    ]
+    wall_started = datetime.now(timezone.utc)
+    for thread in threads:
+        thread.start()
+    cancelled = cancel.wait(window * 4)
+    lost_wall = datetime.now(timezone.utc)
+    beat_stop.set()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert cancelled, f"the handler was never stopped; beats at {sent_at}"
+    assert sent_at and granted_until, "no beat was accepted, so nothing was held"
+    assert lease_unproven.is_set()
+    # AT OR BEFORE THE SERVER'S OWN DEADLINE. Dating from the answer would put
+    # this a whole `hold` past `granted_until[0]`; dating from the send cannot.
+    assert lost_wall <= granted_until[0] + timedelta(seconds=1.0), (
+        f"the lane gave the lease up at {lost_wall.isoformat()}, "
+        f"{(lost_wall - granted_until[0]).total_seconds():.2f}s PAST the "
+        f"server's visible_until {granted_until[0].isoformat()}; a beat whose "
+        f"reply was held {hold}s was dated from the ANSWER"
+    )
+    # And not vacuously early: the attempt ran for roughly one window from the
+    # claim, which is what dating from the send promises.
+    ran_for = (lost_wall - wall_started).total_seconds()
+    assert ran_for >= window - 1.0, (
+        f"the attempt was stopped {window - ran_for:.2f}s inside its own "
+        f"{window}s window (beats at {sent_at})"
+    )
+
+    lapsed = measure()
+    assert (lapsed.claimed, lapsed.lapsed_claims) == (1, 1)

@@ -61,7 +61,7 @@ Design decisions, each traceable to the shipped substrate:
   fault this machinery exists for. Dating from the request costs one round
   trip of a window sized with a whole beat of margin, and is affordable only
   because the split above stopped a lapse from discarding the outcome
-  (VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED, ``monitor_finding`` #41477).
+  (VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED, ``monitor_finding`` #41949).
 * **Shutdown finishes the item in hand.** SIGTERM stops *claiming*; the
   current attempt runs to completion inside systemd's stop timeout. A second
   signal — or the timeout's SIGKILL — abandons it, and the lease expiry plus
@@ -189,15 +189,14 @@ class _LeaseDeadline:
     place -- and, deliberately, as a plain clock with no I/O in it, so that
     the fact it states can be read by a thread the database cannot park.
 
-    The rule itself is `daemon._heartbeat_loop`'s and is unchanged: a window
-    of ``visibility_seconds`` from the last beat the SERVER accepted, by a
+    The rule itself is `daemon._heartbeat_loop`'s: a window of
+    ``visibility_seconds`` from the last beat the SERVER accepted, by a
     MONOTONIC clock (the quantity is an elapsed duration, and a wall clock
     stepped by NTP would move the lease with it), dated from when that beat
-    ANSWERED rather than from when it was sent (the server grants the renewal
-    somewhere inside the round trip, so the answer's arrival is at or after
-    the grant -- which makes `remaining` PROVE the lapse instead of estimating
-    it, and an attempt taken away with time left on its lease costs the whole
-    run; see migration 0029).
+    was SENT. The send is the half that moved (monitor_finding #41949, the
+    last paragraph below); it used to be the answer's arrival, which put this
+    deadline AFTER the server's by the reply's own delay instead of at or
+    before it.
 
     WHY IT IS AN OBJECT RATHER THAN A LOCAL
     (VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED, monitor_finding #41237). It was
@@ -220,7 +219,7 @@ class _LeaseDeadline:
     `WorkerDaemon._execute`.
 
     AND IT IS DATED FROM THE REQUEST, NOT FROM THE ANSWER
-    (VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED, monitor_finding #41477). This is
+    (VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED, monitor_finding #41949). This is
     the half of the rule the three fixes above never touched, and it is the
     one that decides WHICH WAY the clock is wrong when it is wrong.
 
@@ -261,7 +260,7 @@ class _LeaseDeadline:
         # -- is the one this type exists to hold across threads.
         self._lock = threading.Lock()
         # The instant the CLAIM WAS ASKED FOR, passed in rather than read here
-        # (monitor_finding #41477): this object is built after `queue_claim`
+        # (monitor_finding #41949): this object is built after `queue_claim`
         # has answered, so `monotonic()` at construction is already past the
         # grant, and a default would have quietly reproduced the very skew
         # this type was changed to remove.
@@ -549,7 +548,7 @@ class WorkerDaemon:
                     # written by a dying drain cycle can never stick.
                     self._notify("WATCHDOG=1\nSTATUS=aicc-ready")
                     # WHEN THE WINDOW WAS ASKED FOR, which is where the
-                    # attempt's lease clock starts (monitor_finding #41477).
+                    # attempt's lease clock starts (monitor_finding #41949).
                     # `queue_claim` dates `visible_until` from the server's
                     # `now()`, somewhere inside this call; taking the instant
                     # before it means the lane's deadline is at or before the
@@ -737,7 +736,7 @@ class WorkerDaemon:
         # from whenever a thread happened to be scheduled.
         #
         # AND DATED FROM WHEN THE CLAIM WAS ASKED FOR, which is `claim_sent_at`
-        # and is why it is a parameter (monitor_finding #41477). `queue_claim`
+        # and is why it is a parameter (monitor_finding #41949). `queue_claim`
         # grants the window from the server's own `now()`, inside the call the
         # caller is still waiting on, so every instant available HERE is
         # already past that grant -- and a lease clock that starts late ends
@@ -1118,13 +1117,19 @@ class WorkerDaemon:
             # recovered the item, and restarting the lane only arranges for
             # the next tunnel blip to do it again.
             #
-            # DATED FROM WHEN A BEAT ANSWERED, NOT FROM WHEN IT WAS SENT. The
-            # server grants the renewal somewhere inside the round trip, so
-            # the instant the answer arrives is at or after the grant --
-            # which makes this test PROVE the lapse rather than estimate it.
-            # Timing it from the send would give the lease up to a round trip
-            # early, and an attempt taken away with time left on its lease
-            # costs the whole run (migration 0029).
+            # DATED FROM WHEN A BEAT WAS SENT, NOT FROM WHEN IT ANSWERED
+            # (monitor_finding #41949). The server grants the renewal somewhere
+            # inside the round trip, so the send is at or before that grant and
+            # the answer's arrival is at or after it -- and this test is the
+            # one the handler RUNS UNDER, so the direction that matters is the
+            # one that keeps `remaining > 0` meaning "the server's lease is
+            # still live". Dating from the answer inverted it: the lane ran on
+            # for the reply's own delay past a lease the server had let go. The
+            # cost of dating from the send is at most one round trip of a
+            # window sized with a whole beat interval of margin
+            # (`beat_interval_seconds`), and it is affordable only because a
+            # lapse no longer discards the outcome -- it offers it, and
+            # `_queue_owns` decides (monitor_finding #41318).
             remaining = deadline.remaining()
             if remaining <= 0:
                 # `lease_unproven`, NOT `queue_lease_lost` (monitor_finding
@@ -1158,7 +1163,7 @@ class WorkerDaemon:
             # THE INSTANT THE BEAT WAS SENT, captured before the call because
             # that is the only timestamp this loop can take that is at or
             # BEFORE the grant it is about to ask for (monitor_finding
-            # #41477). `queue_heartbeat` dates the new `visible_until` from
+            # #41949). `queue_heartbeat` dates the new `visible_until` from
             # the server's `now()`, which falls somewhere inside this round
             # trip; dating the lane's copy from here therefore lands at or
             # before the server's, whatever the reply path does afterwards.
@@ -1189,7 +1194,7 @@ class WorkerDaemon:
                 self._stop_the_handler(queue_lease_lost, cancel)
                 return
             # DATED FROM THE SEND, NOT FROM THIS INSTANT (VOYN-MON-CONTROL-01-
-            # QUEUE-QUEUE-STALLED, monitor_finding #41477). This line read
+            # QUEUE-QUEUE-STALLED, monitor_finding #41949). This line read
             # `answered_at`, the instant the call returned, on the argument
             # that the grant is at or before it and the test therefore PROVES
             # a lapse. It does -- and the proof is for the wrong half. What

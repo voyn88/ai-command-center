@@ -96,6 +96,14 @@ This is a distinct mechanism from the queue's visibility lease, and the two must
   cancelled this way is reported as a *retryable* failure whatever the handler said: neither terminal
   write (`queue_complete`, or a non-retryable `queue_fail`) may be taken from a workspace a
   terminated agent left behind.
+- **And that clock starts when the lane asks, not when the server answers.** The window is granted
+  from the server's own `now()`, somewhere inside a call the lane is still waiting on, so the
+  request instant is at or before the grant and the answer's is at or after it. Dating from the
+  answer made `remaining <= 0` prove a lapse and made `remaining > 0` — the test the handler actually
+  runs under — prove nothing, so the lane outran the server's lease by the reply's own delay, which
+  is unbounded in exactly the fault above. Dating from the request costs one round trip of a window
+  sized with a whole beat of margin, and is affordable only because the split above stopped a lapse
+  from discarding the outcome (VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED, `monitor_finding` #41949).
 - A payload's `timeout_seconds` therefore never "outlives" the queue's visibility lease in the sense
   of exceeding a fixed budget that lease enforces — a heartbeating worker can hold the row for as
   long as `agent_runner` lets the agent run, and no longer. The two ceilings coincide at 3600s
