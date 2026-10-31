@@ -2544,7 +2544,11 @@ def _open_accepted(head, merge_state="CLEAN"):
         "author": {"login": "writer-bot"},
         "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}",
                      "author": {"login": "voyn88-acceptance-gate[bot]"}}],
-        "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+        "statusCheckRollup": [
+            {"name": "CI", "conclusion": "SUCCESS"},
+            {"name": "Final merge gate", "conclusion": "SUCCESS"},
+            {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS"},
+        ],
     })
 
 
@@ -2554,7 +2558,11 @@ def _merged(head, merge_oid):
         "author": {"login": "writer-bot"},
         "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}",
                      "author": {"login": "voyn88-acceptance-gate[bot]"}}],
-        "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+        "statusCheckRollup": [
+            {"name": "CI", "conclusion": "SUCCESS"},
+            {"name": "Final merge gate", "conclusion": "SUCCESS"},
+            {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS"},
+        ],
     })
 
 
@@ -2667,6 +2675,11 @@ def test_a_queued_entry_leaves_the_merge_budget_to_the_next_task(rig, monkeypatc
         return sp.CompletedProcess(argv, 1, "", "?")
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    _stub_merge_credentials(monkeypatch)
+    monkeypatch.setattr(
+        review_merge, "_merge_pr_as_bot",
+        lambda repo, url, token: fake_gh(["pr", "merge", url], repo),
+    )
     report = merge_once(app_factory, "/tmp", review_merge.ReviewConfig(max_per_tick=1))
     assert ("VOYN-W0-MQ-B-READY", merge_oid) in report.merged
     assert any(
