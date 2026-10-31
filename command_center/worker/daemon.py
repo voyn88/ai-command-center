@@ -18,9 +18,9 @@ Design decisions, each traceable to the shipped substrate:
   the control plane's reaper make that abandonment safe by construction.
 * **Drain ACK does not imply idle.** ``aicc-drained`` retains its legacy
   meaning (claim gate closed, possibly busy). ``aicc-drained-idle`` additionally
-  proves that no claim/handler/report is in flight and every delivered outcome
-  was durably accepted. Ambiguous outcome writes conservatively suppress the
-  idle proof until process restart, including across credential reloads.
+  proves that no claim/handler/report is in flight. A handled outcome-write
+  failure is left to the canonical lease expiry/reaper, as on the normal loop;
+  it is not permanent evidence of work still running inside this process.
 * **Auth failure means stop, not retry.** A refused connection may mean the
   credential was rotated out from under us (`enroll_rotate_self` is
   first-writer-wins); hammering the server with a dead secret is
@@ -136,10 +136,8 @@ class WorkerDaemon:
         # ACK cannot race ahead of an already-starting database claim.
         self._claim_gate_lock = threading.Lock()
         # Guarded by the claim gate: include claim I/O and final persistence,
-        # not only the handler. An uncertain durable outcome stays conservative
-        # until process restart; it must never advertise safe-to-restart idle.
+        # not only the handler. Clear only after _execute finishes its handling.
         self._attempt_active = False
-        self._outcome_unsettled = False
         self._reload_requested = threading.Event()
         self._reload_stop = threading.Event()
         # Injectable so tests drive time instead of waiting through it.
@@ -185,7 +183,7 @@ class WorkerDaemon:
 
     def _drained_status(self) -> str:
         """Caller holds the gate lock, including while emitting this status."""
-        if self._attempt_active or self._outcome_unsettled:
+        if self._attempt_active:
             return "aicc-drained"  # legacy ACK: claims closed, not necessarily idle
         return "aicc-drained-idle"
 
@@ -294,17 +292,16 @@ class WorkerDaemon:
                     self._sleep(min(self._config.idle_max_seconds, cap))
                     continue
                 idle = self._config.idle_min_seconds
-                settled = False
-                try:
-                    settled = self._execute(claimed)
-                finally:
-                    with self._claim_gate_lock:
-                        self._attempt_active = False
-                        self._outcome_unsettled |= not settled
-                        if self._drain.is_set() and self._drain_closed.is_set():
-                            # Reload clears both flags and emits READY under
-                            # this same lock: no late idle ACK can overwrite it.
-                            self._notify(f"STATUS={self._drained_status()}")
+                self._execute(claimed)
+                # A handled report failure has no remaining local I/O or work;
+                # canonical visibility expiry/reaping handles its uncertain
+                # outcome. An escaping exception never reaches this idle ACK.
+                with self._claim_gate_lock:
+                    self._attempt_active = False
+                    if self._drain.is_set() and self._drain_closed.is_set():
+                        # Reload clears both flags and emits READY under
+                        # this same lock: no late idle ACK can overwrite it.
+                        self._notify(f"STATUS={self._drained_status()}")
         finally:
             self._reload_stop.set()
             self._reload_requested.set()
@@ -316,8 +313,7 @@ class WorkerDaemon:
         # not a crash — TimeoutStopSec pacing instead of watchdog action.
         self._notify("STOPPING=1")
 
-    def _execute(self, work: ClaimedWork) -> bool:
-        """True only after the store durably accepts the outcome."""
+    def _execute(self, work: ClaimedWork) -> None:
         lease_lost = threading.Event()
         beat_stop = threading.Event()
         beat = threading.Thread(
@@ -342,7 +338,7 @@ class WorkerDaemon:
                 "attempt %s: lease lost mid-execution; outcome discarded",
                 work.attempt_id,
             )
-            return False
+            return
         try:
             if outcome.ok:
                 accepted = self._store.complete(work, outcome.result)
@@ -371,7 +367,7 @@ class WorkerDaemon:
                 "will lapse and a later delivery will retry",
                 work.attempt_id,
             )
-            return False
+            return
         if not accepted:
             # The database refused the report: the lease lapsed between our
             # last successful beat and this write, and the attempt belongs to
@@ -384,8 +380,6 @@ class WorkerDaemon:
                 "lapsed lease (handler effects may re-run on the next attempt)",
                 work.attempt_id,
             )
-
-        return bool(accepted)
 
     def _dispatch(
         self, work: ClaimedWork, lease_lost: threading.Event

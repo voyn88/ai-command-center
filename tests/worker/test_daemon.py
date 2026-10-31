@@ -213,9 +213,8 @@ def test_sigterm_finishes_the_item_in_hand_and_claims_no_more() -> None:
     original_execute = daemon._execute
 
     def execute_then_stop(work):
-        settled = original_execute(work)
+        original_execute(work)
         daemon.request_stop()  # the signal arrives while item 1 is in hand
-        return settled
 
     daemon._execute = execute_then_stop  # type: ignore[method-assign]
     daemon.run_forever()
@@ -775,7 +774,7 @@ def test_the_daemon_speaks_real_sd_notify_datagrams(monkeypatch) -> None:
 
 
 
-def test_drain_idle_waits_for_claim_handler_and_durable_completion():
+def test_drain_idle_waits_for_claim_handler_and_outcome_persistence():
     import threading
 
     claim_entered = threading.Event()
@@ -895,7 +894,7 @@ def test_completion_after_reload_cannot_overwrite_ready_with_stale_idle():
 
 
 @pytest.mark.parametrize("report_failure", ["exception", "refusal"])
-def test_uncertain_outcome_never_advertises_idle_even_after_reload(report_failure):
+def test_handled_report_failure_does_not_permanently_block_idle_after_reload(report_failure):
     import threading
 
     attempted = threading.Event()
@@ -914,7 +913,7 @@ def test_uncertain_outcome_never_advertises_idle_even_after_reload(report_failur
 
     def notify(message):
         notices.append(message)
-        if "STATUS=aicc-drained" in message:
+        if "STATUS=aicc-drained-idle" in message:
             drained.set()
         if drained.is_set() and message == "STATUS=aicc-ready":
             reloaded.set()
@@ -928,15 +927,31 @@ def test_uncertain_outcome_never_advertises_idle_even_after_reload(report_failur
     try:
         assert attempted.wait(5)
         daemon.request_drain()
-        assert drained.wait(5)
-        assert not any("STATUS=aicc-drained-idle" in p for p in notices)
+        assert drained.wait(5), "a handled failure is no longer in-flight work"
+        assert any("STATUS=aicc-drained-idle" in p for p in notices)
         daemon.request_reload()
         assert reloaded.wait(5)
         drained.clear()
         daemon.request_drain()
-        assert drained.wait(5)
-        assert not any("STATUS=aicc-drained-idle" in p for p in notices)
+        assert drained.wait(5), "a handled failure is no longer in-flight work"
+        assert any("STATUS=aicc-drained-idle" in p for p in notices)
     finally:
         daemon.request_stop()
         worker.join(5)
     assert not worker.is_alive()
+
+
+
+def test_unhandled_execution_exception_does_not_advertise_idle():
+    store = ScriptedStore([_work({"kind": "echo"})])
+    notices = []
+    daemon = WorkerDaemon(store, {}, notify=notices.append)
+
+    def execute(work):
+        daemon.request_drain()
+        raise RuntimeError("unhandled execution failure")
+
+    daemon._execute = execute
+    with pytest.raises(RuntimeError, match="unhandled execution failure"):
+        daemon.run_forever()
+    assert not any("STATUS=aicc-drained-idle" in p for p in notices)
