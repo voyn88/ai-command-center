@@ -574,3 +574,92 @@ def test_daily_spend_usd_tolerates_dict_and_malformed_payloads(tmp_path, monkeyp
 
     assert total == pytest.approx(5.5)
     assert "unparseable" in caplog.text
+
+
+def test_daily_spend_usd_raises_on_non_numeric_total_cost(tmp_path, monkeypatch):
+    """A present but non-numeric `total_cost_usd` is a contract breach: the
+    amount is unknown, not zero. Silently skipping it would undercount and
+    let a configured spend cap fail open."""
+
+    class _FakeCursor:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def fetchall(self):
+            return self._rows
+
+    class _FakeConn:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def execute(self, *_args, **_kwargs):
+            return _FakeCursor(self._rows)
+
+    rows = [
+        {"payload": {"type": "result", "total_cost_usd": "not-a-number"}},
+    ]
+
+    @contextlib.contextmanager
+    def _fake_connect(_db_path):
+        yield _FakeConn(rows)
+
+    monkeypatch.setattr(task_pipeline.runtime_db, "connect", _fake_connect)
+
+    with pytest.raises(task_pipeline.SpendUnknownError) as caught:
+        task_pipeline.daily_spend_usd(tmp_path / "runtime.db")
+    assert caught.value.kind == task_pipeline.SpendUnknownError.CORRUPT_COST_EVENT
+
+
+def test_daily_spend_unknown_pauses_dispatch_without_guessing(tmp_path, api, fake_claude):
+    """VOYN-W0-AICC-REPORT-319: spend-unknown is not a verdict. A configured
+    ceiling whose trailing-24h spend cannot be measured (corrupt cost data)
+    must pause dispatch with `daily_spend_unknown`, never be silently treated
+    as "0" (could overspend) or "at cap" (would misreport why nothing
+    launched)."""
+
+    pipeline_settings.save_settings(
+        tmp_path,
+        PipelineSettings(
+            enabled=True, auto_launch=True, max_daily_spend_usd=1.0,
+            max_global_concurrency=2, max_agent_concurrency=2,
+        ),
+    )
+    _remote, _work = _project_repo(tmp_path, "AIOS", "proj-u")
+    wt = tmp_path / "wt" / "u"
+    task = _task("u", "AIOS", wt, branch="task/u")
+    tasks_repository.save_tasks(tmp_path, [task])
+    execution_queue.enqueue_and_persist(tmp_path, task, {"u": task})
+    configs = project_config.load_project_configs()
+
+    # A completed run whose provider reported a non-numeric cost — corrupt
+    # data, not "no cost data" (which is a legitimate 0.0 and must not raise).
+    prior_task = runtime_db.create_task(
+        api.db_path, project="AIOS", title="prior", task_type="implementation"
+    )
+    prior_session = runtime_db.create_session(
+        api.db_path, task_id=prior_task["id"], project="AIOS", repository_path="/tmp/x"
+    )
+    prior = runtime_db.create_run(
+        api.db_path, session_id=prior_session["id"], task_id=prior_task["id"],
+        project="AIOS", task_type="implementation", repository_path="/tmp/x",
+        prompt="prior", is_resume=False,
+    )
+    runtime_db.append_run_event(
+        api.db_path, prior["id"], "stream_event",
+        {"type": "result", "total_cost_usd": "not-a-number", "usage": {"input_tokens": 1}},
+    )
+    with runtime_db.connect(api.db_path) as conn:
+        with runtime_db.transaction(conn):
+            conn.execute(
+                "UPDATE run SET state='COMPLETED', completed_at=? WHERE id=?",
+                (models.iso_now(), prior["id"]),
+            )
+
+    with pytest.raises(task_pipeline.SpendUnknownError):
+        task_pipeline.daily_spend_usd(api.db_path)
+
+    result = task_pipeline.tick(
+        tmp_path, api, configs, github=FakeGitHubClient(), advance_wait_seconds=60
+    )
+    assert result.launched() == []
+    assert result.launch_status == task_pipeline.LAUNCH_SPEND_UNKNOWN

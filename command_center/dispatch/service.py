@@ -176,11 +176,15 @@ def plan(root: Path, *, db_path: Path | None = None) -> DispatchPlan:
     # stops dispatch. `spend` is `None` on failure rather than a fabricated
     # `0.0`, so the reported `daily_spend_usd`/`projected_spend_usd` in the
     # plan also read as "unknown" rather than "nothing spent today" — the same
-    # fail-closed standard the assignment decision already gets.
+    # fail-closed standard the assignment decision already gets. An unmeasurable
+    # amount is never a fabricated verdict — not "0" and not "at the ceiling".
     budget_unknown = False
     spend: float | None
     try:
         spend = task_pipeline.daily_spend_usd(resolved_db)
+    except task_pipeline.SpendUnknownError:
+        spend = None
+        budget_unknown = True
     except Exception:  # noqa: BLE001 — no cost data => fail closed: block dispatch
         spend = None
         budget_unknown = True

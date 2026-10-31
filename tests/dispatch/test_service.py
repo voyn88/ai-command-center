@@ -59,7 +59,10 @@ def _spend(monkeypatch, value: float):
 
 def _spend_unavailable(monkeypatch):
     def _raise(*_a, **_k):
-        raise RuntimeError("db unreachable")
+        raise task_pipeline.SpendUnknownError(
+            task_pipeline.SpendUnknownError.STORAGE_UNAVAILABLE,
+            detail="db unreachable",
+        )
 
     monkeypatch.setattr(task_pipeline, "daily_spend_usd", _raise)
 
@@ -217,6 +220,40 @@ def test_plan_fails_closed_when_cost_data_is_unavailable_with_default_settings(
         "status": "unavailable",
         "kind": "unknown",
     }
+
+
+def test_plan_defers_as_cost_data_unavailable_on_corrupt_cost_event(monkeypatch, pool):
+    """VOYN-W0-AICC-REPORT-319: spend-unknown is not a verdict.
+
+    A ceiling is configured, but the spend primitive cannot measure it
+    (corrupt cost data). The old bug fabricated "assume ceiling hit"; the
+    fix must defer with the typed unknown-budget reason instead of silently
+    pretending the budget is exhausted.
+    """
+    import dataclasses
+
+    _enable_master_switch()
+    settings = pipeline_settings.load_settings(ROOT)
+    pipeline_settings.save_settings(
+        ROOT, dataclasses.replace(settings, max_daily_spend_usd=0.4)
+    )
+
+    def _raise(*_a, **_k):
+        raise task_pipeline.SpendUnknownError(
+            task_pipeline.SpendUnknownError.CORRUPT_COST_EVENT
+        )
+
+    monkeypatch.setattr(task_pipeline, "daily_spend_usd", _raise)
+    _queued_task(title="t1")
+
+    plan = service.plan(ROOT)
+
+    assert plan.assignments == ()
+    assert plan.decisions[0].reason == models.DEFER_COST_DATA_UNAVAILABLE
+    assert plan.budget_unknown is True
+    assert plan.daily_spend_usd is None
+    assert plan.projected_spend_usd is None
+    assert plan.spend_measurement == models.SPEND_MEASUREMENT_UNAVAILABLE
 
 
 def test_assign_is_a_noop_when_cost_data_is_unavailable(monkeypatch, pool):
