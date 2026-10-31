@@ -671,7 +671,10 @@ def idle_preflight(
     """Close claim gates and prove idle before changing the release selector.
 
     Legacy aicc-drained acknowledges only the gate, not an unsettled attempt.
-    A pre-existing idle acknowledgement is not evidence for this request.
+    Exact idle status may be adopted from an earlier maintenance drain: the
+    daemon emits it under its claim lock only after local work settles, and
+    reload clears the gate and status under that same lock. Re-signal and
+    recheck the original PID; legacy drained status never proves idle.
     """
     show = show or _systemctl_show
     systemctl = systemctl or _lane_signal
@@ -686,10 +689,11 @@ def idle_preflight(
         raise RuntimeError("credential_budget_insufficient")
     for unit in units:
         pid = show(unit, "MainPID")
+        status = show(unit, "StatusText")
         if (not pid.isdigit() or int(pid) <= 0
                 or show(unit, "ActiveState") != "active"
                 or show(unit, "SubState") != "running"
-                or not show(unit, "StatusText").startswith(_READY)):
+                or not (status.startswith(_READY) or status == "aicc-drained-idle")):
             raise RuntimeError(f"lane_not_ready_for_drain:{unit}")
         # Record before signalling: even an ambiguous command failure must unwind.
         gated[unit] = pid
