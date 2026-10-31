@@ -11,14 +11,15 @@ no table here introduces a conversion the shared machinery has not already been
 proved against. The council family keeps its own slice because `council_event`
 carries an identity column and its own event ordering.
 
-`audit_run`/`audit_finding` trip the AIOS boundary gate on their **file name**:
-`audit` is matched without behavioural corroboration by design. The first
-version of this slice withdrew them, on the belief that a baseline edit needed
-a separate architectural decision. `docs/AIOS_BOUNDARY.md` says otherwise —
-this is its Direction 2 (reclassify a detector false positive), whose remedy is
-an ordinary reviewed PR with the justification in its description, which is the
-process that was already running. The tables are back, the baseline carries the
-entry, and the reasoning lives in `command_center/db/audit_store.py`.
+`audit_run`/`audit_finding` trip the AIOS boundary gate on their **file name**.
+The first version of this slice withdrew them rather than edit the frozen
+baseline from inside a migration slice (`VOYN-W0-AICC-MIRROR-AUDIT-BOUNDARY`).
+That decision later landed as signature tuning, not a standing baseline entry:
+`VOYN-W0-AICC-AUDIT-CATEGORY-CORROBORATION` exempts only a positively-validated
+declarative `PostgresTableMirror` module, so `command_center/db/audit_store.py`
+adds no `audit` capability, matches the shape, and stays out of
+`AIOS_BOUNDARY_BASELINE.json`. The tables are mirrored here; the reasoning
+lives in that store's docstring and in `docs/AIOS_BOUNDARY.md`.
 
 What still gets per-table attention, because it is per-table by nature:
 
