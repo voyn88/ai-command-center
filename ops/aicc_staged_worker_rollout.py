@@ -71,14 +71,15 @@ RELEASE_ROOT = Path("/opt/aicc/releases")
 # Timers that mutate worker lane units on their own schedule, independent of
 # this rollout. Both must be held for the rollout's entire duration: a
 # credential-rotation tick's reload-then-restart fallback cannot tell "this
-# lane crashed" from "this lane is mid-drain", and a self-deploy tick
-# unconditionally restarts every service in its list. Left running, either
-# can race this script's own stop/start of a lane -- live on worker-01
+# lane crashed" from "this lane is mid-drain", and the worker release-deploy
+# tick drain-restarts every currently-active registered lane. Left running,
+# either can race this script's own stop/start of a lane -- live on worker-01
 # (2026-09-08), self-deploy's restart of the canary collided with this
 # script's own `stop`, and systemd canceled one of the two jobs.
 LANE_MUTATING_TIMERS = (
     "voyn-aicc-credential-rotation.timer",
-    "voyn-aicc-self-deploy.timer",
+    "voyn-aicc-worker-release-deploy.timer",
+    "voyn-aicc-source-clone-refresh.timer",
 )
 
 # Shared with DEFAULT_ROLLOUT_LOCK_PATH in command_center/ops/
@@ -191,7 +192,9 @@ def _interpreter_resolution_chain(executable: Path) -> tuple[Path, ...]:
             return tuple(chain)
         target = os.readlink(current)
         current = Path(target) if os.path.isabs(target) else current.parent / target
-    raise RolloutError(f"AICC release interpreter symlink chain is too deep: {executable}")
+    raise RolloutError(
+        f"AICC release interpreter symlink chain is too deep: {executable}"
+    )
 
 
 def verify_immutable_release() -> None:
@@ -252,9 +255,7 @@ class Systemd:
     def run(self, *args: str, check: bool = True) -> str:
         returncode, stdout, stderr = self.probe(*args)
         if check and returncode:
-            raise RolloutError(
-                stderr or f"systemctl {' '.join(args)} failed"
-            )
+            raise RolloutError(stderr or f"systemctl {' '.join(args)} failed")
         return stdout
 
     def property(self, unit: str, name: str) -> str:
@@ -390,12 +391,8 @@ def _listed_instances(
             # status stays fail-closed, and `list-units` below never gets
             # this tolerance.
             returncode, stdout, stderr = systemd.probe(*command)
-            if returncode and not (
-                returncode == 1 and not stdout and not stderr
-            ):
-                raise RolloutError(
-                    stderr or f"systemctl {' '.join(command)} failed"
-                )
+            if returncode and not (returncode == 1 and not stdout and not stderr):
+                raise RolloutError(stderr or f"systemctl {' '.join(command)} failed")
             output = stdout
         else:
             output = systemd.run(*command, check=check)
@@ -460,9 +457,7 @@ def verify_snapshot_closure(systemd: Systemd, state: dict[str, object]) -> None:
     )
     extras = sorted(discovered - expected)
     if extras:
-        raise RolloutError(
-            f"template units exist outside service snapshot: {extras}"
-        )
+        raise RolloutError(f"template units exist outside service snapshot: {extras}")
 
 
 def hold_lane_mutating_timers(systemd: Systemd) -> None:
@@ -476,6 +471,15 @@ def hold_lane_mutating_timers(systemd: Systemd) -> None:
     stopped: list[str] = []
     try:
         for timer in LANE_MUTATING_TIMERS:
+            # A host where the timer is not installed (fresh installer
+            # container, a control host without rotation) has nothing to
+            # hold; `systemctl stop` on a not-found unit is an error, not a
+            # no-op (Installer integration red on main since #873).
+            load_state = systemd.run(
+                "show", timer, "--property=LoadState", "--value", check=False
+            )
+            if load_state in {"", "not-found"}:
+                continue
             systemd.run("stop", timer)
             stopped.append(timer)
     except BaseException:
@@ -484,15 +488,26 @@ def hold_lane_mutating_timers(systemd: Systemd) -> None:
         raise
 
 
-def release_lane_mutating_timers(systemd: Systemd) -> None:
+def release_lane_mutating_timers(systemd: Systemd, *, strict: bool = False) -> None:
     """Best-effort restart of every timer `hold_lane_mutating_timers` stopped.
 
     Always called from a `finally`, on both the success and failure path, so
     a rollout can never exit leaving rotation or self-deploy permanently
     paused.
     """
+    failed = []
     for timer in LANE_MUTATING_TIMERS:
-        systemd.run("start", timer, check=False)
+        if not strict:
+            systemd.run("start", timer, check=False)
+            continue
+        try:
+            if systemd.run("show", timer, "--property=LoadState", "--value") == "not-found":
+                continue
+            systemd.run("start", timer)
+        except Exception:  # noqa: BLE001 - try every timer before reporting cleanup failure
+            failed.append(timer)
+    if failed:
+        raise RolloutError("timer_restore_failed:" + ",".join(failed))
 
 
 def write_rollout_lock() -> None:
@@ -500,32 +515,67 @@ def write_rollout_lock() -> None:
 
     World-readable by design: the rotator and self-deploy run as unprivileged
     service users and only need to observe that the file exists, never its
-    contents. Written via temp-then-rename so a concurrent reader never
-    observes a partially written file.
+    contents. Created exclusively: readers only need existence, and concurrent
+    writers must never replace another rollout marker.
     """
     ROLLOUT_LOCK_PATH.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
-    temporary = ROLLOUT_LOCK_PATH.with_name(
-        f".{ROLLOUT_LOCK_PATH.name}.{os.getpid()}"
-    )
-    temporary.write_text(f"{os.getpid()}\n", encoding="utf-8")
-    temporary.chmod(0o644)
-    os.replace(temporary, ROLLOUT_LOCK_PATH)
+    # Exclusive creation prevents another rollout's ownership being overwritten.
+    fd = os.open(ROLLOUT_LOCK_PATH, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(f"{os.getpid()}\n")
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 def remove_rollout_lock() -> None:
-    ROLLOUT_LOCK_PATH.unlink(missing_ok=True)
+    try:
+        owner = ROLLOUT_LOCK_PATH.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return
+    if owner == str(os.getpid()):
+        ROLLOUT_LOCK_PATH.unlink(missing_ok=True)
 
 
 def retire_legacy_units(systemd: Systemd) -> None:
-    """Drain and disable every pre-template worker before lane startup."""
+    """Drain, disable and un-latch every pre-template worker before lane startup.
+
+    `disable` removes the symlink that was these units' fragment, so after
+    this they are deliberately gone from the host for good (see
+    `RETIRED_LEGACY_UNITS` in ops/aicc_install_transaction.py, which exists
+    because quiesce has to tolerate exactly that absence). `reset-failed` is
+    the third step and not a tidy-up: a `stop` that reached its timeout --
+    which a worker daemon holding a task does -- latches `failed` on the way
+    out, and a unit with no fragment can never run again, so it can never
+    reach a successful state that clears the latch. systemd keeps such a
+    unit loaded for no other reason than to remember that latch, which is why
+    the corpses, and only the corpses, outlive a retirement.
+
+    That is what the host unit-health probe then counted, every two minutes,
+    as broken infrastructure on a host whose retirement had in fact succeeded
+    (worker-01 `failed_units`, monitor_finding 2051 and its three
+    successors) -- a finding no repair could clear, because the units it
+    named did not exist. The probe no longer treats a fragment-less unit as a
+    fault (`infra_monitor.evaluate_unit_health`); this is the other half:
+    stop producing them. Clearing the latch here is also what retires the
+    corpses already on hosts that were rolled out before this landed, since
+    every rollout runs this.
+    """
     for unit in LEGACY_WORKER_UNITS:
         systemd.run("stop", unit, check=False)
         systemd.run("disable", unit, check=False)
+        systemd.run("reset-failed", unit, check=False)
     verify_legacy_units_retired(systemd)
 
 
 def verify_legacy_units_retired(systemd: Systemd) -> None:
-    """Prove old claimers cannot coexist with templated worker lanes."""
+    """Prove old claimers cannot coexist with templated worker lanes.
+
+    `failed` is refused alongside `active`/`activating`: a retired unit is
+    expected to be drained AND un-latched, and asserting it proves the
+    `reset-failed` above actually took effect on this host rather than
+    trusting that it was issued -- the lesson of a reaping rule that was
+    written in a section systemd ignores and silently did nothing.
+    """
     for unit in LEGACY_WORKER_UNITS:
         active = systemd.run("is-active", unit, check=False)
         enabled = systemd.run("is-enabled", unit, check=False)
@@ -538,6 +588,10 @@ def verify_legacy_units_retired(systemd: Systemd) -> None:
             or main_pid not in {"", "0"}
         ):
             raise RolloutError(f"legacy worker was not drained and disabled: {unit}")
+        if active == "failed":
+            raise RolloutError(
+                f"legacy worker is retired but still latched failed: {unit}"
+            )
 
 
 def snapshot(systemd: Systemd, units: tuple[str, ...]) -> dict[str, object]:
@@ -598,17 +652,13 @@ def restore(systemd: Systemd, state: dict[str, object]) -> None:
                 "show", unit, "--property=LoadState", "--value"
             )
             if load_returncode or not load_before:
-                raise RolloutError(
-                    f"cannot prove absent service load state: {unit}"
-                )
+                raise RolloutError(f"cannot prove absent service load state: {unit}")
             initially_not_found = load_before == "not-found"
             if not initially_not_found:
                 systemd.run("stop", unit, check=False)
                 systemd.run("disable", unit, check=False)
             active_rc, active, _active_stderr = systemd.probe("is-active", unit)
-            enabled_rc, enabled, _enabled_stderr = systemd.probe(
-                "is-enabled", unit
-            )
+            enabled_rc, enabled, _enabled_stderr = systemd.probe("is-enabled", unit)
             load_rc, load_state, _post_load_stderr = systemd.probe(
                 "show", unit, "--property=LoadState", "--value"
             )
@@ -635,9 +685,7 @@ def restore(systemd: Systemd, state: dict[str, object]) -> None:
             )
             enablement_absent = enabled in {"disabled", "not-found"}
             runtime_absent = (
-                active == "inactive"
-                and load_state == "not-found"
-                and main_pid == "0"
+                active == "inactive" and load_state == "not-found" and main_pid == "0"
             )
             # The generator may be executing inside its own recovery service,
             # so it cannot prove that service inactive/unloaded until it exits.
@@ -682,7 +730,11 @@ def restore(systemd: Systemd, state: dict[str, object]) -> None:
             load_state in {"", "not-found"}
             or ((active == "active") is not expected_active and not activating_start)
             or ((enabled == "enabled") is not (raw.get("enabled") is True))
-            or (active != "active" and not activating_start and main_pid not in {"", "0"})
+            or (
+                active != "active"
+                and not activating_start
+                and main_pid not in {"", "0"}
+            )
         ):
             raise RolloutError(f"service snapshot did not restore exactly: {unit}")
         if version == 3:
@@ -879,9 +931,8 @@ def _lane_inputs_visible(
         )
         if result.returncode != 0:
             detail = (result.stderr or result.stdout).strip().splitlines()
-            return (
-                f"{path} is not usable inside the lane namespace as uid {uid}"
-                + (f": {detail[0][:160]}" if detail else "")
+            return f"{path} is not usable inside the lane namespace as uid {uid}" + (
+                f": {detail[0][:160]}" if detail else ""
             )
     return None
 
@@ -1042,7 +1093,9 @@ def verify_unit(
         if value.startswith(DATA_DIR_ENVIRONMENT_KEY + "=")
     )
     if len(data_dirs) != 1 or not data_dirs[0].startswith("/"):
-        raise RolloutError(f"{unit} MainPID has no single absolute {DATA_DIR_ENVIRONMENT_KEY}")
+        raise RolloutError(
+            f"{unit} MainPID has no single absolute {DATA_DIR_ENVIRONMENT_KEY}"
+        )
     failure = lane_inputs_visible(int(raw_pid), unit_uid, data_dirs[0], environment)
     if failure is not None:
         raise RolloutError(f"{unit} cannot read its task inputs: {failure}")
@@ -1088,7 +1141,9 @@ def verify_all(
 _environment_file_exists = os.path.exists
 
 
-def verify_required_environment_files(systemd: "Systemd", units: tuple[str, ...]) -> None:
+def verify_required_environment_files(
+    systemd: Systemd, units: tuple[str, ...]
+) -> None:
     """Refuse before the first mutation if a required environment file is
     absent from the host.
 
@@ -1172,9 +1227,7 @@ def rollout(
     try:
         try:
             agent_uid = uid_for_user(agent_user)
-            privileged_uids = frozenset(
-                uid_for_user(user) for user in privileged_users
-            )
+            privileged_uids = frozenset(uid_for_user(user) for user in privileged_users)
             # verify_all() has always refused an aliased agent/privileged UID,
             # but a caller invoking this mutating rollout directly (bypassing
             # the separate shell verifier) was not protected by that check:
@@ -1197,9 +1250,7 @@ def rollout(
                 if systemd.property(unit, "ActiveState") != "inactive":
                     raise RolloutError(f"{unit} did not drain to inactive")
                 if systemd.property(unit, "MainPID") != "0":
-                    raise RolloutError(
-                        f"{unit} retained a stale MainPID after drain"
-                    )
+                    raise RolloutError(f"{unit} retained a stale MainPID after drain")
                 # A daemon-reload or drop-in replacement may race the drain.
                 # The final pre-start check makes that race fail closed too.
                 verify_unit_configuration(systemd, unit)
@@ -1223,6 +1274,18 @@ def rollout(
             for unit in (*units, *LEGACY_WORKER_UNITS):
                 systemd.run("stop", unit, check=False)
                 systemd.run("disable", unit, check=False)
+            # Four consecutive attempts failed here on worker-01 (2026-08-31)
+            # and each one disabled the legacy units again, removing their
+            # fragment while a timed-out stop had latched `failed` on them.
+            # The latch is not the evidence of this failure -- the raised
+            # RolloutError and the journal are -- but it is permanent host
+            # state nothing can clear once the fragment is gone, so the
+            # abandoned path must not leave it behind either. Only the legacy
+            # units: a lane's fragment is the template file, which the outer
+            # transaction restores, so a failed lane can still clear its own
+            # latch by running.
+            for unit in LEGACY_WORKER_UNITS:
+                systemd.run("reset-failed", unit, check=False)
             raise
     finally:
         # Restored on both the success and failure path -- a rollout must
@@ -1290,9 +1353,7 @@ def main() -> int:
         payload = json.dumps(
             snapshot(
                 systemd,
-                tuple(
-                    sorted({*units, *included, *discover_launcher_units(systemd)})
-                ),
+                tuple(sorted({*units, *included, *discover_launcher_units(systemd)})),
             ),
             sort_keys=True,
         ).encode()

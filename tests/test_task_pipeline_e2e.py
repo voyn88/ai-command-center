@@ -595,6 +595,12 @@ def test_daily_spend_usd_returns_zero_for_an_empty_window(tmp_path, monkeypatch)
     [
         {"payload": "{not valid json"},
         {"payload": "[1, 2, 3]"},
+        {"payload": '[{"total_cost_usd": 1}]'},
+        {"payload": '"total_cost_usd"'},
+        {"payload": [{"total_cost_usd": 9}]},
+        {"payload": True},
+        {"payload": False},
+        {"payload": None},
         {"payload": 17},
         {"payload": {"type": "result", "total_cost_usd": "1.50"}},
         {"payload": {"type": "result", "total_cost_usd": None}},

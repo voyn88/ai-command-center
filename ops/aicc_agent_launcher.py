@@ -16,10 +16,12 @@ home tree and every publisher authority path remain inaccessible.
 from __future__ import annotations
 
 import base64
+import errno
 import fcntl
 import grp
 import hashlib
 import json
+import math
 import os
 import pwd
 import re
@@ -33,6 +35,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -50,6 +53,8 @@ SOCKET_PATH = "/run/aicc-agent-launcher/control.sock"
 ROOTS_FILE = Path("/etc/aicc/agent-workspace-roots")
 COMMON_ENV_FILE = Path("/etc/aicc/agent.env")
 PROVIDER_ENV_FILES = {
+    "grok": Path("/etc/aicc/agent-grok.env"),
+    "cursor": Path("/etc/aicc/agent-cursor.env"),
     "claude": Path("/etc/aicc/agent-claude.env"),
     "codex": Path("/etc/aicc/agent-codex.env"),
 }
@@ -74,6 +79,8 @@ EPHEMERAL_HOME_ROOT = Path("/run/aicc-agent-homes")
 # nothing at all -- never to a half-installed package tree.
 TOOLCHAIN_BIN = "/opt/aicc/toolchains/current/bin"
 EXECUTOR_BINARIES = {
+    "grok": "/usr/libexec/aicc-grok-agent",
+    "cursor": "/opt/aicc/providers/cursor/agent",
     "claude": f"{TOOLCHAIN_BIN}/claude",
     "codex": f"{TOOLCHAIN_BIN}/codex",
 }
@@ -93,11 +100,17 @@ MAX_PROMPT_BYTES = 128 * 1024
 # combined encoded size below MAX_MANIFEST_BYTES, which is also the client's
 # bounded line-reader limit; oversized output becomes retryable infrastructure
 # while its potentially modified task workspace is preserved.
-MAX_OUTPUT_BYTES = 512 * 1024
+# Per-stream retention bound for agent stdout/stderr held in root memory. An
+# agent that writes more keeps running; only the oldest bytes are dropped and
+# the retained tail is prefixed with a marker (the final report is at the end
+# of the stream for both providers). Refusing the whole run on overflow cost 12
+# of the first 68 isolated implementation runs on 2026-09-09.
+MAX_OUTPUT_BYTES = 4 * 1024 * 1024
+OUTPUT_TRUNCATED_MARKER = b"[aicc-agent-launcher: earlier agent output dropped; tail retained]\n"
 MAX_GIT_INDEX_BYTES = 64 * 1024 * 1024
 MAX_GIT_INDEX_ENTRIES = 1_000_000
 MAX_MODEL_AUTH_BYTES = 16 * 1024 * 1024
-PROFILES = frozenset({"read_only", "trusted_development"})
+PROFILES = frozenset({"read_only", "trusted_development", "model_only"})
 MODEL_RE = re.compile(r"[A-Za-z0-9_.:/-]{1,128}")
 RUN_ID_RE = re.compile(r"[a-f0-9]{32}")
 BROKER_UNIT_RE = re.compile(r"aicc-agent-launcher@[^/]{1,200}\.service")
@@ -127,6 +140,8 @@ COMMON_AGENT_ENV_KEYS = frozenset(
     }
 )
 PROVIDER_AGENT_ENV_KEYS = {
+    "grok": frozenset({"XAI_API_KEY"}),
+    "cursor": frozenset({"CURSOR_API_KEY"}),
     "claude": frozenset(
         {"ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_MODEL"}
     ),
@@ -225,6 +240,8 @@ def _load_manifest(raw: bytes) -> dict[str, Any]:
         raise LaunchRefused("executor is not allowlisted")
     if value["profile"] not in PROFILES:
         raise LaunchRefused("profile is not allowlisted")
+    if value["profile"] == "model_only" and value["executor"] != "grok":
+        raise LaunchRefused("executor does not support the model-only profile")
     prompt = value["prompt"]
     if not isinstance(prompt, str) or not prompt or "\x00" in prompt:
         raise LaunchRefused("prompt must be a non-empty NUL-free string")
@@ -440,23 +457,39 @@ def _node_is_immutable_root_owned(info: os.stat_result) -> bool:
     return not (info.st_mode & 0o022)
 
 
-def _write_back_model_auth(executor: str, home: Path) -> bool:
-    """Persist a provider credential the model process refreshed during the
-    run back into the root-owned store the next run is staged from.
+def _model_auth_freshness(executor: str, document: dict) -> int | float | datetime | None:
+    """Return a comparable provider timestamp, or None when it is unknown."""
+    if executor == "claude":
+        oauth = document.get("claudeAiOauth")
+        value = oauth.get("expiresAt") if isinstance(oauth, dict) else None
+        if type(value) is int or (type(value) is float and math.isfinite(value)):
+            return value
+    elif executor == "codex":
+        value = document.get("last_refresh")
+        if isinstance(value, str):
+            try:
+                parsed = datetime.fromisoformat(value)
+            except ValueError:
+                return None
+            if parsed.tzinfo is not None and parsed.utcoffset() is not None:
+                return parsed
+    return None
 
-    Claude and Codex rotate their refresh token when they refresh: the new
-    token lands in the per-run ephemeral home and the old one in the store
-    is revoked. Without this, the FIRST isolated run succeeds and every
-    later one fails with "OAuth session expired and could not be refreshed"
-    (worker-01, 2026-09-08: 48 dead attempts in 25 minutes). The broker,
-    still root, copies the file back only when it is a regular file the run
-    left in place, parses as a JSON object whose top-level keys equal the
-    staged copy's (a token refresh changes values, never the shape -- a
-    different shape is not a refresh and is not trusted), and differs from
-    the store; the write is atomic (temp + rename in the store directory,
-    0600 root). Returns True when the store was updated."""
+
+def _write_back_model_auth(executor: str, home: Path, staged: bytes | None) -> bool:
+    """Persist only credentials this run changed from its exact staged bytes.
+
+    An unchanged run must never overwrite a token rotated by another lane.
+    Hold the store's exclusive .model-auth.lock across read, compare and atomic
+    replacement. If the store changed since staging, require strictly newer
+    Claude claudeAiOauth.expiresAt (milliseconds) or Codex last_refresh (ISO-8601
+    with timezone); unknown/equal/older freshness preserves the store.
+    Require a bounded regular JSON object with the same top-level shape as
+    both the staged copy and the store. Replacement remains atomic, root 0600.
+    Return True only when the store was updated.
+    """
     source = MODEL_AUTH_SOURCES.get(executor)
-    if source is None:
+    if source is None or staged is None:
         return False
     target = home / MODEL_AUTH_TARGETS[executor]
     try:
@@ -465,48 +498,87 @@ def _write_back_model_auth(executor: str, home: Path) -> bool:
         return False
     if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_MODEL_AUTH_BYTES:
         raise LaunchRefused("refreshed model auth is not a plain regular file")
-    refreshed = target.read_bytes()
-    current = _read_exact_protected_file(
-        source, expected_uid=0, expected_gid=0, exact_mode=0o600
-    )
-    if refreshed == current:
+    with target.open("rb") as stream:
+        refreshed = stream.read(MAX_MODEL_AUTH_BYTES + 1)
+    if len(refreshed) > MAX_MODEL_AUTH_BYTES:
+        raise LaunchRefused("refreshed model auth is not a plain regular file")
+    if refreshed == staged:
         return False
     try:
-        refreshed_doc = json.loads(refreshed.decode("utf-8"))
-        current_doc = json.loads(current.decode("utf-8"))
+        refreshed_doc = json.loads(refreshed)
+        staged_doc = json.loads(staged)
     except (UnicodeDecodeError, ValueError) as exc:
         raise LaunchRefused("refreshed model auth is not JSON") from exc
     if (
         not isinstance(refreshed_doc, dict)
-        or not isinstance(current_doc, dict)
-        or set(refreshed_doc) != set(current_doc)
+        or not isinstance(staged_doc, dict)
+        or set(refreshed_doc) != set(staged_doc)
     ):
         raise LaunchRefused("refreshed model auth changed shape; not a token refresh")
-    temporary = source.with_name(f".{source.name}.{os.getpid()}.tmp")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
-    descriptor = os.open(temporary, flags, 0o600)
+    flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    lock = os.open(source.parent / ".model-auth.lock", flags, 0o600)
     try:
-        os.fchmod(descriptor, 0o600)
-        if os.geteuid() == 0:
-            os.fchown(descriptor, 0, 0)
-        with os.fdopen(descriptor, "wb", closefd=False) as stream:
-            stream.write(refreshed)
-            stream.flush()
-            os.fsync(stream.fileno())
+        lock_info = os.fstat(lock)
+        if (
+            not stat.S_ISREG(lock_info.st_mode)
+            or lock_info.st_nlink != 1
+            or lock_info.st_uid != 0
+            or lock_info.st_gid != 0
+            or stat.S_IMODE(lock_info.st_mode) != 0o600
+        ):
+            raise LaunchRefused("model auth lock ownership or mode drifted")
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        current = _read_exact_protected_file(
+            source, expected_uid=0, expected_gid=0, exact_mode=0o600
+        )
+        if refreshed == current:
+            return False
+        try:
+            current_doc = json.loads(current)
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise LaunchRefused("stored model auth is not JSON") from exc
+        if not isinstance(current_doc, dict) or set(refreshed_doc) != set(current_doc):
+            raise LaunchRefused("refreshed model auth changed shape; not a token refresh")
+        if current != staged:
+            refreshed_at = _model_auth_freshness(executor, refreshed_doc)
+            current_at = _model_auth_freshness(executor, current_doc)
+            if refreshed_at is None or current_at is None or refreshed_at <= current_at:
+                print(
+                    f"model auth write-back: {executor} skipped, "
+                    "store is newer or freshness unknown",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return False
+        temporary = source.with_name(f".{source.name}.{os.getpid()}.tmp")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+        descriptor = os.open(temporary, flags, 0o600)
+        try:
+            os.fchmod(descriptor, 0o600)
+            if os.geteuid() == 0:
+                os.fchown(descriptor, 0, 0)
+            with os.fdopen(descriptor, "wb", closefd=False) as stream:
+                stream.write(refreshed)
+                stream.flush()
+                os.fsync(stream.fileno())
+        finally:
+            os.close(descriptor)
+        os.replace(temporary, source)
     finally:
-        os.close(descriptor)
-    os.replace(temporary, source)
+        os.close(lock)
     print(f"model auth write-back: {executor} credential refreshed by the run", file=sys.stderr, flush=True)
     return True
 
 
-def _prepare_agent_home(executor: str, run_id: str) -> Path:
+def _prepare_agent_home(executor: str, run_id: str) -> tuple[Path, bytes | None]:
     """Create one non-persistent provider home with a private auth copy.
 
     The model process necessarily reads its provider credential, but it must
     not be able to persist plugins, instructions, config or a modified token
     into a later task. The root broker copies only the one allowlisted auth
     file into a per-run tmpfs-backed path and removes it after cgroup exit.
+    Return the home and exact staged bytes, retained only in broker memory
+    for the teardown comparison (never in the agent-writable home).
     """
     try:
         # A DEDICATED group for ephemeral model-credential homes. The shared
@@ -519,6 +591,13 @@ def _prepare_agent_home(executor: str, run_id: str) -> Path:
     except KeyError as exc:
         raise LaunchRefused("aicc-agent-auth group does not exist") from exc
     source = MODEL_AUTH_SOURCES.get(executor)
+    if executor in {"grok", "cursor"}:
+        home = EPHEMERAL_HOME_ROOT / run_id
+        home.mkdir(mode=0o770)
+        os.chown(home, 0, auth_gid)
+        # Only the isolated dynamic agent UID joins this auth group; home is per run.
+        os.chmod(home, 0o770)  # nosec B103
+        return home, None
     if source is None:
         raise LaunchRefused(f"no model auth source for executor {executor!r}")
     source_payload = _read_exact_protected_file(
@@ -562,7 +641,7 @@ def _prepare_agent_home(executor: str, run_id: str) -> Path:
     except (FileExistsError, OSError) as exc:
         shutil.rmtree(home, ignore_errors=True)
         raise LaunchRefused("cannot prepare ephemeral model home") from exc
-    return home
+    return home, source_payload
 
 
 def _parse_git_index_payload(data: bytes, workspace: Path) -> frozenset[Path]:
@@ -825,7 +904,14 @@ def _prepare_workspace_permissions(
                     raise LaunchRefused("workspace nesting exceeds supported depth")
                 os.fchown(directory_fd, owner_uid, workspace_gid)
                 os.fchmod(directory_fd, 0o2770)
-                with os.scandir(os.dup(directory_fd)) as entries:
+                # scandir(fd) dups the descriptor it is handed and closes only
+                # that private copy; wrapping the argument in os.dup() leaked one
+                # descriptor per directory visited, so any workspace with more
+                # directories than the soft RLIMIT_NOFILE (a .venv with
+                # PySide6/Qt: ~21k entries, worker-01 2026-09-15) hit EMFILE and
+                # every open() failure was reported as "entry changed while
+                # opening" -- misread for days as a write race.
+                with os.scandir(directory_fd) as entries:
                     snapshot = list(entries)
                 for entry in snapshot:
                     before = entry.stat(follow_symlinks=False)
@@ -848,6 +934,11 @@ def _prepare_workspace_permissions(
                     try:
                         child_fd = os.open(entry.name, flags, dir_fd=directory_fd)
                     except OSError as exc:
+                        if exc.errno in (errno.EMFILE, errno.ENFILE):
+                            raise LaunchRefused(
+                                "launcher ran out of file descriptors while "
+                                f"walking the workspace at {child_relative}"
+                            ) from exc
                         raise LaunchRefused(
                             f"workspace entry changed while opening: {child_relative}"
                         ) from exc
@@ -920,10 +1011,28 @@ def _provider_command(manifest: dict[str, Any]) -> list[str]:
             binary,
             "exec",
             "--sandbox",
-            "read-only" if profile == "read_only" else "workspace-write",
+            # Inside THIS unit the boundary is systemd's: a dynamic uid, only
+            # /workspace and /agent-home writable, ProtectSystem=strict, no
+            # capabilities. Codex's own workspace-write sandbox (bubblewrap)
+            # on top of it mounts .git read-only, so the commit the fleet
+            # contract requires could never land ("Unable to create
+            # .git/index.lock: Read-only file system", worker-01 2026-09-09).
+            # The development profile therefore runs Codex without its inner
+            # sandbox HERE ONLY (owner decision 2026-09-09); outside the
+            # broker, agent_runner.build_codex_command keeps workspace-write.
+            # The read-only profile keeps Codex's read-only sandbox: it is a
+            # second, cheaper enforcement of the same promise.
+            "read-only" if profile == "read_only" else "danger-full-access",
             "--color",
             "never",
         ]
+    elif executor == "grok":
+        command = [binary]
+        if profile == "model_only":
+            command += ["--no-tools"]
+    elif executor == "cursor":
+        command = [binary, "--print", "--output-format", "text", "--trust"]
+        command += ["--mode", "ask"] if profile == "read_only" else ["--force"]
     else:
         command = [
             binary,
@@ -952,9 +1061,11 @@ def _provider_command(manifest: dict[str, Any]) -> list[str]:
                 "--deny-tool",
                 "shell(git remote)",
             ]
+    if executor == "grok":
+        model = model or "grok-4.3"
     if model:
         command += ["--model", model]
-    if executor == "codex":
+    if executor in {"codex", "grok", "cursor"}:
         # Prompt is an untrusted positional value. Explicitly terminate Codex
         # option parsing so a leading flag cannot override the sandbox.
         command += ["--", prompt]
@@ -1025,6 +1136,17 @@ def _systemd_command(
         "--setenv=PATH=/usr/local/bin:/usr/bin:/bin",
         "--setenv=GIT_CONFIG_NOSYSTEM=1",
         "--setenv=GIT_CONFIG_GLOBAL=/dev/null",
+        # The bound workspace is owned by the WORKER (a foreign uid inside the
+        # agent's dynamic-user view -- it reads as nobody), and git refuses a
+        # repository owned by someone else unless a protected config trusts
+        # it. With system and global config disabled above, the command-line
+        # form is the only protected scope left: trust exactly /workspace,
+        # the one tree the agent is meant to work in. Without it every git
+        # command the agent ran failed with "dubious ownership" and no Codex
+        # commit could ever land (worker-01 2026-09-09).
+        "--setenv=GIT_CONFIG_COUNT=1",
+        "--setenv=GIT_CONFIG_KEY_0=safe.directory",
+        "--setenv=GIT_CONFIG_VALUE_0=/workspace",
         "--setenv=GIT_TERMINAL_PROMPT=0",
         "--setenv=GCM_INTERACTIVE=never",
         "--property=SupplementaryGroups=aicc-workspace aicc-agent-auth",
@@ -1062,9 +1184,17 @@ def _systemd_command(
         # The source is always a broker-created bind mount. There is no
         # pathname fallback: PID 1 must never resolve the mutable workspace
         # argument supplied by the publisher.
-        f"--property=BindPaths={workspace_source}:/workspace",
+        (
+            f"--property=BindPaths={workspace_source}:/workspace"
+            if manifest["profile"] == "trusted_development"
+            else f"--property=BindReadOnlyPaths={workspace_source}:/workspace"
+        ),
         f"--property=BindPaths={agent_home}:/agent-home",
-        "--property=ReadWritePaths=/workspace /agent-home",
+        (
+            "--property=ReadWritePaths=/workspace /agent-home"
+            if manifest["profile"] == "trusted_development"
+            else "--property=ReadWritePaths=/agent-home"
+        ),
     ]
     for env_file in (COMMON_ENV_FILE, PROVIDER_ENV_FILES[executor]):
         if _validate_environment_file(env_file, executor):
@@ -1095,10 +1225,18 @@ def _authorised_peer(uid: int) -> bool:
 def _bounded_collect(
     proc: subprocess.Popen[bytes], on_limit: Any
 ) -> tuple[bytes, bytes]:
-    """Incrementally drain both pipes without letting root memory grow unbounded."""
+    """Incrementally drain both pipes without letting root memory grow unbounded.
+
+    Each stream keeps at most ``MAX_OUTPUT_BYTES`` of its most recent output;
+    overflow drops the oldest bytes and records the stream as truncated so the
+    returned bytes start with ``OUTPUT_TRUNCATED_MARKER``.  ``on_limit`` is
+    invoked once per stream on first overflow (observability hook; it must not
+    kill the agent).
+    """
     if proc.stdout is None or proc.stderr is None:
         raise LaunchRefused("agent output pipes are unavailable")
     collected = {proc.stdout.fileno(): bytearray(), proc.stderr.fileno(): bytearray()}
+    truncated: set[int] = set()
     selector = selectors.DefaultSelector()
     selector.register(proc.stdout, selectors.EVENT_READ)
     selector.register(proc.stderr, selectors.EVENT_READ)
@@ -1110,16 +1248,23 @@ def _bounded_collect(
                     selector.unregister(key.fileobj)
                     continue
                 buffer = collected[key.fd]
-                if len(buffer) + len(chunk) > MAX_OUTPUT_BYTES:
-                    on_limit()
-                    raise LaunchRefused("agent output exceeded the bounded transport")
                 buffer.extend(chunk)
+                if len(buffer) > MAX_OUTPUT_BYTES:
+                    if key.fd not in truncated:
+                        truncated.add(key.fd)
+                        on_limit()
+                    del buffer[: len(buffer) - MAX_OUTPUT_BYTES]
     finally:
         selector.close()
     proc.wait(timeout=25)
-    return bytes(collected[proc.stdout.fileno()]), bytes(
-        collected[proc.stderr.fileno()]
-    )
+
+    def finish(fd: int) -> bytes:
+        data = bytes(collected[fd])
+        if fd in truncated:
+            return OUTPUT_TRUNCATED_MARKER + data
+        return data
+
+    return finish(proc.stdout.fileno()), finish(proc.stderr.fileno())
 
 
 def _systemctl(
@@ -1715,6 +1860,7 @@ def _prepare_reusable_workspace(
 
 def _serve_connected_socket(sock: socket.socket) -> int:
     agent_home: Path | None = None
+    staged_auth: bytes | None = None
     unit: str | None = None
     workspace: Path | None = None
     workspace_lock: int | None = None
@@ -1740,7 +1886,7 @@ def _serve_connected_socket(sock: socket.socket) -> int:
             raise LaunchRefused("workspace is quarantined after an unsealed agent")
         _prepare_reusable_workspace(workspace, workspace_fd)
         _validate_binary(EXECUTOR_BINARIES[manifest["executor"]])
-        agent_home = _prepare_agent_home(manifest["executor"], manifest["run_id"])
+        agent_home, staged_auth = _prepare_agent_home(manifest["executor"], manifest["run_id"])
         unit = f"aicc-agent-{manifest['run_id']}-{os.getpid()}.service"
         workspace_bind = _prepare_workspace_bind(workspace_fd, manifest["run_id"])
         _write_active_workspace_unit(workspace, unit)
@@ -1771,7 +1917,15 @@ def _serve_connected_socket(sock: socket.socket) -> int:
 
         def collect() -> None:
             try:
-                result["value"] = _bounded_collect(proc, lambda: _seal_unit(unit))
+                result["value"] = _bounded_collect(
+                    proc,
+                    lambda: print(
+                        f"agent output exceeded {MAX_OUTPUT_BYTES} bytes; "
+                        f"retaining tail (unit {unit})",
+                        file=sys.stderr,
+                        flush=True,
+                    ),
+                )
             except (LaunchRefused, OSError, subprocess.SubprocessError) as exc:
                 result["error"] = exc
 
@@ -1843,7 +1997,7 @@ def _serve_connected_socket(sock: socket.socket) -> int:
                 }
         if agent_home is not None:
             try:
-                _write_back_model_auth(manifest["executor"], agent_home)
+                _write_back_model_auth(manifest["executor"], agent_home, staged_auth)
             except (LaunchRefused, OSError, ValueError) as exc:
                 print(f"model auth write-back skipped: {exc}", file=sys.stderr, flush=True)
             shutil.rmtree(agent_home, ignore_errors=True)
@@ -1863,11 +2017,34 @@ def _serve_connected_socket(sock: socket.socket) -> int:
             os.close(workspace_lock)
         if workspace_fd is not None:
             os.close(workspace_fd)
+    return _deliver_response(sock, response)
+
+
+def _deliver_response(sock: socket.socket, response: dict[str, Any]) -> int:
+    """Answer the client, then report whether THIS BROKER served the connection.
+
+    The per-connection unit's exit status is not the agent's. The agent's code
+    travels inside the response payload (``exit_code``), and ``_client``
+    returns that to the worker; returning it here as well made PID 1 mark
+    ``aicc-agent-launcher@<connection>.service`` *failed* for every ordinary
+    non-zero agent run -- a red test suite, a refused launch, an agent that
+    exited 125. A failed per-connection instance is never retried and never
+    reaped, so it lingers in the unit table until someone runs `reset-failed`;
+    they accumulated for days until the host unit-health probe read them as
+    `failed_units` (worker-01, monitor_finding 2051) and every ordinary agent
+    failure was reported as broken infrastructure.
+
+    A client that hung up before the answer arrived is not a broker fault
+    either -- the worker already abandoned this launch -- so it is journalled
+    and the status stays 0. The unit therefore fails only when the broker
+    itself broke (a crash, an OOM kill, a namespace that would not build),
+    which is precisely the class the monitor exists to see.
+    """
     try:
         sock.sendall(json.dumps(response, separators=(",", ":")).encode() + b"\n")
-    except OSError:
-        return 125
-    return int(response["exit_code"] or 0)
+    except OSError as exc:
+        print(f"response undeliverable: {exc}", file=sys.stderr, flush=True)
+    return 0
 
 
 def _client() -> int:

@@ -400,6 +400,53 @@ def test_the_attempt_number_is_unique_per_item(
     assert "idx_work_attempt_item_no" in str(raised.value)
 
 
+def test_claim_follows_attempt_history_when_the_counter_lags(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """A lagged `attempt_count` must not UniqueViolation-crash the worker.
+
+    Live 2026-09-11: `work_item.attempt_count` was 7 while `work_attempt`
+    already had `attempt_no=8`. `queue_claim` inserted 8 again, raised, and
+    every `voyn-aicc-worker@` lane crash-looped until the host credential
+    expired. The attempt rows are the authority; the next number is
+    greatest(counter, max(history)) + 1.
+    """
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    with psycopg.connect(
+        _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE]), autocommit=True
+    ) as app:
+        item_id = _enqueue(app, "lagged-counter", max_attempts=5)
+
+    migrator_dsn = _as_role(
+        test_dsn, roles.MIGRATOR_ROLE, role_passwords[roles.MIGRATOR_ROLE]
+    )
+    with psycopg.connect(migrator_dsn, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO work_attempt (attempt_id, work_item_id, attempt_no, "
+                "claimed_by_role, claim_token_hash, visibility_seconds, visible_until, "
+                "state, created_at, updated_at) VALUES "
+                "(%s, %s, 1, session_user, %s, 60, now() + interval '1 min', "
+                "'failed', now(), now())",
+                ("wat_orphan", item_id, "0" * 64),
+            )
+            cur.execute(
+                "SELECT attempt_count FROM work_item WHERE work_item_id = %s",
+                (item_id,),
+            )
+            assert cur.fetchone()[0] == 0
+
+    with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
+        with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+            verdict = _claim(worker, _token()[1])
+    assert verdict[0] is True, verdict
+    assert verdict[4] == 2, "the attempt NUMBER continues the history"
+    state = _item(admin_conn, item_id)
+    assert state[0] == "claimed" and state[1] == 1, (
+        "the attempt COUNT is the budget consumed: the orphan row never ran"
+    )
+
+
 def test_one_claim_call_consumes_exactly_one_attempt(
     admin_conn, psycopg, test_dsn, role_passwords
 ):
@@ -1017,9 +1064,10 @@ def test_completion_without_a_result_is_refused_by_the_signature_itself(
             "WHERE n.nspname = 'public' AND p.proname LIKE 'queue\\_%%' "
             "AND p.proname NOT IN "
             "('queue_enqueue','queue_claim','queue_heartbeat','queue_complete',"
-            "'queue_fail','queue_fail_lease_wait','queue_reap','queue_redrive')"
+            "'queue_fail','queue_fail_lease_wait','queue_fail_infra_wait',"
+            "'queue_reap','queue_redrive')"
         )
-        assert cur.fetchone()[0] == 0, "a ninth queue entry point appeared"
+        assert cur.fetchone()[0] == 0, "an unexpected queue entry point appeared"
 
     with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
         token, token_hash = _token()
@@ -1120,6 +1168,279 @@ def test_a_non_retryable_failure_dead_letters_without_spending_the_budget(
     state = _item(admin_conn, item_id)
     assert state[0] == "dead" and state[1] == 1 and state[2] == 5
     assert state[5] == "non_retryable: malformed payload"
+
+
+def test_infra_wait_failure_refunds_attempt_count_and_uses_its_own_budget(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
+    with psycopg.connect(app_dsn, autocommit=True) as app:
+        item_id = _enqueue(app, "infra", max_attempts=1, backoff_seconds=0)
+
+    with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
+        with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+            token, token_hash = _token()
+            verdict = _claim(worker, token_hash)
+            assert verdict[0] and verdict[4] == 1
+            assert _call(
+                worker,
+                "SELECT ok, reason FROM queue_fail_infra_wait(%s, %s, %s, 2)",
+                (verdict[3], token, "executor infrastructure failure: launcher socket inactive"),
+            ) == (True, "infra_wait_requeued")
+
+    state = _item(admin_conn, item_id)
+    assert state[0] == "ready"
+    assert state[1] == 0, "infrastructure failures refund the claimed attempt"
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "SELECT infra_wait_count FROM work_item WHERE work_item_id = %s",
+            (item_id,),
+        )
+        assert cur.fetchone()[0] == 1
+
+
+def test_infra_waits_do_not_consume_the_attempt_budget_even_as_history_grows(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """0024 refunds an infra wait; 0025 numbers attempts from the history.
+
+    Live 2026-09-15: after two refunded infra waits on a `max_attempts = 2`
+    item the counter said 0 but the history said 2, and the claim derived
+    attempt 3 > 2 -> `attempt_budget_exhausted` -- the task never ran once.
+    The number must keep following the history (no reused `attempt_no`) while
+    the budget follows the counter (refunds count), so the item gets its two
+    real attempts and only then dies on `max_attempts_exhausted`.
+    """
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
+    with psycopg.connect(app_dsn, autocommit=True) as app:
+        item_id = _enqueue(app, "infra-then-real", max_attempts=2, backoff_seconds=0)
+    with (
+        _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names),
+        psycopg.connect(host_dsns[0], autocommit=True) as worker,
+    ):
+        for expected_no in (1, 2):
+            token, token_hash = _token()
+            verdict = _claim(worker, token_hash)
+            assert verdict[0] and verdict[4] == expected_no, verdict
+            assert _call(
+                worker,
+                "SELECT ok, reason FROM queue_fail_infra_wait(%s, %s, %s, 5)",
+                (verdict[3], token, "executor infrastructure failure: launcher"),
+            ) == (True, "infra_wait_requeued")
+        state = _item(admin_conn, item_id)
+        assert state[0] == "ready" and state[1] == 0, "both waits refunded"
+
+        # Attempt 3 by number, attempt 1 by budget.
+        token, token_hash = _token()
+        verdict = _claim(worker, token_hash)
+        assert verdict[0], verdict
+        assert verdict[4] == 3, "the number never reuses a history row"
+        state = _item(admin_conn, item_id)
+        assert state[0] == "claimed" and state[1] == 1, "one attempt consumed"
+        assert _call(
+            worker,
+            "SELECT ok, reason FROM queue_fail(%s, %s, %s, true)",
+            (verdict[3], token, "real failure one"),
+        )[0]
+
+        # Attempt 4 by number, attempt 2 by budget: the last real one.
+        token, token_hash = _token()
+        verdict = _claim(worker, token_hash)
+        assert verdict[0] and verdict[4] == 4, verdict
+        assert _item(admin_conn, item_id)[1] == 2
+        assert _call(
+            worker,
+            "SELECT ok, reason FROM queue_fail(%s, %s, %s, true)",
+            (verdict[3], token, "real failure two"),
+        )[0]
+    state = _item(admin_conn, item_id)
+    assert state[0] == "dead"
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "SELECT dead_reason, attempt_count, infra_wait_count FROM work_item "
+            "WHERE work_item_id = %s",
+            (item_id,),
+        )
+        dead_reason, attempt_count, infra_wait_count = cur.fetchone()
+    assert dead_reason.startswith("max_attempts_exhausted"), dead_reason
+    assert (attempt_count, infra_wait_count) == (2, 2)
+
+
+def _wait_budgets(admin_conn, item_id: str) -> tuple[int, int]:
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "SELECT lease_wait_count, infra_wait_count FROM work_item "
+            "WHERE work_item_id = %s",
+            (item_id,),
+        )
+        return cur.fetchone()
+
+
+def test_the_last_lease_wait_refunds_its_attempt_like_every_one_before(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """0028: the refusal that exhausts the wait budget is a no-fault refusal
+    like the ones it follows, so the DLQ row says plainly that not one model
+    attempt was ever spent on the item. The delivery numbers keep moving
+    (0025/0026) while the budget comes back each time."""
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
+    with psycopg.connect(app_dsn, autocommit=True) as app:
+        item_id = _enqueue(app, "capped", max_attempts=5, backoff_seconds=0)
+    reason = "writer lease unavailable"
+    with (
+        _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names),
+        psycopg.connect(host_dsns[0], autocommit=True) as worker,
+    ):
+        for delivery, expected in enumerate(
+            ("lease_wait_requeued", "lease_wait_requeued", "lease_wait_dead_lettered"),
+            start=1,
+        ):
+            token, token_hash = _token()
+            verdict = _claim(worker, token_hash)
+            assert verdict[0], verdict[1]
+            assert verdict[4] == delivery, "the number follows the history"
+            ok, got = _call(
+                worker,
+                "SELECT ok, reason FROM queue_fail_lease_wait(%s, %s, %s, %s)",
+                (verdict[3], token, reason, 2),
+            )
+            assert ok is True and got == expected
+    state = _item(admin_conn, item_id)
+    assert state[0] == "dead"
+    assert state[5] == f"lease_wait_exhausted: {reason}"
+    assert state[1] == 0, "not one model attempt was ever spent on this item"
+    assert _wait_budgets(admin_conn, item_id) == (3, 0), "the waits themselves are all counted"
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "SELECT reason, detail ->> 'attempt_count', detail ->> 'lease_wait_count' "
+            "FROM work_event WHERE work_item_id = %s AND event = 'fail' "
+            "AND outcome = 'granted' ORDER BY id",
+            (item_id,),
+        )
+        assert cur.fetchall() == [
+            ("lease_wait_requeued", "0", "1"),
+            ("lease_wait_requeued", "0", "2"),
+            ("lease_wait_dead_lettered", "0", "3"),
+        ], "every refusal audits the refunded budget it left behind"
+
+
+def test_the_last_infra_wait_refunds_its_attempt_too(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """0028, the capacity-outage half of the same rule: 0024 refunded on
+    requeue and kept the last delivery on dead-letter, so an item that never
+    reached a model through an outage read `attempt_count = 1` in the DLQ."""
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
+    with psycopg.connect(app_dsn, autocommit=True) as app:
+        item_id = _enqueue(app, "outage", max_attempts=5, backoff_seconds=0)
+    reason = "executor infrastructure failure (provider/auth/quota): session limit"
+    with (
+        _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names),
+        psycopg.connect(host_dsns[0], autocommit=True) as worker,
+    ):
+        for expected in ("infra_wait_requeued", "infra_wait_dead_lettered"):
+            token, token_hash = _token()
+            verdict = _claim(worker, token_hash)
+            assert verdict[0], verdict[1]
+            ok, got = _call(
+                worker,
+                "SELECT ok, reason FROM queue_fail_infra_wait(%s, %s, %s, %s)",
+                (verdict[3], token, reason, 1),
+            )
+            assert ok is True and got == expected
+    state = _item(admin_conn, item_id)
+    assert state[0] == "dead"
+    assert state[5] == f"infra_wait_exhausted: {reason}"
+    assert re.search(r"(?i)session limit", state[5]), "infra_monitor classifies by reason"
+    assert state[1] == 0, "the outage spent no model attempt"
+    assert _wait_budgets(admin_conn, item_id) == (0, 2)
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "SELECT reason, detail ->> 'attempt_count' FROM work_event "
+            "WHERE work_item_id = %s AND event = 'fail' AND outcome = 'granted' ORDER BY id",
+            (item_id,),
+        )
+        assert cur.fetchall() == [("infra_wait_requeued", "0"), ("infra_wait_dead_lettered", "0")]
+
+
+def test_redrive_clears_both_wait_budgets_it_widens_the_attempts_for(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """0027: a redrive of an item the FLEET dead-lettered must survive the
+    next refusal of the same class. Before it, `lease_wait_count` and
+    `infra_wait_count` carried across a redrive unchanged, so the item fell
+    straight back into the dead letter and was counted as fresh growth.
+    The attempt history is still not reset; both wait budgets are, and the
+    cleared counts survive in the audit."""
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
+    with psycopg.connect(app_dsn, autocommit=True) as app:
+        item_id = _enqueue(app, "fleet-dead", max_attempts=2, backoff_seconds=0)
+    with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
+        with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+            # One real attempt first, so "history survived" is distinguishable
+            # from "there was none".
+            token, token_hash = _token()
+            verdict = _claim(worker, token_hash)
+            _call(
+                worker,
+                "SELECT ok, reason FROM queue_fail(%s, %s, %s, true)",
+                (verdict[3], token, "a real failure"),
+            )
+            # One infra wait (refunded, its own budget) ...
+            token, token_hash = _token()
+            verdict = _claim(worker, token_hash)
+            assert _call(
+                worker,
+                "SELECT ok, reason FROM queue_fail_infra_wait(%s, %s, %s, 5)",
+                (verdict[3], token, "executor infrastructure failure: launcher"),
+            ) == (True, "infra_wait_requeued")
+            # ... then two lease waits against a cap of one: the second exceeds it.
+            for expected in ("lease_wait_requeued", "lease_wait_dead_lettered"):
+                token, token_hash = _token()
+                verdict = _claim(worker, token_hash)
+                assert verdict[0], verdict[1]
+                ok, got = _call(
+                    worker,
+                    "SELECT ok, reason FROM queue_fail_lease_wait(%s, %s, %s, %s)",
+                    (verdict[3], token, "writer lease unavailable", 1),
+                )
+                assert ok is True and got == expected
+        assert _item(admin_conn, item_id)[0] == "dead"
+        assert _wait_budgets(admin_conn, item_id) == (2, 1)
+        with psycopg.connect(app_dsn, autocommit=True) as app:
+            assert _call(app, "SELECT queue_redrive(%s, 2)", (item_id,))[0] is True
+        state = _item(admin_conn, item_id)
+        assert state[0] == "ready"
+        assert state[1] == 1, "the real failure's attempt is still not reset"
+        assert state[2] == 4, "the attempt budget is still widened explicitly"
+        assert state[5] is None
+        assert _wait_budgets(admin_conn, item_id) == (0, 0), "both wait budgets start over"
+        # The whole point: the redriven item survives the next fleet refusal.
+        with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+            token, token_hash = _token()
+            verdict = _claim(worker, token_hash)
+            assert verdict[0], verdict[1]
+            assert verdict[4] == 5, "delivery numbers never restart"
+            ok, got = _call(
+                worker,
+                "SELECT ok, reason FROM queue_fail_lease_wait(%s, %s, %s, %s)",
+                (verdict[3], token, "writer lease unavailable", 1),
+            )
+            assert ok is True and got == "lease_wait_requeued"
+        assert _item(admin_conn, item_id)[0] == "ready"
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "SELECT detail ->> 'cleared_lease_wait_count', "
+            "detail ->> 'cleared_infra_wait_count' FROM work_event "
+            "WHERE work_item_id = %s AND event = 'redrive' AND outcome = 'granted'",
+            (item_id,),
+        )
+        assert cur.fetchall() == [("2", "1")]
 
 
 def test_the_dead_letter_view_preserves_the_cause_and_the_history(

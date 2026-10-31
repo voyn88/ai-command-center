@@ -30,9 +30,7 @@ RESTORABLE_UNIT_RE = re.compile(
     r"aicc-agent-launcher@[^/@\s]+\.service|"
     r"aicc-agent-launcher\.socket|aicc-principal-recovery\.service)"
 )
-TEMPLATE_WORKER_UNIT_RE = re.compile(
-    r"voyn-aicc-worker@[^/@\s]+\.service"
-)
+TEMPLATE_WORKER_UNIT_RE = re.compile(r"voyn-aicc-worker@[^/@\s]+\.service")
 # The broker socket spawns one `aicc-agent-launcher@<connection>.service` per
 # accepted connection. Those instances run the agent launcher off
 # `/etc/systemd/system/aicc-agent-launcher@.service` -- a unit file the
@@ -40,9 +38,7 @@ TEMPLATE_WORKER_UNIT_RE = re.compile(
 # stopped and rolled back exactly like the worker lanes are. Naming only the
 # socket left every live instance running on a fragment that was about to be
 # deleted (independent review on 9eb07f8).
-TEMPLATE_LAUNCHER_UNIT_RE = re.compile(
-    r"aicc-agent-launcher@[^/@\s]+\.service"
-)
+TEMPLATE_LAUNCHER_UNIT_RE = re.compile(r"aicc-agent-launcher@[^/@\s]+\.service")
 #: `(systemctl glob, accepting pattern)` for every template family whose
 #: concrete instances are discovered from systemd rather than from a file.
 TEMPLATE_INSTANCE_FAMILIES = (
@@ -70,9 +66,7 @@ SNAPSHOT_PROPERTIES = (
     "ProtectControlGroups",
 )
 INSTALL_LOCK = Path("/var/lib/aicc-principal-isolation/install-recovery.lock")
-RECOVERY_ANCHOR_TARGET = (
-    "/usr/lib/systemd/system-generators/aicc-principal-recovery"
-)
+RECOVERY_ANCHOR_TARGET = "/usr/lib/systemd/system-generators/aicc-principal-recovery"
 
 
 def _template_unit_of(unit: str) -> str | None:
@@ -175,9 +169,7 @@ def removal_spec(target: str, *, sensitive: bool = False) -> FileSpec:
     `source` is a dummy: `remove=True` short-circuits every codepath that
     would otherwise read it.
     """
-    return FileSpec(
-        Path(os.devnull), target, 0, 0, 0, remove=True, sensitive=sensitive
-    )
+    return FileSpec(Path(os.devnull), target, 0, 0, 0, remove=True, sensitive=sensitive)
 
 
 def directory_removal_spec(target: str) -> FileSpec:
@@ -187,9 +179,7 @@ def directory_removal_spec(target: str) -> FileSpec:
     that empty it, so `apply()` reaches a directory only once everything this
     generation removes from it is gone.
     """
-    return FileSpec(
-        Path(os.devnull), target, 0, 0, 0, remove=True, directory=True
-    )
+    return FileSpec(Path(os.devnull), target, 0, 0, 0, remove=True, directory=True)
 
 
 @dataclass(frozen=True)
@@ -254,7 +244,7 @@ def _record_document(record: BackupRecord) -> dict[str, object]:
 
 def _record_from_document(value: object) -> BackupRecord:
     if not isinstance(value, dict):
-        raise RuntimeError("generation manifest record is malformed")
+        raise TypeError("generation manifest record is malformed")
     unsupported = sorted(set(value) - _BACKUP_RECORD_FIELDS)
     if unsupported:
         raise RuntimeError(
@@ -266,13 +256,13 @@ def _record_from_document(value: object) -> BackupRecord:
 def _generation_records(payload: object) -> list[BackupRecord]:
     """Every record of one generation, or a refusal before any mutation."""
     if not isinstance(payload, dict):
-        raise RuntimeError("generation manifest is malformed")
+        raise TypeError("generation manifest is malformed")
     version = payload.get("version")
     if version not in SUPPORTED_MANIFEST_VERSIONS:
         raise RuntimeError(f"unsupported generation manifest version: {version!r}")
     records = payload.get("records")
     if not isinstance(records, list):
-        raise RuntimeError("generation manifest has no records")
+        raise TypeError("generation manifest has no records")
     return [_record_from_document(value) for value in records]
 
 
@@ -365,9 +355,7 @@ def _trusted_journal(path: Path) -> dict[str, object]:
     return payload
 
 
-def _trusted_uninstall_recovery(
-    state_dir: Path, payload: dict[str, object]
-) -> Path:
+def _trusted_uninstall_recovery(state_dir: Path, payload: dict[str, object]) -> Path:
     transaction_id = payload.get("transaction_id")
     recovery_value = payload.get("recovery")
     recovery_sha256 = payload.get("recovery_sha256")
@@ -467,7 +455,9 @@ def begin_uninstall(
             if registry.sha256 != payload["registry_sha256"]:
                 raise RuntimeError("worker lane registry changed during uninstall")
         elif payload["phase"] == "INTENT":
-            raise RuntimeError("worker lane registry disappeared before uninstall armed")
+            raise RuntimeError(
+                "worker lane registry disappeared before uninstall armed"
+            )
         return str(payload["phase"])
 
     identity = _uninstall_identity(
@@ -629,13 +619,16 @@ def _rename_noreplace(
         ctypes.c_uint,
     ]
     rename.restype = ctypes.c_int
-    if rename(
-        source_fd,
-        os.fsencode(source),
-        destination_fd,
-        os.fsencode(destination),
-        flags,
-    ) != 0:
+    if (
+        rename(
+            source_fd,
+            os.fsencode(source),
+            destination_fd,
+            os.fsencode(destination),
+            flags,
+        )
+        != 0
+    ):
         error = ctypes.get_errno()
         raise OSError(error, os.strerror(error))
 
@@ -749,11 +742,7 @@ def _install_lock_fd(
             try:
                 descriptor = os.open(
                     path.name,
-                    os.O_RDWR
-                    | os.O_CREAT
-                    | os.O_EXCL
-                    | os.O_NOFOLLOW
-                    | os.O_CLOEXEC,
+                    os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
                     0o600,
                     dir_fd=parent_fd,
                 )
@@ -775,9 +764,7 @@ def _install_lock_fd(
             try:
                 descriptor = os.dup(inherited_fd)
             except OSError as exc:
-                raise RuntimeError(
-                    "invalid inherited install lock descriptor"
-                ) from exc
+                raise RuntimeError("invalid inherited install lock descriptor") from exc
         observed = os.fstat(descriptor)
         named = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
         if (
@@ -1031,8 +1018,7 @@ def _sensitive_blob_directory(generation: Path, directory: str) -> int:
                 or blob_info.st_gid not in {0, os.getegid()}
             ):
                 raise RuntimeError(
-                    "sensitive blob directory is untrusted: "
-                    f"{generation / directory}"
+                    f"sensitive blob directory is untrusted: {generation / directory}"
                 )
             return blob_fd
         except BaseException:
@@ -1100,9 +1086,7 @@ def _destroy_blob(
             except FileNotFoundError:
                 return
             except OSError as exc:
-                raise RuntimeError(
-                    f"cannot retire sensitive backup: {path}"
-                ) from exc
+                raise RuntimeError(f"cannot retire sensitive backup: {path}") from exc
             before = os.fstat(descriptor)
             if (
                 not stat.S_ISREG(before.st_mode)
@@ -1210,7 +1194,7 @@ def _assert_fresh_control_authority_group(
                 continue
             held: set[int] = set()
             for line in status.splitlines():
-                if line.startswith("Gid:") or line.startswith("Groups:"):
+                if line.startswith(("Gid:", "Groups:")):
                     held.update(
                         int(value) for value in line.split()[1:] if value.isdigit()
                     )
@@ -1452,9 +1436,7 @@ def revoke_legacy_authority_membership(
         if result.returncode and member in _group_members(
             AUTHORITY_GROUP, getgrnam=getgrnam
         ):
-            raise RuntimeError(
-                f"cannot revoke legacy authority membership: {member}"
-            )
+            raise RuntimeError(f"cannot revoke legacy authority membership: {member}")
         _authority_membership_state(payload, getgrnam=getgrnam)
     if _authority_membership_state(payload, getgrnam=getgrnam) != "after":
         raise RuntimeError(
@@ -1493,9 +1475,7 @@ def restore_legacy_authority_membership(
             text=True,
         )
         if result.returncode:
-            raise RuntimeError(
-                f"cannot restore legacy authority membership: {member}"
-            )
+            raise RuntimeError(f"cannot restore legacy authority membership: {member}")
         _authority_membership_state(payload, getgrnam=getgrnam)
     if _authority_membership_state(payload, getgrnam=getgrnam) != "before":
         raise RuntimeError(
@@ -1560,7 +1540,7 @@ def _redact_sensitive_records(manifest: Path, retired: frozenset[str]) -> bool:
     payload = json.loads(manifest.read_text(encoding="utf-8"))
     records = payload.get("records")
     if not isinstance(records, list):
-        raise RuntimeError(f"generation manifest has no records: {manifest}")
+        raise TypeError(f"generation manifest has no records: {manifest}")
     changed = False
     for index, record in enumerate(records):
         if not isinstance(record, dict) or record.get("target") not in retired:
@@ -1652,13 +1632,9 @@ def _preflight_sensitive_records(
                 continue
             expected = generation / directory / f"{index:03d}.bin"
             if Path(value) != expected:
-                raise RuntimeError(
-                    f"sensitive {field} escaped its generation: {value}"
-                )
+                raise RuntimeError(f"sensitive {field} escaped its generation: {value}")
             if not isinstance(digest, str):
-                raise RuntimeError(
-                    f"sensitive {field} has no bound digest: {manifest}"
-                )
+                raise TypeError(f"sensitive {field} has no bound digest: {manifest}")
             if not _validate_sensitive_blob(
                 generation, directory, expected.name, digest
             ):
@@ -1744,11 +1720,9 @@ def _normalise_property(value: str) -> str:
     kept = [
         part.strip()
         for part in value.strip().lstrip("{").rstrip("}").split(";")
-        if part.strip()
-        and not part.strip().startswith(_RUNTIME_COMMAND_FIELDS)
+        if part.strip() and not part.strip().startswith(_RUNTIME_COMMAND_FIELDS)
     ]
     return "{ " + " ; ".join(kept) + " }"
-
 
 
 def restore_service_snapshot(
@@ -1831,11 +1805,7 @@ def restore_service_snapshot(
         # recovery that cannot finish blocks every install behind it
         # (observed live on worker-01, 2026-08-31).
         expects_main_pid = unit.endswith(".service") and state["exists"]
-        if (
-            load_rc
-            or not load_state
-            or (expects_main_pid and (pid_rc or not main_pid))
-        ):
+        if load_rc or not load_state or (expects_main_pid and (pid_rc or not main_pid)):
             raise RuntimeError(f"cannot prove restored service state: {unit}")
         expected_active = state["active"]
         expected_enabled = state["enabled"]
@@ -1878,11 +1848,7 @@ def restore_service_snapshot(
         # this must not re-refuse the exact same state (observed live on
         # worker-01, 2026-09-07/08).
         activating_start = queued_start and expected_active and active == "activating"
-        if (
-            active != "active"
-            and not activating_start
-            and main_pid not in {"", "0"}
-        ):
+        if active != "active" and not activating_start and main_pid not in {"", "0"}:
             raise RuntimeError(f"inactive restored service retains MainPID: {unit}")
         if version == 3 and state["exists"] and not self_recovery:
             properties = state["properties"]
@@ -1911,9 +1877,7 @@ def restore_service_snapshot(
             # is the workers and the socket, and the next connection makes
             # the next instance.
             continue
-        _pid_rc, current_pid = probe(
-            "show", unit, "--property=MainPID", "--value"
-        )
+        _pid_rc, current_pid = probe("show", unit, "--property=MainPID", "--value")
         self_recovery = (
             defer_starts
             and unit == "aicc-principal-recovery.service"
@@ -1930,11 +1894,7 @@ def restore_service_snapshot(
             assert_restored(unit, state)
             continue
         load_rc, load_state = probe("show", unit, "--property=LoadState", "--value")
-        if (
-            not load_rc
-            and load_state == "not-found"
-            and unit in RETIRED_LEGACY_UNITS
-        ):
+        if not load_rc and load_state == "not-found" and unit in RETIRED_LEGACY_UNITS:
             # Retiring the pre-template workers is what installing DOES, and
             # `disable` removes the symlink that was their fragment. Their
             # snapshot still describes the running configuration from before
@@ -2193,8 +2153,8 @@ def discover_template_instances(*, run=subprocess.run, message: str) -> set[str]
                     check=False,
                     text=True,
                 )
-                expected_empty_no_match = (
-                    manager.returncode == 0 and bool(manager.stdout.strip())
+                expected_empty_no_match = manager.returncode == 0 and bool(
+                    manager.stdout.strip()
                 )
             if result.returncode and not expected_empty_no_match:
                 raise RuntimeError(result.stderr.strip() or message)
@@ -2288,15 +2248,11 @@ def verify_service_snapshot_closure(
         # stop launcher sessions and calls this function with the default
         # strict policy.
         extras = {
-            unit
-            for unit in extras
-            if not TEMPLATE_LAUNCHER_UNIT_RE.fullmatch(unit)
+            unit for unit in extras if not TEMPLATE_LAUNCHER_UNIT_RE.fullmatch(unit)
         }
     extras = sorted(extras)
     if extras:
-        raise RuntimeError(
-            f"template units exist outside service snapshot: {extras}"
-        )
+        raise RuntimeError(f"template units exist outside service snapshot: {extras}")
 
 
 #: Statically-named units a control-profile host must not run. Neither the
@@ -2326,10 +2282,13 @@ DRAIN_INTERVAL_SECONDS = 1.0
 # import the separately installed broker, so a fitness test enforces equality.
 MAX_ACCEPTED_LAUNCHER_SECONDS = 3600
 LAUNCHER_DRAIN_GRACE_SECONDS = 60
-LAUNCHER_DRAIN_ATTEMPTS = math.ceil(
-    (MAX_ACCEPTED_LAUNCHER_SECONDS + LAUNCHER_DRAIN_GRACE_SECONDS)
-    / DRAIN_INTERVAL_SECONDS
-) + 2
+LAUNCHER_DRAIN_ATTEMPTS = (
+    math.ceil(
+        (MAX_ACCEPTED_LAUNCHER_SECONDS + LAUNCHER_DRAIN_GRACE_SECONDS)
+        / DRAIN_INTERVAL_SECONDS
+    )
+    + 2
+)
 #: An inactive unit whose cgroup is gone. `ControlGroup` empties only once
 #: systemd has released it, and `TasksCurrent` counts every process still in
 #: it -- a `KillMode=mixed` service can have left children behind after its
@@ -2406,9 +2365,7 @@ def quiesce_worker_only_units(*, run=subprocess.run, sleep=time.sleep) -> None:
         """Stop and disable `unit`; False when there was nothing loaded."""
         load = systemctl("show", unit, "--property=LoadState", "--value")
         if load.returncode:
-            raise RuntimeError(
-                f"cannot prove worker-only unit load state: {unit}"
-            )
+            raise RuntimeError(f"cannot prove worker-only unit load state: {unit}")
         load_state = load.stdout.strip()
         if load_state == "not-found":
             return False
@@ -2423,9 +2380,7 @@ def quiesce_worker_only_units(*, run=subprocess.run, sleep=time.sleep) -> None:
             "generated",
             "transient",
         }:
-            raise RuntimeError(
-                f"cannot prove worker-only unit load state: {unit}"
-            )
+            raise RuntimeError(f"cannot prove worker-only unit load state: {unit}")
         stopped = systemctl("disable", "--now", unit)
         if stopped.returncode:
             raise RuntimeError(
@@ -2458,6 +2413,32 @@ def quiesce_worker_only_units(*, run=subprocess.run, sleep=time.sleep) -> None:
                 jobs.add(fields[1])
         return frozenset(jobs)
 
+    def clear_latched_failures(units: set[str]) -> None:
+        """Un-latch every unit this purge has proven drained.
+
+        `_QUIESCED_ACTIVE_STATES` accepts `failed` as drained, and rightly so
+        -- a unit that died is a unit that is not running. But `failed` is a
+        LATCH: it records how the last run ended and only a successful run or
+        a `reset-failed` clears it, and `apply()` is about to delete the unit
+        file of everything purged here. A unit with no fragment can never run
+        again, so the latch becomes permanent state in PID 1's table that
+        nothing on the host can clear, on a unit that no longer exists --
+        which the host unit-health probe then reported as `failed_units`
+        (worker-01, monitor_finding 2051 and its three successors; the
+        worker-profile half of this is `retire_legacy_units` in
+        ops/aicc_staged_worker_rollout.py).
+
+        After the barrier, never before: on a unit still shutting down this
+        would clear nothing and the stop could latch again behind it. Nothing
+        reads the latch -- `ActiveState` is not in `SNAPSHOT_PROPERTIES` and
+        the snapshot records `active`, which is False either way -- so
+        rollback is unaffected. Best-effort, like every other mutation here:
+        the authoritative state is probed, and a purge is not failed by a
+        tidy-up.
+        """
+        for unit in sorted(units):
+            systemctl("reset-failed", unit)
+
     def wait_drained(units: set[str], *, message: str) -> None:
         for attempt in range(DRAIN_ATTEMPTS):
             outstanding = [
@@ -2467,6 +2448,7 @@ def quiesce_worker_only_units(*, run=subprocess.run, sleep=time.sleep) -> None:
                 if not is_drained
             ]
             if not outstanding:
+                clear_latched_failures(units)
                 return
             if attempt == DRAIN_ATTEMPTS - 1:
                 raise RuntimeError(f"{message}: {outstanding}")
@@ -2529,6 +2511,7 @@ def quiesce_worker_only_units(*, run=subprocess.run, sleep=time.sleep) -> None:
         ):
             stable_passes += 1
             if stable_passes == 2:
+                clear_latched_failures(launchers)
                 return
         else:
             stable_passes = 0
@@ -2878,9 +2861,7 @@ class FileTransaction:
                     {
                         "version": MANIFEST_VERSION,
                         "generation": transaction.name,
-                        "records": [
-                            _record_document(record) for record in records
-                        ],
+                        "records": [_record_document(record) for record in records],
                         "previous_current": previous_current,
                     },
                     sort_keys=True,
@@ -3145,9 +3126,7 @@ class FileTransaction:
             for _attempt in range(16):
                 quarantine = f".{target.name}.aicc-purge-{secrets.token_hex(8)}"
                 try:
-                    _rename_noreplace(
-                        parent_fd, target.name, parent_fd, quarantine
-                    )
+                    _rename_noreplace(parent_fd, target.name, parent_fd, quarantine)
                     break
                 except FileExistsError:
                     continue
@@ -3192,9 +3171,7 @@ class FileTransaction:
         target = self._target(record.target)
         if not record.existed:
             if _path_present(target):
-                raise RuntimeError(
-                    f"purge directory appeared after prepare: {target}"
-                )
+                raise RuntimeError(f"purge directory appeared after prepare: {target}")
             return
         try:
             info = target.lstat()
@@ -3274,9 +3251,7 @@ class FileTransaction:
         target = self._target(record.target)
         if not record.existed:
             if _path_present(target):
-                raise RuntimeError(
-                    f"purge directory appeared after prepare: {target}"
-                )
+                raise RuntimeError(f"purge directory appeared after prepare: {target}")
             return
         try:
             parent_fd = _open_directory_chain(target.parent, create=False)
@@ -3302,9 +3277,7 @@ class FileTransaction:
             for _attempt in range(16):
                 quarantine = f".{target.name}.aicc-purge-{secrets.token_hex(8)}"
                 try:
-                    _rename_noreplace(
-                        parent_fd, target.name, parent_fd, quarantine
-                    )
+                    _rename_noreplace(parent_fd, target.name, parent_fd, quarantine)
                     break
                 except FileExistsError:
                     continue
@@ -3321,8 +3294,7 @@ class FileTransaction:
                 held = os.stat(quarantine, dir_fd=parent_fd, follow_symlinks=False)
                 if (held.st_dev, held.st_ino) != (info.st_dev, info.st_ino):
                     raise RuntimeError(
-                        f"purge directory changed before compare-and-remove: "
-                        f"{target}"
+                        f"purge directory changed before compare-and-remove: {target}"
                     )
                 self._assert_directory_state(record, held, target)
                 try:
@@ -3686,6 +3658,61 @@ class FileTransaction:
             (self.state_dir / SENSITIVE_RETIREMENT_JOURNAL).unlink()
             _fsync_dir(self.state_dir)
 
+    def recover_release_deploy(self) -> None:
+        """Resolve a standalone deploy selector under installer/rollout locks.
+
+        A deploy does not create an install generation. Do not reinterpret its
+        selector marker as an install WAL, or use this path while one exists.
+        Both ends must remain proven releases before the marker is consumed.
+        """
+        if _path_present(self.pending) or _path_present(self.state_dir / "uninstall.json"):
+            raise RuntimeError("install or uninstall journal blocks release deploy recovery")
+        if not _path_present(self.pending_release):
+            return
+        pending = _read_regular(self.pending_release, max_bytes=64)
+        if (
+            pending.uid != os.geteuid() or pending.gid != os.getegid()
+            or pending.mode != 0o600
+        ):
+            raise RuntimeError("pending release selector drifted")
+        previous = pending.payload.decode("ascii").strip()
+        if re.fullmatch(r"releases/[0-9a-f]{40}", previous) is None:
+            raise RuntimeError("standalone recovery requires an attested previous release")
+        current = self._target("/opt/aicc/current")
+        selector = _release_selector(current)
+        if selector == "ABSENT":
+            raise RuntimeError("standalone recovery requires an attested current release")
+        info = current.lstat()
+        if info.st_uid != os.geteuid() or info.st_gid != os.getegid():
+            raise RuntimeError("current release selector is not trusted-owned")
+        # After a crash between selector replacement and marker removal these
+        # may already be the same; verification and restore remain idempotent.
+        # Older root probes could pollute either end. Preflight both before
+        # deleting anything, so unrelated drift in one leaves the other intact.
+        repairs: list[str] = []
+        for candidate in dict.fromkeys((selector, previous)):
+            try:
+                self.verify_release_selection(candidate)
+            except ReleaseRefused:
+                release_id = candidate.split("/", 1)[-1]
+                remove_unattested_recovery_bytecode(
+                    current.parent / candidate,
+                    self.release_manifest_path(release_id), release_id,
+                    trusted_uid=os.geteuid(), trusted_gid=os.getegid(),
+                    dry_run=True,
+                )
+                repairs.append(candidate)
+        for candidate in repairs:
+            release_id = candidate.split("/", 1)[-1]
+            remove_unattested_recovery_bytecode(
+                current.parent / candidate,
+                self.release_manifest_path(release_id), release_id,
+                trusted_uid=os.geteuid(), trusted_gid=os.getegid(),
+            )
+            self.verify_release_selection(candidate)
+        self.verify_release_selection(selector)
+        self._restore_release_selector()
+
     def _restore_release_selector(self, *, clear_pending: bool = True) -> None:
         if not _path_present(self.pending_release):
             return
@@ -3725,7 +3752,20 @@ class FileTransaction:
             # admitting exactly the unattested release the forward path now
             # refuses. Fail secure -- an unproven release is never selected,
             # even to restore service.
-            self.verify_release_selection(selector)
+            try:
+                self.verify_release_selection(selector)
+            except ReleaseRefused:
+                # Older privileged probes could leave root-only bytecode in
+                # the previous release. Repair only that derived, unattested
+                # content; the original manifest remains the authority.
+                remove_unattested_recovery_bytecode(
+                    release_target,
+                    self.release_manifest_path(selector.split("/", 1)[-1]),
+                    selector.split("/", 1)[-1],
+                    trusted_uid=os.geteuid(),
+                    trusted_gid=os.getegid(),
+                )
+                self.verify_release_selection(selector)
             temporary = current.parent / f".current-recover-{os.getpid()}"
             temporary.unlink(missing_ok=True)
             temporary.symlink_to(selector)
@@ -3759,7 +3799,13 @@ class FileTransaction:
         )
 
     def select_release(self, release_id: str, repo_root: Path) -> str:
-        """Arm rollback and atomically activate an exact, re-proven release."""
+        """Arm rollback and atomically activate an exact, re-proven release.
+
+        Allowed during an APPLIED install journal (installer path) OR on a
+        committed host that already has `current.json` (worker release-deploy
+        ticks after the first install). Both arm `pending-release` the same
+        way so crash recovery can restore the previous selector.
+        """
         if RELEASE_ID_RE.fullmatch(release_id) is None:
             raise ReleaseRefused(
                 "release id must be exactly 40 lowercase hex characters"
@@ -3767,10 +3813,11 @@ class FileTransaction:
         selector = f"releases/{release_id}"
         release_dir = self._target("/opt/aicc") / selector
         manifest = self.release_manifest_path(release_id)
-        if not _path_present(self.pending):
-            raise RuntimeError("release selection requires an active install journal")
-        install_journal = _trusted_journal(self.pending)
-        if install_journal.get("phase") != "APPLIED":
+        if _path_present(self.pending):
+            install_journal = _trusted_journal(self.pending)
+            if install_journal.get("phase") != "APPLIED":
+                raise RuntimeError("release selection requires an applied install")
+        elif not _path_present(self.current):
             raise RuntimeError("release selection requires an applied install")
         if _path_present(self.pending_release):
             raise RuntimeError("pending release selector already exists")
@@ -3906,7 +3953,10 @@ class FileTransaction:
                     raise RuntimeError(
                         "sensitive retirement journal is not bound to current generation"
                     )
-                if membership is not None and membership["manifest"] != retirement["manifest"]:
+                if (
+                    membership is not None
+                    and membership["manifest"] != retirement["manifest"]
+                ):
                     raise RuntimeError("auxiliary journals disagree on generation")
             # Prove every historical secret path before even inert cleanup.
             # In particular, orphan removal must never delete a generation
@@ -4141,9 +4191,8 @@ class FileTransaction:
                     "sensitive backup was retired at commit and this "
                     f"generation cannot be rolled back: {record.target}"
                 )
-            if (
-                record.target == RECOVERY_ANCHOR_TARGET
-                and _path_present(self.state_dir / "uninstall.json")
+            if record.target == RECOVERY_ANCHOR_TARGET and _path_present(
+                self.state_dir / "uninstall.json"
             ):
                 # Historical generations treated the generator as reversible.
                 # Preserve the permanent anchor until the uninstall WAL is
@@ -4208,7 +4257,10 @@ class FileTransaction:
                     os.symlink(record.original_symlink, temporary, dir_fd=parent_fd)
                     try:
                         os.rename(
-                            temporary, target.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd
+                            temporary,
+                            target.name,
+                            src_dir_fd=parent_fd,
+                            dst_dir_fd=parent_fd,
                         )
                     except OSError:
                         os.unlink(temporary, dir_fd=parent_fd)
@@ -4305,9 +4357,7 @@ class FileTransaction:
     ) -> None:
         """Preflight the one irreversible exception accepted by uninstall."""
         for record in records:
-            if record.sensitive_retired and _path_present(
-                self._target(record.target)
-            ):
+            if record.sensitive_retired and _path_present(self._target(record.target)):
                 raise RuntimeError(
                     "retired sensitive target reappeared before uninstall: "
                     f"{record.target}"
@@ -4319,9 +4369,7 @@ class FileTransaction:
         # and rejects cycles before this security preflight reads manifests.
         for manifest in self._current_generation_manifests():
             payload = _trusted_journal(manifest)
-            self._assert_retired_sensitive_targets_absent(
-                _generation_records(payload)
-            )
+            self._assert_retired_sensitive_targets_absent(_generation_records(payload))
 
     def _restore_removed_directory(
         self,
@@ -4381,9 +4429,7 @@ class FileTransaction:
                     raise RuntimeError(
                         f"generation target directory changed before restore: {target}"
                     )
-                unexpected = sorted(
-                    set(os.listdir(directory_fd)) - expected_entries
-                )
+                unexpected = sorted(set(os.listdir(directory_fd)) - expected_entries)
                 if unexpected:
                     raise RuntimeError(
                         "generation target directory gained unexpected content "
@@ -4430,7 +4476,10 @@ class FileTransaction:
                 os.symlink(record.original_symlink, temporary, dir_fd=parent_fd)
                 try:
                     os.rename(
-                        temporary, target.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd
+                        temporary,
+                        target.name,
+                        src_dir_fd=parent_fd,
+                        dst_dir_fd=parent_fd,
                     )
                 except OSError:
                     os.unlink(temporary, dir_fd=parent_fd)
@@ -4555,9 +4604,7 @@ def recover_uninstall(
         raise TypeError("uninstall baseline selector is invalid")
     transaction.select_uninstall_baseline(baseline)
     if boot:
-        restore_service_snapshot(
-            state_dir / "baseline-units.json", defer_starts=True
-        )
+        restore_service_snapshot(state_dir / "baseline-units.json", defer_starts=True)
     else:
         restore_service_snapshot(state_dir / "baseline-units.json")
     verify_service_snapshot_closure(snapshot)
@@ -4877,9 +4924,7 @@ def record_release_manifest(
             raise ReleaseRefused("host lacks no-follow manifest support")
         flags |= os.O_NOFOLLOW
         try:
-            descriptor = os.open(
-                manifest.name, flags, 0o600, dir_fd=directory_fd
-            )
+            descriptor = os.open(manifest.name, flags, 0o600, dir_fd=directory_fd)
         except FileExistsError:
             try:
                 existing = _read_regular(manifest, max_bytes=64 * 1024 * 1024)
@@ -4943,9 +4988,7 @@ def publish_release_tree(
             or stat.S_IMODE(root_state.st_mode) & 0o022
         ):
             raise ReleaseRefused("release root is not trusted")
-        staging_state = os.stat(
-            staging.name, dir_fd=root_fd, follow_symlinks=False
-        )
+        staging_state = os.stat(staging.name, dir_fd=root_fd, follow_symlinks=False)
         if (
             not stat.S_ISDIR(staging_state.st_mode)
             or staging_state.st_uid != trusted_uid
@@ -5067,22 +5110,15 @@ def reconcile_release_publication(
         os.close(root_fd)
 
 
-def verify_release_manifest(
-    release_dir: Path,
+def _read_release_manifest(
     manifest: Path,
     release_id: str,
     *,
-    repo_root: Path | None = None,
     trusted_uid: int = 0,
     trusted_gid: int = 0,
     id_pattern: re.Pattern[str] = RELEASE_ID_RE,
 ) -> list[dict[str, object]]:
-    """Prove a pre-existing release directory before it may be selected.
-
-    Refuses a missing manifest outright: an unattested `/opt/aicc/releases/<sha>`
-    is exactly the case this gate exists for, and rebuilding trust from the
-    directory itself would only re-record whatever an attacker left there.
-    """
+    """Read the original trusted release identity without inspecting its tree."""
     if id_pattern.fullmatch(release_id) is None:
         raise ReleaseRefused(
             f"release id does not match its identity pattern {id_pattern.pattern}"
@@ -5117,6 +5153,154 @@ def verify_release_manifest(
         raise ReleaseRefused("release manifest content hash mismatch")
     if document.get("entry_count") != len(expected):
         raise ReleaseRefused("release manifest entry count mismatch")
+    return expected
+
+
+def remove_unattested_recovery_bytecode(
+    release_dir: Path,
+    manifest: Path,
+    release_id: str,
+    *,
+    trusted_uid: int = 0,
+    trusted_gid: int = 0,
+    dry_run: bool = False,
+) -> None:
+    """Remove only derived additions before restoring a pending selector.
+
+    The caller holds the installer/recovery lock. Every attested entry must
+    still match, and every extra must be root-owned CPython bytecode in a
+    cache directory beside an attested source; an attested cache directory and
+    its recorded files must remain unchanged. Preflight the whole
+    tree before removing anything. No manifest or pending journal is rewritten.
+    A crash can leave only a subset of these extras, so the same preflight and
+    removal are safe to repeat; full ordinary verification remains mandatory.
+    `dry_run` performs the identical complete preflight without deleting extras.
+    """
+    expected = _read_release_manifest(
+        manifest, release_id, trusted_uid=trusted_uid, trusted_gid=trusted_gid
+    )
+    expected_by_path: dict[str, dict[str, object]] = {}
+    for entry in expected:
+        if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
+            raise ReleaseRefused("release manifest entry is malformed")
+        relative = entry["path"]
+        if (
+            relative != "."
+            and (Path(relative).is_absolute() or any(
+                part in ("", ".", "..") for part in relative.split("/")
+            ))
+        ) or relative in expected_by_path:
+            raise ReleaseRefused("release manifest path is unsafe")
+        expected_by_path[relative] = entry
+    if expected_by_path.get(".", {}).get("kind") != "dir":
+        raise ReleaseRefused("release manifest root is not a directory")
+
+    seen: set[str] = set()
+    caches: dict[Path, os.stat_result] = {}
+    removable_caches: set[Path] = set()
+    files: dict[Path, os.stat_result] = {}
+
+    def inspect(path: Path, relative: str) -> None:
+        seen.add(relative)
+        if relative in expected_by_path:
+            observed = _release_entry(
+                path, relative, trusted_uid=trusted_uid, trusted_gid=trusted_gid
+            )
+            if observed != expected_by_path[relative]:
+                raise ReleaseRefused(f"release path does not match manifest: {relative}")
+            if observed["kind"] == "dir" and path.name == "__pycache__":
+                caches[path] = path.lstat()
+            return
+        info = path.lstat()
+        if (
+            info.st_uid != trusted_uid or info.st_gid != trusted_gid
+            or stat.S_IMODE(info.st_mode) & 0o022
+        ):
+            raise ReleaseRefused(f"unattested cache is not trusted-owned: {relative}")
+        parent = path.parent.relative_to(release_dir).as_posix()
+        if stat.S_ISDIR(info.st_mode) and path.name == "__pycache__":
+            if expected_by_path.get(parent, {}).get("kind") != "dir":
+                raise ReleaseRefused(f"unattested cache parent is not attested: {relative}")
+            caches[path] = info
+            removable_caches.add(path)
+            return
+        match = re.fullmatch(r"(.+)\.cpython-[0-9]+(?:\.opt-[12])?\.pyc", path.name)
+        source = path.parent.parent / (match[1] + ".py") if match else None
+        if (
+            not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+            or path.parent not in caches or source is None
+            or expected_by_path.get(source.relative_to(release_dir).as_posix(), {}).get("kind") != "file"
+        ):
+            raise ReleaseRefused(f"release has non-cache unattested content: {relative}")
+        files[path] = info
+
+    inspect(release_dir, ".")
+
+    def refuse_walk_error(error: OSError) -> None:
+        raise ReleaseRefused("cannot inspect release during recovery") from error
+
+    for directory, names, filenames in os.walk(
+        release_dir, followlinks=False, onerror=refuse_walk_error
+    ):
+        for name in sorted([*names, *filenames]):
+            path = Path(directory) / name
+            inspect(path, path.relative_to(release_dir).as_posix())
+    missing = set(expected_by_path) - seen
+    if missing:
+        raise ReleaseRefused(f"release is incomplete: {sorted(missing)[:5]}")
+    if dry_run:
+        return
+
+    # Pin each untrusted-content directory, never follow a replaced symlink.
+    # A changed inode/owner/mode refuses before this directory is touched.
+    for cache, snapshot in sorted(caches.items()):
+        if cache not in removable_caches and not any(path.parent == cache for path in files):
+            continue
+        descriptor = os.open(cache, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            current = os.fstat(descriptor)
+            if any(getattr(current, field) != getattr(snapshot, field) for field in (
+                "st_dev", "st_ino", "st_mode", "st_uid", "st_gid"
+            )):
+                raise ReleaseRefused("unattested cache changed during recovery")
+            for path, original in sorted(files.items()):
+                if path.parent != cache:
+                    continue
+                current = os.stat(path.name, dir_fd=descriptor, follow_symlinks=False)
+                if any(getattr(current, field) != getattr(original, field) for field in (
+                    "st_dev", "st_ino", "st_mode", "st_uid", "st_gid", "st_nlink",
+                    "st_size", "st_mtime_ns", "st_ctime_ns",
+                )):
+                    raise ReleaseRefused("unattested bytecode changed during recovery")
+                os.unlink(path.name, dir_fd=descriptor)
+            os.fsync(descriptor)
+            if cache.lstat().st_ino != snapshot.st_ino:
+                raise ReleaseRefused("unattested cache moved during recovery")
+            if cache in removable_caches:
+                cache.rmdir()
+                _fsync_dir(cache.parent)
+        finally:
+            os.close(descriptor)
+
+
+def verify_release_manifest(
+    release_dir: Path,
+    manifest: Path,
+    release_id: str,
+    *,
+    repo_root: Path | None = None,
+    trusted_uid: int = 0,
+    trusted_gid: int = 0,
+    id_pattern: re.Pattern[str] = RELEASE_ID_RE,
+) -> list[dict[str, object]]:
+    """Prove the entire tree against its original trusted manifest.
+
+    Recovery cleanup never relaxes this gate or records a replacement manifest.
+    """
+    expected = _read_release_manifest(
+        manifest, release_id, trusted_uid=trusted_uid,
+        trusted_gid=trusted_gid, id_pattern=id_pattern,
+    )
 
     observed = release_entries(
         release_dir, trusted_uid=trusted_uid, trusted_gid=trusted_gid
@@ -5155,10 +5339,16 @@ WORKER_ONLY_TARGETS = frozenset(
         "/usr/lib/sysusers.d/aicc-agent.conf",
         "/usr/lib/tmpfiles.d/aicc-agent.conf",
         "/usr/libexec/aicc-agent-launcher",
+        "/usr/libexec/aicc-grok-agent",
         "/usr/libexec/aicc-staged-worker-rollout",
+        "/usr/libexec/aicc-worker-release-deploy",
         "/etc/systemd/system/aicc-principal-recovery.service",
         "/etc/systemd/system/aicc-agent-launcher.socket",
         "/etc/systemd/system/aicc-agent-launcher@.service",
+        "/etc/systemd/system/voyn-aicc-source-clone-refresh.service",
+        "/etc/systemd/system/voyn-aicc-source-clone-refresh.timer",
+        "/etc/systemd/system/voyn-aicc-worker-release-deploy.service",
+        "/etc/systemd/system/voyn-aicc-worker-release-deploy.timer",
         "/etc/aicc/agent-workspace-roots",
         "/etc/aicc/worker-lanes",
         "/etc/aicc/gitconfig",
@@ -5204,6 +5394,50 @@ WORKER_ONLY_DIRECTORIES = (
     "/etc/systemd/system/aicc-worker.service.d",
 )
 
+#: Unit files only a control-plane host runs, installed by the control
+#: profile in the same generation as everything else.
+#:
+#: The PR review-window tick is the first of the control plane's own ticks to
+#: become repo-owned. It had to be: the only committed spelling of it
+#: (`deploy/systemd/aicc-backlog-pr-window.{service,timer}`) names a layout
+#: control-01 does not have -- User=aicc-worker, /usr/bin/python,
+#: /srv/ai-command-center -- and nothing ever installed it there, so the
+#: labeller that the window-gated workflows (CI, Acceptance gate, boundary
+#: fitness) key off simply never ran on the fleet. Every fleet PR opened
+#: unlabelled and therefore uncheckable until an operator labelled it by
+#: hand: 24 red-or-checkless PRs, and #907 on 2026-09-09, before an operator
+#: installed the unit by hand at 21:15 UTC. A hand-made unit is not deployed
+#: -- it survives exactly as long as the host does -- which is what this
+#: entry fixes: a rebuilt control host gets the tick from the transaction,
+#: atomically with the rest of the generation and rolled back with it.
+#:
+#: Nothing purges these on a worker host. The worker profile is not a
+#: conversion away from a control host (there is one control plane, and it
+#: owns the database), so unlike `WORKER_ONLY_TARGETS` there is no live host
+#: carrying these files that a worker install has to take them away from.
+CONTROL_ONLY_UNITS = (
+    "voyn-aicc-review.service",
+    "voyn-aicc-review.timer",
+    "voyn-aicc-merge.service",
+    "voyn-aicc-merge.timer",
+    "voyn-aicc-credential-rescue.service",
+    "voyn-aicc-credential-rescue.timer",
+    "voyn-aicc-remediate.service",
+    "voyn-aicc-remediate.timer",
+    "voyn-aicc-pr-window.service",
+    "voyn-aicc-pr-window.timer",
+)
+#: The timers of `CONTROL_ONLY_UNITS` the installer enables after commit, so
+#: installed units are *running* ticks and not just files on disk.
+CONTROL_ONLY_TIMERS = (
+    "voyn-aicc-review.timer",
+    "voyn-aicc-merge.timer",
+    "voyn-aicc-remediate.timer",
+    "voyn-aicc-credential-rescue.timer",
+    "voyn-aicc-pr-window.timer",
+)
+CONTROL_ONLY_TIMER = "voyn-aicc-pr-window.timer"
+
 
 def _runtime_target(target: str) -> bool:
     """Whether a logical target lives on the tmpfs runtime tree.
@@ -5217,6 +5451,7 @@ def _runtime_target(target: str) -> bool:
     """
     path = PurePosixPath(target)
     return path.is_relative_to("/run")
+
 
 PROFILES = ("worker", "control")
 
@@ -5253,10 +5488,12 @@ def default_specs(
     credential files) removed atomically with the control install itself,
     not as a separate step that could commit while the other fails.
 
-    The control-plane's own units (planner, review, merge, reaper, rotation)
-    are not added here: they are still symlinks into the operator's home and
-    become repo-owned under VOYN-W0-AICC-CONTROL-PLANE-REPO-OWNED-UNITS. This
-    profile makes that installation possible; it does not pre-empt it.
+    The control-plane's own ticks become repo-owned under VOYN-W0-AICC-
+    CONTROL-PLANE-REPO-OWNED-UNITS, one at a time as each is needed.
+    `CONTROL_ONLY_UNITS` is the set that has arrived: the PR review-window
+    tick, which had never been installed on control-01 at all. The rest
+    (planner, review, merge, reaper, rotation) are still symlinks into the
+    operator's home and still follow.
 
     What the transition does and does not remove, stated exactly, because
     "the agent principal is absent" is a claim this cannot make:
@@ -5334,6 +5571,13 @@ def default_specs(
             root_gid,
         ),
         FileSpec(
+            repo_root / "ops/aicc_grok_agent.py",
+            "/usr/libexec/aicc-grok-agent",
+            0o755,
+            root_uid,
+            root_gid,
+        ),
+        FileSpec(
             repo_root / "ops/aicc_agent_launcher.py",
             "/usr/libexec/aicc-agent-launcher",
             0o755,
@@ -5355,6 +5599,13 @@ def default_specs(
             root_gid,
         ),
         FileSpec(
+            repo_root / "ops/aicc_release_deploy.py",
+            "/usr/libexec/aicc-worker-release-deploy",
+            0o755,
+            root_uid,
+            root_gid,
+        ),
+        FileSpec(
             repo_root / "deploy/systemd/aicc-principal-recovery.service",
             "/etc/systemd/system/aicc-principal-recovery.service",
             0o644,
@@ -5371,6 +5622,34 @@ def default_specs(
         FileSpec(
             repo_root / "deploy/systemd/aicc-agent-launcher@.service",
             "/etc/systemd/system/aicc-agent-launcher@.service",
+            0o644,
+            root_uid,
+            root_gid,
+        ),
+        FileSpec(
+            repo_root / "deploy/systemd/voyn-aicc-source-clone-refresh.service",
+            "/etc/systemd/system/voyn-aicc-source-clone-refresh.service",
+            0o644,
+            root_uid,
+            root_gid,
+        ),
+        FileSpec(
+            repo_root / "deploy/systemd/voyn-aicc-source-clone-refresh.timer",
+            "/etc/systemd/system/voyn-aicc-source-clone-refresh.timer",
+            0o644,
+            root_uid,
+            root_gid,
+        ),
+        FileSpec(
+            repo_root / "deploy/systemd/voyn-aicc-worker-release-deploy.service",
+            "/etc/systemd/system/voyn-aicc-worker-release-deploy.service",
+            0o644,
+            root_uid,
+            root_gid,
+        ),
+        FileSpec(
+            repo_root / "deploy/systemd/voyn-aicc-worker-release-deploy.timer",
+            "/etc/systemd/system/voyn-aicc-worker-release-deploy.timer",
             0o644,
             root_uid,
             root_gid,
@@ -5515,6 +5794,20 @@ def default_specs(
         # predecessor). A host that never carried the worker profile simply
         # removes nothing -- every one of these targets is already absent.
         kept = tuple(spec for spec in specs if spec.target not in WORKER_ONLY_TARGETS)
+        # The control plane's own ticks, this generation's half of
+        # VOYN-W0-AICC-CONTROL-PLANE-REPO-OWNED-UNITS. Installed with the
+        # rest of the control generation rather than beside it, so the tick
+        # a rebuilt host runs is the tick this commit describes.
+        control_units = tuple(
+            FileSpec(
+                repo_root / "deploy/systemd" / unit,
+                f"/etc/systemd/system/{unit}",
+                0o644,
+                root_uid,
+                root_gid,
+            )
+            for unit in CONTROL_ONLY_UNITS
+        )
         purge = tuple(
             removal_spec(target, sensitive=target in SENSITIVE_TARGETS)
             for target in sorted(WORKER_ONLY_TARGETS)
@@ -5525,11 +5818,17 @@ def default_specs(
         purge_directories = tuple(
             directory_removal_spec(target) for target in WORKER_ONLY_DIRECTORIES
         )
-        return kept + purge + purge_directories
+        return kept + control_units + purge + purge_directories
     return specs
 
 
 def _dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    if args.action == "release-deploy-recover":
+        if args.profile != "worker":
+            raise RuntimeError("standalone release deploy recovery is worker-only")
+        FileTransaction(args.root, args.state_dir).recover_release_deploy()
+        print("AICC_RELEASE_DEPLOY_RECOVERED")
+        return 0
     if args.action == "recovery-anchor-install":
         if _path_present(args.state_dir / "uninstall.json"):
             raise RuntimeError("unfinished uninstall blocks recovery anchor update")
@@ -5560,7 +5859,9 @@ def _dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         return 0
     if args.action == "release-reconcile":
         if args.manifest is None or args.release_id is None:
-            parser.error("--manifest and --release-id are required for release-reconcile")
+            parser.error(
+                "--manifest and --release-id are required for release-reconcile"
+            )
         result = reconcile_release_publication(
             args.release_root,
             args.manifest,
@@ -5758,6 +6059,7 @@ def main() -> int:
             "release-publish",
             "release-reconcile",
             "release-select",
+            "release-deploy-recover",
             "recovery-anchor-install",
         ),
     )
