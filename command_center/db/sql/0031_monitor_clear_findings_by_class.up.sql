@@ -1,4 +1,4 @@
--- 0030: a failure class that measures healthy clears ITS OWN finding
+-- 0031: a failure class that measures healthy clears ITS OWN finding
 -- (VOYN-MON-WORKER-01-INFRA-DEPLOY-LAG-5ABD205763).
 --
 -- 0021 gave the fail-closed monitors one finding row per (source, failure

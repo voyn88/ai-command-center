@@ -537,7 +537,7 @@ _WORKER_FUNCTIONS = (
     # 0021: the worker-host fail-closed probe records what it measured.
     "monitor_record_finding(text, text, jsonb)",
     "monitor_clear_finding(text)",
-    # 0030: and clears the classes it measured GREEN, without waiting for
+    # 0031: and clears the classes it measured GREEN, without waiting for
     # every other probe on the same host to go green too.
     "monitor_clear_findings_except(text, text[])",
     # A second, narrower fail path for a refusal that names no fault in the
@@ -586,6 +586,8 @@ _APP_BACKLOG_FUNCTIONS = (
     "backlog_scan_claim(text, text, text)",
     # Triage of raw findings (0008): UNTRIAGED -> OPEN/NEEDS_REFINEMENT/DONE/DECIDED.
     "backlog_triage(text, text, text)",
+    # Evidence hygiene (0030): remove proven malformed PR evidence.
+    "backlog_clear_evidence(text, text, text, text)",
     # 0021: read-only deploy preflight with dispatch's privileges; the task
     # class setter the planner uses for split children and monitor tasks; the
     # monitor-finding record/clear pair (shared with worker hosts, see
@@ -594,7 +596,7 @@ _APP_BACKLOG_FUNCTIONS = (
     "backlog_set_task_class(text, text)",
     "monitor_record_finding(text, text, jsonb)",
     "monitor_clear_finding(text)",
-    # 0030: per-class clearing, shared with worker hosts for the same reason
+    # 0031: per-class clearing, shared with worker hosts for the same reason
     # as the record/clear pair above.
     "monitor_clear_findings_except(text, text[])",
     "monitor_link_task(bigint, text)",
@@ -1071,7 +1073,7 @@ def _require_function_signature(signature: str) -> None:
         if not argument:
             continue
         # An array type is `text[]`, which is not a bare identifier and must
-        # not be rejected as one: 0030's per-class finding clear takes the
+        # not be rejected as one: 0031's per-class finding clear takes the
         # keep-list as `text[]`. Only the brackets are allowed through, and
         # only as a suffix, so nothing but `[` and `]` ever reaches the
         # interpolated statement beyond what the identifier rule permits.

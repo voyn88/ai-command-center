@@ -1394,7 +1394,7 @@ def test_a_reopened_finding_does_not_reset_the_task_carrying_its_fix(rig) -> Non
 
 
 def test_a_recovered_class_clears_its_own_finding_under_the_worker_grant(rig) -> None:
-    """0030, from the worker host's own role.
+    """0031, from the worker host's own role.
 
     0021 cleared a source's findings only on a tick with no failures at all,
     so one standing red probe (`crash_loop` on worker-01, where units carry

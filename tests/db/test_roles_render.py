@@ -244,7 +244,7 @@ def test_the_worker_reaches_the_queue_only_through_the_six_protocol_steps() -> N
         # -- turns a finding into a task.
         "monitor_record_finding",
         "monitor_clear_finding",
-        # 0030: and clears the classes it measured GREEN this tick, so a
+        # 0031: and clears the classes it measured GREEN this tick, so a
         # recovered class stops being an open finding without waiting for
         # every other probe on the same host.
         "monitor_clear_findings_except",
@@ -303,6 +303,8 @@ def test_the_control_plane_cannot_claim() -> None:
         # scan cursor for the tick windows.
         "backlog_scan_claim",
         "backlog_triage",
+        # 0030: clear proven malformed evidence through the audited function.
+        "backlog_clear_evidence",
         # 0021: read-only deploy preflight with dispatch's privileges; the
         # task-class setter (split children, monitor tasks); and the
         # monitor-finding pair the control-host probe uses.
@@ -363,7 +365,7 @@ def test_function_signature_guard_rejects_injection(bad: str) -> None:
 
 
 def test_function_signature_guard_accepts_an_array_argument() -> None:
-    """0030 takes the keep-list of still-red failure classes as `text[]`,
+    """0031 takes the keep-list of still-red failure classes as `text[]`,
     which is not a bare identifier and must not be rejected as one."""
     roles._require_function_signature("monitor_clear_findings_except(text, text[])")
     assert (
