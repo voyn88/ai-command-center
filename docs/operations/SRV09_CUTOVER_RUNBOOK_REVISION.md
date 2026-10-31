@@ -39,6 +39,18 @@ or this document's own A0 checklist accounts for; and
 Phase B dependencies — partially landed. See the corrected §2, §4, and §13,
 and Appendix A's third pass, below.
 
+**Re-verification pass 4 (2026-10-31, against `cf5a40cd`):** 140 commits
+ahead of the third pass's baseline — the longest quiet period this document
+has ever pretended to survive. Most of that window is fleet/ops/autonomy
+work that does not touch a cutover claim. Three clusters do: thirteen
+PostgreSQL migrations (`0018`–`0030`) landed on the control-plane /
+backlog / queue side, none of them a SQLite dual-write partner; `roles.py`
+and `work_queue_store.py` grew with those migrations; and #651 extracted
+the shared `_table_exists` helper `TABLE-EXISTS-HELPER` was supposed to
+own, without making it dialect-neutral. SQLite `SCHEMA_VERSION` is still
+**25** — A0b's two-part shape is unchanged. See the corrected §2, §4, §6,
+§13, and Appendix A's fourth pass, below.
+
 ## 1. Purpose and scope
 
 Cut the server deployment's runtime store over from SQLite (authority
@@ -63,25 +75,29 @@ this document.** See §13.
   mechanism `READ-POOL` would build on, and it means a credential change no
   longer implies a process restart. The draft's pooling model (one pool,
   opened once, restart to change it) is stale.
-- Migrations applied: `0001_initial` through `0017_backlog_resume_window`
-  (was `0014` when this revision was first written — `0015` and `0016`
-  landed before the second pass, `0017` before the third). Migrations
-  `0005`–`0016` add tables (`backlog_store`, the work-queue control plane,
-  credential-expiry tracking, the tick-scheduler scan cursor, the
-  run-finalization claim fence, ...) that are **outside** the 33-table
-  correspondence map in `docs/srv01b-schema-map.md`. That map is still
-  accurate for the tables it covers — it just no longer covers the whole
-  schema, and it covers less of it with every wave. A reconciliation plan
-  scoped to "the 33 tables in the map" now undercounts what PostgreSQL
-  actually holds, by a growing margin. `0017`
-  (`VOYN-W0-AICC-DEFER-AUTO-RESUME-REM`, #605) is the exception in this list:
-  it adds no table, it only replaces the resume-budget query inside an
-  existing `backlog_task`/`backlog_event` `SECURITY DEFINER` function
-  (lifetime cap → sliding 48h window) — no new `UNMIRRORED_SCHEMA_TABLES`
-  entry required. It still moves `EXPECTED_SCHEMA_VERSION`
-  (`command_center/db/health.py`, `len(migrations.discover())`) from 16 to
-  17, which is the number §4 step 1 and Appendix A row 54 need re-reading
-  against.
+- Migrations applied: `0001_initial` through
+  `0030_repo_route_and_evidence_hygiene` (was `0014` when this revision was
+  first written — `0015`/`0016` before the second pass, `0017` before the
+  third, `0018`–`0030` before the fourth). Migrations `0005`–`0030` add
+  tables and control-plane functions (`backlog_store`, the work-queue
+  control plane, credential-expiry tracking, the tick-scheduler scan
+  cursor, the run-finalization claim fence, `monitor_finding`, lease/infra
+  wait exits, owner-decision protocol, ...) that are **outside** the
+  33-table correspondence map in `docs/srv01b-schema-map.md`. That map is
+  still accurate for the tables it covers — it just no longer covers the
+  whole schema, and it covers less of it with every wave. A reconciliation
+  plan scoped to "the 33 tables in the map" now undercounts what
+  PostgreSQL actually holds, by a growing margin. Several of the newer
+  migrations (`0017`, `0018`, `0020`, `0022`–`0028`, `0029`, `0030`) add no
+  base table at all — they replace `SECURITY DEFINER` functions, restore a
+  view owner, or append audit acts — so they do not each mint a new
+  `UNMIRRORED_SCHEMA_TABLES` entry; the one that did in this window is
+  `monitor_finding` (`0021`, signed exclusion under
+  `VOYN-W0-AICC-PLANNER-AUTO-SPLIT-PIPELINE-TASKS`). Every one of them still
+  moves `EXPECTED_SCHEMA_VERSION`
+  (`command_center/db/health.py`, `len(migrations.discover())`), which is
+  now **30** — the number §4 step 1 and Appendix A rows 54/58 need
+  re-reading against.
 - Generic PostgreSQL machinery still lives in `aios-db`, still consumed
   only through `command_center/db/adapter.py` — unchanged.
 - The mutating HTTP surface now requires authentication
@@ -117,14 +133,16 @@ mirrored.
 ## 4. Preflight (A0)
 
 1. Confirm `python -m command_center.db status` reports every PostgreSQL
-   migration applied through `0017` (was `0014` at this revision's first
-   pass, `0016` at the second — re-check the current highest-numbered file
-   in `command_center/db/sql/` before relying on this digit, it has moved on
-   every pass so far) and its checksum verified.
+   migration applied through `0030` (was `0014` at this revision's first
+   pass, `0016` at the second, `0017` at the third — re-check the current
+   highest-numbered file in `command_center/db/sql/` before relying on this
+   digit, it has moved on every pass so far) and its checksum verified.
 2. Confirm `GET /readyz` is `200`.
 3. Confirm the three-role grant matrix with
    `tests/db/test_postgres_integration.py` — now also covering the
-   backlog-table grants added by `0005`–`0014`.
+   backlog-table grants added by `0005`–`0014` and the later control-plane
+   additions (`monitor_finding`, lease/infra wait functions, owner-decision
+   protocol) that landed with `0018`–`0030`.
 4. Take a verified backup: `scripts/aicc_pg_backup.sh --out-dir
    /var/backups/aicc --verify --keep 14`, then run the restore drill
    (`scripts/aicc_pg_restore.sh ... --target-db aicc_restore_check`)
@@ -212,7 +230,8 @@ above, the live SQLite `SCHEMA_VERSION`, and the live, independently-numbered
 PostgreSQL `EXPECTED_SCHEMA_VERSION` — and states outright that the two live
 counters must never be diffed against each other. Its own snapshot value for
 `EXPECTED_SCHEMA_VERSION` (16, taken 2026-09-02) was itself two days stale by
-the time `0017` landed (2026-09-03, §2 above): read it for the model it
+the time `0017` landed (2026-09-03, §2 above), and is fourteen migrations
+behind by the fourth pass (`0030`, 2026-10-31): read it for the model it
 gives, not the digit it happened to hold when written.
 
 ## 5. Backfill / dual-write posture
@@ -240,10 +259,11 @@ be green on the commit being cut over. They cover the 33-table
 correspondence map only (§3) — they do not, and are not meant to, cover
 the PostgreSQL-only tables added since the draft, each of which instead
 carries its own signed `UNMIRRORED_SCHEMA_TABLES` exclusion (reason +
-owning task) — `run_finalization_claim` and `backlog_scan_cursor` are the
-two newest, both landing after this revision's first pass. Grep that dict
-for the current count; do not copy a number from this paragraph into an
-operator checklist, it will already be stale by the time it's read.
+owning task) — `run_finalization_claim` and `backlog_scan_cursor` landed
+after this revision's first pass; `monitor_finding` (`0021`) is the newest
+as of the fourth. Grep that dict for the current count; do not copy a
+number from this paragraph into an operator checklist, it will already be
+stale by the time it's read.
 
 ## 7. Read path
 
@@ -361,11 +381,16 @@ One addition: worker-host database credential rotation
 (`command_center/ops/credential_rotation.py`) did not exist when the draft
 was written and is now a live, independently-scheduled process. It can run
 concurrently with a cutover window because it uses the same hot pool-swap
-mechanism (§2) rather than a restart. Confirm with whoever owns that
-service that no rotation is scheduled to land inside the cutover window
-before step 8.1 — not because it would fail, but because two independent
-changes to database connectivity in the same window make S1–S8 harder to
-attribute correctly.
+mechanism (§2) rather than a restart. As of #873
+(`VOYN-W0-AICC-ROLLOUT-VS-ROTATE-SELFDEPLOY-TIMERS`) it also defers when a
+staged worker rollout holds `/run/aicc-staged-rollout.lock` — the same
+kind of "two independent changes in one window" collision this paragraph
+already warned about, now with one concrete lock path. Confirm with
+whoever owns that service that no rotation *and* no staged rollout is
+scheduled to land inside the cutover window before step 8.1 — not because
+either would fail the cutover by itself, but because two (or three)
+independent changes to database connectivity in the same window make
+S1–S8 harder to attribute correctly.
 
 ## 12. Post-cutover validation
 
@@ -381,28 +406,40 @@ this document (§13).
 **Not authorized.** The mechanisms Phase B depends on are designed and
 prototyped, not built, in this codebase as of `67a996b` — still true as of
 the second pass's `f799f78` for five of the six; the third pass's `92470bc`
-found the sixth, `QUERY-DIALECT-FIX`, partially landed (below). None of the
-other five moved:
+found the sixth, `QUERY-DIALECT-FIX`, partially landed; the fourth pass's
+`cf5a40cd` finds the same partial landing one step further along (below)
+and still no movement on the other five:
 
-- `READ-SWITCH-MISSING` — no read-path selector exists (§7).
+- `READ-SWITCH-MISSING` — no read-path selector exists (§7). No
+  `AICC_DB_BACKEND`-style flag anywhere in this codebase as of `cf5a40cd`.
 - `REVERSE-MIRROR` — no PostgreSQL → SQLite mirror exists (§9); this is
   the one that actually gates the point of no return.
 - `READ-POOL` — `replace_pool()` (§2) is a prerequisite building block,
   built for credential rotation, not yet wired to a read-side pool split.
 - `DAILY-AUDIT-UNMIRRORED` — no scheduled job audits for rows that reached
   PostgreSQL without a mirrored SQLite counterpart (or the reverse, once
-  `REVERSE-MIRROR` exists).
-- `QUERY-DIALECT-FIX` — **partially landed.** #610 (2026-09-05) fixed two
-  of the four known SQLite-only query constructs: a bare `WHERE 0`
-  (PostgreSQL rejects a non-boolean `WHERE` expression; SQLite does not) in
-  `list_runs` / `count_runs`, replaced with the dialect-neutral `1 = 0`; and
-  an untyped `LIKE` directly against the `jsonb` `payload_json` column in
-  `daily_spend_usd`, fixed by casting to text first. The other two —
-  `rowid` tiebreaks and `sqlite_master` existence guards — are explicitly
-  left to two other, still-unlanded tickets (`INSERT-SEQ`,
-  `TABLE-EXISTS-HELPER`). SQL dialect differences between the two engines'
-  query paths are therefore reconciled in part, not reconciled, outside the
-  mirrored-write path.
+  `REVERSE-MIRROR` exists). Do not confuse this with `command_center/daily_audit.py`
+  / `docs/DAILY_SELF_AUDIT.md` — that is a self-audit campaign runner, not
+  a cross-engine mirror-gap auditor.
+- `QUERY-DIALECT-FIX` — **partially landed, still.** #610 (2026-09-05)
+  fixed two of the four known SQLite-only query constructs: a bare
+  `WHERE 0` (PostgreSQL rejects a non-boolean `WHERE` expression; SQLite
+  does not) in `list_runs` / `count_runs`, replaced with the
+  dialect-neutral `1 = 0`; and an untyped `LIKE` directly against the
+  `jsonb` `payload_json` column in `daily_spend_usd`, fixed by casting to
+  text first. Of the two deferred tickets, `TABLE-EXISTS-HELPER`'s
+  *extraction* half landed as #651 (2026-09-06):
+  `command_center/runtime/db/core.py::_table_exists` now owns the
+  previously hand-rolled `sqlite_master` lookups in `create_run`,
+  provenance backfill, and migration 25. The helper still queries
+  `sqlite_master` — it consolidates the SQLite-only pattern rather than
+  replacing it with a dialect-neutral existence check — so the Phase B
+  gap that ticket was supposed to close is not closed. `INSERT-SEQ`
+  (the `rowid` tiebreaks in `execution.py` / `completion.py` /
+  `provenance.py`) has not landed at all; those `ORDER BY ... rowid`
+  clauses are still present on `cf5a40cd`. SQL dialect differences
+  between the two engines' query paths are therefore still reconciled in
+  part, not reconciled, outside the mirrored-write path.
 - `PARITY-QUERY-EQUIVALENCE` — no proof exists that reads against either
   engine return equivalent results for the same logical query.
 
@@ -535,9 +572,9 @@ to resolve schema-version staleness — went stale on its own headline number
 within 48 hours of being written (row 58, above). The shelf-life warning
 this document keeps giving applies to sibling documents exactly as much as
 to itself. Re-run this check against current `main` before executing this
-runbook; that instruction has now outlived three baselines (`67a996b`,
-`f799f78`, `92470bc`) without becoming less true, and there is no reason to
-expect a fourth baseline to be different.
+runbook; that instruction has now outlived four baselines (`67a996b`,
+`f799f78`, `92470bc`, `cf5a40cd`) without becoming less true, and there is
+no reason to expect a fifth baseline to be different.
 
 ### Audit of the third pass (2026-09-06, same baseline `92470bc`)
 
@@ -611,3 +648,48 @@ No claim needs correction. This does not add a fifth baseline — it is the
 same `92470bc` re-checked with a stricter method, the same relationship the
 "audit of the third pass" section above has to the third pass itself, one
 level further down.
+
+### Fourth pass (2026-10-31, against `cf5a40cd`) — this revision re-verified again
+
+`92470bc` is 140 commits behind `cf5a40cd`. As with prior passes, most of
+that drift does not touch a claim this document makes (fleet autonomy
+hardening, deploy/rollout serialization, merge-tick budgeting, owner React
+dashboard, spend-cap regressions) and is omitted below. The commits that
+did fall into three clusters: the PostgreSQL migration ladder climbing
+from `0017` to `0030`; the grant / queue-store surface growing with those
+migrations; and one Phase B dependency moving halfway.
+
+Method matches the "fourth check" above — every individual path Appendix A
+cites, plus A0/§8/§11 scripts, was re-diffed across `92470bc..cf5a40cd`
+rather than trusting category labels. Paths with zero commits in the
+window (held claims stay held; earlier "changed" rows whose files did not
+move stay at their prior reading): `adapter.py`, `pool.py`, `run_store.py`,
+`record_mirror.py`, `table_mirror.py`, `mirror_support.py`, `queue_store.py`,
+`owner_item_store.py`, `digest_item_store.py`, `conflict_store.py`,
+`model_registry_store.py`, `council_store.py`, `provenance_store.py`,
+`run_finalizer.py`, `supervisor.py`, `runtime/db/core.py`'s
+`current_schema_version()`, `preflight.sh`,
+`assert_independent_acceptance.py`, `webapi/app.py`, both backup/restore
+scripts, `postgres-foundation.md`, `srv01b-schema-map.md`,
+`SCHEMA_VERSION_DRIFT.md` (still pinned at its 2026-09-02 snapshot — its
+`EXPECTED_SCHEMA_VERSION = 16` reading is now fourteen migrations behind
+live `main`, which is exactly the shelf-life failure mode row 58 already
+named), and SQLite `SCHEMA_VERSION` itself (still **25**).
+
+| # | Reference | Third-pass claim | Now |
+| --- | --- | --- | --- |
+| 61 | PostgreSQL migrations (`command_center/db/sql/`) / `EXPECTED_SCHEMA_VERSION` | 17 (`0001`–`0017`) | **30** (`0001`–`0030`) — thirteen migrations in the window. New base table with a signed `UNMIRRORED_SCHEMA_TABLES` exclusion: `monitor_finding` (`0021`, `VOYN-W0-AICC-PLANNER-AUTO-SPLIT-PIPELINE-TASKS`, #899). The rest are function replacements, view-owner repairs, audit acts, or additive columns on already-unmirrored control-plane tables (`work_item.infra_wait_count` / `lease_wait_count`, `backlog_task.task_class`) — they move the version counter without minting a dual-write partner. Migration-number collisions happened inside the window (`queue_fail_lease_wait` was originally cut as `0018` and renumbered to `0020` by #875 after main merged a different `0018`); the tip's ladder is contiguous `0001`–`0030` with no duplicates. |
+| 62 | `command_center/db/roles.py` grant matrix (rows 40/55) | `_FINALIZATION_CLAIM_TABLES` + backlog carve-outs; comment-only touch in the prior window | gained `_MONITOR_FINDING_TABLES`, owner-decision / clear-evidence / smoke / split function grants, and — separately — #420 routed `VIEW_PRIVILEGES` and `COLUMN_PRIVILEGES` through the same `merge_privileges` union discipline `PRIVILEGES` already used, so a second task contributing a view or column grant can no longer silently replace the first. Row 40/55's "grant matrix grows with the control plane" reading holds; the matrix itself is larger. |
+| 63 | `command_center/db/work_queue_store.py` (row 41) | claim/complete/fail + `enqueue()` | gained `fail_lease_wait()` (#875 / migration `0022`, later renumbered) and `fail_infra_wait()` (migration `0024`) — no-fault exits that refund the attempt `queue_claim` spent and bound retries on their own counters instead of `max_attempts`. Still `aicc_app`-only for enqueue; the new exits are worker-side. |
+| 64 | §13 `QUERY-DIALECT-FIX` / `TABLE-EXISTS-HELPER` | partially landed (#610); `INSERT-SEQ` and `TABLE-EXISTS-HELPER` still unlanded | **extraction half of `TABLE-EXISTS-HELPER` landed** as #651 (`ea0b95bc`, 2026-09-06) — `runtime/db/core.py::_table_exists` centralizes the previously hand-rolled `sqlite_master` lookups. The helper still queries `sqlite_master`, so the dialect gap Phase B needs is not closed. `INSERT-SEQ` unlanded; `ORDER BY ... rowid` tiebreaks remain in `execution.py` / `completion.py` / `provenance.py`. |
+| 65 | `command_center/ops/credential_rotation.py` (row 48 / §11) | live, independently-scheduled, hot-swaps the pool | #873 taught it to defer when a staged worker rollout holds `/run/aicc-staged-rollout.lock`, and to refuse reactivating lanes the rollout is deliberately holding down. Strengthens, rather than changes, §11's "don't overlap rotation with the cutover window" advice — and extends that advice to staged rollouts. |
+| 66 | §6 `UNMIRRORED_SCHEMA_TABLES` newest entries | `run_finalization_claim`, `backlog_scan_cursor` | **`monitor_finding`** added (#899). Grep the dict; do not copy a count from this row. |
+
+The fourth pass's addition to the lesson: a quiet `SCHEMA_VERSION` is not
+a quiet schema. SQLite stayed on 25 for the entire 140-commit window while
+PostgreSQL's independently-numbered counter nearly doubled (17 → 30),
+every step of it outside the 33-table correspondence map. The A0b
+two-part shape (through 24 online, 24→25 only after drain) still holds
+exactly because of that asymmetry — and §4 step 1's digit is the one that
+moved. Re-run this check against current `main` before executing this
+runbook; four baselines is not a reason to trust a fifth.
