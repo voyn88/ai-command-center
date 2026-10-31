@@ -10,15 +10,21 @@ COMMENT, not an entry, until its CLI is proven on worker-01.
 
 Cascade mechanics live where the state already is: the planner writes the
 cascade into the payload, ``max_attempts`` = its length (the attempt budget
-IS the cascade budget), and the worker selects ``cascade[attempt_no - 1]``
-(clamped) — so executor failover rides the queue's existing retry/reap
-machinery (SRV-06) with no new tables and no new loop, and the audit trail
-is the existing ``work_event`` attempt history (attempt_no <-> cascade step
-is a bijection until the clamp).
+IS the cascade budget), and the worker selects the cascade link by
+``attempt_no`` wrapped modulo the cascade length (see
+``worker.handlers._cascade_step``) — so executor failover rides the queue's
+existing retry/reap machinery (SRV-06) with no new tables and no new loop,
+and the audit trail is the existing ``work_event`` attempt history. A
+redrive (``queue_redrive``) widens ``max_attempts`` without resetting
+``attempt_count``, so attempt_no <-> cascade step stays a bijection only
+within one pass through the cascade; the wrap is what makes a redrive's
+fresh attempts walk the cascade again instead of dead-ending on the last
+link every time (VOYN-W0-AICC-REDRIVE-CLAMP-RESETS-TO-LAST-LINK).
 """
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 __all__ = ["ROUTING_MATRIX", "cascade_for"]
@@ -47,13 +53,16 @@ ROUTING_MATRIX: dict[str, list[dict[str, Any]]] = {
         # in that table only because its argv builder exists
         # (`build_codex_command`) and the CLI is installed on worker-01.
         {"executor": "codex", "task_type": "implementation"},
-        # Third account, same reasoning one step further: if both the Claude
-        # window and the Codex account are exhausted, Copilot's GitHub
-        # subscription is capacity neither can consume. Three links also means
-        # `max_attempts` is 3 (the attempt budget IS the cascade length), so a
-        # task gets one genuine try per independent quota pool rather than
-        # three tries at one pool.
-        {"executor": "copilot", "task_type": "implementation"},
+        # No copilot link. It was the third account ("capacity neither of the
+        # other two can consume"), but ADR-0010 keeps copilot OFF the isolated
+        # worker principal -- its login credential carries GitHub/repository
+        # authority (`agent_runner.PRINCIPAL_EXECUTOR_BINARIES`) -- and the
+        # whole fleet runs isolated since 2026-09-08. A link the worker refuses
+        # at preflight is exactly the phantom link this module's docstring
+        # warns about: live, it burned the third and last attempt of every
+        # task whose first two failed ("isolated copilot cli unavailable",
+        # 48 dead attempts in 20 minutes). Restore it only together with an
+        # accepted ADR-0010 revision that stages copilot under isolation.
     ],
     "review": [
         # codex first: it is the only review pool currently reachable on the
@@ -62,7 +71,8 @@ ROUTING_MATRIX: dict[str, list[dict[str, Any]]] = {
         # resolves to the read-only profile, so codex reviews under
         # `--sandbox read-only` -- a model-only reviewer that never writes.
         {"executor": "codex", "task_type": "review"},
-        {"executor": "copilot", "task_type": "review"},
+        # copilot: see the implementation cascade -- refused under principal
+        # isolation, so it would only burn a review attempt.
         {"executor": "claude", "task_type": "review"},
     ],
 }
@@ -88,6 +98,10 @@ def cascade_for(
     exist. Every ``ROUTING_MATRIX`` entry names at least one non-claude
     executor, so the result is never empty.
     """
+    if os.environ.get("AICC_EXECUTOR_PROFILE") == "owner-alternatives":
+        task_type = "review" if task_class == "review" else "implementation"
+        return [{"executor": "cursor", "task_type": task_type, "model": "auto"},
+                {"executor": "grok", "task_type": task_type, "model": "grok-4.3"}]
     cascade = [
         dict(link)
         for link in ROUTING_MATRIX.get(task_class, ROUTING_MATRIX["implementation"])

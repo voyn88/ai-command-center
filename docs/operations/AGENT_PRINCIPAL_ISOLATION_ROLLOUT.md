@@ -22,6 +22,13 @@ This is a fail-closed deployment gate. Do not set
    release. To change a CLI version, edit the lock, run the
    `build-agent-toolchain` workflow, and record the digest it reports -- a
    reviewed change, never an ambient `latest`.
+   The release venv also needs the accepted AIOS wheels (`aios-sdk.lock.json`,
+   `aios-db.lock.json`), which CI fetches with a read-only token a root
+   installer must not hold. Stage them once per digest, root-owned and
+   immutable, at `/var/lib/aicc-artifacts/<wheel_sha256>/<wheel_filename>`
+   (`install -D -m 0644 -o root -g root`); the installer verifies each wheel
+   against the release's lock file and refuses a missing, writable or
+   mismatched artifact.
 3. Put only model credentials in `/etc/aicc/agent-claude.env` and
    `/etc/aicc/agent-codex.env` (root:`aicc-agent`, `0640`), or provider config
    below `/var/lib/aicc-agent` (`root:root`, `0600`). The broker uses only an
@@ -124,3 +131,25 @@ This is a fail-closed deployment gate. Do not set
 9. Drain and roll every remaining discovered lane, one at a time, only after the previous lane stays ready. Record
    exact deployed SHA and unit hashes. Roll back the unit/code to the previous
    merged SHA if any boundary or readiness check fails; do not disable isolation.
+
+## Model-auth write-back across worker lanes
+
+The launcher retains the exact credential bytes staged into each run's ephemeral
+home in broker memory. At teardown, an unchanged copy is never written back,
+even if another lane has rotated the store's token in the meantime. This prevents
+a lane still holding T1 from overwriting T2 after T1's refresh token was consumed.
+
+For a changed copy, the broker holds an exclusive `fcntl.flock` on
+`<store directory>/.model-auth.lock` (root:root, `0600`) across the store read,
+comparison and atomic replacement. If the store still matches the staged bytes,
+the refresh may be persisted. If the store changed, the run's credential must be
+strictly newer by Claude's `claudeAiOauth.expiresAt` (milliseconds since epoch) or
+Codex's `last_refresh` (ISO-8601 with timezone). Equal, older, missing or
+unparseable freshness preserves the store and logs
+`model auth write-back: <executor> skipped, store is newer or freshness unknown`.
+A failed refresh that leaves the staged file unchanged therefore cannot roll back
+a successful refresh from another lane.
+
+The regular-file and size checks still apply, and the JSON top-level keys must
+match both the staged credential and the current store. Successful write-back
+uses an atomic temporary-file rename with root:root ownership and mode `0600`.

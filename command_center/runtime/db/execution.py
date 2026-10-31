@@ -417,10 +417,8 @@ def create_run(
                         now,
                     ),
                 )
-            provenance_table = conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'run_provenance'"
-            ).fetchone()
-            if provenance_table is not None:
+            provenance_table = db._table_exists(conn, "run_provenance")
+            if provenance_table:
                 conn.execute(
                     """INSERT INTO run_provenance (
                            run_id, task_id, repository_path, worktree_path, branch,
@@ -439,10 +437,8 @@ def create_run(
                         now,
                     ),
                 )
-            provider_route_table = conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'run_provider_route'"
-            ).fetchone()
-            if provider_route_table is not None and provider_route is not None:
+            provider_route_table = db._table_exists(conn, "run_provider_route")
+            if provider_route_table and provider_route is not None:
                 conn.execute(
                     """INSERT INTO run_provider_route (
                            run_id, providers_json, max_attempts, selection_reason,
@@ -476,14 +472,14 @@ def create_run(
                 conn.execute(
                     "SELECT * FROM run_provenance WHERE run_id = ?", (record["id"],)
                 ).fetchone()
-                if provenance_table is not None
+                if provenance_table
                 else None
             )
             stored_route = (
                 conn.execute(
                     "SELECT * FROM run_provider_route WHERE run_id = ?", (record["id"],)
                 ).fetchone()
-                if provider_route_table is not None
+                if provider_route_table
                 else None
             )
     # Parent first: the target refuses a child whose run is not mirrored.

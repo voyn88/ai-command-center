@@ -43,7 +43,7 @@ _MARKER_PATTERN = r"\[CREDENTIAL_WINDOW_RESET=claude:(.*?)\]"
 # `command_center.db.roles._APP_QUEUE_TABLES` and `VIEW_PRIVILEGES`. Both are
 # the same grants `backlog_eligible` and `work_dlq` already rely on, so this
 # is a plain read: no new SECURITY DEFINER function or migration required.
-_QUERY = f"""
+_QUERY = """
     SELECT reset_at FROM (
         SELECT (regexp_match(outcome_reason, %s))[1]::timestamptz AS reset_at,
                updated_at AS observed_at

@@ -60,11 +60,13 @@ def test_importing_the_package_starts_nothing():
 
 
 def test_unimplemented_modules_are_importable_stubs():
-    """The package shape matches the specification before behaviour exists, so
-    a reader can see what is planned without guessing."""
-    from command_center.companion import api, auth, notify
+    """`auth.py`/`api.py` remain deliberate stubs (M1D, needs device identity):
+    the package shape matches the specification before behaviour exists, so a
+    reader can see what is planned without guessing. `notify.py` is no longer
+    one of them — see the `notify` tests below."""
+    from command_center.companion import api, auth
 
-    for module in (api, auth, notify):
+    for module in (api, auth):
         assert module.__doc__ and "not implemented" in module.__doc__.lower()
 
 
