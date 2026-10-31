@@ -661,10 +661,17 @@ _APP_BACKLOG_FUNCTIONS = (
     # as the record/clear pair above.
     "monitor_clear_findings_except(text, text[])",
     "monitor_link_task(bigint, text)",
-    # Audit trail for where a record came from (0020); the importer's stamp
+    # Audit trail for where a record came from (0023); the importer's stamp
     # that a row was migrated rather than authored directly in the store.
     "backlog_record_provenance(text, text, jsonb)",
-    # 0025: declare the authority a task needs beyond an unprivileged
+    # The importer's atomic insert-and-stamp (0037). Granted INSTEAD of
+    # leaving the importer to pair `backlog_upsert_task` with a separate
+    # `backlog_record_provenance` call: one transaction is what makes "no
+    # migrated row without its provenance" a property rather than a habit.
+    "backlog_import_task(text, text, text, text, text, text, text, text, "
+    "text, jsonb)",
+
+    # 0037: declare the authority a task needs beyond an unprivileged
     # workspace. Granted to the control plane because the OWNER path matters
     # as much as the discovered one -- marking a task "this needs root"
     # before it is ever dispatched is what makes the block cost zero model

@@ -215,7 +215,13 @@ def test_import_stamps_provenance_on_first_migration_only(store) -> None:
     with provenance" proof: a row created by the importer must carry a
     durable, queryable trace of the Markdown line it came from, and that
     trace is stamped once -- at migration -- not on every later reconciling
-    import of the same, now-unchanged, text."""
+    import of the same, now-unchanged, text.
+
+    The `updated` half of "not on every later import" has its own test
+    (`test_an_updated_row_is_not_restamped_by_the_import_that_changes_it`):
+    this one only reaches the `unchanged` branch, and a test whose docstring
+    claims more ground than its assertions walk is a test that goes on
+    passing over the regression it was written to catch."""
     text = FIXTURE.read_text(encoding="utf-8")
     line_no = next(t.line_no for t in parse_backlog(text).tasks if t.task_id == "VOYN-W0-S1")
 
@@ -234,6 +240,107 @@ def test_import_stamps_provenance_on_first_migration_only(store) -> None:
         e for e in store.list_events("VOYN-W0-S1") if e["event"] == "provenance"
     ]
     assert len(provenance_after) == 1, "a stable row is stamped once, not per import run"
+
+
+def test_an_updated_row_is_not_restamped_by_the_import_that_changes_it(store) -> None:
+    """The stamp records WHEN a row was migrated, so an import that later
+    CHANGES that row must not rewrite it.
+
+    Distinct from the unchanged case, and not covered by it: re-importing
+    identical text takes the `unchanged` branch, which never reaches the
+    stamp at all, so proving idempotence over an untouched file proves
+    nothing about the `updated` path — a stamp call wrongly added there would
+    sail past that test."""
+    text = FIXTURE.read_text(encoding="utf-8")
+    assert store.import_markdown(text).inserted > 0
+    before = [e for e in store.list_events("VOYN-W0-S1") if e["event"] == "provenance"]
+    assert len(before) == 1
+
+    edited = text.replace("A plain wave-0 record.", "A plain wave-0 record, edited.")
+    assert edited != text, "the fixture no longer contains the line being edited"
+    report = store.import_markdown(edited)
+    assert report.updated >= 1, "the edited record must take the update path"
+
+    after = [e for e in store.list_events("VOYN-W0-S1") if e["event"] == "provenance"]
+    assert after == before, (
+        "an update reconciles a migrated row, it does not re-migrate it"
+    )
+
+
+def test_import_task_inserts_and_stamps_in_one_transaction(store) -> None:
+    """The insert and its provenance land together or not at all: one call,
+    one statement, one transaction — no window in which a crash leaves a row
+    that exists and is permanently unaudited."""
+    task = _task("VOYN-W0-ATOMIC")
+    assert store.import_task(task, "markdown_import", {"line_no": 7}) == (
+        True,
+        "inserted",
+        True,
+        True,
+    )
+    events = store.list_events("VOYN-W0-ATOMIC")
+    stamped = [e for e in events if e["event"] == "provenance"]
+    assert len(stamped) == 1
+    assert stamped[0]["outcome"] == "granted"
+    assert stamped[0]["reason"] == "markdown_import"
+    assert stamped[0]["detail"] == {"line_no": 7}
+
+    # Reconciling an already-migrated row reports that it did NOT re-migrate.
+    assert store.import_task(task, "markdown_import", {"line_no": 7}) == (
+        True,
+        "unchanged",
+        False,
+        False,
+    )
+
+
+def test_a_record_with_no_provenance_source_is_never_inserted(store) -> None:
+    """Refused before the upsert, not after: a caller that cannot say where a
+    record came from does not get to create one, so there is no row left over
+    to go unaudited."""
+    assert store.import_task(_task("VOYN-W0-NOSRC"), "") == (
+        False,
+        "empty_provenance_source",
+        False,
+        False,
+    )
+    assert store.get_task("VOYN-W0-NOSRC") is None
+
+
+def test_backfill_stamps_the_rows_atomicity_cannot_reach_retroactively(store) -> None:
+    """Rows inserted before the stamp existed — or during the window when it
+    was a second, separate round trip a crash could lose — are invisible to
+    every later import: it finds them `unchanged` and never stamps.
+    `upsert_task` reproduces exactly such a row."""
+    text = FIXTURE.read_text(encoding="utf-8")
+    parsed = parse_backlog(text)
+    for task in parsed.tasks:
+        assert store.upsert_task(task)[0], task.task_id
+    ids = sorted(task.task_id for task in parsed.tasks)
+    assert set(store.tasks_without_provenance(ids)) == set(ids)
+
+    assert store.backfill_markdown_provenance(text) == ids
+    assert store.tasks_without_provenance(ids) == []
+    assert store.backfill_markdown_provenance(text) == [], "a backfill is idempotent"
+
+    events = [e for e in store.list_events("VOYN-W0-S1") if e["event"] == "provenance"]
+    assert [e["reason"] for e in events] == ["markdown_import_backfill"], (
+        "a stamp added by reconciliation must not read as one written with the insert"
+    )
+
+
+def test_tasks_without_provenance_reports_only_rows_that_exist(store) -> None:
+    """An id with no row is nothing to stamp, not an unstamped row — and the
+    planner's own tasks are not the importer's business, so the query answers
+    only about the ids the caller names."""
+    assert store.tasks_without_provenance([]) == []
+    assert store.tasks_without_provenance(["VOYN-W0-GHOST"]) == []
+    assert store.upsert_task(_task("VOYN-W0-UNSTAMPED"))[0]
+    assert store.tasks_without_provenance(["VOYN-W0-UNSTAMPED", "VOYN-W0-GHOST"]) == [
+        "VOYN-W0-UNSTAMPED"
+    ]
+    assert store.record_provenance("VOYN-W0-UNSTAMPED", "operator_backfill")
+    assert store.tasks_without_provenance(["VOYN-W0-UNSTAMPED"]) == []
 
 
 def test_record_provenance_refuses_an_unknown_task(store) -> None:
