@@ -1,0 +1,49 @@
+%% C4 container (level 2) — containers inside the AI Command Center system
+%% boundary from context.mmd. Source of truth for docs/architecture/README.md's
+%% "Containers" diagram. Edit this file, then run
+%% `python scripts/generate_architecture_docs.py` to regenerate the README;
+%% tests/architecture/test_architecture_docs_freshness.py fails CI on drift.
+flowchart TD
+    Engineer["Person<br/><b>Engineer</b>"]
+
+    subgraph AICC["AI Command Center"]
+        Streamlit["Container: Python / Streamlit<br/><b>Streamlit web app</b><br/>app.py, localhost-only by default"]
+        UI["Container: Python<br/><b>UI panels</b><br/>command_center/ui"]
+        Domain["Container: Python<br/><b>Domain &amp; application services</b><br/>planning, launch, execution queue,<br/>portfolio, project_config"]
+        Runtime["Container: Python<br/><b>Runtime subsystem</b><br/>command_center/runtime:<br/>API facade, scheduler,<br/>autonomy, completion"]
+        Supervisor["Container: Python process group<br/><b>Runtime Supervisor</b><br/>owns provider-CLI subprocess lifecycle"]
+        Worker["Container: systemd daemon<br/><b>Headless worker service</b><br/>command_center/worker,<br/>claim → execute → report, unattended"]
+        Desktop["Container: PySide6/Qt<br/><b>Native desktop shell</b><br/>command_center.desktop (D1 shipped)"]
+        AiosAdapter["Container: Python module<br/><b>AIOS/DB adapters</b><br/>application/aios_tasks.py,<br/>db/adapter.py — sole boundary crossings"]
+        Stores[("Container: SQLite + JSON/JSONL<br/><b>Local persistence</b><br/>data/runtime.db, data/tasks.json,<br/>data/execution_queue.json, ...")]
+    end
+
+    ProviderCLI["External<br/><b>Local provider CLIs</b>"]
+    GitRepos["External<br/><b>Git repositories</b>"]
+    GitHub["External<br/><b>GitHub</b>"]
+    AiosCore["External<br/><b>AIOS Core</b>"]
+
+    Engineer -->|"HTTP/WebSocket"| Streamlit
+    Engineer -->|"native app"| Desktop
+
+    Streamlit --> UI
+    Streamlit --> Domain
+    Desktop -->|"D2/D3 target: command_center.application adapters<br/>(not yet built)"| Domain
+
+    UI --> Domain
+    Domain --> Runtime
+    Domain --> Stores
+    Runtime --> Stores
+    Runtime --> Supervisor
+    Supervisor -->|"subprocess"| ProviderCLI
+
+    Worker -->|"claims work_item rows"| Stores
+    Worker -->|"dispatches"| ProviderCLI
+    Worker -->|"push, PR ops"| GitHub
+
+    Domain -->|"git/gh operations"| GitRepos
+    Domain -->|"pull-request operations"| GitHub
+
+    Domain --> AiosAdapter
+    Runtime --> AiosAdapter
+    AiosAdapter -->|"aios_sdk / aios_db only"| AiosCore
