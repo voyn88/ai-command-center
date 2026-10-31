@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import importlib.util
 import json
 import math
 import os
+import shutil
+import socket
 import stat
 import struct
 import subprocess
@@ -24,8 +27,36 @@ pytestmark = pytest.mark.usefixtures("host_shaped_fixture_roots")
 
 
 def _launcher_module():
+    pytest.importorskip("fcntl", reason="launcher requires POSIX flock")
     path = Path(__file__).parents[2] / "ops" / "aicc_agent_launcher.py"
     spec = importlib.util.spec_from_file_location("aicc_agent_launcher", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize('executor', ['grok', 'cursor'])
+@pytest.mark.parametrize('profile', ['read_only', 'trusted_development'])
+def test_alternative_provider_boundary(executor, profile):
+    broker = _launcher_module()
+    command = broker._provider_command({'executor': executor, 'profile': profile,
+        'prompt': '--malicious-option', 'model': None})
+    assert command[-2:] == ['--', '--malicious-option']
+    assert set(broker.PROVIDER_AGENT_ENV_KEYS[executor]) == {('XAI_API_KEY' if executor == 'grok' else 'CURSOR_API_KEY')}
+    assert executor not in broker.MODEL_AUTH_SOURCES
+    if executor == 'grok':
+        assert command[0] == "/usr/libexec/aicc-grok-agent"
+        assert command[command.index("--model") + 1] == "grok-4.3"
+    else:
+        assert ('--force' in command) == (profile == 'trusted_development')
+
+
+def _recovery_generator_module():
+    path = Path(__file__).parents[2] / "ops" / "aicc_principal_recovery_generator.py"
+    spec = importlib.util.spec_from_file_location(
+        "aicc_principal_recovery_generator", path
+    )
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -45,6 +76,22 @@ def _transaction_module():
 @pytest.fixture
 def launcher():
     return _launcher_module()
+
+
+@pytest.mark.parametrize("profile", ["read_only", "model_only"])
+def test_grok_review_mount_is_read_only(launcher, monkeypatch, tmp_path, profile):
+    monkeypatch.setattr(launcher, "_validate_environment_file", lambda *a, **kw: False)
+    manifest = _manifest(tmp_path, executor="grok", profile=profile)
+    launcher._load_manifest(json.dumps(manifest).encode())
+    command = launcher._systemd_command(
+        manifest, Path("/run/aicc-agent-homes/test"), "aicc-agent-test.service",
+        "aicc-agent-launcher@test.service", tmp_path.parent, tmp_path,
+    )
+    assert f"--property=BindReadOnlyPaths={tmp_path}:/workspace" in command
+    assert f"--property=BindPaths={tmp_path}:/workspace" not in command
+    assert "--property=ReadWritePaths=/agent-home" in command
+    assert "--property=ReadWritePaths=/workspace /agent-home" not in command
+    assert ("--no-tools" in command) == (profile == "model_only")
 
 
 def test_launcher_admission_and_natural_drain_share_one_task_deadline(
@@ -228,6 +275,215 @@ def test_only_publisher_group_or_root_can_call_broker(launcher, monkeypatch):
     assert launcher._authorised_peer(0)
     assert launcher._authorised_peer(123)
     assert not launcher._authorised_peer(124)
+
+
+def test_a_refused_connection_is_answered_without_failing_its_unit(
+    launcher, monkeypatch
+):
+    """The connection unit's exit status is the BROKER's verdict on itself.
+
+    Returning the answer's exit code as the process status made PID 1 mark
+    `aicc-agent-launcher@<connection>.service` failed for outcomes the broker
+    handled perfectly -- a refused launch here, an agent whose tests went red
+    below -- and a failed instance is never reaped. Their accumulated count is
+    what the host unit-health probe reported as `failed_units` (worker-01,
+    monitor_finding 2051).
+    """
+    monkeypatch.setattr(launcher, "_authorised_peer", lambda uid: False)
+    server, client = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    with server, client:
+        status = launcher._serve_connected_socket(server)
+        answer = json.loads(client.makefile("rb", buffering=0).readline())
+    # The refusal still reaches the caller in full: it is reported, not hidden.
+    assert answer["exit_code"] == 125
+    assert launcher.FAILURE in base64.b64decode(answer["stderr_b64"]).decode()
+    assert status == 0
+
+
+def test_an_agent_exit_code_travels_in_the_payload_not_the_unit_status(launcher):
+    server, client = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    with server, client:
+        status = launcher._deliver_response(
+            server,
+            {
+                "version": 1,
+                "exit_code": 1,
+                "stdout_b64": "",
+                "stderr_b64": base64.b64encode(b"1 test failed\n").decode("ascii"),
+            },
+        )
+        answer = json.loads(client.makefile("rb", buffering=0).readline())
+    assert answer["exit_code"] == 1
+    assert status == 0
+
+
+def test_a_client_that_hung_up_is_journalled_and_is_not_a_broker_fault(
+    launcher, capsys
+):
+    """A worker that abandoned its launch (deadline, kill) leaves nobody to
+    answer. Nothing on this host is broken, so nothing may stay failed."""
+    server, client = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.close()
+    with server:
+        status = launcher._deliver_response(
+            server,
+            {"version": 1, "exit_code": 0, "stdout_b64": "", "stderr_b64": ""},
+        )
+    assert status == 0
+    assert "response undeliverable" in capsys.readouterr().err
+
+
+#: Directives systemd defines in the [Unit] section only. Put one of these in
+#: [Service] (or [Socket], [Timer], ...) and systemd does not fail the unit --
+#: it logs "Unknown key name '<key>' in section '<section>', ignoring" and
+#: carries on with the default, so the unit file states a rule the host never
+#: applies. That is how `CollectMode=` under [Service] left every failed
+#: per-connection instance in PID 1's unit table and brought `failed_units`
+#: back on a host that was carrying the fix (worker-01, monitor_finding 2295).
+#: Deliberately excluded: FailureAction, RebootArgument, StartLimitAction and
+#: StartLimitBurst, which systemd still accepts under [Service] for backwards
+#: compatibility (checked against systemd 255, the fleet's version).
+UNIT_SECTION_ONLY_DIRECTIVES = frozenset(
+    {
+        "AllowIsolate",
+        "After",
+        "Before",
+        "BindsTo",
+        "CollectMode",
+        "Conflicts",
+        "DefaultDependencies",
+        "Description",
+        "Documentation",
+        "IgnoreOnIsolate",
+        "JobRunningTimeoutSec",
+        "JobTimeoutAction",
+        "JobTimeoutSec",
+        "JoinsNamespaceOf",
+        "OnFailure",
+        "OnFailureJobMode",
+        "OnSuccess",
+        "PartOf",
+        "PropagatesReloadTo",
+        "PropagatesStopTo",
+        "RefuseManualStart",
+        "RefuseManualStop",
+        "ReloadPropagatedFrom",
+        "Requires",
+        "RequiresMountsFor",
+        "Requisite",
+        "SourcePath",
+        "StartLimitIntervalSec",
+        "StopPropagatedFrom",
+        "StopWhenUnneeded",
+        "SuccessAction",
+        "Upholds",
+        "Wants",
+    }
+)
+
+
+def _unit_sections(text: str) -> dict[str, list[str]]:
+    """`systemd.syntax(7)` enough to say which section a directive landed in:
+    comments dropped, continuation lines joined, section names kept verbatim."""
+    sections: dict[str, list[str]] = {}
+    current = ""
+    pending = ""
+    for raw in text.splitlines():
+        line = pending + raw.strip() if pending else raw.strip()
+        pending = ""
+        if not line or line.startswith(("#", ";")):
+            continue
+        if line.endswith("\\"):
+            pending = line[:-1]
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            current = line[1:-1]
+            sections.setdefault(current, [])
+            continue
+        sections.setdefault(current, []).append(line)
+    return sections
+
+
+def test_per_connection_units_are_reaped_and_the_old_corpses_are_cleared():
+    """Even a genuine broker fault must not be permanent systemd state: the
+    probe counts units that are failed NOW, and an unreaped instance makes a
+    one-off event a standing finding no repair can clear."""
+    root = Path(__file__).parents[2]
+    launcher_unit = (root / "deploy/systemd/aicc-agent-launcher@.service").read_text()
+    installer = (root / "deploy/install-agent-principal-isolation.sh").read_text()
+    sections = _unit_sections(launcher_unit)
+    # In [Unit], where systemd parses it -- not in [Service], where it is an
+    # ignored line and the reaping rule does not exist (monitor_finding 2295).
+    assert "CollectMode=inactive-or-failed" in sections["Unit"]
+    assert not [line for line in sections["Service"] if line.startswith("CollectMode")]
+    # A directive systemd ignores is indistinguishable from a directive that
+    # works, in the file. The installer reads PID 1's effective value back and
+    # refuses the host if the rule is not the one in effect.
+    guard = (
+        "collect_mode=$(systemctl show "
+        "'aicc-agent-launcher@collectmode-probe.service' \\\n"
+        "    --property=CollectMode --value 2>/dev/null || true)\n"
+        '  [ "$collect_mode" = "inactive-or-failed" ] || {\n'
+    )
+    assert guard in installer
+    # ...and it does so before the socket can accept a connection, so a host
+    # that would accumulate corpses never serves one.
+    assert installer.index(guard) < installer.index(
+        "systemctl enable --now aicc-agent-launcher.socket"
+    )
+    # CollectMode governs instances started after the reload; the ones already
+    # failed on the host are only cleared by asking for it.
+    assert "systemctl reset-failed 'aicc-agent-launcher@*.service'" in installer
+
+
+def test_shipped_unit_files_keep_unit_directives_in_the_unit_section(tmp_path):
+    """The whole class, not just the one directive that got caught: a misplaced
+    [Unit] key is silently ignored, so the repo asserting it is not evidence the
+    host obeys it."""
+    root = Path(__file__).parents[2]
+    generator = _recovery_generator_module()
+    generator.generate(tmp_path, tmp_path / "state")
+    shipped = sorted((root / "deploy/systemd").iterdir())
+    generated = sorted(path for path in tmp_path.rglob("*") if path.is_file())
+    assert shipped and generated
+    misplaced: list[str] = []
+    for path in shipped + generated:
+        for section, directives in _unit_sections(path.read_text()).items():
+            if section == "Unit":
+                continue
+            for directive in directives:
+                key = directive.split("=", 1)[0].strip()
+                if key in UNIT_SECTION_ONLY_DIRECTIVES:
+                    misplaced.append(f"{path.name}: [{section}] {key}=")
+    assert misplaced == []
+
+
+@pytest.mark.skipif(
+    shutil.which("systemd-analyze") is None, reason="needs systemd to parse units"
+)
+def test_systemd_itself_recognises_every_directive_in_the_shipped_units(tmp_path):
+    """The authority on what systemd parses is systemd. Missing binaries and
+    unreachable paths make `verify` noisy and non-zero on a build host, so the
+    assertion is narrowed to the parse: no directive may be unknown."""
+    root = Path(__file__).parents[2]
+    ignored: list[str] = []
+    for unit in sorted((root / "deploy/systemd").glob("*")):
+        if unit.suffix == ".conf":  # a drop-in fragment, not a loadable unit
+            continue
+        staged = tmp_path / unit.name
+        staged.write_text(unit.read_text())
+        result = subprocess.run(
+            ["systemd-analyze", "verify", str(staged)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        ignored += [
+            line
+            for line in (result.stdout + result.stderr).splitlines()
+            if "Unknown key name" in line or "Unknown lvalue" in line
+        ]
+    assert ignored == []
 
 
 def test_outer_unit_is_exact_workspace_and_cgroup_sealed(
@@ -1495,7 +1751,7 @@ def test_lane_timers_are_held_before_apply_and_released_after_commit():
     commit = lines.index("run_transaction commit")
     release_after_commit = lines.index("release_lane_timers", commit)
 
-    assert active < hold < apply_index < commit < release_after_commit
+    assert hold < lines.index("run_transaction prepare") < active < apply_index < commit < release_after_commit
     # Immediately after commit -- not buried behind
     # `verify-agent-principal-boundary.sh` or the rollout step, both of which
     # run before commit and must stay covered by the hold.
@@ -2092,6 +2348,15 @@ def _auth_store(tmp_path, monkeypatch, launcher, payload: bytes):
     )
     home = tmp_path / "home"
     (home / ".claude").mkdir(parents=True)
+    real_fstat = launcher.os.fstat
+
+    def root_owned_fstat(fd):
+        info = real_fstat(fd)
+        fields = list(info)
+        fields[4:6] = [0, 0]
+        return os.stat_result(fields)
+
+    monkeypatch.setattr(launcher.os, "fstat", root_owned_fstat)
     return store, home
 
 
@@ -2103,7 +2368,7 @@ def test_refreshed_model_auth_is_written_back_to_the_store(tmp_path, monkeypatch
     new = json.dumps({"claudeAiOauth": {"accessToken": "b", "refreshToken": "r2", "expiresAt": 2}}).encode()
     store, home = _auth_store(tmp_path, monkeypatch, launcher, old)
     (home / ".claude" / ".credentials.json").write_bytes(new)
-    assert launcher._write_back_model_auth("claude", home) is True
+    assert launcher._write_back_model_auth("claude", home, old) is True
     assert store.read_bytes() == new
     assert stat.S_IMODE(store.stat().st_mode) == 0o600
     assert not list(store.parent.glob(".*.tmp"))
@@ -2112,9 +2377,9 @@ def test_refreshed_model_auth_is_written_back_to_the_store(tmp_path, monkeypatch
 def test_unchanged_or_missing_model_auth_is_not_written_back(tmp_path, monkeypatch, launcher):
     old = json.dumps({"claudeAiOauth": {"accessToken": "a", "refreshToken": "r1"}}).encode()
     store, home = _auth_store(tmp_path, monkeypatch, launcher, old)
-    assert launcher._write_back_model_auth("claude", home) is False
+    assert launcher._write_back_model_auth("claude", home, old) is False
     (home / ".claude" / ".credentials.json").write_bytes(old)
-    assert launcher._write_back_model_auth("claude", home) is False
+    assert launcher._write_back_model_auth("claude", home, old) is False
     assert store.read_bytes() == old
 
 
@@ -2126,14 +2391,147 @@ def test_model_auth_that_changed_shape_or_is_not_json_is_refused(tmp_path, monke
     target = home / ".claude" / ".credentials.json"
     target.write_bytes(b"not json")
     with pytest.raises(launcher.LaunchRefused, match="not JSON"):
-        launcher._write_back_model_auth("claude", home)
+        launcher._write_back_model_auth("claude", home, old)
     target.write_bytes(json.dumps({"claudeAiOauth": {"accessToken": "a"}, "extra": 1}).encode())
     with pytest.raises(launcher.LaunchRefused, match="changed shape"):
-        launcher._write_back_model_auth("claude", home)
+        launcher._write_back_model_auth("claude", home, old)
     target.unlink()
     target.symlink_to(store)
     with pytest.raises(launcher.LaunchRefused, match="plain regular file"):
-        launcher._write_back_model_auth("claude", home)
+        launcher._write_back_model_auth("claude", home, old)
+    assert store.read_bytes() == old
+
+
+
+@pytest.mark.parametrize("executor", ["claude", "codex"])
+def test_unchanged_run_does_not_clobber_another_lanes_token(
+    tmp_path, monkeypatch, launcher, executor
+):
+    old = b'{"token":"old"}'
+    newer = b'{"token":"new"}'
+    store, home = _auth_store(tmp_path, monkeypatch, launcher, old)
+    monkeypatch.setitem(launcher.MODEL_AUTH_SOURCES, executor, store)
+    target = home / launcher.MODEL_AUTH_TARGETS[executor]
+    target.parent.mkdir(exist_ok=True)
+    target.write_bytes(old)
+    store.write_bytes(newer)
+    assert launcher._write_back_model_auth(executor, home, old) is False
+    assert store.read_bytes() == newer
+    assert not (store.parent / ".model-auth.lock").exists()
+
+
+@pytest.mark.parametrize(
+    "executor,run_time,store_time,updated",
+    [
+        ("claude", 20, 30, False),
+        ("claude", 30, 20, True),
+        ("claude", 20, 20, False),
+        ("claude", None, 20, False),
+        ("claude", 20, "invalid", False),
+        ("claude", True, 20, False),
+        ("claude", float("nan"), 20, False),
+        ("claude", 20, float("inf"), False),
+        ("codex", "2026-10-30T12:00:00Z", "2026-10-30T13:00:00Z", False),
+        ("codex", "2026-10-30T14:00:00Z", "2026-10-30T13:00:00Z", True),
+        ("codex", "2026-10-30T14:00:00+03:00", "2026-10-30T12:00:00Z", False),
+        ("codex", "2026-10-30T14:00:00+03:00", "2026-10-30T11:00:00Z", False),
+        ("codex", "2026-10-30T14:00:00", "2026-10-30T11:00:00Z", False),
+        ("codex", "invalid", "2026-10-30T11:00:00Z", False),
+        ("codex", "2026-10-30T14:00:00Z", None, False),
+    ],
+)
+def test_model_auth_concurrent_refresh_requires_strictly_newer_timestamp(
+    tmp_path, monkeypatch, launcher, capsys, executor, run_time, store_time, updated
+):
+    def payload(token, timestamp):
+        if executor == "claude":
+            value = {"claudeAiOauth": {"accessToken": token, "expiresAt": timestamp}}
+        else:
+            value = {"tokens": {"access_token": token}, "last_refresh": timestamp}
+        return json.dumps(value).encode()
+
+    old = payload("staged", None)
+    refreshed = payload("run", run_time)
+    current = payload("other-lane", store_time)
+    store, home = _auth_store(tmp_path, monkeypatch, launcher, old)
+    monkeypatch.setitem(launcher.MODEL_AUTH_SOURCES, executor, store)
+    target = home / launcher.MODEL_AUTH_TARGETS[executor]
+    target.parent.mkdir(exist_ok=True)
+    target.write_bytes(refreshed)
+    store.write_bytes(current)
+    assert launcher._write_back_model_auth(executor, home, old) is updated
+    assert store.read_bytes() == (refreshed if updated else current)
+    if not updated:
+        assert (
+            f"model auth write-back: {executor} skipped, "
+            "store is newer or freshness unknown"
+        ) in capsys.readouterr().err
+
+
+def test_model_auth_lock_is_private_and_held_through_read_and_replace(
+    tmp_path, monkeypatch, launcher
+):
+    old = b'{"token":"old"}'
+    new = b'{"token":"new"}'
+    store, home = _auth_store(tmp_path, monkeypatch, launcher, old)
+    (home / launcher.MODEL_AUTH_TARGETS["claude"]).write_bytes(new)
+    lock_path = store.parent / ".model-auth.lock"
+    checked = []
+
+    def assert_locked():
+        assert stat.S_IMODE(lock_path.stat().st_mode) == 0o600
+        with lock_path.open("rb") as competing:
+            with pytest.raises(BlockingIOError):
+                launcher.fcntl.flock(
+                    competing.fileno(), launcher.fcntl.LOCK_EX | launcher.fcntl.LOCK_NB
+                )
+
+    def read_locked(path, **kwargs):
+        assert_locked()
+        checked.append("read")
+        return path.read_bytes()
+
+    real_replace = launcher.os.replace
+
+    def replace_locked(source, destination):
+        assert_locked()
+        checked.append("replace")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(launcher, "_read_exact_protected_file", read_locked)
+    monkeypatch.setattr(launcher.os, "replace", replace_locked)
+    assert launcher._write_back_model_auth("claude", home, old) is True
+    assert checked == ["read", "replace"]
+    assert store.read_bytes() == new
+    with lock_path.open("rb") as released:
+        launcher.fcntl.flock(released.fileno(), launcher.fcntl.LOCK_EX | launcher.fcntl.LOCK_NB)
+
+
+
+def test_prepare_home_retains_exact_staged_bytes(tmp_path, monkeypatch, launcher):
+    old = b'{ "token": "staged" }\n'
+    store, _ = _auth_store(tmp_path, monkeypatch, launcher, old)
+    homes = tmp_path / "runs"
+    homes.mkdir()
+    monkeypatch.setattr(launcher, "EPHEMERAL_HOME_ROOT", homes)
+    monkeypatch.setattr(launcher.grp, "getgrnam", lambda name: SimpleNamespace(gr_gid=0))
+    monkeypatch.setattr(launcher.os, "fchown", lambda *args: None)
+    monkeypatch.setattr(launcher.os, "chown", lambda *args: None)
+    home, staged = launcher._prepare_agent_home("claude", "a" * 32)
+    target = home / launcher.MODEL_AUTH_TARGETS["claude"]
+    assert target.read_bytes() == staged == old
+    store.write_bytes(b'{"token":"other-lane"}')
+    assert launcher._write_back_model_auth("claude", home, staged) is False
+    assert store.read_bytes() == b'{"token":"other-lane"}'
+
+
+def test_model_auth_size_limit_is_preserved(tmp_path, monkeypatch, launcher):
+    old = b'{"token":"old"}'
+    store, home = _auth_store(tmp_path, monkeypatch, launcher, old)
+    monkeypatch.setattr(launcher, "MAX_MODEL_AUTH_BYTES", len(old))
+    (home / launcher.MODEL_AUTH_TARGETS["claude"]).write_bytes(old + b" ")
+    with pytest.raises(launcher.LaunchRefused, match="plain regular file"):
+        launcher._write_back_model_auth("claude", home, old)
     assert store.read_bytes() == old
 
 
@@ -2211,6 +2609,8 @@ def test_the_control_profile_installs_the_pr_window_tick(tmp_path):
         "voyn-aicc-review.timer",
         "voyn-aicc-merge.service",
         "voyn-aicc-merge.timer",
+        "voyn-aicc-credential-rescue.service",
+        "voyn-aicc-credential-rescue.timer",
         "voyn-aicc-remediate.service",
         "voyn-aicc-remediate.timer",
         "voyn-aicc-pr-window.service",
@@ -2332,3 +2732,66 @@ def test_the_installer_starts_the_control_timers_after_it_commits(tmp_path):
     assert text.index(enable) < text.index(
         "echo \"AICC_AGENT_PRINCIPAL_ISOLATION_INSTALLED\""
     ), "a failed enable must not be announced as a completed install"
+
+
+def test_workspace_walk_holds_descriptors_per_pending_directory_not_per_visited_one(
+    launcher, monkeypatch, tmp_path
+):
+    """One fd per PENDING directory is the walk's contract; a leak of one fd per
+    VISITED directory (the old `os.scandir(os.dup(fd))`) exhausts the soft
+    RLIMIT_NOFILE on any wide tree and surfaced as "entry changed while
+    opening" (worker-01, 2026-09-15). Walk 400 shallow directories under a
+    120-descriptor limit: it must finish and normalize every mode."""
+    import resource
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    # 20 x 20 = 400 directories VISITED, but never more than ~40 PENDING at
+    # once: the walk legitimately holds one fd per pending directory, so a
+    # per-visit leak is what a 120-descriptor limit exposes here.
+    for outer in range(20):
+        for inner in range(20):
+            leaf = workspace / f"pkg{outer:02d}" / f"sub{inner:02d}"
+            leaf.mkdir(parents=True)
+            (leaf / "module.py").write_text("x = 1\n", encoding="utf-8")
+    monkeypatch.setattr(
+        launcher.grp, "getgrnam", lambda name: SimpleNamespace(gr_gid=os.getgid())
+    )
+    monkeypatch.setattr(launcher.os, "chown", lambda *args, **kwargs: None)
+    monkeypatch.setattr(launcher, "_tracked_executables", lambda path: frozenset())
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (min(120, soft), hard))
+    try:
+        launcher._prepare_workspace_permissions(workspace)
+    finally:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+    assert stat.S_IMODE((workspace / "pkg19" / "sub19").stat().st_mode) == 0o2770
+    assert (
+        stat.S_IMODE((workspace / "pkg19" / "sub19" / "module.py").stat().st_mode)
+        == 0o660
+    )
+
+
+def test_workspace_walk_names_descriptor_exhaustion_honestly(
+    launcher, monkeypatch, tmp_path
+):
+    workspace = tmp_path / "workspace"
+    (workspace / "a").mkdir(parents=True)
+    monkeypatch.setattr(
+        launcher.grp, "getgrnam", lambda name: SimpleNamespace(gr_gid=os.getgid())
+    )
+    monkeypatch.setattr(launcher.os, "chown", lambda *args, **kwargs: None)
+    monkeypatch.setattr(launcher, "_tracked_executables", lambda path: frozenset())
+    real_open = os.open
+
+    def exhausted(path, flags, *args, **kwargs):
+        # `launcher.os` is the os module itself, so this patch is global:
+        # fail only the walk's own open of the workspace entry "a".
+        if kwargs.get("dir_fd") is not None and path == "a":
+            raise OSError(24, "Too many open files")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(launcher.os, "open", exhausted)
+    with pytest.raises(launcher.LaunchRefused) as refused:
+        launcher._prepare_workspace_permissions(workspace)
+    assert "ran out of file descriptors" in str(refused.value)
