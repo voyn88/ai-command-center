@@ -388,6 +388,65 @@ def test_unexplained_deaths_beyond_the_quota_class_still_raise_growth() -> None:
     assert "dead_letter_growth:1>0" in report.failures
 
 
+def test_the_quota_pattern_is_built_from_the_declared_vocabulary() -> None:
+    """The alternation used to be a hand-typed literal inside the SQL.
+
+    It is now derived, and the derivation is what makes the worker's budget
+    choice and this probe's verdict two readings of one list
+    (`agent_runner._CAPACITY_REFUSAL_SIGNATURES` holds the other). A literal
+    that drifted back inline would let the two disagree silently, which is
+    the shape of VOYN-MON-CONTROL-01-QUEUE-EXECUTOR-QUOTA-EXHAUSTED.
+    """
+    import re
+
+    from command_center.ops.infra_monitor import (
+        QUOTA_DEAD_REASON_REGEX,
+        QUOTA_DEAD_REASON_TERMS,
+    )
+
+    assert QUOTA_DEAD_REASON_TERMS, "a probe with no vocabulary measures nothing"
+    for term in QUOTA_DEAD_REASON_TERMS:
+        assert re.search(QUOTA_DEAD_REASON_REGEX, term, re.IGNORECASE), term
+    # The dead letters the capacity family actually writes are counted, and
+    # the host-class ones are not. These are the two `dead_reason` shapes
+    # `queue_fail_capacity_wait` / `queue_fail_infra_wait` leave behind.
+    assert re.search(
+        QUOTA_DEAD_REASON_REGEX,
+        "capacity_wait_exhausted: executor capacity exhausted (quota/spend/rate): "
+        "You've hit your usage limit",
+        re.IGNORECASE,
+    )
+    assert not re.search(
+        QUOTA_DEAD_REASON_REGEX,
+        "infra_wait_exhausted: executor infrastructure failure (provider/auth): "
+        "Error: No authentication information found",
+        re.IGNORECASE,
+    )
+
+
+def test_the_quota_probe_reads_healthy_while_capacity_refusals_are_merely_waiting() -> None:
+    """What "the monitor clears the finding" means after 0029.
+
+    A capacity window no longer dead-letters anything for ~22.75 hours, so
+    during an outage the queue has items waiting and nothing dead: the quota
+    class is zero and the probe reports ok. The finding returns only for an
+    outage that outlasts the whole capacity budget, which is an operator's
+    problem rather than a work item's.
+    """
+    from command_center.ops.infra_monitor import evaluate
+
+    report = evaluate(
+        {"voyn-aicc-worker@1.service": "active"},
+        _queue(ready=12, claimed=0, recent_dead=0, recent_quota_dead=0),
+        minimum_active_workers=1,
+        max_stalled_seconds=900,
+        prometheus_ready=True,
+        max_recent_dead=5,
+    )
+    assert not any(f.startswith("executor_quota_exhausted") for f in report.failures)
+    assert not any(f.startswith("dead_letter_growth") for f in report.failures)
+
+
 def test_spinning_lanes_with_no_success_in_an_hour_are_a_throughput_stall() -> None:
     from command_center.ops.infra_monitor import evaluate
 

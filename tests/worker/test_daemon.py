@@ -68,6 +68,10 @@ class ScriptedStore:
         self.calls.append(("fail_infra_wait", work.attempt_id, reason))
         return True
 
+    def fail_capacity_wait(self, work, *, reason):
+        self.calls.append(("fail_capacity_wait", work.attempt_id, reason))
+        return True
+
 
 def _run_until_idle(daemon: WorkerDaemon, store: ScriptedStore) -> None:
     """Run the loop until the script is exhausted, then stop it via the
@@ -149,6 +153,49 @@ def test_an_infra_wait_failure_routes_to_the_infra_wait_store_method() -> None:
         "executor infrastructure failure (agent principal isolation): socket inactive",
     ) in store.calls
     assert not any(c[0] == "fail" for c in store.calls)
+
+
+def test_a_capacity_wait_failure_routes_to_the_capacity_wait_store_method() -> None:
+    """0029's third no-fault family needs its own route, or the refusal lands
+    back on the infra budget whose clock is an hour
+    (VOYN-MON-CONTROL-01-QUEUE-EXECUTOR-QUOTA-EXHAUSTED)."""
+    store = ScriptedStore([_work({"kind": "capacity"})])
+    reason = "executor capacity exhausted (quota/spend/rate): weekly limit reached"
+
+    def capacity(payload, lease_lost, attempt_no=1):
+        return HandlerOutcome(ok=False, reason=reason, capacity_wait=True)
+
+    daemon = WorkerDaemon(
+        store, {"capacity": capacity}, WorkerConfig(visibility_seconds=3)
+    )
+    _run_until_idle(daemon, store)
+
+    assert ("fail_capacity_wait", "wat-1", reason) in store.calls
+    assert not any(
+        c[0] in {"fail", "fail_infra_wait", "fail_lease_wait"} for c in store.calls
+    )
+
+
+def test_capacity_outranks_infra_when_a_handler_sets_both() -> None:
+    """`capacity_wait` is the narrower fact, so it wins.
+
+    The ordering is load-bearing rather than cosmetic: a handler that reports
+    both must not have the refusal charged to the host-recovery budget, which
+    is the whole failure this family was split out of. Asserted here because
+    the only thing enforcing it is the order of the `elif` chain.
+    """
+    store = ScriptedStore([_work({"kind": "both"})])
+
+    def both(payload, lease_lost, attempt_no=1):
+        return HandlerOutcome(
+            ok=False, reason="usage limit", capacity_wait=True, infra_wait=True
+        )
+
+    daemon = WorkerDaemon(store, {"both": both}, WorkerConfig(visibility_seconds=3))
+    _run_until_idle(daemon, store)
+
+    assert ("fail_capacity_wait", "wat-1", "usage limit") in store.calls
+    assert not any(c[0] == "fail_infra_wait" for c in store.calls)
 
 
 def test_a_raising_handler_is_a_retryable_failure() -> None:

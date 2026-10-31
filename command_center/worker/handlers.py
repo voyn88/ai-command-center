@@ -584,6 +584,15 @@ def _run_agent(
 
     available, detail, unavailable_reason = _executor_preflight(executor, task_type)
     unknown_executors: list[str] = []
+    # Every refusal collected while looking for a link that can run, not just
+    # whichever one the search happened to look at last. `detail` and
+    # `unavailable_reason` are overwritten by each unavailable candidate, so
+    # they name one arbitrary link -- fine for an operator-facing message,
+    # useless for deciding which WAIT BUDGET the refusal belongs to. That is a
+    # property of all of them together (see the `capacity` decision below).
+    refusals: list[tuple[str, str]] = []
+    if not available:
+        refusals.append((unavailable_reason, detail))
     if not available and link is not None:
         # An open Codex circuit is a routing fact, not a consumed model
         # attempt. Select the next healthy cascade link inside this already
@@ -622,6 +631,7 @@ def _run_agent(
             )
             if not candidate_available:
                 detail, unavailable_reason = candidate_detail, candidate_reason
+                refusals.append((candidate_reason, candidate_detail))
                 continue
             link = candidate
             cascade_step = candidate_step
@@ -657,11 +667,63 @@ def _run_agent(
                 ),
                 retryable=True,
             )
+        # Which substrate, though? A missing CLI or a refused sandbox is cured
+        # by the host recovering, which is what the infra-wait budget's clock
+        # is sized for (20 refusals, ~1.1 hours of wall time). An exhausted
+        # ACCOUNT is not: the codex preflight runs a real Codex call, so a
+        # weekly limit lands here as a preflight detail
+        # ("You've hit your usage limit ... try again at Sep 15th") and the
+        # window it names can be days wide. Charged to the infra budget, every
+        # item in flight burned all 20 waits in the first hour and was
+        # dead-lettered -- which is the hourly `executor_quota_exhausted`
+        # finding on control-01:queue
+        # (VOYN-MON-CONTROL-01-QUEUE-EXECUTOR-QUOTA-EXHAUSTED). The capacity
+        # budget waits on the provider's clock instead.
+        #
+        # EVERY refusal must be a capacity refusal, not merely the last one
+        # the search looked at. A cascade whose codex link is out of weekly
+        # quota while its claude link has no CLI installed is curable on the
+        # HOST clock -- the sooner of the two -- so it belongs to the infra
+        # family, and the capacity family's 15-minute floor would be pure
+        # added latency. Deciding from `detail` alone made the family depend
+        # on cascade order, which is not a fact about the outage. The live
+        # incident is the all-capacity case: both paid links of the review
+        # cascade were measured exhausted on the same day.
+        capacity = bool(refusals) and all(
+            agent_runner.is_capacity_refusal(reason, text) for reason, text in refusals
+        )
+        # The terminal reason stays the LAST exhausted candidate's (review
+        # finding on b311666) -- but the last one OF THE CLASS being waited
+        # on, because `reason` becomes `dead_reason` and `dead_reason` is all
+        # the hourly probe sees. Reporting a mixed cascade's capacity half
+        # while charging the refusal to the HOST budget would write
+        # `infra_wait_exhausted: ... usage limit`: counted as a quota death by
+        # a probe measuring a wait that was never on the capacity clock. That
+        # disagreement between the text and the budget is
+        # VOYN-MON-CONTROL-01-QUEUE-EXECUTOR-QUOTA-EXHAUSTED in miniature, so
+        # the rule is to classify and report from the same refusal.
+        #
+        # In a cascade whose refusals are all one class -- every real one so
+        # far -- this is exactly the last refusal, unchanged.
+        reported_reason, reported_detail = next(
+            (
+                refusal
+                for refusal in reversed(refusals)
+                if agent_runner.is_capacity_refusal(*refusal) == capacity
+            ),
+            (unavailable_reason, detail),
+        )
         return HandlerOutcome(
             ok=False,
-            reason=f"{unavailable_reason}: {detail}",
+            reason=(
+                f"executor capacity exhausted (quota/spend/rate): "
+                f"{reported_reason}: {reported_detail}"
+                if capacity
+                else f"{reported_reason}: {reported_detail}"
+            ),
             retryable=True,
-            infra_wait=True,
+            capacity_wait=capacity,
+            infra_wait=not capacity,
         )
 
     if lease_lost.is_set():
@@ -1307,12 +1369,13 @@ def _run_agent(
                 retryable=True,
                 infra_wait=True,
             )
+        provider_error = run.is_executor_provider_error(executor)
         non_mutating_copilot_failure = (
             executor == "copilot"
             and task_type not in agent_runner.MUTATING_TASK_TYPES
             and run.status != "completed"
         )
-        if run.is_executor_provider_error(executor) or non_mutating_copilot_failure:
+        if provider_error or non_mutating_copilot_failure:
             # Incident 2026-08-21 16:09 UTC: the CLI process itself started
             # (exit code 1, non-empty stdout) but the *account*, not the
             # task, failed -- a rate limit / auth / overload response the
@@ -1325,14 +1388,55 @@ def _run_agent(
             checkpoint_failure = checkpoint_preserved_candidate()
             if checkpoint_failure is not None:
                 return checkpoint_failure
+            # This branch -- not the preflight one above -- is where the live
+            # quota deaths were minted, and it is reached only after the
+            # in-lease failover loop above has already failed to find a link
+            # that can serve the delivery. "Redelivery may land on a
+            # healthier host/account" is true of a broken launcher or a
+            # logged-out CLI; it is false of an exhausted subscription
+            # window, which closes on the PROVIDER's schedule and is the same
+            # window on every host. Charged to the infra budget, the Claude
+            # Max 5-hour rolling cap and the codex weekly cap each outlived
+            # all 20 waits (~1.1 h) and dead-lettered the work as
+            # `infra_wait_exhausted: ... (provider/auth/quota)` -- the rows
+            # the hourly `executor_quota_exhausted` finding counts
+            # (VOYN-MON-CONTROL-01-QUEUE-EXECUTOR-QUOTA-EXHAUSTED).
+            #
+            # Classified from the SAME string that is reported, not from the
+            # untruncated original. `reason` becomes `dead_reason`, and
+            # `dead_reason` is all the hourly probe sees: judging the full
+            # text while reporting its tail would let a capacity term decide
+            # the budget and then fall outside the recorded reason (a real
+            # capacity outage the probe cannot see), or survive in the tail of
+            # a refusal classified from a status that outvoted it (a host
+            # death the probe reports as a quota death). One string, one
+            # verdict, no gap for the two to disagree in.
+            #
+            # Passing this text is within `is_capacity_refusal`'s containment
+            # rule even on the `non_mutating_copilot_failure` half: that
+            # predicate requires `run.status != "completed"`, so no delivered
+            # review verdict -- the free text the rule exists to keep out --
+            # can reach here.
+            diagnostic = _tail(result_text or run.stderr)
+            capacity = agent_runner.is_capacity_refusal(
+                run.api_error_status, diagnostic
+            )
             return HandlerOutcome(
                 ok=False,
                 reason=(
-                    "executor infrastructure failure "
-                    f"(provider/auth/quota): {_tail(result_text or run.stderr)}"
+                    f"executor capacity exhausted (quota/spend/rate): {diagnostic}"
+                    if capacity
+                    # No longer "/quota": a capacity refusal takes the branch
+                    # above, so naming quota here would be boilerplate that
+                    # makes the monitor's `dead_reason ~* '(quota|...)'` probe
+                    # report every transport and auth death as a quota death
+                    # -- a finding nobody can act on and one that could never
+                    # clear while any provider refusal at all was dying.
+                    else f"executor infrastructure failure (provider/auth): {diagnostic}"
                 ),
                 retryable=True,
-                infra_wait=True,
+                capacity_wait=capacity,
+                infra_wait=not capacity,
             )
         if run.is_executor_sandbox_error:
             # bwrap failed before Codex could enter the sandbox or run tools.

@@ -194,6 +194,71 @@ _CODEX_RETRYABLE_FAILURE_SIGNATURES = (
     "too many requests",
     "stream disconnected",
 )
+
+#: An ALREADY-CLASSIFIED refusal whose text names an exhausted *pool* rather
+#: than a broken *host*. The two have different clocks, which is the whole
+#: reason this list exists: a missing CLI, a dead launcher socket or a refused
+#: sandbox is cured by the host recovering (minutes), while a spend/usage
+#: window closes on the provider's schedule -- the fleet's Claude credential
+#: is a Max subscription with a 5-hour rolling cap and the codex account a
+#: weekly one (live: out of quota 2026-09-14..19, four days). Retrying a
+#: capacity refusal every five minutes cannot shorten that window; it only
+#: spends the infra-wait budget, which is 20 refusals ~= 1.1 hours of wall
+#: time, and then dead-letters work that nothing was wrong with
+#: (VOYN-MON-CONTROL-01-QUEUE-EXECUTOR-QUOTA-EXHAUSTED).
+#:
+#: Vocabulary note: every term the fail-closed monitor greps for in a
+#: `dead_reason` (`ops.infra_monitor.QUOTA_DEAD_REASON_TERMS`) appears here,
+#: pinned by a test -- the queue must not be able to classify a refusal as
+#: "infrastructure" that the monitor will then report as a quota death.
+_CAPACITY_REFUSAL_SIGNATURES = (
+    "usage limit",  # claude / codex / copilot: "You've hit your usage limit"
+    "session limit",  # the Claude Max 5-hour rolling window
+    "weekly limit",
+    "rate limit",
+    "too many requests",
+    "quota",  # OpenAI-compatible providers: `insufficient_quota`
+    "spend limit",
+    "credit balance",  # Anthropic API: "credit balance is too low"
+    "out of credits",
+)
+
+#: Statuses a provider returns when the ACCOUNT, not the request, is out of
+#: room. Matched EXACTLY against the CLI's own structured `api_error_status`
+#: field, never searched for inside free text: "429" as a substring occurs in
+#: shas, timestamps and diffs. 5xx overload is deliberately absent -- that is
+#: transient infrastructure the next delivery may well find recovered.
+_CAPACITY_API_STATUSES = frozenset({"402", "429"})
+
+
+def is_capacity_refusal(*diagnostics: object) -> bool:
+    """Whether a refusal that is ALREADY known not to be task work names an
+    exhausted account/pool.
+
+    Containment is the caller's job and is the same rule the executor-specific
+    signature lists follow: only pass diagnostics from a run (or preflight)
+    that has already been positively classified as a provider/infrastructure
+    refusal. Free text from a run that EXECUTED must never reach here -- a
+    genuine review may discuss rate limits at length.
+
+    Each argument is judged twice and differently, which is why this takes
+    varargs rather than one joined string: a structured status field is
+    compared exactly (`api_error_status=429`), free text by signature.
+    `None` arguments are ignored so callers can pass optional fields directly.
+    """
+    for diagnostic in diagnostics:
+        if diagnostic is None:
+            continue
+        text = str(diagnostic).strip().lower()
+        if not text:
+            continue
+        if text in _CAPACITY_API_STATUSES:
+            return True
+        if any(signature in text for signature in _CAPACITY_REFUSAL_SIGNATURES):
+            return True
+    return False
+
+
 _CODEX_PREFLIGHT_PROMPT = (
     "This is a disposable sandbox capability probe. In the current repository, "
     "create a file named aicc-codex-commit-probe.txt containing exactly "
@@ -1220,11 +1285,25 @@ class RunResult:
         pre-task auth/quota/network failures on stderr. Free text is
         considered only for a failed, non-zero process, so a successful
         review that merely discusses a rate limit cannot trigger a retry.
+
+        `openai_http` is classified by EXIT CODE, not by text, because this
+        bridge is ours and its codes are a contract (`openai_exec.main`,
+        pinned by `tests/test_openai_exec.py`): 1 is the provider half --
+        every transport error, non-2xx status and empty/unparseable
+        completion -- while 2 (a task type or prompt the bridge refuses) and
+        3 (no key in the environment) are facts about the payload and the
+        deployment that no provider recovery cures. Without this the bridge
+        had no provider classification at all, so a 429 from the free tier
+        that exists to RELIEVE quota pressure was banked as a completed
+        review whose whole verdict was the provider's error text -- the same
+        false success the Codex signature list above was added for.
         """
         if self.is_executor_api_error:
             return True
         if self.status != "failed" or not self.exit_code:
             return False
+        if executor == "openai_http":
+            return self.exit_code == 1
         signatures = {
             "copilot": _COPILOT_RETRYABLE_FAILURE_SIGNATURES,
             "codex": _CODEX_RETRYABLE_FAILURE_SIGNATURES,

@@ -1065,7 +1065,7 @@ def test_completion_without_a_result_is_refused_by_the_signature_itself(
             "AND p.proname NOT IN "
             "('queue_enqueue','queue_claim','queue_heartbeat','queue_complete',"
             "'queue_fail','queue_fail_lease_wait','queue_fail_infra_wait',"
-            "'queue_reap','queue_redrive')"
+            "'queue_fail_capacity_wait','queue_reap','queue_redrive')"
         )
         assert cur.fetchone()[0] == 0, "an unexpected queue entry point appeared"
 
@@ -1268,14 +1268,51 @@ def test_infra_waits_do_not_consume_the_attempt_budget_even_as_history_grows(
     assert (attempt_count, infra_wait_count) == (2, 2)
 
 
-def _wait_budgets(admin_conn, item_id: str) -> tuple[int, int]:
+def _wait_budgets(admin_conn, item_id: str) -> tuple[int, int, int]:
+    """All three no-fault budgets, in migration order: lease (0022), infra
+    (0024), capacity (0029). One helper rather than three, because the
+    property each family's test actually needs is that the OTHER two were not
+    spent -- a refusal charged to the wrong clock is the bug this trio exists
+    to prevent, and a helper returning only its own family's count could not
+    express it.
+    """
     with admin_conn.cursor() as cur:
         cur.execute(
-            "SELECT lease_wait_count, infra_wait_count FROM work_item "
-            "WHERE work_item_id = %s",
+            "SELECT lease_wait_count, infra_wait_count, capacity_wait_count "
+            "FROM work_item WHERE work_item_id = %s",
             (item_id,),
         )
         return cur.fetchone()
+
+
+def infra_monitor_quota_pattern() -> str:
+    """The alternation the hourly `control-01:queue` probe greps a
+    `dead_reason` with, read from the monitor instead of retyped here.
+
+    The queue suite reaching into an ops module is the coupling itself, not an
+    accident of convenience: `dead_reason` is the only channel between the
+    function that writes it and the probe that measures it, so a test that
+    spelled the pattern out again could pass while the two drifted.
+    """
+    from command_center.ops import infra_monitor
+
+    return "(?i)" + infra_monitor.QUOTA_DEAD_REASON_REGEX
+
+
+def _release(admin_conn, item_id: str) -> None:
+    """Make a requeued item claimable now, whatever clock it is waiting on.
+
+    The capacity family deliberately waits 15 minutes to an hour per refusal
+    (`_queue_capacity_backoff`), so a test that drives a whole budget cannot
+    wait it out -- that is the entire point of the clock. The delay itself is
+    asserted directly in
+    `test_the_capacity_clock_waits_on_the_provider_not_the_host`.
+    """
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "UPDATE work_item SET available_at = now() WHERE work_item_id = %s",
+            (item_id,),
+        )
 
 
 def test_the_last_lease_wait_refunds_its_attempt_like_every_one_before(
@@ -1312,7 +1349,7 @@ def test_the_last_lease_wait_refunds_its_attempt_like_every_one_before(
     assert state[0] == "dead"
     assert state[5] == f"lease_wait_exhausted: {reason}"
     assert state[1] == 0, "not one model attempt was ever spent on this item"
-    assert _wait_budgets(admin_conn, item_id) == (3, 0), "the waits themselves are all counted"
+    assert _wait_budgets(admin_conn, item_id) == (3, 0, 0), "the waits themselves are all counted"
     with admin_conn.cursor() as cur:
         cur.execute(
             "SELECT reason, detail ->> 'attempt_count', detail ->> 'lease_wait_count' "
@@ -1337,7 +1374,14 @@ def test_the_last_infra_wait_refunds_its_attempt_too(
     app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
     with psycopg.connect(app_dsn, autocommit=True) as app:
         item_id = _enqueue(app, "outage", max_attempts=5, backoff_seconds=0)
-    reason = "executor infrastructure failure (provider/auth/quota): session limit"
+    # A reason this family can still produce after 0029: the account is fine,
+    # the HOST is not. A session/usage limit is no longer an example of an
+    # infra wait at all -- the worker routes it to the capacity family -- and
+    # leaving one here would have documented the conflation 0029 removes.
+    reason = (
+        "executor infrastructure failure (agent principal isolation): "
+        "launcher socket inactive"
+    )
     with (
         _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names),
         psycopg.connect(host_dsns[0], autocommit=True) as worker,
@@ -1355,9 +1399,14 @@ def test_the_last_infra_wait_refunds_its_attempt_too(
     state = _item(admin_conn, item_id)
     assert state[0] == "dead"
     assert state[5] == f"infra_wait_exhausted: {reason}"
-    assert re.search(r"(?i)session limit", state[5]), "infra_monitor classifies by reason"
+    # `infra_monitor` classifies by reason, so the text a host-class death
+    # leaves behind decides whether the hourly probe calls it a QUOTA death.
+    # This one must not be: nothing about it names an exhausted account.
+    assert not re.search(
+        infra_monitor_quota_pattern(), state[5]
+    ), "a host failure must not be reported as executor_quota_exhausted"
     assert state[1] == 0, "the outage spent no model attempt"
-    assert _wait_budgets(admin_conn, item_id) == (0, 2)
+    assert _wait_budgets(admin_conn, item_id) == (0, 2, 0)
     with admin_conn.cursor() as cur:
         cur.execute(
             "SELECT reason, detail ->> 'attempt_count' FROM work_event "
@@ -1411,7 +1460,7 @@ def test_redrive_clears_both_wait_budgets_it_widens_the_attempts_for(
                 )
                 assert ok is True and got == expected
         assert _item(admin_conn, item_id)[0] == "dead"
-        assert _wait_budgets(admin_conn, item_id) == (2, 1)
+        assert _wait_budgets(admin_conn, item_id) == (2, 1, 0)
         with psycopg.connect(app_dsn, autocommit=True) as app:
             assert _call(app, "SELECT queue_redrive(%s, 2)", (item_id,))[0] is True
         state = _item(admin_conn, item_id)
@@ -1419,7 +1468,7 @@ def test_redrive_clears_both_wait_budgets_it_widens_the_attempts_for(
         assert state[1] == 1, "the real failure's attempt is still not reset"
         assert state[2] == 4, "the attempt budget is still widened explicitly"
         assert state[5] is None
-        assert _wait_budgets(admin_conn, item_id) == (0, 0), "both wait budgets start over"
+        assert _wait_budgets(admin_conn, item_id) == (0, 0, 0), "every wait budget starts over"
         # The whole point: the redriven item survives the next fleet refusal.
         with psycopg.connect(host_dsns[0], autocommit=True) as worker:
             token, token_hash = _token()
@@ -1441,6 +1490,280 @@ def test_redrive_clears_both_wait_budgets_it_widens_the_attempts_for(
             (item_id,),
         )
         assert cur.fetchall() == [("2", "1")]
+
+
+def test_a_capacity_wait_refunds_the_attempt_and_spends_only_its_own_budget(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """0029's base case: the third no-fault family behaves like the other two
+    (attempt refunded, item back to `ready`) and charges the refusal to
+    `capacity_wait_count` alone. The last assertion is the one that matters --
+    an exhausted account must not spend the HOST-recovery budget, because
+    that budget's clock is ~1.1 hours and the window is not."""
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
+    with psycopg.connect(app_dsn, autocommit=True) as app:
+        item_id = _enqueue(app, "capacity", max_attempts=1, backoff_seconds=0)
+
+    with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
+        with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+            token, token_hash = _token()
+            verdict = _claim(worker, token_hash)
+            assert verdict[0] and verdict[4] == 1
+            assert _call(
+                worker,
+                "SELECT ok, reason FROM queue_fail_capacity_wait(%s, %s, %s, 24)",
+                (
+                    verdict[3],
+                    token,
+                    "executor capacity exhausted (quota/spend/rate): "
+                    "You've hit your usage limit",
+                ),
+            ) == (True, "capacity_wait_requeued")
+
+    state = _item(admin_conn, item_id)
+    assert state[0] == "ready"
+    assert state[1] == 0, "an exhausted account spends no model attempt"
+    assert _wait_budgets(admin_conn, item_id) == (0, 0, 1), (
+        "the capacity refusal is charged to the capacity clock and nothing else"
+    )
+
+
+def test_the_capacity_clock_waits_on_the_provider_not_the_host(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """The clock is the whole fix, so it is asserted as a number.
+
+    `_queue_backoff` doubles from 2 s to a 300 s ceiling -- right for a
+    launcher that comes back in minutes, and the reason 20 infra waits fit
+    inside 1.1 hours. `_queue_capacity_backoff` starts at 15 minutes and
+    grows to an hour, so the default 24 waits is most of a day: long enough
+    to outlast the Claude Max 5-hour rolling cap and to keep polling cheap
+    while a weekly window drains.
+    """
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "SELECT extract(epoch FROM _queue_capacity_backoff(w)) "
+            "FROM generate_series(0, 4) AS w"
+        )
+        assert [row[0] for row in cur.fetchall()] == [900, 900, 1800, 3600, 3600]
+        # 24 waits on this clock against the infra family's whole budget.
+        cur.execute(
+            "SELECT sum(extract(epoch FROM _queue_capacity_backoff(w))), "
+            "       sum(extract(epoch FROM _queue_backoff(2, w))) "
+            "FROM generate_series(1, 20) AS w"
+        )
+        capacity_total, infra_total = cur.fetchone()
+        assert infra_total < 1.2 * 60 * 60, infra_total
+        assert capacity_total > 18 * 60 * 60, capacity_total
+
+
+def test_a_capacity_window_outlives_the_infra_budget_without_dead_lettering(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """The regression test for the finding itself
+    (VOYN-MON-CONTROL-01-QUEUE-EXECUTOR-QUOTA-EXHAUSTED).
+
+    Before 0029 an exhausted account was charged to `infra_wait_count`, whose
+    cap is 20. So the twenty-first refusal of a window that was four days wide
+    (codex, 2026-09-14..19) dead-lettered work that nothing was wrong with,
+    and the hourly probe counted those rows as `executor_quota_exhausted`.
+    Here the same twenty refusals -- one more than the infra family would have
+    survived -- leave the item `ready` with its attempt budget untouched, and
+    the infra budget unspent so a real host failure still gets its own full
+    twenty.
+    """
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
+    with psycopg.connect(app_dsn, autocommit=True) as app:
+        item_id = _enqueue(app, "four-day-window", max_attempts=2, backoff_seconds=0)
+    reason = (
+        "executor capacity exhausted (quota/spend/rate): ERROR: You've hit your "
+        "usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase "
+        "more credits or try again at Sep 15th, 2026 1:24 AM."
+    )
+    with (
+        _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names),
+        psycopg.connect(host_dsns[0], autocommit=True) as worker,
+    ):
+        for delivery in range(1, 21):
+            token, token_hash = _token()
+            verdict = _claim(worker, token_hash)
+            assert verdict[0], verdict[1]
+            assert verdict[4] == delivery, "the delivery number follows the history"
+            assert _call(
+                worker,
+                "SELECT ok, reason FROM queue_fail_capacity_wait(%s, %s, %s, 24)",
+                (verdict[3], token, reason),
+            ) == (True, "capacity_wait_requeued")
+            _release(admin_conn, item_id)
+
+    state = _item(admin_conn, item_id)
+    assert state[0] == "ready", "twenty capacity refusals must not kill the work"
+    assert state[5] is None, "and must leave no dead letter for the probe to count"
+    assert state[1] == 0, "none of them spent a model attempt"
+    assert _wait_budgets(admin_conn, item_id) == (0, 0, 20), (
+        "a real host failure still has its own untouched twenty"
+    )
+
+    # And the work actually runs once the window reopens.
+    with (
+        _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names),
+        psycopg.connect(host_dsns[0], autocommit=True) as worker,
+    ):
+        token, token_hash = _token()
+        verdict = _claim(worker, token_hash)
+        assert verdict[0], verdict[1]
+        assert _call(
+            worker,
+            "SELECT ok, reason FROM queue_complete(%s, %s, %s::jsonb)",
+            (verdict[3], token, json.dumps({"head_sha": "a" * 40})),
+        ) == (True, None)
+    assert _item(admin_conn, item_id)[0] == "succeeded"
+
+    # The "before" half, so the regression is pinned and not merely described:
+    # the SAME refusal count charged to the family it used to be charged to
+    # still dead-letters, with a `dead_reason` the hourly probe would read as
+    # a quota death. This is the behaviour the worker must never route a
+    # capacity refusal into again -- not a defect in 0024, whose clock is
+    # correct for the substrate it measures.
+    with psycopg.connect(app_dsn, autocommit=True) as app:
+        misfiled_id = _enqueue(app, "misfiled-window", max_attempts=2, backoff_seconds=0)
+    with (
+        _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names),
+        psycopg.connect(host_dsns[0], autocommit=True) as worker,
+    ):
+        for _ in range(21):
+            token, token_hash = _token()
+            verdict = _claim(worker, token_hash)
+            assert verdict[0], verdict[1]
+            assert _call(
+                worker,
+                "SELECT ok, reason FROM queue_fail_infra_wait(%s, %s, %s)",
+                (verdict[3], token, reason),
+            )[0] is True
+            _release(admin_conn, misfiled_id)
+    misfiled = _item(admin_conn, misfiled_id)
+    assert misfiled[0] == "dead", "the infra budget's twenty do not survive a window"
+    assert misfiled[5].startswith("infra_wait_exhausted: ")
+    assert re.search(infra_monitor_quota_pattern(), misfiled[5]), (
+        "and this is the row the hourly probe counted as executor_quota_exhausted"
+    )
+
+
+def test_a_capacity_outage_that_outlasts_a_whole_day_still_dies_and_is_measured(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """The budget is patience, not immortality.
+
+    A day with no model capacity at all is an operator's problem, so the
+    family still ends in a dead letter -- the attempt refunded on this branch
+    too (0028's rule, third family) -- and its `dead_reason` must be one the
+    hourly probe recognises, or a genuine multi-day outage would now be
+    invisible instead of merely mis-clocked.
+    """
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
+    with psycopg.connect(app_dsn, autocommit=True) as app:
+        item_id = _enqueue(app, "no-capacity-for-a-day", max_attempts=5, backoff_seconds=0)
+    reason = "executor capacity exhausted (quota/spend/rate): weekly limit reached"
+    with (
+        _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names),
+        psycopg.connect(host_dsns[0], autocommit=True) as worker,
+    ):
+        for expected in ("capacity_wait_requeued", "capacity_wait_dead_lettered"):
+            token, token_hash = _token()
+            verdict = _claim(worker, token_hash)
+            assert verdict[0], verdict[1]
+            ok, got = _call(
+                worker,
+                "SELECT ok, reason FROM queue_fail_capacity_wait(%s, %s, %s, %s)",
+                (verdict[3], token, reason, 1),
+            )
+            assert ok is True and got == expected
+            _release(admin_conn, item_id)
+
+    state = _item(admin_conn, item_id)
+    assert state[0] == "dead"
+    assert state[5] == f"capacity_wait_exhausted: {reason}"
+    assert re.search(infra_monitor_quota_pattern(), state[5]), (
+        "a real multi-day capacity outage must still reach the hourly probe"
+    )
+    assert state[1] == 0, "not one model attempt was ever spent on this item"
+    assert _wait_budgets(admin_conn, item_id) == (0, 0, 2)
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "SELECT reason, detail ->> 'attempt_count' FROM work_event "
+            "WHERE work_item_id = %s AND event = 'fail' AND outcome = 'granted' ORDER BY id",
+            (item_id,),
+        )
+        assert cur.fetchall() == [
+            ("capacity_wait_requeued", "0"),
+            ("capacity_wait_dead_lettered", "0"),
+        ]
+
+
+def test_redrive_clears_the_capacity_budget_too(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """0027's rule reaches the third family: an operator's redrive asserts
+    that what the fleet was doing to the item has stopped, so an item redriven
+    out of a capacity death must survive the next capacity refusal instead of
+    falling straight back in and counting as fresh dead-letter growth."""
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
+    with psycopg.connect(app_dsn, autocommit=True) as app:
+        item_id = _enqueue(app, "redriven-capacity", max_attempts=2, backoff_seconds=0)
+    with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
+        with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+            # One host failure on its own budget, so "cleared" is
+            # distinguishable from "never spent" for both families.
+            token, token_hash = _token()
+            verdict = _claim(worker, token_hash)
+            assert _call(
+                worker,
+                "SELECT ok, reason FROM queue_fail_infra_wait(%s, %s, %s, 5)",
+                (verdict[3], token, "executor infrastructure failure: launcher"),
+            ) == (True, "infra_wait_requeued")
+            _release(admin_conn, item_id)
+            for expected in ("capacity_wait_requeued", "capacity_wait_dead_lettered"):
+                token, token_hash = _token()
+                verdict = _claim(worker, token_hash)
+                assert verdict[0], verdict[1]
+                ok, got = _call(
+                    worker,
+                    "SELECT ok, reason FROM queue_fail_capacity_wait(%s, %s, %s, %s)",
+                    (verdict[3], token, "executor capacity exhausted: quota", 1),
+                )
+                assert ok is True and got == expected
+                _release(admin_conn, item_id)
+        assert _item(admin_conn, item_id)[0] == "dead"
+        assert _wait_budgets(admin_conn, item_id) == (0, 1, 2)
+
+        with psycopg.connect(app_dsn, autocommit=True) as app:
+            assert _call(app, "SELECT queue_redrive(%s, 2)", (item_id,))[0] is True
+        assert _wait_budgets(admin_conn, item_id) == (0, 0, 0)
+
+        with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+            token, token_hash = _token()
+            verdict = _claim(worker, token_hash)
+            assert verdict[0], verdict[1]
+            assert _call(
+                worker,
+                "SELECT ok, reason FROM queue_fail_capacity_wait(%s, %s, %s, %s)",
+                (verdict[3], token, "executor capacity exhausted: quota", 1),
+            ) == (True, "capacity_wait_requeued")
+        assert _item(admin_conn, item_id)[0] == "ready"
+
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "SELECT detail ->> 'cleared_infra_wait_count', "
+            "detail ->> 'cleared_capacity_wait_count' FROM work_event "
+            "WHERE work_item_id = %s AND event = 'redrive' AND outcome = 'granted'",
+            (item_id,),
+        )
+        assert cur.fetchall() == [("1", "2")]
 
 
 def test_the_dead_letter_view_preserves_the_cause_and_the_history(
