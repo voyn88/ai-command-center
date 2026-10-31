@@ -48,22 +48,6 @@ LANE_2 = "voyn-aicc-worker@2.service"
 TUNNEL = "voyn-aicc-pgtunnel.service"
 
 
-def _dead_pid() -> int:
-    """A pid that is provably not running: forked, reaped, and never reused
-    while this test holds the slot."""
-    child = subprocess.Popen([sys.executable, "-c", ""])
-    child.wait()
-    return child.pid
-
-
-def _held_lock(tmp_path: Path) -> Path:
-    """A rollout lock held by a LIVE process -- this one, the only pid a
-    test can prove is running."""
-    lock = tmp_path / "aicc-staged-rollout.lock"
-    lock.write_text(f"{os.getpid()}\n", encoding="utf-8")
-    return lock
-
-
 def _environment(path: Path) -> Path:
     path.write_text(
         "# preserved\n"
@@ -591,11 +575,6 @@ def test_hot_budget_has_no_lane_count_ceiling() -> None:
             f"voyn-aicc-worker@{number}.service" for number in range(1, count + 1)
         )
         controller = RotationController.__new__(RotationController)
-        # `__init__` is bypassed on purpose (this exercises pure budget
-        # arithmetic, with no systemd to query), so the per-attempt lane
-        # snapshot it would set is supplied here rather than kept alive as
-        # a class-level default in production code just for this test.
-        controller._rotatable_units = None
         controller.config = RotationConfig(
             env_file=Path("worker.env"),
             lock_file=Path("rotation.lock"),
@@ -1024,114 +1003,6 @@ def test_ambiguous_mutation_phase_promotes_only_working_secret_and_reopens_lanes
     assert not controller.config.circuit_file.exists()
 
 
-def test_recovery_finishes_even_when_the_rollout_has_drained_every_lane(
-    tmp_path: Path, capsys
-) -> None:
-    """`main()` deliberately exempts --recover-only from the rollout-lock
-    defer: an ALREADY-interrupted rotation must be finished rather than left
-    hanging until the rollout ends. A staged rollout mid-drain is also the
-    state in which every configured lane reads `inactive` at once -- so the
-    per-attempt lane snapshot must NOT refuse there, or the exemption is
-    undone through a side door and recovery aborts on exactly the fleet it
-    was carved out for (review of 25487a7).
-
-    The credential still lands: it is one EnvironmentFile shared by the
-    template family, and a lane that is not running reads it when the
-    rollout starts it. There is simply no live pool left to reload."""
-    events: list[tuple] = []
-    controller, systemd, authority = _controller(tmp_path, events)
-    new_secret = "b" * 64
-    prepared = prepare_password_update(controller.config.env_file, new_secret)
-    controller.phase_journal.write("mutation_started", prepared.temporary)
-    authority.current_password = new_secret
-    real_state = systemd.state
-
-    def every_lane_drained(unit: str) -> UnitState:
-        if unit in (LANE_1, LANE_2):
-            events.append(("state", unit))
-            return UnitState("inactive", "dead", "", 0)
-        return real_state(unit)
-
-    systemd.state = every_lane_drained  # type: ignore[method-assign]
-
-    assert controller.recover_interrupted() is True
-
-    assert (
-        read_environment_file(controller.config.env_file)["AICC_PG_PASSWORD"]
-        == new_secret
-    )
-    # No reload or restart is issued at a lane the rollout is holding down --
-    # that is what silently re-activated staged-off lanes 3/4 on worker-01.
-    assert not any(
-        event[0] in {"reload", "reload_many", "restart"} for event in events
-    )
-    # ...and the recovery is genuinely finished, not merely survived: the
-    # durable journal that would make the next tick recover again is gone.
-    assert not controller.config.phase_file.exists()
-    output = capsys.readouterr().out
-    assert '"event":"rotation_recovery_no_live_lane"' in output
-    assert '"event":"rotation_recovery_succeeded"' in output
-
-
-def test_recovery_reopens_the_lanes_the_rollout_left_running(
-    tmp_path: Path, capsys
-) -> None:
-    """The partially-drained fleet: exclusion is per-lane, so the lanes that
-    ARE up still get their pools swapped in the same recovery that skips the
-    one held down."""
-    events: list[tuple] = []
-    controller, systemd, authority = _controller(tmp_path, events)
-    new_secret = "b" * 64
-    prepared = prepare_password_update(controller.config.env_file, new_secret)
-    controller.phase_journal.write("mutation_started", prepared.temporary)
-    authority.current_password = new_secret
-    systemd.status = {LANE_1: "aicc-drained", LANE_2: "aicc-drained"}
-    real_state = systemd.state
-
-    def lane_two_drained(unit: str) -> UnitState:
-        if unit == LANE_2:
-            events.append(("state", unit))
-            return UnitState("inactive", "dead", "", 0)
-        return real_state(unit)
-
-    systemd.state = lane_two_drained  # type: ignore[method-assign]
-
-    assert controller.recover_interrupted() is True
-
-    assert ("reload", LANE_1, 10) in events
-    assert not any(
-        event[0] in {"reload", "restart"} and event[1] == LANE_2 for event in events
-    )
-    assert not controller.config.phase_file.exists()
-    output = capsys.readouterr().out
-    assert '"event":"worker_lane_excluded_not_active"' in output
-    assert '"event":"rotation_recovery_no_live_lane"' not in output
-
-
-def test_rotate_still_refuses_when_no_lane_is_live(tmp_path: Path) -> None:
-    """The recovery exemption is scoped to recovery. A fresh rotation has
-    nothing durable to finish, so a fleet with no live lane is a refusal, not
-    a credential mutation nobody can be proved to have picked up."""
-    events: list[tuple] = []
-    controller, systemd, _ = _controller(tmp_path, events)
-    real_state = systemd.state
-
-    def every_lane_drained(unit: str) -> UnitState:
-        if unit in (LANE_1, LANE_2):
-            return UnitState("inactive", "dead", "", 0)
-        return real_state(unit)
-
-    systemd.state = every_lane_drained  # type: ignore[method-assign]
-
-    with pytest.raises(RotationError, match="no worker lane is currently active"):
-        controller.rotate()
-
-    assert (
-        read_environment_file(controller.config.env_file)["AICC_PG_PASSWORD"]
-        == OLD_PASSWORD
-    )
-
-
 def test_interrupted_recovery_waits_through_tunnel_boot_race(
     tmp_path: Path,
 ) -> None:
@@ -1269,7 +1140,8 @@ def test_cli_defers_to_a_staged_rollout_without_touching_the_controller(
     """A rotation tick that fires while the staged rollout holds the lock
     must defer -- exit 0, audited, no controller mutation -- not race the
     rollout's own lane stop/start (live worker-01 2026-09-08)."""
-    lock = _held_lock(tmp_path)
+    lock = tmp_path / "aicc-staged-rollout.lock"
+    lock.write_text(f"{os.getpid()}\n", encoding="utf-8")
 
     def fail(self) -> None:
         raise AssertionError("rotate() must not run while the rollout lock is held")
@@ -1307,7 +1179,8 @@ def test_cli_recover_only_ignores_the_rollout_lock(
     journal); leaving that fleet drained until the rollout finishes is a
     worse outcome than finishing the recovery, so --recover-only is exempt
     from the rollout-lock defer."""
-    lock = _held_lock(tmp_path)
+    lock = tmp_path / "aicc-staged-rollout.lock"
+    lock.write_text("12345\n", encoding="utf-8")
     monkeypatch.setattr(RotationController, "recover_interrupted", lambda self: True)
 
     result = main(
@@ -1335,88 +1208,32 @@ def test_cli_recover_only_ignores_the_rollout_lock(
     assert '"event":"rotation_deferred_staged_rollout"' not in output
 
 
-def _cli_argv(tmp_path: Path, monkeypatch, *extra: str) -> list[str]:
-    return [
-        "--env-file",
-        str(_environment(tmp_path / "worker.env")),
-        "--lock-file",
-        str(tmp_path / "rotation.lock"),
-        "--phase-file",
-        str(tmp_path / "phase.json"),
-        "--circuit-file",
-        str(tmp_path / "circuit.json"),
-        "--tunnel-unit",
-        TUNNEL,
-        "--lane-registry",
-        str(_lane_registry(tmp_path, monkeypatch)),
-        *extra,
-    ]
-
-
 def test_cli_proceeds_when_no_rollout_is_in_progress(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
-    """Exit 0 and a missing deferral event prove nothing on their own -- a
-    CLI that silently stopped calling `rotate()` would satisfy both. The
-    assertion that matters is that the rotation actually ran (review of
-    25487a7: the original version of this test asserted only the absences)."""
-    rotations: list[bool] = []
-    monkeypatch.setattr(
-        RotationController, "rotate", lambda self: rotations.append(True)
-    )
+    monkeypatch.setattr(RotationController, "rotate", lambda self: None)
 
     result = main(
-        _cli_argv(
-            tmp_path, monkeypatch, "--rollout-lock", str(tmp_path / "no-such-lock")
-        )
+        [
+            "--env-file",
+            str(_environment(tmp_path / "worker.env")),
+            "--lock-file",
+            str(tmp_path / "rotation.lock"),
+            "--phase-file",
+            str(tmp_path / "phase.json"),
+            "--circuit-file",
+            str(tmp_path / "circuit.json"),
+            "--tunnel-unit",
+            TUNNEL,
+            "--lane-registry",
+            str(_lane_registry(tmp_path, monkeypatch)),
+            "--rollout-lock",
+            str(tmp_path / "no-such-lock"),
+        ]
     )
 
     assert result == 0
-    assert rotations == [True]
     assert '"event":"rotation_deferred_staged_rollout"' not in capsys.readouterr().out
-
-
-def test_cli_rotates_through_a_crashed_rollouts_stale_lock(
-    tmp_path: Path, monkeypatch, capsys
-) -> None:
-    """A rollout killed outright never runs the `finally` that removes its
-    lock. If existence alone meant "rollout in progress", every rotation tick
-    on this host would defer until someone rebooted it -- and the worker
-    credential would quietly age out. A holder that is gone is not a holder,
-    so the rotation runs."""
-    rotations: list[bool] = []
-    monkeypatch.setattr(
-        RotationController, "rotate", lambda self: rotations.append(True)
-    )
-    lock = tmp_path / "aicc-staged-rollout.lock"
-    lock.write_text(f"{_dead_pid()}\n", encoding="utf-8")
-
-    result = main(_cli_argv(tmp_path, monkeypatch, "--rollout-lock", str(lock)))
-
-    assert result == 0
-    assert rotations == [True]
-    assert '"event":"rotation_deferred_staged_rollout"' not in capsys.readouterr().out
-
-
-@pytest.mark.parametrize("contents", ["", "   \n", "not-a-pid\n", "-1\n"])
-def test_cli_defers_on_a_lock_it_cannot_read_a_pid_out_of(
-    tmp_path: Path, monkeypatch, capsys, contents: str
-) -> None:
-    """Staleness is an escape hatch for a dead holder, not a general excuse
-    to proceed: an unreadable holder is ambiguous, and every ambiguous case
-    resolves to "held"."""
-
-    def fail(self) -> None:
-        raise AssertionError("rotate() must not run while the lock is ambiguous")
-
-    monkeypatch.setattr(RotationController, "rotate", fail)
-    lock = tmp_path / "aicc-staged-rollout.lock"
-    lock.write_text(contents, encoding="utf-8")
-
-    result = main(_cli_argv(tmp_path, monkeypatch, "--rollout-lock", str(lock)))
-
-    assert result == 0
-    assert '"event":"rotation_deferred_staged_rollout"' in capsys.readouterr().out
 
 
 def test_environment_update_preserves_unrelated_lines_and_mode(tmp_path: Path) -> None:

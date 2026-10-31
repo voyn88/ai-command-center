@@ -72,11 +72,9 @@ class SelfDeployConfig:
     #: Marker file the staged worker rollout (ops/aicc_staged_worker_rollout.py)
     #: holds for its entire duration. A restart issued by this tick while the
     #: rollout is mid-drain is exactly what raced the rollout's own `stop` of
-    #: the canary lane on worker-01 (live 2026-09-08); refusing while a live
-    #: rollout holds the marker means the next tick (5 minutes later, after
-    #: the rollout has finished and removed it) picks the deploy back up
-    #: instead. The default is imported, not re-spelled: see
-    #: command_center/ops/rollout_lock.py.
+    #: the canary lane on worker-01 (live 2026-09-08); refusing while the
+    #: marker exists means the next tick (5 minutes later, after the rollout
+    #: has finished and removed it) picks the deploy back up instead.
     rollout_lock_path: str = str(ROLLOUT_LOCK_PATH)
     #: Optional immutable release root. When set, self-deploy stages tracked
     #: files into `<release_root>/releases/<sha>` and atomically points
@@ -299,12 +297,16 @@ def self_deploy_once(
         report.outcome, report.detail = outcome, detail
         if outcome != "noop":
             _record_provenance(cfg, report)
+        if outcome in {"rolled_back", "failed"} and report.target_sha:
+            try:
+                from command_center.lane_budget import pause_for_red_smoke
+                from pathlib import Path as _Path
+                pause_for_red_smoke(_Path(repo_path), sha=report.target_sha)
+            except Exception:
+                pass
         return report
 
-    def rollout_in_progress() -> bool:
-        return rollout_lock_is_held(cfg.rollout_lock_path)
-
-    if rollout_in_progress():
+    if cfg.rollout_lock_path and rollout_lock_is_held(cfg.rollout_lock_path):
         return finish("refused", "staged_rollout_in_progress")
 
     fetched = _git(repo_path, ["fetch", cfg.remote, cfg.branch], timeout)
@@ -358,15 +360,6 @@ def self_deploy_once(
         return finish(
             "refused", f"dependency_change_requires_manual_deploy: {manifests[:3]}"
         )
-
-    # Re-checked immediately before the first mutation. The check above ran
-    # before `fetch`, which talks to the network and can take most of a tick;
-    # a rollout that started inside that window would otherwise be raced by
-    # everything below (review of 25487a7: the original single check left
-    # exactly this gap). Nothing has been mutated yet here, so the refusal
-    # costs one tick and leaves no half-state.
-    if rollout_in_progress():
-        return finish("refused", "staged_rollout_in_progress")
 
     if not same_sha:
         moved = _git(repo_path, ["reset", "--hard", report.target_sha], timeout)
@@ -482,21 +475,6 @@ def self_deploy_once(
     # here would be the opposite of safety: it is the one operation that can
     # DROP data, which is why the CLI gates it behind
     # --yes-i-understand-this-drops-data.
-    # The last and most important re-check: `restart` is the one command in
-    # this module that collides with the rollout's own `stop`/`start` of the
-    # same lane, and systemd resolves that collision by CANCELING a job
-    # (live worker-01 2026-09-08). Unwinding to the previous sha without
-    # touching systemd at all is strictly better than issuing a restart the
-    # rollout will cancel: the checkout and the release selector go back,
-    # nothing is left half-deployed, and the next tick after the rollout
-    # finishes redoes the whole deploy. (A completed `db upgrade` is not
-    # unwound -- same expand-contract reasoning as every other rollback
-    # here.)
-    if rollout_in_progress():
-        return rollback(
-            "staged_rollout_started_mid_deploy", services_touched=False
-        )
-
     failure = _restart_services(cfg, report)
     if failure is not None:
         # Half old, half new is the state rollback exists to prevent -- so

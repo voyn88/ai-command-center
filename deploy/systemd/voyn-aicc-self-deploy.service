@@ -30,15 +30,5 @@ WorkingDirectory=/opt/aicc/current
 # the rollout's own lane mutations (live 2026-09-08 worker-01;
 # VOYN-W0-AICC-ROLLOUT-VS-ROTATE-SELFDEPLOY-TIMERS). A skipped
 # ExecCondition is not a failure.
-# `[ -e ]` alone was the first version of this and it is the wrong test: a
-# rollout killed outright (SIGKILL, OOM, power) never runs the `finally` that
-# removes its lock, and an existence-only condition turns that one crash into
-# a unit that is skipped every firing until the host reboots and clears the
-# tmpfs. So the lock carries the rollout's pid and a holder that is gone is
-# not a holder. Every other answer stays "held" (exit 1 = skipped, not
-# failed): absent /proc entry aside, an unreadable lock or one whose contents
-# are not a plain number defers, because deferring a tick that could have run
-# costs one interval and running one that should have deferred costs the
-# canceled systemd job this exists to prevent.
-ExecCondition=/bin/sh -c 'lock=/run/aicc-staged-rollout.lock; [ -e "$$lock" ] || exit 0; holder=$$(cat "$$lock" 2>/dev/null) || exit 1; case "$$holder" in ""|*[!0-9]*|0*) exit 1 ;; esac; [ -d "/proc/$$holder" ] && exit 1; exit 0'
+ExecCondition=/bin/sh -c 'lock=/run/aicc-staged-rollout.lock; [ -e "$lock" ] || exit 0; holder=$(cat "$lock" 2>/dev/null) || exit 1; case "$holder" in ""|*[!0-9]*|0*) exit 1 ;; esac; [ -d /proc ] || exit 1; [ -d "/proc/$holder" ] && exit 1; exit 0'
 ExecStart=/bin/bash -lc "set -a && source ${AICC_PREPROD_ROOT}/.env && set +a && exec /opt/aicc/current/.venv/bin/python -m command_center.db self-deploy --repo-path ${AICC_SOURCE_REPO} --release-root /opt/aicc --release-venv ${AICC_RUNTIME_VENV} --migrate"

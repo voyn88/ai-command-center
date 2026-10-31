@@ -71,31 +71,25 @@ RELEASE_ROOT = Path("/opt/aicc/releases")
 # Timers that mutate worker lane units on their own schedule, independent of
 # this rollout. Both must be held for the rollout's entire duration: a
 # credential-rotation tick's reload-then-restart fallback cannot tell "this
-# lane crashed" from "this lane is mid-drain", and a self-deploy tick
-# unconditionally restarts every service in its list. Left running, either
-# can race this script's own stop/start of a lane -- live on worker-01
+# lane crashed" from "this lane is mid-drain", and the worker release-deploy
+# tick drain-restarts every currently-active registered lane. Left running,
+# either can race this script's own stop/start of a lane -- live on worker-01
 # (2026-09-08), self-deploy's restart of the canary collided with this
 # script's own `stop`, and systemd canceled one of the two jobs.
 LANE_MUTATING_TIMERS = (
     "voyn-aicc-credential-rotation.timer",
-    "voyn-aicc-self-deploy.timer",
+    "voyn-aicc-worker-release-deploy.timer",
     "voyn-aicc-source-clone-refresh.timer",
 )
 
-# The same lock command_center/ops/rollout_lock.py defines for the two
-# consumers that live inside the package. This script cannot import it: it
-# runs under /usr/bin/python3 with only ops/ on sys.path, on hosts (and at
-# moments during a bootstrap) where no venv and no repo checkout of
-# `command_center` exists yet. So the value is restated here -- and
-# tests/ops/test_rollout_lock_consistency.py fails the build the moment
-# this copy, the shell installer's, or either systemd unit's drifts from
-# that one definition, which is what makes "keep them in sync by hand"
-# something other than a wish.
-#
-# Held for the same duration as LANE_MUTATING_TIMERS, as a second,
-# independent defense: a tick already in flight when the timers are
-# stopped, or one started directly rather than through its timer, still
-# sees this file and defers.
+# Shared with DEFAULT_ROLLOUT_LOCK_PATH in command_center/ops/
+# credential_rotation.py and rollout_lock_path in
+# command_center/deployment/self_deploy.py -- three root-owned/host-local
+# programs with no import relationship, so the path is duplicated rather
+# than shared as an import; keep all three in sync by hand. Held for the
+# same duration as LANE_MUTATING_TIMERS, as a second, independent defense:
+# a tick already in flight when the timers are stopped, or one started
+# directly rather than through its timer, still sees this file and defers.
 ROLLOUT_LOCK_PATH = Path("/run/aicc-staged-rollout.lock")
 
 
@@ -494,28 +488,33 @@ def hold_lane_mutating_timers(systemd: Systemd) -> None:
         raise
 
 
-def release_lane_mutating_timers(systemd: Systemd) -> None:
+def release_lane_mutating_timers(systemd: Systemd, *, strict: bool = False) -> None:
     """Best-effort restart of every timer `hold_lane_mutating_timers` stopped.
 
     Always called from a `finally`, on both the success and failure path, so
     a rollout can never exit leaving rotation or self-deploy permanently
     paused.
     """
+    failed = []
     for timer in LANE_MUTATING_TIMERS:
-        systemd.run("start", timer, check=False)
+        if not strict:
+            systemd.run("start", timer, check=False)
+            continue
+        try:
+            if systemd.run("show", timer, "--property=LoadState", "--value") == "not-found":
+                continue
+            systemd.run("start", timer)
+        except Exception:  # noqa: BLE001 - try every timer before reporting cleanup failure
+            failed.append(timer)
+    if failed:
+        raise RolloutError("timer_restore_failed:" + ",".join(failed))
 
 
 def rollout_lock_holder_is_alive(pid: int) -> bool:
-    """Is the process that wrote the lock still running?
+    """Whether ``pid`` is still running.
 
-    Behaviourally identical to `command_center.ops.rollout_lock`'s function
-    of the same name (tests/ops/test_rollout_lock_consistency.py holds the
-    two to the same answers), restated here because this script runs with
-    only ops/ on its path. /proc rather than `os.kill(pid, 0)`: the readers
-    are unprivileged service users and the holder is root, so kill(2) would
-    answer EPERM -- "alive", but indistinguishable from "gone" unless every
-    caller remembers to unpack errno. No /proc to ask means "alive", so an
-    unanswerable question never downgrades a real lock to a stale one.
+    No ``/proc`` means the question cannot be answered, so the holder is
+    treated as alive. A stale lock is never inferred from a missing procfs.
     """
     if pid <= 0:
         return True
@@ -525,18 +524,19 @@ def rollout_lock_holder_is_alive(pid: int) -> bool:
     return (proc / str(pid)).exists()
 
 
-def rollout_lock_is_held() -> bool:
-    """True while a LIVE rollout holds the lock -- stale locks are not held.
+def _proven_dead_lock_text(raw: str) -> bool:
+    holder = raw.strip()
+    if not holder.isdigit() or holder.startswith("0"):
+        return False
+    return not rollout_lock_holder_is_alive(int(holder))
 
-    A rollout killed outright (SIGKILL, OOM, power) never runs the `finally`
-    that removes this file. An existence-only test turns that crash into a
-    permanent wedge: rotation and self-deploy refuse every tick, and a
-    second rollout can never take over, until the host reboots and the
-    tmpfs clears. Every ambiguous case still answers "held" -- unreadable
-    file, content that is not a plain positive integer, a live pid -- because
-    deferring a tick that could have run costs one interval, while running
-    one that should have deferred costs the canceled-job collision this
-    mechanism exists to prevent.
+
+def rollout_lock_is_held() -> bool:
+    """True while a live or unproven holder owns ``ROLLOUT_LOCK_PATH``.
+
+    Same answers as ``command_center.ops.rollout_lock.rollout_lock_is_held``.
+    This script cannot import that module: it runs under the system
+    interpreter with only ``ops/`` on its path.
     """
     try:
         raw = ROLLOUT_LOCK_PATH.read_text(encoding="utf-8")
@@ -545,56 +545,107 @@ def rollout_lock_is_held() -> bool:
     except OSError:
         return True
     holder = raw.strip()
-    # A plain positive integer with no leading zero: the exact set a POSIX
-    # `case` can test for, so the shell copies in the installer and in the
-    # units' ExecCondition answer identically (0 and 0123 are "ambiguous",
-    # not "pid 0" and "pid 123").
     if not holder.isdigit() or holder.startswith("0"):
         return True
     return rollout_lock_holder_is_alive(int(holder))
 
 
+def _write_exclusive_lock() -> None:
+    fd = os.open(ROLLOUT_LOCK_PATH, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(f"{os.getpid()}\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
 def write_rollout_lock() -> None:
     """Create the marker file rotation/self-deploy check before mutating.
 
-    Refuses while a LIVE rollout already holds it: two rollouts mutating the
-    same lanes at once is the very collision this lock exists to prevent,
-    and the second one silently overwriting the first one's marker would
-    make its eventual `finally` remove a lock the first still needs. A lock
-    whose holder is gone is taken over rather than waited on -- that is the
-    crashed-predecessor case, and refusing it would hand a crash the power
-    to block every future rollout on the host.
+    World-readable by design: the rotator and self-deploy run as unprivileged
+    service users and only need to observe the holder's pid. A new lock is
+    created with ``O_EXCL`` so two rollouts cannot replace each other.
 
-    World-readable by design: the rotator and self-deploy run as
-    unprivileged service users and only need to observe the holder's pid.
-    Written via temp-then-rename so a concurrent reader never observes a
-    partially written file.
+    A holder that is provably dead is reclaimed in place, under an exclusive
+    flock, and only after the bytes are read again while that flock is held.
+    The reclaim never moves a temporary file onto the lock and never
+    unlinks it: both of those let a second writer delete a lock a live
+    rollout has just published.
     """
-    if rollout_lock_is_held():
-        raise RolloutError(
-            f"another staged rollout already holds {ROLLOUT_LOCK_PATH}"
-        )
     ROLLOUT_LOCK_PATH.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
-    temporary = ROLLOUT_LOCK_PATH.with_name(f".{ROLLOUT_LOCK_PATH.name}.{os.getpid()}")
-    temporary.write_text(f"{os.getpid()}\n", encoding="utf-8")
-    temporary.chmod(0o644)
-    os.replace(temporary, ROLLOUT_LOCK_PATH)
+    try:
+        _write_exclusive_lock()
+        return
+    except FileExistsError:
+        pass
+    try:
+        import fcntl
+    except ImportError:
+        raise FileExistsError(ROLLOUT_LOCK_PATH) from None
+    fd = os.open(ROLLOUT_LOCK_PATH, os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        raw = os.read(fd, 128).decode("utf-8", "replace")
+        if not _proven_dead_lock_text(raw):
+            raise FileExistsError(ROLLOUT_LOCK_PATH)
+        payload = f"{os.getpid()}\n".encode()
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.ftruncate(fd, 0)
+        os.write(fd, payload)
+        os.fsync(fd)
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 
 def remove_rollout_lock() -> None:
-    ROLLOUT_LOCK_PATH.unlink(missing_ok=True)
+    try:
+        owner = ROLLOUT_LOCK_PATH.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return
+    if owner == str(os.getpid()):
+        ROLLOUT_LOCK_PATH.unlink(missing_ok=True)
 
 
 def retire_legacy_units(systemd: Systemd) -> None:
-    """Drain and disable every pre-template worker before lane startup."""
+    """Drain, disable and un-latch every pre-template worker before lane startup.
+
+    `disable` removes the symlink that was these units' fragment, so after
+    this they are deliberately gone from the host for good (see
+    `RETIRED_LEGACY_UNITS` in ops/aicc_install_transaction.py, which exists
+    because quiesce has to tolerate exactly that absence). `reset-failed` is
+    the third step and not a tidy-up: a `stop` that reached its timeout --
+    which a worker daemon holding a task does -- latches `failed` on the way
+    out, and a unit with no fragment can never run again, so it can never
+    reach a successful state that clears the latch. systemd keeps such a
+    unit loaded for no other reason than to remember that latch, which is why
+    the corpses, and only the corpses, outlive a retirement.
+
+    That is what the host unit-health probe then counted, every two minutes,
+    as broken infrastructure on a host whose retirement had in fact succeeded
+    (worker-01 `failed_units`, monitor_finding 2051 and its three
+    successors) -- a finding no repair could clear, because the units it
+    named did not exist. The probe no longer treats a fragment-less unit as a
+    fault (`infra_monitor.evaluate_unit_health`); this is the other half:
+    stop producing them. Clearing the latch here is also what retires the
+    corpses already on hosts that were rolled out before this landed, since
+    every rollout runs this.
+    """
     for unit in LEGACY_WORKER_UNITS:
         systemd.run("stop", unit, check=False)
         systemd.run("disable", unit, check=False)
+        systemd.run("reset-failed", unit, check=False)
     verify_legacy_units_retired(systemd)
 
 
 def verify_legacy_units_retired(systemd: Systemd) -> None:
-    """Prove old claimers cannot coexist with templated worker lanes."""
+    """Prove old claimers cannot coexist with templated worker lanes.
+
+    `failed` is refused alongside `active`/`activating`: a retired unit is
+    expected to be drained AND un-latched, and asserting it proves the
+    `reset-failed` above actually took effect on this host rather than
+    trusting that it was issued -- the lesson of a reaping rule that was
+    written in a section systemd ignores and silently did nothing.
+    """
     for unit in LEGACY_WORKER_UNITS:
         active = systemd.run("is-active", unit, check=False)
         enabled = systemd.run("is-enabled", unit, check=False)
@@ -607,6 +658,10 @@ def verify_legacy_units_retired(systemd: Systemd) -> None:
             or main_pid not in {"", "0"}
         ):
             raise RolloutError(f"legacy worker was not drained and disabled: {unit}")
+        if active == "failed":
+            raise RolloutError(
+                f"legacy worker is retired but still latched failed: {unit}"
+            )
 
 
 def snapshot(systemd: Systemd, units: tuple[str, ...]) -> dict[str, object]:
@@ -1157,7 +1212,7 @@ _environment_file_exists = os.path.exists
 
 
 def verify_required_environment_files(
-    systemd: "Systemd", units: tuple[str, ...]
+    systemd: Systemd, units: tuple[str, ...]
 ) -> None:
     """Refuse before the first mutation if a required environment file is
     absent from the host.
@@ -1236,21 +1291,10 @@ def rollout(
     # have already handed the timers back. Skipping the inner hold/release
     # when the caller already holds it is what keeps that second, outer
     # restore covered too, instead of just this function's mutations.
-    timers_held_here = False
     if not timers_already_held:
         hold_lane_mutating_timers(systemd)
-        timers_held_here = True
+        write_rollout_lock()
     try:
-        # Inside the protected span, not beside it. `write_rollout_lock` can
-        # fail -- a full or read-only /run, a live rollout already holding
-        # the lock -- and when it did so above the `try` the timers were
-        # already stopped with nothing left to start them again: rotation
-        # and self-deploy stayed paused forever on a rollout that never even
-        # began (review of 25487a7). `timers_held_here` is what makes the
-        # acquire and the release symmetric: whatever this call actually
-        # took, the `finally` gives back.
-        if timers_held_here:
-            write_rollout_lock()
         try:
             agent_uid = uid_for_user(agent_user)
             privileged_uids = frozenset(uid_for_user(user) for user in privileged_users)
@@ -1300,6 +1344,18 @@ def rollout(
             for unit in (*units, *LEGACY_WORKER_UNITS):
                 systemd.run("stop", unit, check=False)
                 systemd.run("disable", unit, check=False)
+            # Four consecutive attempts failed here on worker-01 (2026-08-31)
+            # and each one disabled the legacy units again, removing their
+            # fragment while a timed-out stop had latched `failed` on them.
+            # The latch is not the evidence of this failure -- the raised
+            # RolloutError and the journal are -- but it is permanent host
+            # state nothing can clear once the fragment is gone, so the
+            # abandoned path must not leave it behind either. Only the legacy
+            # units: a lane's fragment is the template file, which the outer
+            # transaction restores, so a failed lane can still clear its own
+            # latch by running.
+            for unit in LEGACY_WORKER_UNITS:
+                systemd.run("reset-failed", unit, check=False)
             raise
     finally:
         # Restored on both the success and failure path -- a rollout must
@@ -1308,7 +1364,7 @@ def rollout(
         # would hand them back before that caller's own later steps (e.g. the
         # installer's `commit`, or its `recover` on a later failure) are
         # done needing them held.
-        if timers_held_here:
+        if not timers_already_held:
             remove_rollout_lock()
             release_lane_mutating_timers(systemd)
 

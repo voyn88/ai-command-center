@@ -1,0 +1,42 @@
+# Root-owned worker release deploy
+# (VOYN-W0-AICC-WORKER-SELF-DEPLOY-MUST-STAGE-IMMUTABLE-RELEASE).
+#
+# Replaces the voynadmin `voyn-aicc-self-deploy` worker variant: that tick
+# cannot write root-owned immutable releases under /opt/aicc/releases, so
+# worker-01 stayed on a months-old SHA while origin/main advanced. This
+# oneshot fetches into a root-owned bare mirror, stages via the installer
+# publication path, and drain-restarts only currently-active registered lanes.
+[Unit]
+Description=AICC worker release deploy (merged main -> immutable root-owned release)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecCondition=/bin/sh -c 'lock=/run/aicc-staged-rollout.lock; [ -e "$lock" ] || exit 0; holder=$(cat "$lock" 2>/dev/null) || exit 1; case "$holder" in ""|*[!0-9]*|0*) exit 1 ;; esac; [ -d /proc ] || exit 1; [ -d "/proc/$holder" ] && exit 1; exit 0'
+Environment=AICC_RELEASE_REMOTE_URL=https://github.com/voyn88/ai-command-center.git
+ExecStart=/usr/libexec/aicc-worker-release-deploy
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectControlGroups=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+LockPersonality=yes
+KeyringMode=private
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/opt/aicc/releases /opt/aicc /var/lib/aicc-principal-isolation /run /usr/libexec
+InaccessiblePaths=-/opt/aicc/source
+UMask=0077
+# Busy lanes defer before selection; bound idle rollout plus git staging.
+TimeoutStartSec=1800s

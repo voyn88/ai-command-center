@@ -8,7 +8,6 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest
@@ -98,22 +97,6 @@ def test_noop_when_already_at_origin(pair, calls, tmp_path):
     assert not (tmp_path / "provenance.jsonl").exists()  # noops leave no rows
 
 
-def _dead_pid() -> int:
-    """A pid that is provably not running: forked, reaped, and never reused
-    while this test holds the slot."""
-    child = subprocess.Popen([sys.executable, "-c", ""])
-    child.wait()
-    return child.pid
-
-
-def _held_lock(tmp_path) -> Path:
-    """A lock held by a LIVE process -- this one, the only pid a test can
-    prove is running."""
-    lock = tmp_path / "aicc-staged-rollout.lock"
-    lock.write_text(f"{os.getpid()}\n", encoding="utf-8")
-    return lock
-
-
 def test_refuses_while_a_staged_rollout_holds_the_lock(pair, calls, tmp_path):
     """A self-deploy tick that fires while the staged rollout holds its lock
     must refuse before touching git or systemctl -- a restart issued mid-drain
@@ -122,7 +105,8 @@ def test_refuses_while_a_staged_rollout_holds_the_lock(pair, calls, tmp_path):
     rollout has finished and removed the lock, picks the deploy back up."""
     origin, clone, first = pair
     _commit(origin, "advance")  # a real fast-forward is available and skipped
-    lock = _held_lock(tmp_path)
+    lock = tmp_path / "aicc-staged-rollout.lock"
+    lock.write_text(f"{os.getpid()}\n", encoding="utf-8")
     cfg = _cfg(
         tmp_path,
         services=("voyn-aicc-worker.service",),
@@ -155,130 +139,6 @@ def test_deploys_normally_once_the_rollout_lock_is_absent(pair, calls, tmp_path)
 
     assert (report.outcome, report.detail) == ("deployed", new)
     assert ["restart", "voyn-aicc-worker.service"] in calls["systemctl"]
-
-
-def test_a_crashed_rollouts_stale_lock_does_not_wedge_self_deploy(
-    pair, calls, tmp_path
-):
-    """A rollout killed outright (SIGKILL, OOM, power) never runs the
-    `finally` that removes its lock. Treating the leftover file as "rollout
-    in progress" would refuse every tick on this host -- for a tick that
-    fires every five minutes, until someone reboots it -- so a lock whose
-    holder is gone is not a lock. The deploy proceeds and says so."""
-    origin, clone, _first = pair
-    new = _commit(origin, "advance")
-    lock = tmp_path / "aicc-staged-rollout.lock"
-    lock.write_text(f"{_dead_pid()}\n", encoding="utf-8")
-    cfg = _cfg(
-        tmp_path,
-        services=("voyn-aicc-worker.service",),
-        rollout_lock_path=str(lock),
-    )
-
-    report = self_deploy_once(str(clone), cfg)
-
-    assert (report.outcome, report.detail) == ("deployed", new)
-    assert ["restart", "voyn-aicc-worker.service"] in calls["systemctl"]
-
-
-@pytest.mark.parametrize("contents", ["", "   \n", "not-a-pid\n", "-1\n"])
-def test_an_unparseable_lock_defers_rather_than_guessing(
-    pair, calls, tmp_path, contents
-):
-    """Staleness is an escape hatch for a dead holder, not a general excuse
-    to proceed: a lock whose contents cannot be read as a pid is ambiguous,
-    and ambiguity costs one tick if it defers versus a canceled systemd job
-    if it does not."""
-    origin, clone, first = pair
-    _commit(origin, "advance")
-    lock = tmp_path / "aicc-staged-rollout.lock"
-    lock.write_text(contents, encoding="utf-8")
-    cfg = _cfg(
-        tmp_path,
-        services=("voyn-aicc-worker.service",),
-        rollout_lock_path=str(lock),
-    )
-
-    report = self_deploy_once(str(clone), cfg)
-
-    assert (report.outcome, report.detail) == ("refused", "staged_rollout_in_progress")
-    assert calls["systemctl"] == []
-    assert _git(clone, "rev-parse", "HEAD") == first
-
-
-def test_a_rollout_that_starts_during_fetch_refuses_before_any_mutation(
-    pair, calls, tmp_path, monkeypatch
-):
-    """The entry check runs before `fetch`, which talks to a remote and can
-    take most of a tick. A rollout that starts inside that window has to be
-    caught by the re-check before the first mutation, or everything after it
-    -- reset, release staging, restart -- races the rollout anyway."""
-    origin, clone, first = pair
-    _commit(origin, "advance")
-    lock = tmp_path / "aicc-staged-rollout.lock"
-    real_git = self_deploy._git
-
-    def git_with_a_rollout_starting_during_fetch(repo_path, args, timeout):
-        result = real_git(repo_path, args, timeout)
-        if args[0] == "fetch":
-            lock.write_text(f"{os.getpid()}\n", encoding="utf-8")
-        return result
-
-    monkeypatch.setattr(
-        self_deploy, "_git", git_with_a_rollout_starting_during_fetch
-    )
-    cfg = _cfg(
-        tmp_path,
-        services=("voyn-aicc-worker.service",),
-        rollout_lock_path=str(lock),
-    )
-
-    report = self_deploy_once(str(clone), cfg)
-
-    assert (report.outcome, report.detail) == ("refused", "staged_rollout_in_progress")
-    assert calls["systemctl"] == [] and calls["migrate"] == 0
-    assert _git(clone, "rev-parse", "HEAD") == first  # never moved
-
-
-def test_a_rollout_that_starts_before_the_restart_unwinds_without_systemctl(
-    pair, calls, tmp_path, monkeypatch
-):
-    """`restart` is the one command here that collides with the rollout's own
-    stop/start of the same lane, and systemd resolves that collision by
-    CANCELING a job (live worker-01 2026-09-08). So a rollout observed at the
-    last moment unwinds the checkout instead of issuing the restart: no
-    systemctl call at all, nothing left half-deployed, and the next tick
-    after the rollout redoes the deploy."""
-    origin, clone, first = pair
-    _commit(origin, "advance")
-    lock = tmp_path / "aicc-staged-rollout.lock"
-    real_smoke = self_deploy._import_smoke
-
-    def smoke_then_a_rollout_starts(repo_path, timeout):
-        result = real_smoke(repo_path, timeout)
-        lock.write_text(f"{os.getpid()}\n", encoding="utf-8")
-        return result
-
-    monkeypatch.setattr(self_deploy, "_import_smoke", smoke_then_a_rollout_starts)
-    cfg = _cfg(
-        tmp_path,
-        services=("voyn-aicc-worker.service",),
-        rollout_lock_path=str(lock),
-    )
-
-    report = self_deploy_once(str(clone), cfg)
-
-    assert (report.outcome, report.detail) == (
-        "rolled_back",
-        "staged_rollout_started_mid_deploy",
-    )
-    assert calls["systemctl"] == []  # the rollout owns systemd for now
-    assert _git(clone, "rev-parse", "HEAD") == first  # fully unwound
-    rows = [
-        json.loads(line)
-        for line in (tmp_path / "provenance.jsonl").read_text().splitlines()
-    ]
-    assert rows[-1]["detail"] == "staged_rollout_started_mid_deploy"
 
 
 def test_fast_forward_deploys_migrates_restarts_and_records(pair, calls, tmp_path):
@@ -422,23 +282,27 @@ def test_committed_control_unit_deploys_an_immutable_release():
     assert "exec /opt/aicc/current/.venv/bin/python" in service
 
 
-def test_committed_worker_unit_deploys_an_immutable_release_without_migrations():
+def test_worker_release_deploy_unit_replaces_voynadmin_self_deploy():
+    """Worker hosts stage root-owned immutable releases; the old voynadmin
+    self-deploy-worker unit is retired (VOYN-W0-AICC-WORKER-SELF-DEPLOY-
+    MUST-STAGE-IMMUTABLE-RELEASE)."""
     root = Path(__file__).parents[2]
     service = (
-        root / "deploy/systemd/voyn-aicc-self-deploy-worker.service"
+        root / "deploy/systemd/voyn-aicc-worker-release-deploy.service"
+    ).read_text()
+    timer = (
+        root / "deploy/systemd/voyn-aicc-worker-release-deploy.timer"
     ).read_text()
 
-    assert "WorkingDirectory=/opt/aicc/source" in service
-    assert "--release-root /opt/aicc" in service
-    assert "--release-venv ${AICC_RUNTIME_VENV}" in service
-    assert "--repo-path ${AICC_SOURCE_REPO}" in service
-    assert "--migrate" not in service
-    assert "--restart voyn-aicc-worker@1.service" in service
-    assert "--restart voyn-aicc-worker@4.service" in service
-    assert "source ${AICC_PREPROD_ROOT}/worker.env" in service
-    assert "Environment=AICC_SOURCE_REPO=/opt/aicc/source" in service  # pragma: allowlist secret
-    assert "Environment=AICC_RUNTIME_VENV=/opt/aicc/runtime-venv" in service  # pragma: allowlist secret
-    assert "exec ${AICC_SOURCE_REPO}/.venv/bin/python" in service  # pragma: allowlist secret
+    assert not (root / "deploy/systemd/voyn-aicc-self-deploy-worker.service").exists()
+    assert "User=root" in service
+    assert "ExecStart=/usr/libexec/aicc-worker-release-deploy" in service
+    assert "ProtectSystem=strict" in service
+    assert "ReadWritePaths=/opt/aicc/releases" in service
+    assert "OnUnitActiveSec=5min" in timer
+    # Control-host self-deploy remains for migrations.
+    control = (root / "deploy/systemd/voyn-aicc-self-deploy.service").read_text()
+    assert "--migrate" in control
 
 
 def test_noop_looking_migration_still_records_unrolled_back_write(

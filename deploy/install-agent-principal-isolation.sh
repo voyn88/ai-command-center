@@ -103,99 +103,94 @@ run_release() {
     --lock-fd "$AICC_INSTALL_LOCK_FD"
 }
 
-# Mirrors LANE_MUTATING_TIMERS/ROLLOUT_LOCK_PATH in
-# ops/aicc_staged_worker_rollout.py. A shell script cannot import the Python
-# constants, so tests/ops/test_rollout_lock_consistency.py asserts these two
-# lines carry exactly the same timers and the same path -- the list drifted
-# once already (voyn-aicc-source-clone-refresh.timer joined the Python tuple
-# in #917 and this transaction went on holding two of the three), which is
-# what a hand-sync comment without a test buys you.
-#
-# Held for the transaction's ENTIRE mutating span (prepare through commit),
-# not just the `run_rollout rollout` step: the `rollback` trap below runs
-# `run_transaction recover` on ANY failure in that span, and `recover`
-# restores the same worker units from its own separate, shell-level snapshot
-# -- outside `rollout()`'s own internal hold and, if `rollout()` itself is
-# what failed, AFTER that function's `finally` has already released its
-# hold. A rotate/self-deploy tick firing during that outer `recover` call
-# races it exactly like it raced the rollout step itself, live on worker-01
-# 2026-09-08.
-lane_mutating_timers="voyn-aicc-credential-rotation.timer voyn-aicc-self-deploy.timer voyn-aicc-source-clone-refresh.timer"
-rollout_lock=/run/aicc-staged-rollout.lock
+# Shared with LANE_MUTATING_TIMERS/ROLLOUT_LOCK_PATH in
+# ops/aicc_staged_worker_rollout.py -- duplicated by hand, same rationale as
+# the other independent copies of this path. Held for the transaction's
+# ENTIRE mutating span (prepare through commit), not just the `run_rollout
+# rollout` step: the `rollback` trap below runs `run_transaction recover` on
+# ANY failure in that span, and `recover` restores the same worker units from
+# its own separate, shell-level snapshot -- outside `rollout()`'s own
+# internal hold and, if `rollout()` itself is what failed, AFTER that
+# function's `finally` has already released its hold. A rotate/self-deploy
+# tick firing during that outer `recover` call races it exactly like it raced
+# the rollout step itself, live on worker-01 2026-09-08.
 timers_held=0
-timers_stopped=""
 
-# The staleness rule every reader of this lock shares (see
-# command_center/ops/rollout_lock.py): a live holder means held, and so does
-# every unanswerable case, but a holder that is gone does NOT -- a rollout
-# killed outright never removes its lock, and treating that as held forever
-# would block rotation, self-deploy and every later install on this host
-# until the next reboot clears the tmpfs.
-rollout_lock_is_held() {
-  [ -e "$rollout_lock" ] || return 1
-  holder=$(cat "$rollout_lock" 2>/dev/null) || return 0
-  case "$holder" in
-    ''|*[!0-9]*|0*) return 0 ;;
-  esac
-  [ -d "/proc/$holder" ]
-}
-
-start_lane_timers() {
-  for timer in $timers_stopped; do
-    systemctl start "$timer" >/dev/null 2>&1 || true
-  done
-  timers_stopped=""
-}
-
-# Fail-closed in BOTH halves: every step that can fail is checked, and any
-# failure restarts whatever was already stopped before returning non-zero.
-# The lock write used to be the unchecked half -- `printf`/`chmod`/`mv` with
-# no error handling, inside a function whose body runs with errexit
-# suppressed because the call site is `hold_lane_timers || ...` -- so a full
-# or read-only /run produced a transaction that believed it held the lock
-# while the second line of defense was silently absent (review of 25487a7).
 hold_lane_timers() {
   if [ "$timers_held" -eq 1 ]; then
     return 0
   fi
-  if rollout_lock_is_held; then
-    echo "another staged rollout holds $rollout_lock" >&2
-    return 1
-  fi
-  timers_stopped=""
-  for timer in $lane_mutating_timers; do
-    # A timer this host has not installed yet (a fresh bootstrap installs
-    # the unit files further down, in `run_transaction apply`) has nothing
-    # to hold, and `systemctl stop` on a not-found unit is an error rather
-    # than a no-op.
-    load_state=$(systemctl show "$timer" --property=LoadState --value 2>/dev/null) \
-      || load_state=""
-    case "$load_state" in
-      ''|not-found) continue ;;
+  # Acquire before touching timers. Exclusive create never replaces a
+  # running deploy's lock. A proven-dead holder is rewritten in place under
+  # flock; a temp-file rename would let the loser unlink the winner.
+  if ! (set -C; umask 022; printf '%s\n' "$$" >/run/aicc-staged-rollout.lock); then
+    holder=$(cat /run/aicc-staged-rollout.lock 2>/dev/null) || return 1
+    case "$holder" in
+      ''|*[!0-9]*|0*) return 1 ;;
     esac
-    if ! systemctl stop "$timer"; then
-      start_lane_timers
+    [ -d /proc ] || return 1
+    [ -d "/proc/$holder" ] && return 1
+    command -v flock >/dev/null 2>&1 || return 1
+    exec 9<>/run/aicc-staged-rollout.lock || return 1
+    flock -x 9 || { exec 9<&-; return 1; }
+    IFS= read -r current <&9 || current=""
+    if [ "$current" != "$holder" ] || [ -d "/proc/$current" ]; then
+      exec 9<&-
       return 1
     fi
-    timers_stopped="$timers_stopped $timer"
-  done
-  lock_tmp="$rollout_lock.$$"
-  if ! printf '%s\n' "$$" >"$lock_tmp" \
-    || ! chmod 0644 "$lock_tmp" \
-    || ! mv -f -- "$lock_tmp" "$rollout_lock"; then
-    rm -f -- "$lock_tmp"
-    start_lane_timers
-    return 1
+    /usr/bin/python3 -c 'import os,sys; os.lseek(9,0,os.SEEK_SET); os.ftruncate(9,0); os.write(9,(sys.argv[1]+"\n").encode())' "$$" || {
+      exec 9<&-
+      return 1
+    }
+    exec 9<&-
   fi
   timers_held=1
+  # Refuse overlap with an older deploy already running before this lock.
+  deploy_state=$(systemctl show voyn-aicc-worker-release-deploy.service --property=ActiveState --value) || return 1
+  case "$deploy_state" in
+    inactive|failed|"") ;;
+    *) return 1 ;;
+  esac
+  systemctl stop voyn-aicc-credential-rotation.timer || return 1
+  # Worker hosts run voyn-aicc-worker-release-deploy.timer (root-owned
+  # immutable release). Control still uses voyn-aicc-self-deploy.timer.
+  # Stop whichever is loaded; a not-found unit is skipped like the Python
+  # hold_lane_mutating_timers path.
+  if systemctl show voyn-aicc-worker-release-deploy.timer --property=LoadState --value 2>/dev/null | grep -qx loaded; then
+    if ! systemctl stop voyn-aicc-worker-release-deploy.timer; then
+      systemctl start voyn-aicc-credential-rotation.timer >/dev/null 2>&1 || true
+      return 1
+    fi
+  elif systemctl show voyn-aicc-self-deploy.timer --property=LoadState --value 2>/dev/null | grep -qx loaded; then
+    if ! systemctl stop voyn-aicc-self-deploy.timer; then
+      systemctl start voyn-aicc-credential-rotation.timer >/dev/null 2>&1 || true
+      return 1
+    fi
+  fi
+  # #917 added this timer to LANE_MUTATING_TIMERS. A refresh left running
+  # moves the source tree under a rollout that believes the host is quiet.
+  if systemctl show voyn-aicc-source-clone-refresh.timer --property=LoadState --value 2>/dev/null | grep -qx loaded; then
+    if ! systemctl stop voyn-aicc-source-clone-refresh.timer; then
+      systemctl start voyn-aicc-credential-rotation.timer >/dev/null 2>&1 || true
+      systemctl start voyn-aicc-worker-release-deploy.timer >/dev/null 2>&1 || true
+      systemctl start voyn-aicc-self-deploy.timer >/dev/null 2>&1 || true
+      return 1
+    fi
+  fi
 }
 
 release_lane_timers() {
   if [ "$timers_held" -ne 1 ]; then
     return 0
   fi
-  rm -f -- "$rollout_lock"
-  start_lane_timers
+  if [ "$(cat /run/aicc-staged-rollout.lock 2>/dev/null)" = "$$" ]; then
+    rm -f -- /run/aicc-staged-rollout.lock
+  fi
+  for timer in voyn-aicc-credential-rotation.timer voyn-aicc-worker-release-deploy.timer voyn-aicc-self-deploy.timer voyn-aicc-source-clone-refresh.timer; do
+    if systemctl is-enabled --quiet "$timer"; then
+      systemctl start "$timer" >/dev/null 2>&1 || true
+    fi
+  done
   timers_held=0
 }
 
@@ -331,6 +326,18 @@ PY
 # a fresh uninstall WAL. An already-journalled uninstall is resumed only by
 # its digest-bound capsule, so it cannot swap recovery code mid-transaction.
 if ! path_present "$state_dir/uninstall.json"; then
+  # Native release deploy journals only its selector, not an install generation.
+  # Resolve that protocol explicitly before generic recovery; its orphan-WAL
+  # refusal remains intact. Serialize against native deploy for this early span
+  # too, keeping the hold through the normal transaction below.
+  if [ "$install_profile" = "worker" ] && \
+      path_present "$state_dir/pending-release" && \
+      ! path_present "$state_dir/pending.json"; then
+    trap release_lane_timers EXIT
+    trap 'exit 1' HUP INT TERM
+    hold_lane_timers || exit 1
+    run_transaction release-deploy-recover
+  fi
   # Recover an existing install WAL with the exact anchor/capsule that wrote
   # it before replacing that anchor with code from this release.
   if path_present "$state_dir/pending.json"; then
@@ -611,18 +618,14 @@ else
   # group is empty, distinct and not held live before any generation is staged.
   run_transaction validate-control-authority
 fi
-run_transaction prepare
-transaction_active=1
-# Held from here through `commit` below -- the entire span in which a
-# failure makes the `rollback` trap call `run_transaction recover`, which
-# mutates worker units of its own accord (see `hold_lane_timers` above). A
-# failure to hold aborts cleanly: `transaction_active` is already 1 but
-# nothing below has mutated a worker unit yet, so `recover` above has nothing
-# to undo.
+# Acquire the shared lock before prepare makes a recoverable generation.
+# If another deploy owns it, abort without entering service-mutating recovery.
 hold_lane_timers || {
   echo "cannot hold lane-mutating timers for this transaction" >&2
   exit 1
 }
+run_transaction prepare
+transaction_active=1
 # A control host must not run the agent layer at all, and prepare() has just
 # staged its removal as part of this same generation (default_specs pairs
 # every WORKER_ONLY_TARGETS drop with an explicit removal spec). Stop and
@@ -656,7 +659,39 @@ systemctl daemon-reload
 # principals, the rollout drives worker lanes, and the boundary verifier
 # asserts an agent/publisher separation a control host has no parties for.
 if [ "$install_profile" = "worker" ]; then
+  # An unrecognised directive is not an error to systemd, it is a journal
+  # line: `CollectMode=` under [Service] parsed as "Unknown key name
+  # 'CollectMode' in section 'Service', ignoring", the default
+  # CollectMode=inactive stayed in force, and the reaping rule the unit file
+  # claims silently did not exist -- so `failed_units` came back on a host
+  # that was carrying the fix (worker-01, monitor_finding 2295). The unit
+  # file is the claim; PID 1's effective value after the reload above is the
+  # fact, and only the fact keeps a one-off broker fault from becoming a
+  # standing finding. `show` on an uninstantiated instance loads the template
+  # without starting anything, and systemctl is proven working one line up by
+  # the daemon-reload, so an empty answer here is a wrong answer.
+  collect_mode=$(systemctl show 'aicc-agent-launcher@collectmode-probe.service' \
+    --property=CollectMode --value 2>/dev/null || true)
+  [ "$collect_mode" = "inactive-or-failed" ] || {
+    echo "aicc-agent-launcher@.service reaping rule is not in effect on this host (CollectMode=${collect_mode:-unset}); per-connection corpses would accumulate as failed_units" >&2
+    exit 1
+  }
+  # Connection instances that died before CollectMode= reached this host are
+  # still sitting in the unit table as `failed`, and nothing else ever reaps
+  # them: the reaping rule only applies to instances started after the reload
+  # above. Their count is what the host unit-health probe reports as
+  # `failed_units` (worker-01, monitor_finding 2051), so the fix is not
+  # deployed until the corpses it stops producing are gone. Idempotent, and a
+  # host with none of them says nothing.
+  systemctl reset-failed 'aicc-agent-launcher@*.service' >/dev/null 2>&1 || true
   systemctl enable --now aicc-agent-launcher.socket
+  systemctl enable --now voyn-aicc-source-clone-refresh.timer
+  # Retire the voynadmin worker self-deploy variant (hard-coded lane list,
+  # cannot write root-owned releases) and enable the root-owned release
+  # deploy that stages immutable /opt/aicc/releases/<sha>.
+  systemctl disable --now voyn-aicc-self-deploy.timer >/dev/null 2>&1 || true
+  systemctl disable voyn-aicc-self-deploy.service >/dev/null 2>&1 || true
+  systemctl enable --now voyn-aicc-worker-release-deploy.timer
 fi
 
 # The orchestrator discovers configured plus already-instantiated lanes, then
@@ -681,20 +716,6 @@ transaction_active=0
 release_lane_timers
 rm -f -- "$attempt_units"
 trap - EXIT HUP INT TERM
-# Deliberately AFTER commit and after `release_lane_timers`, for two
-# reasons that point the same way. It is a lane-mutating timer
-# (LANE_MUTATING_TIMERS in ops/aicc_staged_worker_rollout.py), so
-# `--now` inside the held span would start the very thing this
-# transaction just stopped and hand the rollout step back the race it is
-# holding the timers to avoid. And like the control-plane ticks below it
-# is not in the rollback's service snapshot (RESTORABLE_UNIT_RE admits
-# only worker and launcher units), so enabling it while the trap was
-# armed would leave an enablement symlink behind for a unit file the
-# rollback removes. `enable --now` is idempotent, so a re-install is a
-# no-op here.
-if [ "$install_profile" = "worker" ]; then
-  systemctl enable --now voyn-aicc-source-clone-refresh.timer
-fi
 # The control plane's own ticks: installed as files by the generation above,
 # started here. Deliberately AFTER commit and after the trap is disarmed --
 # this timer is not in the rollback's service snapshot (that snapshot only
@@ -710,6 +731,6 @@ fi
 # review-window labeller instead of "someone typed it once on 2026-09-09"
 # (VOYN-W0-AICC-PR-WINDOW-RECONCILER-NOT-DEPLOYED-ON-CONTROL).
 if [ "$install_profile" = "control" ]; then
-  systemctl enable --now voyn-aicc-review.timer voyn-aicc-merge.timer voyn-aicc-remediate.timer voyn-aicc-pr-window.timer
+  systemctl enable --now voyn-aicc-review.timer voyn-aicc-merge.timer voyn-aicc-remediate.timer voyn-aicc-credential-rescue.timer voyn-aicc-pr-window.timer
 fi
 echo "AICC_AGENT_PRINCIPAL_ISOLATION_INSTALLED"

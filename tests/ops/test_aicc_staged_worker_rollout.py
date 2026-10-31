@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import importlib.util
+import inspect
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
 import pytest
@@ -142,7 +144,7 @@ class FakeSystemd:
         # fd5de6b, same rationale as the legacy units above).
         for timer in (
             "voyn-aicc-credential-rotation.timer",
-            "voyn-aicc-self-deploy.timer",
+            "voyn-aicc-worker-release-deploy.timer",
             "voyn-aicc-source-clone-refresh.timer",
         ):
             self.states.setdefault(
@@ -191,7 +193,14 @@ class FakeSystemd:
                 return "inactive"
             # Mutating a unit this fake never declared is a typo'd rollout
             # target, not a no-op (review on fd5de6b).
-            if action in {"start", "stop", "enable", "disable", "restart"}:
+            if action in {
+                "start",
+                "stop",
+                "enable",
+                "disable",
+                "restart",
+                "reset-failed",
+            }:
                 raise KeyError(unit)
             return ""
         state = self.states[unit]
@@ -211,6 +220,13 @@ class FakeSystemd:
             state["ActiveState"] = "active"
             state["SubState"] = "running"
             state["MainPID"] = "3000"
+        elif action == "reset-failed":
+            # systemd's `failed` is a latch; reset-failed is the ONLY thing
+            # that clears it without a successful run. On anything not
+            # latched it is a no-op that succeeds.
+            if state["ActiveState"] == "failed":
+                state["ActiveState"] = "inactive"
+                state["SubState"] = "dead"
         return ""
 
     def probe(self, *args: str) -> tuple[int, str, str]:
@@ -587,12 +603,12 @@ def test_staged_rollout_drains_and_proves_each_lane_before_next(tmp_path, monkey
     stops = [call for call in systemd.calls if call[0] == "stop"]
     assert stops[:3] == [
         ("stop", "voyn-aicc-credential-rotation.timer"),
-        ("stop", "voyn-aicc-self-deploy.timer"),
+        ("stop", "voyn-aicc-worker-release-deploy.timer"),
         ("stop", "voyn-aicc-source-clone-refresh.timer"),
     ]
     assert systemd.calls[-3:] == [
         ("start", "voyn-aicc-credential-rotation.timer"),
-        ("start", "voyn-aicc-self-deploy.timer"),
+        ("start", "voyn-aicc-worker-release-deploy.timer"),
         ("start", "voyn-aicc-source-clone-refresh.timer"),
     ]
     # The shared lock a tick honours even if it fires anyway is gone once the
@@ -883,16 +899,16 @@ def test_rollout_restores_timers_and_lock_on_failure(tmp_path, monkeypatch):
     assert systemd.states["voyn-aicc-credential-rotation.timer"]["ActiveState"] == (
         "active"
     )
-    assert systemd.states["voyn-aicc-self-deploy.timer"]["ActiveState"] == "active"
+    assert systemd.states["voyn-aicc-worker-release-deploy.timer"]["ActiveState"] == "active"
     timer_calls = [
         call for call in systemd.calls if call[-1] in module.LANE_MUTATING_TIMERS
     ]
     assert timer_calls == [
         ("stop", "voyn-aicc-credential-rotation.timer"),
-        ("stop", "voyn-aicc-self-deploy.timer"),
+        ("stop", "voyn-aicc-worker-release-deploy.timer"),
         ("stop", "voyn-aicc-source-clone-refresh.timer"),
         ("start", "voyn-aicc-credential-rotation.timer"),
-        ("start", "voyn-aicc-self-deploy.timer"),
+        ("start", "voyn-aicc-worker-release-deploy.timer"),
         ("start", "voyn-aicc-source-clone-refresh.timer"),
     ]
 
@@ -929,7 +945,7 @@ def test_write_and_remove_rollout_lock_round_trip(tmp_path, monkeypatch):
     module.write_rollout_lock()
 
     assert lock_path.read_text(encoding="utf-8") == f"{os.getpid()}\n"
-    # Written via temp-then-rename: no leftover temp file beside it.
+    # Exclusive create leaves no temporary sibling beside the lock.
     assert list(lock_path.parent.iterdir()) == [lock_path]
 
     module.remove_rollout_lock()
@@ -938,116 +954,13 @@ def test_write_and_remove_rollout_lock_round_trip(tmp_path, monkeypatch):
     module.remove_rollout_lock()
 
 
-def _dead_pid() -> int:
-    """A pid that is provably not running: forked, reaped, and never reused
-    while this test holds the slot."""
-    child = subprocess.Popen([sys.executable, "-c", ""])
-    child.wait()
-    return child.pid
-
-
-def test_a_failed_lock_write_hands_the_timers_back(tmp_path, monkeypatch):
-    """The acquire has two halves -- stop the timers, write the lock -- and
-    they used to sit OUTSIDE the try/finally that releases them. A lock write
-    that failed (full or read-only /run, a rollout already holding it) left
-    the process exiting with the timers stopped and nothing left to start
-    them: rotation and self-deploy paused forever by a rollout that never
-    even began (review of 25487a7). Whatever the acquire actually took, the
-    release gives back."""
-    module = _module()
-    monkeypatch.setattr(
-        module, "ROLLOUT_LOCK_PATH", tmp_path / "read-only" / "rollout.lock"
-    )
-
-    def refuse_to_write() -> None:
-        raise OSError("read-only file system")
-
-    monkeypatch.setattr(module, "write_rollout_lock", refuse_to_write)
-    units = ("voyn-aicc-worker@1.service",)
-    systemd = FakeSystemd(units)
-
-    with pytest.raises(OSError, match="read-only file system"):
-        module.rollout(
-            systemd,
-            units,
-            agent_user="aicc-agent",
-            privileged_users=("root", "voynadmin"),
-            uid_for_user=_uid,
-            process_uid=lambda pid: 1002,
-            process_environment=lambda pid: (
-                "AICC_AGENT_PRINCIPAL_ISOLATION=required",
-            ),
-        )
-
-    for timer in module.LANE_MUTATING_TIMERS:
-        assert systemd.states[timer]["ActiveState"] == "active", timer
-    # ...and no lane was mutated on the way out: the failure is before the
-    # first `enable`, so there is nothing for the outer transaction to undo.
-    assert not [
-        call
-        for call in systemd.calls
-        if call[0] in {"enable", "disable"} and call[-1] not in
-        module.LANE_MUTATING_TIMERS
-    ]
-
-
-def test_write_rollout_lock_refuses_while_another_rollout_holds_it(
-    tmp_path, monkeypatch
-):
-    """Two rollouts mutating the same lanes at once is the collision this
-    lock exists to prevent, and the second silently overwriting the first's
-    marker would make its `finally` remove a lock the first still needs."""
+def test_remove_rollout_lock_preserves_foreign_owner(tmp_path, monkeypatch):
     module = _module()
     lock_path = tmp_path / "aicc-staged-rollout.lock"
     monkeypatch.setattr(module, "ROLLOUT_LOCK_PATH", lock_path)
-    lock_path.write_text(f"{os.getpid()}\n", encoding="utf-8")
-
-    with pytest.raises(module.RolloutError, match="already holds"):
-        module.write_rollout_lock()
-
-    # The live holder's own marker is left exactly as it was.
-    assert lock_path.read_text(encoding="utf-8") == f"{os.getpid()}\n"
-
-
-def test_write_rollout_lock_takes_over_a_crashed_rollouts_lock(
-    tmp_path, monkeypatch
-):
-    """A rollout killed outright (SIGKILL, OOM, power) never runs the
-    `finally` that removes its lock. Refusing on that leftover file would let
-    one crash block every future rollout, rotation and self-deploy on the
-    host until it reboots; a holder that is gone is not a holder."""
-    module = _module()
-    lock_path = tmp_path / "aicc-staged-rollout.lock"
-    monkeypatch.setattr(module, "ROLLOUT_LOCK_PATH", lock_path)
-    lock_path.write_text(f"{_dead_pid()}\n", encoding="utf-8")
-
-    module.write_rollout_lock()
-
-    assert lock_path.read_text(encoding="utf-8") == f"{os.getpid()}\n"
-
-
-@pytest.mark.parametrize(
-    "contents,held",
-    [
-        ("", True),
-        ("   \n", True),
-        ("not-a-pid\n", True),
-        ("-1\n", True),
-        ("0\n", True),
-    ],
-)
-def test_an_unreadable_holder_still_counts_as_held(
-    tmp_path, monkeypatch, contents, held
-):
-    """Staleness is an escape hatch for a dead holder, not a general excuse
-    to proceed: every ambiguous lock defers, because deferring costs one
-    timer interval and proceeding costs a canceled systemd job."""
-    module = _module()
-    lock_path = tmp_path / "aicc-staged-rollout.lock"
-    monkeypatch.setattr(module, "ROLLOUT_LOCK_PATH", lock_path)
-    lock_path.write_text(contents, encoding="utf-8")
-
-    assert module.rollout_lock_is_held() is held
+    lock_path.write_text(f"{os.getpid() + 1}\n", encoding="utf-8")
+    module.remove_rollout_lock()
+    assert lock_path.read_text(encoding="utf-8") == f"{os.getpid() + 1}\n"
 
 
 def test_rollout_with_timers_already_held_does_not_touch_timers_or_lock(
@@ -1903,9 +1816,188 @@ def test_hold_skips_timers_that_are_not_installed_on_the_host():
     module = _module()
     systemd = FakeSystemd(("voyn-aicc-worker@1.service",))
     systemd.states.pop("voyn-aicc-credential-rotation.timer", None)
-    systemd.states.pop("voyn-aicc-self-deploy.timer", None)
+    systemd.states.pop("voyn-aicc-worker-release-deploy.timer", None)
     systemd.states.pop("voyn-aicc-source-clone-refresh.timer", None)
 
     module.hold_lane_mutating_timers(systemd)
 
     assert [call for call in systemd.calls if call[0] == "stop"] == []
+
+
+def test_rollout_lock_does_not_overwrite_existing_owner(tmp_path, monkeypatch):
+    module = _module()
+    lock = tmp_path / "rollout.lock"
+    monkeypatch.setattr(module, "ROLLOUT_LOCK_PATH", lock)
+    lock.write_text("other-owner")
+    with pytest.raises(FileExistsError):
+        module.write_rollout_lock()
+    assert lock.read_text() == "other-owner"
+
+
+def test_rollout_lock_writer_never_renames_over_the_live_file():
+    module = _module()
+    source = inspect.getsource(module.write_rollout_lock)
+    assert "O_EXCL" in inspect.getsource(module._write_exclusive_lock)
+    assert "os.replace" not in source
+    assert "rename" not in source
+    installer = Path(__file__).parents[2].joinpath(
+        "deploy/install-agent-principal-isolation.sh"
+    ).read_text(encoding="utf-8")
+    hold = installer.split("hold_lane_timers()", 1)[1].split("\nrelease_lane_timers()", 1)[0]
+    assert "set -C" in hold
+    assert "mv " not in hold
+
+
+def test_live_foreign_lock_is_not_replaced_or_deleted(tmp_path, monkeypatch):
+    module = _module()
+    lock = tmp_path / "rollout.lock"
+    monkeypatch.setattr(module, "ROLLOUT_LOCK_PATH", lock)
+    monkeypatch.setattr(module, "rollout_lock_holder_is_alive", lambda _pid: True)
+    lock.write_text("4242\n", encoding="utf-8")
+    with pytest.raises(FileExistsError):
+        module.write_rollout_lock()
+    module.remove_rollout_lock()
+    assert lock.read_text(encoding="utf-8") == "4242\n"
+    assert list(lock.parent.iterdir()) == [lock]
+
+
+def test_dead_holder_is_reclaimed_in_place_and_a_racer_cannot_delete_it(
+    tmp_path, monkeypatch
+):
+    pytest.importorskip("fcntl")
+    module = _module()
+    lock = tmp_path / "rollout.lock"
+    monkeypatch.setattr(module, "ROLLOUT_LOCK_PATH", lock)
+    monkeypatch.setattr(
+        module,
+        "rollout_lock_holder_is_alive",
+        lambda pid: pid == os.getpid(),
+    )
+    lock.write_text("4242\n", encoding="utf-8")
+    inode = lock.stat().st_ino
+    errors: list[BaseException] = []
+
+    def reclaim() -> None:
+        try:
+            module.write_rollout_lock()
+        except FileExistsError as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=reclaim) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert lock.read_text(encoding="utf-8") == f"{os.getpid()}\n"
+    assert lock.stat().st_ino == inode
+    assert len(errors) == 1
+    assert list(lock.parent.iterdir()) == [lock]
+    module.remove_rollout_lock()
+    assert not lock.exists()
+
+
+# ---------------------------------------------------------------------------
+# Retirement must not leave an unreapable corpse in PID 1's unit table.
+#
+# VOYN-MON-WORKER-01-INFRA-FAILED-UNITS. Retiring the pre-template workers
+# stops and *disables* them, and disabling removes the symlink that was their
+# fragment -- so they are deliberately gone from the host for good. A `stop`
+# that reaches its timeout (a worker daemon holding a task does) latches
+# `failed` on the way out, and a unit with no fragment can never run again, so
+# nothing will ever clear that latch: systemd keeps the unit loaded for no
+# other reason than to remember it. The host unit-health probe then counted
+# those corpses as broken infrastructure every two minutes on a host whose
+# retirement had succeeded -- a `failed_units` finding no repair could clear,
+# because the units it named no longer existed.
+# ---------------------------------------------------------------------------
+
+
+LEGACY = (
+    "voyn-aicc-worker.service",
+    "voyn-aicc-worker-2.service",
+    "aicc-worker.service",
+)
+
+
+class _TimedOutLegacyStop(FakeSystemd):
+    """A legacy `stop` that reaches TimeoutStopSec: systemd latches `failed`."""
+
+    def run(self, *args: str, check: bool = True) -> str:
+        if args[0] == "stop" and args[-1] in LEGACY:
+            self.calls.append(args)
+            state = self.states[args[-1]]
+            state["ActiveState"] = "failed"
+            state["SubState"] = "failed"
+            state["MainPID"] = "0"
+            return ""
+        return super().run(*args, check=check)
+
+
+def test_a_timed_out_legacy_stop_is_not_left_latched_failed():
+    """The defect, with the live exit shape: every retired unit ends
+    un-latched, and the clear is issued after the disable that removes its
+    fragment -- so what is cleared is final."""
+    module = _module()
+    systemd = _TimedOutLegacyStop(("voyn-aicc-worker@1.service",))
+
+    module.retire_legacy_units(systemd)
+
+    for unit in LEGACY:
+        assert systemd.states[unit]["ActiveState"] != "failed"
+        # Order is part of the contract: stop, disable, then clear.
+        assert systemd.calls.index(("reset-failed", unit)) > systemd.calls.index(
+            ("disable", unit)
+        )
+
+
+def test_retirement_refuses_a_unit_whose_latch_it_could_not_clear():
+    """Proving the latch is gone, not that a clear was issued: a reaping rule
+    that was merely WRITTEN did nothing on any host for a whole finding cycle
+    (7570626c). `reset-failed` here is a no-op, as it is for an unprivileged
+    caller, and the rollout must refuse rather than advance."""
+    module = _module()
+
+    class _ClearDoesNothing(_TimedOutLegacyStop):
+        def run(self, *args: str, check: bool = True) -> str:
+            if args[0] == "reset-failed":
+                self.calls.append(args)
+                return ""
+            return super().run(*args, check=check)
+
+    systemd = _ClearDoesNothing(("voyn-aicc-worker@1.service",))
+    with pytest.raises(module.RolloutError, match="still latched failed"):
+        module.retire_legacy_units(systemd)
+
+
+def test_an_abandoned_rollout_does_not_leave_a_legacy_corpse_behind():
+    """worker-01, 2026-08-31: four consecutive attempts failed, and each one
+    stopped and disabled the legacy units again on the way out. That path is
+    how the corpses were produced as much as the success path is."""
+    module = _module()
+    unit = "voyn-aicc-worker@1.service"
+
+    class _LaneWillNotVerify(_TimedOutLegacyStop):
+        def run(self, *args: str, check: bool = True) -> str:
+            value = super().run(*args, check=check)
+            if args == ("start", unit):
+                self.states[unit]["DropInPaths"] = ""
+            return value
+
+    systemd = _LaneWillNotVerify((unit,))
+    with pytest.raises(module.RolloutError):
+        module.rollout(
+            systemd,
+            (unit,),
+            agent_user="aicc-agent",
+            privileged_users=("root", "voynadmin"),
+            uid_for_user=_uid,
+            process_uid=lambda pid: 1002,
+            process_environment=lambda pid: (
+                "AICC_AGENT_PRINCIPAL_ISOLATION=required",
+                "AICC_DATA_DIR=/var/lib/aicc/data",
+            ),
+        )
+
+    for legacy in LEGACY:
+        assert systemd.states[legacy]["ActiveState"] != "failed"

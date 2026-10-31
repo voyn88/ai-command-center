@@ -23,10 +23,6 @@ from typing import Any
 
 from command_center.db import migrations, pool, roles
 from command_center.db.config import ConfigError, load_config
-# Stdlib-only module: importing it here keeps the flag's default and
-# SelfDeployConfig's default the same string without pulling the deployment
-# package (or anything database-shaped) into every `command_center.db`
-# invocation.
 from command_center.ops.rollout_lock import ROLLOUT_LOCK_PATH
 
 
@@ -228,8 +224,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--rollout-lock",
         default=str(ROLLOUT_LOCK_PATH),
         help="Marker file the staged worker rollout holds for its duration; "
-        "a tick that finds a LIVE rollout holding it refuses rather than "
-        "racing the rollout's own lane mutations.",
+        "a tick that finds it present refuses rather than racing the "
+        "rollout's own lane mutations.",
     )
     self_deploy.add_argument(
         "--release-root",
@@ -709,9 +705,18 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"MERGED    {task_id} -> {head}")
                 for task_id, reason in report.skipped:
                     print(f"SKIP      {task_id}: {reason}")
+                for task_id, reason in report.errors:
+                    print(f"ERROR     {task_id}: {reason}", file=sys.stderr)
                 if report.quota is not None:
                     print(report.quota.line())
-                return 0
+                # `errors` means the gateway could not even evaluate a
+                # merge (its identity is unconfigured, GitHub was
+                # unreachable) -- distinct from an ordinary `skipped` PR
+                # that simply isn't ready, and reported with a non-zero
+                # exit so a caller (timer, runbook) fails loudly instead of
+                # retrying forever unaware (VOYN-W0-AICC-MERGE-GATEWAY-
+                # REM-REM-REM).
+                return 1 if report.errors else 0
 
             if args.command == "backlog-merge-reconcile":
                 from contextlib import nullcontext as _nc
