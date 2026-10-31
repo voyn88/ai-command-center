@@ -55,6 +55,10 @@ _LIVE_STATUS_SQL = (
 _LIVE_REASON_SQL = (
     "CASE WHEN status = 'unavailable' AND unavailable_until > now() THEN reason END"
 )
+_LIVE_UNTIL_SQL = (
+    "CASE WHEN status = 'unavailable' AND unavailable_until > now()"
+    " THEN unavailable_until END"
+)
 _LIVE_SELECT_FRAGMENT = (
     _LIVE_STATUS_SQL + ", " + _LIVE_REASON_SQL + ", " + _LIVE_UNTIL_SQL
 )
