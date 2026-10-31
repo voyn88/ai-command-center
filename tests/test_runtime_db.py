@@ -625,6 +625,16 @@ def test_migrate_creates_all_expected_tables(tmp_path):
         assert expected in tables
 
 
+def test_table_exists_reflects_the_schema(tmp_path):
+    path = _fresh_db(tmp_path)
+    db.migrate(path)
+    with db.connect(path) as conn:
+        assert db.table_exists(conn, "run_provenance") is True
+        assert db.table_exists(conn, "no_such_table_at_all") is False
+        with db.transaction(conn):
+            conn.execute("DROP TABLE run_provenance")
+        assert db.table_exists(conn, "run_provenance") is False
+
 def test_v25_claim_table_shape_index_constraints_and_cascade(tmp_path):
     path = _fresh_db(tmp_path)
     with db.connect(path) as conn:

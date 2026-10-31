@@ -82,6 +82,7 @@ from command_center.runtime.db.core import (  # noqa: F401
     resolve_db_path,
     resolve_timestamp_zone,
     retention_cutoff,
+    table_exists,
     transaction,
 )
 from command_center.runtime.db.schema import (  # noqa: F401
