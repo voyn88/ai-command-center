@@ -53,6 +53,19 @@ def reject(sha: str = HEAD, **kwargs) -> dict:
 def test_a_verdict_from_a_different_identity_on_the_current_head_passes() -> None:
     """The one accepting case, so the negatives below are not vacuous."""
     assert evaluate([accept()], HEAD, AUTHOR) == REVIEWER
+    assert evaluate([accept()], HEAD, AUTHOR, merger="merge-bot") == REVIEWER
+
+
+def test_an_accept_published_by_the_merger_is_refused() -> None:
+    """Author-independence is not enough when that other account is the one
+    that will press merge."""
+    with pytest.raises(AcceptanceError, match="would merge this pull request"):
+        evaluate([accept(login="merge-bot")], HEAD, AUTHOR, merger="merge-bot")
+
+
+def test_omitting_the_merger_keeps_the_author_only_gate() -> None:
+    """The Actions job still has no merger to compare against."""
+    assert evaluate([accept(login="merge-bot")], HEAD, AUTHOR) == "merge-bot"
 
 
 def test_a_verdict_may_carry_its_reasoning_below_the_marker() -> None:

@@ -131,8 +131,19 @@ def verdicts_from(reviews: object) -> list[Verdict]:
     return found
 
 
-def evaluate(reviews: object, head_sha: object, pull_request_author: object) -> str:
-    """Return the accepting reviewer's login, or raise with cause and remedy."""
+def evaluate(
+    reviews: object,
+    head_sha: object,
+    pull_request_author: object,
+    merger: object = None,
+) -> str:
+    """Return the accepting reviewer's login, or raise with cause and remedy.
+
+    ``merger``, when supplied, is the login that will execute the merge.
+    The Actions gate omits it (nobody has been chosen to merge yet). The
+    orchestrator passes the login ``gh api user`` returns for the pull
+    request's own host. An ACCEPT from that login is not independent.
+    """
     if not isinstance(head_sha, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", head_sha):
         raise AcceptanceError(f"head sha is not a 40-character commit id: {head_sha!r}")
     head = head_sha.lower()
@@ -141,6 +152,14 @@ def evaluate(reviews: object, head_sha: object, pull_request_author: object) -> 
             "the pull request has no resolvable author, so independence is unprovable"
         )
     author = pull_request_author.casefold()
+    merger_login: str | None = None
+    if merger is not None:
+        if not isinstance(merger, str) or not merger:
+            raise AcceptanceError(
+                "the merging identity has no resolvable login, so independence from it "
+                "is unprovable"
+            )
+        merger_login = merger.casefold()
 
     verdicts = verdicts_from(reviews)
     on_head = [
@@ -169,6 +188,7 @@ def evaluate(reviews: object, head_sha: object, pull_request_author: object) -> 
         and verdict.state != DISMISSED
         and verdict.author
         and verdict.author.casefold() != author
+        and (merger_login is None or verdict.author.casefold() != merger_login)
     ]
     if accepting:
         return accepting[0].author
@@ -185,6 +205,22 @@ def evaluate(reviews: object, head_sha: object, pull_request_author: object) -> 
             f"the only ACCEPT for {head} was published by {self_issued[0].author}, who authored this "
             "pull request. Acceptance must come from an identity that is not the author; have the "
             "acceptance reviewer publish the verdict"
+        )
+    merger_issued = [
+        verdict
+        for verdict in on_head
+        if verdict.decision == "ACCEPT"
+        and verdict.state != DISMISSED
+        and merger_login is not None
+        and verdict.author
+        and verdict.author.casefold() == merger_login
+    ]
+    if merger_issued:
+        raise AcceptanceError(
+            f"the only ACCEPT for {head} was published by {merger_issued[0].author}, the same "
+            "identity that would merge this pull request. Acceptance must come from an identity "
+            "that is neither the author nor the merger; have a different reviewer publish the "
+            "verdict"
         )
     dismissed = [
         verdict

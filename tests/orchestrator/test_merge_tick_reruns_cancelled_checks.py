@@ -12,6 +12,15 @@ from command_center.orchestrator import review_merge
 
 PR = "https://github.com/voyn88/ai-command-center/pull/1"
 HEAD = "a" * 40
+
+
+@pytest.fixture(autouse=True)
+def _default_merger_login(monkeypatch):
+    monkeypatch.setattr(
+        review_merge,
+        "_gh_current_login",
+        lambda repo_path, pr_url: "merge-bot",
+    )
 URL = "https://github.com/voyn88/ai-command-center/actions/runs/{run}/job/{job}"
 
 

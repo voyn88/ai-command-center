@@ -109,6 +109,11 @@ from typing import Any
 
 from command_center.orchestrator import gh_access, github_app_auth
 from command_center.orchestrator.routing import cascade_for
+from scripts.assert_independent_acceptance import (
+    AcceptanceError,
+    evaluate,
+    parse_marker,
+)
 
 __all__ = [
     "LoopReport",
@@ -435,6 +440,50 @@ def _gh(argv: list[str], repo_path: str) -> subprocess.CompletedProcess[str]:
     the host has one, falls back to the ambient credential when the enclosing
     tick allows it, and counts the call either way."""
     return gh_access.run(argv, repo_path)
+
+
+def _gh_current_login(repo_path: str, pr_url: str) -> str | None:
+    """Login that will execute ``gh pr merge`` for this pull request.
+
+    ``gh api user`` without ``--hostname`` follows ``gh``'s default host,
+    which on a multi-host credential set can be a different account than
+    the one the pull-request URL authenticates as. The host is taken from
+    ``pr_url`` and passed explicitly. None on any failure: callers fail
+    closed instead of treating an unreadable merger as independent.
+    """
+    host = urllib.parse.urlparse(pr_url).hostname
+    if not host:
+        return None
+    result = _gh(["api", "user", "--hostname", host], repo_path)
+    if result.returncode != 0:
+        return None
+    try:
+        data = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError:
+        return None
+    login = data.get("login") if isinstance(data, dict) else None
+    return login if isinstance(login, str) and login else None
+
+
+def _reviews_for_evaluate(reviews: object) -> list[dict[str, Any]]:
+    """Give ``evaluate`` the REST ``user.login`` shape.
+
+    ``gh pr view`` puts the reviewer at ``author.login``. The acceptance
+    script reads ``user.login``. Copying ``author`` into ``user`` when
+    ``user`` is absent keeps both transports on one contract.
+    """
+    if not isinstance(reviews, list):
+        return []
+    adapted: list[dict[str, Any]] = []
+    for review in reviews:
+        if not isinstance(review, dict):
+            continue
+        user = review.get("user")
+        if not isinstance(user, dict):
+            author = review.get("author")
+            user = author if isinstance(author, dict) else None
+        adapted.append({**review, "user": user})
+    return adapted
 
 
 #: `origin` in the forms this fleet's checkouts actually carry: HTTPS (what
@@ -2077,55 +2126,84 @@ def _chunk_payload_matches_envelope(
     )
 
 
+_MARKER_ACCEPTED = "accepted"
+_MARKER_ABSENT = "absent"
+_MARKER_NOT_INDEPENDENT = "not_independent"
+_MARKER_IDENTITY_UNKNOWN = "identity_unknown"
+#: A dismissed review is withdrawn. A pending review was never submitted.
+#: Both are excluded before ranking, so an earlier live ACCEPT still stands
+#: when a later review was dismissed, and a pending draft cannot hide it.
+_NON_STANDING_REVIEW_STATES = frozenset({"DISMISSED", "PENDING"})
+
+
+def _reviewer_login(review: dict[str, Any]) -> str | None:
+    login = (
+        (review.get("author") or {}).get("login")
+        or (review.get("user") or {}).get("login")
+    )
+    return login if isinstance(login, str) and login else None
+
+
+def _accept_marker_standing(
+    reviews: list[dict[str, Any]],
+    head: str,
+    pr_author_login: str | None,
+    merger_login: str | None = None,
+    *,
+    require_merger: bool = False,
+) -> str:
+    """Standing of the ACCEPT marker on the latest live review.
+
+    The marker must be the body's first line, exactly as
+    ``parse_marker`` requires, on the latest review that is neither
+    DISMISSED nor PENDING. A missing author, reviewer, or (when
+    ``require_merger``) merger login is ``identity_unknown``: independence
+    is unproven, not established. The review window does not pass
+    ``require_merger`` — that lookup is a merge/publish read, not a
+    per-PR window scan.
+    """
+    if not isinstance(head, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", head):
+        return _MARKER_ABSENT
+    live = [
+        review
+        for review in reviews
+        if isinstance(review, dict)
+        and review.get("state") not in _NON_STANDING_REVIEW_STATES
+    ]
+    if not live:
+        return _MARKER_ABSENT
+    latest = max(
+        live, key=lambda review: review.get("submittedAt") or review.get("submitted_at") or ""
+    )
+    parsed = parse_marker(latest.get("body"))
+    if parsed is None or parsed[0] != "ACCEPT" or parsed[1] != head.lower():
+        return _MARKER_ABSENT
+    reviewer_login = _reviewer_login(latest)
+    if (
+        not reviewer_login
+        or not pr_author_login
+        or (require_merger and not merger_login)
+    ):
+        return _MARKER_IDENTITY_UNKNOWN
+    reviewer = reviewer_login.casefold()
+    if reviewer == pr_author_login.casefold():
+        return _MARKER_NOT_INDEPENDENT
+    if require_merger and merger_login and reviewer == merger_login.casefold():
+        return _MARKER_NOT_INDEPENDENT
+    return _MARKER_ACCEPTED
+
+
 def _accept_marker_on_latest_review(
     reviews: list[dict[str, Any]], head: str, pr_author_login: str | None
 ) -> bool:
-    """Whether the marker stands on the MOST RECENT *live* review, not
-    merely somewhere in the array. A superseded/earlier review carrying the
-    marker text must not count once a later review exists -- otherwise a
-    stale ACCEPT from before a rejected re-review would still authorize
-    merge. `submittedAt` is ISO 8601, so lexical max is chronological max; a
-    missing timestamp sorts first (never wins).
+    """Whether an independent ACCEPT stands on the latest live review.
 
-    DISMISSED reviews are excluded before that ranking, not merely
-    outranked by a newer one: a dismissed review no longer represents its
-    author's position (matching `scripts/assert_independent_acceptance.py`'s
-    `evaluate`, which drops `state == DISMISSED` the same way), so a marker
-    that was posted and then dismissed -- with no later review at all --
-    must not authorize merge just for having no successor to be superseded
-    by.
-
-    `pr_author_login` closes VOYN-W0-AICC-MARKER-REVIEWER-INDEPENDENCE
-    (found live 2026-08-22: PRs #354/#355 both merged by the same account
-    that had posted their own ACCEPT marker): a marker whose review author
-    is the SAME login as the PR's own author does not count, matching
-    `scripts/assert_independent_acceptance.py`'s own comparison exactly
-    (login against the pull request's author login, not text alone --
-    that script's docstring explains why `authorAssociation` is the wrong
-    field). `casefold()` on both sides, because GitHub logins are
-    case-insensitive (`Dimastov-Lab` and `dimastov-lab` are the same
-    account) -- `evaluate()` in that script already casefolds its own
-    comparison; an exact-string comparison here would silently accept a
-    same-account marker whenever the two API responses happened to differ
-    only in casing. None (author unknown/unfetched) skips this check
-    rather than refusing everything -- callers that cannot supply it keep
-    prior behavior; `_pr_is_mergeable` and `_has_accept_marker` below
-    always can and always do."""
-    live = [review for review in reviews if review.get("state") != "DISMISSED"]
-    if not live:
-        return False
-    latest = max(live, key=lambda r: r.get("submittedAt") or r.get("submitted_at") or "")
-    if f"ACCEPTANCE: ACCEPT {head}" not in (latest.get("body") or ""):
-        return False
-    if pr_author_login is None:
-        return True
-    reviewer_login = (
-        (latest.get("author") or {}).get("login")
-        or (latest.get("user") or {}).get("login")
-    )
+    Used by the review window, which must not spend a merger-login read
+    on every open pull request. Merge and publish use
+    ``_accept_marker_standing`` with ``require_merger`` instead.
+    """
     return (
-        reviewer_login is not None
-        and reviewer_login.casefold() != pr_author_login.casefold()
+        _accept_marker_standing(reviews, head, pr_author_login) == _MARKER_ACCEPTED
     )
 
 
@@ -2135,10 +2213,14 @@ def _has_accept_marker(
     pull: dict[str, Any] | None = None,
     *,
     rest_allowed: bool = True,
-) -> tuple[bool, str]:
-    """Whether an ACCEPT marker already stands on the PR's current head --
-    read-only, no gh pr merge/checks concern (that's _pr_is_mergeable's
-    job). Returns (has_marker, head_sha)."""
+) -> tuple[str, str]:
+    """Marker standing on the PR's current head, plus that head sha.
+
+    Publish uses the standing, not a bool: an independent marker is
+    already posted, a marker that is present but not independent should
+    still be replaced, and an unreadable identity must wait rather than
+    post a duplicate. ``("", "")`` when the pull request cannot be read.
+    """
     parsed = _owner_repo_number_from_pr_url(pr_url)
     if parsed is not None:
         owner, repo, number = parsed
@@ -2159,19 +2241,38 @@ def _has_accept_marker(
                 and isinstance(reviews, list)
             ):
                 return (
-                    _accept_marker_on_latest_review(reviews, head, author_login),
+                    _accept_marker_standing(
+                        reviews,
+                        head,
+                        author_login,
+                        _gh_current_login(repo_path, pr_url),
+                        require_merger=True,
+                    ),
                     head,
                 )
     view = _gh(
         ["pr", "view", pr_url, "--json", "reviews,headRefOid,author"], repo_path
     )
     if view.returncode != 0:
-        return False, ""
-    data = json.loads(view.stdout or "{}")
+        return "", ""
+    try:
+        data = json.loads(view.stdout or "{}")
+    except json.JSONDecodeError:
+        return "", ""
+    if not isinstance(data, dict):
+        return "", ""
     head = data.get("headRefOid", "")
     author_login = (data.get("author") or {}).get("login")
-    accept = _accept_marker_on_latest_review(data.get("reviews", []), head, author_login)
-    return accept, head
+    return (
+        _accept_marker_standing(
+            data.get("reviews") or [],
+            head,
+            author_login,
+            _gh_current_login(repo_path, pr_url),
+            require_merger=True,
+        ),
+        head if isinstance(head, str) else "",
+    )
 
 
 def _has_accept_marker_with_pull(
@@ -2180,7 +2281,7 @@ def _has_accept_marker_with_pull(
     pull: dict[str, Any] | None,
     *,
     rest_allowed: bool,
-) -> tuple[bool, str]:
+) -> tuple[str, str]:
     try:
         signature = inspect.signature(_has_accept_marker)
     except (TypeError, ValueError):
@@ -2760,14 +2861,17 @@ def publish_review_verdicts(
         if not window.allowed:
             report.skipped.append((task_id, window.reason))
             continue
-        already, current_head = _has_accept_marker_with_pull(
+        standing, current_head = _has_accept_marker_with_pull(
             repo_path,
             pr_url,
             window.pull,
             rest_allowed=window.reason != "review_window_lookup_failed",
         )
-        if already:
+        if standing == _MARKER_ACCEPTED:
             report.skipped.append((task_id, "marker_already_posted"))
+            continue
+        if standing == _MARKER_IDENTITY_UNKNOWN:
+            report.skipped.append((task_id, "marker_identity_unresolved"))
             continue
         if not current_head:
             report.skipped.append((task_id, "pr_view_failed"))
@@ -3027,8 +3131,20 @@ def _pr_is_mergeable(
         return False, f"pr_{str(data.get('state')).lower()}"
     head = data.get("headRefOid", "")
     author_login = (data.get("author") or {}).get("login")
-    accept = _accept_marker_on_latest_review(data.get("reviews", []), head, author_login)
-    if not accept:
+    merger_login = _gh_current_login(repo_path, pr_url)
+    reviews = data.get("reviews") or []
+    standing = _accept_marker_standing(
+        reviews, head, author_login, merger_login, require_merger=True
+    )
+    if standing == _MARKER_IDENTITY_UNKNOWN and not merger_login:
+        return False, "merger_identity_unresolved"
+    if standing != _MARKER_ACCEPTED:
+        return False, "no_accept_marker_on_head"
+    try:
+        evaluate(
+            _reviews_for_evaluate(reviews), head, author_login, merger=merger_login
+        )
+    except AcceptanceError:
         return False, "no_accept_marker_on_head"
     raw_rollup = data.get("statusCheckRollup") or []
     rollup = _latest_checks_by_name(raw_rollup)
@@ -3271,9 +3387,18 @@ def _merged_target_sha(repo_path: str, pr_url: str) -> tuple[str | None, str]:
         return None, "merge_commit_missing"
     head = data.get("headRefOid", "")
     author_login = (data.get("author") or {}).get("login")
-    if not _accept_marker_on_latest_review(
-        data.get("reviews", []), head, author_login
-    ):
+    merger_login = _gh_current_login(repo_path, pr_url)
+    reviews = data.get("reviews") or []
+    standing = _accept_marker_standing(
+        reviews, head, author_login, merger_login, require_merger=True
+    )
+    if standing != _MARKER_ACCEPTED:
+        return None, "merged_without_acceptance_evidence"
+    try:
+        evaluate(
+            _reviews_for_evaluate(reviews), head, author_login, merger=merger_login
+        )
+    except AcceptanceError:
         return None, "merged_without_acceptance_evidence"
     rollup = _latest_checks_by_name(data.get("statusCheckRollup") or [])
     # An EMPTY rollup is inconclusive, not green (review of eabe0d3: `any()`
