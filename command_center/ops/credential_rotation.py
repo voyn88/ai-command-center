@@ -43,6 +43,10 @@ from pathlib import Path
 from typing import Protocol
 
 from command_center.db.config import PostgresConfig, load_config
+from command_center.ops.rollout_lock import (
+    ROLLOUT_LOCK_PATH as DEFAULT_ROLLOUT_LOCK_PATH,
+    rollout_lock_is_held,
+)
 from command_center.worker.credential_file import (
     PreparedCredentialFile,
     parse_environment_text,
@@ -52,18 +56,9 @@ from command_center.worker.credential_file import (
 
 _READY = "aicc-ready"
 
-# Shared with ROLLOUT_LOCK_PATH in ops/aicc_staged_worker_rollout.py -- both
-# are root-owned scripts on the same host with no import relationship, so the
-# path is duplicated rather than shared as an import; keep the two in sync by
-# hand. The staged rollout holds this file for its entire duration (creating
-# it before the first lane mutation, removing it in a `finally`) precisely so
-# that a rotation tick which fires anyway -- because its timer had already
-# elapsed before the rollout could stop it, or because it was started
-# directly rather than through the timer -- has a way to notice a rollout is
-# in flight and defer instead of racing it (live 2026-09-08 worker-01: a
-# rotate tick's `try-restart` collided with the rollout's own drain of the
-# canary lane).
-DEFAULT_ROLLOUT_LOCK_PATH = Path("/run/aicc-staged-rollout.lock")
+# The staged rollout holds DEFAULT_ROLLOUT_LOCK_PATH for its entire duration
+# so a rotation tick that fires anyway can defer instead of racing the
+# rollout (live 2026-09-08 worker-01).
 
 # enroll_rotate_self() grants a fixed one-hour credential. Keep this contract
 # beside the protocol budget so a unit/test change cannot silently make a
@@ -1792,7 +1787,7 @@ def main(argv: list[str] | None = None) -> int:
     # (a durable phase journal), and leaving that fleet drained until the
     # rollout finishes is a worse outcome than finishing the recovery.
     if not args.recover_only and args.rollout_lock is not None and (
-        args.rollout_lock.exists()
+        rollout_lock_is_held(args.rollout_lock)
     ):
         Audit(args.audit_file).emit(
             "rotation_deferred_staged_rollout", lock=str(args.rollout_lock)

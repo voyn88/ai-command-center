@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import importlib.util
+import inspect
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
 import pytest
@@ -943,7 +945,7 @@ def test_write_and_remove_rollout_lock_round_trip(tmp_path, monkeypatch):
     module.write_rollout_lock()
 
     assert lock_path.read_text(encoding="utf-8") == f"{os.getpid()}\n"
-    # Written via temp-then-rename: no leftover temp file beside it.
+    # Exclusive create leaves no temporary sibling beside the lock.
     assert list(lock_path.parent.iterdir()) == [lock_path]
 
     module.remove_rollout_lock()
@@ -1830,6 +1832,69 @@ def test_rollout_lock_does_not_overwrite_existing_owner(tmp_path, monkeypatch):
     with pytest.raises(FileExistsError):
         module.write_rollout_lock()
     assert lock.read_text() == "other-owner"
+
+
+def test_rollout_lock_writer_never_renames_over_the_live_file():
+    module = _module()
+    source = inspect.getsource(module.write_rollout_lock)
+    assert "O_EXCL" in inspect.getsource(module._write_exclusive_lock)
+    assert "os.replace" not in source
+    assert "rename" not in source
+    installer = Path(__file__).parents[2].joinpath(
+        "deploy/install-agent-principal-isolation.sh"
+    ).read_text(encoding="utf-8")
+    hold = installer.split("hold_lane_timers()", 1)[1].split("\nrelease_lane_timers()", 1)[0]
+    assert "set -C" in hold
+    assert "mv " not in hold
+
+
+def test_live_foreign_lock_is_not_replaced_or_deleted(tmp_path, monkeypatch):
+    module = _module()
+    lock = tmp_path / "rollout.lock"
+    monkeypatch.setattr(module, "ROLLOUT_LOCK_PATH", lock)
+    monkeypatch.setattr(module, "rollout_lock_holder_is_alive", lambda _pid: True)
+    lock.write_text("4242\n", encoding="utf-8")
+    with pytest.raises(FileExistsError):
+        module.write_rollout_lock()
+    module.remove_rollout_lock()
+    assert lock.read_text(encoding="utf-8") == "4242\n"
+    assert list(lock.parent.iterdir()) == [lock]
+
+
+def test_dead_holder_is_reclaimed_in_place_and_a_racer_cannot_delete_it(
+    tmp_path, monkeypatch
+):
+    pytest.importorskip("fcntl")
+    module = _module()
+    lock = tmp_path / "rollout.lock"
+    monkeypatch.setattr(module, "ROLLOUT_LOCK_PATH", lock)
+    monkeypatch.setattr(
+        module,
+        "rollout_lock_holder_is_alive",
+        lambda pid: pid == os.getpid(),
+    )
+    lock.write_text("4242\n", encoding="utf-8")
+    inode = lock.stat().st_ino
+    errors: list[BaseException] = []
+
+    def reclaim() -> None:
+        try:
+            module.write_rollout_lock()
+        except FileExistsError as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=reclaim) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert lock.read_text(encoding="utf-8") == f"{os.getpid()}\n"
+    assert lock.stat().st_ino == inode
+    assert len(errors) == 1
+    assert list(lock.parent.iterdir()) == [lock]
+    module.remove_rollout_lock()
+    assert not lock.exists()
 
 
 # ---------------------------------------------------------------------------

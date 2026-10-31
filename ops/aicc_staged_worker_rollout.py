@@ -510,21 +510,91 @@ def release_lane_mutating_timers(systemd: Systemd, *, strict: bool = False) -> N
         raise RolloutError("timer_restore_failed:" + ",".join(failed))
 
 
-def write_rollout_lock() -> None:
-    """Create the marker file rotation/self-deploy check before mutating.
+def rollout_lock_holder_is_alive(pid: int) -> bool:
+    """Whether ``pid`` is still running.
 
-    World-readable by design: the rotator and self-deploy run as unprivileged
-    service users and only need to observe that the file exists, never its
-    contents. Created exclusively: readers only need existence, and concurrent
-    writers must never replace another rollout marker.
+    No ``/proc`` means the question cannot be answered, so the holder is
+    treated as alive. A stale lock is never inferred from a missing procfs.
     """
-    ROLLOUT_LOCK_PATH.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
-    # Exclusive creation prevents another rollout's ownership being overwritten.
+    if pid <= 0:
+        return True
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return True
+    return (proc / str(pid)).exists()
+
+
+def _proven_dead_lock_text(raw: str) -> bool:
+    holder = raw.strip()
+    if not holder.isdigit() or holder.startswith("0"):
+        return False
+    return not rollout_lock_holder_is_alive(int(holder))
+
+
+def rollout_lock_is_held() -> bool:
+    """True while a live or unproven holder owns ``ROLLOUT_LOCK_PATH``.
+
+    Same answers as ``command_center.ops.rollout_lock.rollout_lock_is_held``.
+    This script cannot import that module: it runs under the system
+    interpreter with only ``ops/`` on its path.
+    """
+    try:
+        raw = ROLLOUT_LOCK_PATH.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    holder = raw.strip()
+    if not holder.isdigit() or holder.startswith("0"):
+        return True
+    return rollout_lock_holder_is_alive(int(holder))
+
+
+def _write_exclusive_lock() -> None:
     fd = os.open(ROLLOUT_LOCK_PATH, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
         handle.write(f"{os.getpid()}\n")
         handle.flush()
         os.fsync(handle.fileno())
+
+
+def write_rollout_lock() -> None:
+    """Create the marker file rotation/self-deploy check before mutating.
+
+    World-readable by design: the rotator and self-deploy run as unprivileged
+    service users and only need to observe the holder's pid. A new lock is
+    created with ``O_EXCL`` so two rollouts cannot replace each other.
+
+    A holder that is provably dead is reclaimed in place, under an exclusive
+    flock, and only after the bytes are read again while that flock is held.
+    The reclaim never moves a temporary file onto the lock and never
+    unlinks it: both of those let a second writer delete a lock a live
+    rollout has just published.
+    """
+    ROLLOUT_LOCK_PATH.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    try:
+        _write_exclusive_lock()
+        return
+    except FileExistsError:
+        pass
+    try:
+        import fcntl
+    except ImportError:
+        raise FileExistsError(ROLLOUT_LOCK_PATH) from None
+    fd = os.open(ROLLOUT_LOCK_PATH, os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        raw = os.read(fd, 128).decode("utf-8", "replace")
+        if not _proven_dead_lock_text(raw):
+            raise FileExistsError(ROLLOUT_LOCK_PATH)
+        payload = f"{os.getpid()}\n".encode()
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.ftruncate(fd, 0)
+        os.write(fd, payload)
+        os.fsync(fd)
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 
 def remove_rollout_lock() -> None:

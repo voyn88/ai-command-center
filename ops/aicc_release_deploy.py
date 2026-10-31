@@ -794,6 +794,29 @@ def rollout_active_lanes(
     return True, f"ready:{ready_count}"
 
 
+def _rollout_lock_is_held(path: Path) -> bool:
+    """Same answers as command_center.ops.rollout_lock.rollout_lock_is_held.
+
+    This script is installed as a standalone file under /usr/libexec and
+    cannot import the package. A missing file is not held. An unreadable
+    file, a non-pid, or a host without /proc is held. A numeric pid is held
+    only while /proc/<pid> exists.
+    """
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    holder = raw.strip()
+    if not holder.isdigit() or holder.startswith("0"):
+        return True
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return True
+    return (proc / holder).is_dir()
+
+
 def deploy_once(
     cfg: DeployConfig | None = None,
     *,
@@ -832,7 +855,7 @@ def deploy_once(
         report.detail = detail
         return report
 
-    if cfg.rollout_lock_path.exists():
+    if _rollout_lock_is_held(cfg.rollout_lock_path):
         return finish("REFUSED", "staged_rollout_in_progress")
 
     rollout_mod = None

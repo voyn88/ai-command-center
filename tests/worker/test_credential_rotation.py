@@ -1141,7 +1141,7 @@ def test_cli_defers_to_a_staged_rollout_without_touching_the_controller(
     must defer -- exit 0, audited, no controller mutation -- not race the
     rollout's own lane stop/start (live worker-01 2026-09-08)."""
     lock = tmp_path / "aicc-staged-rollout.lock"
-    lock.write_text("12345\n", encoding="utf-8")
+    lock.write_text(f"{os.getpid()}\n", encoding="utf-8")
 
     def fail(self) -> None:
         raise AssertionError("rotate() must not run while the rollout lock is held")
