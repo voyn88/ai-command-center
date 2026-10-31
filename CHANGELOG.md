@@ -8,6 +8,22 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Added — platform rollback asymmetry analysis (`VOYN-W0-AICC-SRV-09-PLATFORM-ROLLBACK-ASYMMETRY`)
+- `docs/operations/PLATFORM_ROLLBACK_ASYMMETRY.md`: enumerates exactly what
+  AICC writes into the AIOS platform's own database during a cutover window
+  (the `repo_lease`/`repo_lease_event` writer lease via `voyn-lease`, and
+  `tasks`/`task_events` via `aios_sdk`) that `scripts/aicc_pg_restore.sh`
+  cannot reach or undo, traces the gap to `SRV-02`'s lease-split decision,
+  excludes adjacent non-platform surfaces (status reads, in-AICC
+  `backlog_lease`, queue claims), and defines the reconciliation procedure
+  to run around a restore during such a window.
+- `scripts/aicc_pre_restore_platform_manifest.py`: captures claimed work,
+  `aios_task_map.json`, and `voyn-lease list` **before** an
+  `--allow-overwrite` restore, so the platform rows that will survive have
+  a named inventory once `AICC_PG_DB`'s own audit trail is gone.
+- `tests/ops/test_platform_rollback_asymmetry.py`: pins the write-call-site
+  inventory and the pre-restore manifest shape.
+
 ### Added — the one-button audit, wired into the web UI (`VOYN-W0-APP-CONTROL-S4`)
 
 - `web/src/screens/Tasks.tsx`: an `AuditLauncher` panel above the task list —

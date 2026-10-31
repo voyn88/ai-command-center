@@ -200,6 +200,14 @@ it writes anything. Restoring over the live database requires
 drill — a restore procedure that requires an outage to rehearse is one nobody
 rehearses.
 
+A restore reaches only `AICC_PG_DB`. Writer leases (`repo_lease` /
+`repo_lease_event` via `voyn-lease`) and AIOS task state (`tasks` /
+`task_events` via `aios_sdk`) live in the platform database and are not
+undone here — see
+[`docs/operations/PLATFORM_ROLLBACK_ASYMMETRY.md`](operations/PLATFORM_ROLLBACK_ASYMMETRY.md)
+and capture
+`scripts/aicc_pre_restore_platform_manifest.py` before any live overwrite.
+
 `test_backup_restore_drill_round_trips_data` runs both scripts end to end
 against a real server and reads the restored rows back, so what is verified is
 the scripts an operator actually runs, not just that `pg_dump` exists.
