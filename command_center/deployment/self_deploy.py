@@ -295,6 +295,13 @@ def self_deploy_once(
         report.outcome, report.detail = outcome, detail
         if outcome != "noop":
             _record_provenance(cfg, report)
+        if outcome in {"rolled_back", "failed"} and report.target_sha:
+            try:
+                from command_center.lane_budget import pause_for_red_smoke
+                from pathlib import Path as _Path
+                pause_for_red_smoke(_Path(repo_path), sha=report.target_sha)
+            except Exception:
+                pass
         return report
 
     if cfg.rollout_lock_path and Path(cfg.rollout_lock_path).expanduser().exists():
