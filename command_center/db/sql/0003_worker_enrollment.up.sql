@@ -510,10 +510,15 @@ BEGIN
         RETURN v;
     END IF;
 
-    -- The network the operator declared IN ADVANCE, checked before the address
-    -- the credential happened to be used from first. A worker host is refused
-    -- outright; operators and the control plane move around, so for them it is
-    -- audited and allowed.
+    -- VOYN-W0-AICC-SRV-02d. The network the operator declared IN ADVANCE,
+    -- checked before the address the credential happened to be used from
+    -- first. SRV-02 declared `expected_cidr` and then ignored it —
+    -- `identity_assert` only consulted `bound_addr` — so a ticket's CIDR
+    -- constrained nothing while reading as a network control. A
+    -- declared-but-inert limit is worse than none. Closed here: the
+    -- containment check runs, is audited as `check=expected_cidr`, and for
+    -- a worker host it refuses outright. Operators and the control plane
+    -- move around, so for them a mismatch is audited and allowed.
     IF p.expected_cidr IS NOT NULL AND inet_client_addr() IS NOT NULL
        AND NOT (inet_client_addr() <<= p.expected_cidr) THEN
         PERFORM _principal_audit(c.principal_id, 'assert', 'rejected', c.credential_id,
