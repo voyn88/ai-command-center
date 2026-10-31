@@ -95,7 +95,12 @@ def create_dispatch_router() -> APIRouter:
     router = APIRouter(prefix="/api/v1/dispatch", tags=["dispatch"])
 
     @router.get("/plan")
-    def get_plan() -> dict:  # read-only, no mutation
+    # No board/queue state is mutated. The one write this can make is an
+    # `activity_log` line when the trailing-24h spend cannot be read (see
+    # `service.plan`) — an append-only record of a refusal, not a change to
+    # anything this endpoint reports. Worth knowing before polling it: while
+    # the spend store is down, every call appends one such line.
+    def get_plan() -> dict:
         return _service.plan(_root()).as_dict()
 
     @router.post("/assign")

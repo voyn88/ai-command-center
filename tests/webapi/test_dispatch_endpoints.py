@@ -203,11 +203,19 @@ def test_get_plan_reports_null_spend_not_a_fabricated_zero_when_unreadable(monke
     monkeypatch.setattr(dispatch_service, "active_by_executor", lambda db_path: {})
 
     def _raise(*_a, **_k):
-        raise RuntimeError("db unreachable")
+        raise task_pipeline.SpendUnknownError(
+            task_pipeline.SPEND_UNKNOWN_STORAGE_UNAVAILABLE, "db unreachable"
+        )
 
     monkeypatch.setattr(task_pipeline, "daily_spend_usd", _raise)
     settings = pipeline_settings.load_settings(_ROOT)
-    pipeline_settings.save_settings(_ROOT, dataclasses.replace(settings, enabled=True))
+    # A ceiling must be configured for the spend to be read at all: with no
+    # ceiling nothing gates on the figure, so it is not measured and an
+    # unreadable store cannot block dispatch.
+    pipeline_settings.save_settings(
+        _ROOT,
+        dataclasses.replace(settings, enabled=True, max_daily_spend_usd=5.0),
+    )
 
     tasks_repository.create_task(
         _ROOT, project="AICC", title="ship dispatch",
