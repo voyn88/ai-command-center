@@ -3687,6 +3687,29 @@ class FileTransaction:
             raise RuntimeError("current release selector is not trusted-owned")
         # After a crash between selector replacement and marker removal these
         # may already be the same; verification and restore remain idempotent.
+        # Older root probes could pollute either end. Preflight both before
+        # deleting anything, so unrelated drift in one leaves the other intact.
+        repairs: list[str] = []
+        for candidate in dict.fromkeys((selector, previous)):
+            try:
+                self.verify_release_selection(candidate)
+            except ReleaseRefused:
+                release_id = candidate.split("/", 1)[-1]
+                remove_unattested_recovery_bytecode(
+                    current.parent / candidate,
+                    self.release_manifest_path(release_id), release_id,
+                    trusted_uid=os.geteuid(), trusted_gid=os.getegid(),
+                    dry_run=True,
+                )
+                repairs.append(candidate)
+        for candidate in repairs:
+            release_id = candidate.split("/", 1)[-1]
+            remove_unattested_recovery_bytecode(
+                current.parent / candidate,
+                self.release_manifest_path(release_id), release_id,
+                trusted_uid=os.geteuid(), trusted_gid=os.getegid(),
+            )
+            self.verify_release_selection(candidate)
         self.verify_release_selection(selector)
         self._restore_release_selector()
 
@@ -5140,6 +5163,7 @@ def remove_unattested_recovery_bytecode(
     *,
     trusted_uid: int = 0,
     trusted_gid: int = 0,
+    dry_run: bool = False,
 ) -> None:
     """Remove only derived additions before restoring a pending selector.
 
@@ -5150,6 +5174,7 @@ def remove_unattested_recovery_bytecode(
     tree before removing anything. No manifest or pending journal is rewritten.
     A crash can leave only a subset of these extras, so the same preflight and
     removal are safe to repeat; full ordinary verification remains mandatory.
+    `dry_run` performs the identical complete preflight without deleting extras.
     """
     expected = _read_release_manifest(
         manifest, release_id, trusted_uid=trusted_uid, trusted_gid=trusted_gid
@@ -5223,6 +5248,8 @@ def remove_unattested_recovery_bytecode(
     missing = set(expected_by_path) - seen
     if missing:
         raise ReleaseRefused(f"release is incomplete: {sorted(missing)[:5]}")
+    if dry_run:
+        return
 
     # Pin each untrusted-content directory, never follow a replaced symlink.
     # A changed inode/owner/mode refuses before this directory is touched.
