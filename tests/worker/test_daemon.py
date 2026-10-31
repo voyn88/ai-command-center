@@ -15,6 +15,8 @@ import signal
 import time
 from pathlib import Path
 
+import pytest
+
 from command_center.db.work_queue_store import ClaimedWork, QueueRefusal
 from command_center.worker.daemon import (
     HandlerOutcome,
@@ -308,12 +310,12 @@ def test_drain_ack_is_after_atomic_claim_gate_close() -> None:
 
     daemon.request_drain()
     time.sleep(0.05)
-    assert "STATUS=aicc-drained" not in notices
+    assert "STATUS=aicc-drained-idle" not in notices
     release.set()
     deadline = time.monotonic() + 5
-    while "STATUS=aicc-drained" not in notices and time.monotonic() < deadline:
+    while "STATUS=aicc-drained-idle" not in notices and time.monotonic() < deadline:
         time.sleep(0.01)
-    assert "STATUS=aicc-drained" in notices
+    assert "STATUS=aicc-drained-idle" in notices
     time.sleep(0.05)
     assert calls[0] == 1, "no claim may begin after the drain ACK"
     daemon.request_stop()
@@ -394,7 +396,7 @@ def test_real_sigterm_boundary_then_bounded_sigkill_allows_lease_redelivery(
             )
             daemon.install_signal_handlers()
             daemon.run_forever()
-        except BaseException:
+        except BaseException:  # noqa: BLE001 - child test reports any failure to parent
             os._exit(1)
         os._exit(0)
 
@@ -769,3 +771,187 @@ def test_the_daemon_speaks_real_sd_notify_datagrams(monkeypatch) -> None:
     assert any(
         frame == b"WATCHDOG=1" or frame.startswith(b"WATCHDOG=1\n") for frame in frames
     )
+
+
+
+def test_drain_idle_waits_for_claim_handler_and_outcome_persistence():
+    import threading
+
+    claim_entered = threading.Event()
+    claim_release = threading.Event()
+    handler_entered = threading.Event()
+    handler_release = threading.Event()
+    persist_entered = threading.Event()
+    persist_release = threading.Event()
+    busy_ack = threading.Event()
+    idle_ack = threading.Event()
+    notices = []
+
+    class Store(ScriptedStore):
+        def claim(self, queue, *, visibility_seconds):
+            claim_entered.set()
+            assert claim_release.wait(5)
+            return super().claim(queue, visibility_seconds=visibility_seconds)
+
+        def complete(self, work, result):
+            persist_entered.set()
+            assert persist_release.wait(5)
+            return super().complete(work, result)
+
+    store = Store([_work({"kind": "slow"})])
+
+    def handler(payload, lease_lost, attempt_no=1):
+        handler_entered.set()
+        assert handler_release.wait(5)
+        return HandlerOutcome(ok=True, result={})
+
+    def notify(message):
+        notices.append(message)
+        if "STATUS=aicc-drained-idle" in message:
+            idle_ack.set()
+        elif "STATUS=aicc-drained" in message:
+            busy_ack.set()
+
+    daemon = WorkerDaemon(store, {"slow": handler},
+                          WorkerConfig(idle_min_seconds=0.01), notify=notify)
+    worker = threading.Thread(target=daemon.run_forever)
+    worker.start()
+    try:
+        assert claim_entered.wait(5)
+        daemon.request_drain()
+        assert not busy_ack.wait(0.05)
+        assert not idle_ack.is_set()
+        claim_release.set()
+        assert handler_entered.wait(5)
+        assert busy_ack.wait(5)
+        assert not idle_ack.is_set()
+        handler_release.set()
+        assert persist_entered.wait(5)
+        assert not idle_ack.is_set(), "handler completion is not durable completion"
+        persist_release.set()
+        assert idle_ack.wait(5)
+        assert [c[0] for c in store.calls].count("claim") == 1
+        assert ("complete", "wat-1", {}) in store.calls
+    finally:
+        claim_release.set()
+        handler_release.set()
+        persist_release.set()
+        daemon.request_stop()
+        worker.join(5)
+    assert not worker.is_alive()
+
+
+def test_completion_after_reload_cannot_overwrite_ready_with_stale_idle():
+    import threading
+
+    persisting = threading.Event()
+    finish = threading.Event()
+    busy = threading.Event()
+    reloaded = threading.Event()
+    notices = []
+
+    class Store(ScriptedStore):
+        def complete(self, work, result):
+            persisting.set()
+            assert finish.wait(5)
+            return super().complete(work, result)
+
+    store = Store([_work({"kind": "echo"})])
+
+    def notify(message):
+        notices.append(message)
+        if message == "STATUS=aicc-drained":
+            busy.set()
+        if busy.is_set() and message == "STATUS=aicc-ready":
+            reloaded.set()
+
+    daemon = WorkerDaemon(
+        store, {"echo": lambda p, e, a=1: HandlerOutcome(ok=True)},
+        WorkerConfig(idle_min_seconds=0.01), notify=notify,
+    )
+    worker = threading.Thread(target=daemon.run_forever)
+    worker.start()
+    try:
+        assert persisting.wait(5)
+        daemon.request_drain()
+        assert busy.wait(5)
+        daemon.request_reload()
+        assert reloaded.wait(5)
+        ready_index = len(notices)
+        finish.set()
+        deadline = time.monotonic() + 5
+        while not any(c[0] == "complete" for c in store.calls) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert any(c[0] == "complete" for c in store.calls)
+        daemon.request_stop()
+        worker.join(5)
+        assert not any("STATUS=aicc-drained" in p for p in notices[ready_index:])
+    finally:
+        finish.set()
+        daemon.request_stop()
+        worker.join(5)
+    assert not worker.is_alive()
+
+
+@pytest.mark.parametrize("report_failure", ["exception", "refusal"])
+def test_handled_report_failure_does_not_permanently_block_idle_after_reload(report_failure):
+    import threading
+
+    attempted = threading.Event()
+    drained = threading.Event()
+    reloaded = threading.Event()
+    notices = []
+
+    class Store(ScriptedStore):
+        def complete(self, work, result):
+            attempted.set()
+            if report_failure == "exception":
+                raise RuntimeError("ambiguous database write")
+            return False
+
+    store = Store([_work({"kind": "echo"})])
+
+    def notify(message):
+        notices.append(message)
+        if "STATUS=aicc-drained-idle" in message:
+            drained.set()
+        if drained.is_set() and message == "STATUS=aicc-ready":
+            reloaded.set()
+
+    daemon = WorkerDaemon(
+        store, {"echo": lambda p, e, a=1: HandlerOutcome(ok=True)},
+        WorkerConfig(idle_min_seconds=0.01), notify=notify,
+    )
+    worker = threading.Thread(target=daemon.run_forever)
+    worker.start()
+    try:
+        assert attempted.wait(5)
+        daemon.request_drain()
+        assert drained.wait(5), "a handled failure is no longer in-flight work"
+        assert any("STATUS=aicc-drained-idle" in p for p in notices)
+        daemon.request_reload()
+        assert reloaded.wait(5)
+        drained.clear()
+        daemon.request_drain()
+        assert drained.wait(5), "a handled failure is no longer in-flight work"
+        assert any("STATUS=aicc-drained-idle" in p for p in notices)
+    finally:
+        daemon.request_stop()
+        worker.join(5)
+    assert not worker.is_alive()
+
+
+
+def test_unhandled_execution_exception_does_not_advertise_idle():
+    store = ScriptedStore([_work({"kind": "echo"})])
+    notices = []
+    daemon = WorkerDaemon(store, {}, notify=notices.append)
+
+    def execute(work):
+        daemon.request_drain()
+        raise RuntimeError("unhandled execution failure")
+
+    daemon._execute = execute
+    with pytest.raises(RuntimeError, match="unhandled execution failure"):
+        daemon.run_forever()
+    assert not any("STATUS=aicc-drained-idle" in p for p in notices)
