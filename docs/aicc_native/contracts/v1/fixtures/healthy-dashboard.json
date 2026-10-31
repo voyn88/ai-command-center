@@ -1,0 +1,12 @@
+{
+  "schema_version": "1.0",
+  "snapshot_revision": "r-001",
+  "generated_at": "2026-08-24T00:00:00Z",
+  "staleness": {"state": "fresh", "age_seconds": 4},
+  "trace_id": "fixture-healthy-001",
+  "data": {
+    "autonomy": {"state": "healthy", "needs_owner_action": false},
+    "tasks": [{"id": "VOYN-EXAMPLE-001", "title": "Example delivery", "derived_status": "in_progress", "evidence": {"head_sha": "abc123", "pr": "#42", "ci": "passed", "acceptance": "pending", "merged_sha": "UNKNOWN", "deployed_sha": "UNKNOWN"}}],
+    "events_cursor": "evt-001"
+  }
+}

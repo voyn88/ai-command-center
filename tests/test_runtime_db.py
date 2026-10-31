@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from command_center.runtime import db
+from command_center.runtime import db, supervisor
 
 
 def _fresh_db(tmp_path):
@@ -55,6 +55,45 @@ def _mp_event_writer_worker(path_str: str, run_id: str, process_idx: int, n_even
         _db.append_run_event(path, run_id, "lifecycle", {"process_idx": process_idx, "i": i})
 
 
+def _v24_db_with_run(tmp_path, monkeypatch, *, state: str, finalized: bool):
+    """Build the exact pre-claim cutover shape with one controlled run."""
+    path = tmp_path / f"runtime-v24-{state.lower()}-{int(finalized)}.db"
+    current_migrations = list(db.MIGRATIONS)
+    with monkeypatch.context() as pre_claim:
+        pre_claim.setattr(db, "MIGRATIONS", current_migrations[:-1])
+        pre_claim.setattr(db, "SCHEMA_VERSION", 24)
+        db.migrate(path)
+        task = db.create_task(
+            path,
+            project="AIOS",
+            title=f"v24 {state}",
+            task_type="implementation",
+        )
+        session = db.create_session(
+            path,
+            task_id=task["id"],
+            project="AIOS",
+            repository_path="/tmp/v24-cutover",
+        )
+        run = db.create_run(
+            path,
+            session_id=session["id"],
+            task_id=task["id"],
+            project="AIOS",
+            repository_path="/tmp/v24-cutover",
+            task_type="implementation",
+            prompt="v24 cutover",
+            is_resume=False,
+        )
+        with db.connect(path) as conn:
+            with db.transaction(conn):
+                conn.execute(
+                    "UPDATE run SET state = ?, finalized_at = ? WHERE id = ?",
+                    (state, db.iso_now() if finalized else None, run["id"]),
+                )
+    return path, run["id"]
+
+
 # --------------------------------------------------------------------------
 # Migrations / schema versioning
 # --------------------------------------------------------------------------
@@ -71,6 +110,372 @@ def test_migrate_is_idempotent(tmp_path):
     db.migrate(path)
     db.migrate(path)
     assert db.current_schema_version(path) == db.SCHEMA_VERSION
+
+
+@pytest.mark.parametrize(
+    "state",
+    sorted(db.EXECUTION_CENTER_ACTIVE_STATES),
+)
+@pytest.mark.parametrize("finalized", [False, True])
+def test_v25_migration_refuses_every_active_v24_run(
+    tmp_path, monkeypatch, state, finalized
+):
+    path, _run_id = _v24_db_with_run(
+        tmp_path, monkeypatch, state=state, finalized=finalized
+    )
+
+    with pytest.raises(
+        db.FinalizationClaimCutoverRequired, match="explicit offline"
+    ):
+        db.migrate(path)
+
+    assert db.current_schema_version(path) == 24
+    with db.connect(path) as conn:
+        table = conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'run_finalization_claim'"
+        ).fetchone()
+    assert table is None
+
+
+@pytest.mark.parametrize("finalized", [False, True])
+def test_v25_migration_refuses_unknown_or_future_state(
+    tmp_path, monkeypatch, finalized
+):
+    path, _run_id = _v24_db_with_run(
+        tmp_path,
+        monkeypatch,
+        state="FUTURE_ACTIVE_STATE",
+        finalized=finalized,
+    )
+
+    with pytest.raises(
+        db.FinalizationClaimCutoverRequired, match="explicit offline"
+    ):
+        db.migrate(path)
+
+    assert db.current_schema_version(path) == 24
+
+
+def test_v25_migration_rolls_back_table_when_ledger_stamp_fails(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "runtime-v24-ledger-failure.db"
+    current_migrations = list(db.MIGRATIONS)
+    with monkeypatch.context() as pre_claim:
+        pre_claim.setattr(db, "MIGRATIONS", current_migrations[:-1])
+        pre_claim.setattr(db, "SCHEMA_VERSION", 24)
+        db.migrate(path)
+
+    with monkeypatch.context() as failed_stamp:
+        failed_stamp.setattr(
+            db,
+            "iso_now",
+            lambda: (_ for _ in ()).throw(RuntimeError("stamp failed")),
+        )
+        with pytest.raises(RuntimeError, match="stamp failed"):
+            db.bootstrap_finalization_claim_cutover(
+                path,
+                owner_token="cutover-owner",
+                owner_pid=123,
+                owner_identity="birth|command",
+                offline_confirmed=True,
+            )
+
+    assert db.current_schema_version(path) == 24
+    with db.connect(path) as conn:
+        table = conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'run_finalization_claim'"
+        ).fetchone()
+    assert table is None
+
+
+def test_v25_migration_rejects_unversioned_preexisting_claim_table(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "runtime-v24-drifted-claim.db"
+    current_migrations = list(db.MIGRATIONS)
+    with monkeypatch.context() as pre_claim:
+        pre_claim.setattr(db, "MIGRATIONS", current_migrations[:-1])
+        pre_claim.setattr(db, "SCHEMA_VERSION", 24)
+        db.migrate(path)
+    with db.connect(path) as conn:
+        conn.execute("CREATE TABLE run_finalization_claim (run_id TEXT PRIMARY KEY)")
+
+    with pytest.raises(
+        db.FinalizationClaimCutoverRequired,
+        match="unversioned finalization claim",
+    ):
+        db.bootstrap_finalization_claim_cutover(
+            path,
+            owner_token="cutover-owner",
+            owner_pid=123,
+            owner_identity="birth|command",
+            offline_confirmed=True,
+        )
+
+    assert db.current_schema_version(path) == 24
+
+
+@pytest.mark.parametrize("state", sorted(db.TERMINAL_STATES))
+def test_v25_migration_refuses_every_unfinalized_terminal_v24_run(
+    tmp_path, monkeypatch, state
+):
+    path, _run_id = _v24_db_with_run(
+        tmp_path, monkeypatch, state=state, finalized=False
+    )
+
+    with pytest.raises(
+        db.FinalizationClaimCutoverRequired, match="explicit offline"
+    ):
+        db.migrate(path)
+
+    assert db.current_schema_version(path) == 24
+    with db.connect(path) as conn:
+        table = conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'run_finalization_claim'"
+        ).fetchone()
+    assert table is None
+
+
+@pytest.mark.parametrize("state", sorted(db.TERMINAL_STATES))
+def test_v25_migration_requires_explicit_cutover_even_for_clean_v24_history(
+    tmp_path, monkeypatch, state
+):
+    path, run_id = _v24_db_with_run(
+        tmp_path, monkeypatch, state=state, finalized=True
+    )
+    before = db.get_run(path, run_id)["finalized_at"]
+
+    with pytest.raises(
+        db.FinalizationClaimCutoverRequired, match="explicit offline"
+    ):
+        db.migrate(path)
+
+    assert db.current_schema_version(path) == 24
+    assert db.get_run(path, run_id)["finalized_at"] == before
+    with db.connect(path) as conn:
+        table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'run_finalization_claim'"
+        ).fetchone()
+    assert table is None
+
+
+def test_supervisor_startup_cannot_bypass_clean_v24_cutover(tmp_path, monkeypatch):
+    path, _run_id = _v24_db_with_run(
+        tmp_path, monkeypatch, state="COMPLETED", finalized=True
+    )
+
+    with pytest.raises(
+        db.FinalizationClaimCutoverRequired, match="explicit offline"
+    ):
+        supervisor.Supervisor(path)
+
+    assert db.current_schema_version(path) == 24
+
+
+def test_v25_offline_cutover_requires_explicit_confirmation(tmp_path, monkeypatch):
+    path, _run_id = _v24_db_with_run(
+        tmp_path, monkeypatch, state="COMPLETED", finalized=False
+    )
+
+    with pytest.raises(
+        db.FinalizationClaimCutoverRequired, match="explicit confirmation"
+    ):
+        db.bootstrap_finalization_claim_cutover(
+            path,
+            owner_token="cutover-owner",
+            owner_pid=123,
+            owner_identity="birth|command",
+            offline_confirmed=False,
+        )
+
+    assert db.current_schema_version(path) == 24
+
+
+@pytest.mark.parametrize("state", sorted(db.EXECUTION_CENTER_ACTIVE_STATES))
+def test_v25_offline_cutover_refuses_active_rows_atomically(
+    tmp_path, monkeypatch, state
+):
+    path, _run_id = _v24_db_with_run(
+        tmp_path, monkeypatch, state=state, finalized=False
+    )
+
+    with pytest.raises(
+        db.FinalizationClaimCutoverRequired, match="refuses active"
+    ):
+        db.bootstrap_finalization_claim_cutover(
+            path,
+            owner_token="cutover-owner",
+            owner_pid=123,
+            owner_identity="birth|command",
+            offline_confirmed=True,
+        )
+
+    assert db.current_schema_version(path) == 24
+    with db.connect(path) as conn:
+        table = conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'run_finalization_claim'"
+        ).fetchone()
+    assert table is None
+
+
+@pytest.mark.parametrize("state", sorted(db.TERMINAL_STATES))
+def test_v25_offline_cutover_fences_each_legacy_terminal_crash_row(
+    tmp_path, monkeypatch, state
+):
+    path, run_id = _v24_db_with_run(
+        tmp_path, monkeypatch, state=state, finalized=False
+    )
+
+    seeded = db.bootstrap_finalization_claim_cutover(
+        path,
+        owner_token="cutover-owner",
+        owner_pid=123,
+        owner_identity="birth|command",
+        offline_confirmed=True,
+    )
+
+    assert seeded == 1
+    assert db.current_schema_version(path) == 25
+    claim = db.get_run_finalization_claim(path, run_id)
+    assert claim is not None
+    assert claim["owner_token"] == "cutover-owner"
+    assert claim["owner_pid"] == 123
+    assert claim["owner_identity"] == "birth|command"
+    assert claim["completed_at"] is None
+    assert db.get_run(path, run_id)["finalized_at"] is None
+    assert (
+        db.bootstrap_finalization_claim_cutover(
+            path,
+            owner_token="another-owner",
+            owner_pid=456,
+            owner_identity="later|command",
+            offline_confirmed=True,
+        )
+        == 0
+    )
+    assert db.get_run_finalization_claim(path, run_id)["owner_token"] == "cutover-owner"
+
+
+def test_v25_offline_cutover_accepts_finalized_history_without_claim(
+    tmp_path, monkeypatch
+):
+    path, run_id = _v24_db_with_run(
+        tmp_path, monkeypatch, state="COMPLETED", finalized=True
+    )
+
+    seeded = db.bootstrap_finalization_claim_cutover(
+        path,
+        owner_token="cutover-owner",
+        owner_pid=123,
+        owner_identity="birth|command",
+        offline_confirmed=True,
+    )
+
+    assert seeded == 0
+    assert db.current_schema_version(path) == 25
+    assert db.get_run_finalization_claim(path, run_id) is None
+
+
+def test_v25_offline_cutover_rejects_ledger_without_claim_schema(
+    tmp_path, monkeypatch
+):
+    path, _run_id = _v24_db_with_run(
+        tmp_path, monkeypatch, state="COMPLETED", finalized=True
+    )
+    with db.connect(path) as conn:
+        with db.transaction(conn):
+            conn.execute(
+                "INSERT INTO schema_version (version, applied_at) VALUES (25, ?)",
+                (db.iso_now(),),
+            )
+
+    with pytest.raises(
+        db.FinalizationClaimCutoverRequired,
+        match="invalid columns or key constraints",
+    ):
+        db.migrate(path)
+
+    with pytest.raises(
+        db.FinalizationClaimCutoverRequired,
+        match="invalid columns or key constraints",
+    ):
+        db.bootstrap_finalization_claim_cutover(
+            path,
+            owner_token="cutover-owner",
+            owner_pid=123,
+            owner_identity="birth|command",
+            offline_confirmed=True,
+        )
+
+
+def test_v25_offline_cutover_rejects_name_compatible_but_unfenced_schema(
+    tmp_path, monkeypatch
+):
+    path, _run_id = _v24_db_with_run(
+        tmp_path, monkeypatch, state="COMPLETED", finalized=True
+    )
+    with db.connect(path) as conn:
+        with db.transaction(conn):
+            conn.execute(
+                "CREATE TABLE run_finalization_claim ("
+                "run_id TEXT, owner_token TEXT, owner_pid INTEGER, "
+                "owner_identity TEXT, claimed_at TEXT, completed_at TEXT)"
+            )
+            conn.execute(
+                "CREATE INDEX idx_run_finalization_claim_open "
+                "ON run_finalization_claim(owner_pid) WHERE owner_pid IS NULL"
+            )
+            conn.execute(
+                "INSERT INTO schema_version (version, applied_at) VALUES (25, ?)",
+                (db.iso_now(),),
+            )
+
+    with pytest.raises(
+        db.FinalizationClaimCutoverRequired,
+        match="invalid columns or key constraints",
+    ):
+        db.migrate(path)
+
+    with pytest.raises(
+        db.FinalizationClaimCutoverRequired,
+        match="invalid columns or key constraints",
+    ):
+        db.bootstrap_finalization_claim_cutover(
+            path,
+            owner_token="cutover-owner",
+            owner_pid=123,
+            owner_identity="birth|command",
+            offline_confirmed=True,
+        )
+
+
+def test_v25_offline_cutover_rejects_future_schema(tmp_path, monkeypatch):
+    path, _run_id = _v24_db_with_run(
+        tmp_path, monkeypatch, state="COMPLETED", finalized=True
+    )
+    with db.connect(path) as conn:
+        with db.transaction(conn):
+            conn.execute(
+                "INSERT INTO schema_version (version, applied_at) VALUES (26, ?)",
+                (db.iso_now(),),
+            )
+
+    with pytest.raises(
+        db.FinalizationClaimCutoverRequired, match="only understands v25"
+    ):
+        db.bootstrap_finalization_claim_cutover(
+            path,
+            owner_token="cutover-owner",
+            owner_pid=123,
+            owner_identity="birth|command",
+            offline_confirmed=True,
+        )
 
 
 # Parametrized over the *actual* recorded migration versions below the current
@@ -109,7 +514,21 @@ def test_upgrade_from_every_supported_historical_schema(
     # made this test fail on every schema addition for a reason unrelated to
     # what it verifies (that a historical database upgrades cleanly).
     assert db.SCHEMA_VERSION == current_version
-    db.migrate(path)
+    with pytest.raises(
+        db.FinalizationClaimCutoverRequired, match="explicit offline"
+    ):
+        db.migrate(path)
+    assert db.current_schema_version(path) == 24
+    assert (
+        db.bootstrap_finalization_claim_cutover(
+            path,
+            owner_token="cutover-owner",
+            owner_pid=123,
+            owner_identity="birth|command",
+            offline_confirmed=True,
+        )
+        == 0
+    )
     db.migrate(path)
     assert db.current_schema_version(path) == db.SCHEMA_VERSION
     with db.connect(path) as conn:
@@ -155,7 +574,29 @@ def test_v5_historical_runs_migrate_to_claude_provider_default(tmp_path, monkeyp
                     ),
                 )
 
-    db.migrate(path)
+    # v25 is intentionally a controlled, non-rolling cutover: first bring the
+    # old file to v24 while intake is stopped, verify/remediate the historical
+    # terminal row, and only then enable claim fencing.
+    with monkeypatch.context() as pre_claim:
+        pre_claim.setattr(db, "MIGRATIONS", current_migrations[:-1])
+        pre_claim.setattr(db, "SCHEMA_VERSION", 24)
+        db.migrate(path)
+    with db.connect(path) as conn:
+        with db.transaction(conn):
+            conn.execute(
+                "UPDATE run SET finalized_at = ? WHERE id = ?",
+                (db.iso_now(), "historical-run"),
+            )
+    assert (
+        db.bootstrap_finalization_claim_cutover(
+            path,
+            owner_token="cutover-owner",
+            owner_pid=123,
+            owner_identity="birth|command",
+            offline_confirmed=True,
+        )
+        == 0
+    )
     historical_run = db.get_run(path, "historical-run")
     assert historical_run["provider_id"] == "claude_code"
     assert historical_run["provider_metadata_json"] is None
@@ -172,8 +613,136 @@ def test_migrate_creates_all_expected_tables(tmp_path):
             row["name"]
             for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
         }
-    for expected in ("task", "session", "run", "run_event", "report", "schema_version"):
+    for expected in (
+        "task",
+        "session",
+        "run",
+        "run_event",
+        "report",
+        "run_finalization_claim",
+        "schema_version",
+    ):
         assert expected in tables
+
+
+def test_v25_claim_table_shape_index_constraints_and_cascade(tmp_path):
+    path = _fresh_db(tmp_path)
+    with db.connect(path) as conn:
+        columns = {
+            row["name"]: row
+            for row in conn.execute(
+                "PRAGMA table_info(run_finalization_claim)"
+            ).fetchall()
+        }
+        indexes = {
+            row["name"]: row
+            for row in conn.execute(
+                "PRAGMA index_list(run_finalization_claim)"
+            ).fetchall()
+        }
+        foreign_keys = conn.execute(
+            "PRAGMA foreign_key_list(run_finalization_claim)"
+        ).fetchall()
+    assert set(columns) == {
+        "run_id",
+        "owner_token",
+        "owner_pid",
+        "owner_identity",
+        "claimed_at",
+        "completed_at",
+    }
+    assert columns["run_id"]["pk"] == 1
+    assert columns["run_id"]["notnull"] == 1
+    assert columns["owner_token"]["notnull"] == 1
+    assert columns["owner_pid"]["notnull"] == 1
+    assert columns["owner_identity"]["notnull"] == 1
+    assert columns["claimed_at"]["notnull"] == 1
+    assert indexes["idx_run_finalization_claim_open"]["partial"] == 1
+    assert any(
+        row["table"] == "run"
+        and row["from"] == "run_id"
+        and row["to"] == "id"
+        and row["on_delete"] == "CASCADE"
+        for row in foreign_keys
+    )
+
+    task = db.create_task(
+        path, project="AIOS", title="cascade", task_type="implementation"
+    )
+    session = db.create_session(
+        path,
+        task_id=task["id"],
+        project="AIOS",
+        repository_path="/tmp/cascade",
+    )
+    run = db.create_run(
+        path,
+        session_id=session["id"],
+        task_id=task["id"],
+        project="AIOS",
+        repository_path="/tmp/cascade",
+        task_type="implementation",
+        prompt="cascade",
+        is_resume=False,
+        finalization_owner_token="token",
+        finalization_owner_pid=1,
+        finalization_owner_identity="identity",
+    )
+    with db.connect(path) as conn:
+        with pytest.raises(sqlite3.IntegrityError):
+            with db.transaction(conn):
+                conn.execute(
+                    "INSERT INTO run_finalization_claim "
+                    "(run_id, owner_token, owner_pid, owner_identity, claimed_at) "
+                    "VALUES (NULL, 'token', 1, 'identity', '2026-01-01T00:00:00')"
+                )
+        with pytest.raises(sqlite3.IntegrityError):
+            with db.transaction(conn):
+                conn.execute(
+                    "UPDATE run_finalization_claim SET completed_at = '0000' "
+                    "WHERE run_id = ?",
+                    (run["id"],),
+                )
+        with db.transaction(conn):
+            conn.execute("DELETE FROM run WHERE id = ?", (run["id"],))
+        remaining = conn.execute(
+            "SELECT COUNT(*) AS c FROM run_finalization_claim"
+        ).fetchone()["c"]
+    assert remaining == 0
+
+
+@pytest.mark.parametrize(
+    ("owner_token", "owner_identity"),
+    [("", "identity"), ("token", "")],
+)
+def test_create_run_rejects_blank_finalization_owner_fields(
+    tmp_path, owner_token, owner_identity
+):
+    path = _fresh_db(tmp_path)
+    task = db.create_task(
+        path, project="AIOS", title="invalid owner", task_type="implementation"
+    )
+    session = db.create_session(
+        path,
+        task_id=task["id"],
+        project="AIOS",
+        repository_path="/tmp/invalid-owner",
+    )
+
+    with pytest.raises(ValueError, match="must be non-empty"):
+        db.create_run(
+            path,
+            session_id=session["id"],
+            task_id=task["id"],
+            project="AIOS",
+            repository_path="/tmp/invalid-owner",
+            task_type="implementation",
+            prompt="invalid owner",
+            is_resume=False,
+            finalization_owner_token=owner_token,
+            finalization_owner_pid=1,
+            finalization_owner_identity=owner_identity,
+        )
 
 
 def test_migrate_on_existing_populated_db_does_not_lose_data(tmp_path):
@@ -810,10 +1379,20 @@ def test_create_run_task_lock_allows_relaunch_after_prior_run_terminal(tmp_path)
     first = db.create_run(
         path, session_id=s1["id"], task_id=task["id"], project="AIOS", task_type="implementation",
         repository_path="/tmp/a", prompt="p", is_resume=False, enforce_workspace_lock=True,
+        finalization_owner_token="owner", finalization_owner_pid=123,
+        finalization_owner_identity="start|command",
     )
     first = db.update_run_state(path, first["id"], expected_version=first["version"], new_state="QUEUED")
     first = db.update_run_state(path, first["id"], expected_version=first["version"], new_state="RUNNING")
     first = db.update_run_state(path, first["id"], expected_version=first["version"], new_state="COMPLETED")
+
+    with pytest.raises(db.TaskAlreadyActiveError):
+        db.create_run(
+            path, session_id=s2["id"], task_id=task["id"], project="AIOS",
+            task_type="implementation", repository_path="/tmp/b", prompt="blocked",
+            is_resume=False, enforce_workspace_lock=True,
+        )
+    assert db.mark_run_finalized(path, first["id"], owner_token="owner") is not None
 
     second = db.create_run(
         path, session_id=s2["id"], task_id=task["id"], project="AIOS", task_type="implementation",
@@ -843,17 +1422,29 @@ def test_create_run_with_workspace_lock_conflicts_on_every_active_state(tmp_path
         )
 
 
-def test_create_run_with_workspace_lock_allows_when_conflict_is_terminal(tmp_path):
+def test_create_run_with_workspace_lock_waits_for_terminal_finalization(tmp_path):
     path = _fresh_db(tmp_path)
     task = db.create_task(path, project="AIOS", title="t", task_type="implementation")
     session = db.create_session(path, task_id=task["id"], project="AIOS", repository_path="/tmp/x")
     first = db.create_run(
         path, session_id=session["id"], task_id=task["id"], project="AIOS", task_type="implementation",
         repository_path="/tmp/x", prompt="p", is_resume=False,
+        finalization_owner_token="owner", finalization_owner_pid=123,
+        finalization_owner_identity="start|command",
     )
     first = db.update_run_state(path, first["id"], expected_version=first["version"], new_state="QUEUED")
     first = db.update_run_state(path, first["id"], expected_version=first["version"], new_state="RUNNING")
-    db.update_run_state(path, first["id"], expected_version=first["version"], new_state="COMPLETED")
+    first = db.update_run_state(
+        path, first["id"], expected_version=first["version"], new_state="COMPLETED"
+    )
+
+    with pytest.raises(db.WorkspaceLockedError):
+        db.create_run(
+            path, session_id=session["id"], task_id=task["id"], project="AIOS",
+            task_type="implementation", repository_path="/tmp/x", prompt="blocked",
+            is_resume=True, enforce_workspace_lock=True,
+        )
+    assert db.mark_run_finalized(path, first["id"], owner_token="owner") is not None
 
     second = db.create_run(
         path, session_id=session["id"], task_id=task["id"], project="AIOS", task_type="implementation",
@@ -894,6 +1485,8 @@ def test_create_run_workspace_lock_rejected_insert_does_not_advance_sequence(tmp
     first = db.create_run(
         path, session_id=session["id"], task_id=task["id"], project="AIOS", task_type="implementation",
         repository_path="/tmp/x", prompt="p", is_resume=False,
+        finalization_owner_token="owner", finalization_owner_pid=123,
+        finalization_owner_identity="start|command",
     )
     with pytest.raises(db.WorkspaceLockedError):
         db.create_run(
@@ -901,6 +1494,7 @@ def test_create_run_workspace_lock_rejected_insert_does_not_advance_sequence(tmp
             repository_path="/tmp/x", prompt="p2", is_resume=False, enforce_workspace_lock=True,
         )
     db.update_run_state(path, first["id"], expected_version=first["version"], new_state="CANCELLED")
+    assert db.mark_run_finalized(path, first["id"], owner_token="owner") is not None
     third = db.create_run(
         path, session_id=session["id"], task_id=task["id"], project="AIOS", task_type="implementation",
         repository_path="/tmp/x", prompt="p3", is_resume=False, enforce_workspace_lock=True,
