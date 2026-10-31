@@ -2207,19 +2207,19 @@ def _accept_marker_on_latest_review(
     )
 
 
-def _has_accept_marker(
+def _marker_standing(
     repo_path: str,
     pr_url: str,
     pull: dict[str, Any] | None = None,
     *,
     rest_allowed: bool = True,
+    require_merger: bool = False,
 ) -> tuple[str, str]:
-    """Marker standing on the PR's current head, plus that head sha.
+    """Marker standing on the current head, plus that head sha.
 
-    Publish uses the standing, not a bool: an independent marker is
-    already posted, a marker that is present but not independent should
-    still be replaced, and an unreadable identity must wait rather than
-    post a duplicate. ``("", "")`` when the pull request cannot be read.
+    ``require_merger`` spends one ``gh api user`` read pinned to the pull
+    request host. The bool helper leaves it false so a review-window
+    marker question is answered from the pull and its reviews alone.
     """
     parsed = _owner_repo_number_from_pr_url(pr_url)
     if parsed is not None:
@@ -2240,13 +2240,10 @@ def _has_accept_marker(
                 and re.fullmatch(r"[0-9a-f]{40}", head)
                 and isinstance(reviews, list)
             ):
+                merger = _gh_current_login(repo_path, pr_url) if require_merger else None
                 return (
                     _accept_marker_standing(
-                        reviews,
-                        head,
-                        author_login,
-                        _gh_current_login(repo_path, pr_url),
-                        require_merger=True,
+                        reviews, head, author_login, merger, require_merger=require_merger
                     ),
                     head,
                 )
@@ -2263,16 +2260,34 @@ def _has_accept_marker(
         return "", ""
     head = data.get("headRefOid", "")
     author_login = (data.get("author") or {}).get("login")
+    merger = _gh_current_login(repo_path, pr_url) if require_merger else None
     return (
         _accept_marker_standing(
             data.get("reviews") or [],
             head,
             author_login,
-            _gh_current_login(repo_path, pr_url),
-            require_merger=True,
+            merger,
+            require_merger=require_merger,
         ),
         head if isinstance(head, str) else "",
     )
+
+
+def _has_accept_marker(
+    repo_path: str,
+    pr_url: str,
+    pull: dict[str, Any] | None = None,
+    *,
+    rest_allowed: bool = True,
+) -> tuple[bool, str]:
+    """Whether an independent ACCEPT already stands on the current head.
+
+    True only for ``accepted``. An unreadable identity is not True: the
+    publish path reads the standing itself and waits instead of posting
+    over a marker it cannot attribute.
+    """
+    standing, head = _marker_standing(repo_path, pr_url, pull, rest_allowed=rest_allowed)
+    return standing == _MARKER_ACCEPTED, head
 
 
 def _has_accept_marker_with_pull(
@@ -2861,11 +2876,12 @@ def publish_review_verdicts(
         if not window.allowed:
             report.skipped.append((task_id, window.reason))
             continue
-        standing, current_head = _has_accept_marker_with_pull(
+        standing, current_head = _marker_standing(
             repo_path,
             pr_url,
             window.pull,
             rest_allowed=window.reason != "review_window_lookup_failed",
+            require_merger=True,
         )
         if standing == _MARKER_ACCEPTED:
             report.skipped.append((task_id, "marker_already_posted"))

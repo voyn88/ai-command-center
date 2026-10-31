@@ -106,6 +106,8 @@ def test_accepted_pending_checks_wait_without_rerun_or_remediation(monkeypatch, 
     _install_common(monkeypatch, accepted=True, window_reason="checks_stale")
     # Exercise the actual gh JSON path, not a mocked pending classification.
     def fake_gh(argv, _repo):
+        if argv[:3] == ["api", "user", "--hostname"]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"login": "merge-bot"}), "")
         assert argv[:2] == ["pr", "view"]
         body = {
             "state": "OPEN", "headRefOid": HEAD,
