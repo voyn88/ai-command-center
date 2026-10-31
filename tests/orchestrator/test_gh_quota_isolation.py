@@ -557,11 +557,11 @@ def test_queue_active_pr_sheds_stale_waiting_label_without_adding_active(
     )
 
 
-def test_queue_waiting_pr_sheds_blocked_label_before_detail_budget(
+def test_queue_waiting_pr_promotes_into_a_free_active_slot(
     fake_gh, checkout, fleet_store, monkeypatch
 ):
-    """The same early normalization applies to queue-waiting PRs, which make
-    up most of the old backlog tail."""
+    """A lone queue-waiting PR with free capacity becomes queue-active and
+    sheds contradictory review-window labels in the same tick."""
     monkeypatch.setenv(
         "FAKE_GH_PR_LABELS", "queue-waiting-review,review-window:blocked"
     )
@@ -569,12 +569,24 @@ def test_queue_waiting_pr_sheds_blocked_label_before_detail_budget(
     report = reconcile_pr_window(str(checkout), PrWindowConfig(detail_budget=0))
 
     assert report.error is None
-    assert report.waiting == [(42, HEAD)]
+    assert report.active == [(42, HEAD)]
+    assert report.waiting == []
     calls = [call["argv"] for call in _calls(fake_gh)]
     assert not any("/reviews" in argv[-1] for argv in calls)
     assert any(
         argv[:3] == ["api", "--method", "DELETE"]
         and argv[3].endswith("/issues/42/labels/review-window%3Ablocked")
+        for argv in calls
+    )
+    assert any(
+        argv[:3] == ["api", "--method", "POST"]
+        and argv[3].endswith("/issues/42/labels")
+        and argv[-1] == "labels[]=queue-active"
+        for argv in calls
+    )
+    assert any(
+        argv[:3] == ["api", "--method", "DELETE"]
+        and argv[3].endswith("/issues/42/labels/queue-waiting-review")
         for argv in calls
     )
     assert not any(
@@ -585,11 +597,11 @@ def test_queue_waiting_pr_sheds_blocked_label_before_detail_budget(
     )
 
 
-def test_queue_waiting_pr_sheds_stale_active_label_without_adding_waiting(
+def test_queue_waiting_pr_promotes_and_sheds_stale_active_window_label(
     fake_gh, checkout, fleet_store, monkeypatch
 ):
-    """A queue-waiting PR is owned by queue triage. The window tick should not
-    create a second waiting label just to describe the same state."""
+    """Promotion to queue-active also clears a leftover review-window:active
+    rather than leaving a contradictory pair behind."""
     monkeypatch.setenv(
         "FAKE_GH_PR_LABELS", "queue-waiting-review,review-window:active"
     )
@@ -597,11 +609,17 @@ def test_queue_waiting_pr_sheds_stale_active_label_without_adding_waiting(
     report = reconcile_pr_window(str(checkout), PrWindowConfig(detail_budget=0))
 
     assert report.error is None
-    assert report.waiting == [(42, HEAD)]
+    assert report.active == [(42, HEAD)]
     calls = [call["argv"] for call in _calls(fake_gh)]
     assert any(
         argv[:3] == ["api", "--method", "DELETE"]
         and argv[3].endswith("/issues/42/labels/review-window%3Aactive")
+        for argv in calls
+    )
+    assert any(
+        argv[:3] == ["api", "--method", "POST"]
+        and argv[3].endswith("/issues/42/labels")
+        and argv[-1] == "labels[]=queue-active"
         for argv in calls
     )
     assert not any(

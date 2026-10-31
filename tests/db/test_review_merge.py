@@ -2533,7 +2533,8 @@ def test_reconcile_skips_an_unresolvable_lookup_instead_of_flagging(rig, monkeyp
 def test_an_externally_merged_pr_without_acceptance_never_goes_done(rig, monkeypatch):  # noqa: F811, E501
     """Verification of 53c7b52 (CONFIRMED): a PR merged around the queue --
     admin bypass, hand merge -- with no acceptance marker on its merged head
-    must not be silently blessed DONE. It skips loudly for the operator."""
+    must not be silently blessed DONE. It leaves READY_TO_REVIEW as REJECTED
+    so the stale row cannot clog the review queue forever."""
     import subprocess as sp
 
     app_factory, store, _ = rig
@@ -2557,13 +2558,14 @@ def test_an_externally_merged_pr_without_acceptance_never_goes_done(rig, monkeyp
     assert not report.merged
     with app_factory() as c, c.cursor() as cur:
         cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-MX",))
-        assert cur.fetchone()[0] == "READY_TO_REVIEW"
+        assert cur.fetchone()[0] == "REJECTED"
 
 
 def test_an_empty_check_rollup_on_a_merged_pr_is_inconclusive(rig, monkeypatch):  # noqa: F811, E501
     """Review of eabe0d3: `any()` over an empty rollup is False -- a merged
     PR whose check data is unavailable must fail closed as missing
-    acceptance evidence, never be blessed DONE."""
+    acceptance evidence, never be blessed DONE. The stale READY_TO_REVIEW
+    row is rejected so it cannot clog the queue."""
     import subprocess as sp
 
     app_factory, store, _ = rig
@@ -2586,6 +2588,40 @@ def test_an_empty_check_rollup_on_a_merged_pr_is_inconclusive(rig, monkeypatch):
     report = merge_once(app_factory, "/tmp")
     assert ("VOYN-W0-MY", "merged_without_acceptance_evidence") in report.skipped
     assert not report.merged
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-MY",))
+        assert cur.fetchone()[0] == "REJECTED"
+
+
+def test_a_closed_unmerged_pr_rejects_the_ready_to_review_task(rig, monkeypatch):  # noqa: F811, E501
+    """CLOSED without merge abandons the autonomous path: clear READY_TO_REVIEW
+    as REJECTED rather than re-examining forever
+    (VOYN-W0-AICC-REVIEW-SOURCE-REFRESH-EROFS-KILLS-ALL-REVIEWS)."""
+    import subprocess as sp
+
+    app_factory, store, _ = rig
+    pr_url = "https://github.com/x/y/pull/35"
+    _ready(store, app_factory, "VOYN-W0-MZ", pr_url)
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["pr", "view"]:
+            body = json.dumps({
+                "state": "CLOSED",
+                "mergeCommit": None,
+                "headRefOid": "f5" * 20,
+                "reviews": [],
+                "statusCheckRollup": [],
+            })
+            return sp.CompletedProcess(argv, 0, body, "")
+        return sp.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    assert ("VOYN-W0-MZ", "pr_closed_unmerged") in report.skipped
+    assert not report.merged
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-MZ",))
+        assert cur.fetchone()[0] == "REJECTED"
 
 
 def test_permanent_skips_do_not_starve_the_publish_window(rig, monkeypatch):  # noqa: F811, E501
@@ -4103,6 +4139,7 @@ def test_queue_selected_prs_shed_stale_blocked_labels(monkeypatch):
     assert ("10", "add", "review-window:active") not in fake.labels
     assert ("11", "remove", "review-window:blocked") in fake.labels
     assert ("11", "add", "review-window:waiting") not in fake.labels
+    assert ("11", "add", "queue-active") not in fake.labels
 
 
 def test_queue_selected_prs_shed_blocked_labels_even_with_block_reason(monkeypatch):
@@ -4143,6 +4180,45 @@ def test_queue_selected_prs_shed_blocked_labels_even_with_block_reason(monkeypat
     assert ("12", "add", "review-window:active") not in fake.labels
     assert ("13", "remove", "review-window:blocked") in fake.labels
     assert ("13", "add", "review-window:waiting") not in fake.labels
+
+
+def test_queue_waiting_promotes_into_free_active_slots_by_age(monkeypatch):
+    """Hand-set queue-waiting-review labels must advance: oldest first, up to
+    max_active. Without this the pr-window tick left 60+ PRs waiting forever
+    (VOYN-W0-AICC-REVIEW-SOURCE-REFRESH-EROFS-KILLS-ALL-REVIEWS)."""
+    older = _win_pr(
+        20,
+        "2026-01-01T00:00:00Z",
+        "a" * 40,
+        labels=["queue-waiting-review", "review-window:blocked"],
+    )
+    newer = _win_pr(
+        21,
+        "2026-01-02T00:00:00Z",
+        "b" * 40,
+        labels=["queue-waiting-review"],
+    )
+    youngest = _win_pr(
+        22,
+        "2026-01-03T00:00:00Z",
+        "c" * 40,
+        labels=["queue-waiting-review"],
+    )
+    fake = _RestGitHub([newer, youngest, older])
+    monkeypatch.setattr(review_merge, "_gh", fake)
+
+    report = reconcile_pr_window(
+        "/repo", PrWindowConfig(max_active=2, stale_seconds=10**12)
+    )
+
+    assert report.active == [(20, "a" * 40), (21, "b" * 40)]
+    assert report.waiting == [(22, "c" * 40)]
+    assert ("20", "add", "queue-active") in fake.labels
+    assert ("20", "remove", "queue-waiting-review") in fake.labels
+    assert ("20", "remove", "review-window:blocked") in fake.labels
+    assert ("21", "add", "queue-active") in fake.labels
+    assert ("21", "remove", "queue-waiting-review") in fake.labels
+    assert ("22", "add", "queue-active") not in fake.labels
 
 
 def test_window_listing_failure_is_reported_not_silently_empty(monkeypatch):
