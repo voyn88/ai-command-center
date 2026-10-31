@@ -36,6 +36,22 @@ def _launcher_module():
     return module
 
 
+@pytest.mark.parametrize('executor', ['grok', 'cursor'])
+@pytest.mark.parametrize('profile', ['read_only', 'trusted_development'])
+def test_alternative_provider_boundary(executor, profile):
+    broker = _launcher_module()
+    command = broker._provider_command({'executor': executor, 'profile': profile,
+        'prompt': '--malicious-option', 'model': None})
+    assert command[-2:] == ['--', '--malicious-option']
+    assert set(broker.PROVIDER_AGENT_ENV_KEYS[executor]) == {('XAI_API_KEY' if executor == 'grok' else 'CURSOR_API_KEY')}
+    assert executor not in broker.MODEL_AUTH_SOURCES
+    if executor == 'grok':
+        assert command[0] == "/usr/libexec/aicc-grok-agent"
+        assert command[command.index("--model") + 1] == "grok-4.3"
+    else:
+        assert ('--force' in command) == (profile == 'trusted_development')
+
+
 def _recovery_generator_module():
     path = Path(__file__).parents[2] / "ops" / "aicc_principal_recovery_generator.py"
     spec = importlib.util.spec_from_file_location(
@@ -60,6 +76,22 @@ def _transaction_module():
 @pytest.fixture
 def launcher():
     return _launcher_module()
+
+
+@pytest.mark.parametrize("profile", ["read_only", "model_only"])
+def test_grok_review_mount_is_read_only(launcher, monkeypatch, tmp_path, profile):
+    monkeypatch.setattr(launcher, "_validate_environment_file", lambda *a, **kw: False)
+    manifest = _manifest(tmp_path, executor="grok", profile=profile)
+    launcher._load_manifest(json.dumps(manifest).encode())
+    command = launcher._systemd_command(
+        manifest, Path("/run/aicc-agent-homes/test"), "aicc-agent-test.service",
+        "aicc-agent-launcher@test.service", tmp_path.parent, tmp_path,
+    )
+    assert f"--property=BindReadOnlyPaths={tmp_path}:/workspace" in command
+    assert f"--property=BindPaths={tmp_path}:/workspace" not in command
+    assert "--property=ReadWritePaths=/agent-home" in command
+    assert "--property=ReadWritePaths=/workspace /agent-home" not in command
+    assert ("--no-tools" in command) == (profile == "model_only")
 
 
 def test_launcher_admission_and_natural_drain_share_one_task_deadline(

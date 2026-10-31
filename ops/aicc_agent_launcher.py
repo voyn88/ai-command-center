@@ -53,6 +53,8 @@ SOCKET_PATH = "/run/aicc-agent-launcher/control.sock"
 ROOTS_FILE = Path("/etc/aicc/agent-workspace-roots")
 COMMON_ENV_FILE = Path("/etc/aicc/agent.env")
 PROVIDER_ENV_FILES = {
+    "grok": Path("/etc/aicc/agent-grok.env"),
+    "cursor": Path("/etc/aicc/agent-cursor.env"),
     "claude": Path("/etc/aicc/agent-claude.env"),
     "codex": Path("/etc/aicc/agent-codex.env"),
 }
@@ -77,6 +79,8 @@ EPHEMERAL_HOME_ROOT = Path("/run/aicc-agent-homes")
 # nothing at all -- never to a half-installed package tree.
 TOOLCHAIN_BIN = "/opt/aicc/toolchains/current/bin"
 EXECUTOR_BINARIES = {
+    "grok": "/usr/libexec/aicc-grok-agent",
+    "cursor": "/opt/aicc/providers/cursor/agent",
     "claude": f"{TOOLCHAIN_BIN}/claude",
     "codex": f"{TOOLCHAIN_BIN}/codex",
 }
@@ -106,7 +110,7 @@ OUTPUT_TRUNCATED_MARKER = b"[aicc-agent-launcher: earlier agent output dropped; 
 MAX_GIT_INDEX_BYTES = 64 * 1024 * 1024
 MAX_GIT_INDEX_ENTRIES = 1_000_000
 MAX_MODEL_AUTH_BYTES = 16 * 1024 * 1024
-PROFILES = frozenset({"read_only", "trusted_development"})
+PROFILES = frozenset({"read_only", "trusted_development", "model_only"})
 MODEL_RE = re.compile(r"[A-Za-z0-9_.:/-]{1,128}")
 RUN_ID_RE = re.compile(r"[a-f0-9]{32}")
 BROKER_UNIT_RE = re.compile(r"aicc-agent-launcher@[^/]{1,200}\.service")
@@ -136,6 +140,8 @@ COMMON_AGENT_ENV_KEYS = frozenset(
     }
 )
 PROVIDER_AGENT_ENV_KEYS = {
+    "grok": frozenset({"XAI_API_KEY"}),
+    "cursor": frozenset({"CURSOR_API_KEY"}),
     "claude": frozenset(
         {"ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_MODEL"}
     ),
@@ -234,6 +240,8 @@ def _load_manifest(raw: bytes) -> dict[str, Any]:
         raise LaunchRefused("executor is not allowlisted")
     if value["profile"] not in PROFILES:
         raise LaunchRefused("profile is not allowlisted")
+    if value["profile"] == "model_only" and value["executor"] != "grok":
+        raise LaunchRefused("executor does not support the model-only profile")
     prompt = value["prompt"]
     if not isinstance(prompt, str) or not prompt or "\x00" in prompt:
         raise LaunchRefused("prompt must be a non-empty NUL-free string")
@@ -562,7 +570,7 @@ def _write_back_model_auth(executor: str, home: Path, staged: bytes | None) -> b
     return True
 
 
-def _prepare_agent_home(executor: str, run_id: str) -> tuple[Path, bytes]:
+def _prepare_agent_home(executor: str, run_id: str) -> tuple[Path, bytes | None]:
     """Create one non-persistent provider home with a private auth copy.
 
     The model process necessarily reads its provider credential, but it must
@@ -583,6 +591,13 @@ def _prepare_agent_home(executor: str, run_id: str) -> tuple[Path, bytes]:
     except KeyError as exc:
         raise LaunchRefused("aicc-agent-auth group does not exist") from exc
     source = MODEL_AUTH_SOURCES.get(executor)
+    if executor in {"grok", "cursor"}:
+        home = EPHEMERAL_HOME_ROOT / run_id
+        home.mkdir(mode=0o770)
+        os.chown(home, 0, auth_gid)
+        # Only the isolated dynamic agent UID joins this auth group; home is per run.
+        os.chmod(home, 0o770)  # nosec B103
+        return home, None
     if source is None:
         raise LaunchRefused(f"no model auth source for executor {executor!r}")
     source_payload = _read_exact_protected_file(
@@ -1011,6 +1026,13 @@ def _provider_command(manifest: dict[str, Any]) -> list[str]:
             "--color",
             "never",
         ]
+    elif executor == "grok":
+        command = [binary]
+        if profile == "model_only":
+            command += ["--no-tools"]
+    elif executor == "cursor":
+        command = [binary, "--print", "--output-format", "text", "--trust"]
+        command += ["--mode", "ask"] if profile == "read_only" else ["--force"]
     else:
         command = [
             binary,
@@ -1039,9 +1061,11 @@ def _provider_command(manifest: dict[str, Any]) -> list[str]:
                 "--deny-tool",
                 "shell(git remote)",
             ]
+    if executor == "grok":
+        model = model or "grok-4.3"
     if model:
         command += ["--model", model]
-    if executor == "codex":
+    if executor in {"codex", "grok", "cursor"}:
         # Prompt is an untrusted positional value. Explicitly terminate Codex
         # option parsing so a leading flag cannot override the sandbox.
         command += ["--", prompt]
@@ -1160,9 +1184,17 @@ def _systemd_command(
         # The source is always a broker-created bind mount. There is no
         # pathname fallback: PID 1 must never resolve the mutable workspace
         # argument supplied by the publisher.
-        f"--property=BindPaths={workspace_source}:/workspace",
+        (
+            f"--property=BindPaths={workspace_source}:/workspace"
+            if manifest["profile"] == "trusted_development"
+            else f"--property=BindReadOnlyPaths={workspace_source}:/workspace"
+        ),
         f"--property=BindPaths={agent_home}:/agent-home",
-        "--property=ReadWritePaths=/workspace /agent-home",
+        (
+            "--property=ReadWritePaths=/workspace /agent-home"
+            if manifest["profile"] == "trusted_development"
+            else "--property=ReadWritePaths=/agent-home"
+        ),
     ]
     for env_file in (COMMON_ENV_FILE, PROVIDER_ENV_FILES[executor]):
         if _validate_environment_file(env_file, executor):

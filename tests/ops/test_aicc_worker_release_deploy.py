@@ -47,8 +47,9 @@ def test_helper_loaders_source_and_installed_layout(tmp_path, monkeypatch, insta
         monkeypatch.delitem(sys.modules, name, raising=False)
     monkeypatch.setattr(module, "_OPS_DIR", tmp_path)
     try:
-        tx = module._load_install_transaction()
+        # Real deploy acquires the rollout lock before asking for the transaction.
         rollout = module._load_staged_rollout()
+        tx = module._load_install_transaction()
         assert callable(tx.verify_release_manifest)
         assert Path(tx.__file__).parent == tmp_path
         assert Path(rollout.__file__).parent == tmp_path
@@ -280,6 +281,20 @@ def test_committed_unit_files_are_root_hardened():
     assert "ReadWritePaths=/opt/aicc/releases" in service
     assert "/usr/libexec" in service
     assert "/run/aicc-staged-rollout.lock" in service
+
+
+def test_grok_driver_is_refreshed_from_selected_release(tmp_path):
+    module = _module()
+    cfg = _cfg(module, tmp_path)
+    body = b"#!/usr/bin/python3\n# bounded Grok driver\n"
+    _seed_helpers(cfg, SHA_A, release_bodies={"ops/aicc_grok_agent.py": body},
+                  installed={"aicc-grok-agent": b"old-driver"})
+    report = _deploy(module, cfg, resolve_sha=lambda _: SHA_A)
+    assert report.outcome == "NOOP"
+    target = cfg.libexec_dir / "aicc-grok-agent"
+    assert target.read_bytes() == body
+    if sys.platform != "win32":
+        assert stat.S_IMODE(target.stat().st_mode) == 0o755
 
 
 def test_changed_helper_is_replaced_with_mode_0755(tmp_path):
@@ -539,3 +554,38 @@ def test_cli_passes_real_paths_to_deploy(tmp_path, monkeypatch, capsys, override
     assert module.main(argv) == 0
     assert len(seen) == 1
     assert capsys.readouterr().out == f"NOOP {SHA_A} already_current\n"
+
+
+def test_registry_uses_installed_release_runtime(tmp_path, monkeypatch):
+    import subprocess
+    module = _module()
+    cfg = _cfg(module, tmp_path)
+    monkeypatch.setattr(module, "_current_release_sha", lambda _: SHA_A)
+    def run(args, **kwargs):
+        assert args[0] == str(cfg.runtime_venv / "bin/python")
+        assert args[-3:] == [str(cfg.lane_registry), str(cfg.trusted_uid), str(cfg.trusted_gid)]
+        assert kwargs["cwd"] == str(cfg.release_root / SHA_A)
+        assert kwargs["env"]["PYTHONPATH"] == str(cfg.release_root / SHA_A)
+        assert kwargs["timeout"] == 60
+        return subprocess.CompletedProcess(args, 0, '["voyn-aicc-worker@1.service"]', '')
+    monkeypatch.setattr(module, "_run", run)
+    assert module.load_installed_lane_registry(cfg) == (LANE_1,)
+
+
+@pytest.mark.parametrize("payload", ['[]', '["sshd.service"]', '[null]',
+                                      '["voyn-aicc-worker@1.service", "voyn-aicc-worker@1.service"]'])
+def test_registry_refuses_invalid_runtime_output(tmp_path, monkeypatch, payload):
+    import subprocess
+    module = _module()
+    monkeypatch.setattr(module, "_current_release_sha", lambda _: SHA_A)
+    monkeypatch.setattr(module, "_run", lambda args, **kw: subprocess.CompletedProcess(args, 0, payload, ''))
+    with pytest.raises(RuntimeError, match="invalid lane registry"):
+        module.load_installed_lane_registry(_cfg(module, tmp_path))
+
+
+def test_registry_refuses_absent_installed_release(tmp_path, monkeypatch):
+    module = _module()
+    monkeypatch.setattr(module, "_current_release_sha", lambda _: None)
+    monkeypatch.setattr(module, "_run", lambda *a, **kw: pytest.fail("must not execute candidate"))
+    with pytest.raises(RuntimeError, match="no installed release"):
+        module.load_installed_lane_registry(_cfg(module, tmp_path))

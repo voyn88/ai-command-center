@@ -586,6 +586,56 @@ def test_copilot_provider_failure_switches_inside_the_same_attempt(
     ]
 
 
+@pytest.mark.parametrize("task_type,executor,model", [
+    ("review", "cursor", "auto"),
+    ("independent_review", "grok", "grok-4.3"),
+])
+def test_owner_alternatives_preserve_review_capability_and_replace_old_model(
+    handler, monkeypatch, task_type, executor, model
+):
+    run_agent, runs = handler
+    monkeypatch.setenv("AICC_EXECUTOR_PROFILE", "owner-alternatives")
+    payload = _payload(task_type=task_type, model="claude-old-model", cascade=[
+        {"executor": "claude", "task_type": task_type},
+    ])
+    run_agent(payload, _event(), 1)
+    assert len(runs) == 1
+    assert runs[0]["executor"] == executor
+    assert runs[0]["model"] == model
+    assert runs[0]["task_type"] == task_type
+
+
+def test_alternative_quota_refusal_is_not_repeated_by_the_next_task(handler, monkeypatch):
+    run_agent, _ = handler
+    monkeypatch.setenv("AICC_EXECUTOR_PROFILE", "owner-alternatives")
+    called = []
+    def run(**kwargs):
+        executor = kwargs["executor"]
+        called.append(executor)
+        return agent_runner.RunResult(
+            status="failed" if executor == "cursor" else "completed",
+            exit_code=1 if executor == "cursor" else 0,
+            stdout="" if executor == "cursor" else '{"result":"done"}',
+            stderr="usage limit reached" if executor == "cursor" else "",
+            duration_seconds=0.1, started_at="t0", completed_at="t1",
+        )
+    monkeypatch.setattr(agent_runner, "run_claude_code", run)
+    assert run_agent(_payload(), _event(), 1).ok
+    assert run_agent(_payload(), _event(), 1).ok
+    assert called == ["cursor", "grok", "grok"]
+
+
+def test_exhausted_alternatives_wait_without_launching_models(handler, monkeypatch):
+    run_agent, runs = handler
+    monkeypatch.setenv("AICC_EXECUTOR_PROFILE", "owner-alternatives")
+    agent_runner.record_executor_exhausted("cursor")
+    agent_runner.record_executor_exhausted("grok")
+    outcome = run_agent(_payload(), _event(), 1)
+    assert not outcome.ok and outcome.infra_wait
+    assert "quota exhausted" in outcome.reason
+    assert runs == []
+
+
 def test_codex_usage_limit_switches_inside_the_same_attempt(handler, monkeypatch):
     """Live 2026-09-11: Codex quota used to complete the review as succeeded
     with an empty result. It must failover like Copilot, not publish."""
