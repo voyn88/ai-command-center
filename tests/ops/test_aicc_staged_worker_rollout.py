@@ -1184,6 +1184,99 @@ def test_a_writable_directory_far_above_the_interpreter_is_refused(
         module.verify_immutable_release()
 
 
+def _pin_symlink_mode_linux(link: Path) -> None:
+    """Force `lrwxrwxrwx` so a developer macOS host cannot mask the defect."""
+    if hasattr(os, "lchmod"):
+        try:
+            os.lchmod(link, 0o777)
+        except (OSError, NotImplementedError):
+            pass
+
+
+def _rewire_system_bin_behind_ancestor_symlinks(
+    tmp_path: Path, *, hops: tuple[str, ...]
+) -> Path:
+    """Replace `usr/bin/` with a symlink chain of length `len(hops)` ending at
+    a real directory that holds the interpreter. Returns that real directory.
+
+    The absolute path string `…/usr/bin/python3.12` is preserved so the venv's
+    outbound symlink still names it; the kernel follows the directory
+    symlinks during lookup, and the ancestor walk must follow them too.
+    """
+    usr_bin = tmp_path / "usr" / "bin"
+    real = usr_bin / "python3.12"
+    content = real.read_text(encoding="utf-8")
+    final_mode = real.stat().st_mode & 0o777
+    real.unlink()
+    usr_bin.rmdir()
+
+    final = tmp_path / hops[-1]
+    final.mkdir()
+    (final / "python3.12").write_text(content, encoding="utf-8")
+    (final / "python3.12").chmod(final_mode)
+
+    target: Path = final
+    for name in reversed(hops[:-1]):
+        link = tmp_path / name
+        link.symlink_to(target)
+        _pin_symlink_mode_linux(link)
+        target = link
+
+    usr_bin.symlink_to(target)
+    _pin_symlink_mode_linux(usr_bin)
+    return final
+
+
+def test_ancestor_directory_that_is_itself_a_symlink_is_followed_to_its_real_target(
+    tmp_path, monkeypatch
+):
+    """A writable real directory behind `usr/bin -> altbin` must be refused.
+    Lexical `.parent` never sees `altbin`.
+    """
+    module = _module()
+    _install_release(module, monkeypatch, tmp_path)
+    altbin = _rewire_system_bin_behind_ancestor_symlinks(tmp_path, hops=("altbin",))
+    altbin.chmod(0o777)
+
+    with pytest.raises(module.RolloutError, match="mutable"):
+        module.verify_immutable_release()
+
+
+def test_multi_hop_ancestor_symlink_chain_ending_in_writable_dir_is_refused(
+    tmp_path, monkeypatch
+):
+    """`usr/bin -> midbin -> altbin` (writable). One-hop follow stops at
+    `midbin` (a symlink, mode-exempt) and never inspects `altbin` -- the gap
+    the one-hop fix left one level removed. Full chain resolution must refuse.
+    """
+    module = _module()
+    _install_release(module, monkeypatch, tmp_path)
+    altbin = _rewire_system_bin_behind_ancestor_symlinks(
+        tmp_path, hops=("midbin", "altbin")
+    )
+    altbin.chmod(0o777)
+
+    with pytest.raises(module.RolloutError, match="mutable"):
+        module.verify_immutable_release()
+
+
+def test_multi_hop_ancestor_symlink_chain_to_immutable_target_is_accepted(
+    tmp_path, monkeypatch
+):
+    """The same two-hop shape is accepted when the real directory is not
+    writable -- proving the walk reaches the target and does not refuse the
+    intermediate symlinks for their meaningless mode bits.
+    """
+    module = _module()
+    _install_release(module, monkeypatch, tmp_path)
+    altbin = _rewire_system_bin_behind_ancestor_symlinks(
+        tmp_path, hops=("midbin", "altbin")
+    )
+    altbin.chmod(0o555)
+
+    module.verify_immutable_release()
+
+
 # ---------------------------------------------------------------------------
 # A rollout must not retire the old fleet and then discover the new one cannot
 # start. worker-01, 2026-08-31: every configuration check passed, the legacy

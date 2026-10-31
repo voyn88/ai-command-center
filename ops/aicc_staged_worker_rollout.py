@@ -147,16 +147,56 @@ def _verify_immutable_object(path: Path) -> os.stat_result:
     return info
 
 
-def _ancestors_of(path: Path) -> tuple[Path, ...]:
+def _ancestors_of(
+    path: Path, *, hops: list[int] | None = None
+) -> tuple[Path, ...]:
     """Every directory between `path` and `_TRUSTED_ROOT`, inclusive.
 
     Terminates at the trusted root, and also when a parent stops changing, so
     a path outside the trusted root still ends rather than looping at `/`.
+
+    When an ancestor is itself a symlink, follow every hop to the real
+    directory and include that target's own ancestors. A lexical `.parent`
+    walk alone cannot see a writable real directory behind
+    `usr/bin -> mid -> real`. Following only the first hop reintroduces the
+    same gap one level removed (independent review of the one-hop fix). The
+    shared `hops` cell bounds the total follows across ancestor symlinks and
+    interpreter hops once, not once per branch -- a cycle spread across both
+    is still refused.
     """
+    if hops is None:
+        hops = [0]
     ancestors: list[Path] = []
     current = path.parent
     while True:
         ancestors.append(current)
+        try:
+            info = current.lstat()
+        except OSError:
+            info = None
+        if info is not None and stat.S_ISLNK(info.st_mode):
+            link = current
+            while True:
+                hops[0] += 1
+                if hops[0] > _MAX_SYMLINK_HOPS:
+                    raise RolloutError(
+                        f"AICC release interpreter symlink chain is too deep: {link}"
+                    )
+                target_text = os.readlink(link)
+                target = (
+                    Path(target_text)
+                    if os.path.isabs(target_text)
+                    else link.parent / target_text
+                )
+                ancestors.append(target)
+                try:
+                    target_info = target.lstat()
+                except OSError:
+                    break
+                if not stat.S_ISLNK(target_info.st_mode):
+                    ancestors.extend(_ancestors_of(target, hops=hops))
+                    break
+                link = target
         if current == _TRUSTED_ROOT or current == current.parent:
             return tuple(ancestors)
         current = current.parent
@@ -178,23 +218,31 @@ def _interpreter_resolution_chain(executable: Path) -> tuple[Path, ...]:
     `/usr/bin` while ignoring `/usr` would leave the binary swappable by
     anyone who can write to `/usr` (independent review of `ab887b2` caught
     exactly that: only the hop and its immediate parent were checked).
+
+    Ancestor directories that are themselves symlinks are resolved to their
+    real targets (every hop, not just the first) and those targets' ancestors
+    are verified too -- otherwise a chain `usr/bin -> mid -> writable` hides
+    the writable directory from a lexical or one-hop walk.
     """
     chain: list[Path] = []
+    hops = [0]
     current = executable
-    for _ in range(_MAX_SYMLINK_HOPS + 1):
+    while True:
         chain.append(current)
-        chain.extend(_ancestors_of(current))
+        chain.extend(_ancestors_of(current, hops=hops))
         try:
             info = current.lstat()
         except OSError as exc:
             raise RolloutError(f"AICC release path is unavailable: {current}") from exc
         if not stat.S_ISLNK(info.st_mode):
             return tuple(chain)
+        hops[0] += 1
+        if hops[0] > _MAX_SYMLINK_HOPS:
+            raise RolloutError(
+                f"AICC release interpreter symlink chain is too deep: {executable}"
+            )
         target = os.readlink(current)
         current = Path(target) if os.path.isabs(target) else current.parent / target
-    raise RolloutError(
-        f"AICC release interpreter symlink chain is too deep: {executable}"
-    )
 
 
 def verify_immutable_release() -> None:
