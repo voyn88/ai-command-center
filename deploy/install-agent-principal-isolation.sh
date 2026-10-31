@@ -120,25 +120,47 @@ hold_lane_timers() {
   if [ "$timers_held" -eq 1 ]; then
     return 0
   fi
-  systemctl stop voyn-aicc-credential-rotation.timer || return 1
-  if ! systemctl stop voyn-aicc-self-deploy.timer; then
-    systemctl start voyn-aicc-credential-rotation.timer >/dev/null 2>&1 || true
+  # Acquire before touching timers; never replace a running deploy's lock.
+  if ! (set -C; umask 022; printf '%s\n' "$$" >/run/aicc-staged-rollout.lock); then
     return 1
   fi
-  lock_tmp="/run/aicc-staged-rollout.lock.$$"
-  printf '%s\n' "$$" >"$lock_tmp"
-  chmod 0644 "$lock_tmp"
-  mv -f -- "$lock_tmp" /run/aicc-staged-rollout.lock
   timers_held=1
+  # Refuse overlap with an older deploy already running before this lock.
+  deploy_state=$(systemctl show voyn-aicc-worker-release-deploy.service --property=ActiveState --value) || return 1
+  case "$deploy_state" in
+    inactive|failed|"") ;;
+    *) return 1 ;;
+  esac
+  systemctl stop voyn-aicc-credential-rotation.timer || return 1
+  # Worker hosts run voyn-aicc-worker-release-deploy.timer (root-owned
+  # immutable release). Control still uses voyn-aicc-self-deploy.timer.
+  # Stop whichever is loaded; a not-found unit is skipped like the Python
+  # hold_lane_mutating_timers path.
+  if systemctl show voyn-aicc-worker-release-deploy.timer --property=LoadState --value 2>/dev/null | grep -qx loaded; then
+    if ! systemctl stop voyn-aicc-worker-release-deploy.timer; then
+      systemctl start voyn-aicc-credential-rotation.timer >/dev/null 2>&1 || true
+      return 1
+    fi
+  elif systemctl show voyn-aicc-self-deploy.timer --property=LoadState --value 2>/dev/null | grep -qx loaded; then
+    if ! systemctl stop voyn-aicc-self-deploy.timer; then
+      systemctl start voyn-aicc-credential-rotation.timer >/dev/null 2>&1 || true
+      return 1
+    fi
+  fi
 }
 
 release_lane_timers() {
   if [ "$timers_held" -ne 1 ]; then
     return 0
   fi
-  rm -f -- /run/aicc-staged-rollout.lock
-  systemctl start voyn-aicc-credential-rotation.timer >/dev/null 2>&1 || true
-  systemctl start voyn-aicc-self-deploy.timer >/dev/null 2>&1 || true
+  if [ "$(cat /run/aicc-staged-rollout.lock 2>/dev/null)" = "$$" ]; then
+    rm -f -- /run/aicc-staged-rollout.lock
+  fi
+  for timer in voyn-aicc-credential-rotation.timer voyn-aicc-worker-release-deploy.timer voyn-aicc-self-deploy.timer; do
+    if systemctl is-enabled --quiet "$timer"; then
+      systemctl start "$timer" >/dev/null 2>&1 || true
+    fi
+  done
   timers_held=0
 }
 
@@ -554,18 +576,14 @@ else
   # group is empty, distinct and not held live before any generation is staged.
   run_transaction validate-control-authority
 fi
-run_transaction prepare
-transaction_active=1
-# Held from here through `commit` below -- the entire span in which a
-# failure makes the `rollback` trap call `run_transaction recover`, which
-# mutates worker units of its own accord (see `hold_lane_timers` above). A
-# failure to hold aborts cleanly: `transaction_active` is already 1 but
-# nothing below has mutated a worker unit yet, so `recover` above has nothing
-# to undo.
+# Acquire the shared lock before prepare makes a recoverable generation.
+# If another deploy owns it, abort without entering service-mutating recovery.
 hold_lane_timers || {
   echo "cannot hold lane-mutating timers for this transaction" >&2
   exit 1
 }
+run_transaction prepare
+transaction_active=1
 # A control host must not run the agent layer at all, and prepare() has just
 # staged its removal as part of this same generation (default_specs pairs
 # every WORKER_ONLY_TARGETS drop with an explicit removal spec). Stop and
@@ -626,6 +644,12 @@ if [ "$install_profile" = "worker" ]; then
   systemctl reset-failed 'aicc-agent-launcher@*.service' >/dev/null 2>&1 || true
   systemctl enable --now aicc-agent-launcher.socket
   systemctl enable --now voyn-aicc-source-clone-refresh.timer
+  # Retire the voynadmin worker self-deploy variant (hard-coded lane list,
+  # cannot write root-owned releases) and enable the root-owned release
+  # deploy that stages immutable /opt/aicc/releases/<sha>.
+  systemctl disable --now voyn-aicc-self-deploy.timer >/dev/null 2>&1 || true
+  systemctl disable voyn-aicc-self-deploy.service >/dev/null 2>&1 || true
+  systemctl enable --now voyn-aicc-worker-release-deploy.timer
 fi
 
 # The orchestrator discovers configured plus already-instantiated lanes, then

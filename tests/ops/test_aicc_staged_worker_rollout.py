@@ -142,7 +142,7 @@ class FakeSystemd:
         # fd5de6b, same rationale as the legacy units above).
         for timer in (
             "voyn-aicc-credential-rotation.timer",
-            "voyn-aicc-self-deploy.timer",
+            "voyn-aicc-worker-release-deploy.timer",
             "voyn-aicc-source-clone-refresh.timer",
         ):
             self.states.setdefault(
@@ -601,12 +601,12 @@ def test_staged_rollout_drains_and_proves_each_lane_before_next(tmp_path, monkey
     stops = [call for call in systemd.calls if call[0] == "stop"]
     assert stops[:3] == [
         ("stop", "voyn-aicc-credential-rotation.timer"),
-        ("stop", "voyn-aicc-self-deploy.timer"),
+        ("stop", "voyn-aicc-worker-release-deploy.timer"),
         ("stop", "voyn-aicc-source-clone-refresh.timer"),
     ]
     assert systemd.calls[-3:] == [
         ("start", "voyn-aicc-credential-rotation.timer"),
-        ("start", "voyn-aicc-self-deploy.timer"),
+        ("start", "voyn-aicc-worker-release-deploy.timer"),
         ("start", "voyn-aicc-source-clone-refresh.timer"),
     ]
     # The shared lock a tick honours even if it fires anyway is gone once the
@@ -897,16 +897,16 @@ def test_rollout_restores_timers_and_lock_on_failure(tmp_path, monkeypatch):
     assert systemd.states["voyn-aicc-credential-rotation.timer"]["ActiveState"] == (
         "active"
     )
-    assert systemd.states["voyn-aicc-self-deploy.timer"]["ActiveState"] == "active"
+    assert systemd.states["voyn-aicc-worker-release-deploy.timer"]["ActiveState"] == "active"
     timer_calls = [
         call for call in systemd.calls if call[-1] in module.LANE_MUTATING_TIMERS
     ]
     assert timer_calls == [
         ("stop", "voyn-aicc-credential-rotation.timer"),
-        ("stop", "voyn-aicc-self-deploy.timer"),
+        ("stop", "voyn-aicc-worker-release-deploy.timer"),
         ("stop", "voyn-aicc-source-clone-refresh.timer"),
         ("start", "voyn-aicc-credential-rotation.timer"),
-        ("start", "voyn-aicc-self-deploy.timer"),
+        ("start", "voyn-aicc-worker-release-deploy.timer"),
         ("start", "voyn-aicc-source-clone-refresh.timer"),
     ]
 
@@ -950,6 +950,15 @@ def test_write_and_remove_rollout_lock_round_trip(tmp_path, monkeypatch):
     assert not lock_path.exists()
     # Idempotent: removing an already-absent lock is not an error.
     module.remove_rollout_lock()
+
+
+def test_remove_rollout_lock_preserves_foreign_owner(tmp_path, monkeypatch):
+    module = _module()
+    lock_path = tmp_path / "aicc-staged-rollout.lock"
+    monkeypatch.setattr(module, "ROLLOUT_LOCK_PATH", lock_path)
+    lock_path.write_text(f"{os.getpid() + 1}\n", encoding="utf-8")
+    module.remove_rollout_lock()
+    assert lock_path.read_text(encoding="utf-8") == f"{os.getpid() + 1}\n"
 
 
 def test_rollout_with_timers_already_held_does_not_touch_timers_or_lock(
@@ -1805,12 +1814,22 @@ def test_hold_skips_timers_that_are_not_installed_on_the_host():
     module = _module()
     systemd = FakeSystemd(("voyn-aicc-worker@1.service",))
     systemd.states.pop("voyn-aicc-credential-rotation.timer", None)
-    systemd.states.pop("voyn-aicc-self-deploy.timer", None)
+    systemd.states.pop("voyn-aicc-worker-release-deploy.timer", None)
     systemd.states.pop("voyn-aicc-source-clone-refresh.timer", None)
 
     module.hold_lane_mutating_timers(systemd)
 
     assert [call for call in systemd.calls if call[0] == "stop"] == []
+
+
+def test_rollout_lock_does_not_overwrite_existing_owner(tmp_path, monkeypatch):
+    module = _module()
+    lock = tmp_path / "rollout.lock"
+    monkeypatch.setattr(module, "ROLLOUT_LOCK_PATH", lock)
+    lock.write_text("other-owner")
+    with pytest.raises(FileExistsError):
+        module.write_rollout_lock()
+    assert lock.read_text() == "other-owner"
 
 
 # ---------------------------------------------------------------------------

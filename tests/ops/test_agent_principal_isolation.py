@@ -1708,7 +1708,7 @@ def test_lane_timers_are_held_before_apply_and_released_after_commit():
     commit = lines.index("run_transaction commit")
     release_after_commit = lines.index("release_lane_timers", commit)
 
-    assert active < hold < apply_index < commit < release_after_commit
+    assert hold < lines.index("run_transaction prepare") < active < apply_index < commit < release_after_commit
     # Immediately after commit -- not buried behind
     # `verify-agent-principal-boundary.sh` or the rollout step, both of which
     # run before commit and must stay covered by the hold.
