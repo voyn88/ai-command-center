@@ -595,6 +595,8 @@ _APP_BACKLOG_FUNCTIONS = (
     # Audit trail for where a record came from (0020); the importer's stamp
     # that a row was migrated rather than authored directly in the store.
     "backlog_record_provenance(text, text, jsonb)",
+    "backlog_owner_decision(text, bigint, text, text)",
+    "backlog_owner_lock(text)",
 )
 
 # The enrolment surface (0003), split by who may do what.
