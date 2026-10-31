@@ -63,6 +63,14 @@ dist/
 data/backups/
 roadmap/*.zip
 
+# Frozen snapshots + reports written by the SRV-07 legacy cutover migration
+# (command_center/db/legacy_migration.py, `python -m command_center.db
+# legacy-migrate`/`legacy-reconcile`). These are full, checksummed copies of
+# the legacy runtime.db/execution_queue.json — local operator artifacts, not
+# repository content, and never committed for the same reason runtime.db itself
+# is not.
+data/legacy-migration/
+
 # stray test artifacts at repo root
 runtime.db
 runtime.db-shm
