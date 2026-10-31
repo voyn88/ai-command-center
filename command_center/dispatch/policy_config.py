@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from command_center import models, storage
-from command_center.dispatch.models import DispatchPolicy
+from command_center.dispatch.models import DispatchPolicy, QuarantineRecord
 
 if TYPE_CHECKING:  # a type-only import: the config store stays free of FastAPI
     from command_center.http_auth.identity import Principal
@@ -85,6 +85,50 @@ def update_policy(
         merged = dict(current.as_dict())
         merged.update(changes or {})
         stamped = _stamp(DispatchPolicy.from_dict(merged), principal.principal_id)
+        storage.atomic_write_json(policy_file_path(root), stamped.as_dict())
+    return stamped
+
+
+def record_quarantine(
+    root: Path, record: QuarantineRecord, *, actor: str | None = None
+) -> DispatchPolicy:
+    """Read-modify-write `quarantined_agents[record.executor_id] = record`
+    under the lock, the same lost-update-safe shape as `update_policy` but for
+    an in-process caller (the degradation monitor) rather than an HTTP
+    `Principal` — mirrors `save_policy`'s `actor` string, since this is
+    reachable only from callers that already have their own provenance."""
+    with policy_lock(root):
+        current = DispatchPolicy.from_dict(
+            storage.read_json(policy_file_path(root), {})
+        )
+        merged = dict(current.as_dict())
+        quarantined = dict(current.quarantined_agents)
+        quarantined[record.executor_id] = record
+        merged["quarantined_agents"] = {
+            eid: rec.as_dict() for eid, rec in quarantined.items()
+        }
+        stamped = _stamp(DispatchPolicy.from_dict(merged), actor)
+        storage.atomic_write_json(policy_file_path(root), stamped.as_dict())
+    return stamped
+
+
+def clear_quarantine(
+    root: Path, executor_id: str, *, actor: str | None = None
+) -> DispatchPolicy:
+    """The inverse of `record_quarantine`: drop `executor_id` from
+    `quarantined_agents` (a no-op if it was not quarantined), for an operator
+    releasing an agent once retraining is complete."""
+    with policy_lock(root):
+        current = DispatchPolicy.from_dict(
+            storage.read_json(policy_file_path(root), {})
+        )
+        merged = dict(current.as_dict())
+        quarantined = dict(current.quarantined_agents)
+        quarantined.pop(executor_id, None)
+        merged["quarantined_agents"] = {
+            eid: rec.as_dict() for eid, rec in quarantined.items()
+        }
+        stamped = _stamp(DispatchPolicy.from_dict(merged), actor)
         storage.atomic_write_json(policy_file_path(root), stamped.as_dict())
     return stamped
 

@@ -11,6 +11,7 @@ from command_center.dispatch.models import (
     AgentLimit,
     DispatchPolicy,
     ExecutorProfile,
+    QuarantineRecord,
     QueuedTask,
     TailRiskScenario,
 )
@@ -457,6 +458,79 @@ def test_plan_is_deterministic_for_identical_input():
     assert [d.as_dict() for d in first.decisions] == [
         d.as_dict() for d in second.decisions
     ]
+
+
+# --------------------------------------------------------------------------
+# Quarantine gate (VOYN-MIN-AGT-DRIFT2) — a quarantined executor is never
+# assigned again, structurally: 0 further errors from a degrading agent.
+# --------------------------------------------------------------------------
+
+
+def _quarantine(executor_id: str) -> QuarantineRecord:
+    return QuarantineRecord(
+        executor_id=executor_id,
+        reason="degradation_confirmed",
+        quarantined_at="2026-09-08T00:00:00Z",
+    )
+
+
+def test_quarantined_executor_is_never_assigned_even_when_cheapest():
+    policy = DispatchPolicy(
+        cost_matrix={"codex": 0.0, "claude_code": 0.5},
+        quarantined_agents={"codex": _quarantine("codex")},
+    )
+    executors = [
+        _executor("codex", cost=0.0),
+        _executor("claude_code", cost=0.5),
+    ]
+
+    plan = _plan([_task("t1")], executors, policy)
+
+    assert plan.assignments[0].assigned_executor == "claude_code"
+
+
+def test_quarantined_and_only_permitted_executor_defers_with_typed_reason():
+    policy = DispatchPolicy(quarantined_agents={"codex": _quarantine("codex")})
+    executors = [_executor("codex", cost=0.0)]
+
+    plan = _plan([_task("t1", allowed=frozenset({"codex"}))], executors, policy)
+
+    assert plan.assignments == ()
+    assert plan.deferred[0].reason == models.DEFER_AGENT_QUARANTINED
+
+
+def test_hard_pin_onto_a_quarantined_executor_is_refused_not_honored():
+    # Quarantine outranks a hard pin: an operator (or stale task record)
+    # pinning a task onto a degrading agent must not be able to route around
+    # the quarantine.
+    policy = DispatchPolicy(quarantined_agents={"codex": _quarantine("codex")})
+    executors = [_executor("codex", cost=0.0, available=True)]
+
+    plan = _plan([_task("t1", pinned="codex")], executors, policy)
+
+    assert plan.assignments == ()
+    assert plan.deferred[0].reason == models.DEFER_AGENT_QUARANTINED
+
+
+def test_quarantine_is_refused_even_though_the_agent_reports_available():
+    # Quarantine is a structural refusal, not "temporarily unavailable" — it
+    # must win even when the executor's own live probe still says available,
+    # and it must report the quarantine reason, not DEFER_NO_AVAILABLE_EXECUTOR.
+    policy = DispatchPolicy(quarantined_agents={"codex": _quarantine("codex")})
+    executors = [_executor("codex", cost=0.0, available=True)]
+
+    plan = _plan([_task("t1", allowed=frozenset({"codex"}))], executors, policy)
+
+    assert plan.deferred[0].reason == models.DEFER_AGENT_QUARANTINED
+
+
+def test_quarantine_of_one_agent_does_not_affect_another():
+    policy = DispatchPolicy(quarantined_agents={"codex": _quarantine("codex")})
+    executors = [_executor("codex", cost=0.0), _executor("claude_code", cost=0.0)]
+
+    plan = _plan([_task("t1", allowed=frozenset({"claude_code"}))], executors, policy)
+
+    assert plan.assignments[0].assigned_executor == "claude_code"
 
 
 # --------------------------------------------------------------------------
