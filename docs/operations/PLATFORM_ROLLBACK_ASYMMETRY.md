@@ -41,11 +41,13 @@ own history with it.
 AICC never talks to that database directly. It shells out to the external
 `voyn-lease` CLI (named by `VOYN_LEASE_TOOL`, reached through
 `VOYN_LEASE_DSN` — a DSN naming the platform's database, not AICC's) from
-three call sites:
+exactly two write call sites, plus one read-only observer:
 
 - `command_center/worker/writer_lease.py` — the full-lifecycle lease held
   from workspace provisioning through the agent run, tests and publish
-  (`acquire`, periodic re-`acquire` as renewal, `release`).
+  (`acquire`, periodic re-`acquire` as renewal, `release`). Deliberately
+  does **not** run `install-hooks` (task-scoped identity must not overwrite
+  the clone-wide pre-push hook file; see its module docstring).
 - `command_center/orchestrator/publish.py` — the lease held around the
   actual `git push` (`acquire`, `install-hooks`, `release`).
 
@@ -57,8 +59,10 @@ three call sites:
 
 Every `acquire`/`release` call is a write into `repo_lease` and a new row in
 `repo_lease_event`, on the platform's database, the instant the CLI returns
-success. None of it is transactional with anything AICC commits to its own
-`AICC_PG_DB`.
+success. `install-hooks` additionally writes the on-disk identity file
+`voyn-lease.env` into the clone's common git dir (a filesystem side effect,
+not an `AICC_PG_DB` row). None of it is transactional with anything AICC
+commits to its own `AICC_PG_DB`.
 
 ### 2. Task state — `tasks` / `task_events` ("состояние задач через SDK")
 
@@ -78,6 +82,30 @@ authoritative. A stale payload lane cannot promote or roll back a task."*
 That is correct as a normal-operation invariant and is precisely what turns
 into the asymmetry below once AICC's own database — the thing that lane
 comes from — gets rolled back underneath it.
+
+### What this inventory deliberately excludes
+
+These look adjacent but are **not** platform-DB writes that survive an AICC
+restore, and must not be reconciled as if they were:
+
+- **AIOS status / whoami / timeline** (`command_center/application/aios_status.py`,
+  `AIOSSDKStatusClient`) — read-only evidence port; no `tasks`/`repo_lease`
+  mutation.
+- **`backlog_lease_acquire` / `backlog_lease_release`**
+  (`command_center/db/backlog_store.py`, planner) — SQL functions inside
+  `AICC_PG_DB` itself. A restore rolls them back with everything else; they
+  are not the LEASE-SPLIT surface.
+- **AICC queue claims** (`queue_claim` / `work_attempt` / `work_event`) —
+  also inside `AICC_PG_DB`. Restored away; that is why the pre-restore
+  manifest below must be captured first.
+- **GitHub / git push side effects** (PRs, commits, review comments) — outside
+  both databases; the procedure notes them as a separate review, not a
+  platform-row undo.
+
+Across this repository, the only two mechanisms that write into the AIOS
+platform database during a cutover window are therefore the writer lease
+(`voyn-lease` → `repo_lease` / `repo_lease_event`) and the tasks SDK
+(`aios_sdk` → `tasks` / `task_events`).
 
 ## Why `aicc_pg_restore.sh` cannot reach either of these
 
@@ -161,11 +189,13 @@ the restore, that opinion is gone (see above). Concretely, around any
    while this procedure is in flight would itself become a third undocumented
    writer into the platform.
 2. Snapshot in-flight work from the live (not-yet-restored) `AICC_PG_DB`:
-   every `work_item`/`work_attempt` pair in `state = 'claimed'`
-   (`work_item_public`/`work_attempt_public`), each row's `task_id`. There is
-   no existing admin query for this — `command_center/db/work_queue_admin.py`
-   today only exposes `reap`/list-dead-letters/`redrive` — so this is a gap
-   to close (see Follow-up).
+   every `work_item` in `state = 'claimed'` via the existing read surface
+   `command_center/db/work_queue_read.py` →
+   `WorkQueueReadStore.list_items(state="claimed")`, also exposed as
+   `GET /api/v1/queue/items?state=claimed`
+   (`command_center/webapi/queue_routes.py`). (`work_queue_admin.py` stays
+   recovery-only — `reap`/list-dead-letters/`redrive` — and is the wrong
+   tool here.)
 3. For each in-flight `task_id`, resolve its platform identities *now*, while
    they are still fresh, and write the result **outside** `AICC_PG_DB` (a
    plain file on the operator's restore host is enough — it must not be
@@ -174,6 +204,19 @@ the restore, that opinion is gone (see above). Concretely, around any
    - whether `voyn-lease list` shows a `held` row whose `worktree`/`task`
      matches this task (`command_center/worker/worktree_lease.py`'s
      `blocking_lease` already parses this exact JSON shape).
+
+   Prefer the packaged capture over hand-assembling those three sources:
+
+   ```bash
+   # Write somewhere the restore cannot destroy (not under AICC_PG_DB,
+   # and not a path the restore host is about to wipe).
+   scripts/aicc_pre_restore_platform_manifest.py \
+     --out /var/backups/aicc/platform-manifest-$(date -u +%Y%m%dT%H%M%SZ).json
+   ```
+
+   The script reads claimed rows, `aios_task_map.json`, and `voyn-lease list`
+   (when `VOYN_LEASE_DSN` is set) and emits one JSON inventory. It mutates
+   nothing.
 
 **Run** `scripts/aicc_pg_backup.sh`/`scripts/aicc_pg_restore.sh` as the
 cutover requires.
@@ -220,17 +263,19 @@ cutover requires.
 
 ## Follow-up (not done by this task)
 
-Nothing above is automated in either repository today; this document defines
-the procedure an operator runs by hand. Two concrete gaps to close as
-separate, reviewed work:
+The pre-restore half is now mechanically capturable
+(`scripts/aicc_pre_restore_platform_manifest.py` over the existing
+`WorkQueueReadStore` + task map + `voyn-lease list`). Post-restore
+disposition is still an operator decision in both repositories today. One
+concrete gap to close as separate, reviewed work:
 
-- A read query (`command_center/db/work_queue_admin.py` or a sibling) that
-  lists in-flight (`state = 'claimed'`) `work_item`/`work_attempt` rows —
-  step 2 above has no existing surface to call today.
 - A `scripts/aicc_post_restore_platform_reconcile.py` that drives steps
-  3–5 mechanically: read the pre-restore manifest and `aios_task_map.json`,
+  4–5 mechanically: read the pre-restore manifest and `aios_task_map.json`,
   call `voyn-lease list` and the same `TasksGateway` AICC already uses, and
   print the operator's decision points instead of requiring them to be
   reconstructed by hand from logs. This depends on first confirming with the
   `voyn-lease` owner whether an operator-forced release of a database-orphaned
-  (not process-dead) lease is a supported verb — see step 4.
+  (not process-dead) lease is a supported verb — see step 4. The existing
+  `ops/lease_reap.sh` only reaps rows the authority itself confirms are
+  expired with a dead recorded holder (`--auto-takeover`); that is the wrong
+  tool for a live holder whose *database* was rolled back.

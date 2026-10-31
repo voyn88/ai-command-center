@@ -14,8 +14,15 @@ functional application milestones of `app.py`.
   (the `repo_lease`/`repo_lease_event` writer lease via `voyn-lease`, and
   `tasks`/`task_events` via `aios_sdk`) that `scripts/aicc_pg_restore.sh`
   cannot reach or undo, traces the gap to `SRV-02`'s lease-split decision,
-  and defines the manual reconciliation procedure to run around a restore
-  during such a window.
+  excludes adjacent non-platform surfaces (status reads, in-AICC
+  `backlog_lease`, queue claims), and defines the reconciliation procedure
+  to run around a restore during such a window.
+- `scripts/aicc_pre_restore_platform_manifest.py`: captures claimed work,
+  `aios_task_map.json`, and `voyn-lease list` **before** an
+  `--allow-overwrite` restore, so the platform rows that will survive have
+  a named inventory once `AICC_PG_DB`'s own audit trail is gone.
+- `tests/ops/test_platform_rollback_asymmetry.py`: pins the write-call-site
+  inventory and the pre-restore manifest shape.
 
 ### Added (SRV-05 slice 2)
 - `command_center/worker/payloads.py` — versioned `agent_run` payload contract
