@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import stat
 import subprocess
 import sys
+from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -337,14 +339,122 @@ def test_real_install_lock_refuses_closed_or_negative_inherited_fd(tmp_path):
             module._install_lock_fd(lock, invalid, trusted_uid=uid, trusted_gid=gid)
 
 
+def _relax_identity(module, monkeypatch, *, repo=None):
+    """Run `main()` as an unprivileged test process.
+
+    Only the trusted IDENTITY is relaxed -- every guard whose behaviour is
+    under test still runs for real. `_fetch_exact_checkout` is stubbed because
+    it is a network clone from the real trusted remote; what these tests are
+    about is what happens to the checkout AFTER it exists.
+    """
+    real_guard = module._require_private_root_directory
+    monkeypatch.setattr(
+        module,
+        "_require_private_root_directory",
+        lambda path, *, create, trusted_uid=None, trusted_gid=None: real_guard(
+            path, create=create, trusted_uid=os.getuid(), trusted_gid=os.getgid()
+        ),
+    )
+    real_verify = module._verify_checkout
+    monkeypatch.setattr(
+        module,
+        "_verify_checkout",
+        lambda checkout, env, sha, attempt_id, **_kw: real_verify(
+            checkout,
+            env,
+            sha,
+            attempt_id,
+            trusted_uid=os.getuid(),
+            trusted_gid=os.getgid(),
+        ),
+    )
+    monkeypatch.setattr(module.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(module.os, "chown", lambda *a, **k: None)
+    monkeypatch.setattr(module.os, "fchown", lambda *a, **k: None)
+    monkeypatch.setattr(
+        module, "_install_lock_fd", lambda *a, **k: os.open("/dev/null", os.O_RDONLY)
+    )
+    if repo is not None:
+        monkeypatch.setattr(module, "_fetch_exact_checkout", lambda *a, **k: repo)
+    executed: list[list[str]] = []
+    real_run = module._run
+
+    def fake_run(argv, *, cwd, env, pass_fds=()):
+        # Only the privileged installer is faked. Git still runs for real, so
+        # the verification these tests turn on is the production one.
+        if argv and str(argv[0]).endswith("install-agent-principal-isolation.sh"):
+            executed.append(argv)
+            return subprocess.CompletedProcess(argv, 0, b"", b"")
+        return real_run(argv, cwd=cwd, env=env, pass_fds=pass_fds)
+
+    monkeypatch.setattr(module, "_run", fake_run)
+    return executed
+
+
 def test_unfinished_uninstall_blocks_before_authority_mutation(monkeypatch, tmp_path):
+    """Driven through `main()`: the guard's own unit behaviour is trivial, and
+    what matters is that the real install workflow consults it BEFORE
+    `_prepare_authority_file` writes a new authority key onto a host whose
+    uninstall journal is still open. A test that calls the guard directly
+    passes even when `main()` prepares the authority file first.
+    """
     module = _module()
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    (state / "attempts").mkdir(mode=0o700)
+    repo = tmp_path / "checkout"
+    repo.mkdir()
+    sha = "a" * 40
+    executed = _relax_identity(module, monkeypatch, repo=repo)
+
     journal = tmp_path / "uninstall.json"
     journal.write_text("{}", encoding="utf-8")
-    mutated = []
+    order: list[str] = []
+    real_guard = module._refuse_unfinished_uninstall
+    monkeypatch.setattr(
+        module,
+        "_refuse_unfinished_uninstall",
+        lambda path=journal: (order.append("guard"), real_guard(journal))[1],
+    )
+    authority = tmp_path / "workspace-authority.env"
+
+    def recording_authority(path):
+        order.append("authority")
+        # Stands in for the real mutation: this test runs unprivileged, so it
+        # records the host write that WOULD have happened here.
+        path.write_text("AICC_WORKSPACE_AUTHORITY_KEY=hex:deadbeef\n", encoding="utf-8")
+
+    monkeypatch.setattr(module, "_prepare_authority_file", recording_authority)
+    monkeypatch.setattr(
+        module,
+        "_verify_checkout",
+        lambda *a, **k: module.TreeAttestation(
+            expected_sha=sha,
+            remote_main_sha=sha,
+            tree_manifest_sha256="0" * 64,
+            file_count=1,
+            repository=module.TRUSTED_REMOTE,
+            attempt_id="attempt-test",
+        ),
+    )
+
     with pytest.raises(module.BootstrapRefused, match="unfinished uninstall"):
-        module._refuse_unfinished_uninstall(journal)
-    assert mutated == []
+        module.main(
+            [
+                "--expected-sha",
+                sha,
+                "--state-root",
+                str(state),
+                "--authority-env",
+                str(authority),
+            ],
+            install_lock_path=tmp_path / "install-recovery.lock",
+        )
+
+    assert order == ["guard"], "the authority file must not be prepared at all"
+    assert not authority.exists()
+    assert executed == [], "no privileged installer may run behind an open uninstall"
+    assert not list(state.rglob("completed.json"))
 
 
 def test_poisoned_repository_config_cannot_run_code_during_verification(tmp_path):
@@ -384,20 +494,99 @@ def test_environment_git_config_injection_is_ignored(tmp_path, monkeypatch):
     assert _verify(module, repo, env, sha).expected_sha == sha
 
 
-def test_checkout_replaced_after_attestation_is_detected(tmp_path):
-    """Attestation-then-use is a TOCTOU window: the installer re-verifies the
-    checkout against the recorded attestation instead of trusting the file."""
+def test_checkout_replaced_after_attestation_never_reaches_the_installer(
+    monkeypatch, tmp_path
+):
+    """Attestation-then-use is a TOCTOU window, and the thing that closes it is
+    `main()` re-proving the checkout after it takes the host lock -- not the
+    verifier being capable of noticing.
+
+    So the replacement happens INSIDE that window (during lock acquisition)
+    and the assertion is about the privileged consequence: the installer must
+    never be executed. Calling `_verify_checkout` twice by hand passes even if
+    `main()` trusts the stale attestation and execs the replaced files, which
+    is the regression this is here to prevent.
+    """
     module = _module()
-    repo, sha, env = _trusted_repo(module, tmp_path)
-    attestation = _verify(module, repo, env, sha)
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    (state / "attempts").mkdir(mode=0o700)
+    repo, sha, _env = _trusted_repo(module, tmp_path)
+    executed = _relax_identity(module, monkeypatch, repo=repo)
 
     implanted = repo / module.REQUIRED_ENTRYPOINTS[0]
-    implanted.chmod(0o755)
+
+    def replace_during_lock_acquisition(*args, **kwargs):
+        # Exactly the window the second verification exists for: the tree was
+        # attested, and is replaced before a single byte of it is executed.
+        implanted.write_text("trusted:implanted\n", encoding="utf-8")
+        implanted.chmod(0o755)
+        return os.open("/dev/null", os.O_RDONLY)
+
+    monkeypatch.setattr(module, "_install_lock_fd", replace_during_lock_acquisition)
+    monkeypatch.setattr(module, "_refuse_unfinished_uninstall", lambda *a, **k: None)
+    monkeypatch.setattr(module, "_prepare_authority_file", lambda *a, **k: None)
+
+    with pytest.raises(module.BootstrapRefused) as refused:
+        module.main(
+            ["--expected-sha", sha, "--state-root", str(state)],
+            install_lock_path=tmp_path / "install-recovery.lock",
+        )
+
+    assert executed == [], "the replaced checkout must not be executed as root"
+    assert not list(state.rglob("completed.json"))
+    # The attestation of the honest tree WAS written, which is what makes this
+    # the post-attestation window rather than a tree that never verified: the
+    # first verification passed, the replacement landed, and the second one
+    # refused before the installer could be executed.
+    assert list(state.rglob("attestation.json"))
+    assert "trusted checkout" in str(refused.value) or "changed before" in str(
+        refused.value
+    )
+
+
+def test_installer_reentry_refuses_a_checkout_replaced_after_attestation(
+    monkeypatch, tmp_path
+):
+    """The installer re-enters the bootstrap (`--verify-attestation
+    --repo-root`) to re-prove the tree it is running from. That consumption
+    path must refuse a replaced checkout rather than accept the record."""
+    module = _module()
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    real_guard = module._require_private_root_directory
+    monkeypatch.setattr(
+        module,
+        "_require_private_root_directory",
+        lambda path, *, create, trusted_uid=None, trusted_gid=None: real_guard(
+            path, create=create, trusted_uid=os.getuid(), trusted_gid=os.getgid()
+        ),
+    )
+    repo, sha, env = _trusted_repo(module, state)
+    attestation = _verify(module, repo, env, sha)
+    attestation_path = state / "attestation.json"
+    attestation_path.write_text(
+        json.dumps(asdict(attestation), sort_keys=True), encoding="utf-8"
+    )
+    attestation_path.chmod(0o600)
+
+    def consume():
+        return module._verify_existing_attestation(
+            attestation_path,
+            repo,
+            sha,
+            trusted_uid=os.getuid(),
+            trusted_gid=os.getgid(),
+        )
+
+    assert consume() == attestation
+
+    implanted = repo / module.REQUIRED_ENTRYPOINTS[0]
     implanted.write_text("trusted:implanted\n", encoding="utf-8")
+    implanted.chmod(0o755)
 
     with pytest.raises(module.BootstrapRefused):
-        _verify(module, repo, env, sha)
-    assert attestation.expected_sha == sha
+        consume()
 
 
 def test_hardlinked_payload_file_is_refused(tmp_path):

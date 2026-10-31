@@ -108,6 +108,20 @@ This is a fail-closed deployment gate. Do not set
    Before any templated lane starts, the installer snapshots, drains and
    disables both legacy `voyn-aicc-worker.service` units and proves they are
    inactive, disabled and have `MainPID=0`; rollback restores the snapshot.
+   That snapshot covers the union of the incoming manifest's lanes and the
+   lanes already in `/etc/aicc/worker-lanes`, so a host-specific lane the new
+   manifest no longer declares is still restorable by rollback.
+
+   Boot recovery runs before `sysinit.target` and can only *enqueue* the
+   starts its snapshot owes; it records them in
+   `/var/lib/aicc-principal-isolation/deferred-starts.json` before consuming
+   the WAL. `aicc-principal-recovery-complete.service` (emitted by the boot
+   generator, ordered after `multi-user.target`) proves each of those units
+   reached `active` and only then removes the record. **If that unit is
+   `failed` after a boot, a lane that was running before an interrupted
+   install is still down**: read the journal it names, fix the unit, and run
+   `systemctl start aicc-principal-recovery-complete.service` to re-prove and
+   clear the record.
 6. Run the OS-boundary test and a real Codex `workspace-write` commit preflight.
    Both must run under per-run systemd `DynamicUser` identities; a shared
    `aicc-agent` execution UID or direct worker-UID fallback is forbidden. Run
