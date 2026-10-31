@@ -87,6 +87,11 @@ class SourceCloneSnapshot:
 class UnitState:
     restarts: int
     active_state: str
+    #: ``systemctl show --property=LoadState``: whether this host still has a
+    #: unit file for the name at all.  ``not-found`` means it does not -- see
+    #: ``RETIRED_LOAD_STATE`` and ``evaluate_unit_health``.  Empty when the
+    #: property was not asked for, which is never a retirement.
+    load_state: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,12 +120,24 @@ class UnitHealthSnapshot:
     listing is the census (one call, every unit, state included) and
     `systemctl show` is the follow-up question, asked in bounded batches and
     only where the census has not already produced the unit's finding.
+
+    A unit this host no longer HAS is reported separately (`retired_units`)
+    and is not a finding: see `evaluate_unit_health`.
     """
 
     crash_loops: tuple[tuple[str, int], ...]
     failed_units: tuple[tuple[str, int], ...]
+    #: Units whose last run latched `failed` and whose unit file this host no
+    #: longer has -- the only reason PID 1 still holds them. Measured and
+    #: reported, deliberately not a failure.
+    retired_units: tuple[tuple[str, int], ...] = ()
     error: str | None = None
 
+
+#: `systemctl show --property=LoadState` for a name systemd has no unit file
+#: for. Such a unit is kept in PID 1's table only to remember that its last
+#: run failed; see `evaluate_unit_health`.
+RETIRED_LOAD_STATE = "not-found"
 
 #: How many units a finding's detail names before it says `+N more`: the
 #: identity is the class, the listing is for the reader, and an unbounded
@@ -160,13 +177,21 @@ class DeployLagSnapshot:
     worker-01 2026-09-13 14:48 .. 09-14 18:49: six merged PRs sat behind a
     refused promotion for 28 hours while test and preprod advanced. A green
     branch says nothing about what customers run; only comparing the two
-    SHAs does. The clock is the age of the OLDEST commit on the branch that
-    production does not run -- not the head's age, which every new merge
-    resets, so a busy branch could stay a day behind and never report. That
-    oldest undeployed commit is allowed a grace period (CI plus the merge
-    queue plus the promotion tick) before its absence is a finding. A red
-    branch older than the grace period is a finding too, deliberately: a
-    branch that stays red that long is a delivery outage.
+    SHAs does. The clock is the age of the OLDEST undeployed commit as the
+    BRANCH gained it -- not the head's age, which every new merge resets, so
+    a busy branch could stay a day behind and never report, and not the
+    commit object's own date either (worker-01 2026-10-29, monitor_finding
+    #38959: a feature branch written days earlier and merged minutes ago
+    landed commits whose committer dates were already past the grace period,
+    so the probe opened `deploy_lag` the instant any such PR merged and
+    stayed red until production matched the head exactly -- the promotion
+    pipeline was healthy throughout). What the branch gained, and when, is
+    its first-parent chain: see `_first_parent_chain_times`. That oldest
+    undeployed commit is allowed a grace period (CI plus the merge queue
+    plus the promotion tick) before its absence is a finding -- a budget
+    that can only start once the code is ON the branch. A red branch older
+    than the grace period is a finding too, deliberately: a branch that
+    stays red that long is a delivery outage.
     """
 
     repo: str
@@ -544,6 +569,7 @@ def parse_unit_show(output: str) -> dict[str, UnitState]:
         units[unit] = UnitState(
             restarts=restarts,
             active_state=fields.get("ActiveState", ""),
+            load_state=fields.get("LoadState", ""),
         )
     return units
 
@@ -592,12 +618,66 @@ def _template_name(unit: str) -> str:
 def evaluate_unit_health(
     units: dict[str, UnitState], *, crash_loop_restarts: int
 ) -> UnitHealthSnapshot:
+    """Split the host's units into faults and residue.
+
+    systemd's `failed` is a LATCH, not a measurement: it records how a unit's
+    last run ended and it survives the condition indefinitely. For a unit this
+    host still has, that latch is actionable -- the next run clears it, and a
+    unit that keeps failing keeps it set, which is the fault this probe exists
+    to see. For a unit this host no longer HAS it is residue: there is no unit
+    file, so it can never run again, can never reach a successful state, and
+    only a privileged `systemctl reset-failed` will ever clear it. Nothing to
+    restart, nothing to repair, nothing measured about the present.
+
+    Those two cases are indistinguishable in `ActiveState` alone, which is why
+    this probe asks for `LoadState` as well. They are not hypothetical: the
+    staged isolated-lane rollout retires `voyn-aicc-worker.service`,
+    `voyn-aicc-worker-2.service` and `aicc-worker.service` by stopping and
+    *disabling* them, and disabling removes the symlink that was their
+    fragment -- so after a rollout those units are deliberately gone
+    (`RETIRED_LEGACY_UNITS` in ops/aicc_install_transaction.py says so in as
+    many words). A stop that reached its timeout latched `failed` on the way
+    out, and `verify_legacy_units_retired` accepted that as drained. systemd
+    garbage-collects a fragment-less unit the moment it is inactive and
+    unreferenced, so the ONLY retired units still in PID 1's table are exactly
+    the ones latched `failed` -- and this probe counted them from the day it
+    was added (worker-01, monitor_finding 2051 and its three successors). No
+    repair could clear that finding, because the units it named no longer
+    existed on the host.
+
+    Residue is not silenced, it is reclassified: `retired_units` carries it
+    into the journalled measurement so an operator can still see what is
+    there. Nor does this blind the probe. A unit file that goes missing while
+    the service matters is not quiet -- the lanes are `active_workers`, the
+    monitor's other classes cover the ticks -- and a unit file that is present
+    but broken loads as `error`/`bad-setting`, not `not-found`, so it stays a
+    fault here.
+
+    NRestarts is residue on the same unit for the same reason (a frozen
+    counter on something that cannot restart), and is excluded with it: were
+    it not, clearing the `failed_units` finding would merely re-raise the same
+    corpses as `crash_loop`.
+    """
     if crash_loop_restarts < 1:
         raise ValueError("crash_loop_restarts must be at least 1")
     loops: dict[str, int] = {}
     failed: dict[str, int] = {}
+    retired: dict[str, int] = {}
     for unit, state in units.items():
         key = _template_name(unit)
+        if state.load_state == RETIRED_LOAD_STATE:
+            # Only the latched ones are residue worth reporting. A
+            # fragment-less unit that is merely inactive is a dangling
+            # dependency reference -- `Wants=prometheus.service` on a host
+            # without Prometheus, `After=postgresql@16-main.service` on a
+            # host whose database is elsewhere -- which is not a unit at all
+            # and has never been a finding. Counted like failed_units (one
+            # entry per template, instances summed), because the launcher's
+            # per-connection corpses reach this branch too once the template
+            # file is removed.
+            if state.active_state == "failed":
+                retired[key] = retired.get(key, 0) + 1
+            continue
         if state.restarts >= crash_loop_restarts:
             loops[key] = max(loops.get(key, 0), state.restarts)
         if state.active_state == "failed":
@@ -605,6 +685,7 @@ def evaluate_unit_health(
     return UnitHealthSnapshot(
         crash_loops=tuple(sorted(loops.items())),
         failed_units=tuple(sorted(failed.items())),
+        retired_units=tuple(sorted(retired.items())),
     )
 
 
@@ -681,7 +762,7 @@ def read_unit_health_snapshot(*, crash_loop_restarts: int) -> UnitHealthSnapshot
                 [
                     "systemctl",
                     "show",
-                    "--property=Id,NRestarts,ActiveState",
+                    "--property=Id,LoadState,NRestarts,ActiveState",
                     "--no-pager",
                     "--",
                     *batch,
@@ -772,12 +853,59 @@ def _committer_time(commit: Any) -> float | None:
     return _parse_iso8601(str(committer.get("date") or ""))
 
 
+def _first_parent_chain_times(commits: list[Any], head: str) -> list[float]:
+    """Committer dates of the undeployed commits that LANDED on the branch:
+    its first-parent chain, walked from the head down to the first parent
+    outside the compared range.
+
+    A commit object's committer date is when someone wrote it, which is when
+    the branch gained it only for commits pushed, squashed or rebased onto
+    it. A merge commit carries its whole feature branch at the branch's own
+    ages, so dating the range by the oldest commit OBJECT in it charges the
+    promotion pipeline for everything that happened before the code was
+    mergeable at all. The first-parent chain is exactly what the branch
+    itself gained, each entry dated when it was gained (GitHub stamps the
+    merge/squash/rebase commit at merge time), so the oldest date on it is
+    when the branch first held something production does not run.
+
+    Returns [] when the chain cannot be walked end to end -- a compare page
+    truncated at its 250-commit cap (which keeps the OLDEST commits, so the
+    head is not in the payload at all), a payload without `parents`, a
+    cycle, or a commit without a date -- so the caller falls back to dating
+    the commit objects rather than trusting a partial walk.
+    """
+    by_sha: dict[str, dict[str, Any]] = {}
+    for commit in commits:
+        if isinstance(commit, dict):
+            sha = str(commit.get("sha") or "")
+            if sha:
+                by_sha[sha] = commit
+    times: list[float] = []
+    sha, seen = head, set()
+    while sha in by_sha and sha not in seen:
+        seen.add(sha)
+        commit = by_sha[sha]
+        when = _committer_time(commit)
+        if when is None:
+            return []
+        times.append(when)
+        parents = commit.get("parents")
+        first = parents[0] if isinstance(parents, list) and parents else None
+        sha = str(first.get("sha") or "") if isinstance(first, dict) else ""
+    # A complete walk leaves the range through a real first parent (the merge
+    # base side). Anything else -- an empty `parents`, a cycle, a head the
+    # truncated page never carried -- is not a chain to date the lag from.
+    if not times or not sha or sha in by_sha:
+        return []
+    return times
+
+
 def read_deploy_lag_snapshot(
     repo: str, version_url: str, *, branch: str, grace_seconds: float
 ) -> DeployLagSnapshot:
     """One GET of what runs, one `gh api` for the branch head, and -- only
-    when they differ -- one `gh api` compare to date the oldest undeployed
-    commit. Never raises.
+    when they differ -- one `gh api` compare to count the undeployed commits
+    and date the oldest one by when the branch gained it. Never raises.
 
     `gh` authenticates from the unit's GH_CONFIG_DIR (the fleet's GitHub App
     store on the worker), never from a token in arguments or logs.
@@ -813,10 +941,23 @@ def read_deploy_lag_snapshot(
             # forward hotfix, a branch swap): nothing is waiting to deploy.
             undeployed, lag = 0, 0.0
         else:
-            times = [t for t in (_committer_time(c) for c in commits) if t is not None]
+            # The clock is when the BRANCH gained its oldest undeployed
+            # commit, not when that commit was written; the commit objects
+            # are the fallback for a range this probe cannot walk.
+            times = _first_parent_chain_times(commits, head) or [
+                t for t in (_committer_time(c) for c in commits) if t is not None
+            ]
             if not times:
                 raise RuntimeError("gh api compare listed commits without dates")
-            undeployed, lag = len(times), max(time.time() - min(times), 0.0)
+            total = compared.get("total_commits")
+            # `total_commits` counts the whole range; `commits` stops at one
+            # page, so a long stall must not report a smaller backlog.
+            undeployed = (
+                int(total)
+                if isinstance(total, int) and not isinstance(total, bool) and total > 0
+                else len([c for c in commits if isinstance(c, dict)])
+            )
+            lag = max(time.time() - min(times), 0.0)
         return DeployLagSnapshot(
             repo=repo,
             branch=branch,
