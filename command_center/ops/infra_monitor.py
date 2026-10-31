@@ -13,8 +13,9 @@ import json
 import os
 import subprocess
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -95,30 +96,178 @@ class UnitState:
 
 
 @dataclass(frozen=True, slots=True)
+class RestartSample:
+    """One tick's reading of a unit's restart counter."""
+
+    observed_at: float
+    restarts: int
+
+
+#: Samples retained per unit. The two-minute tick of voyn-infra-monitor.timer
+#: fills a one-hour window with about thirty; the cap only bounds a hand-run
+#: or a much faster timer, so the state file cannot grow without limit.
+RESTART_SAMPLE_CAP = 512
+
+
+@dataclass(frozen=True, slots=True)
+class RestartHistory:
+    """What the earlier ticks saw, so this tick can measure a RATE.
+
+    A crash loop is restarts per unit of time; ``NRestarts`` is a lifetime
+    total. It only ever grows for as long as a unit keeps running -- systemd
+    resets it on an explicit start/restart/reset-failed and never on its own --
+    so judging the total answers a question nobody asked: "has this unit ever
+    restarted N times?". That is true of every `Restart=` unit on a host that
+    has been up long enough (the SSH tunnel reconnects, a lane rides out a
+    PostgreSQL blip, credential rotation checks back on its bounded two-minute
+    cadence during a circuit cooldown), and once true it stays true forever.
+    worker-01 2026-09-15: `crash_loop` was open against a host whose loops had
+    stopped, no later measurement could ever clear it, and a fail-closed
+    monitor that cannot go green is a monitor nobody reads
+    (VOYN-MON-WORKER-01-INFRA-CRASH-LOOP).
+
+    Two readings give the difference the word "loop" actually means. This file
+    is only how the second tick remembers the first, which decides how its
+    failures are treated: an unreadable or corrupt file costs one window of
+    history and is rewritten by this very tick, so it is tolerated; a file the
+    probe cannot WRITE means every future tick measures nothing, which is the
+    silent blindness this module exists to prevent, so it fails the probe.
+    """
+
+    samples: dict[str, tuple[RestartSample, ...]] = field(default_factory=dict)
+
+    @classmethod
+    def load(cls, path: Path) -> RestartHistory:
+        """Read the previous ticks. Never raises: see the class docstring."""
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+            units = document["units"]
+        except (OSError, ValueError, TypeError, KeyError):
+            return cls({})
+        if not isinstance(units, dict):
+            return cls({})
+        samples: dict[str, tuple[RestartSample, ...]] = {}
+        for unit, rows in units.items():
+            if not isinstance(rows, list):
+                continue
+            parsed = [
+                RestartSample(float(row[0]), int(row[1]))
+                for row in rows
+                if isinstance(row, list)
+                and len(row) == 2
+                and isinstance(row[0], (int, float))
+                and isinstance(row[1], int)
+                and row[1] >= 0
+            ]
+            if parsed:
+                samples[str(unit)] = tuple(sorted(parsed, key=lambda s: s.observed_at))
+        return cls(samples)
+
+    def save(self, path: Path) -> None:
+        """Replace the file atomically; a partial file must never be read as
+        a baseline, and a write that fails must reach the caller."""
+        path.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
+        document = {
+            "version": 1,
+            "units": {
+                unit: [[sample.observed_at, sample.restarts] for sample in samples]
+                for unit, samples in sorted(self.samples.items())
+            },
+        }
+        temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        try:
+            temporary.write_text(json.dumps(document, sort_keys=True), encoding="utf-8")
+            os.replace(temporary, path)
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+
+    def observe(
+        self, counters: dict[str, int], *, now: float, window_seconds: float
+    ) -> RestartHistory:
+        """This tick's counters appended, everything outside the window gone.
+
+        Units absent from ``counters`` drop out entirely, so per-connection
+        template instances cannot accumulate in the file. A counter that went
+        DOWN is systemd's own signal that the series ended -- an operator
+        restarted the unit or ran `reset-failed` -- so the samples before it
+        are discarded and the window restarts from the new baseline instead of
+        reporting a negative or bogus gain. Samples stamped in the future
+        (a clock that stepped backwards) are dropped for the same reason.
+        """
+        fresh: dict[str, tuple[RestartSample, ...]] = {}
+        for unit, restarts in counters.items():
+            kept = tuple(
+                sample
+                for sample in self.samples.get(unit, ())
+                if now - window_seconds <= sample.observed_at <= now
+                and sample.restarts <= restarts
+            )
+            keep_from = max(0, len(kept) - (RESTART_SAMPLE_CAP - 1))
+            fresh[unit] = (*kept[keep_from:], RestartSample(now, restarts))
+        return RestartHistory(fresh)
+
+    def gained(self, unit: str) -> int:
+        """Restarts added between the oldest and newest sample in the window.
+
+        Zero with fewer than two samples: a probe with nothing to compare
+        against has measured no rate, and saying so is not the same as saying
+        the unit is healthy. The next tick, two minutes later, measures one --
+        and the loops this probe exists for (every 3 s, every 15 s) clear any
+        sane threshold inside a single tick.
+        """
+        samples = self.samples.get(unit, ())
+        if len(samples) < 2:
+            return 0
+        return samples[-1].restarts - samples[0].restarts
+
+
+@dataclass(frozen=True, slots=True)
 class UnitHealthSnapshot:
-    """Every service unit on the host, judged by restarts and failed state.
+    """Every service unit on the host, judged by restart RATE and failed state.
 
     worker-01 2026-09-02..14: `ollama.service` restarted every 3 s for twelve
     days (315 891 restarts) and `voyn-canary.service` every 15 s for eighteen
     (70 305) while every monitor stayed green, because each probe asked
     `is-active` of its own hand-picked units and a `Restart=always` unit is
     `activating` again by the time anyone looks. NRestarts is the number that
-    cannot be hidden. Template instances (per-connection launcher units)
-    collapse to one `template@*.service` in both listings -- crash loops carry
-    the highest NRestarts among the instances, failed units their count -- so
-    a hundred dead connections are one finding, not a hundred.
+    cannot be hidden -- but the number that means "loop" is how fast it grows,
+    not how large it is (see `RestartHistory`), so `crash_loops` carries the
+    restarts a unit GAINED in the trailing `window_seconds`, not its total.
+    Template instances (per-connection launcher units) collapse to one
+    `template@*.service` in both listings -- crash loops carry the highest
+    NRestarts among the instances, failed units their count -- so a hundred
+    dead connections are one finding, not a hundred.
 
-    A unit this host no longer HAS is reported separately (`retired_units`)
-    and is not a finding: see `evaluate_unit_health`.
+    Retired units are reported separately and excluded from both fault classes.
     """
 
     crash_loops: tuple[tuple[str, int], ...]
     failed_units: tuple[tuple[str, int], ...]
+    window_seconds: float = 0.0
+
     #: Units whose last run latched `failed` and whose unit file this host no
     #: longer has -- the only reason PID 1 still holds them. Measured and
     #: reported, deliberately not a failure.
     retired_units: tuple[tuple[str, int], ...] = ()
     error: str | None = None
+    #: Set when the host WAS read but the rate half could not be judged --
+    #: today, only a tick with nowhere to remember its predecessor. Its own
+    #: failure code, because "no loop was measured" must never read as "no
+    #: loop", and the failed-unit half needs no memory and keeps reporting.
+    crash_loop_error: str | None = None
+
+
+#: Why the rate half is unmeasured when the tick has nowhere to remember.
+#: The code reaches worker-01 the moment self-deploy fast-forwards the
+#: checkout that `ExecStart` runs from; `/etc/systemd/system` is not in that
+#: checkout and does not move with it, so there is a window in which new code
+#: reads an old unit file with no `StateDirectory=`. The probe says exactly
+#: what closes the window rather than assuming it never opens.
+CRASH_LOOP_STATE_UNSET = (
+    "no crash-loop state path: reinstall deploy/systemd/voyn-infra-monitor.service"
+    " (StateDirectory=) and run `systemctl daemon-reload`"
+)
 
 
 #: `systemctl show --property=LoadState` for a name systemd has no unit file
@@ -564,54 +713,54 @@ def _template_name(unit: str) -> str:
     return f"{name}@*{suffix}"
 
 
+def collapse_restart_counters(units: dict[str, UnitState]) -> dict[str, int]:
+    """Highest NRestarts per template name.
+
+    Collapsing before the history is stored is what keeps the state file
+    bounded: `aicc-agent-launcher@2079-27636-984.service` is a NEW unit name
+    per connection, and keyed by instance the file would grow by one entry per
+    launch forever.
+    """
+    highest: dict[str, int] = {}
+    for unit, state in units.items():
+        if state.load_state == RETIRED_LOAD_STATE:
+            continue
+        key = _template_name(unit)
+        highest[key] = max(highest.get(key, 0), state.restarts)
+    return highest
+
+
 def evaluate_unit_health(
-    units: dict[str, UnitState], *, crash_loop_restarts: int
+    units: dict[str, UnitState],
+    *,
+    crash_loop_restarts: int,
+    history: RestartHistory | None,
+    window_seconds: float,
 ) -> UnitHealthSnapshot:
-    """Split the host's units into faults and residue.
+    """Judge the host from this tick's units and the window of ticks behind it.
 
-    systemd's `failed` is a LATCH, not a measurement: it records how a unit's
-    last run ended and it survives the condition indefinitely. For a unit this
-    host still has, that latch is actionable -- the next run clears it, and a
-    unit that keeps failing keeps it set, which is the fault this probe exists
-    to see. For a unit this host no longer HAS it is residue: there is no unit
-    file, so it can never run again, can never reach a successful state, and
-    only a privileged `systemctl reset-failed` will ever clear it. Nothing to
-    restart, nothing to repair, nothing measured about the present.
-
-    Those two cases are indistinguishable in `ActiveState` alone, which is why
-    this probe asks for `LoadState` as well. They are not hypothetical: the
-    staged isolated-lane rollout retires `voyn-aicc-worker.service`,
-    `voyn-aicc-worker-2.service` and `aicc-worker.service` by stopping and
-    *disabling* them, and disabling removes the symlink that was their
-    fragment -- so after a rollout those units are deliberately gone
-    (`RETIRED_LEGACY_UNITS` in ops/aicc_install_transaction.py says so in as
-    many words). A stop that reached its timeout latched `failed` on the way
-    out, and `verify_legacy_units_retired` accepted that as drained. systemd
-    garbage-collects a fragment-less unit the moment it is inactive and
-    unreferenced, so the ONLY retired units still in PID 1's table are exactly
-    the ones latched `failed` -- and this probe counted them from the day it
-    was added (worker-01, monitor_finding 2051 and its three successors). No
-    repair could clear that finding, because the units it named no longer
-    existed on the host.
-
-    Residue is not silenced, it is reclassified: `retired_units` carries it
-    into the journalled measurement so an operator can still see what is
-    there. Nor does this blind the probe. A unit file that goes missing while
-    the service matters is not quiet -- the lanes are `active_workers`, the
-    monitor's other classes cover the ticks -- and a unit file that is present
-    but broken loads as `error`/`bad-setting`, not `not-found`, so it stays a
-    fault here.
-
-    NRestarts is residue on the same unit for the same reason (a frozen
-    counter on something that cannot restart), and is excluded with it: were
-    it not, clearing the `failed_units` finding would merely re-raise the same
-    corpses as `crash_loop`.
+    ``history`` must already include this tick (``RestartHistory.observe``);
+    the crash-loop verdict is the gain across it, never the lifetime counter.
+    ``None`` means this tick had nowhere to remember its predecessor, so there
+    is no rate to judge: the failed-unit half still reports (it needs no
+    memory) and the rate half reports that it did not measure.
     """
     if crash_loop_restarts < 1:
         raise ValueError("crash_loop_restarts must be at least 1")
+    if window_seconds <= 0:
+        raise ValueError("crash_loop_window_seconds must be positive")
     loops: dict[str, int] = {}
     failed: dict[str, int] = {}
     retired: dict[str, int] = {}
+    active_templates = {_template_name(unit) for unit, state in units.items()
+                        if state.load_state != RETIRED_LOAD_STATE}
+    if history is not None:
+        for unit in history.samples:
+            if unit not in active_templates:
+                continue
+            gained = history.gained(unit)
+            if gained >= crash_loop_restarts:
+                loops[unit] = gained
     for unit, state in units.items():
         key = _template_name(unit)
         if state.load_state == RETIRED_LOAD_STATE:
@@ -627,25 +776,44 @@ def evaluate_unit_health(
             if state.active_state == "failed":
                 retired[key] = retired.get(key, 0) + 1
             continue
-        if state.restarts >= crash_loop_restarts:
-            loops[key] = max(loops.get(key, 0), state.restarts)
         if state.active_state == "failed":
+            key = _template_name(unit)
             failed[key] = failed.get(key, 0) + 1
     return UnitHealthSnapshot(
         crash_loops=tuple(sorted(loops.items())),
         failed_units=tuple(sorted(failed.items())),
+        window_seconds=window_seconds,
+        crash_loop_error=None if history is not None else CRASH_LOOP_STATE_UNSET,
+
         retired_units=tuple(sorted(retired.items())),
     )
 
 
-def _unit_listing(entries: tuple[tuple[str, int], ...]) -> str:
-    shown = ",".join(f"{unit}={count}" for unit, count in entries[:UNIT_LISTING_CAP])
+def _unit_listing(entries: tuple[tuple[str, int], ...], *, sign: str = "") -> str:
+    shown = ",".join(
+        f"{unit}={sign}{count}" for unit, count in entries[:UNIT_LISTING_CAP]
+    )
     hidden = len(entries) - UNIT_LISTING_CAP
     return f"{shown},+{hidden}_more" if hidden > 0 else shown
 
 
-def read_unit_health_snapshot(*, crash_loop_restarts: int) -> UnitHealthSnapshot:
-    """Two unprivileged systemctl calls for the whole host, never raising."""
+def read_unit_health_snapshot(
+    *,
+    crash_loop_restarts: int,
+    state_path: Path | None,
+    window_seconds: float,
+    now: float | None = None,
+) -> UnitHealthSnapshot:
+    """Two unprivileged systemctl calls for the whole host, never raising.
+
+    The counters read here are folded into ``state_path`` before they are
+    judged, because the verdict is a rate across ticks and this process lives
+    for one tick. ``None`` -- a unit file without ``StateDirectory=``, which is
+    what a host looks like between a self-deploy and the unit's reinstall --
+    still reads the host and still reports failed units; only the rate half
+    goes unmeasured, and says so (``CRASH_LOOP_STATE_UNSET``).
+    """
+    moment = time.time() if now is None else now
     try:
         listed = subprocess.run(
             [
@@ -690,11 +858,28 @@ def read_unit_health_snapshot(*, crash_loop_restarts: int) -> UnitHealthSnapshot
             raise RuntimeError(
                 f"systemctl show returned {len(units)} of {len(names)} units"
             )
-        return evaluate_unit_health(units, crash_loop_restarts=crash_loop_restarts)
+        history = None
+        if state_path is not None:
+            history = RestartHistory.load(state_path).observe(
+                collapse_restart_counters(units),
+                now=moment,
+                window_seconds=window_seconds,
+            )
+            # Saved before the verdict: a tick that cannot leave a baseline
+            # behind is a tick that makes every FUTURE tick blind, so it fails
+            # closed here rather than reporting a confident "no loops" forever.
+            history.save(state_path)
+        return evaluate_unit_health(
+            units,
+            crash_loop_restarts=crash_loop_restarts,
+            history=history,
+            window_seconds=window_seconds,
+        )
     except Exception as exc:  # noqa: BLE001 - see read_pr_window_snapshot
         return UnitHealthSnapshot(
             crash_loops=(),
             failed_units=(),
+            window_seconds=window_seconds,
             error=f"{type(exc).__name__}: {exc}"[:200],
         )
 
@@ -999,14 +1184,24 @@ def evaluate(
             # One finding per class, every unit in the detail: the identity
             # is the code before the first ':' (`finding_key`).
             if unit_health.crash_loops:
+                # `unit=+N` is the restarts GAINED in the window, not the
+                # lifetime counter: the sign is there so nobody reads the
+                # number as a total (the window itself rides in the detail).
                 failures.append(
                     f"crash_loop:{len(unit_health.crash_loops)}"
-                    f":{_unit_listing(unit_health.crash_loops)}"
+                    f":{_unit_listing(unit_health.crash_loops, sign='+')}"
                 )
             if unit_health.failed_units:
                 failures.append(
                     f"failed_units:{len(unit_health.failed_units)}"
                     f":{_unit_listing(unit_health.failed_units)}"
+                )
+            if unit_health.crash_loop_error is not None:
+                # Never `crash_loop`: that key is a measured loop, and an
+                # operator who sees it goes looking for a looping unit. This
+                # one is the probe reporting that it judged no rate at all.
+                failures.append(
+                    f"crash_loop_unmeasured:{unit_health.crash_loop_error}"
                 )
 
     if deploy_lag is not None:
@@ -1041,13 +1236,46 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
+def _positive_float(value: str) -> float:
+    parsed = float(value)
+    if not parsed > 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
+
+
+def default_crash_loop_state() -> str:
+    """`$STATE_DIRECTORY/unit-restarts.json`, or empty when the unit declares
+    no `StateDirectory=`.
+
+    systemd exports a colon-separated list; the first entry is this unit's own
+    state root. Nothing else on the monitor's filesystem is writable -- it runs
+    under ProtectSystem=strict with ProtectHome=read-only and PrivateTmp, and a
+    private /tmp is wiped between ticks, which would make the history silently
+    empty on every run.
+    """
+    root = os.environ.get("STATE_DIRECTORY", "").split(":")[0]
+    return str(Path(root) / "unit-restarts.json") if root else ""
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    """Parse and cross-validate: a half-configured deploy-lag probe is a
-    usage error argparse reports, not a monitoring failure that pages."""
+    """Parse and cross-validate: a half-configured deploy-lag or crash-loop
+    probe is a usage error argparse reports, not a monitoring failure that
+    pages."""
     parser = build_parser()
     args = parser.parse_args(argv)
     if bool(args.deploy_lag_repo) != bool(args.deploy_lag_version_url):
         parser.error("--deploy-lag-repo and --deploy-lag-version-url must be given together")
+    # `--unit-health` without a state path is deliberately NOT a usage error,
+    # unlike the half-configured deploy-lag probe above. Those flags are typed
+    # on one ExecStart line and are wrong together or right together; this path
+    # comes from a DIFFERENT file, on a different deploy path -- self-deploy
+    # fast-forwards the checkout `ExecStart` runs from, and nothing in that
+    # checkout updates `/etc/systemd/system`. Exiting 2 there would take the
+    # worker, queue, Prometheus, deploy-lag and PR-window probes down with the
+    # rate half and record nothing at all, turning one unmeasurable verdict
+    # into a blind host -- the exact silence this module exists to prevent.
+    # The probe reports `crash_loop_unmeasured` instead: still fail-closed,
+    # still a finding, and every other probe still measures.
     return args
 
 
@@ -1129,7 +1357,37 @@ def build_parser() -> argparse.ArgumentParser:
         "--crash-loop-restarts",
         type=_positive_int,
         default=5,
-        help="NRestarts at or above which a unit is a crash loop (default 5, minimum 1).",
+        help=(
+            "Restarts GAINED inside --crash-loop-window-seconds at or above "
+            "which a unit is a crash loop (default 5, minimum 1). Five an hour "
+            "is well under the loops this exists for (1200/h and 240/h) and "
+            "well over what a healthy `Restart=` unit does -- the fleet's own "
+            "lane restarts come from `systemctl restart`, which resets the "
+            "counter rather than raising it."
+        ),
+    )
+    parser.add_argument(
+        "--crash-loop-window-seconds",
+        type=_positive_float,
+        default=3600.0,
+        help=(
+            "How far back the restart counters are compared (default 1 hour). "
+            "A crash loop is a rate, so the verdict clears on its own once a "
+            "unit stops restarting -- a lifetime total never could."
+        ),
+    )
+    parser.add_argument(
+        "--crash-loop-state",
+        default=default_crash_loop_state(),
+        metavar="PATH",
+        help=(
+            "JSON file holding the previous ticks' restart counters, because "
+            "the window spans ticks and one tick is one process. Defaults to "
+            "$STATE_DIRECTORY/unit-restarts.json, which is how the unit's "
+            "StateDirectory= turns it on. Without one, --unit-health still "
+            "reports failed units and reports the rate half as unmeasured; it "
+            "never reports a confident \"no crash loops\"."
+        ),
     )
     parser.add_argument(
         "--deploy-lag-repo",
@@ -1224,7 +1482,13 @@ def main(argv: list[str] | None = None) -> int:
             else None
         )
         unit_health = (
-            read_unit_health_snapshot(crash_loop_restarts=args.crash_loop_restarts)
+            read_unit_health_snapshot(
+                crash_loop_restarts=args.crash_loop_restarts,
+                state_path=(
+                    Path(args.crash_loop_state) if args.crash_loop_state else None
+                ),
+                window_seconds=args.crash_loop_window_seconds,
+            )
             if args.unit_health
             else None
         )
