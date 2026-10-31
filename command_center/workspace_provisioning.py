@@ -1171,15 +1171,6 @@ def _verify_task_local_workspace(spec: WorkspaceSpec) -> VerificationEvidence:
             detail=f"task-local ownership mismatch: {static_failed or 'invalid base SHA'}",
         )
     candidate = _read_agent_head(absolute, spec.expected_branch)
-    if candidate != marker_start:
-        raise WorkspaceVerificationError(
-            failed_step="task_workspace_checkpoint",
-            remediation="Recover the uncheckpointed branch through trusted operator review.",
-            expected_workspace=str(expected_path),
-            actual_workspace=str(absolute),
-            expected_branch=spec.expected_branch,
-            detail=f"saved HEAD {candidate} differs from signed checkpoint {marker_start}",
-        )
     current_base = _resolve_remote_ref_sha(
         repo, remote_url, f"refs/heads/{spec.base_branch}", spec
     )
@@ -1195,14 +1186,16 @@ def _verify_task_local_workspace(spec: WorkspaceSpec) -> VerificationEvidence:
     remote_task = _resolve_remote_ref_sha(
         repo, remote_url, f"refs/heads/{spec.expected_branch}", spec
     )
-    # This disposable clone proves the marker's original base is a real
-    # ancestor of today's canonical base and that the saved candidate is a
-    # clean descendant. It never reads agent-controlled Git config.
+    # This disposable clone proves the saved candidate is a clean descendant
+    # of the LAST SIGNED CHECKPOINT (not just of the original base): passing
+    # `marker_start` as `start_sha` makes the existing `agent_commit_ancestry`
+    # check double as the checkpoint-forward-progress proof. It never reads
+    # agent-controlled Git config.
     with trusted_publish_clone(
         absolute,
         expected_branch=spec.expected_branch,
         remote_url=remote_url,
-        start_sha=marker_base,
+        start_sha=marker_start,
         trusted_base_sha=marker_base,
         current_base_sha=current_base,
         expected_remote_sha=remote_task,
@@ -1210,6 +1203,23 @@ def _verify_task_local_workspace(spec: WorkspaceSpec) -> VerificationEvidence:
         require_clean=spec.status_policy != STATUS_POLICY_ALLOW_DIRTY,
     ):
         pass
+    if candidate != marker_start:
+        # HEAD has already moved past the last signed checkpoint without a
+        # matching marker update -- e.g. `checkpoint_dirty_task_workspace`
+        # durably advanced the branch ref and the process then died or a
+        # later step failed before the follow-up `checkpoint_task_workspace`
+        # call could sign the new tip. The trusted clone above just proved
+        # this exact HEAD is a well-formed, fsck-clean descendant of the
+        # last signed checkpoint (and of the original base) -- re-sign the
+        # marker to match it instead of bricking every future attempt at
+        # this task behind a checkpoint that can never catch up on its own.
+        candidate = checkpoint_task_workspace(
+            absolute,
+            expected_branch=spec.expected_branch,
+            previous_start_sha=marker_start,
+            expected_candidate_sha=candidate,
+            expected_inode=(workspace_stat.st_dev, workspace_stat.st_ino),
+        )
     evidence = VerificationEvidence(
         workspace_path=str(absolute),
         repository_path=str(repo),

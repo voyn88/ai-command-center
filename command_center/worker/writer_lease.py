@@ -59,6 +59,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
@@ -74,6 +75,27 @@ logger = logging.getLogger(__name__)
 # network blip) may pass before the lease actually lapses server-side.
 _RENEW_FRACTION = 3.0
 _MIN_RENEW_INTERVAL_SECONDS = 1.0
+
+# VOYN-W0-AICC-DEAD-QUEUE-THREE-WRITER-CONTENTION-CLASSES class 3 (161 of 712
+# dead `work_item`s): `writer lease unavailable: acquire_failed`. The initial
+# acquire used to be tried exactly once -- but this lease is task-scoped
+# (VOYN-W0-AICC-LEASE-SCOPE-PER-TASK) and "two attempts of the SAME task still
+# collide, which is correct: they share one worktree by design"
+# (`handlers._provision_lock`'s docstring). A retry of a task whose PREVIOUS
+# attempt is still running (mid agent-run, or mid checkpoint/publish) finds
+# the lease correctly still held and fails on the very first try -- and the
+# queue's own redelivery backoff (`_queue_backoff`: base_seconds * 2^attempt,
+# e.g. 2s/4s/8s for a short cascade) is far shorter than a run that can hold
+# the workspace for up to `request.timeout_seconds` (minutes). The attempt
+# budget exhausts into a dead letter while the "other writer" is simply still
+# doing legitimate work. This bounded local retry absorbs that ordinary
+# overlap inside ONE delivery instead of spending the queue's few attempts on
+# it; a lease that is still unavailable after the whole budget elapses (a
+# genuinely stuck or refused lease) fails exactly as before. Safe to block
+# the handler thread here: `WorkerDaemon._heartbeat_loop` renews the queue
+# claim's own visibility independently, on its own thread, the same way it
+# already tolerates the agent run itself running for minutes.
+_ACQUIRE_RETRY_INTERVAL_SECONDS = 3.0
 
 
 class WriterLeaseUnavailable(Exception):
@@ -92,6 +114,13 @@ class WriterLeaseConfig:
     session: str
     task: str  # the backlog task id
     ttl: int = 600
+    # Bounded budget for the INITIAL acquire to retry against ordinary,
+    # short-lived contention (see `_ACQUIRE_RETRY_INTERVAL_SECONDS` above) --
+    # not applied to renewal, which already has its own margin
+    # (`_RENEW_FRACTION`) and must fail fast so a genuinely lost lease
+    # cancels the running agent promptly rather than continuing to mutate
+    # the workspace unaccountably.
+    acquire_wait_seconds: float = 30.0
 
 
 def _identity(cfg: WriterLeaseConfig) -> lease_client.LeaseIdentity:
@@ -191,19 +220,39 @@ class _Handle:
                 return
 
 
+def _acquire_with_retry(repo_path: Path, cfg: WriterLeaseConfig) -> str | None:
+    """Try the initial acquire, retrying on failure until `cfg.acquire_wait_seconds`
+    has elapsed. Returns the last failure reason, or ``None`` once it succeeds."""
+    deadline = time.monotonic() + max(cfg.acquire_wait_seconds, 0.0)
+    failure = _acquire_and_provision_hooks(repo_path, cfg)
+    while failure is not None and time.monotonic() < deadline:
+        logger.info(
+            "writer lease acquire for task %s did not succeed yet (%s); retrying",
+            cfg.task,
+            failure,
+        )
+        time.sleep(min(_ACQUIRE_RETRY_INTERVAL_SECONDS, max(deadline - time.monotonic(), 0.0)))
+        failure = _acquire_and_provision_hooks(repo_path, cfg)
+    return failure
+
+
 def hold(
     repo_path: Path, cfg: WriterLeaseConfig, lease_lost: threading.Event
 ) -> _Handle:
     """Acquire the full-lifecycle writer lease and return a context manager
     that renews it in the background until released.
 
-    Raises `WriterLeaseUnavailable` if the initial acquire fails -- the
-    caller must not provision a workspace or run an agent without it. Use
-    as ``stack.enter_context(hold(...))`` (an `ExitStack`, so the acquire
-    can be tried and its failure converted to a normal retryable outcome
-    before anything is entered) or a plain ``with hold(...):``.
+    The initial acquire is retried with a short interval for up to
+    `cfg.acquire_wait_seconds` (see its docstring) before giving up --
+    ordinary contention from the SAME task's still-running previous attempt
+    is expected to clear on its own well inside that budget. Raises
+    `WriterLeaseUnavailable` once that budget elapses without success -- the
+    caller must not provision a workspace or run an agent without it. Use as
+    ``stack.enter_context(hold(...))`` (an `ExitStack`, so the acquire can be
+    tried and its failure converted to a normal retryable outcome before
+    anything is entered) or a plain ``with hold(...):``.
     """
-    failure = _acquire_and_provision_hooks(repo_path, cfg)
+    failure = _acquire_with_retry(repo_path, cfg)
     if failure is not None:
         raise WriterLeaseUnavailable(failure)
     return _Handle(repo_path, cfg, lease_lost)
