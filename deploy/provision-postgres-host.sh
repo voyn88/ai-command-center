@@ -35,13 +35,34 @@ fi
 # so it needs to be a recent PostgreSQL, not byte-identical to that pin.
 # Adding a second apt source (e.g. PGDG) here would be an unforced increase
 # in this host's trusted-package surface for no requirement this satisfies.
-DEBIAN_FRONTEND=noninteractive apt-get update
-DEBIAN_FRONTEND=noninteractive apt-get install -y postgresql postgresql-client
+# Skip the package round-trip when a server is already serving. Matching the
+# check script: either systemd reports active, or pg_lsclusters reports an
+# online cluster (systemctl can be unreachable in constrained sessions while
+# the cluster is still up).
+already_up=0
+if systemctl is-active --quiet postgresql 2>/dev/null; then
+  already_up=1
+elif command -v pg_lsclusters >/dev/null 2>&1 \
+  && pg_lsclusters -h 2>/dev/null | awk '$4 == "online" { found=1 } END { exit !found }'; then
+  already_up=1
+fi
 
-systemctl enable --now postgresql
+if [ "$already_up" -eq 0 ]; then
+  DEBIAN_FRONTEND=noninteractive apt-get update
+  DEBIAN_FRONTEND=noninteractive apt-get install -y postgresql postgresql-client
+  systemctl enable --now postgresql
+fi
 
-if ! systemctl is-active --quiet postgresql; then
-  echo "postgresql.service did not reach active state" >&2
+# Prefer enabling even on the fast path so a previously-manual start survives reboot.
+systemctl enable postgresql >/dev/null 2>&1 || true
+
+if systemctl is-active --quiet postgresql 2>/dev/null; then
+  :
+elif command -v pg_lsclusters >/dev/null 2>&1 \
+  && pg_lsclusters -h 2>/dev/null | awk '$4 == "online" { found=1 } END { exit !found }'; then
+  :
+else
+  echo "postgresql.service did not reach active state and no cluster reports online" >&2
   exit 1
 fi
 

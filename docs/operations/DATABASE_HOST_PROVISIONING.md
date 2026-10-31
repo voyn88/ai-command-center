@@ -9,15 +9,15 @@ a real PostgreSQL server existed on either host, so `tests/db` could only
 skip and `aicc-backlog-merge.service`/`aicc-backlog-review.service` (which
 both declare `After=postgresql.service`) had nothing to start after.
 
-Re-verified live on `voyn-worker-01` on 2026-08-26: `postgresql-16` (server)
-is now installed and `postgresql.service` is active — that host already has a
-working native route. The `docker` group is still empty; `voynadmin` still
-cannot reach `/var/run/docker.sock`. `voyn-control-01`'s state was not
-re-checked from here — self-deploy's own architecture note records that
-control-01 and worker-01 cannot reach each other over SSH, so each host's
-state has to be verified on that host. Run `scripts/check_postgres_host.sh`
-on any host to get current, structured answers instead of another one-off
-probe.
+Re-verified live on `voyn-worker-01` on 2026-10-31: `postgresql-16` (server)
+is installed, `pg_lsclusters` reports cluster `16/main` **online** on
+`127.0.0.1:5432`, and `psql` works. The `docker` group is still empty
+(`getent group docker` → no members); the current principal still cannot
+reach `/var/run/docker.sock`. `voyn-control-01` is a separate host — self-deploy
+records that control-01 and worker-01 cannot reach each other over SSH, so
+each host's state has to be verified on that host. Run
+`scripts/check_postgres_host.sh` on any host to get current, structured
+answers instead of another one-off probe.
 
 ## Decision: native install, not Docker-group membership
 
@@ -54,12 +54,16 @@ to be a real PostgreSQL server recent enough to run the schema.
 ## Runbook
 
 1. `scripts/check_postgres_host.sh` — read-only; reports which routes (native,
-   Docker, Podman) are usable on the current host. Exits non-zero only when
-   none are.
+   Docker, Podman) are usable on the current host. A native route counts when
+   `postgresql.service` is active **or** `pg_lsclusters` reports a cluster
+   `online` (so a constrained session that cannot talk to systemd still
+   reports truthfully). Exits non-zero only when none of the routes are
+   usable.
 2. If it reports no native server: `sudo deploy/provision-postgres-host.sh`.
    Installs the distribution's `postgresql`/`postgresql-client` packages and
    enables `postgresql.service`. Idempotent — rerunning on an
-   already-provisioned host is a no-op.
+   already-provisioned host is a no-op (skips apt when a cluster is already
+   online).
 3. Re-run `scripts/check_postgres_host.sh` to confirm.
 4. Continue with the existing bootstrap/migrate steps in
    [`postgres-foundation.md`](../postgres-foundation.md#standing-up-a-database)

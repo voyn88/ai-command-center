@@ -14,6 +14,12 @@
 # docs/operations/DATABASE_HOST_PROVISIONING.md for the actual remediation
 # and deploy/provision-postgres-host.sh for the automated fix.
 #
+# A usable native route is either an active postgresql.service *or* at least
+# one cluster that pg_lsclusters reports as online. Agent/sandbox sessions on
+# an already-provisioned host often cannot talk to systemd (`Transport
+# endpoint is not connected`) even while the cluster is listening -- trusting
+# only systemctl produced a false "no route" there.
+#
 # Exit status: 0 when at least one route to a real server is usable, 1
 # otherwise. Usage: scripts/check_postgres_host.sh
 
@@ -50,25 +56,69 @@ fi
 
 echo "== native PostgreSQL server =="
 server_bin=""
-for candidate in /usr/lib/postgresql/*/bin/postgres postgres; do
-    if command -v "$candidate" >/dev/null 2>&1; then
+# Absolute package paths first: Debian/Ubuntu put the real binary under
+# /usr/lib/postgresql/<ver>/bin/ and do not put `postgres` on PATH.
+for candidate in /usr/lib/postgresql/*/bin/postgres; do
+    if [[ -x "$candidate" ]]; then
         server_bin="$candidate"
         break
     fi
 done
-if [[ -n "$server_bin" ]]; then
-    pass "server binary present ($server_bin)"
-    if command -v pg_lsclusters >/dev/null 2>&1 && pg_lsclusters 2>/dev/null | grep -q .; then
+if [[ -z "$server_bin" ]] && command -v postgres >/dev/null 2>&1; then
+    server_bin="$(command -v postgres)"
+fi
+# Fall back to the companion server tools named in the original probe when the
+# `postgres` binary itself is absent from the usual locations.
+if [[ -z "$server_bin" ]]; then
+    for tool in pg_ctl initdb; do
+        for candidate in /usr/lib/postgresql/*/bin/"$tool"; do
+            if [[ -x "$candidate" ]]; then
+                server_bin="$candidate"
+                break 2
+            fi
+        done
+        if command -v "$tool" >/dev/null 2>&1; then
+            server_bin="$(command -v "$tool")"
+            break
+        fi
+    done
+fi
+
+cluster_online=0
+if command -v pg_lsclusters >/dev/null 2>&1; then
+    # Column 4 of `pg_lsclusters -h` is Status (online/down/…).
+    if pg_lsclusters -h 2>/dev/null | awk '$4 == "online" { found=1 } END { exit !found }'; then
+        cluster_online=1
+    fi
+    if pg_lsclusters 2>/dev/null | grep -q .; then
         pg_lsclusters | sed 's/^/         /'
     fi
-    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet postgresql 2>/dev/null; then
+fi
+
+systemd_active=0
+if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet postgresql 2>/dev/null; then
+    systemd_active=1
+fi
+
+if [[ -n "$server_bin" ]]; then
+    pass "server binary present ($server_bin)"
+    if [[ "$systemd_active" -eq 1 ]]; then
         pass "postgresql.service is active"
         native_ok=1
+    elif [[ "$cluster_online" -eq 1 ]]; then
+        pass "at least one PostgreSQL cluster is online (pg_lsclusters)"
+        native_ok=1
     else
-        fail "postgresql.service is not active (installed but not running)"
+        fail "postgresql.service is not active and no cluster reports online"
     fi
 else
     fail "no postgres/pg_ctl/initdb server binary found"
+    if [[ "$cluster_online" -eq 1 ]]; then
+        # Cluster table can still prove a running server when binaries are
+        # outside the paths we searched (unusual packaging).
+        pass "at least one PostgreSQL cluster is online (pg_lsclusters)"
+        native_ok=1
+    fi
 fi
 
 if command -v psql >/dev/null 2>&1; then
