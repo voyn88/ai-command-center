@@ -1,0 +1,9 @@
+[Unit]
+Description=Run the tick-stall watchdog periodically (VOYN-W0-AICC-TICK-STALL-WATCHDOG)
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=15min
+
+[Install]
+WantedBy=timers.target

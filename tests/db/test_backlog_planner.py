@@ -1329,6 +1329,113 @@ def test_open_monitor_findings_become_pipeline_tasks_once(rig) -> None:
             assert cur.fetchone()[0] == 1
 
 
+def test_a_reopened_finding_does_not_reset_the_task_carrying_its_fix(rig) -> None:
+    """VOYN-MON-WORKER-01-INFRA-DEPLOY-LAG-5ABD205763.
+
+    A probe only measures a class healthy once its fix is merged AND
+    deployed, so every monitor finding re-opens while the work answering it
+    is still travelling. `backlog_upsert_task` is the importer's path and may
+    set a status directly, so the second opening of the same (source,
+    failure) used to yank its task from READY_TO_REVIEW back to OPEN --
+    discarding the review of the pull request carrying the fix and bumping
+    the revision the in-flight run would present to `backlog_transition`,
+    which `backlog_ingest_results` raises on, taking the whole ingest tick
+    with it. The finding is linked; the task is untouched.
+    """
+    from command_center.orchestrator.planner import PlanLimits, Planner, _monitor_task_id
+
+    app_factory, store, _worker = rig
+    source, failure = "worker-01:infra", "deploy_lag"
+    monitor_id = _monitor_task_id(source, failure)
+
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT monitor_record_finding(%s, %s, %s::jsonb)",
+                (source, failure, '{"lag_seconds": 93600}'),
+            )
+    assert Planner(app_factory).plan_once(
+        PlanLimits(planner="planner-t")
+    ).monitor_tasks == [(monitor_id, failure)]
+
+    # The fleet took it, implemented the fix and published: IN_PROGRESS then
+    # READY_TO_REVIEW, which is where a monitor task sits for as long as the
+    # measurement it fixes is still red.
+    task = store.get_task(monitor_id)
+    ok, _reason, revision = store.transition(monitor_id, "IN_PROGRESS", task["revision"])
+    assert ok
+    ok, _reason, revision = store.transition(monitor_id, "READY_TO_REVIEW", revision)
+    assert ok
+
+    # Same (source, failure), measured red again after a clear: a NEW row,
+    # unlinked, which is what the planner's finding loop selects.
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT monitor_clear_finding(%s)", (source,))
+            cur.execute(
+                "SELECT monitor_record_finding(%s, %s, %s::jsonb)",
+                (source, failure, '{"lag_seconds": 97200}'),
+            )
+            reopened = cur.fetchone()[0]
+
+    report = Planner(app_factory).plan_once(PlanLimits(planner="planner-t"))
+    assert report.monitor_relinked == [(monitor_id, failure)]
+    assert report.monitor_tasks == []
+    after = store.get_task(monitor_id)
+    assert after["status"] == "READY_TO_REVIEW"
+    assert after["revision"] == revision
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT task_id FROM monitor_finding WHERE finding_id = %s", (reopened,)
+            )
+            # Linked, so the next tick does not read this finding again.
+            assert cur.fetchone()[0] == monitor_id
+
+
+def test_a_recovered_class_clears_its_own_finding_under_the_worker_grant(rig) -> None:
+    """0031, from the worker host's own role.
+
+    0021 cleared a source's findings only on a tick with no failures at all,
+    so one standing red probe (`crash_loop` on worker-01, where units carry
+    six-figure NRestarts) held every recovered class open with it.
+    """
+    app_factory, _store, worker = rig
+    # The worker role holds EXECUTE on the finding functions and no grant at
+    # all on the table (0021's policy, deliberately): every read below goes
+    # through the control plane's role instead.
+    with worker._factory() as conn:  # noqa: SLF001 — the worker role's own connection
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT monitor_record_finding(%s, %s, %s::jsonb)",
+                ("worker-01:infra", "crash_loop", "{}"),
+            )
+            standing = cur.fetchone()[0]
+            cur.execute(
+                "SELECT monitor_record_finding(%s, %s, %s::jsonb)",
+                ("worker-01:infra", "deploy_lag", "{}"),
+            )
+            # The next tick: deploy_lag green, crash_loop still red.
+            cur.execute(
+                "SELECT monitor_clear_findings_except(%s, %s)",
+                ("worker-01:infra", ["crash_loop"]),
+            )
+            assert cur.fetchone()[0] == 1
+            cur.execute(
+                "SELECT monitor_record_finding(%s, %s, %s::jsonb)",
+                ("worker-01:infra", "crash_loop", "{}"),
+            )
+            # Recorded before the clear each tick, so the standing finding
+            # keeps its id -- and with it its opened_at and its linked task.
+            assert cur.fetchone()[0] == standing
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT failure, state FROM monitor_finding "
+                "WHERE source = 'worker-01:infra' ORDER BY failure"
+            )
+            assert cur.fetchall() == [("crash_loop", "open"), ("deploy_lag", "cleared")]
+
 @pytest.mark.parametrize("bad_url", [
     "not-a-pr",
     "https://github.com/owner?x/repo/pull/1",

@@ -1,0 +1,27 @@
+# Installed as /etc/fail2ban/jail.d/voyn-aicc.local on control-01
+# (VOYN-W0-AICC-CONTROL-PLANE-RESILIENCE).
+#
+# Incident this fixes: an operator reconnecting repeatedly over Tailscale
+# (a flaky client-side network, a sleeping laptop resuming, several short-
+# lived sessions in a row) produced enough sshd connection churn that
+# fail2ban's default sshd jail banned the operator's OWN Tailscale IP --
+# self-inflicted lockout of the one host that can fix a stuck control plane.
+#
+# The fix is `ignoreip` scoped to the Tailscale CGNAT range (100.64.0.0/10,
+# RFC 6598 -- the whole tailnet), not a single hardcoded address: any device
+# on the tailnet (the operator's laptop today, a second operator, worker-01)
+# is reachable only after Tailscale's own WireGuard auth already gated it,
+# so fail2ban banning inside that range defends nothing an unreachable
+# tailnet doesn't already block, while banning it under legitimate
+# reconnect churn is a pure self-DoS. Loopback is exempted for the same
+# reason jail.conf's own default does it. The `ignoreip` value below is
+# ADDITIVE to fail2ban's own default (`jail.d/*.local` merges over
+# `jail.conf`); it does not need repeating the loopback jail.conf already
+# ignores, but is listed explicitly here so this file is a complete,
+# reviewable policy on its own.
+
+[DEFAULT]
+ignoreip = 127.0.0.1/8 ::1 100.64.0.0/10
+
+[sshd]
+enabled = true
