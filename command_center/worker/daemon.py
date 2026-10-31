@@ -16,6 +16,12 @@ Design decisions, each traceable to the shipped substrate:
   current attempt runs to completion inside systemd's stop timeout. A second
   signal — or the timeout's SIGKILL — abandons it, and the lease expiry plus
   the control plane's reaper make that abandonment safe by construction.
+* **Drain ACK does not imply idle.** ``aicc-drained`` retains its legacy
+  meaning (claim gate closed, possibly busy). ``aicc-drained-busy`` explicitly
+  identifies unsettled local work. ``aicc-drained-idle`` additionally
+  proves that no claim/handler/report is in flight. A handled outcome-write
+  failure is left to the canonical lease expiry/reaper, as on the normal loop;
+  it is not permanent evidence of work still running inside this process.
 * **Auth failure means stop, not retry.** A refused connection may mean the
   credential was rotated out from under us (`enroll_rotate_self` is
   first-writer-wins); hammering the server with a dead secret is
@@ -60,6 +66,25 @@ class HandlerOutcome:
     result: dict[str, Any] = field(default_factory=dict)
     reason: str = ""
     retryable: bool = True
+    # True only for a refusal that names no fault in the work itself -- a
+    # writer-lease race lost to a sibling lane (publish `lease_unavailable`
+    # or a held worktree / task lease at dispatch), not a broken commit or a
+    # bad payload (VOYN-W0-AICC-PUBLISH-LEASE-CONTENTION-BURNS-ATTEMPT: a
+    # publish that lost that race used to fail through the ordinary
+    # `retryable=True` path, which spends this item's `max_attempts` on
+    # contention it had no part in causing and can dead-letter already
+    # -finished work; REM also closes the same burn on the dispatch-time
+    # acquire / blocking_lease door). Routes to `queue_fail_lease_wait`
+    # instead of `queue_fail`: it refunds the attempt `queue_claim` already
+    # spent for this delivery and counts the wait against its own bounded
+    # budget instead. Meaningless when `ok` is True and implies `retryable`
+    # -- there is no such thing as a non-retryable lease wait.
+    lease_wait: bool = False
+    # Same refund semantics for failures in the host/launcher/provider
+    # substrate. These are not task attempts: a missing systemd socket, a
+    # broken sandbox, or a provider outage says the work did not get a fair
+    # execution slot.
+    infra_wait: bool = False
 
 
 class Handler(Protocol):
@@ -113,6 +138,9 @@ class WorkerDaemon:
         # loop holds it from its final drain check through claim(), so a drain
         # ACK cannot race ahead of an already-starting database claim.
         self._claim_gate_lock = threading.Lock()
+        # Guarded by the claim gate: include claim I/O and final persistence,
+        # not only the handler. Clear only after _execute finishes its handling.
+        self._attempt_active = False
         self._reload_requested = threading.Event()
         self._reload_stop = threading.Event()
         # Injectable so tests drive time instead of waiting through it.
@@ -156,6 +184,12 @@ class WorkerDaemon:
         self._notify(f"RELOADING=1\nMONOTONIC_USEC={time.monotonic_ns() // 1_000}")
         self._reload_requested.set()
 
+    def _drained_status(self) -> str:
+        """Caller holds the gate lock, including while emitting this status."""
+        if self._attempt_active:
+            return "aicc-drained-busy"  # claims closed; an attempt is still unsettled
+        return "aicc-drained-idle"
+
     def _drain_coordinator_loop(self) -> None:
         while not self._drain_stop.is_set():
             if not self._drain_wakeup.wait(0.25):
@@ -166,11 +200,11 @@ class WorkerDaemon:
             with self._claim_gate_lock:
                 if self._drain.is_set() and not self._drain_closed.is_set():
                     self._drain_closed.set()
-                    # This is the protocol ACK consumed by the rotator.  At
+                    # Both statuses acknowledge the closed claim gate. At
                     # this point claim() is not running and cannot begin until
                     # the lock is released, after which the closed flag is
                     # checked again before any claim.
-                    self._notify("STATUS=aicc-drained")
+                    self._notify(f"STATUS={self._drained_status()}")
 
     def _credential_reload_loop(self) -> None:
         while not self._reload_stop.is_set():
@@ -229,7 +263,7 @@ class WorkerDaemon:
                     draining = self._drain.is_set()
                     if draining:
                         status = (
-                            "aicc-drained"
+                            self._drained_status()
                             if self._drain_closed.is_set()
                             else "aicc-drain-requested"
                         )
@@ -243,10 +277,13 @@ class WorkerDaemon:
                     # STATUS travels with every claim-path ping so a status
                     # written by a dying drain cycle can never stick.
                     self._notify("WATCHDOG=1\nSTATUS=aicc-ready")
+                    self._attempt_active = True
                     claimed = self._store.claim(
                         self._config.queue,
                         visibility_seconds=self._config.visibility_seconds,
                     )
+                    if isinstance(claimed, QueueRefusal):
+                        self._attempt_active = False
                 if isinstance(claimed, QueueRefusal):
                     if claimed.reason == "no_work":
                         self._sleep(min(idle + random.uniform(0, idle), cap))
@@ -259,6 +296,15 @@ class WorkerDaemon:
                     continue
                 idle = self._config.idle_min_seconds
                 self._execute(claimed)
+                # A handled report failure has no remaining local I/O or work;
+                # canonical visibility expiry/reaping handles its uncertain
+                # outcome. An escaping exception never reaches this idle ACK.
+                with self._claim_gate_lock:
+                    self._attempt_active = False
+                    if self._drain.is_set() and self._drain_closed.is_set():
+                        # Reload clears both flags and emits READY under
+                        # this same lock: no late idle ACK can overwrite it.
+                        self._notify(f"STATUS={self._drained_status()}")
         finally:
             self._reload_stop.set()
             self._reload_requested.set()
@@ -296,12 +342,35 @@ class WorkerDaemon:
                 work.attempt_id,
             )
             return
-        if outcome.ok:
-            accepted = self._store.complete(work, outcome.result)
-        else:
-            accepted = self._store.fail(
-                work, reason=outcome.reason, retryable=outcome.retryable
+        try:
+            if outcome.ok:
+                accepted = self._store.complete(work, outcome.result)
+            elif outcome.lease_wait:
+                accepted = self._store.fail_lease_wait(work, reason=outcome.reason)
+            elif outcome.infra_wait:
+                accepted = self._store.fail_infra_wait(work, reason=outcome.reason)
+            else:
+                accepted = self._store.fail(
+                    work, reason=outcome.reason, retryable=outcome.retryable
+                )
+        except Exception:
+            # The handler successfully decided an outcome -- what it admits --
+            # but persisting it raised (a DB hiccup, a dropped connection, a
+            # result the driver cannot encode): the same class of failure
+            # `_dispatch` already guards for a raising HANDLER. Uncaught here,
+            # it would propagate out of `run_forever`'s loop and kill the
+            # whole daemon over the one attempt it was reporting, taking every
+            # other queued item down with it -- mirroring the non-object-
+            # payload crash this module already closed once. The lease is
+            # left to lapse on its own (visibility expiry, then the reaper),
+            # exactly like the stale-owner refusal below; a later delivery
+            # retries.
+            logger.exception(
+                "attempt %s: writing the outcome raised; the attempt's lease "
+                "will lapse and a later delivery will retry",
+                work.attempt_id,
             )
+            return
         if not accepted:
             # The database refused the report: the lease lapsed between our
             # last successful beat and this write, and the attempt belongs to

@@ -120,3 +120,65 @@ Before credential mutation there is no worker-state rollback because no claim
 gate has moved. After a successful or ambiguous credential mutation, never
 restore an old `worker.env`; probe both durable candidates and hot-reload the
 accepted one while the existing ready processes continue serving.
+
+## Control-plane rescue
+
+On 2026-09-22 the worker database credential expired before renewal. Because
+both the worker lanes and their rotator authenticated with that credential,
+normal retries could not recover. The outage lasted 37 days, until an operator
+extended the ledger and role deadline on 2026-10-29.
+
+`command_center.ops.credential_rescue` uses the control plane's existing admin
+`AICC_PG_*` configuration to reopen the latest non-revoked credential briefly.
+It does not issue a secret. The normal worker rotator then authenticates, rotates,
+and revokes the old credential. Inactive principals, workers with any valid
+non-revoked credential (including a successor), and credentials expired for
+less than 600 seconds are left alone. Workers without a non-revoked credential
+are also left alone.
+
+The default grace is 2040 seconds (34 minutes); `--grace-seconds` is clamped to
+300–2040 seconds, below the rotator's 2100-second threshold. The default bounds
+refuse another rescue within 21600 seconds (six hours) or after three grants
+in a rolling 24 hours. These limits count successful audit rows per principal,
+across credentials. Flags `--min-expired-seconds`, `--cooldown-seconds`, and
+`--max-per-day` configure the bounds. Repeated rescues require investigation of
+the worker rotator; recovery must not become indefinite credential renewal.
+
+The repository locks the principal and non-revoked credentials, rechecks
+eligibility, and commits the ledger deadline, safely quoted `ALTER ROLE`, and
+`_principal_audit` call in one transaction. All timestamps use the database
+clock. A failed operation rolls back the whole rescue.
+
+The control installer installs and enables `voyn-aicc-credential-rescue.timer`.
+It starts four minutes after boot and five minutes after the last run finishes,
+as `voynadmin`, sourcing the existing control environment. To preview decisions
+from that configured environment, run:
+
+```sh
+python -m command_center.ops.credential_rescue --dry-run
+journalctl -u voyn-aicc-credential-rescue.service
+```
+
+Output is one `NOOP`, `RESCUED`, `REFUSED`, or `DRYRUN` line per worker, with
+principal, credential (or `-`), and reason. Dry-run writes nothing and still
+reports limit refusals. Exit 0 means no refusal, 3 means a rescue bound refused
+and the systemd service is failed for monitoring, and 1 means an error.
+
+Inspect grants using an administrator session:
+
+```sql
+SELECT principal_id, credential_id, created_at, reason, metadata_json
+FROM principal_event
+WHERE event_type = 'rescue' AND outcome = 'granted'
+ORDER BY created_at DESC;
+```
+
+Audit details include `previous_expires_at`, `new_expires_at`, and
+`grace_seconds`. To disable automatic rescue:
+
+```sh
+sudo systemctl disable --now voyn-aicc-credential-rescue.timer
+```
+
+A control-profile reinstall enables its declared timers again; preserve a
+planned disable through the deployment procedure as well.
