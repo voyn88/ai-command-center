@@ -207,7 +207,9 @@ def _status_after_failed_ps(pid: int) -> ProcessQueryStatus:
     return ProcessQueryStatus.UNKNOWN
 
 
-def _query_identity_linux_procfs(pid: int) -> ProcessQuery | None:
+def _query_identity_linux_procfs(
+    pid: int, *, allow_zombie: bool = False
+) -> ProcessQuery | None:
     """Use Linux kernel start ticks, which do not have ``ps lstart``'s 1 s race.
 
     ``None`` means procfs is unavailable and the caller may use the weak,
@@ -255,7 +257,8 @@ def _query_identity_linux_procfs(pid: int) -> ProcessQuery | None:
         first_state.startswith("Z") and not second_state.startswith("Z")
     ):
         return ProcessQuery(ProcessQueryStatus.UNKNOWN)
-    if second_state.startswith("Z"):
+    is_zombie = second_state.startswith("Z")
+    if is_zombie and not allow_zombie:
         return ProcessQuery(ProcessQueryStatus.ZOMBIE)
     try:
         boot_id = str(
@@ -270,28 +273,36 @@ def _query_identity_linux_procfs(pid: int) -> ProcessQuery | None:
         # a durable identity could collide with an unrelated process after a
         # host reboot, so an available-but-incomplete procfs must fail closed.
         return ProcessQuery(ProcessQueryStatus.UNKNOWN)
-    return ProcessQuery(
-        ProcessQueryStatus.LIVE,
-        ProcessIdentity(
-            pid=pid,
-            start_time=(
-                f"{_LINUX_PROCFS_BOOT_START_SCHEME}{boot_id}:{start_ticks}"
-            ),
-            command=command,
-        ),
+    process_identity = ProcessIdentity(
+        pid=pid,
+        start_time=f"{_LINUX_PROCFS_BOOT_START_SCHEME}{boot_id}:{start_ticks}",
+        command=command,
     )
+    if is_zombie:
+        return ProcessQuery(ProcessQueryStatus.ZOMBIE, process_identity)
+    return ProcessQuery(ProcessQueryStatus.LIVE, process_identity)
 
 
-def query_identity(pid: int, *, timeout: float = 5.0) -> ProcessQuery:
+def query_identity(
+    pid: int, *, timeout: float = 5.0, allow_zombie: bool = False
+) -> ProcessQuery:
     """Return a tri-state-safe process query.
 
     ``UNKNOWN`` is intentionally distinct from ``ABSENT``/``ZOMBIE`` so a
     failing or incompatible ``ps`` cannot make live work appear gone.
+
+    ``allow_zombie`` opts into attaching identity to a ``ZOMBIE`` result. It
+    exists for a caller that holds an unreaped ``Popen`` handle: a pid it
+    still owns cannot have been reused while it sits as a zombie (only the
+    owning parent's reap can free it for reuse), so start-time+command read
+    from that zombie is exactly as trustworthy as a live sample. General
+    liveness/reconciliation checks must leave this ``False`` — a zombie is
+    never live work, per the module docstring.
     """
     if os.name == "nt":
         return _query_identity_windows(pid)
     if sys.platform.startswith("linux"):
-        procfs_query = _query_identity_linux_procfs(pid)
+        procfs_query = _query_identity_linux_procfs(pid, allow_zombie=allow_zombie)
         if procfs_query is not None:
             return procfs_query
 
@@ -324,26 +335,36 @@ def query_identity(pid: int, *, timeout: float = 5.0) -> ProcessQuery:
     # don't need to parse the timestamp, only compare it verbatim, so no
     # locale-specific date parsing is required here.
     parts = line.split(None, 6)
-    if parts and parts[0].startswith("Z"):
+    is_zombie = bool(parts) and parts[0].startswith("Z")
+    if is_zombie and not allow_zombie:
         return ProcessQuery(ProcessQueryStatus.ZOMBIE)
     if len(parts) < 7:
-        return ProcessQuery(ProcessQueryStatus.UNKNOWN)
+        return (
+            ProcessQuery(ProcessQueryStatus.ZOMBIE)
+            if is_zombie
+            else ProcessQuery(ProcessQueryStatus.UNKNOWN)
+        )
     start_time = f"{_POSIX_PS_START_SCHEME}{' '.join(parts[1:6])}"
     command = parts[6]
     process_identity = ProcessIdentity(
         pid=pid, start_time=start_time, command=command
     )
+    if is_zombie:
+        return ProcessQuery(ProcessQueryStatus.ZOMBIE, process_identity)
     return ProcessQuery(ProcessQueryStatus.LIVE, process_identity)
 
 
-def capture_identity(pid: int, *, timeout: float = 5.0) -> ProcessIdentity | None:
+def capture_identity(
+    pid: int, *, timeout: float = 5.0, allow_zombie: bool = False
+) -> ProcessIdentity | None:
     """Return a confirmed live identity, else ``None``.
 
     Callers making a liveness decision must use :func:`query_identity` or
     :func:`process_exists`; ``None`` alone intentionally does not distinguish
-    absent/zombie from an unqueryable process.
+    absent/zombie from an unqueryable process. See :func:`query_identity` for
+    what ``allow_zombie`` is for and when it is safe to pass.
     """
-    return query_identity(pid, timeout=timeout).identity
+    return query_identity(pid, timeout=timeout, allow_zombie=allow_zombie).identity
 
 
 def process_exists(pid: int) -> bool:
