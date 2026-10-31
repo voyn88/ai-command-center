@@ -352,6 +352,22 @@ def render_autopilot_wave(result=None, *, live_running: int | None = None) -> No
 
     if result.launch_status == task_pipeline.LAUNCH_DISABLED and result.ran:
         st.caption("Автозапуск выключен — волна показана, но ничего не запускалось.")
+    elif result.launch_status == task_pipeline.LAUNCH_BUDGET_EXHAUSTED:
+        st.warning(
+            "Дневной бюджет исчерпан — новые запуски остановлены "
+            "(выполняющаяся работа продолжается).",
+            icon=":material/account_balance_wallet:",
+        )
+    elif result.launch_status == task_pipeline.LAUNCH_SPEND_UNKNOWN:
+        # Deliberately worded as "unreadable", never as "exhausted": the cap was
+        # never checked, so claiming it was hit would be a verdict nobody
+        # reached (VOYN-W0-AICC-REPORT-319). See `errors` for the read failure.
+        st.warning(
+            "Расход за последние 24 часа не удалось прочитать — новые запуски "
+            "остановлены (fail-closed). Лимит при этом не проверялся; причина "
+            "неудачного чтения — в ошибках тика ниже.",
+            icon=":material/help:",
+        )
     elif result.launch_status.startswith(task_pipeline.LAUNCH_BATCH_FAILED):
         st.error(f"Пакет запуска не выполнен: {result.launch_status}", icon=":material/error:")
 

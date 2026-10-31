@@ -176,7 +176,7 @@ def test_budget_unknown_defers_everything_even_with_zero_ceiling():
 
     assert plan.budget_unknown is True
     assert plan.assignments == ()
-    assert all(d.reason == models.DEFER_COST_DATA_UNAVAILABLE for d in plan.decisions)
+    assert all(d.reason == models.DEFER_SPEND_UNKNOWN for d in plan.decisions)
 
 
 def test_budget_unknown_reports_no_spend_figure_rather_than_a_fabricated_zero():
@@ -214,7 +214,7 @@ def test_budget_unknown_defers_everything_with_a_nonzero_ceiling_and_free_execut
     )
 
     assert plan.assignments == ()
-    assert plan.decisions[0].reason == models.DEFER_COST_DATA_UNAVAILABLE
+    assert plan.decisions[0].reason == models.DEFER_SPEND_UNKNOWN
 
 
 def test_kill_switch_takes_priority_over_budget_unknown_in_the_reason():
