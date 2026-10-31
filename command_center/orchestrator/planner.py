@@ -99,6 +99,11 @@ class PlanReport:
     #: (task, failure) pipeline tasks created this tick from open monitor
     #: findings (0021 monitor_finding).
     monitor_tasks: list[tuple[str, str]] = field(default_factory=list)
+    #: (task, failure) re-opened findings linked this tick to a task that was
+    #: already carrying their fix -- reported separately from `monitor_tasks`
+    #: because nothing about the task changed: see
+    #: `_MONITOR_TASK_REFILED_FROM`.
+    monitor_relinked: list[tuple[str, str]] = field(default_factory=list)
     #: Pipeline-class tasks dispatched THROUGH the review-backlog fence this
     #: tick: work that repairs CI, review, merge train, planner or queue must
     #: never wait behind the backlog it exists to drain
@@ -186,6 +191,32 @@ def _monitor_task_id(source: str, failure: str) -> str:
     return f"VOYN-MON-{slug}-{digest}"
 
 
+#: The statuses from which a RE-OPENED monitor finding may re-file its task.
+#: `backlog_upsert_task` is the importer's reconciliation path and is the one
+#: function allowed to set a status directly, so upserting an existing monitor
+#: task with 'OPEN' does not "re-use" it -- it yanks it back to OPEN. Every
+#: monitor finding re-opens while its own fix is still travelling (a probe
+#: only measures healthy once the fix is merged AND deployed), so that upsert
+#: discarded the run or the review PR carrying the fix and bumped the revision
+#: the in-flight run would later present to `backlog_transition`, which
+#: `backlog_ingest_results` raises on -- taking the whole ingest tick with it.
+#: DONE is the one state where re-filing is the right answer: the fix shipped,
+#: the measurement came back, and that is a new cycle of work.
+_MONITOR_TASK_REFILED_FROM = frozenset({"DONE"})
+
+
+def _monitor_task_is_in_flight(status: str | None) -> bool:
+    """True when a re-opened finding must leave its task exactly as it is.
+
+    Not just the executable states: a task parked with the owner
+    (DEFER_TO_USER), split into children (SPLIT) or waiting on triage
+    (UNTRIAGED, NEEDS_REFINEMENT) is equally not the planner's to reset, and
+    an already-OPEN one needs nothing done to it. A finding whose task does
+    not exist yet (`status is None`) is filed, which is the ordinary path.
+    """
+    return status is not None and status not in _MONITOR_TASK_REFILED_FROM
+
+
 def _split_requested(rows: Any, task_id: str) -> bool:
     """True when the task's latest granted return_to_pool asked for a split."""
     row = rows(
@@ -231,6 +262,7 @@ def _payload_for(
             "untrusted": False,
             "cascade": cascade,
             "backlog_task_id": task["task_id"],
+            "required_authorities": list(task.get("required_authorities") or ()),
             "mode": "split",
         }
         return payload, len(cascade)
@@ -254,7 +286,21 @@ def _payload_for(
         "after you exit.\n"
         "End your final message with a line of exactly this form so the "
         "orchestrator can record the evidence:\n"
-        "HEAD_SHA: <the branch head commit sha>"
+        "HEAD_SHA: <the branch head commit sha>\n"
+        # VOYN-W0-AICC-PRIVILEGED-TASK-ROUTED-TO-UNPRIVILEGED-EXECUTOR: the
+        # discovery half of the authority contract. The worker principal is
+        # unprivileged by design (ADR-0010), so an agent that needs root or a
+        # host PostgreSQL role cannot get it by trying harder -- and trying
+        # burned three cascade attempts per task on the restored queue
+        # (2026-08-30). Reporting it instead parks the task for the owner
+        # once, with the requirement recorded, so no later attempt repeats
+        # the discovery. Asked for as a strict one-line trailer with a closed
+        # vocabulary, exactly like HEAD_SHA above.
+        "If -- and only if -- the work genuinely cannot proceed without "
+        "authority this executor does not have, stop rather than retrying, "
+        "and end your final message with a line of exactly this form:\n"
+        "REQUIRES_AUTHORITY: <comma-separated, from: root, postgres_role, "
+        "external_credential>"
     ).strip()
     payload = {
         "kind": "agent_run",
@@ -267,6 +313,13 @@ def _payload_for(
         "untrusted": False,
         "cascade": cascade,
         "backlog_task_id": task["task_id"],
+        # VOYN-W0-AICC-PRIVILEGED-TASK-ROUTED-TO-UNPRIVILEGED-EXECUTOR: what
+        # this task needs beyond an unprivileged workspace, declared by the
+        # backlog record. The worker checks it against what it actually holds
+        # BEFORE launching a model (`worker.handlers._run_agent`), so a
+        # mismatch costs zero model calls and zero cascade attempts instead
+        # of the three it used to.
+        "required_authorities": list(task.get("required_authorities") or ()),
     }
     return payload, len(cascade)
 
@@ -378,6 +431,26 @@ class Planner:
                     (),
                 ):
                     task_id_for_finding = _monitor_task_id(source, failure)
+                    existing = self._rows(
+                        "SELECT status FROM backlog_task WHERE task_id = %s",
+                        (task_id_for_finding,),
+                    )
+                    status = str(existing[0][0]) if existing else None
+                    if _monitor_task_is_in_flight(status):
+                        # The finding re-opened while the work that answers it is
+                        # still in flight. Link the new row to the task that
+                        # already carries that work and touch nothing else -- not
+                        # the status, not the body, not the revision. Linking is
+                        # what keeps this loop from re-reading the same finding
+                        # every tick; see _MONITOR_TASK_REFILED_FROM for what the
+                        # upsert used to do to an IN_PROGRESS or READY_TO_REVIEW
+                        # task instead (VOYN-MON-WORKER-01-INFRA-DEPLOY-LAG).
+                        self._exec(
+                            "SELECT monitor_link_task(%s, %s)",
+                            (finding_id, task_id_for_finding),
+                        )
+                        report.monitor_relinked.append((task_id_for_finding, failure))
+                        continue
                     ok, reason, _changed, _rev = self._row(
                         "SELECT * FROM backlog_upsert_task(%s, %s, %s, %s, %s, %s, %s, %s)",
                         (
@@ -441,11 +514,12 @@ class Planner:
 
             candidates = self._rows(
                 "SELECT task_id, wave, priority, title, body, repo, dispatchable, "
-                "       task_class "
+                "       task_class, required_authorities "
                 "FROM backlog_eligible"
             )
             for (
                 task_id, wave, priority, title, body, repo, dispatchable, task_class,
+                required_authorities,
             ) in candidates:
                 if limits.only_task_id is not None and task_id != limits.only_task_id:
                     continue
@@ -463,6 +537,12 @@ class Planner:
                     "title": title,
                     "body": body,
                     "repo": repo,
+                    # VOYN-W0-AICC-PRIVILEGED-TASK-ROUTED-TO-UNPRIVILEGED-
+                    # EXECUTOR: the declaration travels with the dispatch so
+                    # the worker can refuse before launching a model. `text[]`
+                    # arrives as a list; a pre-0025 row (or a driver that
+                    # hands back NULL) means "declares nothing".
+                    "required_authorities": list(required_authorities or ()),
                 }
                 if not dispatchable:
                     report.undispatchable.append((task_id, "no_repo"))
