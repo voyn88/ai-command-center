@@ -225,6 +225,14 @@ section below for why it exists at all):
   cascade. Every atomic decision is a SQL function of the store; the package
   owns candidate iteration, the static routing matrix and the plan report,
   and adds no engine capability of its own.
+  `command_center/orchestrator/gh_access.py`
+  (VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS) is a baseline addition
+  of the same shape as `github_app_auth.py`: a transport adapter that chooses
+  which GitHub credential the ticks' existing `gh` calls run under (the fleet
+  App's installation token instead of a human's OAuth token), counts them,
+  and caches per-pull-request reads. It classifies as `orchestration` only
+  because it sits in this package; it owns no decision the tick functions did
+  not already own, and adds no capability AIOS Core would otherwise provide.
   `command_center/db/roles.py`'s `principal`/`principal_credential`/
   `principal_event` tables (VOYN-W0-AICC-SRV-03, `0003_worker_enrollment.up.sql`)
   are SRV-02's identity registry, finally placed (VOYN-W0-AICC-SRV-02-PLACEMENT).
@@ -332,6 +340,16 @@ lane's own reviewed PRs; growth of the *legacy* frozen engines remains
 prohibited, and convergence into AIOS Core remains this subsystem's stated
 end state once the core's dispatch contract (aios ADR-0022) is accepted and
 covers it.
+
+`tests/db/test_queue_claim.py` proves the claim protocol mechanically —
+one process, several roles, real concurrency inside one database. A separate,
+two-physical-host acceptance pass against this exact commit (`VOYN-W0-AICC-
+CLAIM-TWO-HOST-ACCEPTED`) additionally confirmed exclusivity, claimant
+identity, and — under a real userspace network blackhole and the reap/
+requeue/reclaim it forces — that the old and new owners of a reassigned item
+were never simultaneously valid, plus resistance to cross-host token theft
+and `SET ROLE` laundering — with one named limit (the database host's OS).
+See [`docs/srv04b-two-host-acceptance.md`](srv04b-two-host-acceptance.md).
 
 ## CI wiring
 
