@@ -88,6 +88,7 @@ Security model:
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import signal
@@ -97,10 +98,10 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from command_center import models, project_config, storage
+from command_center import models, openai_exec, project_config, storage
 
 # Ruff targets the product's Python 3.14 desktop runtime and would otherwise
 # apply PEP 758's optional-parentheses rewrite.  Worker/control hosts and CI
@@ -130,9 +131,19 @@ COPILOT_BINARY = os.environ.get("AICC_COPILOT_BINARY") or "copilot"
 PRINCIPAL_ISOLATION_LAUNCHER = "/usr/libexec/aicc-agent-launcher"
 PRINCIPAL_ISOLATION_REQUIRED_ENV = "AICC_AGENT_PRINCIPAL_ISOLATION"
 PRINCIPAL_WORKSPACE_ROOTS_FILE = Path("/etc/aicc/agent-workspace-roots")
+# The ONE place the isolated executors live: the root-owned toolchain the
+# broker validates and launches (`ops/aicc_agent_launcher.py`,
+# `EXECUTOR_BINARIES`). This map used to name /usr/local/bin, a path the
+# toolchain does not populate: on worker-01 codex was absent there, the
+# worker's preflight declared it unavailable, and every review fell through
+# the cascade to claude (2026-09-08). Two authorities for "where is the
+# executor" is exactly the drift that hid it; keep this in step with the
+# launcher's TOOLCHAIN_BIN.
 PRINCIPAL_EXECUTOR_BINARIES: dict[str, str] = {
-    "claude": "/usr/local/bin/claude",
-    "codex": "/usr/local/bin/codex",
+    "grok": "/usr/libexec/aicc-grok-agent",
+    "cursor": "/opt/aicc/providers/cursor/agent",
+    "claude": "/opt/aicc/toolchains/current/bin/claude",
+    "codex": "/opt/aicc/toolchains/current/bin/codex",
     # Copilot is DELIBERATELY absent: ADR-0010 keeps it disabled under
     # principal isolation because its login credential carries GitHub /
     # repository authority -- staging it would hand untrusted model code the
@@ -168,6 +179,24 @@ _COPILOT_RETRYABLE_FAILURE_SIGNATURES = (
     "getaddrinfo",
     "econnreset",
 )
+#: Codex pre-task failures reported only as free text on a failed, non-zero
+#: process. Live incident 2026-09-02 / 2026-09-11: the CLI exited 1 with
+#: "ERROR: You've hit your usage limit ... try again at Sep 15th" and an
+#: empty result, the review work item completed "successfully" with that
+#: error as its whole payload, and every review stalled until the quota
+#: window -- the account failed, not the task, and nothing advanced the
+#: cascade to the next executor. Same containment rules as the Copilot list:
+#: consulted only for status == "failed" with a non-zero exit code, so a
+#: successful review that merely DISCUSSES a usage limit cannot match.
+_CODEX_RETRYABLE_FAILURE_SIGNATURES = (
+    "you've hit your usage limit",
+    "usage limit reached",
+    "not logged in",
+    "authentication failed",
+    "unauthorized",
+    "too many requests",
+    "stream disconnected",
+)
 _CODEX_PREFLIGHT_PROMPT = (
     "This is a disposable sandbox capability probe. In the current repository, "
     "create a file named aicc-codex-commit-probe.txt containing exactly "
@@ -178,6 +207,40 @@ _CODEX_PREFLIGHT_PROMPT = (
 )
 _codex_workspace_write_preflight_lock = threading.Lock()
 _codex_workspace_write_preflight_result: tuple[bool, str] | None = None
+
+# Adapted from the existing quota-routing work in PR #1002. Keep the circuit
+# in the worker process: no new scheduler, polling thread, or database writer.
+EXECUTOR_QUOTA_COOLDOWN_SECONDS = 1800
+_executor_exhaustion_lock = threading.Lock()
+_executor_exhausted_until: dict[str, datetime] = {}
+
+
+def record_executor_exhausted(
+    executor: str, *, cooldown_seconds: float = EXECUTOR_QUOTA_COOLDOWN_SECONDS,
+    now: datetime | None = None,
+) -> datetime:
+    if not math.isfinite(cooldown_seconds) or cooldown_seconds <= 0:
+        raise ValueError("executor cooldown must be finite and positive")
+    until = (now or datetime.now(UTC)) + timedelta(seconds=min(cooldown_seconds, 3600))
+    with _executor_exhaustion_lock:
+        until = max(until, _executor_exhausted_until.get(executor, until))
+        _executor_exhausted_until[executor] = until
+    return until
+
+
+def executor_exhausted_until(executor: str, *, now: datetime | None = None) -> datetime | None:
+    moment = now or datetime.now(UTC)
+    with _executor_exhaustion_lock:
+        until = _executor_exhausted_until.get(executor)
+        if until is not None and until <= moment:
+            _executor_exhausted_until.pop(executor)
+            return None
+        return until
+
+
+def clear_executor_exhaustion() -> None:
+    with _executor_exhaustion_lock:
+        _executor_exhausted_until.clear()
 
 
 def disable_codex_workspace_write(detail: str = "") -> None:
@@ -225,6 +288,13 @@ READ_ONLY_TASK_TYPES = {
 }
 MODEL_ONLY_TASK_TYPES = {"independent_review"}
 MUTATING_TASK_TYPES = {"implementation", "remediation"}
+
+#: The verdict tier — the only task classes allowed to spend the metered
+#: review key (see run_claude_code). Matches the orchestrator's dispatch
+#: vocabulary exactly. Deliberately NOT "review": that is the live
+#: task_type of interactive chat turns and web audit-sandbox runs — metered
+#: money is for verdicts, not conversation.
+REVIEW_TASK_TYPES = {"independent_review", "verification_review"}
 
 # `--permission-mode` for every profile. Both profiles use `acceptEdits`:
 # empirically verified (2026-07-21, real `claude` CLI, headless `-p` mode)
@@ -426,12 +496,17 @@ def build_principal_isolation_manifest(
     """
     if executor not in COMMAND_BUILDERS:
         raise RunnerError(f"unknown executor {executor!r}")
+    if executor == "cursor" and task_type in MODEL_ONLY_TASK_TYPES:
+        raise RunnerError("Cursor model-only execution is not supported")
     return {
         "version": 1,
         "run_id": uuid.uuid4().hex,
         "workspace": str(repository_path.resolve(strict=True)),
         "executor": executor,
-        "profile": profile_for_task_type(task_type),
+        "profile": (
+            "model_only" if executor == "grok" and task_type in MODEL_ONLY_TASK_TYPES
+            else profile_for_task_type(task_type)
+        ),
         "prompt": prompt,
         "model": model,
         "timeout_seconds": timeout_seconds,
@@ -870,9 +945,11 @@ def build_codex_command(
       enforcement, exactly as `--tools` is for Claude: a read-only sandbox
       cannot write the tree no matter what the model decides to attempt.
     * `PROFILE_TRUSTED_DEVELOPMENT` -> `--sandbox workspace-write`, which
-      confines writes to the working root `--cd` names. `danger-full-
-      access` is never used: it removes the boundary this profile exists
-      to draw.
+      confines writes to the working root `--cd` names -- OUTSIDE principal
+      isolation. Under isolation (`principal_isolation_required()`) the
+      systemd unit is the boundary and Codex runs `danger-full-access`
+      inside it: its inner bubblewrap mounted .git read-only and no commit
+      could land (owner decision 2026-09-09).
 
     `--skip-git-repo-check` is NOT passed: every dispatch runs inside a
     real git worktree (`workspace_provisioning`), so the check is a free
@@ -885,7 +962,19 @@ def build_codex_command(
     executor, so nothing downstream has to learn a second format.
     """
     profile = profile_for_task_type(task_type)
-    sandbox = "read-only" if profile == PROFILE_READ_ONLY else "workspace-write"
+    if profile == PROFILE_READ_ONLY:
+        sandbox = "read-only"
+    elif principal_isolation_required():
+        # Under principal isolation the systemd unit the broker builds is the
+        # boundary (dynamic uid, only /workspace writable, ProtectSystem=
+        # strict, no capabilities); Codex's own bubblewrap on top mounted
+        # .git read-only, so the commit the fleet contract requires could
+        # never land (worker-01 2026-09-09). Owner decision 2026-09-09: no
+        # inner sandbox INSIDE the unit. The launcher builds the same argv
+        # (a test pins both against each other).
+        sandbox = "danger-full-access"
+    else:
+        sandbox = "workspace-write"
     command = [
         CODEX_BINARY,
         "exec",
@@ -986,10 +1075,92 @@ def build_copilot_command(
 #: real CLI. Caught by exactly those tests when this was first written the
 #: other way.
 COMMAND_BUILDERS: dict[str, str] = {
+    "grok": "build_grok_command",
+    "cursor": "build_cursor_command",
     "claude": "build_command",
     "codex": "build_codex_command",
     "copilot": "build_copilot_command",
+    "openai_http": "build_openai_http_command",
 }
+
+
+def build_grok_command(prompt: str, *, task_type: str, model: str | None = None) -> list[str]:
+    if not principal_isolation_required():
+        raise RunnerError("Grok tools require principal isolation")
+    command = [PRINCIPAL_EXECUTOR_BINARIES["grok"], "--model", model or "grok-4.3"]
+    if task_type in MODEL_ONLY_TASK_TYPES:
+        command += ["--no-tools"]
+    return command + ["--", prompt]
+
+
+def build_cursor_command(prompt: str, *, task_type: str, model: str | None = None) -> list[str]:
+    if not principal_isolation_required():
+        raise RunnerError("Cursor requires principal isolation")
+    if task_type in MODEL_ONLY_TASK_TYPES:
+        raise RunnerError("Cursor model-only execution is not supported")
+    command = [PRINCIPAL_EXECUTOR_BINARIES["cursor"], "--print", "--output-format", "text", "--trust"]
+    command += ["--mode", "ask"] if profile_for_task_type(task_type) == PROFILE_READ_ONLY else ["--force"]
+    if model:
+        command += ["--model", model]
+    return command + ["--", prompt]
+
+
+def build_openai_http_command(
+    prompt: str,
+    *,
+    task_type: str,
+    model: str | None = None,
+    capability_override: str | None = None,
+) -> list[str]:
+    """Argv for the model-only OpenAI-compatible HTTP bridge
+    (`command_center.openai_exec`; VOYN-W0-AICC-GROQ-VERDICT-BENCH).
+
+    The bridge has no tool loop, no workspace and no repository access, so
+    the ONLY task types it may serve are the MODEL_ONLY ones whose prompt
+    already embeds the exact bytes under review. Refusing here is fail
+    closed at the builder — and `openai_exec.main` re-validates, because an
+    argv builder can be bypassed by hand. `capability_override` is accepted
+    for signature parity with `build_command` and refused for the same
+    reason: there is no wider capability to grant.
+
+    `sys.executable` rather than a binary name: the worker daemon runs in
+    the fleet venv, and the bridge must import from the same checkout the
+    daemon does — a PATH lookup could find another install.
+    """
+    if task_type not in MODEL_ONLY_TASK_TYPES:
+        raise ValueError(
+            f"openai_http serves only MODEL_ONLY task types, not {task_type!r}"
+        )
+    if capability_override is not None:
+        raise ValueError("openai_http has no capabilities to override")
+    if not model:
+        raise ValueError("openai_http requires an explicit provider/model")
+    return [
+        sys.executable,
+        "-m",
+        "command_center.openai_exec",
+        "--model",
+        model,
+        "--task-type",
+        task_type,
+        "--",
+        prompt,
+    ]
+
+
+def openai_http_preflight() -> tuple[bool, str]:
+    """Available iff at least one provider key is present in the environment.
+
+    Deliberately does not probe the network: preflight runs on every
+    dispatch, and a provider blip must classify as that attempt's failure
+    (retryable, next cascade link), not as executor absence.
+    """
+    present = [
+        env for _, env in sorted(openai_exec.PROVIDERS.values()) if os.environ.get(env)
+    ]
+    if present:
+        return True, "keys: " + ",".join(sorted(present))
+    return False, "no provider key set (GROQ/OPENROUTER/MISTRAL_API_KEY)"
 
 
 def _command_builder(executor: str) -> Callable[..., list[str]] | None:
@@ -1068,6 +1239,8 @@ class RunResult:
         self.is_error: bool = bool(payload.get("is_error")) if payload else False
         self.api_error_status = payload.get("api_error_status") if payload else None
         self.terminal_reason = payload.get("terminal_reason") if payload else None
+        result_message = payload.get("result") if payload else None
+        self.result_message = result_message if isinstance(result_message, str) else ""
 
     @property
     def result_status(self) -> str:
@@ -1110,20 +1283,51 @@ class RunResult:
     def is_executor_provider_error(self, executor: str) -> bool:
         """Whether the selected CLI positively reports a provider failure.
 
-        Claude exposes structured API fields; Copilot 1.0.x reports its
-        pre-task auth/quota/network failures on stderr. Copilot free-text is
+        Claude exposes structured API fields; Copilot 1.0.x and Codex report
+        pre-task auth/quota/network failures on stderr. Free text is
         considered only for a failed, non-zero process, so a successful
         review that merely discusses a rate limit cannot trigger a retry.
         """
         if self.is_executor_api_error:
             return True
-        if executor != "copilot" or self.status != "failed" or not self.exit_code:
+        if self.status != "failed" or not self.exit_code:
+            return False
+        if executor == "grok":
+            # Our driver emits one fixed diagnostic, never a provider body.
+            # A report discussing HTTP errors must not trigger another run.
+            return self.stderr.strip() in {
+                f"provider HTTP {code}"
+                for code in (401, 403, 429, 500, 502, 503, 504)
+            }
+        signatures = {
+            "cursor": _CODEX_RETRYABLE_FAILURE_SIGNATURES + _COPILOT_RETRYABLE_FAILURE_SIGNATURES,
+            "copilot": _COPILOT_RETRYABLE_FAILURE_SIGNATURES,
+            "codex": _CODEX_RETRYABLE_FAILURE_SIGNATURES,
+        }.get(executor)
+        if signatures is None:
             return False
         diagnostic = f"{self.stdout}\n{self.stderr}".lower()
-        return any(
-            signature in diagnostic
-            for signature in _COPILOT_RETRYABLE_FAILURE_SIGNATURES
-        )
+        return any(signature in diagnostic for signature in signatures)
+
+    def executor_quota_signature(self, executor: str) -> str | None:
+        """Only provider refusals may suspend future calls, never a task report."""
+        if self.status != "failed" or not self.exit_code:
+            return None
+        if executor == "grok":
+            return "HTTP 429" if self.stderr.strip() == "provider HTTP 429" else None
+        signatures = {
+            "claude": ("hit your session limit", "hit your usage limit", "usage limit reached"),
+            "codex": ("hit your usage limit", "usage limit reached"),
+            "cursor": ("hit your usage limit", "usage limit reached", "quota exceeded"),
+            "copilot": ("exceeded your monthly quota", "ai credit usage limit"),
+        }.get(executor, ())
+        if executor == "claude":
+            if not self.is_executor_api_error:
+                return None
+            diagnostic = self.result_message.lower()
+        else:
+            diagnostic = self.stderr[-2000:].lower()
+        return next((phrase for phrase in signatures if phrase in diagnostic), None)
 
     @property
     def is_executor_sandbox_error(self) -> bool:
@@ -1299,6 +1503,26 @@ def run_claude_code(
     command = builder(prompt, task_type=task_type, model=model)
     launcher_input: str | None = None
     launch_environment = scrub_vcs_credentials(dict(os.environ))
+    review_key = launch_environment.pop("AICC_REVIEW_ANTHROPIC_API_KEY", "")
+    # Popped UNCONDITIONALLY: the raw variable must never reach any child —
+    # a mutating run with Bash, or any third-party executor, could read it
+    # under its own name and defeat the positive list below (independent
+    # review of 3472b45, FINDING 1).
+    if executor == "claude" and review_key and task_type in REVIEW_TASK_TYPES:
+        # The verdict tier runs on the owner's metered review key
+        # (VOYN-W0-SERVER-OWN-BILLING pilot, decision 2026-09-04): with
+        # ANTHROPIC_API_KEY set, the claude CLI bills the API instead of
+        # the subscription, so acceptance stops competing with every other
+        # lane for the subscription's rolling windows. The positive list
+        # is deliberate — implementation/remediation and anything else
+        # stay on the subscription; a task class must be added here
+        # explicitly to spend metered money. The console-side monthly cap
+        # and the merged spend machinery bound the burn (the 2026-08-20
+        # ungoverned-key incident is why this is env-gated and scoped,
+        # not a blanket switch). The principal-isolation branch below
+        # rebuilds the environment from root-owned files and is
+        # intentionally not touched by this.
+        launch_environment["ANTHROPIC_API_KEY"] = review_key
     launch_cwd = repository_path
     if principal_isolation_required():
         try:

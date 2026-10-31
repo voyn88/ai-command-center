@@ -41,6 +41,19 @@ def run_audit(payload: a.AuditRunRequest) -> a.AuditRunResult:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@router.post("/audit/auto-trigger", response_model=a.AutoTriggerResult)
+def auto_trigger(payload: a.AutoTriggerRequest) -> a.AutoTriggerResult:
+    """Fire one audit pass for ``payload.project`` only if it is due — the
+    early-tracking seam a short-interval script, a pre-commit gate, or a UI
+    tick calls instead of an unconditional ``/audit/run``. Never runs a
+    sensitive project (reported as a skip, not an error); an unknown check
+    name is a client error (400), exactly like ``/audit/run``."""
+    try:
+        return service.auto_trigger(payload)
+    except KeyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.get("/audit/runs", response_model=a.AuditRunList)
 def list_runs(
     project: str | None = None,
