@@ -1,4 +1,4 @@
--- Reverse of 0025: drop the function, then the table it writes.
+-- Reverse of 0038: drop the function, then the table it writes.
 --
 -- The order matters only for readability here (the function is not a
 -- dependency of the table), but dropping the writer before the store is the

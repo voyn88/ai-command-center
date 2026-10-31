@@ -228,6 +228,11 @@ def test_the_worker_reaches_the_queue_only_through_the_six_protocol_steps() -> N
     # And the enrolment layer: prove its own identity, read only the
     # server-authoritative expiry of that proved credential, rotate its own
     # secret, and nothing else — a worker cannot mint or redeem an enrolment.
+    #
+    # And the fleet-wide availability layer (0018, VOYN-W0-AICC-EXECUTOR-
+    # QUOTA-VISIBILITY): report its own observation of a provider failure, or
+    # clear one early after its own successful run — nothing that lets it
+    # read another host's decisions or bypass the queue-claim protocol above.
     assert granted == {
         "queue_claim",
         "queue_heartbeat",
@@ -238,12 +243,19 @@ def test_the_worker_reaches_the_queue_only_through_the_six_protocol_steps() -> N
         "identity_assert",
         "identity_current_credential",
         "enroll_rotate_self",
+        "executor_mark_unavailable",
+        "executor_mark_available",
+
         # 0021: the worker-host fail-closed probe records what it measured
         # (a finding row keyed by source+failure, and its clearing); neither
         # reads the backlog nor the queue, and the planner -- not the worker
         # -- turns a finding into a task.
         "monitor_record_finding",
         "monitor_clear_finding",
+        # 0031: and clears the classes it measured GREEN this tick, so a
+        # recovered class stops being an open finding without waiting for
+        # every other probe on the same host.
+        "monitor_clear_findings_except",
     }
     assert roles.VIEW_PRIVILEGES[roles.WORKER_ROLE] == {}
 
@@ -280,6 +292,9 @@ def test_the_control_plane_cannot_claim() -> None:
         "backlog_transition",
         "backlog_record_evidence",
         "backlog_record_remediation",
+        # VOYN-W0-AICC-REVIEW-FULLCONTEXT-TRIAGE (0032): the minor-findings
+        # follow-up lineage, alongside the remediation lineage above.
+        "backlog_record_followup",
         "backlog_add_dependency",
         "backlog_lease_acquire",
         "backlog_lease_heartbeat",
@@ -291,6 +306,7 @@ def test_the_control_plane_cannot_claim() -> None:
         # VOYN-W0-AICC-DEFER-AUTO-RESUME (0014): the machine exit from
         # DEFER_TO_USER for technical parks.
         "backlog_resume_deferred",
+        "backlog_declare_required_authority",
         # VOYN-W0-AICC-NO-RECOVERY-PATH-STUCK-READY-TO-REVIEW (0018): the
         # machine exit from READY_TO_REVIEW for a task stuck there with no
         # `pr` evidence.
@@ -302,6 +318,9 @@ def test_the_control_plane_cannot_claim() -> None:
         # VOYN-W0-AICC-BGE-M3-DEDUP-SCAN (0025): the same 'duplicate' decision
         # one state over — OPEN -> DECIDED, with the canonical task named.
         "backlog_mark_duplicate",
+
+        # 0030: clear proven malformed evidence through the audited function.
+        "backlog_clear_evidence",
         # 0021: read-only deploy preflight with dispatch's privileges; the
         # task-class setter (split children, monitor tasks); and the
         # monitor-finding pair the control-host probe uses.
@@ -309,10 +328,18 @@ def test_the_control_plane_cannot_claim() -> None:
         "backlog_set_task_class",
         "monitor_record_finding",
         "monitor_clear_finding",
+        "monitor_clear_findings_except",
         "monitor_link_task",
-        # VOYN-W0-AICC-BACKLOG-PG-CANONICAL-GATE (0020): the importer's stamp
-        # of where a migrated row came from.
+        # VOYN-W0-AICC-BACKLOG-PG-CANONICAL-GATE (0023): the importer's stamp
+        # of where a migrated row came from, and (0025,
+        # ...-CANONICAL-GATE-REM) the atomic insert-and-stamp that makes the
+        # stamp inseparable from the insert it describes.
         "backlog_record_provenance",
+        "backlog_import_task",
+
+        # 0029: bounded row lock and audited owner decision, no table UPDATE.
+        "backlog_owner_lock",
+        "backlog_owner_decision",
     }
 
 
@@ -342,11 +369,33 @@ def test_function_grants_are_revoked_before_they_are_reapplied() -> None:
 
 
 @pytest.mark.parametrize(
-    "bad", ["queue_claim(text; DROP TABLE task)", "queue_claim(text"]
+    "bad",
+    [
+        "queue_claim(text; DROP TABLE task)",
+        "queue_claim(text",
+        # An array suffix is allowed, but only as a suffix and only on an
+        # otherwise plain identifier.
+        "monitor_clear_findings_except(text, te xt[])",
+        "monitor_clear_findings_except(text, []text)",
+    ],
 )
 def test_function_signature_guard_rejects_injection(bad: str) -> None:
     with pytest.raises(ValueError):
         roles._require_function_signature(bad)
+
+
+def test_function_signature_guard_accepts_an_array_argument() -> None:
+    """0031 takes the keep-list of still-red failure classes as `text[]`,
+    which is not a bare identifier and must not be rejected as one."""
+    roles._require_function_signature("monitor_clear_findings_except(text, text[])")
+    assert (
+        "monitor_clear_findings_except(text, text[])"
+        in roles.FUNCTION_PRIVILEGES[roles.WORKER_ROLE]
+    )
+    assert (
+        "GRANT EXECUTE ON FUNCTION public.monitor_clear_findings_except(text, text[]) "
+        "TO aicc_worker;" in roles.render_table_grants()
+    )
 
 
 def test_a_worker_host_role_is_a_login_member_of_the_worker_group() -> None:

@@ -27,7 +27,13 @@ from typing import Any
 from command_center.orchestrator.routing import cascade_for
 from command_center.worker.payloads import AGENT_RUN_SCHEMA_VERSION
 
-__all__ = ["PlanLimits", "PlanReport", "plan_once"]
+__all__ = [
+    "PlanLimits",
+    "PlanReport",
+    "RepoRouteAudit",
+    "audit_repo_routes",
+    "plan_once",
+]
 
 _PLANNER_AUTHORITY = "planner:global"
 
@@ -66,6 +72,10 @@ class PlanLimits:
     #: sibling field's convention would otherwise get a silently different
     #: meaning for the same sentinel value on this field).
     review_backlog_limit: int = 20
+    #: An owner request may narrow dispatch, never broaden eligibility.
+    only_task_id: str | None = None
+    #: Distinct tick identity; repository leases keep the canonical planner id.
+    tick_owner: str | None = None
 
 
 @dataclass(slots=True)
@@ -89,6 +99,11 @@ class PlanReport:
     #: (task, failure) pipeline tasks created this tick from open monitor
     #: findings (0021 monitor_finding).
     monitor_tasks: list[tuple[str, str]] = field(default_factory=list)
+    #: (task, failure) re-opened findings linked this tick to a task that was
+    #: already carrying their fix -- reported separately from `monitor_tasks`
+    #: because nothing about the task changed: see
+    #: `_MONITOR_TASK_REFILED_FROM`.
+    monitor_relinked: list[tuple[str, str]] = field(default_factory=list)
     #: Pipeline-class tasks dispatched THROUGH the review-backlog fence this
     #: tick: work that repairs CI, review, merge train, planner or queue must
     #: never wait behind the backlog it exists to drain
@@ -176,6 +191,32 @@ def _monitor_task_id(source: str, failure: str) -> str:
     return f"VOYN-MON-{slug}-{digest}"
 
 
+#: The statuses from which a RE-OPENED monitor finding may re-file its task.
+#: `backlog_upsert_task` is the importer's reconciliation path and is the one
+#: function allowed to set a status directly, so upserting an existing monitor
+#: task with 'OPEN' does not "re-use" it -- it yanks it back to OPEN. Every
+#: monitor finding re-opens while its own fix is still travelling (a probe
+#: only measures healthy once the fix is merged AND deployed), so that upsert
+#: discarded the run or the review PR carrying the fix and bumped the revision
+#: the in-flight run would later present to `backlog_transition`, which
+#: `backlog_ingest_results` raises on -- taking the whole ingest tick with it.
+#: DONE is the one state where re-filing is the right answer: the fix shipped,
+#: the measurement came back, and that is a new cycle of work.
+_MONITOR_TASK_REFILED_FROM = frozenset({"DONE"})
+
+
+def _monitor_task_is_in_flight(status: str | None) -> bool:
+    """True when a re-opened finding must leave its task exactly as it is.
+
+    Not just the executable states: a task parked with the owner
+    (DEFER_TO_USER), split into children (SPLIT) or waiting on triage
+    (UNTRIAGED, NEEDS_REFINEMENT) is equally not the planner's to reset, and
+    an already-OPEN one needs nothing done to it. A finding whose task does
+    not exist yet (`status is None`) is filed, which is the ordinary path.
+    """
+    return status is not None and status not in _MONITOR_TASK_REFILED_FROM
+
+
 def _split_requested(rows: Any, task_id: str) -> bool:
     """True when the task's latest granted return_to_pool asked for a split."""
     row = rows(
@@ -221,6 +262,7 @@ def _payload_for(
             "untrusted": False,
             "cascade": cascade,
             "backlog_task_id": task["task_id"],
+            "required_authorities": list(task.get("required_authorities") or ()),
             "mode": "split",
         }
         return payload, len(cascade)
@@ -244,7 +286,21 @@ def _payload_for(
         "after you exit.\n"
         "End your final message with a line of exactly this form so the "
         "orchestrator can record the evidence:\n"
-        "HEAD_SHA: <the branch head commit sha>"
+        "HEAD_SHA: <the branch head commit sha>\n"
+        # VOYN-W0-AICC-PRIVILEGED-TASK-ROUTED-TO-UNPRIVILEGED-EXECUTOR: the
+        # discovery half of the authority contract. The worker principal is
+        # unprivileged by design (ADR-0010), so an agent that needs root or a
+        # host PostgreSQL role cannot get it by trying harder -- and trying
+        # burned three cascade attempts per task on the restored queue
+        # (2026-08-30). Reporting it instead parks the task for the owner
+        # once, with the requirement recorded, so no later attempt repeats
+        # the discovery. Asked for as a strict one-line trailer with a closed
+        # vocabulary, exactly like HEAD_SHA above.
+        "If -- and only if -- the work genuinely cannot proceed without "
+        "authority this executor does not have, stop rather than retrying, "
+        "and end your final message with a line of exactly this form:\n"
+        "REQUIRES_AUTHORITY: <comma-separated, from: root, postgres_role, "
+        "external_credential>"
     ).strip()
     payload = {
         "kind": "agent_run",
@@ -257,6 +313,13 @@ def _payload_for(
         "untrusted": False,
         "cascade": cascade,
         "backlog_task_id": task["task_id"],
+        # VOYN-W0-AICC-PRIVILEGED-TASK-ROUTED-TO-UNPRIVILEGED-EXECUTOR: what
+        # this task needs beyond an unprivileged workspace, declared by the
+        # backlog record. The worker checks it against what it actually holds
+        # BEFORE launching a model (`worker.handlers._run_agent`), so a
+        # mismatch costs zero model calls and zero cascade attempts instead
+        # of the three it used to.
+        "required_authorities": list(task.get("required_authorities") or ()),
     }
     return payload, len(cascade)
 
@@ -287,7 +350,7 @@ class Planner:
             "SELECT * FROM backlog_lease_acquire(%s, %s, %s)",
             (
                 _PLANNER_AUTHORITY,
-                limits.planner,
+                limits.tick_owner or limits.planner,
                 max(limits.planner_lease_ttl_seconds, 60),
             ),
         )
@@ -295,99 +358,121 @@ class Planner:
             report.planner_busy = True
             return report
         try:
-            # Ingest finished work first (BO-S3): evidence + READY_TO_REVIEW
-            # for the succeeded, return-to-pool (or park) for the dead, lanes
-            # freed — so this very tick can refill them.
-            for task_id, queue_state, action, _detail in self._rows(
-                "SELECT * FROM backlog_ingest_results(%s)", (limits.planner,)
-            ):
-                report.ingested.append((task_id, action))
+            # Owner dispatch is narrowly scoped; periodic ticks own fleet maintenance.
+            if limits.only_task_id is None:
+                # Ingest finished work first (BO-S3): evidence + READY_TO_REVIEW
+                # for the succeeded, return-to-pool (or park) for the dead, lanes
+                # freed — so this very tick can refill them.
+                for task_id, queue_state, action, _detail in self._rows(
+                    "SELECT * FROM backlog_ingest_results(%s)", (limits.planner,)
+                ):
+                    report.ingested.append((task_id, action))
 
-            # Reconcile technical DEFER_TO_USER parks back to OPEN (VOYN-W0-
-            # AICC-DEFER-AUTO-RESUME) before selecting candidates, so a
-            # resumed task is eligible in this very tick. The candidate query
-            # mirrors the 0014 gate's own conditions purely as a FILTER --
-            # so ineligible parks are not attempted (and not audit-spammed)
-            # every tick; the SECURITY DEFINER function remains the only
-            # authority and revalidates everything under the row lock.
-            if limits.max_resumes_per_tick > 0:
-                resumable = self._rows(
-                    "SELECT t.task_id, park.reason FROM backlog_task t "
-                    "CROSS JOIN LATERAL ("
-                    "  SELECT e.reason, e.event_id FROM backlog_event e"
-                    "   WHERE e.task_id = t.task_id"
-                    "     AND e.event = 'return_to_pool'"
-                    "     AND e.outcome = 'granted'"
-                    "     AND e.detail->>'target' = 'DEFER_TO_USER'"
-                    "   ORDER BY e.event_id DESC LIMIT 1"
-                    ") park "
-                    "WHERE t.status = 'DEFER_TO_USER' AND t.kind = 'task' "
-                    "  AND park.reason LIKE 'cascade_exhausted:%%' "
-                    "  AND NOT EXISTS ("
-                    "    SELECT 1 FROM backlog_event e2"
-                    "     WHERE e2.task_id = t.task_id"
-                    "       AND e2.outcome = 'granted'"
-                    "       AND e2.event IN ('upsert', 'transition', 'triage',"
-                    "                        'dispatch', 'return_to_pool',"
-                    "                        'resume_deferred')"
-                    "       AND e2.event_id > park.event_id) "
-                    # The anti-ping-pong bound is a sliding WINDOW, not a
-                    # lifetime score: three granted resumes within the
-                    # trailing 48h say "this park re-arms itself faster than
-                    # automation can help — a human should look". A lifetime
-                    # count buried tasks forever: parks from the dead-codex
-                    # era (2026-09) exhausted their 3 and stayed DEFER even
-                    # after the pipeline that parked them was fixed
-                    # (VOYN-W0-AICC-DEFER-AUTO-RESUME-REM).
-                    "  AND (SELECT count(*) FROM backlog_event e"
-                    "        WHERE e.task_id = t.task_id"
-                    "          AND e.event = 'resume_deferred'"
-                    "          AND e.outcome = 'granted'"
-                    "          AND e.created_at > now() - interval '48 hours'"
-                    "       ) < 3 "
-                    "ORDER BY t.priority NULLS LAST, t.wave, t.task_id "
-                    "LIMIT %s",
-                    (limits.max_resumes_per_tick,),
-                )
-                for task_id, park_reason in resumable:
-                    ok, _reason, _revision = self._row(
-                        "SELECT * FROM backlog_resume_deferred(%s)", (task_id,)
+                # Reconcile technical DEFER_TO_USER parks back to OPEN (VOYN-W0-
+                # AICC-DEFER-AUTO-RESUME) before selecting candidates, so a
+                # resumed task is eligible in this very tick. The candidate query
+                # mirrors the 0014 gate's own conditions purely as a FILTER --
+                # so ineligible parks are not attempted (and not audit-spammed)
+                # every tick; the SECURITY DEFINER function remains the only
+                # authority and revalidates everything under the row lock.
+                if limits.max_resumes_per_tick > 0:
+                    resumable = self._rows(
+                        "SELECT t.task_id, park.reason FROM backlog_task t "
+                        "CROSS JOIN LATERAL ("
+                        "  SELECT e.reason, e.event_id FROM backlog_event e"
+                        "   WHERE e.task_id = t.task_id"
+                        "     AND e.event = 'return_to_pool'"
+                        "     AND e.outcome = 'granted'"
+                        "     AND e.detail->>'target' = 'DEFER_TO_USER'"
+                        "   ORDER BY e.event_id DESC LIMIT 1"
+                        ") park "
+                        "WHERE t.status = 'DEFER_TO_USER' AND t.kind = 'task' "
+                        "  AND park.reason LIKE 'cascade_exhausted:%%' "
+                        "  AND NOT EXISTS ("
+                        "    SELECT 1 FROM backlog_event e2"
+                        "     WHERE e2.task_id = t.task_id"
+                        "       AND e2.outcome = 'granted'"
+                        "       AND e2.event IN ('upsert', 'transition', 'triage',"
+                        "                        'dispatch', 'return_to_pool',"
+                        "                        'resume_deferred')"
+                        "       AND e2.event_id > park.event_id) "
+                        # The anti-ping-pong bound is a sliding WINDOW, not a
+                        # lifetime score: three granted resumes within the
+                        # trailing 48h say "this park re-arms itself faster than
+                        # automation can help — a human should look". A lifetime
+                        # count buried tasks forever: parks from the dead-codex
+                        # era (2026-09) exhausted their 3 and stayed DEFER even
+                        # after the pipeline that parked them was fixed
+                        # (VOYN-W0-AICC-DEFER-AUTO-RESUME-REM).
+                        "  AND (SELECT count(*) FROM backlog_event e"
+                        "        WHERE e.task_id = t.task_id"
+                        "          AND e.event = 'resume_deferred'"
+                        "          AND e.outcome = 'granted'"
+                        "          AND e.created_at > now() - interval '48 hours'"
+                        "       ) < 3 "
+                        "ORDER BY t.priority NULLS LAST, t.wave, t.task_id "
+                        "LIMIT %s",
+                        (limits.max_resumes_per_tick,),
                     )
-                    if ok:
-                        report.resumed.append((task_id, park_reason))
+                    for task_id, park_reason in resumable:
+                        ok, _reason, _revision = self._row(
+                            "SELECT * FROM backlog_resume_deferred(%s)", (task_id,)
+                        )
+                        if ok:
+                            report.resumed.append((task_id, park_reason))
 
-            # Fail-closed monitors record what they measured (0021
-            # monitor_finding); every open finding becomes a pipeline task
-            # once, so a red monitor is a task the fleet fixes rather than a
-            # permanently failed unit (owner instruction 2026-09-08).
-            for finding_id, source, failure in self._rows(
-                "SELECT finding_id, source, failure FROM monitor_finding "
-                "WHERE state = 'open' AND task_id IS NULL ORDER BY finding_id LIMIT 20",
-                (),
-            ):
-                task_id_for_finding = _monitor_task_id(source, failure)
-                ok, reason, _changed, _rev = self._row(
-                    "SELECT * FROM backlog_upsert_task(%s, %s, %s, %s, %s, %s, %s, %s)",
-                    (
-                        task_id_for_finding, "0", "P1", "OPEN", "task",
-                        f"monitor finding: {failure} on {source}",
-                        f"Recorded by the fail-closed monitor '{source}' (monitor_finding "
-                        f"#{finding_id}): failure '{failure}'. Find the root cause and fix "
-                        "it so the measurement is healthy again; the monitor clears the "
-                        "finding when it measures healthy. Acceptance: the monitor reports "
-                        "ok for 24h and the root-cause fix is merged with a regression test.",
-                        "ai-command-center",
-                    ),
-                )
-                if ok or reason == "unchanged":
-                    self._exec(
-                        "SELECT backlog_set_task_class(%s, 'pipeline')",
+                # Fail-closed monitors record what they measured (0021
+                # monitor_finding); every open finding becomes a pipeline task
+                # once, so a red monitor is a task the fleet fixes rather than a
+                # permanently failed unit (owner instruction 2026-09-08).
+                for finding_id, source, failure in self._rows(
+                    "SELECT finding_id, source, failure FROM monitor_finding "
+                    "WHERE state = 'open' AND task_id IS NULL ORDER BY finding_id LIMIT 20",
+                    (),
+                ):
+                    task_id_for_finding = _monitor_task_id(source, failure)
+                    existing = self._rows(
+                        "SELECT status FROM backlog_task WHERE task_id = %s",
                         (task_id_for_finding,),
                     )
-                    self._exec(
-                        "SELECT monitor_link_task(%s, %s)", (finding_id, task_id_for_finding)
+                    status = str(existing[0][0]) if existing else None
+                    if _monitor_task_is_in_flight(status):
+                        # The finding re-opened while the work that answers it is
+                        # still in flight. Link the new row to the task that
+                        # already carries that work and touch nothing else -- not
+                        # the status, not the body, not the revision. Linking is
+                        # what keeps this loop from re-reading the same finding
+                        # every tick; see _MONITOR_TASK_REFILED_FROM for what the
+                        # upsert used to do to an IN_PROGRESS or READY_TO_REVIEW
+                        # task instead (VOYN-MON-WORKER-01-INFRA-DEPLOY-LAG).
+                        self._exec(
+                            "SELECT monitor_link_task(%s, %s)",
+                            (finding_id, task_id_for_finding),
+                        )
+                        report.monitor_relinked.append((task_id_for_finding, failure))
+                        continue
+                    ok, reason, _changed, _rev = self._row(
+                        "SELECT * FROM backlog_upsert_task(%s, %s, %s, %s, %s, %s, %s, %s)",
+                        (
+                            task_id_for_finding, "0", "P1", "OPEN", "task",
+                            f"monitor finding: {failure} on {source}",
+                            f"Recorded by the fail-closed monitor '{source}' (monitor_finding "
+                            f"#{finding_id}): failure '{failure}'. Find the root cause and fix "
+                            "it so the measurement is healthy again; the monitor clears the "
+                            "finding when it measures healthy. Acceptance: the monitor reports "
+                            "ok for 24h and the root-cause fix is merged with a regression test.",
+                            "ai-command-center",
+                        ),
                     )
-                    report.monitor_tasks.append((task_id_for_finding, failure))
+                    if ok or reason == "unchanged":
+                        self._exec(
+                            "SELECT backlog_set_task_class(%s, 'pipeline')",
+                            (task_id_for_finding,),
+                        )
+                        self._exec(
+                            "SELECT monitor_link_task(%s, %s)", (finding_id, task_id_for_finding)
+                        )
+                        report.monitor_tasks.append((task_id_for_finding, failure))
 
             # The review-backlog fence is DISPATCH-only backpressure: it
             # must never short-circuit anything above it in the tick. An
@@ -429,12 +514,15 @@ class Planner:
 
             candidates = self._rows(
                 "SELECT task_id, wave, priority, title, body, repo, dispatchable, "
-                "       task_class "
+                "       task_class, required_authorities "
                 "FROM backlog_eligible"
             )
             for (
                 task_id, wave, priority, title, body, repo, dispatchable, task_class,
+                required_authorities,
             ) in candidates:
+                if limits.only_task_id is not None and task_id != limits.only_task_id:
+                    continue
                 if len(report.dispatched) >= limits.max_dispatches_per_tick:
                     break
                 if fence_active and not lanes_idle and task_class != "pipeline":
@@ -449,6 +537,12 @@ class Planner:
                     "title": title,
                     "body": body,
                     "repo": repo,
+                    # VOYN-W0-AICC-PRIVILEGED-TASK-ROUTED-TO-UNPRIVILEGED-
+                    # EXECUTOR: the declaration travels with the dispatch so
+                    # the worker can refuse before launching a model. `text[]`
+                    # arrives as a list; a pre-0025 row (or a driver that
+                    # hands back NULL) means "declares nothing".
+                    "required_authorities": list(required_authorities or ()),
                 }
                 if not dispatchable:
                     report.undispatchable.append((task_id, "no_repo"))
@@ -488,10 +582,51 @@ class Planner:
             # The global lease is per TICK; repo leases outlive it by design.
             self._row(
                 "SELECT * FROM backlog_lease_release(%s, %s)",
-                (_PLANNER_AUTHORITY, limits.planner),
+                (_PLANNER_AUTHORITY, limits.tick_owner or limits.planner),
             )
         return report
 
 
 def plan_once(connection_factory: Any, limits: PlanLimits = PlanLimits()) -> PlanReport:
     return Planner(connection_factory).plan_once(limits)
+
+
+@dataclass(slots=True)
+class RepoRouteAudit:
+    """Read-only route inventory; gaps require configuration reconciliation."""
+
+    #: (task_id, repo or "") — OPEN, kind='task', repo missing or unrouted.
+    open_unrouted: list[tuple[str, str]] = field(default_factory=list)
+    #: (task_id, repo or "") — READY_TO_REVIEW, repo missing or unrouted.
+    ready_to_review_unrouted: list[tuple[str, str]] = field(default_factory=list)
+
+
+def audit_repo_routes(connection_factory: Any) -> RepoRouteAudit:
+    """Every OPEN or READY_TO_REVIEW task's repo, checked against the route
+    table `repo_route()` reads (VOYN-W0-AICC-REPO-ROUTE-AND-EVIDENCE-
+    HYGIENE). The planner and review ticks already refuse to act on an
+    unrouted repo rather than dead-lettering into one; this is the
+    complementary read the ticket asked for -- the operator's answer to
+    "which routes are actually missing," across both statuses in one pass,
+    without waiting for either tick's own report to surface it."""
+    audit = RepoRouteAudit()
+    with connection_factory() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT task_id, repo FROM backlog_task "
+            "WHERE kind = 'task' AND status = 'OPEN' "
+            "ORDER BY task_id"
+        )
+        open_rows = cur.fetchall()
+        cur.execute(
+            "SELECT task_id, repo FROM backlog_task "
+            "WHERE kind = 'task' AND status = 'READY_TO_REVIEW' "
+            "ORDER BY task_id"
+        )
+        review_rows = cur.fetchall()
+    for task_id, repo in open_rows:
+        if not repo or repo_route(repo) is None:
+            audit.open_unrouted.append((task_id, repo or ""))
+    for task_id, repo in review_rows:
+        if not repo or repo_route(repo) is None:
+            audit.ready_to_review_unrouted.append((task_id, repo or ""))
+    return audit

@@ -22,6 +22,17 @@ def test_queue_reap_takes_no_arguments() -> None:
     assert args.command == "queue-reap"
 
 
+def test_control_reconcile_and_watchdog_take_no_arguments() -> None:
+    """The reconciler/watchdog CLI commands (VOYN-W0-AICC-CONTROL-PLANE-
+    RESILIENCE) carry no flags: everything they need (which timers, which
+    units, backoff bounds) is declared in
+    command_center.orchestrator.control_plane_reconciler, not passed in on
+    the command line — the same "operator contract, not a parser test of
+    the reconcile logic itself" split test_cli_queue.py's other tests draw."""
+    assert build_parser().parse_args(["control-reconcile"]).command == "control-reconcile"
+    assert build_parser().parse_args(["control-watchdog"]).command == "control-watchdog"
+
+
 def test_backlog_review_can_target_one_exact_task() -> None:
     args = build_parser().parse_args(
         ["backlog-review", "--repo-path", "/srv/aicc", "--task-id", "VOYN-W0-X"]
@@ -30,6 +41,20 @@ def test_backlog_review_can_target_one_exact_task() -> None:
     assert args.repo_path == "/srv/aicc"
     assert args.task_id == "VOYN-W0-X"
     assert build_parser().parse_args(["backlog-review"]).task_id is None
+
+
+def test_backlog_import_reconciles_by_default_and_backfills_only_on_request() -> None:
+    """The backfill is the operator's lever for rows whose provenance stamp
+    predates 0025's atomic insert-and-stamp. Off unless asked for: a normal
+    reconciling import must not start writing migration stamps for rows it
+    found already there."""
+    args = build_parser().parse_args(["backlog-import", "VOYN_TASKS_BACKLOG.md"])
+    assert args.command == "backlog-import"
+    assert args.backfill_provenance is False and args.parse_only is False
+    asked = build_parser().parse_args(
+        ["backlog-import", "VOYN_TASKS_BACKLOG.md", "--backfill-provenance"]
+    )
+    assert asked.backfill_provenance is True
 
 
 def test_queue_dlq_defaults_to_every_queue_fifty_rows() -> None:
