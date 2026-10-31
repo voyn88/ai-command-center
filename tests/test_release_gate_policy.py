@@ -9,12 +9,37 @@ from pathlib import Path
 
 import yaml
 
-
 ROOT = Path(__file__).resolve().parents[1]
 CI_WORKFLOW = ROOT / ".github/workflows/ci.yml"
 BOUNDARY_WORKFLOW = ROOT / ".github/workflows/arch-fitness.yml"
 
+LABEL_NOISE = (
+    "github.event_name == 'pull_request' && (github.event.action == 'labeled' "
+    "|| github.event.action == 'unlabeled') && !startsWith(github.event.label.name, "
+    "'release-gate-canary-') && !(github.event.action == 'labeled' && "
+    "(github.event.label.name == 'review-window:active' || github.event.label.name == 'queue-active'))"
+)
+OUTSIDE_WINDOW = (
+    "github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, "
+    "'review-window:active') && !contains(github.event.pull_request.labels.*.name, 'queue-active') "
+    "&& !startsWith(github.event.label.name, 'release-gate-canary-')"
+)
+#: The guard every gated job negates: label noise OR outside the review window.
+LABEL_NOISE_GUARD = f"({LABEL_NOISE}) || ({OUTSIDE_WINDOW})"
+
+
+def _context_name(job: dict) -> str:
+    """The check-run name a non-noise run reports. Required-context jobs carry
+    the label-noise rename (see test_label_noise_never_cancels_or_reruns_the_head_gates)."""
+    name = job["name"]
+    prefix = "${{ (" + LABEL_NOISE_GUARD + ") && 'Gate not run (label noise or outside review window)' || '"
+    if name.startswith(prefix) and name.endswith("' }}"):
+        return name[len(prefix):-len("' }}")]
+    return name
+
+
 EXPECTED_CONTEXTS = {
+    "prepare": "Prepare CI shared inputs",
     "quality-gates": "Linux quality shard ${{ matrix.shard }} of 4",
     "manifest-gate": "Linux manifest gate (exactly once)",
     "coverage-gate": "Main coverage aggregation",
@@ -35,13 +60,17 @@ EXPECTED_STEPS = {
     # owns each non-parallel partition. The manifest gate proves the nodeid
     # union is non-empty and exactly-once before Final can pass.
     "quality-gates": {
-        "Build exactly-once test manifest",
         "Pytest core shard",
         "Pytest (serial tail)",
         "Real-browser E2E",
-        "Publish exact test manifest",
+        "Publish actual test collection receipt",
     },
-    "manifest-gate": {"Verify four identical non-empty manifests"},
+    "prepare": {
+        "Fetch and verify exact accepted AIOS SDK and DB artifacts",
+        "Build exactly-once test manifest",
+        "Publish prepared SDK, DB, and test manifest",
+    },
+    "manifest-gate": {"Verify actual collections equal planned partition"},
     "coverage-gate": {"PR and merge-group coverage policy"},
     "impact-fast-check": {
         "Select impacted tests",
@@ -92,7 +121,12 @@ def test_release_context_names_and_workflow_coverage_are_exact() -> None:
 
     assert set(ci["jobs"]) == set(EXPECTED_CONTEXTS) - {"boundary-fitness"}
     assert set(boundary["jobs"]) == {"boundary-fitness"}
-    assert {job_id: job["name"] for job_id, job in jobs.items()} == EXPECTED_CONTEXTS
+    assert {job_id: _context_name(job) for job_id, job in jobs.items()} == EXPECTED_CONTEXTS
+    assert ci["jobs"]["quality-gates"]["needs"] == "prepare"
+    assert set(ci["jobs"]["manifest-gate"]["needs"]) == {
+        "prepare",
+        "quality-gates",
+    }
 
     # The exact trigger set, and it is a security statement rather than
     # bookkeeping: every entry here is a context in which these gates run with
@@ -169,6 +203,39 @@ def test_impact_fast_check_uses_the_mandatory_two_phase_serial_split() -> None:
     assert "xargs" not in "\n".join(
         line for line in command.splitlines() if not line.lstrip().startswith("#")
     )
+
+
+def test_deploy_only_fast_path_covers_pr_window_unit_policy_changes() -> None:
+    ci = _workflow(CI_WORKFLOW)
+    prepare_steps = ci["jobs"]["prepare"]["steps"]
+    (scope_step,) = [
+        step for step in prepare_steps if step.get("id") == "change-scope"
+    ]
+    scope_command = scope_step["run"]
+
+    for path in (
+        "deploy/systemd/voyn-aicc-merge\\.(service|timer)",
+        "deploy/systemd/voyn-aicc-pr-window\\.service",
+        "deploy/systemd/voyn-aicc-review\\.(service|timer)",
+        "tests/ops/test_agent_principal_isolation\\.py",
+    ):
+        assert path in scope_command
+
+    quality = ci["jobs"]["quality-gates"]
+    (fast_step,) = [
+        step
+        for step in quality["steps"]
+        if step.get("name") == "Deploy-only fast path"
+    ]
+    fast_command = fast_step["run"]
+
+    assert "tests/ops/test_agent_principal_isolation.py" in fast_command
+    assert (
+        "test_the_pr_window_unit_carries_no_host_layout_of_its_own"
+        in fast_command
+    )
+    assert "test_the_review_and_merge_units_are_immutable_control_ticks" in fast_command
+    assert "test_the_control_profile_installs_the_pr_window_tick" in fast_command
 
 
 def _impact_script() -> str:
@@ -428,14 +495,14 @@ def test_the_secret_invariants_see_every_workflow_in_the_directory() -> None:
 
 def test_every_required_context_has_a_deliberate_failure_canary() -> None:
     jobs = _all_jobs()
-    for job_id in CANARY_LABELS:
+    for job_id, canary_label in CANARY_LABELS.items():
         job = jobs[job_id]
         (canary,) = [
             step
             for step in job["steps"]
             if step.get("name") == "Deliberate failure canary"
         ]
-        assert CANARY_LABELS[job_id] in canary["if"]
+        assert canary_label in canary["if"]
         assert canary["run"].strip() == "exit 1"
 
 
@@ -457,7 +524,9 @@ def test_final_gate_is_fail_closed_for_every_upstream_result() -> None:
         "build-gates",
     }
 
-    assert final_gate["if"] == "always()"
+    # `always()` so every upstream result is asserted; the label-noise guard
+    # only skips the whole run for a `queue-*` label event (see below).
+    assert final_gate["if"] == "${{ always() && !(" + LABEL_NOISE_GUARD + ") }}"
     assert set(final_gate["needs"]) == required
 
     (assertion_step,) = [
@@ -478,3 +547,58 @@ def test_final_gate_is_fail_closed_for_every_upstream_result() -> None:
         for negative_result in ("failure", "cancelled", "skipped"):
             results = success | {job_id: negative_result}
             assert not accepted(results), (job_id, negative_result)
+
+
+
+def test_label_noise_never_cancels_or_reruns_the_head_gates():
+    """VOYN-W0-AICC-CI-SELF-CANCEL-SAME-SHA: `labeled`/`unlabeled` stay in the
+    trigger set for the `release-gate-canary-*` labels, but the queue
+    reconciler and operators move `queue-*` labels constantly. Reproduced
+    3x on 2026-09-06 (PRs 649, 672, 762) and all night 2026-09-07/08: every
+    label change started a second run on the same SHA inside the same
+    concurrency group, `cancel-in-progress` killed the live run, its
+    `always()` jobs then held the group so the replacement sat `pending`,
+    and the cancelled check-runs left every window PR `checks_not_green`.
+
+    A noise run therefore (1) gets a group of its own, (2) skips every job,
+    and (3) renames the required-context job so a skipped job under the real
+    name (which GitHub counts as success) can never mask a failed head."""
+    for workflow_name, required_job in (
+        ("ci.yml", "final-gate"),
+        ("acceptance-gate.yml", "acceptance-gate"),
+        ("arch-fitness.yml", "boundary-fitness"),
+    ):
+        workflow = _workflow(ROOT / ".github/workflows" / workflow_name)
+        # The group is exactly the pre-existing key plus the noise suffix: a
+        # noise run gets its own run id as group, every other run shares the
+        # head's group as before.
+        group = workflow["concurrency"]["group"]
+        assert group.endswith(
+            f"-${{{{ ({LABEL_NOISE_GUARD}) && github.run_id || 'head' }}}}"
+        ), (workflow_name, group)
+        # Every job's condition is one of three exact forms, all of which are
+        # `<prior condition> && !(guard)`: the guard is the outermost
+        # conjunct, so a true guard skips the job whatever the prior term
+        # says. A substring check would also pass `x || !(guard)`, which does
+        # not skip on noise (adversarial review on 47ff7d9c).
+        allowed = {
+            f"${{{{ !({LABEL_NOISE_GUARD}) }}}}",
+            f"${{{{ always() && !({LABEL_NOISE_GUARD}) }}}}",
+            f"${{{{ github.event_name == 'pull_request' && !({LABEL_NOISE_GUARD}) }}}}",
+        }
+        for job_id, job in workflow["jobs"].items():
+            assert str(job.get("if", "")) in allowed, (workflow_name, job_id, job.get("if"))
+        # The required context is renamed only on a noise run, and only to the
+        # no-op name; on every other run it is exactly the name branch
+        # protection requires.
+        required_name = workflow["jobs"][required_job]["name"]
+        real_name = EXPECTED_CONTEXTS.get(required_job) or {
+            "acceptance-gate": "Acceptance gate (independent verdict on exact SHA)",
+        }[required_job]
+        assert required_name == (
+            f"${{{{ ({LABEL_NOISE_GUARD}) && 'Gate not run (label noise or outside review window)' || '{real_name}' }}}}"
+        ), (workflow_name, required_name)
+    # Never traded for dropping the canary triggers: the release-gate canaries
+    # still need a fresh event carrying the label.
+    ci = _workflow(CI_WORKFLOW)
+    assert {"labeled", "unlabeled"} <= set(ci["on"]["pull_request"]["types"])

@@ -678,6 +678,34 @@ def test_console_create_task_panel_opens_and_creates_a_task():
     assert "Задача из консоли" in titles
 
 
+def test_console_create_task_shows_hero_playbook_suggestion_for_similar_context():
+    """A new scenario whose (project, task_type) matches a combo with a
+    strong historical track record gets pointed at that Hero Playbook right
+    after creation — VOYN-MIN-HERO's acceptance criterion."""
+    for i in range(2):
+        task = tasks_repository.create_task(
+            APP_ROOT, "AICC", f"Historical win {i}", "review", "Done", executor="claude"
+        )
+        task["latest_verdict"] = "APPROVED_FOR_COMMIT"
+        task["started_at"] = "2026-01-01T10:00:00"
+        task["finished_at"] = "2026-01-01T10:30:00"
+        tasks_repository.upsert_task(APP_ROOT, task)
+
+    at = _at_on_page("execution_center", exec_board_open_panel="create")
+    assert not at.exception
+
+    at.selectbox(key="console_create_project").select("AICC").run()
+    at.selectbox(key="console_create_type").select("review").run()
+    at.text_input(key="console_create_title").set_value("New review scenario").run()
+    form_submit = next(b for b in at.button if b.label == "Создать")
+    at = form_submit.click().run()
+    assert not at.exception
+
+    infos = " ".join(str(i.value) for i in at.info)
+    assert "Hero Playbook" in infos
+    assert "claude" in infos
+
+
 def test_attention_row_shows_reason_without_expanding():
     """A failed run's reason must be readable on the row itself — collapsing it
     behind the toggle would trade one unusable screen for another."""

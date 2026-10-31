@@ -11,11 +11,13 @@ running the import again only picks up runs that weren't there last time.
 
 from __future__ import annotations
 
+import os
+import uuid
 from pathlib import Path
 
 from command_center import agent_runner
 from command_center.models import iso_now
-from command_center.runtime import db
+from command_center.runtime import db, identity, reports
 
 # v1.2 `RUN_STATUSES` -> v2 run states. v1.2's runner was synchronous
 # (README/ARCHITECTURE §11.4), so a legacy row still sitting at "queued" or
@@ -99,6 +101,10 @@ def import_legacy_runs(db_path: Path, *, legacy_runs: list[dict] | None = None) 
             legacy_run_id=legacy_id,
         )
 
+        importer_identity = identity.capture_identity(os.getpid())
+        if importer_identity is None:
+            raise RuntimeError("Could not establish legacy importer process identity")
+        owner_token = uuid.uuid4().hex
         run = db.create_run(
             db_path,
             session_id=session["id"],
@@ -110,6 +116,9 @@ def import_legacy_runs(db_path: Path, *, legacy_runs: list[dict] | None = None) 
             is_resume=False,
             timeout_seconds=legacy.get("timeout_seconds"),
             command=None,
+            finalization_owner_token=owner_token,
+            finalization_owner_pid=os.getpid(),
+            finalization_owner_identity=importer_identity.as_string(),
         )
 
         state = _map_state(legacy.get("status"))
@@ -149,8 +158,15 @@ def import_legacy_runs(db_path: Path, *, legacy_runs: list[dict] | None = None) 
             db.append_run_event(db_path, run["id"], "legacy_stderr", {"stderr": legacy["stderr"]})
 
         report_path = legacy.get("report_path")
-        if report_path:
+        resolved_report = reports.resolve_report_path(report_path) if report_path else None
+        if resolved_report is not None and resolved_report.is_file():
             db.create_report(db_path, run["id"], report_path)
+        else:
+            events = db.list_run_events(db_path, run["id"], after_seq=0, limit=1_000_000)
+            generated = reports.save_report(run, events)
+            db.create_report(
+                db_path, run["id"], reports.stored_report_path(generated)
+            )
 
         # Last, after the events and the report, exactly as a live run's
         # finalization does it. An imported row has no finalization pending —
@@ -158,7 +174,10 @@ def import_legacy_runs(db_path: Path, *, legacy_runs: list[dict] | None = None) 
         # park every historical run in the "still finalizing" set permanently
         # and make the cutover predicate unusable on any install that imported
         # its v1 history.
-        db.mark_run_finalized(db_path, run["id"])
+        if db.mark_run_finalized(
+            db_path, run["id"], owner_token=owner_token
+        ) is None:
+            raise RuntimeError(f"Could not finalize imported legacy run {run['id']!r}")
 
         created_run_ids.append(run["id"])
 
