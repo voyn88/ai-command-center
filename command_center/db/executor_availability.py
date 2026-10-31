@@ -55,9 +55,8 @@ _LIVE_STATUS_SQL = (
 _LIVE_REASON_SQL = (
     "CASE WHEN status = 'unavailable' AND unavailable_until > now() THEN reason END"
 )
-_LIVE_UNTIL_SQL = (
-    "CASE WHEN status = 'unavailable' AND unavailable_until > now()"
-    " THEN unavailable_until END"
+_LIVE_SELECT_FRAGMENT = (
+    _LIVE_STATUS_SQL + ", " + _LIVE_REASON_SQL + ", " + _LIVE_UNTIL_SQL
 )
 
 
@@ -122,8 +121,8 @@ class ExecutorAvailabilityStore:
         with self._connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    f"SELECT {_LIVE_STATUS_SQL}, {_LIVE_REASON_SQL}, {_LIVE_UNTIL_SQL}"
-                    " FROM executor_availability WHERE executor_id = %s",
+                    "SELECT " + _LIVE_SELECT_FRAGMENT
+                    + " FROM executor_availability WHERE executor_id = %s",
                     (executor_id,),
                 )
                 row = cur.fetchone()
@@ -145,8 +144,8 @@ class ExecutorAvailabilityStore:
         with self._connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    f"SELECT executor_id, {_LIVE_STATUS_SQL}, {_LIVE_REASON_SQL},"
-                    f" {_LIVE_UNTIL_SQL} FROM executor_availability ORDER BY executor_id"
+                    "SELECT executor_id, " + _LIVE_SELECT_FRAGMENT
+                    + " FROM executor_availability ORDER BY executor_id"
                 )
                 rows = cur.fetchall()
         return [
