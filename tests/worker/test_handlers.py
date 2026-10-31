@@ -147,6 +147,15 @@ def handler(monkeypatch, tmp_path):
     # has one. Unset it here so the default fixture stays hermetic -- the
     # gate's own tests opt back in explicitly.
     monkeypatch.delenv("VOYN_LEASE_DSN", raising=False)
+    # Review-pin currency hits gh REST; hermetic fixture treats pins as current.
+    # Dedicated tests below drive stale/transient/same-head outcomes explicitly.
+    from command_center.worker import handlers as handlers_module
+
+    monkeypatch.setattr(
+        handlers_module,
+        "_review_pin_currency",
+        lambda repository, pr_number, head_sha: ("current", head_sha),
+    )
     return build_handlers()["agent_run"], runs
 
 
@@ -1927,6 +1936,148 @@ def test_review_head_pin_is_refused_for_a_mutating_task(handler) -> None:
     assert not outcome.ok and not outcome.retryable
     assert "review_head" in outcome.reason
     assert runs == []
+
+
+@pytest.mark.parametrize(
+    ("status", "detail", "retryable", "infra_wait", "task_type"),
+    [
+        (
+            "current",
+            "a" * 40,
+            None,
+            None,
+            "independent_review",
+        ),
+        (
+            "stale",
+            "review_pin_stale: pull 42 head is " + "c" * 40 + ", queued pin was " + "b" * 40,
+            False,
+            False,
+            "independent_review",
+        ),
+        (
+            "stale",
+            "review_pin_stale: pull 42 is 'closed', not open at " + "b" * 40,
+            False,
+            False,
+            "verification_review",
+        ),
+        (
+            "transient",
+            "review_pin_transient: pull lookup failed: boom",
+            True,
+            True,
+            "independent_review",
+        ),
+    ],
+)
+def test_review_pin_currency_gates_model_before_checkout(
+    handler, monkeypatch, status, detail, retryable, infra_wait, task_type
+) -> None:
+    """Queued review pins must not spend a model call once the PR closed,
+    merged, or moved -- and must keep transient authority failures retryable."""
+    from command_center.worker import handlers as handlers_module
+
+    run_agent, runs = handler
+    monkeypatch.setattr(
+        handlers_module,
+        "_review_pin_currency",
+        lambda repository, pr_number, head_sha: (status, detail),
+    )
+    checkout_calls: list[tuple] = []
+
+    def fake_checkout(repository, pr_number, head_sha):
+        checkout_calls.append((pr_number, head_sha))
+        return repository / "wt", None
+
+    monkeypatch.setattr(handlers_module, "_review_head_checkout", fake_checkout)
+    outcome = run_agent(
+        _payload(
+            task_type=task_type,
+            untrusted=True,
+            review_head={"pr_number": "42", "head_sha": "b" * 40},
+        ),
+        _event(),
+    )
+    if status == "current":
+        assert outcome.ok
+        assert runs, "same-head pin must still reach the model"
+        # model_only independent_review needs no detached checkout
+        if task_type == "independent_review":
+            assert checkout_calls == []
+        return
+    assert not outcome.ok
+    assert outcome.retryable is retryable
+    assert outcome.infra_wait is infra_wait
+    assert detail in outcome.reason
+    assert runs == []
+    assert checkout_calls == []
+
+
+def test_review_pin_currency_same_head_open_vs_changed_closed_transient(
+    monkeypatch, tmp_path
+) -> None:
+    """Trusted gh REST + local origin: open+same head is current; closed,
+    merged, moved head are stale; lookup failure stays transient."""
+    from command_center.worker import handlers as handlers_module
+
+    origin = tmp_path / "repo"
+    origin.mkdir()
+    subprocess.run(["git", "init", "-q", str(origin)], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(origin),
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/voyn88/ai-command-center.git",
+        ],
+        check=True,
+    )
+    head = "a" * 40
+    bodies = {
+        "same": {
+            "state": "open",
+            "merged_at": None,
+            "head": {"sha": head},
+        },
+        "changed": {
+            "state": "open",
+            "merged_at": None,
+            "head": {"sha": "b" * 40},
+        },
+        "closed": {"state": "closed", "merged_at": None, "head": {"sha": head}},
+        "merged": {
+            "state": "closed",
+            "merged_at": "2026-10-31T00:00:00Z",
+            "head": {"sha": head},
+        },
+    }
+
+    def run_case(name, *, returncode=0):
+        monkeypatch.setattr(
+            handlers_module.gh_access,
+            "run",
+            lambda argv, cwd, **kw: subprocess.CompletedProcess(
+                argv,
+                returncode,
+                json.dumps(bodies[name]) if returncode == 0 else "",
+                "api failed" if returncode else "",
+            ),
+        )
+        return handlers_module._review_pin_currency(origin, "9", head)
+
+    assert run_case("same") == ("current", head)
+    status, detail = run_case("changed")
+    assert status == "stale" and "queued pin was" in detail
+    status, detail = run_case("closed")
+    assert status == "stale" and "closed" in detail
+    status, detail = run_case("merged")
+    assert status == "stale" and "merged" in detail
+    status, detail = run_case("same", returncode=1)
+    assert status == "transient" and detail.startswith("review_pin_transient:")
 
 
 def test_review_head_checkout_failure_is_retryable(handler, monkeypatch) -> None:

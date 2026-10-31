@@ -1643,6 +1643,10 @@ def _review_once(
             report.skipped.append((task_id, f"no_repo_route: {pr_url!r}"))
             continue
         project_id, repository_path = route
+        parsed_url = _owner_repo_number_from_pr_url(pr_url)
+        if parsed_url is None:
+            report.skipped.append((task_id, f"no_repo_route: {pr_url!r}"))
+            continue
         try:
             chunks = _review_chunks(snapshot, task_id, pr_url)
         except (RuntimeError, ValueError) as exc:
@@ -1663,6 +1667,12 @@ def _review_once(
                 "timeout_seconds": cfg.review_timeout,
                 "untrusted": True,
                 "cascade": cascade,
+                # Worker re-checks open+exact head before any model call;
+                # scheduling's snapshot guard does not cover the queue delay.
+                "review_head": {
+                    "pr_number": parsed_url[2],
+                    "head_sha": snapshot.head,
+                },
             }
             if chunk.count == 1:
                 prepared.append((key, payload))
@@ -1800,12 +1810,20 @@ def reconcile_review_once(
                 factory, current_task_id, base_key
             )
             retry_cascade = _failover_cascade(cascade, refusing_executor)
+            parsed_url = _owner_repo_number_from_pr_url(pr_url)
+            if parsed_url is None:
+                report.skipped.append((current_task_id, "review_key_invalid"))
+                continue
             payload: dict[str, Any] = {
                 "kind": "agent_run", "v": 1, "project_id": project_id,
                 "repository_path": repository_path,
                 "task_type": "independent_review", "prompt": prompt,
                 "timeout_seconds": cfg.review_timeout, "untrusted": True,
                 "cascade": retry_cascade,
+                "review_head": {
+                    "pr_number": parsed_url[2],
+                    "head_sha": snapshot.head,
+                },
             }
             if chunk.count > 1:
                 payload["review_chunk"] = {
@@ -2559,15 +2577,24 @@ def _verified_rejection_outcome(
         # Idempotency is scoped by (queue, idempotency_key) -- review of
         # 653963d: without the queue predicate, a same-key item in another
         # queue read as pending here and blocked this queue's enqueue.
-        "SELECT state FROM work_item "
+        "SELECT state, dead_reason FROM work_item "
         "WHERE queue = %s AND task_id = %s AND idempotency_key = %s",
         (cfg.queue, task_id, key),
     )
     if existing:
         state = str(existing[0][0])
+        dead_reason = existing[0][1]
         if state in ("ready", "claimed"):
             # Genuinely in flight: wait, costing the tick nothing.
             return "WAIT", "verification_pending"
+        # Worker refused a closed/moved pin before the model ran: never
+        # remediate or accept on that definitive staleness.
+        if (
+            state == "dead"
+            and isinstance(dead_reason, str)
+            and dead_reason.startswith("review_pin_stale:")
+        ):
+            return "WAIT", "review_pin_stale"
         # dead (retries exhausted -- review of 5443b6e) or a TERMINAL
         # succeeded/failed item whose result the lookup above could not
         # consume (missing or malformed output -- review of cadc595: a
@@ -3618,6 +3645,9 @@ def _enqueue_review_refresh(
     except (RuntimeError, ValueError) as exc:
         return f"review_prompt_budget_invalid: {exc}"
     project_id, repository_path = route
+    parsed_url = _owner_repo_number_from_pr_url(pr_url)
+    if parsed_url is None:
+        return "review_key_invalid"
     for chunk in chunks:
         prompt = _render_review_prompt(task_id, pr_url, snapshot, chunk)
         payload = {
@@ -3630,6 +3660,10 @@ def _enqueue_review_refresh(
             "timeout_seconds": cfg.review_timeout,
             "untrusted": True,
             "cascade": cascade,
+            "review_head": {
+                "pr_number": parsed_url[2],
+                "head_sha": snapshot.head,
+            },
         }
         review_key = key
         if chunk.count != 1:

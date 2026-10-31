@@ -39,6 +39,10 @@ def test_review_payload_carries_the_two_step_cascade(monkeypatch):
     assert [link["executor"] for link in payload["cascade"]] == ["codex", "claude"]
     assert payload["untrusted"] is True
     assert payload["task_type"] == "independent_review"
+    assert payload["review_head"] == {
+        "pr_number": "7",
+        "head_sha": "a" * 40,
+    }
     assert all(
         link["task_type"] == "independent_review"
         and link["capability"] == "model_only"
