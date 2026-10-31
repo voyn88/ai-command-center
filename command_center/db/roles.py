@@ -657,6 +657,8 @@ _APP_BACKLOG_FUNCTIONS = (
     # existing canonical is the gate, so granting this does not grant a
     # generic OPEN -> DECIDED.
     "backlog_mark_duplicate(text, text, text)",
+    # VOYN-W0-AICC-DISPATCH-REUSE-GATE (0040): close remediation superseded by merged work.
+    "backlog_close_superseded(text, text, text, text, text)",
 
     # Evidence hygiene (0030): remove proven malformed PR evidence.
     "backlog_clear_evidence(text, text, text, text)",

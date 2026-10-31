@@ -318,6 +318,7 @@ def test_the_control_plane_cannot_claim() -> None:
         # VOYN-W0-AICC-BGE-M3-DEDUP-SCAN (0025): the same 'duplicate' decision
         # one state over — OPEN -> DECIDED, with the canonical task named.
         "backlog_mark_duplicate",
+        "backlog_close_superseded",
 
         # 0030: clear proven malformed evidence through the audited function.
         "backlog_clear_evidence",

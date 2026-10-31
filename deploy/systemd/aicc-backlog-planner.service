@@ -10,6 +10,13 @@
 # makes two control hosts one planner; dispatch is atomic per task; the
 # idempotency key pins re-ticks to the same work item), so a missed tick
 # delays planning and never corrupts it.
+#
+# The pre-dispatch reuse gate (VOYN-W0-AICC-DISPATCH-REUSE-GATE) reads the
+# default branch of `--repo-path`, which defaults to WorkingDirectory below:
+# this host's own release checkout. It only ever reads (`git log`/`git
+# grep`), and a WorkingDirectory that is not a git checkout simply turns the
+# gate off -- the tick then dispatches exactly as it did before the gate
+# existed. ProtectHome=true is why it cannot be pointed at ~/Projects.
 
 [Unit]
 Description=AI Command Center backlog planner (dispatch tick)
