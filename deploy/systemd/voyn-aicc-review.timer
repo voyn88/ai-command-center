@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the AICC backlog review tick periodically
+
+[Timer]
+OnBootSec=5min
+OnUnitInactiveSec=5min
+Unit=voyn-aicc-review.service
+
+[Install]
+WantedBy=timers.target

@@ -107,6 +107,13 @@ loss.
 
 ### B. Server-native tables (no SQLite counterpart — PostgreSQL is the sole authority)
 
+`monitor_finding` records infrastructure failures. Its mutation boundary is
+`monitor_record_finding(text, text, jsonb)` / `monitor_clear_finding(text)`
+(migration `0021`), called by `command_center/ops/infra_monitor.py`; the planner
+reads open findings to create pipeline tasks. PostgreSQL is the recovery source
+for finding history; a monitor rerun can rediscover current failures but cannot
+reconstruct cleared history, which requires database backup recovery.
+
 | Tables | Authority | Writer | Recovery |
 |---|---|---|---|
 | `backlog_task`, `backlog_dependency`, `backlog_evidence`, `backlog_event`, `backlog_writer_lease`, `backlog_task_remediation`, `backlog_scan_cursor` (+ view `backlog_eligible`) | The structured backlog/planner store (BO-S1/S2/S3): task intake, triage, dependency edges, remediation evidence, the planner's dispatch and lease protocol. Every state transition is a status-machine step inside a SECURITY DEFINER function — there is no SQL path that jumps a state directly. | The `backlog_*` PL/pgSQL functions defined across `command_center/db/sql/0005`–`0015` (`backlog_upsert_task`, `backlog_transition`, `backlog_record_evidence`, `backlog_record_remediation`, `backlog_add_dependency`, `backlog_lease_acquire/heartbeat/release`, `backlog_dispatch`, `backlog_ingest_results`, `backlog_return_to_pool`, `backlog_resume_deferred`, `backlog_scan_claim`, `backlog_triage`), called only through `command_center/db/backlog_store.py`. | Re-derivable from `command_center/db/backlog_export.py`'s Markdown projection plus `backlog_event`'s append-only audit trail; no separate backup path yet. |
@@ -127,6 +134,7 @@ loss.
 | `data/portfolio_launches.json`, `data/portfolio_locks/` | Portfolio launch records/locks. | `portfolio_launch.py` | Append-only; truncate to last valid line on corruption. |
 | `data/chats.json` | Project chat threads (UI convenience). | `chat_service.py` | Non-critical; loss is acceptable by design. |
 | `data/integration_registry.json` (+lock) | Integration Center project registry (AICC-INT-001): locally-configured repositories — machine-local paths, `gh` remotes, task-namespace mapping. Machine-local configuration, gitignored; contents are never committed. Operator configuration, never execution truth (see `docs/INTEGRATION_CENTER.md`). | `command_center/integration/registry.py` | Seeded defaults (`DEFAULT_ENTRIES`) + operator re-entry of paths. |
+| `data/evolution_population.json` (+lock) | Evolutionary config-agent population (VOYN-MIN-EVOL): each config-agent's genes (`executor`/`max_attempts`/`timeout_seconds`/`wip_limit`), lineage (`generation`, `parent_ids`) and recorded `RunOutcome` metrics. A separate, additive axis from `orchestrator.routing.ROUTING_MATRIX` (which stays static) — nothing in the fleet's live dispatch path reads or writes this file yet; it is populated and evolved via `command_center/evolution/store.py`'s API only. Fail-closed parse (malformed entry ⇒ dropped, never a half-built config-agent). | `command_center/evolution/store.py` | Defaults are empty (no config-agents until `seed_population` is called); re-seed from `evolution.seeds.DEFAULT_SEED_CONFIG_AGENTS` and replay `record_outcome` from `runtime.db` run history. |
 
 ## JSONL (append-only, crash-truncatable)
 
