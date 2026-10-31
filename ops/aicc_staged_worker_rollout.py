@@ -488,15 +488,26 @@ def hold_lane_mutating_timers(systemd: Systemd) -> None:
         raise
 
 
-def release_lane_mutating_timers(systemd: Systemd) -> None:
+def release_lane_mutating_timers(systemd: Systemd, *, strict: bool = False) -> None:
     """Best-effort restart of every timer `hold_lane_mutating_timers` stopped.
 
     Always called from a `finally`, on both the success and failure path, so
     a rollout can never exit leaving rotation or self-deploy permanently
     paused.
     """
+    failed = []
     for timer in LANE_MUTATING_TIMERS:
-        systemd.run("start", timer, check=False)
+        if not strict:
+            systemd.run("start", timer, check=False)
+            continue
+        try:
+            if systemd.run("show", timer, "--property=LoadState", "--value") == "not-found":
+                continue
+            systemd.run("start", timer)
+        except Exception:  # noqa: BLE001 - try every timer before reporting cleanup failure
+            failed.append(timer)
+    if failed:
+        raise RolloutError("timer_restore_failed:" + ",".join(failed))
 
 
 def write_rollout_lock() -> None:
@@ -1131,7 +1142,7 @@ _environment_file_exists = os.path.exists
 
 
 def verify_required_environment_files(
-    systemd: "Systemd", units: tuple[str, ...]
+    systemd: Systemd, units: tuple[str, ...]
 ) -> None:
     """Refuse before the first mutation if a required environment file is
     absent from the host.

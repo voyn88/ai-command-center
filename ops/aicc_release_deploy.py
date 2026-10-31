@@ -112,7 +112,7 @@ class DeployConfig:
 
 @dataclass(slots=True)
 class DeployReport:
-    outcome: str = ""  # NOOP | DEPLOYED | REFUSED | ROLLED_BACK
+    outcome: str = ""  # NOOP | DEPLOYED | DEFERRED | REFUSED | ROLLED_BACK
     detail: str = ""
     target_sha: str = ""
     previous_sha: str = ""
@@ -469,6 +469,7 @@ def _wait_lane_ready(
     timeout: float,
     poll_interval: float,
     show: Callable[[str, str], str],
+    expected_pid: str | None = None,
     clock: Callable[[], float] = time.monotonic,
     sleeper: Callable[[float], None] = time.sleep,
 ) -> bool:
@@ -478,6 +479,8 @@ def _wait_lane_ready(
         sub = show(unit, "SubState")
         status = show(unit, "StatusText")
         main_pid = show(unit, "MainPID")
+        if expected_pid is not None and main_pid != expected_pid:
+            return False
         try:
             pid = int(main_pid or "0")
         except ValueError:
@@ -663,6 +666,10 @@ def _lane_signal(args: list[str]) -> subprocess.CompletedProcess[str]:
     return _run(["systemctl", *args], timeout=30)
 
 
+class BusyLanes(RuntimeError):
+    """Known busy protocol before selection; retry after successful unwind."""
+
+
 def idle_preflight(
     cfg: DeployConfig, units: tuple[str, ...], gated: dict[str, str], *,
     show=None, systemctl=None, remaining=None,
@@ -703,17 +710,22 @@ def idle_preflight(
     deadline = clock() + 30
     while units:
         pending = []
+        statuses = []
         for unit in units:
             if (show(unit, "MainPID") != gated[unit]
                     or show(unit, "ActiveState") != "active"
                     or show(unit, "SubState") != "running"):
                 raise RuntimeError(f"drain_identity_changed:{unit}")
-            if show(unit, "StatusText") != "aicc-drained-idle":
+            status = show(unit, "StatusText")
+            if status != "aicc-drained-idle":
                 pending.append(unit)
+                statuses.append(status)
         if not pending:
             break
         if clock() >= deadline:
-            raise RuntimeError("lanes_busy_or_idle_protocol_unavailable")
+            if all(status == "aicc-drained-busy" for status in statuses):
+                raise BusyLanes("lanes_busy")
+            raise RuntimeError("idle_protocol_unavailable")
         sleeper(cfg.poll_interval)
     if available - (clock() - started) <= budget:
         raise RuntimeError("credential_budget_insufficient")
@@ -969,18 +981,44 @@ def deploy_once(
                 except Exception as rollback_exc:  # noqa: BLE001
                     return finish("REFUSED", f"rollback_failed:{exc}:{rollback_exc}")
                 return finish("ROLLED_BACK", f"rollout_failed:{exc}")
+            if isinstance(exc, BusyLanes):
+                return finish("DEFERRED", str(exc))
             return finish("REFUSED", f"rollout_lock_or_select_failed:{exc}")
         finally:
             try:
+                if report.outcome == "DEFERRED":
+                    inspect = show or _systemctl_show
+                    if any(inspect(unit, "MainPID") != pid
+                           or inspect(unit, "ActiveState") != "active"
+                           for unit, pid in gated.items()):
+                        finish("REFUSED", "busy_resume_identity_changed")
                 resume_failed = (resume or resume_gated_lanes)(gated, show=show)
                 if resume_failed:
                     report.steps.append("resume_failed:" + ",".join(resume_failed))
+                    if report.outcome == "DEFERRED":
+                        finish("REFUSED", "busy_resume_failed")
+                if report.outcome == "DEFERRED" and any(
+                    not _wait_lane_ready(
+                        unit, timeout=min(30, cfg.readiness_timeout),
+                        poll_interval=cfg.poll_interval, show=show or _systemctl_show,
+                        expected_pid=pid)
+                    for unit, pid in gated.items()
+                ):
+                    finish("REFUSED", "busy_resume_not_ready")
             except Exception:  # noqa: BLE001 - preserve original deploy failure
                 report.steps.append("resume_failed")
-            if lock_written and release_timers is not None:
-                release_timers()
-            elif lock_written and rollout_mod is not None:
-                rollout_mod.release_lane_mutating_timers(rollout_mod.Systemd())
+                if report.outcome == "DEFERRED":
+                    finish("REFUSED", "busy_resume_failed")
+            try:
+                if lock_written and release_timers is not None:
+                    release_timers()
+                elif lock_written and rollout_mod is not None:
+                    rollout_mod.release_lane_mutating_timers(
+                        rollout_mod.Systemd(), strict=report.outcome == "DEFERRED")
+            except Exception:
+                if report.outcome != "DEFERRED":
+                    raise
+                finish("REFUSED", "busy_timer_restore_failed")
 
         if clear_pending is not None:
             clear_pending()
@@ -1072,7 +1110,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     report = deploy_once(cfg)
     print(report.line())
-    return 0 if report.outcome in {"NOOP", "DEPLOYED"} else 1
+    return 0 if report.outcome in {"NOOP", "DEPLOYED", "DEFERRED"} else 1
 
 
 if __name__ == "__main__":
