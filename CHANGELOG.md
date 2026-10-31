@@ -8,6 +8,8 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+
+
 ### Added — the one-button audit, wired into the web UI (`VOYN-W0-APP-CONTROL-S4`)
 
 - `web/src/screens/Tasks.tsx`: an `AuditLauncher` panel above the task list —
@@ -128,6 +130,8 @@ functional application milestones of `app.py`.
   clock independence (0 of 11 protocol functions take a timestamp parameter).
   Named limit: the database host's OS was not Linux in this pass.
   `docs/AIOS_BOUNDARY.md` cross-references it from the SRV-04b exception note.
+
+
 
 ### Added — Fleet status and lifecycle (`VOYN-MIN-FARM`)
 - `command_center/db/fleet_admin.py` (`FleetAdmin`): the single-panel view
