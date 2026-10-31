@@ -37,8 +37,8 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 import shutil
+import re
 import threading
 import uuid
 from contextlib import ExitStack
