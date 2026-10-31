@@ -1,0 +1,61 @@
+# The writer-lease reaper (VOYN-W0-AICC-REAPER-NOT-RUNNING).
+#
+# "Death of a connection does not release a claim": a lease row survives the
+# process and the connection that took it. No protocol message releases it --
+# only expiry plus this sweep does, which is the construction
+# `command_center/worker/daemon.py` calls "safe by construction" when it
+# describes a SIGKILLed worker's abandoned work as recoverable. Until this
+# unit existed that construction had no production caller in this repository:
+# `ops/lease_reap.sh` was installed by hand on one host, was not running when
+# it was needed, and one stuck repository row then refused every later
+# acquire with VOYN_LEASE_REFUSED -- traced live to the majority of one day's
+# DEFER_TO_USER escalations (see the script's header).
+#
+# Install (worker host, beside the lease credential):
+#   cp deploy/systemd/voyn-aicc-lease-reap.{service,timer} /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now voyn-aicc-lease-reap.timer
+#
+# ExecStart runs the copy inside the immutable release, not one inside an
+# operator's clone: the sweep a rebuilt host runs is then the sweep this
+# commit describes, and it cannot be edited out from under the fleet by
+# ordinary work in a checkout.
+#
+# Identity: voynadmin, the principal that owns the preprod lane and can read
+# its pgpass. Deliberately NOT an agent principal -- the sweep takes real
+# leases (briefly, with --auto-takeover against rows the authority itself
+# confirms are expired with a dead holder) and releases them again.
+#
+# Why a timer and not a loop: the sweep is idempotent and takes only rows the
+# authority proves are dead, so a missed tick delays recovery and never
+# corrupts it. Reaping is bounded by the cadence below, not by correctness.
+
+[Unit]
+Description=AICC writer-lease reaper (expired-row reclaim)
+After=network-online.target voyn-aicc-pgtunnel.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=voynadmin
+Group=voynadmin
+ExecStart=/opt/aicc/current/ops/lease_reap.sh
+# State, not home: systemd creates and owns this tree for this principal, so
+# the sweep's disposable identity repository and log do not depend on any
+# operator's home directory existing or being writable.
+StateDirectory=aicc-lease-reap
+StateDirectoryMode=0750
+Environment=AICC_LEASE_REAP_REPO=/var/lib/aicc-lease-reap/identity
+Environment=AICC_LEASE_REAP_LOG=/var/lib/aicc-lease-reap/lease_reap.log
+# VOYN_LEASE_DSN, and PGPASSFILE where the lane's credential differs from the
+# script's default, come from the same file the worker lanes read.
+EnvironmentFile=-/etc/aicc/lease.env
+# A sweep against an unreachable lease authority is a failed tick, not an
+# incident: the next tick retries and the journal keeps the evidence.
+TimeoutStartSec=120s
+
+# Containment: this process talks to the lease authority and writes nothing
+# outside its own state directory.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
