@@ -33,6 +33,15 @@ Five bottom tabs keep the product approachable while retaining the complete map:
 
 Each tab has a direct deep link to any represented object. The iPhone never presents a desktop table squeezed onto a small screen; it presents cards and a focused detail path. Widgets and push open the relevant decision, conversation or incident, never a generic home screen.
 
+## Watch companion
+
+The watch companion is single-purpose, not a miniature iPhone app: a
+complication and one app screen exist to raise an escalation in one tap, with
+no tab bar and no overview to pass through first. It reads the same cached
+snapshot as the phone and never opens its own network connection. The full
+screen, state and governance design lives in `WATCH_ESCALATION_UX.md`
+(`VOYN-IOS-WEAR-ESCALATE`).
+
 ## Shared interaction model
 
 - A global **Ask AICC** entry point is present everywhere. It accepts text or voice and offers three explicit intentions: ask a question, create a proposed task, or prepare a decision. Nothing is launched or changed without a visible confirmation.

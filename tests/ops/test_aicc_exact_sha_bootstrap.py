@@ -462,6 +462,11 @@ def test_installer_failure_leaves_no_completed_marker(tmp_path, monkeypatch):
     """A failed privileged installer must not record a completed generation:
     the durable evidence is what a later run and boot recovery believe."""
     module = _module()
+    uninstall_guard = module._refuse_unfinished_uninstall
+    monkeypatch.setattr(
+        module, "_refuse_unfinished_uninstall",
+        lambda: uninstall_guard(tmp_path / "uninstall.json"),
+    )
     state = tmp_path / "state"
     (state / "attempts").mkdir(mode=0o700, parents=True)
     calls: list[list[str]] = []

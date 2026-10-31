@@ -9,23 +9,30 @@ from pathlib import Path
 
 import yaml
 
-
 ROOT = Path(__file__).resolve().parents[1]
 CI_WORKFLOW = ROOT / ".github/workflows/ci.yml"
 BOUNDARY_WORKFLOW = ROOT / ".github/workflows/arch-fitness.yml"
 
-LABEL_NOISE_GUARD = (
+LABEL_NOISE = (
     "github.event_name == 'pull_request' && (github.event.action == 'labeled' "
     "|| github.event.action == 'unlabeled') && !startsWith(github.event.label.name, "
-    "'release-gate-canary-')"
+    "'release-gate-canary-') && !(github.event.action == 'labeled' && "
+    "(github.event.label.name == 'review-window:active' || github.event.label.name == 'queue-active'))"
 )
+OUTSIDE_WINDOW = (
+    "github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, "
+    "'review-window:active') && !contains(github.event.pull_request.labels.*.name, 'queue-active') "
+    "&& !startsWith(github.event.label.name, 'release-gate-canary-')"
+)
+#: The guard every gated job negates: label noise OR outside the review window.
+LABEL_NOISE_GUARD = f"({LABEL_NOISE}) || ({OUTSIDE_WINDOW})"
 
 
 def _context_name(job: dict) -> str:
     """The check-run name a non-noise run reports. Required-context jobs carry
     the label-noise rename (see test_label_noise_never_cancels_or_reruns_the_head_gates)."""
     name = job["name"]
-    prefix = "${{ (" + LABEL_NOISE_GUARD + ") && 'Label event (no gate ran)' || '"
+    prefix = "${{ (" + LABEL_NOISE_GUARD + ") && 'Gate not run (label noise or outside review window)' || '"
     if name.startswith(prefix) and name.endswith("' }}"):
         return name[len(prefix):-len("' }}")]
     return name
@@ -196,6 +203,39 @@ def test_impact_fast_check_uses_the_mandatory_two_phase_serial_split() -> None:
     assert "xargs" not in "\n".join(
         line for line in command.splitlines() if not line.lstrip().startswith("#")
     )
+
+
+def test_deploy_only_fast_path_covers_pr_window_unit_policy_changes() -> None:
+    ci = _workflow(CI_WORKFLOW)
+    prepare_steps = ci["jobs"]["prepare"]["steps"]
+    (scope_step,) = [
+        step for step in prepare_steps if step.get("id") == "change-scope"
+    ]
+    scope_command = scope_step["run"]
+
+    for path in (
+        "deploy/systemd/voyn-aicc-merge\\.(service|timer)",
+        "deploy/systemd/voyn-aicc-pr-window\\.service",
+        "deploy/systemd/voyn-aicc-review\\.(service|timer)",
+        "tests/ops/test_agent_principal_isolation\\.py",
+    ):
+        assert path in scope_command
+
+    quality = ci["jobs"]["quality-gates"]
+    (fast_step,) = [
+        step
+        for step in quality["steps"]
+        if step.get("name") == "Deploy-only fast path"
+    ]
+    fast_command = fast_step["run"]
+
+    assert "tests/ops/test_agent_principal_isolation.py" in fast_command
+    assert (
+        "test_the_pr_window_unit_carries_no_host_layout_of_its_own"
+        in fast_command
+    )
+    assert "test_the_review_and_merge_units_are_immutable_control_ticks" in fast_command
+    assert "test_the_control_profile_installs_the_pr_window_tick" in fast_command
 
 
 def _impact_script() -> str:
@@ -455,14 +495,14 @@ def test_the_secret_invariants_see_every_workflow_in_the_directory() -> None:
 
 def test_every_required_context_has_a_deliberate_failure_canary() -> None:
     jobs = _all_jobs()
-    for job_id in CANARY_LABELS:
+    for job_id, canary_label in CANARY_LABELS.items():
         job = jobs[job_id]
         (canary,) = [
             step
             for step in job["steps"]
             if step.get("name") == "Deliberate failure canary"
         ]
-        assert CANARY_LABELS[job_id] in canary["if"]
+        assert canary_label in canary["if"]
         assert canary["run"].strip() == "exit 1"
 
 
@@ -556,7 +596,7 @@ def test_label_noise_never_cancels_or_reruns_the_head_gates():
             "acceptance-gate": "Acceptance gate (independent verdict on exact SHA)",
         }[required_job]
         assert required_name == (
-            f"${{{{ ({LABEL_NOISE_GUARD}) && 'Label event (no gate ran)' || '{real_name}' }}}}"
+            f"${{{{ ({LABEL_NOISE_GUARD}) && 'Gate not run (label noise or outside review window)' || '{real_name}' }}}}"
         ), (workflow_name, required_name)
     # Never traded for dropping the canary triggers: the release-gate canaries
     # still need a fresh event carrying the label.

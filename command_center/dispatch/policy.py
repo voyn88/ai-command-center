@@ -43,6 +43,7 @@ The hard guarantees, enforced structurally here:
 from __future__ import annotations
 
 from command_center.dispatch.models import (
+    ALT_NOT_CHEAPEST,
     ASSIGNED,
     DEFER_AGENT_BUDGET,
     DEFER_AGENT_CAPACITY,
@@ -55,6 +56,7 @@ from command_center.dispatch.models import (
     DEFER_TAIL_RISK,
     SPEND_MEASUREMENT_ACTUAL,
     SPEND_MEASUREMENT_UNAVAILABLE,
+    AlternativeCandidate,
     DispatchDecision,
     DispatchPlan,
     DispatchPolicy,
@@ -211,40 +213,74 @@ def plan_dispatch(
 
         candidates = sorted(candidates, key=lambda ex: _cost_order_key(ex, policy))
 
+        # Evaluate every cost-ordered candidate up front (one pass, no
+        # mutation — `_budget_block` only reads the accumulators) so the
+        # engine learns not just *the* winner but each candidate's own
+        # binding constraint. That per-candidate reason is what lets the
+        # decision explain "why not X instead" for every option in the same
+        # pass that picks the winner, rather than a second lookup later.
+        evaluated: list[tuple[ExecutorProfile, str | None]] = [
+            (
+                executor,
+                _budget_block(
+                    executor=executor,
+                    cost=executor.cost_per_task_usd,
+                    task=task,
+                    policy=policy,
+                    projected=projected,
+                    max_daily_spend_usd=max_daily_spend_usd,
+                    agent_spend=agent_spend,
+                    agent_assigned=agent_assigned,
+                    active_by_executor=active_by_executor,
+                    project_spend=project_spend,
+                ),
+            )
+            for executor in candidates
+        ]
+
         chosen: ExecutorProfile | None = None
         # Track the binding constraint of the *cheapest* rejected candidate so
         # the defer reason is the most economically relevant one.
         blocking_reason: str | None = None
-        for executor in candidates:
-            cost = executor.cost_per_task_usd
-            reason = _budget_block(
-                executor=executor,
-                cost=cost,
-                task=task,
-                policy=policy,
-                projected=projected,
-                max_daily_spend_usd=max_daily_spend_usd,
-                agent_spend=agent_spend,
-                agent_assigned=agent_assigned,
-                active_by_executor=active_by_executor,
-                project_spend=project_spend,
-            )
-            if reason is None:
+        for executor, reason in evaluated:
+            if reason is None and chosen is None:
                 chosen = executor
-                break
-            if blocking_reason is None:
+            if reason is not None and blocking_reason is None:
                 blocking_reason = reason
 
         if chosen is None:
+            alternatives = tuple(
+                AlternativeCandidate(
+                    executor_id=executor.id,
+                    cost_per_task_usd=executor.cost_per_task_usd,
+                    # Every candidate was blocked to reach this branch — the
+                    # per-candidate reason always exists here.
+                    reason=reason or DEFER_DAILY_BUDGET,
+                )
+                for executor, reason in evaluated
+            )
             decisions.append(
                 DispatchDecision(
                     task_id=task.id,
                     project=task.project,
                     priority=task.priority,
                     reason=blocking_reason or DEFER_DAILY_BUDGET,
+                    alternatives=alternatives,
                 )
             )
             continue
+
+        # A rejected candidate is either blocked by its own budget/capacity
+        # constraint, or was simply pricier/less preferred than `chosen`.
+        alternatives = tuple(
+            AlternativeCandidate(
+                executor_id=executor.id,
+                cost_per_task_usd=executor.cost_per_task_usd,
+                reason=reason if reason is not None else ALT_NOT_CHEAPEST,
+            )
+            for executor, reason in evaluated
+            if executor.id != chosen.id
+        )
 
         # (2) Record the assignment and advance every accumulator, so the next
         #     task's budget checks see this commitment.
@@ -262,6 +298,7 @@ def plan_dispatch(
                 reason=ASSIGNED,
                 assigned_executor=chosen.id,
                 estimated_cost_usd=cost,
+                alternatives=alternatives,
             )
         )
 
