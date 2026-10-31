@@ -739,13 +739,13 @@ def test_failed_rollback_is_reported_once_and_preserves_pending_recovery(tmp_pat
     assert calls == [True]
     assert (cfg.state_dir / "pending-release").exists()
 
-@pytest.mark.parametrize("failure", ["busy", "legacy", "old_ack", "pid", "budget", "rotation"])
+@pytest.mark.parametrize("failure", ["busy", "legacy", "legacy_initial", "idle_lost", "pid", "idle_pid", "budget", "rotation"])
 def test_idle_preflight_refuses_before_select_and_resumes(tmp_path, failure):
     module = _module()
     cfg = _cfg(module, tmp_path)
     signals, selected, released = [], [], []
     now = [0.0]
-    status = ["aicc-drained-idle" if failure == "old_ack" else "aicc-ready"]
+    status = [{"idle_lost": "aicc-drained-idle", "idle_pid": "aicc-drained-idle", "legacy_initial": "aicc-drained"}.get(failure, "aicc-ready")]
     pid = ["42"]
 
     def show(unit, prop):
@@ -758,7 +758,7 @@ def test_idle_preflight_refuses_before_select_and_resumes(tmp_path, failure):
         signals.append(args)
         if "--signal=SIGUSR1" in args:
             status[0] = "aicc-drained" if failure == "legacy" else "aicc-ready"
-            if failure == "pid":
+            if failure in {"pid", "idle_pid"}:
                 pid[0] = "43"
         return SimpleNamespace(returncode=0)
 
@@ -778,13 +778,14 @@ def test_idle_preflight_refuses_before_select_and_resumes(tmp_path, failure):
     assert report.outcome == "REFUSED"
     assert not selected
     assert released == [True]
-    assert any("--signal=SIGHUP" in args for args in signals) == (failure in {"busy", "legacy"})
+    assert any("--signal=SIGHUP" in args for args in signals) == (failure in {"busy", "legacy", "idle_lost"})
 
 
-def test_idle_ack_selects_after_all_lanes_and_unwinds_selection_failure(tmp_path):
+@pytest.mark.parametrize("initial_status", ["aicc-ready", "aicc-drained-idle"])
+def test_idle_ack_selects_after_all_lanes_and_unwinds_selection_failure(tmp_path, initial_status):
     module = _module()
     cfg = _cfg(module, tmp_path)
-    statuses = {LANE_1: "aicc-ready", LANE_2: "aicc-ready"}
+    statuses = {LANE_1: initial_status, LANE_2: initial_status}
     signals = []
 
     def show(unit, prop):
@@ -833,3 +834,37 @@ def test_credential_probe_uses_installed_runtime_without_secret_output(tmp_path,
     monkeypatch.setattr(module, "_run", lambda *a, **k: SimpleNamespace(returncode=1, stdout="secret"))
     with pytest.raises(RuntimeError, match="^credential_budget_unavailable$"):
         module.credential_remaining_seconds(cfg)
+
+
+@pytest.mark.parametrize("initial_status", ["aicc-ready", "aicc-drained-idle"])
+def test_idle_handoff_requires_signal_and_original_pid(tmp_path, initial_status):
+    module = _module()
+    cfg = _cfg(module, tmp_path)
+    status = [initial_status]
+    signals, gated = [], {}
+
+    def show(unit, prop):
+        if "credential-" in unit:
+            return "inactive"
+        return {"ActiveState": "active", "SubState": "running",
+                "MainPID": "42", "StatusText": status[0]}[prop]
+
+    def signal(args):
+        signals.append(args)
+        status[0] = "aicc-drained-idle"
+        return SimpleNamespace(returncode=0)
+
+    module.idle_preflight(cfg, (LANE_1,), gated, show=show,
+                          systemctl=signal, remaining=lambda _: 3600)
+    assert gated == {LANE_1: "42"}
+    assert signals == [["kill", "--kill-who=main", "--signal=SIGUSR1", LANE_1]]
+
+
+def test_noop_does_not_adopt_maintenance_idle_status(tmp_path):
+    module = _module()
+    cfg = _cfg(module, tmp_path, readiness_timeout=0.001)
+    report = _deploy(module, cfg, resolve_sha=lambda _: SHA_A,
+                     show=lambda unit, prop: {"ActiveState": "active", "SubState": "running",
+                                              "MainPID": "42", "StatusText": "aicc-drained-idle"}[prop])
+    assert report.outcome == "REFUSED"
+    assert report.detail == f"current_lane_not_ready:{LANE_1}"
