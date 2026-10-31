@@ -556,19 +556,20 @@ def test_cli_passes_real_paths_to_deploy(tmp_path, monkeypatch, capsys, override
     assert capsys.readouterr().out == f"NOOP {SHA_A} already_current\n"
 
 
-def test_registry_uses_verified_release_runtime(tmp_path, monkeypatch):
+def test_registry_uses_installed_release_runtime(tmp_path, monkeypatch):
     import subprocess
     module = _module()
     cfg = _cfg(module, tmp_path)
+    monkeypatch.setattr(module, "_current_release_sha", lambda _: SHA_A)
     def run(args, **kwargs):
         assert args[0] == str(cfg.runtime_venv / "bin/python")
         assert args[-3:] == [str(cfg.lane_registry), str(cfg.trusted_uid), str(cfg.trusted_gid)]
-        assert kwargs["cwd"] == str(cfg.release_root / SHA_B)
-        assert kwargs["env"]["PYTHONPATH"] == str(cfg.release_root / SHA_B)
+        assert kwargs["cwd"] == str(cfg.release_root / SHA_A)
+        assert kwargs["env"]["PYTHONPATH"] == str(cfg.release_root / SHA_A)
         assert kwargs["timeout"] == 60
         return subprocess.CompletedProcess(args, 0, '["voyn-aicc-worker@1.service"]', '')
     monkeypatch.setattr(module, "_run", run)
-    assert module.load_release_lane_registry(cfg, SHA_B) == (LANE_1,)
+    assert module.load_installed_lane_registry(cfg) == (LANE_1,)
 
 
 @pytest.mark.parametrize("payload", ['[]', '["sshd.service"]', '[null]',
@@ -576,6 +577,15 @@ def test_registry_uses_verified_release_runtime(tmp_path, monkeypatch):
 def test_registry_refuses_invalid_runtime_output(tmp_path, monkeypatch, payload):
     import subprocess
     module = _module()
+    monkeypatch.setattr(module, "_current_release_sha", lambda _: SHA_A)
     monkeypatch.setattr(module, "_run", lambda args, **kw: subprocess.CompletedProcess(args, 0, payload, ''))
     with pytest.raises(RuntimeError, match="invalid lane registry"):
-        module.load_release_lane_registry(_cfg(module, tmp_path), SHA_B)
+        module.load_installed_lane_registry(_cfg(module, tmp_path))
+
+
+def test_registry_refuses_absent_installed_release(tmp_path, monkeypatch):
+    module = _module()
+    monkeypatch.setattr(module, "_current_release_sha", lambda _: None)
+    monkeypatch.setattr(module, "_run", lambda *a, **kw: pytest.fail("must not execute candidate"))
+    with pytest.raises(RuntimeError, match="no installed release"):
+        module.load_installed_lane_registry(_cfg(module, tmp_path))

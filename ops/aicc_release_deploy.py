@@ -597,9 +597,12 @@ def refresh_root_helpers(
     return refreshed
 
 
-def load_release_lane_registry(cfg: DeployConfig, release_sha: str) -> tuple[str, ...]:
-    """Use the verified release and runtime, never the root helper's import path."""
-    release = cfg.release_root / release_sha
+def load_installed_lane_registry(cfg: DeployConfig) -> tuple[str, ...]:
+    """Use the installed root-owned release validator, never candidate code."""
+    installed_sha = _current_release_sha(cfg.aicc_root)
+    if installed_sha is None:
+        raise RuntimeError("no installed release for lane registry validation")
+    release = cfg.release_root / installed_sha
     result = _run(
         [str(cfg.runtime_venv / "bin" / "python"), "-c",
          ("import json, sys; from pathlib import Path; "
@@ -766,7 +769,7 @@ def deploy_once(
 
         try:
             lanes = (
-                load_release_lane_registry(cfg, target) if load_lanes is None else
+                load_installed_lane_registry(cfg) if load_lanes is None else
                 load_lanes(cfg.lane_registry, expected_uid=cfg.trusted_uid,
                            expected_gid=cfg.trusted_gid)
             )
