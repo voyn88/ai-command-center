@@ -200,10 +200,17 @@ def isolated_generated_dir(isolated_data_dir, monkeypatch):
     hard-imports streamlit at line 10, so on a headless worker machine this
     autouse fixture would fail setup for every test in the tree — including
     the worker-daemon tests whose whole point is running where the desktop
-    does not. No streamlit means no `app`, means nothing here to isolate."""
+    does not. No streamlit means no `app`, means nothing here to isolate.
+
+    Import failures beyond a missing dependency are also skipped: a restricted
+    agent sandbox can import streamlit yet still fail ``import app`` because
+    module-level ``get_execution_center_api()`` cannot capture a process
+    identity without ``/proc/sys/kernel/random/boot_id``. That is the same
+    "nothing here to isolate" situation — the desktop app is not runnable —
+    and must not turn every non-UI test red at fixture setup."""
     try:
         import app
-    except ImportError:
+    except Exception:
         yield
         return
     from command_center import workspace_home
