@@ -258,6 +258,11 @@ from command_center.runtime.db.audit import (  # noqa: F401
     set_audit_finding_status,
     set_audit_run_status,
 )
+from command_center.runtime.db.silent_audit import (  # noqa: F401
+    audited_shas_among,
+    get_silent_audit_result,
+    record_silent_audit_result,
+)
 from command_center.runtime.db.marketplace import (  # noqa: F401
     MARKET_ITEM_KINDS,
     MARKET_ITEM_STATUSES,
