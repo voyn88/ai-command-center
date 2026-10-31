@@ -1272,11 +1272,13 @@ def test_lease_unavailable_publish_failure_is_a_lease_wait_not_a_spent_attempt(
     """VOYN-W0-AICC-PUBLISH-LEASE-CONTENTION-BURNS-ATTEMPT, live 2026-09-06
     (wki_55f316db): a guarded publish lost the writer-lease race to a
     sibling lane -- neighbouring publishes for OTHER tasks succeeded
-    04:57-04:58Z while this one got `lease_unavailable`. That names no fault
-    in this run's own (already-committed) work, so the outcome must set
-    `lease_wait=True` -- routing the daemon to the refund-and-bound path
-    instead of spending this item's `max_attempts` on contention it had no
-    part in causing."""
+    04:57-04:58Z while this one got `lease_unavailable`. Same day,
+    second occurrence (wki_e0695c3d): dead-lettered when sibling
+    VOYN-MIN-PROOFLESS held the single writer lease during a same-batch
+    DLQ redrive publish. That names no fault in this run's own
+    (already-committed) work, so the outcome must set `lease_wait=True` --
+    routing the daemon to the refund-and-bound path instead of spending
+    this item's `max_attempts` on contention it had no part in causing."""
     import command_center.worker.handlers as handlers_module
 
     run_agent, _runs = handler
@@ -1346,12 +1348,18 @@ def test_mutating_dispatch_into_a_leased_worktree_is_refused(
 ) -> None:
     """The defect this task names: the worker dispatched into a checkout
     another writer holds, and the collision only surfaced at commit time --
-    by which point the foreign edits were already in the tree."""
+    by which point the foreign edits were already in the tree.
+
+    Contention must set `lease_wait=True` so the refund path absorbs the
+    refusal instead of burning `max_attempts`
+    (VOYN-W0-AICC-PUBLISH-LEASE-CONTENTION-BURNS-ATTEMPT-REM)."""
     run_agent, runs = handler
     worktree = isolated_path(tmp_path)
     lease_tool(_lease_row(worktree))
     outcome = run_agent(_payload(task_type="implementation"), _event())
     assert not outcome.ok and outcome.retryable
+    assert outcome.lease_wait is True
+    assert outcome.infra_wait is False
     assert "claude-worker" in outcome.reason and str(worktree) in outcome.reason
     assert runs == [], "nothing may execute in another writer's checkout"
 
@@ -1401,23 +1409,27 @@ def test_an_unreachable_authority_blocks_rather_than_opens(
 ) -> None:
     """A guard that opens when it cannot see is not a guard. Every failure
     to ask a configured authority -- non-zero exit, unreadable output,
-    missing binary -- refuses the dispatch."""
+    missing binary -- refuses the dispatch. These are substrate failures
+    (`infra_wait`), not writer contention (`lease_wait`)."""
     run_agent, runs = handler
 
     lease_tool("boom: connection refused", exit_code=1)
     refused = run_agent(_payload(task_type="implementation"), _event())
     assert not refused.ok and refused.retryable and runs == []
+    assert refused.lease_wait is False and refused.infra_wait is True
     assert "connection refused" in refused.reason
 
     lease_tool("not json at all")
     unreadable = run_agent(_payload(task_type="implementation"), _event())
     assert not unreadable.ok and unreadable.retryable and runs == []
+    assert unreadable.lease_wait is False and unreadable.infra_wait is True
     assert "unreadable" in unreadable.reason
 
     lease_tool("[]")
     monkeypatch.setenv("VOYN_LEASE_TOOL", str(tmp_path / "does-not-exist"))
     missing = run_agent(_payload(task_type="implementation"), _event())
     assert not missing.ok and missing.retryable and runs == []
+    assert missing.lease_wait is False and missing.infra_wait is True
     assert "unreachable" in missing.reason
 
 
@@ -1713,11 +1725,12 @@ def test_publish_releases_its_own_lease_when_no_full_lifecycle_lease_is_held(
 def test_writer_lease_unavailable_blocks_dispatch_before_the_agent_runs(
     handler, monkeypatch, tmp_path
 ) -> None:
-    """Another writer already holding the repository-level lease (or the
-    authority refusing/unreachable for the acquire specifically, as opposed
-    to `list`) must refuse the dispatch retryably before any workspace is
-    touched or the agent is launched -- the same fail-closed shape
-    `blocking_lease` already has for its own preflight."""
+    """Another writer already holding the task-scoped lease must refuse the
+    dispatch retryably before any workspace is touched or the agent is
+    launched -- the same fail-closed shape `blocking_lease` already has for
+    its own preflight. Contention must set `lease_wait=True` so the refund
+    path (not `max_attempts`) absorbs the refusal
+    (VOYN-W0-AICC-PUBLISH-LEASE-CONTENTION-BURNS-ATTEMPT-REM)."""
     run_agent, runs = handler
     binary = tmp_path / "fake-voyn-lease"
     binary.write_text(
@@ -1739,8 +1752,39 @@ def test_writer_lease_unavailable_blocks_dispatch_before_the_agent_runs(
     outcome = run_agent(_payload(task_type="implementation"), _event())
     assert not outcome.ok
     assert outcome.retryable
+    assert outcome.lease_wait is True
+    assert outcome.infra_wait is False
     assert "writer lease unavailable" in outcome.reason
     assert runs == [], "the agent must not run without the writer lease held"
+
+
+def test_writer_lease_authority_failure_at_dispatch_is_an_infra_wait(
+    handler, monkeypatch, tmp_path
+) -> None:
+    """An acquire that fails without naming a holder is substrate failure,
+    not contention: route to `infra_wait` so the lease-wait budget is not
+    spent down by a down authority."""
+    run_agent, runs = handler
+    binary = tmp_path / "fake-voyn-lease"
+    binary.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "list" ]; then echo "[]"; exit 0; fi\n'
+        'case "$3" in\n'
+        "  acquire) echo 'connection refused' >&2; exit 1 ;;\n"
+        "  *) exit 0 ;;\n"
+        "esac\n"
+    )
+    binary.chmod(0o755)
+    monkeypatch.setenv("VOYN_LEASE_TOOL", str(binary))
+    monkeypatch.setenv("VOYN_LEASE_DSN", "postgresql://authority/present")
+
+    outcome = run_agent(_payload(task_type="implementation"), _event())
+    assert not outcome.ok
+    assert outcome.retryable
+    assert outcome.lease_wait is False
+    assert outcome.infra_wait is True
+    assert "writer lease unavailable" in outcome.reason
+    assert runs == []
 
 
 def test_no_configured_authority_leaves_the_writer_lease_inert_too(

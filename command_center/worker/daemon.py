@@ -66,16 +66,18 @@ class HandlerOutcome:
     reason: str = ""
     retryable: bool = True
     # True only for a refusal that names no fault in the work itself -- a
-    # writer-lease race lost to a sibling lane, not a broken commit or a bad
-    # payload (VOYN-W0-AICC-PUBLISH-LEASE-CONTENTION-BURNS-ATTEMPT: a
+    # writer-lease race lost to a sibling lane (publish `lease_unavailable`
+    # or a held worktree / task lease at dispatch), not a broken commit or a
+    # bad payload (VOYN-W0-AICC-PUBLISH-LEASE-CONTENTION-BURNS-ATTEMPT: a
     # publish that lost that race used to fail through the ordinary
     # `retryable=True` path, which spends this item's `max_attempts` on
     # contention it had no part in causing and can dead-letter already
-    # -finished work). Routes to `queue_fail_lease_wait` instead of
-    # `queue_fail`: it refunds the attempt `queue_claim` already spent for
-    # this delivery and counts the wait against its own bounded budget
-    # instead. Meaningless when `ok` is True and implies `retryable` --
-    # there is no such thing as a non-retryable lease wait.
+    # -finished work; REM also closes the same burn on the dispatch-time
+    # acquire / blocking_lease door). Routes to `queue_fail_lease_wait`
+    # instead of `queue_fail`: it refunds the attempt `queue_claim` already
+    # spent for this delivery and counts the wait against its own bounded
+    # budget instead. Meaningless when `ok` is True and implies `retryable`
+    # -- there is no such thing as a non-retryable lease wait.
     lease_wait: bool = False
     # Same refund semantics for failures in the host/launcher/provider
     # substrate. These are not task attempts: a missing systemd socket, a
