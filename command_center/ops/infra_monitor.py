@@ -1084,7 +1084,7 @@ def record_findings(
     source: str, failures: tuple[str, ...], detail: dict[str, Any]
 ) -> None:
     """Write the measurement to the database through the SECURITY DEFINER
-    functions of migrations 0021 and 0029 (granted to aicc_app and
+    functions of migrations 0021 and 0030 (granted to aicc_app and
     aicc_worker). A red class becomes a task the fleet fixes; a class that is
     green again clears its own row. Never lets a recording problem mask the
     measurement: raises, and main() reports monitor_error while still exiting

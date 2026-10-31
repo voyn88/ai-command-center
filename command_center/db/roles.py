@@ -537,7 +537,7 @@ _WORKER_FUNCTIONS = (
     # 0021: the worker-host fail-closed probe records what it measured.
     "monitor_record_finding(text, text, jsonb)",
     "monitor_clear_finding(text)",
-    # 0029: and clears the classes it measured GREEN, without waiting for
+    # 0030: and clears the classes it measured GREEN, without waiting for
     # every other probe on the same host to go green too.
     "monitor_clear_findings_except(text, text[])",
     # A second, narrower fail path for a refusal that names no fault in the
@@ -594,13 +594,17 @@ _APP_BACKLOG_FUNCTIONS = (
     "backlog_set_task_class(text, text)",
     "monitor_record_finding(text, text, jsonb)",
     "monitor_clear_finding(text)",
-    # 0029: per-class clearing, shared with worker hosts for the same reason
+    # 0030: per-class clearing, shared with worker hosts for the same reason
     # as the record/clear pair above.
     "monitor_clear_findings_except(text, text[])",
     "monitor_link_task(bigint, text)",
     # Audit trail for where a record came from (0020); the importer's stamp
     # that a row was migrated rather than authored directly in the store.
     "backlog_record_provenance(text, text, jsonb)",
+    # 0029: explicit human decisions on parked tasks; never a shortcut past
+    # review gates. Control-plane only -- workers must not unlock a deferral.
+    "backlog_owner_decision(text, bigint, text, text)",
+    "backlog_owner_lock(text)",
 )
 
 # The enrolment surface (0003), split by who may do what.
@@ -1067,7 +1071,7 @@ def _require_function_signature(signature: str) -> None:
         if not argument:
             continue
         # An array type is `text[]`, which is not a bare identifier and must
-        # not be rejected as one: 0029's per-class finding clear takes the
+        # not be rejected as one: 0030's per-class finding clear takes the
         # keep-list as `text[]`. Only the brackets are allowed through, and
         # only as a suffix, so nothing but `[` and `]` ever reaches the
         # interpolated statement beyond what the identifier rule permits.

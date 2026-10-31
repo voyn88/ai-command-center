@@ -112,3 +112,22 @@ def test_expected_schema_version_tracks_the_migration_set() -> None:
     from command_center.db import health
 
     assert health.EXPECTED_SCHEMA_VERSION == len(migrations.discover())
+
+
+def test_monitor_clear_by_class_does_not_collide_with_owner_decision() -> None:
+    """VOYN-MON-WORKER-01-INFRA-DEPLOY-LAG-5ABD205763 (finding #42222).
+
+    Production already applied `0029_backlog_owner_decision`. A branch that
+    lands a *different* 0029 (`monitor_clear_findings_by_class`) cannot
+    migrate: `discover()` rejects the duplicate, and a DB that already has
+    0029 recorded refuses the mismatched checksum. The per-class clear that
+    lets a recovered `deploy_lag` close while `crash_loop` stays red must
+    therefore be 0030 -- and 0029 must be the owner-decision pair the fleet
+    already runs, byte-identical.
+    """
+    found = {m.version: m for m in migrations.discover()}
+    assert found[29].slug == "backlog_owner_decision"
+    assert found[30].slug == "monitor_clear_findings_by_class"
+    # Contiguous through 30 so a control host that already has 0029 applied
+    # can step to 0030 without a gap or a rename fight.
+    assert [m.version for m in migrations.discover()] == list(range(1, 31))
