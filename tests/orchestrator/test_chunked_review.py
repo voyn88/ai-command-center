@@ -34,7 +34,7 @@ def rows(snapshot, verdicts=None):
             "review_chunk": metadata,
         }
         key = review_merge._chunk_review_key(TASK, PR, snapshot, chunk)
-        output = {"result_text": f"VERDICT: {verdict}\nHEAD_SHA: {HEAD}"}
+        output = {"result_text": ("a.py:1: missing authorization check\n" if verdict == "REJECT" else "") + f"VERDICT: {verdict}\nHEAD_SHA: {HEAD}"}
         result.append((key, "succeeded", payload, output))
     return result
 
@@ -234,7 +234,7 @@ def test_refusal_with_exit_zero_and_no_verdict_is_retried_not_permanently_succee
 
     assert report.retried == [(TASK, f"{target}:retry:1")]
     assert len(dispatched) == 1
-    queue, retry_key, payload, task_id, max_attempts = dispatched[0]
+    _queue, retry_key, payload, task_id, max_attempts = dispatched[0]
     assert retry_key == f"{target}:retry:1"
     assert task_id == TASK
     assert max_attempts > 0
@@ -246,7 +246,7 @@ def test_retry_prefers_a_different_executor_than_the_one_that_refused(monkeypatc
     a persistent single-executor refusal (a systemic policy/prompt reaction)
     would otherwise exhaust the entire bounded retry budget on the same
     executor and still never produce a verdict."""
-    target, dispatched, _report = _refusal_reconcile_setup(
+    _target, dispatched, _report = _refusal_reconcile_setup(
         monkeypatch,
         executor="claude",
         cascade=[{"executor": "claude"}, {"executor": "codex"}],
@@ -300,7 +300,7 @@ def test_chunk_rows_never_override_an_earlier_valid_verdict(monkeypatch):
     base_row = rows(snapshot)[0]
     key, state, payload, _result = base_row
     database_rows = [
-        (key, state, payload, {"result_text": f"VERDICT: REJECT\nHEAD_SHA: {HEAD}"}),
+        (key, state, payload, {"result_text": f"a.py:1 missing auth check\nVERDICT: REJECT\nHEAD_SHA: {HEAD}"}),
         (
             f"{key}:retry:1",
             state,
@@ -313,7 +313,7 @@ def test_chunk_rows_never_override_an_earlier_valid_verdict(monkeypatch):
     _prefix, selected = review_merge._chunk_review_rows(None, TASK, PR, snapshot)
 
     assert len(selected) == 1
-    assert selected[0][3]["result_text"].startswith("VERDICT: REJECT")
+    assert "VERDICT: REJECT" in selected[0][3]["result_text"]
 
 
 def test_manifest_reorder_hash_and_snapshot_identity_are_bound():
@@ -367,7 +367,7 @@ def test_pr_snapshot_uses_only_atomic_pr_and_immutable_compare(monkeypatch):
     def gh(argv, _repo):
         calls.append(argv)
         if "/pulls/380" in argv[1]:
-            body = {"base": {"sha": BASE, "repo": {
+            body = {"state": "open", "base": {"sha": BASE, "repo": {
                 "full_name": "voyn88/ai-command-center"}}, "head": {"sha": HEAD},
                 "changed_files": 1, "additions": 0, "deletions": 0}
             return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
@@ -396,7 +396,7 @@ def test_pr_snapshot_rejects_malformed_or_cross_repo(monkeypatch):
 
 @pytest.mark.parametrize("stats", [(2, 0, 0), (1, 1, 0)])
 def test_pr_snapshot_rejects_truncated_or_file_count_mismatch(monkeypatch, stats):
-    body = {"base": {"sha": BASE, "repo": {
+    body = {"state": "open", "base": {"sha": BASE, "repo": {
         "full_name": "voyn88/ai-command-center"}}, "head": {"sha": HEAD},
         "changed_files": stats[0], "additions": stats[1], "deletions": stats[2]}
 
@@ -409,7 +409,7 @@ def test_pr_snapshot_rejects_truncated_or_file_count_mismatch(monkeypatch, stats
 
 
 def test_pr_snapshot_rejects_oversize(monkeypatch):
-    body = {"base": {"sha": BASE, "repo": {
+    body = {"state": "open", "base": {"sha": BASE, "repo": {
         "full_name": "voyn88/ai-command-center"}}, "head": {"sha": HEAD},
         "changed_files": 1, "additions": 0, "deletions": 0}
     monkeypatch.setattr(review_merge, "_MAX_REVIEW_DIFF_BYTES", 1)
@@ -419,10 +419,71 @@ def test_pr_snapshot_rejects_oversize(monkeypatch):
 
 
 def test_pr_snapshot_rejects_binary_diff_even_when_stats_match(monkeypatch):
-    body = {"base": {"sha": BASE, "repo": {
+    body = {"state": "open", "base": {"sha": BASE, "repo": {
         "full_name": "voyn88/ai-command-center"}}, "head": {"sha": HEAD},
         "changed_files": 1, "additions": 0, "deletions": 0}
     binary = "diff --git a/image.png b/image.png\nBinary files a/image.png and b/image.png differ\n"
     monkeypatch.setattr(review_merge, "_gh", lambda argv, _repo: subprocess.CompletedProcess(
         argv, 0, json.dumps(body) if "/pulls/" in argv[1] else binary, ""))
     assert review_merge._pr_diff_and_head("/repo", PR) is None
+
+
+@pytest.mark.parametrize("text", [
+    f"VERDICT: REJECT\nHEAD_SHA: {HEAD}",
+    f"Chunk 2/5:\nVERDICT: REJECT\nHEAD_SHA: {HEAD}\n",
+])
+def test_empty_reject_never_adjudicates_or_accepts_and_retry_is_bounded(monkeypatch, text):
+    snapshot = snap("diff --git a/a b/a\n+x\n")
+    monkeypatch.setattr(review_merge, "_latest_review_result", lambda *a: pytest.fail("no verifier lookup"))
+    assert review_merge._verified_rejection_outcome(
+        None, lambda *a: pytest.fail("no model enqueue"), TASK, PR, snapshot,
+        text, review_merge.ReviewConfig(),
+    ) == ("WAIT", "review_reject_missing_findings")
+    assert review_merge._parse_review_verdict(text) is None
+    key = "review:empty"
+    for attempt in range(review_merge._MAX_RESULT_RETRY_ATTEMPTS + 1):
+        monkeypatch.setattr(review_merge, "_latest_attempt", lambda *a, attempt=attempt: (
+            attempt, "succeeded", {"result_text": text}))
+        expected = f"{key}:retry:{attempt + 1}" if attempt < review_merge._MAX_RESULT_RETRY_ATTEMPTS else None
+        assert review_merge._next_retry_key(None, TASK, key, HEAD) == expected
+
+
+def test_empty_reject_chunk_cannot_create_remediation(monkeypatch):
+    snapshot = snap("diff --git a/a b/a\n" + "x\n" * 40_000)
+    review_rows = rows(snapshot)
+    key, state, payload, _ = review_rows[-1]
+    review_rows[-1] = (key, state, payload, {"result_text": f"VERDICT: REJECT\nHEAD_SHA: {HEAD}"})
+    report, posted, remediated = publish(monkeypatch, snapshot, review_rows)
+    assert not posted and not remediated
+    assert report.skipped
+
+
+@pytest.mark.parametrize("change", ["closed", "merged", "head", "base", "unavailable"])
+def test_snapshot_revalidates_open_exact_head_after_diff(monkeypatch, change):
+    diff = "diff --git a/a b/a\n+x\n"
+    initial = {"state": "open", "base": {"sha": BASE, "repo": {"full_name": "voyn88/ai-command-center"}},
+               "head": {"sha": HEAD}, "changed_files": 1, "additions": 1, "deletions": 0}
+    current = json.loads(json.dumps(initial))
+    if change == "closed":
+        current["state"] = "closed"
+    elif change == "merged":
+        current["merged_at"] = "2026-10-31T12:00:00Z"
+    elif change in {"head", "base"}:
+        current[change]["sha"] = "f" * 40
+    calls = []
+
+    def gh(args, _repo):
+        calls.append(args)
+        if "compare/" in args[1]:
+            return subprocess.CompletedProcess(args, 0, diff, "")
+        return subprocess.CompletedProcess(args, 1 if change == "unavailable" else 0, json.dumps(current), "")
+
+    monkeypatch.setattr(review_merge, "_gh", gh)
+    assert review_merge._pr_diff_and_head("/repo", PR, initial) is None
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("state", ["closed", None])
+def test_closed_or_unproven_pr_never_fetches_model_diff(monkeypatch, state):
+    monkeypatch.setattr(review_merge, "_gh", lambda *a: pytest.fail("no diff fetch"))
+    assert review_merge._pr_diff_and_head("/repo", PR, {"state": state}) is None

@@ -1191,6 +1191,24 @@ def test_release_selection_arms_pending_selector_without_clobber(monkeypatch, tm
         transaction.select_release(release_id, tmp_path)
 
 
+def test_grok_driver_installs_from_release_as_worker_only_helper(tmp_path):
+    module = _module()
+    repo = Path(__file__).parents[2]
+    kwargs = {
+        "authority_env": tmp_path / "authority.env",
+        "claude_auth": tmp_path / "claude.json",
+        "codex_auth": tmp_path / "codex.json",
+        "resolve_identities": False,
+    }
+    specs = {s.target: s for s in module.default_specs(repo, **kwargs)}
+    driver = specs["/usr/libexec/aicc-grok-agent"]
+    assert driver.source == repo / "ops/aicc_grok_agent.py"
+    assert (driver.mode, driver.uid, driver.gid) == (0o755, 0, 0)
+    assert driver.target in module.WORKER_ONLY_TARGETS
+    targets = list(specs)
+    assert targets.index(driver.target) < targets.index("/usr/libexec/aicc-agent-launcher")
+
+
 def test_recovery_generator_is_a_permanent_pretransaction_anchor(tmp_path):
     module = _module()
     repo = Path(__file__).parents[2]
@@ -1242,6 +1260,9 @@ def test_same_boot_barrier_is_active_before_first_wal_or_claimer_start():
     source_refresh = commands.index(
         "systemctl enable --now voyn-aicc-source-clone-refresh.timer"
     )
+    worker_release = commands.index(
+        "systemctl enable --now voyn-aicc-worker-release-deploy.timer"
+    )
 
     assert (
         anchor
@@ -1251,8 +1272,10 @@ def test_same_boot_barrier_is_active_before_first_wal_or_claimer_start():
         < prepare
         < launcher
         < source_refresh
+        < worker_release
     )
     assert "systemctl enable aicc-principal-recovery.service" not in installer
+    assert "systemctl disable --now voyn-aicc-self-deploy.timer" in installer
 
 
 def test_boot_recovery_restores_dynamic_worker_and_auxiliary_unit_state(tmp_path):
@@ -3512,6 +3535,18 @@ def test_the_control_purge_covers_every_retired_worker_unit():
     )
     assert (
         "/etc/systemd/system/voyn-aicc-source-clone-refresh.timer"
+        in module.WORKER_ONLY_TARGETS
+    )
+    assert (
+        "/usr/libexec/aicc-worker-release-deploy"
+        in module.WORKER_ONLY_TARGETS
+    )
+    assert (
+        "/etc/systemd/system/voyn-aicc-worker-release-deploy.service"
+        in module.WORKER_ONLY_TARGETS
+    )
+    assert (
+        "/etc/systemd/system/voyn-aicc-worker-release-deploy.timer"
         in module.WORKER_ONLY_TARGETS
     )
     # The boot recovery capsule is the one agent-adjacent unit that must keep

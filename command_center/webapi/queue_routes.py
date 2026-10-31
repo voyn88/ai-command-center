@@ -30,6 +30,15 @@ a digest of what the audit would do, so a retried request (or a
 double-submitted form) lands on the SAME work item instead of a second run —
 the caller may override when it genuinely wants a fresh run of identical
 parameters.
+
+``repository_path`` is optional in the request: a one-button trigger (the
+web UI's project card) only knows a ``project_id``, not the server's
+filesystem layout. When omitted, it is resolved from the same source the
+worker will check it against at execution time — `project_config.
+get_project_config` (see `agent_runner.validate_repository`) — so a caller
+that skips it still gets exactly the path the run will actually use. An
+explicit ``repository_path`` in the body is still honored verbatim (existing
+callers, and the eventual worker-side confirmation check, are unaffected).
 """
 
 from __future__ import annotations
@@ -39,6 +48,7 @@ from typing import Any
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
 
+from command_center import project_config
 from command_center.db.work_queue_read import WorkQueueReadStore
 from command_center.db.work_queue_store import WorkQueueStore
 from command_center.http_auth import routing
@@ -93,7 +103,6 @@ def create_queue_router() -> APIRouter:
             key
             for key, value in (
                 ("project_id", project_id),
-                ("repository_path", repository_path),
                 ("prompt", prompt),
             )
             if not (isinstance(value, str) and value.strip())
@@ -102,6 +111,20 @@ def create_queue_router() -> APIRouter:
             raise HTTPException(
                 status_code=422, detail=f"missing required fields: {missing}"
             )
+
+        if not (isinstance(repository_path, str) and repository_path.strip()):
+            configured = project_config.get_project_config(project_id).get(
+                "repository_path"
+            )
+            if not (isinstance(configured, str) and configured.strip()):
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"repository_path not configured for project {project_id!r}; "
+                        "set it in Projects settings or pass repository_path explicitly"
+                    ),
+                )
+            repository_path = configured
 
         key = body.get("idempotency_key")
         if key is not None and not (isinstance(key, str) and key.strip()):

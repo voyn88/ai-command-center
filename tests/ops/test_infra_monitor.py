@@ -357,6 +357,37 @@ def test_executor_quota_refusals_are_their_own_failure_class() -> None:
     assert not any(f.startswith("dead_letter_growth") for f in report.failures)
 
 
+def test_quota_deaths_do_not_double_count_as_dead_letter_growth() -> None:
+    """One cause, one finding: a death already surfaced as
+    executor_quota_exhausted is not also dead-letter growth."""
+    from command_center.ops.infra_monitor import evaluate
+
+    report = evaluate(
+        {"voyn-aicc-worker@1.service": "active"},
+        _queue(recent_dead=2, recent_quota_dead=2),
+        minimum_active_workers=1,
+        max_stalled_seconds=900,
+        prometheus_ready=True,
+        max_recent_dead=0,
+    )
+    assert "executor_quota_exhausted:2" in report.failures
+    assert not any(f.startswith("dead_letter_growth") for f in report.failures)
+
+
+def test_unexplained_deaths_beyond_the_quota_class_still_raise_growth() -> None:
+    from command_center.ops.infra_monitor import evaluate
+
+    report = evaluate(
+        {"voyn-aicc-worker@1.service": "active"},
+        _queue(recent_dead=3, recent_quota_dead=2),
+        minimum_active_workers=1,
+        max_stalled_seconds=900,
+        prometheus_ready=True,
+        max_recent_dead=0,
+    )
+    assert "dead_letter_growth:1>0" in report.failures
+
+
 def test_spinning_lanes_with_no_success_in_an_hour_are_a_throughput_stall() -> None:
     from command_center.ops.infra_monitor import evaluate
 
@@ -1313,14 +1344,32 @@ def _gh_stub(responses: dict[str, str], calls: list[list[str]]):
 
 HEAD_JSON = '{"sha": "' + "a" * 40 + '", "commit": {"committer": {"date": "2026-09-14T12:00:00Z"}}}'
 
+#: 2026-09-14T13:00:00Z, the "now" every dated deploy-lag test freezes.
+NOW = 1789390800.0
+
+
+def _commit(sha: str, date: str, *parents: str) -> dict:
+    """One commit as the compare endpoint returns it: GitHub carries
+    `parents` on every entry, first parent first."""
+    return {
+        "sha": sha,
+        "commit": {"committer": {"date": date}},
+        "parents": [{"sha": parent} for parent in parents],
+    }
+
 
 def test_deploy_lag_snapshot_dates_the_oldest_undeployed_commit(monkeypatch) -> None:
     calls: list[list[str]] = []
-    compare = (
-        '{"status": "ahead", "commits": ['
-        '{"sha": "c1", "commit": {"committer": {"date": "2026-09-13T16:00:00Z"}}},'
-        '{"sha": "c2", "commit": {"committer": {"date": "2026-09-14T12:00:00Z"}}}]}'
-    )
+    # A linear range: both commits landed on main directly, so each commit's
+    # own date is also the date main gained it.
+    compare = json.dumps({
+        "status": "ahead",
+        "total_commits": 2,
+        "commits": [
+            _commit("c1", "2026-09-13T16:00:00Z", "b" * 40),
+            _commit("a" * 40, "2026-09-14T12:00:00Z", "c1"),
+        ],
+    })
     monkeypatch.setattr(
         infra_monitor.subprocess, "run",
         _gh_stub({
@@ -1330,7 +1379,7 @@ def test_deploy_lag_snapshot_dates_the_oldest_undeployed_commit(monkeypatch) -> 
     )
     monkeypatch.setattr(infra_monitor, "_fetch_json", lambda url, timeout=5: {"release_sha": "b" * 40})
     # now = 2026-09-14T13:00:00Z: the head is 1 h old, the oldest undeployed commit 21 h.
-    monkeypatch.setattr(infra_monitor.time, "time", lambda: 1789390800.0)
+    monkeypatch.setattr(infra_monitor.time, "time", lambda: NOW)
     snapshot = infra_monitor.read_deploy_lag_snapshot(
         "voyn88/voyn-logistics-crm", "http://127.0.0.1:8089/version",
         branch="main", grace_seconds=2700.0,
@@ -1409,6 +1458,132 @@ def test_deploy_lag_snapshot_never_raises(monkeypatch, breakage) -> None:
         prometheus_ready=True, deploy_lag=snapshot,
     )
     assert any(f.startswith("deploy_lag_probe_failed:") for f in report.failures)
+
+
+# VOYN-MON-WORKER-01-INFRA-DEPLOY-LAG-5ABD205763 (monitor_finding #38959):
+# the probe dated the lag from the oldest commit OBJECT in the undeployed
+# range, so a feature branch written days earlier and merged a minute ago
+# opened `deploy_lag` the instant it merged -- the grace period for CI, the
+# merge queue and the promotion tick was already spent before the code was
+# even mergeable -- and the finding stayed open until production matched the
+# head exactly, while the promotion pipeline was doing its job. The clock is
+# when the BRANCH gained the commit: its first-parent chain.
+
+
+def _deploy_lag_probe(monkeypatch, compare: str):
+    """The probe against one compare payload, with the unit's 45-minute
+    grace period and `NOW` frozen as the measurement time."""
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        infra_monitor.subprocess, "run",
+        _gh_stub({
+            "repos/r/commits/main": HEAD_JSON,
+            "repos/r/compare/" + "b" * 40 + "..." + "a" * 40: compare,
+        }, calls),
+    )
+    monkeypatch.setattr(infra_monitor, "_fetch_json", lambda url, timeout=5: {"release_sha": "b" * 40})
+    monkeypatch.setattr(infra_monitor.time, "time", lambda: NOW)
+    return infra_monitor.read_deploy_lag_snapshot(
+        "r", "http://127.0.0.1:8089/version", branch="main", grace_seconds=2700.0
+    )
+
+
+def _merged_branch_compare(merge_date: str) -> str:
+    """Five-day-old feature-branch commits that reached main through a merge
+    commit: `merge_date` is when main gained all three."""
+    return json.dumps({
+        "status": "ahead",
+        "total_commits": 3,
+        "commits": [
+            _commit("f1", "2026-09-09T08:00:00Z", "b" * 40),
+            _commit("f2", "2026-09-09T09:00:00Z", "f1"),
+            _commit("a" * 40, merge_date, "b" * 40, "f2"),
+        ],
+    })
+
+
+def test_an_old_branch_merged_inside_the_grace_period_is_not_deploy_lag(monkeypatch) -> None:
+    # Merged at 12:59, measured at 13:00: one minute of promotion budget used
+    # out of forty-five, however old the commits the merge carried are.
+    snapshot = _deploy_lag_probe(monkeypatch, _merged_branch_compare("2026-09-14T12:59:00Z"))
+    assert snapshot.error is None
+    assert snapshot.undeployed_commits == 3
+    assert abs(snapshot.lag_seconds - 60.0) < 1
+    assert snapshot.lagging is False
+    report = infra_monitor.evaluate(
+        {}, None, minimum_active_workers=0, max_stalled_seconds=900,
+        prometheus_ready=True, deploy_lag=snapshot,
+    )
+    assert report.ok
+
+
+def test_deploy_lag_of_a_merged_branch_is_measured_from_the_merge(monkeypatch) -> None:
+    # The same branch, merged 26 h ago and still not deployed: a real stall,
+    # reported as 26 h -- not as the five days since the commits were written.
+    snapshot = _deploy_lag_probe(monkeypatch, _merged_branch_compare("2026-09-13T11:00:00Z"))
+    assert snapshot.error is None
+    assert abs(snapshot.lag_seconds - 26 * 3600) < 1
+    assert snapshot.lagging is True
+    report = infra_monitor.evaluate(
+        {}, None, minimum_active_workers=0, max_stalled_seconds=900,
+        prometheus_ready=True, deploy_lag=snapshot,
+    )
+    assert {infra_monitor.finding_key(f) for f in report.failures} == {"deploy_lag"}
+    assert "_3_commits_93600s>2700s" in report.failures[0]
+
+
+def test_a_compare_without_parents_dates_the_commit_objects_not_the_head(monkeypatch) -> None:
+    # A payload the first-parent walk cannot follow must fall back to the
+    # commit objects. Dating a partial walk would date the lag from the head,
+    # the one number every new merge resets.
+    compare = json.dumps({
+        "status": "ahead",
+        "commits": [
+            {"sha": "c1", "commit": {"committer": {"date": "2026-09-13T16:00:00Z"}}},
+            {"sha": "a" * 40, "commit": {"committer": {"date": "2026-09-14T12:00:00Z"}}},
+        ],
+    })
+    snapshot = _deploy_lag_probe(monkeypatch, compare)
+    assert snapshot.error is None
+    assert snapshot.undeployed_commits == 2
+    assert abs(snapshot.lag_seconds - 21 * 3600) < 1
+    assert snapshot.lagging is True
+
+
+def test_a_truncated_compare_page_counts_the_whole_range(monkeypatch) -> None:
+    # GitHub returns at most 250 commits, oldest first, so a long stall's
+    # payload has no head to walk from and `len(commits)` understates the
+    # backlog. The count comes from `total_commits`; the clock from the
+    # oldest commit on the page, which is the oldest undeployed one.
+    compare = json.dumps({
+        "status": "ahead",
+        "total_commits": 612,
+        "commits": [
+            _commit("p1", "2026-09-01T00:00:00Z", "b" * 40),
+            _commit("p2", "2026-09-02T00:00:00Z", "p1"),
+        ],
+    })
+    snapshot = _deploy_lag_probe(monkeypatch, compare)
+    assert snapshot.error is None
+    assert snapshot.undeployed_commits == 612
+    assert abs(snapshot.lag_seconds - 1_170_000.0) < 1  # 2026-09-01 -> 09-14T13:00
+    assert snapshot.lagging is True
+
+
+def test_a_first_parent_cycle_falls_back_instead_of_looping(monkeypatch) -> None:
+    # c1 claims the head as its first parent. GitHub cannot return this, but
+    # the walk must terminate on it rather than spin inside a monitor tick.
+    compare = json.dumps({
+        "status": "ahead",
+        "total_commits": 2,
+        "commits": [
+            _commit("c1", "2026-09-13T16:00:00Z", "a" * 40),
+            _commit("a" * 40, "2026-09-14T12:00:00Z", "c1"),
+        ],
+    })
+    snapshot = _deploy_lag_probe(monkeypatch, compare)
+    assert snapshot.error is None
+    assert abs(snapshot.lag_seconds - 21 * 3600) < 1
 
 
 def test_a_half_configured_deploy_lag_probe_is_a_usage_error() -> None:
