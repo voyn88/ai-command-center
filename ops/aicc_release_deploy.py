@@ -68,6 +68,9 @@ def _load_install_transaction():
 
 
 def _load_staged_rollout():
+    # The installed rollout imports its hyphenated sibling by Python module name.
+    # Load that trusted sibling before executing rollout, including the first lock.
+    _load_install_transaction()
     path = _OPS_DIR / "aicc_staged_worker_rollout.py"
     if not path.is_file():
         path = _OPS_DIR / "aicc-staged-worker-rollout"

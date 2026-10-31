@@ -23,6 +23,7 @@ def test_driver_refuses_tools_outside_broker(monkeypatch):
 def test_model_only_http_request_disables_tools(monkeypatch):
     module = driver()
     def open_request(request, timeout):
+        assert request.full_url == "https://api.x.ai/v1/responses"
         body = json.loads(request.data)
         assert body['tools'] == []
         assert 'tool_choice' not in body  # xAI rejects this field with an empty tools list.

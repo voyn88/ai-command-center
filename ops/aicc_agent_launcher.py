@@ -595,7 +595,8 @@ def _prepare_agent_home(executor: str, run_id: str) -> tuple[Path, bytes | None]
         home = EPHEMERAL_HOME_ROOT / run_id
         home.mkdir(mode=0o770)
         os.chown(home, 0, auth_gid)
-        os.chmod(home, 0o770)
+        # Only the isolated dynamic agent UID joins this auth group; home is per run.
+        os.chmod(home, 0o770)  # nosec B103
         return home, None
     if source is None:
         raise LaunchRefused(f"no model auth source for executor {executor!r}")

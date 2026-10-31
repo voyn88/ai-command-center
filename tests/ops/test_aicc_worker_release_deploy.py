@@ -47,8 +47,9 @@ def test_helper_loaders_source_and_installed_layout(tmp_path, monkeypatch, insta
         monkeypatch.delitem(sys.modules, name, raising=False)
     monkeypatch.setattr(module, "_OPS_DIR", tmp_path)
     try:
-        tx = module._load_install_transaction()
+        # Real deploy acquires the rollout lock before asking for the transaction.
         rollout = module._load_staged_rollout()
+        tx = module._load_install_transaction()
         assert callable(tx.verify_release_manifest)
         assert Path(tx.__file__).parent == tmp_path
         assert Path(rollout.__file__).parent == tmp_path

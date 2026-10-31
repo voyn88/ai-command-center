@@ -30,7 +30,8 @@ def completion(key: str, model: str, items: list, tools: bool = True) -> dict:
         headers={'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json',
                  'User-Agent': 'aicc-grok-agent/1'})
     try:
-        with urllib.request.urlopen(req, timeout=90) as response:
+        # Request URL is a fixed HTTPS provider endpoint, never caller supplied.
+        with urllib.request.urlopen(req, timeout=90) as response:  # nosec B310
             return json.load(response)
     except urllib.error.HTTPError as exc:
         # Never echo provider response bodies (they can contain submitted data).
