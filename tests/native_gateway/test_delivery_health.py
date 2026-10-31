@@ -246,7 +246,7 @@ def test_hostile_pipeline_health_is_redacted(client, device_token, projection_pa
     health["owner_escalations"][0]["title"] = "rotate password postgres://a@db/x"
     health["active_lanes"][0]["role"] = "/srv/aicc/.claude"
     health["monitor"]["failures"] = ["token expired for ghp_abcdef123"]
-    health["monitor"]["verdict"] = "<script>"
+    health["monitor"]["verdict"] = "failing"
     health["backlog_by_status"]["password"] = 1
     health["queue"]["ready"] = -5
     health["unknown_field"] = "ssh-rsa AAAA"
@@ -257,11 +257,12 @@ def test_hostile_pipeline_health_is_redacted(client, device_token, projection_pa
     body = response.json()["pipelineHealth"]
     assert body["ownerEscalations"][0]["title"] == "[REDACTED]"
     assert body["activeLanes"][0]["role"] == "[REDACTED]"
-    assert body["monitor"] is None  # unknown verdict vocabulary → dropped
+    assert body["monitor"]["verdict"] == "failing"
+    assert body["monitor"]["failures"] == ["[REDACTED]"]
     assert "password" not in body["backlogByStatus"]
     assert body["queue"]["ready"] == 0
     lowered = response.text.lower()
-    for needle in ("password", "postgres://", "ssh-rsa", "ghp_", "/home/"):
+    for needle in ("password", "postgres://", "ssh-rsa", "ghp_", "/srv/", ".claude"):
         assert needle not in lowered, needle
 
 
@@ -350,9 +351,9 @@ def test_postgres_source_reads_only_the_public_views():
     assert rows.monitor["open"][0]["failure"] == "dead_letter_growth"
     sql = " ".join(statement for statement, _ in conn.log)
     # The redacted views only — `work_attempt` itself holds claim_token_hash.
-    assert not re.search(r"\bfrom\s+(work_attempt|work_item)\b", sql, re.I)
+    assert not re.search(r"\b(work_attempt|work_item)\b", sql, re.I)
     assert not re.search(
-        r"\b(INSERT|UPDATE|DELETE|TRUNCATE|DROP|ALTER|COPY|GRANT)\b", sql, re.I
+        r"\b(INSERT|UPDATE|DELETE|TRUNCATE|DROP|ALTER|COPY|GRANT|MERGE|CREATE|REVOKE|CALL|DO)\b", sql, re.I
     )
     assert (AUTH_FAILURE_PATTERN,) in [params for _, params in conn.log]
 
