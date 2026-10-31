@@ -1822,6 +1822,8 @@ def test_hold_skips_timers_that_are_not_installed_on_the_host():
     assert [call for call in systemd.calls if call[0] == "stop"] == []
 
 
+
+
 def test_rollout_lock_does_not_overwrite_existing_owner(tmp_path, monkeypatch):
     module = _module()
     lock = tmp_path / "rollout.lock"
