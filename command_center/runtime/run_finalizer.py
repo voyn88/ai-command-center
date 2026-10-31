@@ -14,6 +14,7 @@ this module resolves ``db``/``git_ops``/... through the same facade modules.
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 from command_center import agent_runner, provider_route
@@ -31,11 +32,20 @@ TERMINAL_CAS_MAX_ATTEMPTS = 5
 class RunFinalizer:
     """Persists terminal outcomes and post-run bookkeeping for one store."""
 
-    def __init__(self, db_path: Path) -> None:
+    def __init__(self, db_path: Path, *, owner_token: str, owner_pid: int) -> None:
         self.db_path = db_path
+        self.owner_token = owner_token
+        self.owner_pid = owner_pid
+
+    def _assert_current_process(self) -> None:
+        if os.getpid() != self.owner_pid:
+            raise RuntimeError(
+                "A RunFinalizer inherited across fork cannot use parent authority."
+            )
 
     def append_lifecycle_event_best_effort(self, lifecycle: str, run_id: str, **payload: object) -> None:
         """Persist audit telemetry without making lifecycle safety depend on it."""
+        self._assert_current_process()
         try:
             db.append_run_event(
                 self.db_path,
@@ -66,6 +76,7 @@ class RunFinalizer:
         clean (an idempotent no-op — the agent committed its own work, or the
         run was read-only) or the commit could not be made.
         """
+        self._assert_current_process()
         message = (
             f"chore(agent): auto-commit work from run {run_id}\n"
             "\n"
@@ -103,7 +114,7 @@ class RunFinalizer:
         self.append_lifecycle_event_best_effort("auto_committed", run_id, head=head)
         return head
 
-    def mark_finalized(self, run_id: str) -> None:
+    def mark_finalized(self, run_id: str) -> bool:
         """Stamp the run's durability watermark — the last write of any
         finalization path (VOYN-W0-AICC-SRV-09-FINALIZED-AT).
 
@@ -120,11 +131,62 @@ class RunFinalizer:
         complete, where the failure in the other direction — declaring a run
         finalized when its report is missing — is the one that loses work.
         """
+        self._assert_current_process()
+        # Preserve idempotency without reopening SQLite *after* publishing the
+        # marker.  ``finalized_at`` must be the final local DB access in the
+        # successful path; otherwise a teardown/cutover reader can observe the
+        # watermark while this process is still able to recreate WAL/SHM files.
+        # Production callers enter through Supervisor's process-global per-run
+        # finalization lock, so same-owner Supervisors cannot race this window.
+        current = db.get_run(self.db_path, run_id)
+        if current is not None and current.get("finalized_at"):
+            return True
         try:
-            db.mark_run_finalized(self.db_path, run_id)
+            stored = db.mark_run_finalized(
+                self.db_path, run_id, owner_token=self.owner_token
+            )
         except Exception:
             logger.exception("Could not mark run %s finalized", run_id)
             self.append_lifecycle_event_best_effort("finalization_marker_failed", run_id)
+            return False
+        return bool(stored and stored.get("finalized_at"))
+
+    def finish_started_attempt(
+        self, current: dict, *, fallback_failure_reason: str
+    ) -> None:
+        """Idempotently close the provider attempt for a terminal run."""
+        self._assert_current_process()
+        run_id = current["id"]
+        attempts = db.list_provider_attempts(self.db_path, run_id)
+        if not attempts or attempts[-1]["outcome"] != "started":
+            return
+        reason = current.get("failure_reason") or fallback_failure_reason
+        state = current["state"]
+        if state == "COMPLETED":
+            attempt_outcome = "succeeded"
+            classification = provider_route.SUCCESS
+            disposition = provider_route.SUCCEEDED
+            error_code = None
+        elif state == "CANCELLED":
+            attempt_outcome = "cancelled"
+            classification = provider_route.CANCELLED
+            disposition = provider_route.TERMINAL
+            error_code = "cancelled"
+        else:
+            attempt_outcome = "failed"
+            classification = provider_route.classify_failure(reason)
+            disposition = provider_route.TERMINAL
+            error_code = reason
+        db.finish_provider_attempt(
+            self.db_path,
+            run_id=run_id,
+            attempt_number=attempts[-1]["attempt_number"],
+            outcome=attempt_outcome,
+            classification=classification,
+            disposition=disposition,
+            error_code=error_code,
+            completed_at=current.get("completed_at") or iso_now(),
+        )
 
     def persist_run_failure(
         self,
@@ -140,21 +202,19 @@ class RunFinalizer:
         All exception classes are retried: a transient SQLite failure must not
         permanently strand an exited run in an active state.
         """
-        def finish_started_attempt(current: dict) -> None:
-            attempts = db.list_provider_attempts(self.db_path, run_id)
-            if not attempts or attempts[-1]["outcome"] != "started":
-                return
-            reason = current.get("failure_reason") or failure_reason
-            db.finish_provider_attempt(
-                self.db_path,
-                run_id=run_id,
-                attempt_number=attempts[-1]["attempt_number"],
-                outcome="failed",
-                classification=provider_route.classify_failure(reason),
-                disposition=provider_route.TERMINAL,
-                error_code=reason,
-                completed_at=current.get("completed_at") or iso_now(),
+        self._assert_current_process()
+
+        def finish_terminal_persistence(current: dict) -> bool:
+            self.finish_started_attempt(
+                current, fallback_failure_reason=failure_reason
             )
+            self.append_lifecycle_event_best_effort(
+                lifecycle,
+                run_id,
+                exit_code=exit_code,
+            )
+            stored = db.get_run(self.db_path, run_id)
+            return bool(stored and stored["state"] in db.TERMINAL_STATES)
 
         for _ in range(TERMINAL_CAS_MAX_ATTEMPTS):
             try:
@@ -162,9 +222,12 @@ class RunFinalizer:
                 if current is None:
                     return True
                 if current["state"] in db.TERMINAL_STATES:
-                    if current["state"] == "FAILED":
-                        finish_started_attempt(current)
-                    return True
+                    # A terminal row may belong to another live supervisor
+                    # that is still writing its report/commit.  Only the
+                    # explicit finalization claim can authorize completing it;
+                    # the Supervisor recovery path verifies that ownership and
+                    # reconstructs the required artifacts before marking.
+                    return bool(current.get("finalized_at"))
                 if current["state"] not in db.EXECUTION_CENTER_ACTIVE_STATES:
                     return False
                 current = db.update_run_state(
@@ -178,20 +241,10 @@ class RunFinalizer:
                         "failure_reason": failure_reason,
                     },
                 )
-                finish_started_attempt(current)
-                self.append_lifecycle_event_best_effort(
-                    lifecycle,
-                    run_id,
-                    exit_code=exit_code,
-                )
-                # Last, as everywhere: this path *is* the whole finalization for
-                # a run whose supervision failed or whose child was confirmed
-                # gone — there is no report to wait for — so the marker goes
-                # after the attempt is finished and the lifecycle event is
-                # appended. Without it such runs would stay permanently
-                # unfinalized and the cutover predicate would never drain.
-                self.mark_finalized(run_id)
-                return True
+                # This helper persists only the terminal decision and provider
+                # attempt.  The owning Supervisor must still create/verify the
+                # immutable report before it may stamp finalized_at.
+                return finish_terminal_persistence(current)
             except (db.LostUpdateError, db.InvalidTransitionError):
                 continue
             except Exception:
@@ -206,6 +259,7 @@ class RunFinalizer:
         return False
 
     def persist_supervision_failure(self, run_id: str, *, exit_code: int | None) -> bool:
+        self._assert_current_process()
         return self.persist_run_failure(
             run_id,
             exit_code=exit_code,
@@ -220,6 +274,7 @@ class RunFinalizer:
         if no such event was persisted. Called only after both stdout/stderr
         reader threads have joined (see `_supervise`), so every event this
         run will ever produce is already committed to `run_event`."""
+        self._assert_current_process()
         result_events = db.list_run_events(self.db_path, run_id, after_seq=0, limit=1_000_000, event_type="result")
         if not result_events:
             return None
