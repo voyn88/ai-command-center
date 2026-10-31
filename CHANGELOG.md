@@ -8,6 +8,26 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Security — enforced the identity boundary decision for Streamlit (`VOYN-W0-AICC-CONSOLE-NO-AUTH`)
+- [ADR-0011](docs/adr/0011-streamlit-console-identity-boundary.md): the loopback-only bind
+  enforced by `VOYN-W0-AICC-STREAMLIT-EXPOSED-NO-AUTH` is a compensating control, not an
+  identity boundary. External deployment of the console (widening `AML_BIND_HOST`, or any
+  other way of making it reachable by more than "whoever has a shell on this host") is not
+  authorized until it sits behind an identity-aware reverse proxy consuming the same AIOS
+  identity surface `command_center/http_auth/` already consumes for the HTTP control plane
+  (`VOYN-W0-AICC-AUTH-HTTP-01`), or is retired in favor of a client that reaches parity for
+  privileged operations and adopts that boundary itself. A Streamlit-native auth layer is
+  rejected as a second identity/authz engine, forbidden by ADR-0008.
+- `command_center/console_identity.py` makes that decision fail-closed at runtime: an
+  off-loopback reach is refused, and no environment-variable proxy claim can bypass the gate.
+  `app.py` checks before loading data or rendering privileged controls; the AML container
+  entrypoint checks before seeding or starting Streamlit. Compose passes the published host
+  interface into the container so the gate evaluates actual reach rather than the private
+  namespace's required `0.0.0.0` listening socket.
+- `tests/test_console_identity_boundary.py` pins the address rule, refusal exit code, ordering,
+  compose/entrypoint wiring, and the absence of privileged UI controls after refusal. Comments in
+  every launch path, `docs/AIOS_BOUNDARY.md`, and `README.md` point to ADR-0011.
+
 ### Added — the one-button audit, wired into the web UI (`VOYN-W0-APP-CONTROL-S4`)
 
 - `web/src/screens/Tasks.tsx`: an `AuditLauncher` panel above the task list —
