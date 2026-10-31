@@ -102,6 +102,7 @@ def test_the_cli_gate_exits_ex_config_on_refusal() -> None:
     """The launch scripts read the exit code, not the message."""
     completed = subprocess.run(
         [sys.executable, "-m", "command_center.console_identity", "0.0.0.0"],
+        check=False,
         cwd=ROOT,
         env=os.environ,
         capture_output=True,
@@ -150,6 +151,7 @@ def _run_entrypoint(tmp_path: Path, env_overrides: dict[str, str]) -> tuple[int,
 
     completed = subprocess.run(
         ["bash", str(ENTRYPOINT)],
+        check=False,
         cwd=ROOT,
         env=env,
         capture_output=True,
@@ -261,5 +263,5 @@ def test_the_guard_runs_before_the_console_loads_anything(monkeypatch) -> None:
     """
     source = Path(APP_PATH).read_text()
     guard = source.index("console_identity.check(")
-    for later in ("tasks = load_tasks()", "shell.render_shell("):
+    for later in ("tasks = backlog_client.board_tasks(load_tasks())", "shell.render_shell("):
         assert guard < source.index(later), f"the ADR-0011 guard runs after {later!r}"
