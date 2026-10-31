@@ -20,7 +20,7 @@ import pytest
 pytest.importorskip("aios_db")
 
 from command_center.db import cli  # noqa: E402
-from command_center.orchestrator import review_merge  # noqa: E402
+from command_center.orchestrator import gh_access, review_merge  # noqa: E402
 
 
 class _Report:
@@ -57,6 +57,7 @@ def test_reconciliation_runs_between_review_and_marker_publication(monkeypatch):
     ):
         monkeypatch.setattr(review_merge, name, record(name))
 
+    monkeypatch.setattr(gh_access, "tick", lambda _path: nullcontext(SimpleNamespace(line=lambda: "quota")))
     monkeypatch.setattr(cli, "load_config", lambda: SimpleNamespace(redacted=lambda: ""))
     monkeypatch.setattr(cli.pool, "open_pool", lambda _config: None)
     monkeypatch.setattr(cli.pool, "close_pool", lambda: None)

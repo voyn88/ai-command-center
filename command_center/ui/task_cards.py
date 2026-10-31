@@ -33,8 +33,18 @@ from command_center import (
 )
 from command_center.runtime import api as runtime_api
 from command_center.runtime import session_view
-from command_center.ui import agent_launcher, confirm_dialog, inspector, legacy_task_helpers, tokens
-from command_center.ui.agent_launcher import ROOT, TASK_TYPE_LABELS, _get_execution_center_api
+from command_center.ui import (
+    agent_launcher,
+    confirm_dialog,
+    inspector,
+    legacy_task_helpers,
+    tokens,
+)
+from command_center.ui.agent_launcher import (
+    ROOT,
+    TASK_TYPE_LABELS,
+    _get_execution_center_api,
+)
 
 # Canonical sources (no duplicate vocabularies here — same rule app.py follows).
 PRIORITY_COLORS: dict[str, str] = tokens.PRIORITY_COLORS
@@ -98,6 +108,14 @@ def render_dependency_graph(task: dict, tasks_by_id: dict[str, dict]) -> None:
     if dot is None:
         st.caption("Нет связанных задач.")
         return
+    # The graph below is an image with no text alternative — plain-language
+    # sentences come first so a non-technical reader (or a screen reader)
+    # gets "why this matters" without needing to parse a node/arrow diagram.
+    narrative = task_view.dependency_narrative(task, tasks_by_id)
+    if narrative:
+        st.markdown("**Почему это важно**")
+        for line in narrative:
+            st.caption(f"- {line}")
     st.graphviz_chart(dot)
 
 
@@ -214,6 +232,18 @@ def render_task_card(
             if task.get("notes"):
                 st.caption(f"Заметки: {task['notes']}")
             st.caption(f"Репозиторий: `{task.get('repository_path') or '—'}` · Workspace: `{workspace_path or '—'}`")
+
+            if task.get("read_only"):
+                # A master-projection record is a window into the canonical
+                # backlog, not an operable console task: no launch, no queue,
+                # no manual status — the fleet's own pipeline is its only
+                # writer (VOYN-W0-AICC-WIRE-BACKLOG-API; save_tasks drops
+                # such records structurally even if a path slipped through).
+                st.info(
+                    "Задача центрального бэклога (read-only): исполняется "
+                    "флотом, управление — через конвейер, не через консоль."
+                )
+                return
 
             action_cols = st.columns(5)
             with action_cols[0]:
