@@ -1191,6 +1191,22 @@ def test_release_selection_arms_pending_selector_without_clobber(monkeypatch, tm
         transaction.select_release(release_id, tmp_path)
 
 
+def test_grok_driver_installs_from_release_as_worker_only_helper(tmp_path):
+    module = _module()
+    repo = Path(__file__).parents[2]
+    kwargs = {
+        "authority_env": tmp_path / "authority.env",
+        "claude_auth": tmp_path / "claude.json",
+        "codex_auth": tmp_path / "codex.json",
+        "resolve_identities": False,
+    }
+    specs = {s.target: s for s in module.default_specs(repo, **kwargs)}
+    driver = specs["/usr/libexec/aicc-grok-agent"]
+    assert driver.source == repo / "ops/aicc_grok_agent.py"
+    assert (driver.mode, driver.uid, driver.gid) == (0o755, 0, 0)
+    assert driver.target in module.WORKER_ONLY_TARGETS
+
+
 def test_recovery_generator_is_a_permanent_pretransaction_anchor(tmp_path):
     module = _module()
     repo = Path(__file__).parents[2]

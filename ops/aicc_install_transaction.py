@@ -5130,6 +5130,7 @@ WORKER_ONLY_TARGETS = frozenset(
         "/usr/lib/sysusers.d/aicc-agent.conf",
         "/usr/lib/tmpfiles.d/aicc-agent.conf",
         "/usr/libexec/aicc-agent-launcher",
+        "/usr/libexec/aicc-grok-agent",
         "/usr/libexec/aicc-staged-worker-rollout",
         "/usr/libexec/aicc-worker-release-deploy",
         "/etc/systemd/system/aicc-principal-recovery.service",
@@ -5363,6 +5364,13 @@ def default_specs(
         FileSpec(
             repo_root / "ops/aicc_agent_launcher.py",
             "/usr/libexec/aicc-agent-launcher",
+            0o755,
+            root_uid,
+            root_gid,
+        ),
+        FileSpec(
+            repo_root / "ops/aicc_grok_agent.py",
+            "/usr/libexec/aicc-grok-agent",
             0o755,
             root_uid,
             root_gid,

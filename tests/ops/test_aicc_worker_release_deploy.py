@@ -282,6 +282,20 @@ def test_committed_unit_files_are_root_hardened():
     assert "/run/aicc-staged-rollout.lock" in service
 
 
+def test_grok_driver_is_refreshed_from_selected_release(tmp_path):
+    module = _module()
+    cfg = _cfg(module, tmp_path)
+    body = b"#!/usr/bin/python3\n# bounded Grok driver\n"
+    _seed_helpers(cfg, SHA_A, release_bodies={"ops/aicc_grok_agent.py": body},
+                  installed={"aicc-grok-agent": b"old-driver"})
+    report = _deploy(module, cfg, resolve_sha=lambda _: SHA_A)
+    assert report.outcome == "NOOP"
+    target = cfg.libexec_dir / "aicc-grok-agent"
+    assert target.read_bytes() == body
+    if sys.platform != "win32":
+        assert stat.S_IMODE(target.stat().st_mode) == 0o755
+
+
 def test_changed_helper_is_replaced_with_mode_0755(tmp_path):
     module = _module()
     cfg = _cfg(module, tmp_path)

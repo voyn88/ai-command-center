@@ -42,12 +42,14 @@ import shutil
 import threading
 import uuid
 from contextlib import ExitStack
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 from command_center import agent_runner, project_config, workspace_provisioning
 from command_center.ops.source_clone_refresh import refresh_source_clone
 from command_center.orchestrator.publish import PublishConfig, publish_run
+from command_center.orchestrator.routing import cascade_for
 from command_center.worker import writer_lease
 from command_center.worker.daemon import Handler, HandlerOutcome
 from command_center.worker.payloads import PayloadError, parse_agent_run
@@ -283,8 +285,8 @@ def _read_only_isolated_checkout(
         if present is None or present.returncode != 0:
             return (
                 None,
-                f"review_head {pin_sha} is not in the bound clone yet "
-                "(the lane cannot fetch; the source mirror catches up)",
+                (f"review_head {pin_sha} is not in the bound clone yet "
+                 "(the lane cannot fetch; the source mirror catches up)"),
                 True,
             )
         sha = pin_sha
@@ -373,8 +375,8 @@ def _read_only_isolated_checkout(
         observed = at.stdout.strip() if at is not None else "unknown"
         return (
             None,
-            f"read-only isolated checkout verification failed: HEAD is {observed}"
-            f" (expected detached {sha})",
+            (f"read-only isolated checkout verification failed: HEAD is {observed}"
+             f" (expected detached {sha})"),
             True,
         )
     return target, None, False
@@ -511,6 +513,11 @@ def _same_mutability_class(current_task_type: str, candidate_task_type: str) -> 
 
 
 def _executor_preflight(executor: str, task_type: str) -> tuple[bool, str, str]:
+    exhausted_until = agent_runner.executor_exhausted_until(executor)
+    if exhausted_until is not None:
+        return False, f"quota exhausted until {exhausted_until.isoformat()}", f"{executor} quota exhausted"
+    if executor == "cursor" and task_type in agent_runner.MODEL_ONLY_TASK_TYPES:
+        return False, "Cursor cannot guarantee zero tools", "model-only executor unavailable"
     if executor == "openai_http":
         # No CLI to probe and no principal to isolate: the bridge is this
         # checkout's own module. Availability is exactly "a provider key is
@@ -544,6 +551,17 @@ def _run_agent(
         return HandlerOutcome(
             ok=False, reason=request.reason, retryable=request.retryable
         )
+
+    # Explicit operator profile also covers already queued subscription work.
+    # Preserve the requested capability class, prompt, task and idempotency key.
+    if os.environ.get("AICC_EXECUTOR_PROFILE") == "owner-alternatives":
+        requested_type = request.task_type
+        request = replace(request, cascade=tuple(
+            {**entry, "task_type": requested_type}
+            for entry in cascade_for("implementation")
+            if requested_type not in agent_runner.MODEL_ONLY_TASK_TYPES
+            or entry["executor"] == "grok"
+        ))
 
     link = _cascade_link(request, attempt_no)
     cascade_step = (
@@ -1032,7 +1050,12 @@ def _run_agent(
                 and not lease_lost.is_set()
             ):
                 result_text = agent_runner.extract_result_text(run.stdout)
-                provider_failure = run.is_executor_provider_error(executor) or (
+                quota_signature = run.executor_quota_signature(executor)
+                if quota_signature is not None:
+                    agent_runner.record_executor_exhausted(
+                        executor, cooldown_seconds=60 if executor == "grok" else 1800,
+                    )
+                provider_failure = quota_signature is not None or run.is_executor_provider_error(executor) or (
                     executor == "copilot"
                     and task_type not in agent_runner.MUTATING_TASK_TYPES
                     and run.status != "completed"
