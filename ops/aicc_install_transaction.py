@@ -2266,7 +2266,19 @@ def verify_service_snapshot_closure(
 #: The legacy worker units are taken from `RETIRED_LEGACY_UNITS` rather than
 #: relisted: a name that drifts between the two would leave a worker unit
 #: running on a control host whose unit file this generation just removed.
-CONTROL_PURGE_UNITS = frozenset({"aicc-agent-launcher.socket"}) | RETIRED_LEGACY_UNITS
+#: Credential rotation is a worker-host substrate (lanes, worker.env, pgtunnel).
+#: control-01 had `voyn-aicc-credential-rotation.timer` hand-linked from
+#: `~/aicc-systemd`; with only `OnUnitInactiveSec=` and a service that never
+#: ran on control it stayed `Result=resources`. The rotator does not belong
+#: on the control profile at all — purge it on conversion
+#: (VOYN-W0-AICC-OPT-AICC-GROUP-WRITABLE-BREAKS-LAUNCHER related).
+CONTROL_PURGE_UNITS = frozenset(
+    {
+        "aicc-agent-launcher.socket",
+        "voyn-aicc-credential-rotation.service",
+        "voyn-aicc-credential-rotation.timer",
+    }
+) | RETIRED_LEGACY_UNITS
 
 
 #: Ordinary worker clients and the admission socket should stop promptly.
@@ -5101,6 +5113,8 @@ WORKER_ONLY_TARGETS = frozenset(
         "/etc/systemd/system/aicc-agent-launcher@.service",
         "/etc/systemd/system/voyn-aicc-source-clone-refresh.service",
         "/etc/systemd/system/voyn-aicc-source-clone-refresh.timer",
+        "/etc/systemd/system/voyn-aicc-credential-rotation.service",
+        "/etc/systemd/system/voyn-aicc-credential-rotation.timer",
         "/etc/aicc/agent-workspace-roots",
         "/etc/aicc/worker-lanes",
         "/etc/aicc/gitconfig",
@@ -5241,8 +5255,11 @@ def default_specs(
     CONTROL-PLANE-REPO-OWNED-UNITS, one at a time as each is needed.
     `CONTROL_ONLY_UNITS` is the set that has arrived: the PR review-window
     tick, which had never been installed on control-01 at all. The rest
-    (planner, review, merge, reaper, rotation) are still symlinks into the
-    operator's home and still follow.
+    (planner, review, merge, reaper) are still symlinks into the operator's
+    home and still follow. Credential rotation is deliberately NOT among
+    them and NOT a home-symlink follow-on: it is worker-only substrate
+    (lanes + worker.env + pgtunnel) and is purged from a control host via
+    `CONTROL_PURGE_UNITS` / `WORKER_ONLY_TARGETS`.
 
     What the transition does and does not remove, stated exactly, because
     "the agent principal is absent" is a claim this cannot make:
@@ -5302,6 +5319,23 @@ def default_specs(
             repo_root / "ops/aicc_exact_sha_bootstrap.py",
             "/usr/local/sbin/voyn-aicc-bootstrap",
             0o755,
+            root_uid,
+            root_gid,
+        ),
+        # Privileged publisher for per-host self-deploy: voynadmin stages and
+        # selects releases only through this helper so /opt/aicc stays
+        # root-owned 0755 (VOYN-W0-AICC-OPT-AICC-GROUP-WRITABLE-BREAKS-LAUNCHER).
+        FileSpec(
+            repo_root / "deploy/voyn-aicc-release-helper",
+            "/usr/local/sbin/voyn-aicc-release-helper",
+            0o755,
+            root_uid,
+            root_gid,
+        ),
+        FileSpec(
+            repo_root / "deploy/sudoers.d/voyn-aicc-self-deploy",
+            "/etc/sudoers.d/voyn-aicc-self-deploy",
+            0o440,
             root_uid,
             root_gid,
         ),

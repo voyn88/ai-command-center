@@ -51,6 +51,13 @@ __all__ = ["SelfDeployConfig", "SelfDeployReport", "self_deploy_once"]
 _DEPENDENCY_MANIFESTS = re.compile(
     r"(^|/)(uv\.lock|pyproject\.toml|requirements[^/]*\.txt|package(-lock)?\.json)$"
 )
+#: Production immutable release root. Staging and selecting here MUST go
+#: through the root-owned helper: voynadmin never owns `/opt/aicc/releases`
+#: or `/opt/aicc/current`. Hand-widening `/opt/aicc` to 2775 so the tick could
+#: write it directly made `_validate_binary` refuse every executor under
+#: `/opt/aicc/toolchains` (fleet outage 2026-09-11 → 2026-09-14).
+PRODUCTION_RELEASE_ROOT = Path("/opt/aicc")
+RELEASE_HELPER = Path("/usr/local/sbin/voyn-aicc-release-helper")
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,6 +132,24 @@ def _systemctl(args: list[str], timeout: int) -> subprocess.CompletedProcess[str
     return _run_bounded(["sudo", "-n", "systemctl", *args], timeout)
 
 
+def _privileged_release_root(release_root: Path) -> bool:
+    """Whether this release root is the production tree voynadmin must not own."""
+    try:
+        return release_root.resolve() == PRODUCTION_RELEASE_ROOT.resolve()
+    except OSError:
+        return os.path.normpath(str(release_root)) == str(PRODUCTION_RELEASE_ROOT)
+
+
+def _release_helper(
+    args: list[str], timeout: int
+) -> subprocess.CompletedProcess[str]:
+    """Passwordless-sudo release publisher (deploy/sudoers.d/voyn-aicc-self-deploy)."""
+    return _run_bounded(
+        ["sudo", "-n", str(RELEASE_HELPER), "--release-root", str(PRODUCTION_RELEASE_ROOT), *args],
+        timeout,
+    )
+
+
 def _run_migrations(repo_path: str, timeout: int) -> subprocess.CompletedProcess[str]:
     # cwd=repo_path is load-bearing (review of f794b3e): the runtime package
     # is imported from the checkout, not installed into the venv -- without
@@ -193,6 +218,16 @@ def _point_current_at(current_link: Path, selector: str) -> None:
         and not re.fullmatch(r"releases/[0-9a-f]{40}", selector)
     ):
         raise RuntimeError("release selector is invalid")
+    if _privileged_release_root(current_link.parent):
+        restored = _release_helper(
+            ["select-previous", "--selector", selector],
+            60,
+        )
+        if restored.returncode != 0:
+            raise RuntimeError(
+                f"privileged release restore failed: {restored.stderr.strip()[:200]}"
+            )
+        return
     tmp = current_link.with_name(f".{current_link.name}.next")
     try:
         tmp.unlink()
@@ -215,12 +250,47 @@ def _tracked_files(repo_path: str, timeout: int) -> list[str]:
     return [name for name in listed.stdout.split("\0") if name]
 
 
+def _stage_via_helper(
+    repo_path: str, cfg: SelfDeployConfig, sha: str
+) -> tuple[Path, str]:
+    """Stage + read prior selector through the root-owned release helper."""
+    previous = _release_helper(["current"], cfg.command_timeout)
+    if previous.returncode != 0:
+        raise RuntimeError(
+            f"privileged release current failed: {previous.stderr.strip()[:200]}"
+        )
+    previous_selector = previous.stdout.strip() or "ABSENT"
+    stage_args = ["stage", "--repo", repo_path, "--sha", sha]
+    if cfg.release_venv is not None:
+        stage_args.extend(["--venv", cfg.release_venv])
+    else:
+        default_venv = Path(repo_path) / ".venv"
+        if default_venv.exists():
+            stage_args.extend(["--venv", str(default_venv)])
+    staged = _release_helper(stage_args, cfg.command_timeout)
+    if staged.returncode != 0:
+        raise RuntimeError(
+            f"privileged release stage failed: {staged.stderr.strip()[:200]}"
+        )
+    return PRODUCTION_RELEASE_ROOT / _selector_for_sha(sha), previous_selector
+
+
+def _select_via_helper(sha: str, timeout: int) -> None:
+    selected = _release_helper(["select", "--sha", sha], timeout)
+    if selected.returncode != 0:
+        raise RuntimeError(
+            f"privileged release select failed: {selected.stderr.strip()[:200]}"
+        )
+
+
 def _stage_immutable_release(
     repo_path: str, cfg: SelfDeployConfig, sha: str
 ) -> tuple[Path, str]:
     if cfg.release_root is None:
         return Path(repo_path), "ABSENT"
     release_root = Path(cfg.release_root)
+    if _privileged_release_root(release_root):
+        return _stage_via_helper(repo_path, cfg, sha)
     selector = _selector_for_sha(sha)
     release_dir = release_root / selector
     current_link = release_root / "current"
@@ -316,7 +386,17 @@ def self_deploy_once(
     if same_sha and cfg.release_root is not None:
         release_root = Path(cfg.release_root)
         try:
-            current_selector = _current_selector(release_root / "current")
+            if _privileged_release_root(release_root):
+                current = _release_helper(["current"], timeout)
+                if current.returncode != 0:
+                    return finish(
+                        "failed",
+                        "release_selector_read_failed: "
+                        f"{current.stderr.strip()[:200]}",
+                    )
+                current_selector = current.stdout.strip() or "ABSENT"
+            else:
+                current_selector = _current_selector(release_root / "current")
         except (OSError, RuntimeError) as exc:
             return finish("failed", f"release_selector_read_failed: {exc}")
         release_selector = _selector_for_sha(report.target_sha)
@@ -449,9 +529,13 @@ def self_deploy_once(
 
     if cfg.release_root is not None:
         try:
-            _point_current_at(
-                Path(cfg.release_root) / "current", _selector_for_sha(report.target_sha)
-            )
+            if _privileged_release_root(Path(cfg.release_root)):
+                _select_via_helper(report.target_sha, timeout)
+            else:
+                _point_current_at(
+                    Path(cfg.release_root) / "current",
+                    _selector_for_sha(report.target_sha),
+                )
         except (OSError, RuntimeError) as exc:
             return rollback(f"release_selector_failed: {exc}", services_touched=False)
         selector_flipped = True

@@ -498,15 +498,38 @@ def principal_workspace_root(
 def principal_executor_preflight(executor: str) -> tuple[bool, str]:
     """Cheap worker-side check for the fixed root-owned provider path.
 
-    The privileged broker repeats ownership/mode validation.  This check only
-    avoids spending a queue attempt when deployment is visibly incomplete.
+    Mirrors the launcher's `_validate_binary` ancestor rule closely enough to
+    refuse a group-writable `/opt/aicc` (fleet outage 2026-09-11) as
+    `AICC_AGENT_LAUNCH_INFRA_FAILURE` before a queue attempt is spent. The
+    privileged broker still re-validates at launch.
     """
     binary = PRINCIPAL_EXECUTOR_BINARIES.get(executor)
     if binary is None:
         return False, f"executor {executor!r} is not allowlisted"
-    if Path(binary).is_file() and os.access(binary, os.X_OK):
-        return True, ""
-    return False, f"isolated executor binary is unavailable: {binary}"
+    candidate = Path(binary)
+    try:
+        if not candidate.is_file() or not os.access(candidate, os.X_OK):
+            return False, f"isolated executor binary is unavailable: {binary}"
+        resolved = candidate.resolve(strict=True)
+    except OSError:
+        return False, f"isolated executor binary is unavailable: {binary}"
+    for chain in (candidate.parents, resolved.parents):
+        for parent in chain:
+            try:
+                info = parent.stat()
+            except OSError as exc:
+                return (
+                    False,
+                    f"{_PRINCIPAL_ISOLATION_FAILURE}: executor path component "
+                    f"unreadable: {parent}: {exc}",
+                )
+            if info.st_uid != 0 or info.st_mode & 0o022:
+                return (
+                    False,
+                    f"{_PRINCIPAL_ISOLATION_FAILURE}: executor path component "
+                    f"is not immutable root-owned: {parent}",
+                )
+    return True, ""
 
 
 def _principal_launcher_environment() -> dict[str, str]:
@@ -697,6 +720,17 @@ def codex_workspace_write_preflight() -> tuple[bool, str]:
                 _codex_workspace_write_preflight_result = (
                     False,
                     f"Codex workspace-write sandbox unavailable: {detail}",
+                )
+            elif run.is_principal_isolation_error:
+                # Preserve the launcher marker so the worker classifies this as
+                # infra_wait (no attempt burn, no cascade_exhausted park) —
+                # VOYN-W0-AICC-OPT-AICC-GROUP-WRITABLE-BREAKS-LAUNCHER.
+                detail = diagnostic[-400:] or _PRINCIPAL_ISOLATION_FAILURE
+                return (
+                    False,
+                    detail
+                    if detail.startswith(f"{_PRINCIPAL_ISOLATION_FAILURE}:")
+                    else f"{_PRINCIPAL_ISOLATION_FAILURE}: {detail}",
                 )
             elif run.status != "completed":
                 detail = diagnostic[-400:] or f"exit_code={run.exit_code!r}"

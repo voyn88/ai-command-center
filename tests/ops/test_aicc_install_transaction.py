@@ -3460,6 +3460,18 @@ def test_the_control_purge_covers_every_retired_worker_unit():
 
     assert module.RETIRED_LEGACY_UNITS < module.CONTROL_PURGE_UNITS
     assert "aicc-agent-launcher.socket" in module.CONTROL_PURGE_UNITS
+    # Credential rotation is worker-only substrate; a hand-linked timer on
+    # control-01 sat Result=resources forever (OnUnitInactiveSec-only).
+    assert "voyn-aicc-credential-rotation.timer" in module.CONTROL_PURGE_UNITS
+    assert "voyn-aicc-credential-rotation.service" in module.CONTROL_PURGE_UNITS
+    assert (
+        "/etc/systemd/system/voyn-aicc-credential-rotation.timer"
+        in module.WORKER_ONLY_TARGETS
+    )
+    assert (
+        "/etc/systemd/system/voyn-aicc-credential-rotation.service"
+        in module.WORKER_ONLY_TARGETS
+    )
     assert (
         "/etc/systemd/system/voyn-aicc-source-clone-refresh.service"
         in module.WORKER_ONLY_TARGETS

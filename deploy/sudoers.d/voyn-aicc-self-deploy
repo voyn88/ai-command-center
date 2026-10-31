@@ -1,0 +1,13 @@
+# Installed as /etc/sudoers.d/voyn-aicc-self-deploy (root:root 0440).
+# The self-deploy tick runs as voynadmin and may only publish/select releases
+# through the root-owned helper. It never receives a grant to write into
+# /opt/aicc directly — that is what made the 2775 hand-fix necessary and
+# what took the launcher down (VOYN-W0-AICC-OPT-AICC-GROUP-WRITABLE-BREAKS-LAUNCHER).
+# --release-root is fixed to /opt/aicc so the helper cannot be pointed at an
+# attacker-chosen tree.
+Cmnd_Alias VOYN_AICC_SELF_DEPLOY_RELEASE = \
+ /usr/local/sbin/voyn-aicc-release-helper --release-root /opt/aicc current, \
+ /usr/local/sbin/voyn-aicc-release-helper --release-root /opt/aicc stage *, \
+ /usr/local/sbin/voyn-aicc-release-helper --release-root /opt/aicc select *, \
+ /usr/local/sbin/voyn-aicc-release-helper --release-root /opt/aicc select-previous *
+voynadmin ALL=(root) NOPASSWD: VOYN_AICC_SELF_DEPLOY_RELEASE

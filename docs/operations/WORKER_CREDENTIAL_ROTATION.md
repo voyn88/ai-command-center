@@ -3,6 +3,13 @@
 `command_center.ops.credential_rotation` is the only supported worker-host
 rotation path. It replaces the untracked `~/aicc-preprod/rotate.py`.
 
+**Control hosts must not run this timer.** The rotator drains/reloads worker
+lanes against `worker.env` and the pgtunnel; none of that substrate exists on
+control. A hand-linked `voyn-aicc-credential-rotation.timer` from
+`~/aicc-systemd` on control-01 stayed `Result=resources` (OnUnitInactiveSec-only
+with a service that never became active). The control install profile purges
+the unit files and disables the timer; restore it only on worker hosts.
+
 ## Safety protocol
 
 1. The controller takes a non-blocking host lock, requires `worker.env`, waits

@@ -300,6 +300,10 @@ def test_principal_isolation_failure_is_retryable_not_a_task_result(
     )
     assert not outcome.ok
     assert outcome.retryable
+    assert outcome.infra_wait, (
+        "AICC_AGENT_LAUNCH_INFRA_FAILURE must refund via infra_wait "
+        "(no attempt burn, no cascade_exhausted park)"
+    )
     assert "agent principal isolation" in outcome.reason
     assert not removed, "ambiguous launcher failure must preserve task-local work"
 

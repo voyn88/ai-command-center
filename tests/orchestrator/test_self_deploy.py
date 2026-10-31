@@ -279,6 +279,61 @@ def test_committed_control_unit_deploys_an_immutable_release():
         in service
     )
     assert "exec /opt/aicc/current/.venv/bin/python" in service
+    # voynadmin never writes /opt/aicc directly; the sudoers grant is the
+    # only publish surface (VOYN-W0-AICC-OPT-AICC-GROUP-WRITABLE-BREAKS-LAUNCHER).
+    sudoers = (root / "deploy/sudoers.d/voyn-aicc-self-deploy").read_text()
+    assert "voyn-aicc-release-helper" in sudoers
+    assert "NOPASSWD: VOYN_AICC_SELF_DEPLOY_RELEASE" in sudoers
+    assert "User=voynadmin" in service
+
+
+def test_production_release_root_goes_through_the_privileged_helper(
+    pair, calls, tmp_path, monkeypatch
+):
+    """/opt/aicc staging must not run as voynadmin against a group-writable
+    tree. The tick calls the root-owned helper instead."""
+    origin, clone, _first = pair
+    new = _commit(origin, "advance")
+    helper_calls: list[list[str]] = []
+
+    def fake_helper(args, timeout):
+        helper_calls.append(list(args))
+        if args[:1] == ["current"]:
+            return subprocess.CompletedProcess(args, 0, "ABSENT\n", "")
+        if args[:1] == ["stage"]:
+            return subprocess.CompletedProcess(
+                args, 0, f"AICC_RELEASE_STAGED releases/{new}\n", ""
+            )
+        if args[:1] == ["select"]:
+            return subprocess.CompletedProcess(
+                args, 0, f"AICC_RELEASE_SELECTED releases/{new} previous=ABSENT\n", ""
+            )
+        return subprocess.CompletedProcess(args, 1, "", "unexpected")
+
+    monkeypatch.setattr(self_deploy, "_release_helper", fake_helper)
+    monkeypatch.setattr(
+        self_deploy,
+        "_privileged_release_root",
+        lambda path: True,
+    )
+
+    report = self_deploy_once(
+        str(clone),
+        _cfg(
+            tmp_path,
+            migrate=True,
+            release_root="/opt/aicc",
+            release_venv=str(tmp_path / "runtime-venv"),
+        ),
+    )
+
+    assert (report.outcome, report.detail) == ("deployed", new)
+    assert helper_calls[0] == ["current"]
+    assert helper_calls[1][0] == "stage"
+    assert "--sha" in helper_calls[1] and new in helper_calls[1]
+    assert helper_calls[2] == ["select", "--sha", new]
+    assert "release_selected:" + new in report.steps
+    assert calls["smoke_cwd"] == str(self_deploy.PRODUCTION_RELEASE_ROOT / f"releases/{new}")
 
 
 def test_committed_worker_unit_deploys_an_immutable_release_without_migrations():

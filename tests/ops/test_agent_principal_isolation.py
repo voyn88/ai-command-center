@@ -1929,6 +1929,51 @@ def test_boundary_flag_check_skips_a_retired_legacy_family_unit_but_not_a_lane()
     assert "isolation flag did not reach $family_unit exactly" in block
 
 
+def test_boundary_script_probes_opt_aicc_immutability_as_a_lane_input():
+    """VOYN-W0-AICC-OPT-AICC-GROUP-WRITABLE-BREAKS-LAUNCHER: /opt/aicc mode and
+    every executor path component must be measured before lanes start."""
+    script = (
+        Path(__file__).parents[2] / "ops" / "verify-agent-principal-boundary.sh"
+    ).read_text()
+    assert '[ "$opt_aicc_mode" = 755 ]' in script
+    assert "/opt/aicc is group/other-writable" in script
+    assert "executor path component is group/other-writable" in script
+    assert "executor path component is not root-owned" in script
+
+
+def test_principal_executor_preflight_refuses_a_group_writable_ancestor(monkeypatch):
+    """Worker-side preflight surfaces AICC_AGENT_LAUNCH_INFRA_FAILURE so the
+    attempt is refunded as infra_wait instead of cascade_exhausted."""
+    from pathlib import Path as PathType
+
+    from command_center import agent_runner
+
+    binary = "/opt/aicc/toolchains/current/bin/claude"
+    monkeypatch.setitem(agent_runner.PRINCIPAL_EXECUTOR_BINARIES, "claude", binary)
+
+    class _Info:
+        def __init__(self, uid: int, mode: int) -> None:
+            self.st_uid = uid
+            self.st_mode = mode
+
+    monkeypatch.setattr(PathType, "is_file", lambda self: str(self) == binary)
+    monkeypatch.setattr(PathType, "resolve", lambda self, strict=True: PathType(binary))
+    monkeypatch.setattr(
+        PathType,
+        "stat",
+        lambda self: _Info(0, 0o040775)
+        if str(self) == "/opt/aicc"
+        else _Info(0, 0o040755),
+    )
+    monkeypatch.setattr(os, "access", lambda path, mode: True)
+
+    available, detail = agent_runner.principal_executor_preflight("claude")
+    assert available is False
+    assert detail.startswith("AICC_AGENT_LAUNCH_INFRA_FAILURE:")
+    assert "not immutable root-owned" in detail
+    assert "/opt/aicc" in detail
+
+
 def test_executor_symlink_is_judged_by_owner_only_and_its_target_by_mode(launcher):
     """VOYN-W0-AICC-LAUNCHER-PARENT-RULE-REJECTS-WORKER-OWNED-WORKSPACES: a
     symlink's mode is always 0777 and means nothing; refusing it on `& 0o022`

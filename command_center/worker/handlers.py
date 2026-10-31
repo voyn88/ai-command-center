@@ -657,6 +657,10 @@ def _run_agent(
                 ),
                 retryable=True,
             )
+        # AICC_AGENT_LAUNCH_INFRA_FAILURE (group-writable /opt/aicc, dead
+        # launcher socket, ...) is substrate failure: refund via infra_wait,
+        # never burn the cascade into cascade_exhausted parking
+        # (VOYN-W0-AICC-OPT-AICC-GROUP-WRITABLE-BREAKS-LAUNCHER).
         return HandlerOutcome(
             ok=False,
             reason=f"{unavailable_reason}: {detail}",
