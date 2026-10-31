@@ -659,7 +659,20 @@ def retention_cutoff(db_path: Path, *, retention_days: int) -> tuple[str, str, s
     return cutoff, zone_name, source
 
 
-def apply_runtime_retention(db_path: Path, *, retention_days: int) -> int:
+#: Fixed number of `run_event` rows one `DELETE` may touch. A neglected
+#: database can accumulate an unbounded backlog of doomed rows; without this,
+#: a single sweep would run one `DELETE` matching all of them inside one
+#: `BEGIN IMMEDIATE`, holding the write lock for however long that takes
+#: (`VOYN-W0-AICC-RETENTION-UNBOUNDED-DELETE`).
+RUNTIME_RETENTION_BATCH_SIZE = 500
+
+
+def apply_runtime_retention(
+    db_path: Path,
+    *,
+    retention_days: int,
+    batch_size: int = RUNTIME_RETENTION_BATCH_SIZE,
+) -> int:
     """Delete `run_event` rows (and orphaned `report` rows) for runs that have
     been terminal for longer than `retention_days`, returning the number of
     `run_event` rows removed.
@@ -676,32 +689,66 @@ def apply_runtime_retention(db_path: Path, *, retention_days: int) -> int:
       * the run row itself is kept (its `state`/`completed_at` remain visible
         in the Execution Center and to reconciliation); only the bulky
         per-output-event history is pruned;
-      * runs with a NULL `completed_at` are left untouched.
+      * runs with a NULL `completed_at` are left untouched;
+      * deletion happens `batch_size` rows at a time, each batch its own short
+        `BEGIN IMMEDIATE`/`COMMIT`, so the write lock is only ever held for one
+        bounded batch — never for the whole backlog at once.
+
+    Batching is not free: the sweep used to be one transaction, so it was
+    all-or-nothing. It no longer is. If a batch raises (SQLITE_BUSY past the
+    retry budget, a full disk, a corrupt page), that batch rolls back but every
+    batch that already committed stays committed, and the return value — the
+    only place the count lives — is lost with the exception. Callers must read
+    a raised error as "an unknown number of rows, up to the whole backlog, may
+    already be gone", not as "nothing happened". Deleting *some* old terminal
+    events early is harmless in a way half-deleting live state would not be,
+    which is why this is an acceptable trade here and not a general one; the
+    next call simply resumes from what is left. `maintenance.archive_and_prune`
+    makes the same trade, but because it also writes a cold archive it can
+    afford to name the exact count and the backup that undoes the run.
 
     Does not VACUUM here — reclaiming disk is a separate, heavier, lock-holding
     operation the operator should run deliberately (see `maybe_apply_runtime_retention`).
     """
     if retention_days <= 0:
         return 0
+    if batch_size <= 0:
+        # SQLite treats a negative `LIMIT` as unbounded, which would silently
+        # undo the batching this function exists to guarantee.
+        raise ValueError("batch_size must be positive")
     cutoff, _zone, _zone_source = db.retention_cutoff(
         db_path, retention_days=retention_days
     )
     placeholders = ",".join("?" for _ in db.TERMINAL_STATES)
+    removed = 0
     with db.connect(db_path) as conn:
-        with db.transaction(conn):
-            cur = conn.execute(
-                f"""
-                DELETE FROM run_event
-                 WHERE run_id IN (
-                    SELECT id FROM run
-                     WHERE state IN ({placeholders})
-                       AND completed_at IS NOT NULL
-                       AND completed_at < ?
-                 )
-                """,
-                (*db.TERMINAL_STATES, cutoff),
-            )
-            removed = cur.rowcount
+        while True:
+            with db.transaction(conn):
+                batch_ids = [
+                    row["id"]
+                    for row in conn.execute(
+                        f"""
+                        SELECT id FROM run_event
+                         WHERE run_id IN (
+                            SELECT id FROM run
+                             WHERE state IN ({placeholders})
+                               AND completed_at IS NOT NULL
+                               AND completed_at < ?
+                         )
+                         ORDER BY id
+                         LIMIT ?
+                        """,
+                        (*db.TERMINAL_STATES, cutoff, batch_size),
+                    ).fetchall()
+                ]
+                if not batch_ids:
+                    break
+                id_placeholders = ",".join("?" for _ in batch_ids)
+                cur = conn.execute(
+                    f"DELETE FROM run_event WHERE id IN ({id_placeholders})",
+                    batch_ids,
+                )
+                removed += cur.rowcount
         # `report` rows cascade-delete with `run` via FK, but a terminal run's
         # report file on disk is also historical; leave the DB row (the path is
         # small) — only events are bulky.

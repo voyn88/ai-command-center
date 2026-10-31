@@ -28,6 +28,13 @@ Usage:
 
 `--apply` refuses to run unless `--backup` names a file that does not yet
 exist; the database is copied there first. There is no undo otherwise.
+
+Deletion runs in fixed-size batches (`PRUNE_BATCH_SIZE`), not one sweep, so a
+long-neglected database cannot put its entire backlog into a single statement
+or a single write-lock hold (`VOYN-W0-AICC-RETENTION-UNBOUNDED-DELETE`). The
+trade is that a failure part-way through is *not* a no-op: whatever batches
+committed stay committed, the script says how many, and the backup is the way
+back.
 """
 
 from __future__ import annotations
@@ -52,6 +59,33 @@ _CHILD_TABLES: tuple[str, ...] = (
     "completion",
 )
 
+#: How many runs one statement may name. Every DELETE here binds one SQL
+#: variable per run, so an unbatched sweep of a long-neglected database both
+#: holds the write lock for the whole backlog and can blow past SQLite's
+#: SQLITE_LIMIT_VARIABLE_NUMBER (999 on builds before 3.32) outright
+#: (`VOYN-W0-AICC-RETENTION-UNBOUNDED-DELETE`).
+PRUNE_BATCH_SIZE = 500
+
+
+def _existing_child_tables(conn) -> tuple[str, ...]:
+    """The subset of `_CHILD_TABLES` this schema actually has.
+
+    Resolved once, up front, rather than by catching an error per table per
+    batch: that catch could not tell "this old schema has no `completion`
+    table" apart from "this DELETE failed for a real reason", and swallowing
+    the latter would let the run rows go while their child rows stayed.
+    """
+    present = {
+        row["name"]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    missing = [t for t in _CHILD_TABLES if t not in present]
+    for table in missing:
+        print(f"  пропущено {table}: нет в этой схеме")
+    return tuple(t for t in _CHILD_TABLES if t in present)
+
 
 def debug_artifacts(db_path: Path) -> list[dict]:
     """Runs that are debugging residue. See the module docstring for why the
@@ -64,18 +98,35 @@ def debug_artifacts(db_path: Path) -> list[dict]:
     ]
 
 
-def prune(db_path: Path, run_ids: list[str]) -> None:
+def prune(db_path: Path, run_ids: list[str], *, batch_size: int = PRUNE_BATCH_SIZE) -> None:
+    """Delete `run_ids` and their child rows, `batch_size` runs per transaction.
+
+    Batched rather than one sweep so no single statement names the whole
+    backlog and no single transaction holds the write lock for it
+    (`VOYN-W0-AICC-RETENTION-UNBOUNDED-DELETE`). Within a batch the order is
+    still children-first, so no statement leaves a row pointing at a deleted
+    parent whatever the schema's cascade rules.
+
+    The cost of batching is that this is no longer all-or-nothing: if a batch
+    raises, that batch rolls back but every batch already committed stays
+    committed. The `--backup` this script demands before `--apply` is the way
+    back, and `main` reports what actually got through.
+    """
     if not run_ids:
         return
-    placeholders = ", ".join("?" for _ in run_ids)
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
     with db.connect(db_path) as conn:
-        with db.transaction(conn):
-            for table in _CHILD_TABLES:
-                try:
-                    conn.execute(f"DELETE FROM {table} WHERE run_id IN ({placeholders})", run_ids)
-                except Exception as exc:  # noqa: BLE001 — a table may not exist on older schemas
-                    print(f"  пропущено {table}: {type(exc).__name__}")
-            conn.execute(f"DELETE FROM run WHERE id IN ({placeholders})", run_ids)
+        child_tables = _existing_child_tables(conn)
+        for start in range(0, len(run_ids), batch_size):
+            batch = run_ids[start : start + batch_size]
+            placeholders = ", ".join("?" for _ in batch)
+            with db.transaction(conn):
+                for table in child_tables:
+                    conn.execute(
+                        f"DELETE FROM {table} WHERE run_id IN ({placeholders})", batch
+                    )
+                conn.execute(f"DELETE FROM run WHERE id IN ({placeholders})", batch)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -113,7 +164,20 @@ def main(argv: list[str] | None = None) -> int:
     shutil.copy2(db_path, args.backup)
     print(f"\nБэкап: {args.backup}")
 
-    prune(db_path, [run["id"] for run in doomed])
+    try:
+        prune(db_path, [run["id"] for run in doomed])
+    except Exception as exc:  # noqa: BLE001 — report what committed, then fail
+        # Deletion is batched, so a failure here is not a no-op: say how far it
+        # actually got instead of letting the operator assume nothing changed.
+        left = len(debug_artifacts(db_path))
+        print(f"\nОШИБКА при удалении: {type(exc).__name__}: {exc}", file=sys.stderr)
+        print(
+            f"Удаление идёт батчами по {PRUNE_BATCH_SIZE}, поэтому уже зафиксировано: "
+            f"удалено {len(doomed) - left}, осталось {left}. "
+            f"Полный откат: восстановите БД из {args.backup}.",
+            file=sys.stderr,
+        )
+        return 1
     print(f"Удалено: {len(doomed)}  ·  Осталось: {len(db.list_runs(db_path))}")
     return 0
 
