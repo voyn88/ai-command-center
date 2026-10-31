@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Cost-per-meaningful-task report CLI (VOYN-MIN-AGT-COST-METRIC).
 
-Prints one row per agent (`run.provider_id`): how much it actually cost
-(summed from each run's own reported `total_cost_usd`) to produce one
-*meaningful* completed task (`completion_state == COMPLETED`) — a FinOps
-metric against finished, verified work, never raw speed or run count alone.
+Reports recorded runtime runs only, grouped by executor. Shows the known cost
+subtotal and coverage; total cost and cost per verified task are unknown when
+any run lacks a valid provider-reported cost. Queue-only jobs are not included.
+A task counts only after the existing completion pipeline verifies completion.
 
-See `command_center.runtime.cost_report` for the full computation and its
+See `command_center.cost_report` for the full computation and its
 definitions of "cost" and "meaningful task".
 
 Usage:
@@ -23,11 +23,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from command_center.runtime import db as runtime_db  # noqa: E402
-from command_center.runtime.cost_report import (  # noqa: E402
+from command_center.cost_report import (
     cost_per_meaningful_task,
     render_markdown,
 )
+from command_center.runtime import db as runtime_db
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -41,7 +41,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--json",
         action="store_true",
-        help="Print one JSON object per agent instead of a markdown table.",
+        help="Print a JSON array of agent reports instead of a markdown table.",
     )
     args = parser.parse_args(argv)
 
