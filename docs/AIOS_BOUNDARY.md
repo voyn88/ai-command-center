@@ -279,11 +279,12 @@ covers it.
 `tests/db/test_queue_claim.py` proves the claim protocol mechanically —
 one process, several roles, real concurrency inside one database. A separate,
 two-physical-host acceptance pass against this exact commit (`VOYN-W0-AICC-
-CLAIM-TWO-HOST-ACCEPTED`) additionally confirmed exclusivity, the stale-owner
-fence, and claimant identity under real network jitter, a real userspace
-network blackhole, and cross-host token theft/`SET ROLE` laundering attempts —
-with one named limit (the database host's OS). See
-[`docs/srv04b-two-host-acceptance.md`](srv04b-two-host-acceptance.md).
+CLAIM-TWO-HOST-ACCEPTED`) additionally confirmed exclusivity, claimant
+identity, and — under a real userspace network blackhole and the reap/
+requeue/reclaim it forces — that the old and new owners of a reassigned item
+were never simultaneously valid, plus resistance to cross-host token theft
+and `SET ROLE` laundering — with one named limit (the database host's OS).
+See [`docs/srv04b-two-host-acceptance.md`](srv04b-two-host-acceptance.md).
 
 ## CI wiring
 

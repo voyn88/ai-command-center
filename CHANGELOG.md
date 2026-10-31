@@ -12,11 +12,15 @@ functional application milestones of `app.py`.
 - `docs/srv04b-two-host-acceptance.md`: records a separate, two-physical-host
   acceptance pass of the `0002_queue_claim` protocol against
   `origin/main@f9bb889` — exclusivity under real network jitter (192 attempts
-  across 8 runs, exactly 8 winners), the stale-owner fence under a real
-  userspace network blackhole (`attempt_expired` after 27.45s), cross-host
-  token theft/`SET ROLE` laundering refused by the `session_user` claimant
-  check, and clock independence (0 of 11 protocol functions take a timestamp
-  parameter). Named limit: the database host's OS was not Linux in this pass.
+  across 8 runs, exactly 8 winners); a real userspace network blackhole that
+  forces `queue_reap()` to expire and requeue the stale owner's attempt
+  (`attempt_expired` after 27.45s) followed by a genuine second, winning
+  claim, with the old and new owners confirmed never simultaneously valid
+  (the stale owner's post-reap token use was rejected `attempt_expired` only
+  *after* the second claim had already won); cross-host token theft/
+  `SET ROLE` laundering refused by the `session_user` claimant check; and
+  clock independence (0 of 11 protocol functions take a timestamp parameter).
+  Named limit: the database host's OS was not Linux in this pass.
   `docs/AIOS_BOUNDARY.md` cross-references it from the SRV-04b exception note.
 
 ### Added (SRV-05 slice 2)
