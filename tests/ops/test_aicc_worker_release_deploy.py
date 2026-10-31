@@ -554,3 +554,28 @@ def test_cli_passes_real_paths_to_deploy(tmp_path, monkeypatch, capsys, override
     assert module.main(argv) == 0
     assert len(seen) == 1
     assert capsys.readouterr().out == f"NOOP {SHA_A} already_current\n"
+
+
+def test_registry_uses_verified_release_runtime(tmp_path, monkeypatch):
+    import subprocess
+    module = _module()
+    cfg = _cfg(module, tmp_path)
+    def run(args, **kwargs):
+        assert args[0] == str(cfg.runtime_venv / "bin/python")
+        assert args[-3:] == [str(cfg.lane_registry), str(cfg.trusted_uid), str(cfg.trusted_gid)]
+        assert kwargs["cwd"] == str(cfg.release_root / SHA_B)
+        assert kwargs["env"]["PYTHONPATH"] == str(cfg.release_root / SHA_B)
+        assert kwargs["timeout"] == 60
+        return subprocess.CompletedProcess(args, 0, '["voyn-aicc-worker@1.service"]', '')
+    monkeypatch.setattr(module, "_run", run)
+    assert module.load_release_lane_registry(cfg, SHA_B) == (LANE_1,)
+
+
+@pytest.mark.parametrize("payload", ['[]', '["sshd.service"]', '[null]',
+                                      '["voyn-aicc-worker@1.service", "voyn-aicc-worker@1.service"]'])
+def test_registry_refuses_invalid_runtime_output(tmp_path, monkeypatch, payload):
+    import subprocess
+    module = _module()
+    monkeypatch.setattr(module, "_run", lambda args, **kw: subprocess.CompletedProcess(args, 0, payload, ''))
+    with pytest.raises(RuntimeError, match="invalid lane registry"):
+        module.load_release_lane_registry(_cfg(module, tmp_path), SHA_B)

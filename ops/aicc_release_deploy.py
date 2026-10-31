@@ -19,6 +19,7 @@ import argparse
 import hashlib
 import importlib.machinery
 import importlib.util
+import json
 import os
 import re
 import shutil
@@ -596,6 +597,31 @@ def refresh_root_helpers(
     return refreshed
 
 
+def load_release_lane_registry(cfg: DeployConfig, release_sha: str) -> tuple[str, ...]:
+    """Use the verified release and runtime, never the root helper's import path."""
+    release = cfg.release_root / release_sha
+    result = _run(
+        [str(cfg.runtime_venv / "bin" / "python"), "-c",
+         ("import json, sys; from pathlib import Path; "
+         "from command_center.ops.credential_rotation import load_lane_registry; "
+         "print(json.dumps(load_lane_registry(Path(sys.argv[1]), "
+         "expected_uid=int(sys.argv[2]), expected_gid=int(sys.argv[3]))))"),
+         str(cfg.lane_registry), str(cfg.trusted_uid), str(cfg.trusted_gid)],
+        timeout=60,
+        cwd=str(release),
+        env={**os.environ, "PYTHONPATH": str(release)},
+    )
+    if result.returncode != 0:
+        raise RuntimeError("release lane registry validation failed")
+    lanes = json.loads(result.stdout)
+    if (not isinstance(lanes, list) or not lanes
+            or any(not isinstance(unit, str) or not re.fullmatch(
+                r"voyn-aicc-worker@[0-9]{1,4}\.service", unit) for unit in lanes)
+            or len(set(lanes)) != len(lanes)):
+        raise RuntimeError("release returned invalid lane registry")
+    return tuple(lanes)
+
+
 def rollout_active_lanes(
     units: tuple[str, ...],
     *,
@@ -738,15 +764,11 @@ def deploy_once(
         except Exception as exc:  # noqa: BLE001 - surface as REFUSED, never half-selected
             return finish("REFUSED", f"publish_select_failed:{exc}")
 
-        if load_lanes is None:
-            from command_center.ops.credential_rotation import load_lane_registry
-
-            load_lanes = load_lane_registry
         try:
-            lanes = load_lanes(
-                cfg.lane_registry,
-                expected_uid=cfg.trusted_uid,
-                expected_gid=cfg.trusted_gid,
+            lanes = (
+                load_release_lane_registry(cfg, target) if load_lanes is None else
+                load_lanes(cfg.lane_registry, expected_uid=cfg.trusted_uid,
+                           expected_gid=cfg.trusted_gid)
             )
         except Exception as exc:  # noqa: BLE001
             return finish("REFUSED", f"lane_registry_failed:{exc}")
