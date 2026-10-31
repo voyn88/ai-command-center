@@ -508,3 +508,34 @@ def test_mirror_failure_releases_early_lock(tmp_path):
                      remove_lock=lambda: held.clear(), ensure_mirror=fail)
     assert report.outcome == "REFUSED"
     assert held == []
+
+
+@pytest.mark.parametrize("override", [False, True])
+def test_cli_passes_real_paths_to_deploy(tmp_path, monkeypatch, capsys, override):
+    """The installed service invokes main with no path flags, not deploy_once directly."""
+    module = _module()
+    fields = {
+        "bare-mirror": "bare_mirror", "aicc-root": "aicc_root",
+        "release-root": "release_root", "state-dir": "state_dir",
+        "runtime-venv": "runtime_venv", "lane-registry": "lane_registry",
+        "rollout-lock": "rollout_lock_path",
+    }
+    argv = []
+    if override:
+        for flag in fields:
+            argv += [f"--{flag}", str(tmp_path / flag)]
+    seen = []
+    def deploy(cfg):
+        seen.append(cfg)
+        for flag, field in fields.items():
+            value = getattr(cfg, field)
+            assert isinstance(value, Path), (field, value)
+            expected = tmp_path / flag if override else getattr(module.DeployConfig(), field)
+            assert value == expected
+        # Exercise the operation that crashed the live service before lock acquisition.
+        cfg.rollout_lock_path.exists()
+        return module.DeployReport(outcome="NOOP", target_sha=SHA_A, detail="already_current")
+    monkeypatch.setattr(module, "deploy_once", deploy)
+    assert module.main(argv) == 0
+    assert len(seen) == 1
+    assert capsys.readouterr().out == f"NOOP {SHA_A} already_current\n"
