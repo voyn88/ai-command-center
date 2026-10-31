@@ -958,6 +958,50 @@ def test_standalone_deploy_recovery_keeps_generic_orphan_wal_refusal(tmp_path):
     transaction.recover_release_deploy()
 
 
+def _pollute_current_release(current):
+    cache = current / "__pycache__"
+    cache.mkdir(mode=0o700)
+    extra = cache / "current.cpython-312.pyc"
+    extra.write_bytes(b"derived current cache")
+    extra.chmod(0o600)
+    return cache, extra
+
+
+def test_standalone_recovery_repairs_derived_cache_in_both_releases(tmp_path):
+    _module_value, transaction, release, manifest, old_cache, _old_extra, current = _standalone_bytecode_deploy(tmp_path)
+    current_cache, current_extra = _pollute_current_release(current)
+    current_manifest = transaction.release_manifest_path("b" * 40)
+    original_manifests = (manifest.read_bytes(), current_manifest.read_bytes())
+
+    transaction.recover_release_deploy()
+
+    assert not current_cache.exists() and not current_extra.exists()
+    assert not old_cache.exists()
+    assert not transaction.pending_release.exists()
+    assert (release.parent.parent / "current").resolve() == release
+    assert (manifest.read_bytes(), current_manifest.read_bytes()) == original_manifests
+    transaction.verify_release_selection(f"releases/{RELEASE_ID}")
+    transaction.verify_release_selection(f"releases/{'b' * 40}")
+
+
+@pytest.mark.parametrize("hostile_end", ["current", "previous"])
+def test_standalone_recovery_preflights_both_ends_before_any_cache_cleanup(tmp_path, hostile_end):
+    module, transaction, release, manifest, old_cache, old_extra, current = _standalone_bytecode_deploy(tmp_path)
+    current_cache, current_extra = _pollute_current_release(current)
+    hostile_tree = current if hostile_end == "current" else release
+    (hostile_tree / "unrelated.txt").write_text("not derived bytecode\n")
+    original_manifest = manifest.read_bytes()
+
+    with pytest.raises(module.ReleaseRefused):
+        transaction.recover_release_deploy()
+
+    assert old_cache.exists() and old_extra.exists()
+    assert current_cache.exists() and current_extra.exists()
+    assert transaction.pending_release.exists()
+    assert (release.parent.parent / "current").resolve() == current
+    assert manifest.read_bytes() == original_manifest
+
+
 @pytest.mark.parametrize("failure", ["current-drift", "pending-install", "pending-uninstall", "absent-previous"])
 def test_standalone_recovery_preflight_keeps_current_and_cache_intact(tmp_path, failure):
     _module_value, transaction, release, manifest, cache, bytecode, current = _standalone_bytecode_deploy(tmp_path)
