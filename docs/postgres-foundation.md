@@ -111,6 +111,13 @@ rules, so a database published on all interfaces is reachable from the internet
 while the firewall still reports it closed. Remote access is an SSH tunnel or a
 private network.
 
+On a host with no Docker access (no `docker` group membership, no rootless
+Docker, no Podman), use a native install instead —
+[`docs/operations/DATABASE_HOST_PROVISIONING.md`](operations/DATABASE_HOST_PROVISIONING.md)
+covers the decision and the `scripts/check_postgres_host.sh` /
+`deploy/provision-postgres-host.sh` pair. Everything below this point takes a
+DSN and does not care which route produced it.
+
 Then, once as a superuser, and once per deploy as the migrator:
 
 ```bash
