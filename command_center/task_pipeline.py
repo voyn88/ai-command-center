@@ -2423,6 +2423,15 @@ def daily_spend_usd(db_path: Path, *, now: str | None = None) -> float:
     error and no log line — a spend cap that reads 0 stops gating without
     ever saying so. Only malformed JSON *text* is tolerated (and logged); a
     row of an unexpected shape is now visible instead of silently dropped.
+
+    Valid JSON that is not an object is a separate hazard: the SQLite path
+    only ever yields `str`/`bytes` rows (the `LIKE '%total_cost_usd%'`
+    predicate and `NOT NULL` column rule out numeric payloads), and
+    `json.loads('[{"total_cost_usd": 1}]')` succeeds with a `list`. Calling
+    `.get` on that raises `AttributeError` unless the decoded value is
+    confirmed to be a `dict` first — which the guard below does, logging and
+    skipping list/str/int/bool/null shapes instead of crashing the sum or
+    catching a phantom `TypeError` that the SQLite row set can never produce.
     """
     import json as _json
     from datetime import datetime as _dt, timedelta as _td
@@ -2451,6 +2460,10 @@ def daily_spend_usd(db_path: Path, *, now: str | None = None) -> float:
                     payload[:200] if isinstance(payload, str) else payload,
                 )
                 continue
+        # Guard before `.get`: valid JSON may decode to list/str/number/bool/
+        # null (and jsonb may already hand those back). Without this check a
+        # single `[{"total_cost_usd": 1}]` row raises AttributeError and aborts
+        # the whole trailing-24h sum.
         if not isinstance(payload, dict):
             _LOG.warning(
                 "daily_spend_usd: skipping run_event whose payload is a %s, not an object",
