@@ -8,6 +8,22 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Resolved — audit table mirrors unblocked at the AIOS boundary (`VOYN-W0-AICC-MIRROR-AUDIT-BOUNDARY`)
+
+- Slice 8 once withdrew `audit_run`/`audit_finding` mirrors rather than edit
+  the frozen engine baseline from inside a migration slice. Acceptance asked
+  for a reviewed decision under `docs/AIOS_BOUNDARY.md` and then the usual
+  mirror evidence (including `list_audit_runs_stored`). Both halves already
+  landed: the mirrors and stored-shape reader ship in
+  `command_center/db/audit_store.py` / `runtime/db/audit.py`, and
+  `VOYN-W0-AICC-AUDIT-CATEGORY-CORROBORATION` (PR #583) settled the gate as
+  signature tuning — a declarative `PostgresTableMirror` module is not an
+  `audit` engine, so these files stay out of
+  `AIOS_BOUNDARY_BASELINE.json` instead of carrying justified entries.
+  Renaming was never the remedy. No further production code is owed under
+  this ticket; the note exists so a redispatched attempt is not mistaken for
+  unfinished mirror work. See `docs/AIOS_BOUNDARY.md`.
+
 ### Added — the one-button audit, wired into the web UI (`VOYN-W0-APP-CONTROL-S4`)
 
 - `web/src/screens/Tasks.tsx`: an `AuditLauncher` panel above the task list —

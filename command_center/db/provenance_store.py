@@ -27,17 +27,16 @@ detector's `audit` name signature (this module matches on `provenance`) used
 to classify on the name alone, with no behavioural corroboration. This module
 declares four `MirroredTable`s and four mirror classes over tables that
 already exist; it contains no function, no SQL and no connection handling, so
-it added no audit capability, making it the false positive
-`docs/AIOS_BOUNDARY.md` calls Direction 2 — the same one `audit_store.py`
-(slice 8) already carried.
+it added no audit capability — the same false positive that blocked
+`VOYN-W0-AICC-MIRROR-AUDIT-BOUNDARY` for `audit_store.py` (slice 8).
 
 Two was where the pattern started, and `VOYN-W0-AICC-AUDIT-CATEGORY-CORROBORATION`
-is the structural fix rather than a third baseline entry:
-`_behaves_like_an_audit_engine` in `tests/architecture/aios_boundary.py`
-corroborates the `audit` name against a single, positively-validated shape — a
-module that is nothing but imports, constant table declarations and
-well-formed `PostgresTableMirror` subclasses — and both this file and
-`audit_store.py` match it, so both retired from
+is the structural fix rather than a third baseline entry (and the closure of
+that blocking ticket): `_behaves_like_an_audit_engine` in
+`tests/architecture/aios_boundary.py` corroborates the `audit` name against a
+single, positively-validated shape — a module that is nothing but imports,
+constant table declarations and well-formed `PostgresTableMirror` subclasses —
+and both this file and `audit_store.py` match it, so both retired from
 `tests/architecture/AIOS_BOUNDARY_BASELINE.json`. Any further table of this
 family can now be declared in its own module as readily as inside one of
 these two, provided it keeps to the same declarative shape; anything that

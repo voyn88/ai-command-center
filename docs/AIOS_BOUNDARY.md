@@ -144,6 +144,21 @@ bound to a name, or a `PostgresTableMirror` subclass carrying logic beyond
 `spec = ...` — still classifies as `audit` on the name alone, exactly as
 before. Recorded as `VOYN-W0-AICC-AUDIT-CATEGORY-CORROBORATION`.
 
+That corroboration is also the closure of
+`VOYN-W0-AICC-MIRROR-AUDIT-BOUNDARY` — the ticket opened when SRV-01B slice 8
+withdrew `audit_run`/`audit_finding` mirrors rather than edit the frozen
+baseline from inside a migration slice. Acceptance asked for a reviewed
+decision under this procedure (baseline entry with justification, or another
+placement that does not evade the detector by renaming) and then the usual
+mirror evidence, including `list_audit_runs_stored`. Both halves landed: the
+mirrors and stored-shape reader shipped with the restored slice-8 batch (and
+are still exercised by `tests/db/test_batch_stores.py`), and the gate decision
+settled as signature tuning rather than a standing baseline exception — the
+declarative modules drop out of the inventory instead of carrying justified
+`audit` entries. Renaming was never the remedy: any honest name keeps the
+`audit`/`provenance` token. This task needs no further code and should not be
+re-attempted.
+
 What deliberately does **not** corroborate `memory` is executing SQL on a
 connection the caller opened. That is delegation, not ownership — the engine
 is wherever the driver is — and counting it would flag SQL-rendering and grant
