@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -371,7 +372,80 @@ def test_failed_copilot_independent_review_is_retryable_infrastructure(
 
     assert not outcome.ok
     assert outcome.retryable
-    assert "provider/auth/quota" in outcome.reason
+    # An absent credential is a HOST fact -- installing or re-authenticating
+    # it cures the refusal in minutes -- so it stays on the infra budget and
+    # its reason does not name quota.
+    assert "provider/auth" in outcome.reason
+    assert "quota" not in outcome.reason
+    assert outcome.infra_wait and not outcome.capacity_wait
+
+
+@pytest.mark.parametrize(
+    ("stderr", "expect_quota_death"),
+    [
+        # A host fact: the credential is absent, not spent.
+        ("Error: No authentication information found", False),
+        # The account is out of room.
+        ("AI credit usage limit reached", True),
+    ],
+)
+def test_only_a_capacity_refusal_reads_as_a_quota_death_to_the_monitor(
+    handler, monkeypatch, stderr, expect_quota_death
+) -> None:
+    """The measurement half of
+    VOYN-MON-CONTROL-01-QUEUE-EXECUTOR-QUOTA-EXHAUSTED.
+
+    The hourly `control-01:queue` probe decides a dead letter was a quota
+    death by grepping `dead_reason`, and `dead_reason` is this `reason` under
+    a `*_wait_exhausted:` prefix that names no capacity term itself. So the
+    text the handler chooses here IS the measurement. While the infra label
+    read "(provider/auth/quota)" every transport and auth death matched
+    `quota`, so the finding counted deaths that had nothing to do with
+    capacity and could never read healthy while any provider refusal at all
+    was dying.
+
+    Nothing is retyped: the reason comes from the real handler and the
+    pattern from the real monitor, because a test that spelled either out
+    again could pass while the two drifted.
+    """
+    from command_center.ops import infra_monitor
+
+    run_agent, _ = handler
+
+    def refused(**kwargs):
+        return agent_runner.RunResult(
+            status="failed",
+            exit_code=1,
+            stdout="",
+            stderr=stderr,
+            duration_seconds=0.1,
+            started_at="2026-09-14T00:00:00+00:00",
+            completed_at="2026-09-14T00:00:00+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", refused)
+    outcome = run_agent(
+        _payload(
+            task_type="independent_review",
+            cascade=[
+                {
+                    "executor": "copilot",
+                    "task_type": "independent_review",
+                    "capability": "model_only",
+                }
+            ],
+        ),
+        _event(),
+        1,
+    )
+
+    assert not outcome.ok and outcome.retryable
+    assert outcome.capacity_wait is expect_quota_death
+    assert outcome.infra_wait is not expect_quota_death
+    counted = re.search(
+        infra_monitor.QUOTA_DEAD_REASON_REGEX, outcome.reason, re.IGNORECASE
+    )
+    assert bool(counted) is expect_quota_death, outcome.reason
 
 
 def test_api_error_in_cli_output_is_retryable_not_a_success(
@@ -384,7 +458,13 @@ def test_api_error_in_cli_output_is_retryable_not_a_success(
     fired and the run fell through to `ok=True` -- an infrastructure failure
     recorded as a genuine task success, so it was never retried. 142 backlog
     tasks cascade-exhausted their retry budget from this exact payload,
-    captured verbatim from the live incident DB."""
+    captured verbatim from the live incident DB.
+
+    The payload is also the canonical CAPACITY refusal -- `api_error_status`
+    429 and a `result` naming the session window -- so it must land on the
+    capacity budget, which waits out the Max credential's 5-hour rolling cap,
+    rather than the infra budget whose whole clock is ~1.1 hours
+    (VOYN-MON-CONTROL-01-QUEUE-EXECUTOR-QUOTA-EXHAUSTED)."""
     run_agent, _ = handler
 
     rate_limited_stdout = json.dumps(
@@ -426,8 +506,8 @@ def test_api_error_in_cli_output_is_retryable_not_a_success(
     outcome = run_agent(_payload(), _event(), 1)
     assert not outcome.ok
     assert outcome.retryable
-    assert outcome.infra_wait
-    assert "executor infrastructure failure" in outcome.reason
+    assert outcome.capacity_wait and not outcome.infra_wait
+    assert "executor capacity exhausted (quota/spend/rate)" in outcome.reason
     assert "session limit" in outcome.reason
 
 
@@ -637,7 +717,16 @@ def test_codex_usage_limit_switches_inside_the_same_attempt(handler, monkeypatch
     ]
 
 
-def test_codex_usage_limit_on_the_last_link_is_infra_not_success(handler, monkeypatch):
+def test_codex_usage_limit_on_the_last_link_is_a_capacity_wait_not_success(
+    handler, monkeypatch
+):
+    """The live refusal, verbatim, on a cascade with nowhere left to fail over.
+
+    It must not be banked as a success (the original point of this test), and
+    it must not be charged to the infra budget either: the window this text
+    names is days wide and that budget's whole clock is ~1.1 hours
+    (VOYN-MON-CONTROL-01-QUEUE-EXECUTOR-QUOTA-EXHAUSTED).
+    """
     run_agent, runs = handler
 
     def failed_codex(**kwargs):
@@ -661,9 +750,10 @@ def test_codex_usage_limit_on_the_last_link_is_infra_not_success(handler, monkey
     payload["cascade"] = [{"executor": "codex", "task_type": "review"}]
     outcome = run_agent(payload, _event(), 1)
 
-    assert not outcome.ok and outcome.retryable and outcome.infra_wait
+    assert not outcome.ok and outcome.retryable
+    assert outcome.capacity_wait and not outcome.infra_wait
     assert [run["executor"] for run in runs] == ["codex"]
-    assert "provider/auth/quota" in outcome.reason
+    assert "executor capacity exhausted (quota/spend/rate)" in outcome.reason
 
 
 @pytest.mark.parametrize("workspace_unchanged", [True, False])
@@ -716,7 +806,8 @@ def test_mutating_provider_failover_requires_unchanged_workspace(
     else:
         assert not outcome.ok and outcome.retryable
         assert [run["executor"] for run in runs] == ["copilot"]
-        assert "provider/auth/quota" in outcome.reason
+        assert outcome.capacity_wait and not outcome.infra_wait
+        assert "executor capacity exhausted (quota/spend/rate)" in outcome.reason
 
 
 def test_unknown_copilot_failure_switches_for_read_only_review(handler, monkeypatch):
@@ -783,7 +874,8 @@ def test_provider_failover_never_crosses_the_workspace_mutability_boundary(
 
     assert not outcome.ok and outcome.retryable
     assert [run["executor"] for run in runs] == ["copilot"]
-    assert "provider/auth/quota" in outcome.reason
+    assert outcome.capacity_wait and not outcome.infra_wait
+    assert "executor capacity exhausted (quota/spend/rate)" in outcome.reason
 
 
 def test_genuine_task_failure_with_error_flavoured_text_still_ok(
@@ -2425,6 +2517,82 @@ def test_no_healthy_cascade_link_is_an_infra_wait_not_a_spent_attempt(
     assert not outcome.ok and outcome.retryable and outcome.infra_wait
     assert "unavailable" in outcome.reason
     assert runs == []
+
+
+def test_every_link_out_of_quota_at_preflight_is_a_capacity_wait(
+    handler, monkeypatch
+) -> None:
+    """The live shape: both paid links of the cascade measured exhausted on
+    the same day (codex out of quota 2026-09-14..19). Nothing about the hosts
+    is broken, so the host-recovery budget must not be spent on it -- all 20
+    of its waits fit inside the first hour of a four-day window
+    (VOYN-MON-CONTROL-01-QUEUE-EXECUTOR-QUOTA-EXHAUSTED)."""
+    run_agent, runs = handler
+    monkeypatch.setattr(
+        agent_runner,
+        "codex_workspace_write_preflight",
+        lambda: (False, "You've hit your usage limit, try again at Sep 15th"),
+    )
+    monkeypatch.setattr(
+        agent_runner,
+        "claude_cli_preflight",
+        lambda binary=None: (False, "You've hit your session limit · resets 4:10pm"),
+    )
+    outcome = run_agent(_implementation_cascade_payload(), _event(), 1)
+    assert not outcome.ok and outcome.retryable
+    assert outcome.capacity_wait and not outcome.infra_wait
+    assert "executor capacity exhausted (quota/spend/rate)" in outcome.reason
+    assert runs == [], "no attempt was spent on a model"
+
+
+@pytest.mark.parametrize("quota_link", ["claude", "codex"])
+def test_one_broken_host_among_exhausted_accounts_keeps_the_host_clock(
+    handler, monkeypatch, quota_link
+) -> None:
+    """A mixed cascade is curable on the sooner of the two clocks.
+
+    If any link is refusing for a reason a host recovery fixes, the item
+    should come back in seconds-to-minutes and re-check, not sit out the
+    capacity family's 15-minute floor. Classifying from the single `detail`
+    the preflight search happened to leave behind made the answer depend on
+    which link was refusing for which reason -- cascade order, which is not a
+    fact about the outage. Parametrised over both orders for exactly that
+    reason: the verdict must be the same either way.
+    """
+    run_agent, runs = handler
+    refusals = {
+        "claude": "You've hit your session limit · resets 4:10pm",
+        "codex": "You've hit your usage limit, try again at Sep 15th",
+    }
+    host_failure = "Error: No authentication information found"
+    monkeypatch.setattr(
+        agent_runner,
+        "claude_cli_preflight",
+        lambda binary=None: (
+            False,
+            refusals["claude"] if quota_link == "claude" else host_failure,
+        ),
+    )
+    monkeypatch.setattr(
+        agent_runner,
+        "codex_workspace_write_preflight",
+        lambda: (False, refusals["codex"] if quota_link == "codex" else host_failure),
+    )
+    outcome = run_agent(_implementation_cascade_payload(), _event(), 1)
+    assert not outcome.ok and outcome.retryable
+    assert outcome.infra_wait and not outcome.capacity_wait
+    assert runs == []
+    # And the reason names the refusal that decided the family -- the host
+    # one. Reporting the capacity half while waiting on the host clock would
+    # leave `infra_wait_exhausted: ... usage limit` for the hourly probe to
+    # count as a quota death, which is the mismatch between text and budget
+    # this whole task is about.
+    from command_center.ops import infra_monitor
+
+    assert host_failure in outcome.reason
+    assert not re.search(
+        infra_monitor.QUOTA_DEAD_REASON_REGEX, outcome.reason, re.IGNORECASE
+    ), outcome.reason
 
 
 def _checkpoint_mismatch(spec):

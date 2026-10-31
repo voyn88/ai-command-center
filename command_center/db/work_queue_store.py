@@ -163,6 +163,26 @@ class WorkQueueStore:
         )
         return bool(row["ok"])
 
+    def fail_capacity_wait(
+        self, work: ClaimedWork, *, reason: str, max_capacity_waits: int = 24
+    ) -> bool:
+        """Report an executor CAPACITY refusal: the account/spend window is
+        exhausted, not the host (``agent_runner.is_capacity_refusal``).
+
+        Refunds the claimed attempt like the other two no-fault families, and
+        bounds retries against its own budget -- but on a capacity clock: the
+        requeue waits 15 minutes growing to an hour, so the default 24 waits
+        is roughly a day of patience rather than the infra family's hour (see
+        ``0029_queue_fail_capacity_wait``). An exhausted subscription window
+        closes on the provider's schedule; asking it every five minutes only
+        spends the host-recovery budget and dead-letters good work.
+        """
+        row = self._call(
+            "SELECT * FROM queue_fail_capacity_wait(%s, %s, %s, %s)",
+            (work.attempt_id, work.claim_token, reason, max_capacity_waits),
+        )
+        return bool(row["ok"])
+
     # -- enqueue (control plane, app role) ------------------------------------
 
     def enqueue(

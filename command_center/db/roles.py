@@ -545,6 +545,11 @@ _WORKER_FUNCTIONS = (
     # failures. These are not task attempts, but must still be bounded under
     # their own wait budget.
     "queue_fail_infra_wait(text, text, text, integer)",
+    # And the third no-fault class: an exhausted account/spend window, whose
+    # budget is bounded on a capacity clock (hours) rather than the host
+    # -recovery clock of the infra family -- see
+    # 0029_queue_fail_capacity_wait.
+    "queue_fail_capacity_wait(text, text, text, integer)",
 )
 
 # Deliberately not `queue_claim`: only a role that PostgreSQL authenticated as a

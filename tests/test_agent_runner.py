@@ -1267,3 +1267,144 @@ def test_a_codex_task_failure_without_a_signature_stays_a_task_failure():
 def test_an_unknown_executor_never_matches_free_text_signatures():
     run = _provider_error_run(stderr="unauthorized")
     assert run.is_executor_provider_error("claude") is False
+
+
+@pytest.mark.parametrize(
+    ("exit_code", "is_provider"),
+    [
+        # `openai_exec.main`'s contract: 1 is the provider half -- every
+        # transport error, non-2xx status and empty/unparseable completion.
+        (1, True),
+        # 2 is a task type or prompt the bridge itself refuses, 3 is no key in
+        # the environment. Both are facts about the payload and the deployment
+        # that no provider recovery cures, so neither may be waited out.
+        (2, False),
+        (3, False),
+    ],
+)
+def test_the_openai_bridge_is_classified_by_exit_code_not_by_text(
+    exit_code, is_provider
+):
+    """The bridge is ours, so its exit codes are a contract rather than a
+    vendor's prose (pinned by `tests/test_openai_exec.py`). Without this it
+    had no provider classification at all, and a 429 from the free tier that
+    exists to RELIEVE quota pressure was banked as a completed review whose
+    whole verdict was the provider's error text."""
+    run = _provider_error_run(exit_code=exit_code, stderr="provider HTTP 429: ...")
+    assert run.is_executor_provider_error("openai_http") is is_provider
+
+
+def test_a_completed_openai_bridge_run_is_never_a_provider_error():
+    """Exit code 0 is a delivered review; its text is a verdict, not a
+    diagnostic, however much it discusses rate limits."""
+    run = _provider_error_run(
+        status="completed",
+        exit_code=0,
+        stdout="FINDING: the client ignores the provider's 429 retry-after.",
+    )
+    assert run.is_executor_provider_error("openai_http") is False
+
+
+# -- capacity refusals: which clock a no-fault refusal waits on ---------------
+#
+# `is_capacity_refusal` answers a NARROWER question than
+# `is_executor_provider_error` above, and only ever for a refusal that one has
+# already answered yes for: of the substrate failures, which name an exhausted
+# ACCOUNT rather than a broken HOST. The two heal on different clocks, which
+# is why the queue has a separate wait budget for each
+# (VOYN-MON-CONTROL-01-QUEUE-EXECUTOR-QUOTA-EXHAUSTED).
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "You've hit your usage limit",
+        "You've hit your session limit · resets 4:10pm (UTC)",
+        "weekly limit reached; try again at Sep 15th",
+        "rate limit exceeded",
+        "insufficient_quota",
+        "Your credit balance is too low to access the Anthropic API",
+        "AI credit usage limit reached",
+    ],
+)
+def test_a_refusal_naming_an_exhausted_pool_waits_on_the_capacity_clock(text):
+    """The live vocabulary, verbatim from the refusals the fleet actually
+    met: a Claude Max rolling window, a codex weekly cap, a paid-API credit
+    balance. None of these is shortened by asking again in five minutes."""
+    assert agent_runner.is_capacity_refusal(text) is True
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Error: No authentication information found",
+        "launcher socket inactive",
+        "codex: command not found",
+        "bwrap: Can't bind mount loopback",
+        "stream disconnected before completion",
+        "tests failed: 3 assertions did not hold",
+    ],
+)
+def test_a_refusal_naming_a_broken_host_stays_on_the_host_clock(text):
+    """A missing CLI, a dead launcher and a refused sandbox are cured by the
+    host recovering in minutes. Charging them to the capacity budget would
+    impose its 15-minute floor on a refusal a redelivery could clear at once.
+    """
+    assert agent_runner.is_capacity_refusal(text) is False
+
+
+def test_the_account_out_of_room_statuses_are_matched_exactly_not_searched_for():
+    """402/429 are compared against the CLI's own structured field, never
+    sought inside free text: "429" occurs in shas, timestamps and diffs, and
+    a substring match would reclassify unrelated runs as quota deaths."""
+    assert agent_runner.is_capacity_refusal(429) is True
+    assert agent_runner.is_capacity_refusal("402") is True
+    # The same digits as a fragment of something else must not match.
+    assert agent_runner.is_capacity_refusal("abc429def") is False
+    assert (
+        agent_runner.is_capacity_refusal("commit 429ab1c failed to apply") is False
+    )
+    # 5xx overload is transient infrastructure: the next delivery may well
+    # find it recovered, so it belongs to the host clock.
+    assert agent_runner.is_capacity_refusal(503) is False
+    assert agent_runner.is_capacity_refusal("500") is False
+
+
+def test_each_diagnostic_is_judged_on_its_own_terms():
+    """Varargs rather than one joined string, because a structured status is
+    compared exactly while free text is searched. Joining them would let a
+    status field be scanned for signatures and the text be compared to "429".
+    """
+    # Structured status says nothing; the text carries the fact.
+    assert agent_runner.is_capacity_refusal(500, "You've hit your usage limit") is True
+    # Text says nothing; the status carries it.
+    assert agent_runner.is_capacity_refusal(429, "request failed") is True
+    # `None` and blank fields are ignored so callers can pass optional fields
+    # straight through.
+    assert agent_runner.is_capacity_refusal(None, "") is False
+    assert agent_runner.is_capacity_refusal() is False
+    assert agent_runner.is_capacity_refusal(None, "quota") is True
+
+
+def test_the_monitors_quota_vocabulary_is_contained_in_the_workers():
+    """The invariant that makes `executor_quota_exhausted` actionable.
+
+    `infra_monitor` decides a dead letter was a quota death by grepping
+    `dead_reason`; the worker decides which budget to spend from its own
+    signature list. A term the probe greps for but the worker does not
+    recognise is a death reported as a quota death AFTER the queue already
+    spent the host-recovery budget on an account window -- the finding this
+    pair of lists was split to end. Containment, not equality: the worker may
+    wait out more kinds of refusal than the probe names.
+    """
+    from command_center.ops import infra_monitor
+
+    missing = [
+        term
+        for term in infra_monitor.QUOTA_DEAD_REASON_TERMS
+        if not agent_runner.is_capacity_refusal(term)
+    ]
+    assert missing == [], (
+        "the monitor would report these as quota deaths while the worker "
+        "charged them to the host-recovery budget"
+    )

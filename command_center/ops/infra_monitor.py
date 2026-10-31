@@ -195,6 +195,41 @@ def discover_worker_units() -> dict[str, str]:
     return parse_worker_units(completed.stdout)
 
 
+#: What makes a dead letter a QUOTA death in this monitor's eyes.
+#:
+#: Every term here must also be one the worker classifies as a capacity
+#: refusal (`agent_runner._CAPACITY_REFUSAL_SIGNATURES`), and that containment
+#: -- this list inside that one, not the reverse -- is the invariant a test
+#: pins. It is what makes the measurement actionable: a term the monitor greps
+#: for but the worker does not recognise is a death this probe reports as a
+#: quota death after the queue already spent the HOST-recovery budget on an
+#: account window, which is the conflation
+#: VOYN-MON-CONTROL-01-QUEUE-EXECUTOR-QUOTA-EXHAUSTED was. The reverse is
+#: harmless and deliberate: the worker may wait out more kinds of refusal
+#: ("too many requests", "out of credits") than this probe chooses to name a
+#: quota death, and those still surface through plain dead-letter growth.
+#:
+#: The other half of actionability is that no reason reaches here by
+#: BOILERPLATE. The infra family's label used to read
+#: "(provider/auth/quota)", so every transport and auth death matched `quota`
+#: and this probe could never read healthy while any provider refusal at all
+#: was dying; `handlers` now says "(provider/auth)" and spells out capacity
+#: only when it means it.
+QUOTA_DEAD_REASON_TERMS: tuple[str, ...] = (
+    "quota",
+    "spend limit",
+    "weekly limit",
+    "session limit",
+    "credit balance",
+    "rate limit",
+    "usage limit",
+)
+
+#: The terms as one case-insensitive alternation for `~*`. Built, never
+#: hand-written twice: the literal used to live inline in the query below.
+QUOTA_DEAD_REASON_REGEX = "(" + "|".join(QUOTA_DEAD_REASON_TERMS) + ")"
+
+
 def read_queue_snapshot() -> QueueSnapshot:
     from command_center.db import pool
     from command_center.db.config import load_config
@@ -223,14 +258,15 @@ def read_queue_snapshot() -> QueueSnapshot:
                     count(*) FILTER (
                         WHERE state = 'dead'
                           AND updated_at > now() - interval '1 hour'
-                          AND dead_reason ~* '(quota|spend limit|weekly limit|session limit|credit balance|rate limit)'
+                          AND dead_reason ~* %s
                     ),
                     count(*) FILTER (
                         WHERE state = 'succeeded'
                           AND updated_at > now() - interval '1 hour'
                     )
                 FROM work_item
-                """
+                """,
+                (QUOTA_DEAD_REASON_REGEX,),
             )
             (
                 ready,

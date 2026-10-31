@@ -77,6 +77,16 @@ class HandlerOutcome:
     # broken sandbox, or a provider outage says the work did not get a fair
     # execution slot.
     infra_wait: bool = False
+    # The same refund again, for the one substrate failure that does NOT heal
+    # on a host-recovery clock: an exhausted account, spend cap or rate
+    # window. Routes to `queue_fail_capacity_wait`, whose budget waits
+    # 15 minutes to an hour per refusal instead of the infra family's
+    # seconds-to-5-minutes, because the Claude subscription's 5-hour rolling
+    # cap and the codex account's weekly one outlive that budget's whole hour
+    # and every item in flight used to die inside it
+    # (VOYN-MON-CONTROL-01-QUEUE-EXECUTOR-QUOTA-EXHAUSTED). Takes precedence
+    # over `infra_wait` when both are set, since it is the narrower fact.
+    capacity_wait: bool = False
 
 
 class Handler(Protocol):
@@ -316,6 +326,8 @@ class WorkerDaemon:
         try:
             if outcome.ok:
                 accepted = self._store.complete(work, outcome.result)
+            elif outcome.capacity_wait:
+                accepted = self._store.fail_capacity_wait(work, reason=outcome.reason)
             elif outcome.lease_wait:
                 accepted = self._store.fail_lease_wait(work, reason=outcome.reason)
             elif outcome.infra_wait:
