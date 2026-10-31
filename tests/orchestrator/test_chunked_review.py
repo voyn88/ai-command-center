@@ -747,9 +747,6 @@ def test_pr_snapshot_rejects_truncated_or_file_count_mismatch(monkeypatch, stats
 
 
 def test_pr_snapshot_rejects_oversize(monkeypatch):
-    body = {"state": "open", "base": {"sha": BASE, "repo": {
-        "full_name": "voyn88/ai-command-center"}}, "head": {"sha": HEAD},
-        "changed_files": 1, "additions": 0, "deletions": 0}
     monkeypatch.setattr(review_merge, "_MAX_REVIEW_DIFF_BYTES", 1)
     monkeypatch.setattr(
         review_merge, "_gh", gh_stub(pull_body(), "diff --git a/x b/x\n")
@@ -758,9 +755,6 @@ def test_pr_snapshot_rejects_oversize(monkeypatch):
 
 
 def test_pr_snapshot_rejects_binary_diff_even_when_stats_match(monkeypatch):
-    body = {"state": "open", "base": {"sha": BASE, "repo": {
-        "full_name": "voyn88/ai-command-center"}}, "head": {"sha": HEAD},
-        "changed_files": 1, "additions": 0, "deletions": 0}
     binary = "diff --git a/image.png b/image.png\nBinary files a/image.png and b/image.png differ\n"
     monkeypatch.setattr(review_merge, "_gh", gh_stub(pull_body(), binary))
     assert review_merge._pr_diff_and_head("/repo", PR) is None
