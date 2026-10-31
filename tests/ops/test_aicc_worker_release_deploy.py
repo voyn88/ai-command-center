@@ -12,6 +12,7 @@ import importlib.util
 import stat
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -101,7 +102,7 @@ def _seed_helpers(cfg, release_sha: str, *, release_bodies: dict[str, bytes], in
 def _deploy(module, cfg, *, previous: str | None = SHA_A, **kwargs):
     (cfg.release_root / (previous or SHA_A)).mkdir(exist_ok=True)
     defaults = {
-        "install_tx": object(),  # never load fcntl-bound installer on Windows
+        "install_tx": SimpleNamespace(verify_release_manifest=lambda *a, **k: None),
         "ensure_mirror": lambda _cfg: None,
         "resolve_sha": lambda _cfg: SHA_B if previous != SHA_B else SHA_A,
         "current_sha": lambda _cfg: previous,
@@ -111,6 +112,9 @@ def _deploy(module, cfg, *, previous: str | None = SHA_A, **kwargs):
         "hold_timers": lambda: None,
         "release_timers": lambda: None,
         "clear_pending": lambda: None,
+        "preflight": lambda *a, **k: None,
+        "load_lanes": lambda *a, **k: (LANE_1,),
+        "show": lambda unit, prop: "inactive" if prop == "ActiveState" else "",
     }
     defaults.update(kwargs)
     return module.deploy_once(cfg, **defaults)
@@ -173,7 +177,7 @@ def test_deploy_calls_publish_verify_select_rollout_in_order(tmp_path):
     )
 
     assert report.outcome == "DEPLOYED"
-    assert report.steps[:4] == ["publish", "verify", "select", "rollout"]
+    assert report.steps[:5] == ["publish", "verify", "idle_preflight", "select", "rollout"]
     assert order == [
         "lock",
         f"publish:{SHA_B}",
@@ -589,3 +593,243 @@ def test_registry_refuses_absent_installed_release(tmp_path, monkeypatch):
     monkeypatch.setattr(module, "_run", lambda *a, **kw: pytest.fail("must not execute candidate"))
     with pytest.raises(RuntimeError, match="no installed release"):
         module.load_installed_lane_registry(_cfg(module, tmp_path))
+
+
+
+def test_registry_import_does_not_pollute_published_release(tmp_path, monkeypatch):
+    import subprocess
+
+    module = _module()
+    cfg = _cfg(module, tmp_path)
+    release = cfg.release_root / SHA_A
+    package = release / "command_center" / "ops"
+    package.mkdir(parents=True)
+    (package.parent / "__init__.py").write_text("")
+    (package / "__init__.py").write_text("")
+    (package / "credential_rotation.py").write_text(
+        "def load_lane_registry(path, **kwargs):\n"
+        "    return ['voyn-aicc-worker@1.service']\n"
+    )
+    before = sorted(str(p.relative_to(release)) for p in release.rglob("*"))
+    monkeypatch.setattr(module, "_current_release_sha", lambda _: SHA_A)
+    # Do not let the parent test environment mask the production failure.
+    monkeypatch.delenv("PYTHONDONTWRITEBYTECODE", raising=False)
+    monkeypatch.delenv("PYTHONPYCACHEPREFIX", raising=False)
+
+    def run(args, **kwargs):
+        return subprocess.run(
+            [sys.executable, *args[1:]], capture_output=True, text=True, check=False,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(module, "_run", run)
+    assert module.load_installed_lane_registry(cfg) == (LANE_1,)
+    assert sorted(str(p.relative_to(release)) for p in release.rglob("*")) == before
+
+
+def test_rollout_stop_uses_drain_budget_not_readiness_budget(monkeypatch):
+    import subprocess
+    module = _module()
+    calls = []
+    state = "active"
+
+    def run(args, *, timeout):
+        nonlocal state
+        calls.append((args, timeout))
+        state = "inactive" if args[1] == "stop" else "active"
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    def show(_unit, prop):
+        return {"ActiveState": state, "SubState": "running",
+                "MainPID": "42", "StatusText": "aicc-ready"}[prop]
+
+    monkeypatch.setattr(module, "_run", run)
+    ok, detail = module.rollout_active_lanes(
+        (LANE_1,), readiness_timeout=120, drain_timeout=30,
+        poll_interval=0.01, show=show,
+    )
+    assert (ok, detail) == (True, "ready:1")
+    assert calls == [(["systemctl", "stop", LANE_1], 30),
+                     (["systemctl", "start", LANE_1], 225)]
+
+
+def test_deploy_budget_defers_busy_workers_instead_of_waiting_for_jobs():
+    root = Path(__file__).parents[2]
+    deploy = (root / "deploy/systemd/voyn-aicc-worker-release-deploy.service").read_text()
+    cfg = _module().DeployConfig()
+    assert cfg.drain_timeout == 30
+    assert "TimeoutStartSec=1800s" in deploy
+    assert 2 * (cfg.drain_timeout + 225 + cfg.readiness_timeout) + 300 < 1800
+
+
+def test_pending_release_prevents_false_noop_and_helper_refresh(tmp_path, monkeypatch):
+    module = _module()
+    cfg = _cfg(module, tmp_path)
+    (cfg.state_dir / "pending-release").write_text("releases/" + SHA_B)
+    monkeypatch.setattr(module, "refresh_root_helpers", lambda *a, **k: pytest.fail("no refresh"))
+    report = _deploy(module, cfg, resolve_sha=lambda _: SHA_A)
+    assert (report.outcome, report.detail) == ("REFUSED", "pending_release_recovery_required")
+
+
+def test_noop_revalidates_manifest_before_refresh(tmp_path, monkeypatch):
+    module = _module()
+    cfg = _cfg(module, tmp_path)
+    verified = []
+
+    def verify(*args, **kwargs):
+        verified.append((args, kwargs))
+        raise RuntimeError("unattested content")
+
+    monkeypatch.setattr(module, "refresh_root_helpers", lambda *a, **k: pytest.fail("no refresh"))
+    report = _deploy(module, cfg, resolve_sha=lambda _: SHA_A,
+                     install_tx=SimpleNamespace(verify_release_manifest=verify))
+    assert report.outcome == "REFUSED"
+    assert report.detail == "current_release_unverified:unattested content"
+    args, kwargs = verified[0]
+    assert args == (cfg.release_root / SHA_A,
+                    cfg.state_dir / "releases" / f"{SHA_A}.json", SHA_A)
+    assert kwargs["repo_root"] == cfg.bare_mirror
+
+
+@pytest.mark.parametrize("active", ["failed", "deactivating", "activating", "active", ""])
+def test_noop_refuses_unhealthy_registered_lane(tmp_path, monkeypatch, active):
+    module = _module()
+    cfg = _cfg(module, tmp_path, readiness_timeout=0.001)
+    monkeypatch.setattr(module, "refresh_root_helpers", lambda *a, **k: pytest.fail("no refresh"))
+    report = _deploy(module, cfg, resolve_sha=lambda _: SHA_A,
+                     show=lambda unit, prop: active if prop == "ActiveState" else "")
+    assert report.outcome == "REFUSED"
+    assert report.detail == f"current_lane_not_ready:{LANE_1}"
+
+
+def test_noop_accepts_ready_lane_and_leaves_intentionally_stopped_lane(tmp_path):
+    module = _module()
+    cfg = _cfg(module, tmp_path)
+
+    def show(unit, prop):
+        if unit == LANE_2:
+            assert prop == "ActiveState"
+            return "inactive"
+        return {"ActiveState": "active", "SubState": "running",
+                "MainPID": "42", "StatusText": "aicc-ready"}[prop]
+
+    report = _deploy(module, cfg, resolve_sha=lambda _: SHA_A,
+                     load_lanes=lambda *a, **k: (LANE_1, LANE_2), show=show)
+    assert report.outcome == "NOOP"
+
+
+def test_failed_rollback_is_reported_once_and_preserves_pending_recovery(tmp_path):
+    module = _module()
+    cfg = _cfg(module, tmp_path)
+    calls = []
+
+    def select(sha):
+        (cfg.state_dir / "pending-release").write_text("releases/" + SHA_A)
+
+    def restore():
+        calls.append(True)
+        raise RuntimeError("nontraversable rollback release")
+
+    report = _deploy(module, cfg,
+                     stage=lambda *_: None, select=select,
+                     rollout=lambda _: (False, "stop_failed:lane2"),
+                     restore_previous=restore)
+    assert report.outcome == "REFUSED"
+    assert report.detail.startswith("rollback_failed:stop_failed:lane2:")
+    assert calls == [True]
+    assert (cfg.state_dir / "pending-release").exists()
+
+@pytest.mark.parametrize("failure", ["busy", "legacy", "old_ack", "pid", "budget", "rotation"])
+def test_idle_preflight_refuses_before_select_and_resumes(tmp_path, failure):
+    module = _module()
+    cfg = _cfg(module, tmp_path)
+    signals, selected, released = [], [], []
+    now = [0.0]
+    status = ["aicc-drained-idle" if failure == "old_ack" else "aicc-ready"]
+    pid = ["42"]
+
+    def show(unit, prop):
+        if "credential-" in unit:
+            return "active" if failure == "rotation" else "inactive"
+        return {"ActiveState": "active", "SubState": "running",
+                "MainPID": pid[0], "StatusText": status[0]}[prop]
+
+    def signal(args):
+        signals.append(args)
+        if "--signal=SIGUSR1" in args:
+            status[0] = "aicc-drained" if failure == "legacy" else "aicc-ready"
+            if failure == "pid":
+                pid[0] = "43"
+        return SimpleNamespace(returncode=0)
+
+    def sleep(seconds):
+        now[0] += 31
+
+    def preflight(config, units, gated, **kwargs):
+        module.idle_preflight(config, units, gated, show=show, systemctl=signal,
+                              remaining=lambda _: 1 if failure == "budget" else 3600,
+                              clock=lambda: now[0], sleeper=sleep)
+
+    report = _deploy(module, cfg, show=show, stage=lambda *_: None,
+                     preflight=preflight, select=selected.append,
+                     resume=lambda gated, **kw: module.resume_gated_lanes(
+                         gated, show=show, systemctl=signal),
+                     release_timers=lambda: released.append(True))
+    assert report.outcome == "REFUSED"
+    assert not selected
+    assert released == [True]
+    assert any("--signal=SIGHUP" in args for args in signals) == (failure in {"busy", "legacy"})
+
+
+def test_idle_ack_selects_after_all_lanes_and_unwinds_selection_failure(tmp_path):
+    module = _module()
+    cfg = _cfg(module, tmp_path)
+    statuses = {LANE_1: "aicc-ready", LANE_2: "aicc-ready"}
+    signals = []
+
+    def show(unit, prop):
+        if "credential-" in unit:
+            return "inactive"
+        return {"ActiveState": "active", "SubState": "running",
+                "MainPID": "42", "StatusText": statuses[unit]}[prop]
+
+    def signal(args):
+        signals.append(args)
+        statuses[args[-1]] = "aicc-drained-idle"
+        return SimpleNamespace(returncode=0)
+
+    def preflight(config, units, gated, **kwargs):
+        module.idle_preflight(config, units, gated, show=show, systemctl=signal,
+                              remaining=lambda _: 3600)
+
+    def select(sha):
+        assert all(value == "aicc-drained-idle" for value in statuses.values())
+        raise RuntimeError("selector refusal")
+
+    report = _deploy(module, cfg, load_lanes=lambda *a, **k: (LANE_1, LANE_2),
+                     show=show, stage=lambda *_: None, preflight=preflight,
+                     select=select, resume=lambda gated, **kw: module.resume_gated_lanes(
+                         gated, show=show, systemctl=signal))
+    assert report.outcome == "REFUSED"
+    assert sum("--signal=SIGHUP" in args for args in signals) == 2
+
+
+def test_credential_probe_uses_installed_runtime_without_secret_output(tmp_path, monkeypatch):
+    module = _module()
+    cfg = _cfg(module, tmp_path)
+    monkeypatch.setattr(module, "_current_release_sha", lambda _: SHA_A)
+    calls = []
+
+    def run(args, **kwargs):
+        calls.append((args, kwargs))
+        return SimpleNamespace(returncode=0, stdout="1200.5\n")
+
+    monkeypatch.setattr(module, "_run", run)
+    assert module.credential_remaining_seconds(cfg) == 1200.5
+    args, kwargs = calls[0]
+    assert args[:3] == [str(cfg.runtime_venv / "bin/python"), "-B", "-c"]
+    assert "/var/lib/voyn-aicc-credential-rotation/worker.env" in args[3]
+    assert kwargs["cwd"] == str(cfg.release_root / SHA_A)
+    monkeypatch.setattr(module, "_run", lambda *a, **k: SimpleNamespace(returncode=1, stdout="secret"))
+    with pytest.raises(RuntimeError, match="^credential_budget_unavailable$"):
+        module.credential_remaining_seconds(cfg)

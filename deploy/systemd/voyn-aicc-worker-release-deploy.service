@@ -38,4 +38,5 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 ReadWritePaths=/opt/aicc/releases /opt/aicc /var/lib/aicc-principal-isolation /run /usr/libexec
 InaccessiblePaths=-/opt/aicc/source
 UMask=0077
-TimeoutStartSec=900s
+# Busy lanes defer before selection; bound idle rollout plus git staging.
+TimeoutStartSec=1800s

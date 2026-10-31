@@ -296,6 +296,18 @@ PY
 # a fresh uninstall WAL. An already-journalled uninstall is resumed only by
 # its digest-bound capsule, so it cannot swap recovery code mid-transaction.
 if ! path_present "$state_dir/uninstall.json"; then
+  # Native release deploy journals only its selector, not an install generation.
+  # Resolve that protocol explicitly before generic recovery; its orphan-WAL
+  # refusal remains intact. Serialize against native deploy for this early span
+  # too, keeping the hold through the normal transaction below.
+  if [ "$install_profile" = "worker" ] && \
+      path_present "$state_dir/pending-release" && \
+      ! path_present "$state_dir/pending.json"; then
+    trap release_lane_timers EXIT
+    trap 'exit 1' HUP INT TERM
+    hold_lane_timers || exit 1
+    run_transaction release-deploy-recover
+  fi
   # Recover an existing install WAL with the exact anchor/capsule that wrote
   # it before replacing that anchor with code from this release.
   if path_present "$state_dir/pending.json"; then

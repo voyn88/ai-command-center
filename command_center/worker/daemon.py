@@ -16,6 +16,11 @@ Design decisions, each traceable to the shipped substrate:
   current attempt runs to completion inside systemd's stop timeout. A second
   signal — or the timeout's SIGKILL — abandons it, and the lease expiry plus
   the control plane's reaper make that abandonment safe by construction.
+* **Drain ACK does not imply idle.** ``aicc-drained`` retains its legacy
+  meaning (claim gate closed, possibly busy). ``aicc-drained-idle`` additionally
+  proves that no claim/handler/report is in flight. A handled outcome-write
+  failure is left to the canonical lease expiry/reaper, as on the normal loop;
+  it is not permanent evidence of work still running inside this process.
 * **Auth failure means stop, not retry.** A refused connection may mean the
   credential was rotated out from under us (`enroll_rotate_self` is
   first-writer-wins); hammering the server with a dead secret is
@@ -130,6 +135,9 @@ class WorkerDaemon:
         # loop holds it from its final drain check through claim(), so a drain
         # ACK cannot race ahead of an already-starting database claim.
         self._claim_gate_lock = threading.Lock()
+        # Guarded by the claim gate: include claim I/O and final persistence,
+        # not only the handler. Clear only after _execute finishes its handling.
+        self._attempt_active = False
         self._reload_requested = threading.Event()
         self._reload_stop = threading.Event()
         # Injectable so tests drive time instead of waiting through it.
@@ -173,6 +181,12 @@ class WorkerDaemon:
         self._notify(f"RELOADING=1\nMONOTONIC_USEC={time.monotonic_ns() // 1_000}")
         self._reload_requested.set()
 
+    def _drained_status(self) -> str:
+        """Caller holds the gate lock, including while emitting this status."""
+        if self._attempt_active:
+            return "aicc-drained"  # legacy ACK: claims closed, not necessarily idle
+        return "aicc-drained-idle"
+
     def _drain_coordinator_loop(self) -> None:
         while not self._drain_stop.is_set():
             if not self._drain_wakeup.wait(0.25):
@@ -183,11 +197,11 @@ class WorkerDaemon:
             with self._claim_gate_lock:
                 if self._drain.is_set() and not self._drain_closed.is_set():
                     self._drain_closed.set()
-                    # This is the protocol ACK consumed by the rotator.  At
+                    # Both statuses acknowledge the closed claim gate. At
                     # this point claim() is not running and cannot begin until
                     # the lock is released, after which the closed flag is
                     # checked again before any claim.
-                    self._notify("STATUS=aicc-drained")
+                    self._notify(f"STATUS={self._drained_status()}")
 
     def _credential_reload_loop(self) -> None:
         while not self._reload_stop.is_set():
@@ -246,7 +260,7 @@ class WorkerDaemon:
                     draining = self._drain.is_set()
                     if draining:
                         status = (
-                            "aicc-drained"
+                            self._drained_status()
                             if self._drain_closed.is_set()
                             else "aicc-drain-requested"
                         )
@@ -260,10 +274,13 @@ class WorkerDaemon:
                     # STATUS travels with every claim-path ping so a status
                     # written by a dying drain cycle can never stick.
                     self._notify("WATCHDOG=1\nSTATUS=aicc-ready")
+                    self._attempt_active = True
                     claimed = self._store.claim(
                         self._config.queue,
                         visibility_seconds=self._config.visibility_seconds,
                     )
+                    if isinstance(claimed, QueueRefusal):
+                        self._attempt_active = False
                 if isinstance(claimed, QueueRefusal):
                     if claimed.reason == "no_work":
                         self._sleep(min(idle + random.uniform(0, idle), cap))
@@ -276,6 +293,15 @@ class WorkerDaemon:
                     continue
                 idle = self._config.idle_min_seconds
                 self._execute(claimed)
+                # A handled report failure has no remaining local I/O or work;
+                # canonical visibility expiry/reaping handles its uncertain
+                # outcome. An escaping exception never reaches this idle ACK.
+                with self._claim_gate_lock:
+                    self._attempt_active = False
+                    if self._drain.is_set() and self._drain_closed.is_set():
+                        # Reload clears both flags and emits READY under
+                        # this same lock: no late idle ACK can overwrite it.
+                        self._notify(f"STATUS={self._drained_status()}")
         finally:
             self._reload_stop.set()
             self._reload_requested.set()
