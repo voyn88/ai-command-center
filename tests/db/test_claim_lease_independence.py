@@ -126,7 +126,7 @@ def test_work_queue_store_does_not_import_or_invoke_the_platform_lease() -> None
     }
     assert not lease_strings, lease_strings
 
-    # The only SQL the store may call is the local 0002 protocol
+        # The only SQL the store may call is the local queue protocol
     # (claim/ownership plus the control-plane enqueue).
     sql_literals = sorted(
         value for value in string_constants if "SELECT" in value.upper()
@@ -134,7 +134,7 @@ def test_work_queue_store_does_not_import_or_invoke_the_platform_lease() -> None
     assert sql_literals, "expected at least the queue_* call sites"
     for literal in sql_literals:
         assert re.search(
-            r"\bqueue_(claim|heartbeat|complete|fail|enqueue)\b", literal
+            r"\bqueue_(claim|heartbeat|complete|fail|fail_infra_wait|fail_lease_wait|enqueue)\b", literal
         ), (
             f"work_queue_store must only call the local queue_* protocol; "
             f"found {literal!r}"
