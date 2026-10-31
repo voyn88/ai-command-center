@@ -952,6 +952,15 @@ def test_write_and_remove_rollout_lock_round_trip(tmp_path, monkeypatch):
     module.remove_rollout_lock()
 
 
+def test_remove_rollout_lock_preserves_foreign_owner(tmp_path, monkeypatch):
+    module = _module()
+    lock_path = tmp_path / "aicc-staged-rollout.lock"
+    monkeypatch.setattr(module, "ROLLOUT_LOCK_PATH", lock_path)
+    lock_path.write_text(f"{os.getpid() + 1}\n", encoding="utf-8")
+    module.remove_rollout_lock()
+    assert lock_path.read_text(encoding="utf-8") == f"{os.getpid() + 1}\n"
+
+
 def test_rollout_with_timers_already_held_does_not_touch_timers_or_lock(
     tmp_path, monkeypatch
 ):

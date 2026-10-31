@@ -517,7 +517,12 @@ def write_rollout_lock() -> None:
 
 
 def remove_rollout_lock() -> None:
-    ROLLOUT_LOCK_PATH.unlink(missing_ok=True)
+    try:
+        owner = ROLLOUT_LOCK_PATH.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return
+    if owner == str(os.getpid()):
+        ROLLOUT_LOCK_PATH.unlink(missing_ok=True)
 
 
 def retire_legacy_units(systemd: Systemd) -> None:
