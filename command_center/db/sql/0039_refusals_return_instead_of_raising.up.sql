@@ -60,7 +60,7 @@
 -- most the remainder of its TTL, while releasing one that is still protecting
 -- a running task costs a second writer in the same working copy.
 
-CREATE FUNCTION _backlog_lease_release_if_idle(
+CREATE OR REPLACE FUNCTION _backlog_lease_release_if_idle(
     p_repo text, p_owner text, p_except_task text
 ) RETURNS backlog_lease_verdict
     LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, public AS $$
@@ -120,7 +120,7 @@ $$;
 -- The idempotency key still uses the PRE-transition revision, so a re-tick of
 -- the same revision lands on the same work item; the accepted transition bumps
 -- the revision and therefore opens a new dispatch epoch.
-CREATE FUNCTION backlog_dispatch(
+CREATE OR REPLACE FUNCTION backlog_dispatch(
     p_task_id text, p_planner text, p_ttl_seconds integer,
     p_wip_limit integer, p_payload jsonb, p_max_attempts integer DEFAULT 3
 ) RETURNS backlog_dispatch_verdict
