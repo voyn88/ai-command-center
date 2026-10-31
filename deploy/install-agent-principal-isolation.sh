@@ -168,7 +168,7 @@ hold_lane_timers() {
     fi
   fi
   # #917 added this timer to LANE_MUTATING_TIMERS. A refresh left running
-  # moves the source tree under a rollout that believes the host is quiet.
+  # can still move the checkout while a rollout believes the host is quiet.
   if systemctl show voyn-aicc-source-clone-refresh.timer --property=LoadState --value 2>/dev/null | grep -qx loaded; then
     if ! systemctl stop voyn-aicc-source-clone-refresh.timer; then
       systemctl start voyn-aicc-credential-rotation.timer >/dev/null 2>&1 || true
