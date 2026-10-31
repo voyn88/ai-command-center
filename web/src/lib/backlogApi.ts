@@ -3,8 +3,9 @@ export type BacklogTask = {
   project: string; updated_at: string
 }
 export type BacklogSnapshot = {
-  source: 'server_backlog'; read_only: true; updated_at: string
+  source: 'server_backlog'; read_only: boolean; updated_at: string
   stale: boolean; total: number; tasks: BacklogTask[]; counts: Record<string, number>
+  commands_enabled?: boolean
 }
 export async function fetchBacklog(signal?: AbortSignal): Promise<BacklogSnapshot> {
   const response = await fetch('/api/backlog', { signal, cache: 'no-store' })

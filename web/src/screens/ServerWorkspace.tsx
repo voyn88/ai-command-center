@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react'
 import GlassPanel from '../components/GlassPanel'
 import KpiCard from '../components/KpiCard'
 import NavItem from '../components/NavItem'
+import OwnerTaskActions from '../components/OwnerTaskActions'
 import { HomeIcon, TasksIcon, ExecutionIcon } from '../components/NavIcons'
 import { fetchBacklog, statusName } from '../lib/backlogApi'
 import type { BacklogSnapshot, BacklogTask } from '../lib/backlogApi'
@@ -18,12 +19,13 @@ const displayDate = (value: string) => {
   return Number.isNaN(date.getTime()) ? 'Дата неизвестна' : date.toLocaleString('ru-RU', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })
 }
 
-function TaskCard({ task }: { task: BacklogTask }) {
+function TaskCard({ task, commands, onChanged }: { task: BacklogTask; commands?: boolean; onChanged: () => void }) {
+  const [open, setOpen] = useState(false)
   return <article className="owner-task">
     <div className="owner-task-meta"><span className={`owner-status status-${task.status}`}>{statusName(task.status)}</span><span>{task.project}</span></div>
     <h3>{task.title === '[REDACTED]' ? 'Описание скрыто: содержит служебные данные' : task.title}</h3>
     <div className="owner-task-meta"><span>{task.priority ? `${task.priority} · ${priorities[task.priority]}` : 'Приоритет не задан'}</span><span>{displayDate(task.updated_at)}</span></div>
-    <details><summary>Подробнее</summary><p className="owner-id">{task.id}</p><p>Статус из серверного списка задач. Завершение задачи само по себе не подтверждает её развёртывание.</p></details>
+    <details onToggle={e => setOpen(e.currentTarget.open)}><summary>Подробнее{commands ? ' и действия' : ''}</summary><p className="owner-id">{task.id}</p><p>Статус из серверного списка задач. Завершение задачи само по себе не подтверждает её развёртывание.</p>{commands && open && <OwnerTaskActions taskId={task.id} onChanged={onChanged} />}</details>
   </article>
 }
 
@@ -86,14 +88,14 @@ export default function ServerWorkspace() {
       {data?.stale && <div role="alert" className="owner-notice">Список давно не обновлялся. Статусы могут быть неактуальны.</div>}
       {!data && !error && <p role="status">Загружаем серверные задачи…</p>}
       {data && <>
-        <div className="owner-page-heading"><h1>{screen === 'home' ? 'Обзор разработки' : screen === 'tasks' ? 'Задачи' : 'В работе и на проверке'}</h1><p>Обновлено {displayDate(data.updated_at)} · Только просмотр</p></div>
+        <div className="owner-page-heading"><h1>{screen === 'home' ? 'Обзор разработки' : screen === 'tasks' ? 'Задачи' : 'В работе и на проверке'}</h1><p>Обновлено {displayDate(data.updated_at)} · {data.commands_enabled ? 'Действия доступны в карточках' : 'Только просмотр'}</p></div>
         {screen === 'home' ? <>
           <div className="owner-kpis">
             {[['IN_PROGRESS', 'В работе'], ['READY_TO_REVIEW', 'На проверке'], ['DEFER_TO_USER', 'Ждут вас'], ['DONE', 'Завершено']].map(([key, label]) => <button key={key} className="owner-kpi-button" onClick={() => navigate('tasks', key)} aria-label={`${label}: ${counts[key] || 0}`}><KpiCard label={label} value={counts[key] || 0} meta="Открыть задачи" /></button>)}
           </div>
           <GlassPanel title="Нужно ваше решение">
-            <p className="owner-muted">{attention.length ? `${attention.length} задач ждут ответа. Здесь можно посмотреть их; отправка решений ещё не подключена.` : 'Сейчас нет задач, ожидающих вашего решения.'}</p>
-            {attention.slice(0, 4).map((task, i) => <TaskCard key={`${task.id}-${i}`} task={task} />)}
+            <p className="owner-muted">{attention.length ? `${attention.length} задач ждут ответа. ${data.commands_enabled ? 'Откройте карточку, чтобы отправить решение.' : 'Доступен только просмотр.'}` : 'Сейчас нет задач, ожидающих вашего решения.'}</p>
+            {attention.slice(0, 4).map((task, i) => <TaskCard key={`${task.id}-${i}`} task={task} commands={data.commands_enabled} onChanged={() => setRefresh(n => n + 1)} />)}
             {attention.length > 4 && <button className="owner-button" onClick={() => navigate('tasks', 'DEFER_TO_USER')}>Все ожидающие решения ({attention.length})</button>}
           </GlassPanel>
           <div className="owner-section"><GlassPanel title="Проекты">
@@ -106,7 +108,7 @@ export default function ServerWorkspace() {
             <label>Статус<select value={status} onChange={e => { setStatus(e.target.value); setLimit(30) }}><option value="ALL">Все статусы</option>{Object.keys(counts).filter(s => screen !== 'execution' || ['IN_PROGRESS', 'READY_TO_REVIEW'].includes(s)).map(s => <option value={s} key={s}>{statusName(s)} ({counts[s]})</option>)}</select></label>
           </div>
           <p className="owner-muted" role="status">Найдено {filtered.length} · Всего {data.total}</p>
-          {filtered.slice(0, limit).map((task, i) => <TaskCard key={`${task.id}-${i}`} task={task} />)}
+          {filtered.slice(0, limit).map((task, i) => <TaskCard key={`${task.id}-${i}`} task={task} commands={data.commands_enabled} onChanged={() => setRefresh(n => n + 1)} />)}
           {!filtered.length && <p>По этим фильтрам задач нет.</p>}
           {filtered.length > limit && <button className="owner-button" onClick={() => setLimit(n => n + 30)}>Показать ещё ({filtered.length - limit})</button>}
         </GlassPanel>}
