@@ -391,6 +391,23 @@ def create_run(
             # would make `create_run` unusable against any schema older than
             # the one that introduced them.
             table_columns = {row["name"] for row in conn.execute("PRAGMA table_info(run)")}
+            if "insert_seq" in table_columns:
+                # Insertion order, stamped in the same `BEGIN IMMEDIATE` that
+                # already serialises this insert — so two concurrent launches
+                # cannot read the same `MAX`. The write lock is the guarantee,
+                # not the clock and not a constraint: the same discipline
+                # `sequence` above and `run_event.seq` already run on.
+                # Deliberately global rather than per-task, because
+                # `backfill_run_provenance` orders the whole table by it, and
+                # `idx_run_insert_seq` is what keeps this `MAX` from scanning
+                # that whole table while the lock is held.
+                #
+                # Read behind the `PRAGMA` for the same reason as the column
+                # list: schema 25 and older have no such column, and
+                # `create_run` has to keep working against them.
+                record["insert_seq"] = conn.execute(
+                    "SELECT COALESCE(MAX(insert_seq), 0) + 1 AS next_seq FROM run"
+                ).fetchone()["next_seq"]
             insert_columns = [name for name in record if name in table_columns]
             conn.execute(
                 f"""INSERT INTO run ({", ".join(insert_columns)})
@@ -560,17 +577,32 @@ def get_run(db_path: Path, run_id: str) -> dict | None:
 def get_latest_run_for_task(db_path: Path, task_id: str) -> dict | None:
     """Newest run row for `task_id`, or None if the task has no runs.
 
-    Distinct from `list_runs(task_id=..., limit=1)`: that path orders only by
-    `created_at DESC`, and `created_at` is second-granularity (`iso_now()`),
-    so two runs created in the same second tie and SQLite returns them in
-    unspecified rowid order. We add `rowid DESC` as a stable tiebreak — rowid
-    is insertion order, so the higher rowid is the newer row — guaranteeing
-    the actually-newest run is returned. Used by `task_sync.sync_tasks` to
-    self-heal tasks whose `current_run_id` was orphaned by a lost update.
+    Distinct from `list_runs(task_id=..., limit=1)`: that path orders by
+    `created_at DESC`, and `created_at` is second-granularity (`iso_now()`), so
+    two runs created in the same second tie and the engine returns an arbitrary
+    one of them. Used by `task_sync.sync_tasks` to self-heal tasks whose
+    `current_run_id` was orphaned by a lost update.
+
+    Ordered by `insert_seq` (schema 26) **alone**, not as a tiebreak after
+    `created_at`. It was a tiebreak while it was `rowid`, because `rowid` was
+    only ever available on SQLite; as a real column on both engines it is the
+    total order the question actually means. Leaving `created_at` in front of it
+    would keep two properties nobody wants: the sort stays a temp B-tree over
+    every run the task ever had, since no index can lead on `created_at` here
+    without a third one existing for it; and a backwards clock step between two
+    inserts would return the older row as the newer. `insert_seq` is minted
+    under the write lock, so it cannot do either. `idx_run_task_insert_seq`
+    makes this a bounded index scan.
+
+    Rows seeded by the migration keep exactly the order `rowid` gave them, so no
+    already-stored task changes its answer. A row inserted by raw SQL outside
+    `create_run` — migration fixtures do this — carries no stamp and sorts last;
+    that is honest rather than convenient, since such a row has no recorded
+    insertion order for this query to report.
     """
     with db.connect(db_path) as conn:
         row = conn.execute(
-            "SELECT * FROM run WHERE task_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            "SELECT * FROM run WHERE task_id = ? ORDER BY insert_seq DESC LIMIT 1",
             (task_id,),
         ).fetchone()
         return db._row_to_dict(row)

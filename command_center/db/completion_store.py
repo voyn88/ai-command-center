@@ -39,6 +39,10 @@ COMPLETION_COLUMNS: tuple[str, ...] = (
     "recommended_action", "validation_summary", "policy_json", "last_checked_at",
     "next_retry_at", "retry_count", "recovery_count", "version", "created_at",
     "updated_at", "review_verdict", "review_run_id", "review_summary",
+    # Appended by `0025_run_completion_insert_seq`: both engines add a column at
+    # the end of the ordinal order, so this position is the position the
+    # databases have.
+    "insert_seq",
 )
 
 COMPLETION_EVENT_COLUMNS: tuple[str, ...] = (

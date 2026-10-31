@@ -42,6 +42,17 @@ def backfill_run_provenance(db_path: Path, *, limit: int = 500) -> int:
     with db.connect(db_path) as conn:
         if not db._table_exists(conn, "run_provenance"):
             return 0
+        # Schema 26 gave `run` a real insertion-order column. Below it there is
+        # only `created_at`, which is second-resolution text and therefore ties,
+        # so the batch boundary within one second is arbitrary — harmless,
+        # because `NOT EXISTS` means the next call picks up whatever this one
+        # left behind. The branch exists because `migrate()` runs this backfill
+        # for any schema from 13 up, and the historical-schema migration
+        # fixtures stop part-way on purpose.
+        has_insert_seq = any(
+            row["name"] == "insert_seq" for row in conn.execute("PRAGMA table_info(run)")
+        )
+        order_by = "r.created_at, r.insert_seq" if has_insert_seq else "r.created_at"
         with db.transaction(conn):
             cursor = conn.execute(
                 """INSERT INTO run_provenance (
@@ -70,9 +81,9 @@ def backfill_run_provenance(db_path: Path, *, limit: int = 500) -> int:
                    WHERE NOT EXISTS (
                        SELECT 1 FROM run_provenance AS p WHERE p.run_id = r.id
                    )
-                   ORDER BY r.created_at, r.rowid
+                   ORDER BY {order_by}
                    LIMIT ?
-                   RETURNING *""",
+                   RETURNING *""".format(order_by=order_by),
                 (now, limit),
             )
             # `RETURNING *` gives the rows this statement created — exactly
