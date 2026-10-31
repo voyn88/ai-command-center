@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from command_center import models
 from command_center.runtime import session_view
 
 HEALTH_OK = "OK"
@@ -17,13 +18,21 @@ HEALTH_DEGRADED = "Degraded"
 
 
 def _is_today(iso_ts: str | None, now: datetime) -> bool:
+    """Whether `iso_ts` falls on the day the operator is currently having.
+
+    Both sides are localised first. The stored string and `now` are naive UTC
+    (`models.iso_now`, `models.utc_now`), and comparing their UTC dates would
+    label a run "today" by a calendar the operator is not reading — mis-bucketing
+    every run within the host's UTC offset of midnight, which is also how the
+    rest of the app's day-buckets behave (`app._runs_per_day`).
+    """
     if not iso_ts:
         return False
     try:
         ts = datetime.fromisoformat(iso_ts)
     except (ValueError, TypeError):
         return False
-    return ts.date() == now.date()
+    return models.to_local(ts).date() == models.to_local(now).date()
 
 
 def build_project_overview(

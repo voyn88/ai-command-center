@@ -49,7 +49,7 @@ def _row(item_id: str, **overrides: object) -> dict:
         "done": 0,
         "source_ref": None,
         "version": 0,
-        "created_at": "2026-08-13T00:00:00",  # naive local, exactly what `models.iso_now()` emits
+        "created_at": "2026-08-13T00:00:00",  # naive UTC, exactly what `models.iso_now()` emits
         "updated_at": "2026-08-13T00:00:00",
         "project_ref": None,
     }
@@ -242,10 +242,12 @@ def test_the_authoritative_write_happens_before_the_mirror(tmp_path, monkeypatch
 def test_a_real_iso_now_timestamp_round_trips(mirror: PostgresOwnerItemMirror) -> None:
     """The test that would have caught the blocker: use what the app writes.
 
-    `models.iso_now()` returns *naive local time* — no offset, second
-    precision. The first version of this mirror rendered UTC with a `Z` suffix
-    and the tests fabricated `Z`-suffixed inputs to match, so the conversion was
-    proved against data no writer in this application emits. Against real
+    `models.iso_now()` returns an *offsetless* string at second precision —
+    naive UTC since `VOYN-W0-AICC-ISO-NOW-NAIVE-LOCAL`, naive local before it,
+    and never `Z`-suffixed either way. The first version of this mirror
+    rendered UTC with a `Z` suffix and the tests fabricated `Z`-suffixed inputs
+    to match, so the conversion was proved against data no writer in this
+    application emits. Against real
     output, `divergence` would have reported every row as different — the
     permanently-red gate the module docstring warns about.
     """
@@ -386,19 +388,26 @@ def test_every_lost_mirror_write_is_visible_to_reconciliation(
 
 
 def test_a_naive_timestamp_is_stored_as_the_instant_the_writer_meant(
-    mirror: PostgresOwnerItemMirror, pg_connection_factory
+    mirror: PostgresOwnerItemMirror, pg_connection_factory, process_tz
 ) -> None:
     """Naive text handed to `timestamptz` is stamped with the *session* zone.
 
     That is silent: no error, every row shifted by the gap between the writing
     machine and the server. The zone is attached on the way in instead, so the
-    stored instant is the one the writer meant regardless of the server's
+    stored instant is the one the writer meant — UTC (`models.iso_now`,
+    `VOYN-W0-AICC-ISO-NOW-NAIVE-LOCAL`) — regardless of the server's
     `TimeZone`.
-    """
-    from datetime import datetime
 
+    Under a non-UTC process zone deliberately: the mirroring process's zone
+    used to decide the stored instant, and on a UTC host that reading and this
+    one land on the same value, so the assertion would hold for either and pin
+    neither.
+    """
+    from datetime import datetime, timezone
+
+    process_tz("Europe/Moscow")
     written = "2026-08-13T12:00:00"
-    expected = datetime.fromisoformat(written).astimezone()
+    expected = datetime(2026, 8, 13, 12, 0, tzinfo=timezone.utc)
 
     mirror.upsert(_row("tz", created_at=written, updated_at=written))
 

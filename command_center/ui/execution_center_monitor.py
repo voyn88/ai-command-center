@@ -1666,7 +1666,12 @@ def _render_live_execution_center_body(api: runtime_api.ExecutionCenterAPI, task
     actually changed (`persist_if`), so an idle poll tick costs a lock
     acquisition (cheap, uncontended) but not a disk write. `tasks` is then
     rebound to that fresh, reconciled list for the rest of this render."""
-    now = datetime.now()
+    # Naive UTC: `now` is the reference every age, elapsed and heartbeat
+    # figure below is measured against, and the stamps it is compared with are
+    # `models.iso_now` strings (naive UTC). The one place the operator sees a
+    # wall clock instead of a duration renders it in local time explicitly —
+    # see the "last refreshed" line at the end of this function.
+    now = models.utc_now()
 
     # Desktop autopilot (AICC-DESKTOP-016). The bounded pipeline tick runs from
     # *this* existing refresh checkpoint — the same one that already owns
@@ -1799,7 +1804,11 @@ def _render_live_execution_center_body(api: runtime_api.ExecutionCenterAPI, task
             tick_result if tick_result is not None and tick_result.ran else None,
         )
 
-    st.session_state["exec_center_last_refreshed_at"] = now.strftime("%H:%M:%S")
+    # The operator reads this against their own wall clock, so it is the one
+    # value here rendered in local time rather than on the app's UTC scale.
+    st.session_state["exec_center_last_refreshed_at"] = (
+        datetime.now().strftime("%H:%M:%S")
+    )
 
 
 # Three fixed-interval monitoring pollers (15/30/60s) —

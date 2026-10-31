@@ -26,7 +26,7 @@ def _entry(entry_id: str, **overrides: object) -> dict:
         "state": "queued",
         "reason": None,
         "run_id": None,
-        "added_at": "2026-08-13T00:00:00",  # naive local, what `models.iso_now()` emits
+        "added_at": "2026-08-13T00:00:00",  # naive UTC, what `models.iso_now()` emits
         "evaluated_at": None,
         "launched_at": None,
     }
@@ -198,10 +198,11 @@ def test_a_real_iso_now_timestamp_round_trips(mirror: PostgresQueueMirror) -> No
 
     The first version rendered UTC with a `Z` suffix and every test fabricated
     `Z`-suffixed inputs to match, so the conversion was proved against data no
-    writer in this application emits. `models.iso_now()` returns *naive local
-    time*, and against that the mirror reported every entry as different —
-    which is the permanently-red cutover gate this module warns about, produced
-    by the code that warns about it.
+    writer in this application emits. `models.iso_now()` returns an *offsetless*
+    string — naive UTC since `VOYN-W0-AICC-ISO-NOW-NAIVE-LOCAL`, naive local
+    before it, and never `Z`-suffixed either way — and against that the mirror
+    reported every entry as different, which is the permanently-red cutover
+    gate this module warns about, produced by the code that warns about it.
     """
     from command_center import models
 
@@ -214,17 +215,27 @@ def test_a_real_iso_now_timestamp_round_trips(mirror: PostgresQueueMirror) -> No
 
 
 def test_a_naive_timestamp_is_stored_as_the_instant_the_writer_meant(
-    mirror: PostgresQueueMirror, pg_connection_factory
+    mirror: PostgresQueueMirror, pg_connection_factory, process_tz
 ) -> None:
     """Naive text handed to `timestamptz` is stamped with the *session* zone.
 
     Silently: no error, every row shifted by the gap between the writing
-    machine and the server. The zone is attached on the way in instead.
-    """
-    from datetime import datetime
+    machine and the server. The zone is attached on the way in instead, and
+    what the writer means by an offsetless string is UTC (`models.iso_now`,
+    `VOYN-W0-AICC-ISO-NOW-NAIVE-LOCAL`).
 
+    Run under a non-UTC process zone on purpose: the mirroring process's own
+    zone used to decide the stored instant, and on a UTC host that reading is
+    indistinguishable from this one — the assertion would pass either way and
+    prove nothing. The comparison is between aware values, so the server's
+    `TimeZone` (which decides only how the row is *presented* on read back)
+    cannot affect it either.
+    """
+    from datetime import datetime, timezone
+
+    process_tz("Europe/Moscow")
     written = "2026-08-13T12:00:00"
-    expected = datetime.fromisoformat(written).astimezone()
+    expected = datetime(2026, 8, 13, 12, 0, tzinfo=timezone.utc)
 
     mirror.replace_entries([_entry("tz", added_at=written)])
 

@@ -4,7 +4,7 @@ import html
 import os
 import subprocess
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import streamlit as st
@@ -386,12 +386,23 @@ get_git_worktrees = git_readers.get_git_worktrees
 
 
 def _parse_iso_ts(value: str | None) -> float | None:
+    """A stored timestamp as a true POSIX epoch.
+
+    Offsetless input is read as UTC, which is what this app writes
+    (`models.iso_now`). That matters twice over: these epochs are interleaved
+    with real file mtimes in the timeline below, so a wrong reading sorts
+    agent events against artifacts incorrectly, and every `fromtimestamp`
+    render of one of them is the operator's *local* time only if the epoch was
+    true to begin with."""
     if not value:
         return None
     try:
-        return datetime.fromisoformat(value).timestamp()
+        parsed = datetime.fromisoformat(value)
     except ValueError:
         return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
 
 
 def build_timeline_events(
@@ -783,7 +794,12 @@ def _home_greeting() -> str:
 
 def _runs_per_day(runs: list[dict], days: int = 7) -> tuple[int, ...]:
     """A real short series: runs started per day over the last `days` — the
-    honest trend for a KPI sparkline (never random)."""
+    honest trend for a KPI sparkline (never random).
+
+    Bucketed by the operator's *local* calendar day, so "today" on the sparkline
+    is the day they are having. `started_at` is naive UTC (`models.iso_now`),
+    hence the conversion — comparing a UTC date against a local `today` would
+    mis-bucket every run within the host's offset of midnight."""
     today = datetime.now().date()
     buckets = [0] * days
     for r in runs:
@@ -791,7 +807,7 @@ def _runs_per_day(runs: list[dict], days: int = 7) -> tuple[int, ...]:
         if not started:
             continue
         try:
-            d = datetime.fromisoformat(started).date()
+            d = models.to_local(datetime.fromisoformat(started)).date()
         except (ValueError, TypeError):
             continue
         delta = (today - d).days
@@ -801,12 +817,15 @@ def _runs_per_day(runs: list[dict], days: int = 7) -> tuple[int, ...]:
 
 
 def _run_started_date(run: dict) -> datetime | None:
-    """Parse a run's ``started_at`` ISO timestamp to a date, or ``None``."""
+    """A run's ``started_at`` as the operator's *local* wall clock, or ``None``.
+
+    Local because its callers bucket by calendar day ("runs today vs
+    yesterday"); the stored value is naive UTC (`models.iso_now`)."""
     started = run.get("started_at")
     if not started:
         return None
     try:
-        return datetime.fromisoformat(started)
+        return models.to_local(datetime.fromisoformat(started))
     except (ValueError, TypeError):
         return None
 
@@ -820,6 +839,7 @@ HEALTH_WINDOW_DAYS = 7
 
 
 def _window_terminal_runs(runs: list[dict], *, days: int = HEALTH_WINDOW_DAYS) -> list[dict]:
+    # Local calendar days on both sides of the comparison — see `_runs_per_day`.
     today = datetime.now().date()
     out = []
     for r in runs:
@@ -829,7 +849,7 @@ def _window_terminal_runs(runs: list[dict], *, days: int = HEALTH_WINDOW_DAYS) -
         if not started:
             continue
         try:
-            d = datetime.fromisoformat(started).date()
+            d = models.to_local(datetime.fromisoformat(started)).date()
         except (ValueError, TypeError):
             continue
         if 0 <= (today - d).days < days:
@@ -878,7 +898,10 @@ def render_home_dashboard(
     AI-Supervisor side panel. Pure presentation over the live task/run state via
     `command_center.ui.home_dashboard`; every number is real."""
     home_dashboard.inject_css()
-    now = datetime.now()
+    # The reference for every age/elapsed figure on this screen, so it is on
+    # the scale the stamps are stored on: naive UTC (`models.iso_now`).
+    # Calendar-day KPIs below deliberately use a *local* `today` instead.
+    now = models.utc_now()
     # Operator name is configurable via the AICC_OPERATOR env var — never a
     # hardcoded person. Unset → a neutral greeting with no name, so a fresh
     # install does not greet "Artyom".
@@ -947,7 +970,9 @@ def render_home_dashboard(
     # Real 24h run delta (UX-2b): runs started today vs yesterday, so the
     # "Агенты" KPI carries an honest day-over-day trend instead of a static
     # count. Both windows read from the already-loaded `runs` (limit=200).
-    today = now.date()
+    # The operator's day, not the UTC one `now` is on: `_run_started_date`
+    # returns local wall clock for exactly this comparison.
+    today = datetime.now().date()
     runs_today = sum(1 for r in runs if _run_started_date(r) and _run_started_date(r).date() == today)
     runs_yesterday = sum(
         1 for r in runs
@@ -1091,7 +1116,11 @@ def render_home_dashboard(
                 when = ""
                 if ts:
                     try:
-                        when = datetime.fromisoformat(ts).strftime("%d.%m %H:%M")
+                        # An absolute time the operator reads off their own
+                        # clock, so the stored UTC value is localised.
+                        when = models.to_local(
+                            datetime.fromisoformat(ts)
+                        ).strftime("%d.%m %H:%M")
                     except (ValueError, TypeError):
                         when = ts[:16]
                 meta = " · ".join(p for p in (event.get("project"), when) if p)
@@ -1674,7 +1703,9 @@ elif page_key == "aml":
 
 elif page_key == "board_view":
     board_view.render_board_view(
-        board_view.build_weekly_summary(tasks, parse_project_statuses(), now=datetime.now())
+        board_view.build_weekly_summary(
+            tasks, parse_project_statuses(), now=models.utc_now()
+        )
     )
 
 
@@ -2173,7 +2204,9 @@ elif page_key == "kanban":
         for run in kanban_api.list_runs(limit=200)
         if run.get("id") in current_run_id_set
     }
-    kanban_now = datetime.now()
+    # Reference for `session_view.elapsed_seconds`, which reads the stored
+    # naive stamps as UTC — so this has to be UTC too.
+    kanban_now = models.utc_now()
 
     def _kanban_live_progress(task: dict) -> tuple[int | None, str | None] | None:
         run = current_runs_by_id.get(task.get("current_run_id"))

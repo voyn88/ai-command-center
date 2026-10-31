@@ -219,7 +219,9 @@ that supply it.
 `runtime.scheduler` and `ExecutionCenterAPI.plan_schedule` form a deterministic read-only planning
 layer. Given work items, an agent registry, retry/capacity policy, and a point-in-time load snapshot,
 the planner returns explainable `ASSIGN`, `DEFER`, or `BLOCKED` decisions. Full determinism requires
-the caller to pass `now`; omitting it uses the current local time.
+the caller to pass `now`; omitting it reads the clock via `models.iso_now()`, which is naive
+UTC — the scale every timestamp the planner compares against is stored on
+(`VOYN-W0-AICC-ISO-NOW-NAIVE-LOCAL`).
 
 An `ASSIGN` decision is advisory. Planning writes no queue or run row, reserves no agent or task,
 creates no lease or durable claim, and launches no process. Task-id, capacity, and workspace checks

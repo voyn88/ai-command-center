@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from command_center import storage
+from command_center import models, storage
 from command_center.runtime import db as runtime_db
 from command_center import run_lineage as provenance
 from command_center.runtime import git_ops, repo_state, validation
@@ -91,7 +91,9 @@ MERGE_LOCK_TIMEOUT_SECONDS = 0.0
 
 
 def _now() -> datetime:
-    return datetime.now()
+    """Naive UTC, matching every timestamp this service reads and writes
+    (`next_retry_at`, `completed_at`); see `models.iso_now`."""
+    return models.utc_now()
 
 
 def _iso(dt: datetime) -> str:

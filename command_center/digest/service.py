@@ -40,8 +40,14 @@ CATEGORY_STATUS = "status"
 
 
 def today_str(*, now: datetime | None = None) -> str:
-    """The ``YYYY-MM-DD`` a digest built now belongs to (naive-local, matching
-    the app's timestamp convention)."""
+    """The ``YYYY-MM-DD`` a digest built now belongs to.
+
+    Deliberately the *local* calendar day, and the exception to the app's
+    otherwise-UTC timestamp scale (`models.iso_now`): this is the day the
+    operator is having — the key their morning digest is filed and looked up
+    under — not an instant compared against a stored column. The window the
+    digest's content is collected over *is* on the UTC scale; see
+    `sources.overnight_cutoff`."""
     return (now or datetime.now()).date().isoformat()
 
 

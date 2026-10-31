@@ -64,7 +64,7 @@ from command_center import (
     workspace_provisioning,
 )
 from command_center import run_lineage as provenance
-from command_center.models import iso_now
+from command_center.models import iso_now, utc_now
 from command_center.runtime import (
     context_service,
     db,
@@ -2755,7 +2755,12 @@ class Supervisor:
         this app whose process is still alive) has run past
         `started_at + timeout_seconds`. Conservative: if either field is missing
         or unparseable, returns False, so an orphan with no recorded deadline is
-        never force-reaped — it stays adopted RUNNING, the prior behaviour."""
+        never force-reaped — it stays adopted RUNNING, the prior behaviour.
+
+        `started_at` is a naive UTC `iso_now` string, so the comparison is
+        against `utc_now()`. A bare `datetime.now()` here was off by the host's
+        UTC offset — which decides whether a live adopted run gets SIGKILLed
+        hours early (east of UTC) or is never reaped at all (west)."""
         timeout_seconds = run.get("timeout_seconds")
         started_at = run.get("started_at")
         if not timeout_seconds or not started_at:
@@ -2764,7 +2769,7 @@ class Supervisor:
             started = datetime.fromisoformat(started_at)
         except (TypeError, ValueError):
             return False
-        return datetime.now() >= started + timedelta(seconds=float(timeout_seconds))
+        return utc_now() >= started + timedelta(seconds=float(timeout_seconds))
 
     def _sigkill_orphan_group(self, run_id: str, pid: int | None, recorded_identity: str | None) -> bool:
         """Terminalize only an orphan whose process is already confirmed gone.
