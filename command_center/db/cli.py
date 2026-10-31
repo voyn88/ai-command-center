@@ -118,6 +118,20 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="Destination path; written atomically (tmp + rename), whole file.",
     )
+    project = sub.add_parser(
+        "backlog-project",
+        help=(
+            "Render the canonical store as the MASTER markdown backlog "
+            "(BO-S4) -- the format backlog-import reads. Re-importing the "
+            "output changes nothing: the two are inverses, verified on the "
+            "rendered text before it is written."
+        ),
+    )
+    project.add_argument(
+        "--output",
+        required=True,
+        help="Destination VOYN_TASKS_BACKLOG.md; written atomically, whole file.",
+    )
     plan = sub.add_parser(
         "backlog-plan",
         help="One planner tick (BO-S2): release finished lanes, dispatch "
@@ -484,11 +498,18 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
 
             if args.command == "backlog-import":
+                from datetime import UTC, datetime
                 from pathlib import Path
 
+                from command_center.db import backlog_projection
                 from command_center.db.backlog_parser import parse_backlog
                 from command_center.db.backlog_store import BacklogStore
 
+                notice = backlog_projection.two_way_window_notice(
+                    datetime.now(UTC).date()
+                )
+                if notice:
+                    print(notice)
                 text = Path(args.path).read_text(encoding="utf-8")
                 if args.parse_only:
                     parsed = parse_backlog(text)
@@ -534,6 +555,28 @@ def main(argv: list[str] | None = None) -> int:
                     _Path(args.output), backlog_export.render_projection(rows)
                 )
                 print(f"rendered {len(rows)} records -> {args.output}")
+                return 0
+
+            if args.command == "backlog-project":
+                from pathlib import Path as _Path
+
+                from command_center import projection_writer
+                from command_center.db import backlog_projection
+
+                text, tasks = backlog_projection.render_master_file(conn)
+                # Always, with no flag to turn it off: the round trip is
+                # proved on THIS text, before it replaces the owner's file
+                # and becomes something `backlog-import` will read back. A
+                # projection that is not exact must not be written at all,
+                # so there is nothing for an operator to opt out of.
+                problems = backlog_projection.verify_round_trip(tasks, text)
+                for task_id, detail in problems:
+                    print(f"ROUND-TRIP {task_id}: {detail}")
+                if problems:
+                    print("refusing to write: the projection is not exact")
+                    return 1
+                projection_writer.write_atomically(_Path(args.output), text)
+                print(f"projected {len(tasks)} tasks -> {args.output}")
                 return 0
 
             if args.command == "backlog-plan":
