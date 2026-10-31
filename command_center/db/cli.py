@@ -648,6 +648,13 @@ def main(argv: list[str] | None = None) -> int:
                         print(f"RETRY     {task_id} -> {retry_key}")
                     for task_id, reason in retry_report.skipped:
                         print(f"RETRY-SKIP {task_id}: {reason}")
+                    # A review cycle that can no longer reach a verdict is
+                    # NOT a skip: it prints under its own name so an
+                    # operator reading the tick sees a failure instead of
+                    # the same wait line it printed yesterday
+                    # (VOYN-W0-AICC-VERDICT-AGGREGATION-STALLS).
+                    for task_id, reason in retry_report.stalled:
+                        print(f"STALLED   {task_id}: {reason}")
                     marker_report = publish_review_verdicts(
                         lambda: _nc(conn), args.repo_path, task_id=args.task_id,
                         # The same queue writer review_once uses: a REJECT
@@ -661,6 +668,8 @@ def main(argv: list[str] | None = None) -> int:
                         print(f"REMEDIATE {task_id} -> {new_task_id}")
                     for task_id, reason in marker_report.skipped:
                         print(f"SKIP      {task_id}: {reason}")
+                    for task_id, reason in marker_report.stalled:
+                        print(f"STALLED   {task_id}: {reason}")
                 # Printed AFTER the scope closes: the remaining-budget half
                 # of the line is read on the way out (`gh api rate_limit`,
                 # which does not itself consume quota).
