@@ -80,3 +80,12 @@ data/integration_registry.lock
 # pytest-testmon's local coverage-derived test<->source dependency cache
 # (`make test-impacted`). Per-checkout, never shared — CI does not use it.
 .testmondata
+
+# Agent-instruction files are per-machine context with absolute local paths
+# and internal programme names — never repository content in a PUBLIC repo.
+# One `git add -A` swept CLAUDE.md into pushed history twice (#259, and the
+# aios ops/ci-shard-balance branch); closed-PR diffs stay visible forever,
+# so the only working fix is "never add", enforced here and by
+# scripts/ci/prepush/leak_guard.sh (VOYN-OPS-PUBLIC-REPO-CLAUDE-MD-LEAK).
+CLAUDE.md
+CLAUDE.*.md

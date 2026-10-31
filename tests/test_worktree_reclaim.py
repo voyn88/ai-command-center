@@ -99,6 +99,38 @@ def test_recent_worktree_is_skipped(tmp_path):
     assert decisions[0].decision == worktree_reclaim.DECISION_SKIP_RECENT
 
 
+def test_old_detached_commit_is_preserved(tmp_path):
+    repo = _make_repo(tmp_path / "repo")
+    wt = _add_worktree(repo, tmp_path / "old", "task/old")
+    _git(wt, "checkout", "--detach")
+    _commit_dated(wt, days_ago=30)
+    decision, = worktree_reclaim.sweep_repository(repo)
+    assert decision.decision == worktree_reclaim.DECISION_SKIP_DETACHED
+    assert wt.exists()
+
+
+def test_apply_rechecks_new_writer_lease(tmp_path, monkeypatch):
+    repo = _make_repo(tmp_path / "repo")
+    wt = _add_worktree(repo, tmp_path / "old", "task/old")
+    _commit_dated(wt, days_ago=30)
+    decision, = worktree_reclaim.sweep_repository(repo)
+    monkeypatch.setattr(worktree_reclaim, "leased_worktree_paths", lambda: (True, frozenset({wt.resolve()})))
+    applied = worktree_reclaim.apply_decision(decision)
+    assert applied.applied_outcome == "remove_failed"
+    assert wt.exists()
+
+
+def test_apply_rechecks_detached_head(tmp_path):
+    repo = _make_repo(tmp_path / "repo")
+    wt = _add_worktree(repo, tmp_path / "old", "task/old")
+    _commit_dated(wt, days_ago=30)
+    decision, = worktree_reclaim.sweep_repository(repo)
+    _git(wt, "checkout", "--detach")
+    applied = worktree_reclaim.apply_decision(decision)
+    assert applied.applied_outcome == "remove_failed"
+    assert wt.exists()
+
+
 def test_dirty_worktree_is_never_reclaimable_regardless_of_age(tmp_path):
     repo = _make_repo(tmp_path / "repo")
     wt = _add_worktree(repo, tmp_path / "wt" / "dirty", "task/dirty")

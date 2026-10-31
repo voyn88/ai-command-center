@@ -1312,7 +1312,7 @@ def attach_worktree(repo_root: Path, *, branch: str, worktree_path: Path) -> Non
 def remove_worktree(repo_root: Path, worktree_path: Path) -> None:
     """Best-effort rollback — never raises. Only called for a worktree this
     launch attempt itself created (see `_rollback_worktree`). Delegates to
-    the shared force-removal site (VOYN-W0-AICC-WORKTREE-LEAK) so a
+    the shared force-removal site (VOYN-W0-AICC-WORKTREE-LEAK-RETRY) so a
     refused `git worktree remove` here falls back to `rmtree` + `prune`
     instead of leaking the directory and its metadata forever."""
     workspace_provisioning.force_remove_worktree(repo_root, worktree_path)

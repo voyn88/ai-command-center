@@ -103,6 +103,7 @@ DECISION_SKIP_LEASE_UNKNOWN = "skip_lease_authority_unreachable"
 DECISION_SKIP_NOT_OWNED = "skip_not_pipeline_owned"
 DECISION_SKIP_NO_ACTIVITY_SIGNAL = "skip_head_commit_unknown"
 DECISION_SKIP_METADATA_UNAVAILABLE = "skip_metadata_unavailable"
+DECISION_SKIP_DETACHED = "skip_detached_head"
 
 _DEFAULT_MIN_AGE_DAYS = 7.0
 _LEASE_TIMEOUT_SECONDS = 30
@@ -123,6 +124,7 @@ class ReclaimDecision:
     decision: str
     reason: str
     applied_outcome: str | None = None
+    min_age_days: float = _DEFAULT_MIN_AGE_DAYS
 
     @property
     def reclaimable(self) -> bool:
@@ -259,6 +261,21 @@ def evaluate_worktree(
     branch = entry.get("branch", "")
     head_sha = entry.get("head", "")
 
+    # Removing detached worktree metadata can drop the only durable reference
+    # to unpublished commits. A clean directory and old commit do not prove
+    # that its history is preserved elsewhere.
+    if not branch or branch in {"(detached)", "(bare)"}:
+        return ReclaimDecision(
+            repository_path=str(repository_path),
+            worktree_path=str(worktree_path),
+            branch=branch,
+            head_sha=head_sha,
+            last_activity_at=None,
+            age_days=None,
+            decision=DECISION_SKIP_DETACHED,
+            reason="HEAD is not attached to a branch; preserve its commits",
+        )
+
     status = git_info.get_status(worktree_path)
     if not status.get("is_repo"):
         return ReclaimDecision(
@@ -351,6 +368,7 @@ def evaluate_worktree(
         age_days=round(age_days, 2),
         decision=DECISION_RECLAIMABLE,
         reason=f"clean, unleased, HEAD commit is {age_days:.1f}d old",
+        min_age_days=min_age_days,
     )
 
 
@@ -412,6 +430,25 @@ def apply_decision(decision: ReclaimDecision) -> ReclaimDecision:
     than silently doing nothing."""
     if decision.decision != DECISION_RECLAIMABLE:
         raise ValueError(f"refusing to apply a non-reclaimable decision: {decision.decision!r}")
+    repository = Path(decision.repository_path)
+    target = Path(decision.worktree_path).resolve()
+    entry = next(
+        (row for row in git_info.get_worktrees(repository)
+         if row.get("path") and Path(row["path"]).resolve() == target),
+        None,
+    )
+    if entry is None:
+        return replace(decision, applied_outcome="remove_failed", reason="worktree metadata changed")
+    fresh = evaluate_worktree(
+        entry, repository, min_age_days=decision.min_age_days,
+        lease_state=leased_worktree_paths(),
+    )
+    if (fresh is None or not fresh.reclaimable or fresh.branch != decision.branch
+            or fresh.head_sha != decision.head_sha):
+        return replace(
+            decision, applied_outcome="remove_failed",
+            reason="worktree changed after classification: " + (fresh.reason if fresh else "unavailable"),
+        )
     outcome = workspace_provisioning.remove_workspace(
         decision.worktree_path, decision.repository_path
     )
