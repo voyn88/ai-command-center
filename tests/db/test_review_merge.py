@@ -248,7 +248,7 @@ def test_review_enqueues_one_run_per_ready_task(rig, _test_repo_routes, monkeypa
     def fake_gh(argv, repo):
         import subprocess
         if argv[0] == "api" and "/pulls/7" in argv[1]:
-            body = {"base": {"sha": BASE, "repo": {"full_name": "x/repo-d2"}},
+            body = {"state": "open", "base": {"sha": BASE, "repo": {"full_name": "x/repo-d2"}},
                     "head": {"sha": head}, "changed_files": 1,
                     "additions": 1, "deletions": 0}
             return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
@@ -391,7 +391,7 @@ def test_review_chunks_a_diff_over_the_single_prompt_cap(rig, _test_repo_routes,
     def fake_gh(argv, repo):
         import subprocess
         if argv[0] == "api" and "/pulls/13" in argv[1]:
-            body = {"base": {"sha": BASE, "repo": {"full_name": "x/repo-d2"}},
+            body = {"state": "open", "base": {"sha": BASE, "repo": {"full_name": "x/repo-d2"}},
                     "head": {"sha": head}, "changed_files": 1,
                     "additions": 1, "deletions": 0}
             return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
@@ -1676,8 +1676,8 @@ def test_review_once_gives_a_second_push_to_the_same_task_its_own_fresh_review(r
 
     def fake_gh(argv, repo):
         if argv[0] == "api" and "/pulls/20" in argv[1]:
-            body = {"base": {"sha": BASE, "repo": {"full_name": "x/repo-d2"}},
-                    "head": {"sha": next(current_head)}, "changed_files": 1,
+            body = {"state": "open", "base": {"sha": BASE, "repo": {"full_name": "x/repo-d2"}},
+                    "head": {"sha": current_head}, "changed_files": 1,
                     "additions": 1, "deletions": 0}
             return sp.CompletedProcess(argv, 0, json.dumps(body), "")
         if argv[0] == "api":
@@ -1690,9 +1690,9 @@ def test_review_once_gives_a_second_push_to_the_same_task_its_own_fresh_review(r
     def enqueue(q, k, p, tid, attempts):
         calls.append((q, k, p, tid, attempts))
 
-    current_head = iter(["a" * 40])
+    current_head = "a" * 40
     review_once(app_factory, enqueue, "/tmp")
-    current_head = iter(["b" * 40])
+    current_head = "b" * 40
     review_once(app_factory, enqueue, "/tmp")
 
     assert len(calls) == 2
@@ -2834,7 +2834,7 @@ def test_permanent_skips_do_not_starve_the_review_window(rig, _test_repo_routes,
     def fake_gh(argv, repo):
         import subprocess
         if argv[0] == "api" and "/pulls/50" in argv[1]:
-            body = {"base": {"sha": BASE, "repo": {"full_name": "x/repo-d2"}},
+            body = {"state": "open", "base": {"sha": BASE, "repo": {"full_name": "x/repo-d2"}},
                     "head": {"sha": head}, "changed_files": 1,
                     "additions": 1, "deletions": 0}
             return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
