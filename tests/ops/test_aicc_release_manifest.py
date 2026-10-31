@@ -801,6 +801,67 @@ def test_pending_selector_recovers_only_unattested_bytecode(tmp_path):
     transaction.verify_release_selection(f"releases/{RELEASE_ID}")
 
 
+def _pending_mixed_bytecode_release(tmp_path):
+    module = _module()
+    transaction, root, _state = _transaction(module, tmp_path)
+    release = root / "opt/aicc/releases" / RELEASE_ID
+    existing = release / "command_center/db/__pycache__"
+    existing.mkdir(parents=True)
+    (existing.parent / "config.py").write_text("value = 1\n")
+    original = existing / "config.cpython-313.pyc"
+    original.write_bytes(b"attested bytecode")
+    package = release / "command_center/ops"
+    package.mkdir()
+    (package / "probe.py").write_text("value = 2\n")
+    manifest = transaction.release_manifest_path(RELEASE_ID)
+    _record(module, release, manifest)
+    extra = existing / "config.cpython-312.pyc"
+    extra.write_bytes(b"derived extra bytecode")
+    extra.chmod(0o600)
+    fresh = package / "__pycache__"
+    fresh.mkdir(mode=0o700)
+    fresh_extra = fresh / "probe.cpython-312.pyc"
+    fresh_extra.write_bytes(b"new cache bytecode")
+    fresh_extra.chmod(0o600)
+    transaction.pending_release.write_text(f"releases/{RELEASE_ID}\n", encoding="ascii")
+    transaction.pending_release.chmod(0o600)
+    return module, transaction, manifest, original, extra, fresh_extra
+
+
+def test_recovery_removes_extra_bytecode_in_attested_and_new_cache_dirs(tmp_path):
+    _module_value, transaction, manifest, original, extra, fresh_extra = _pending_mixed_bytecode_release(tmp_path)
+    original_manifest = manifest.read_bytes()
+    original_bytes = original.read_bytes()
+    cache_mode = original.parent.stat().st_mode
+
+    transaction._restore_release_selector()
+
+    assert not extra.exists() and not fresh_extra.parent.exists()
+    assert original.read_bytes() == original_bytes
+    assert original.parent.stat().st_mode == cache_mode
+    assert manifest.read_bytes() == original_manifest
+    assert not transaction.pending_release.exists()
+    transaction.verify_release_selection(f"releases/{RELEASE_ID}")
+
+
+@pytest.mark.parametrize("drift", ["attested-file", "nested-extra"])
+def test_mixed_cache_recovery_refuses_drift_before_removing_any_extra(tmp_path, drift):
+    module, transaction, manifest, original, extra, fresh_extra = _pending_mixed_bytecode_release(tmp_path)
+    if drift == "attested-file":
+        original.write_bytes(b"modified attested bytecode")
+    else:
+        (original.parent / "nested").mkdir()
+    before = manifest.read_bytes()
+
+    with pytest.raises(module.ReleaseRefused):
+        transaction._restore_release_selector()
+
+    assert extra.exists() and fresh_extra.exists()
+    assert original.exists() and original.parent.is_dir()
+    assert transaction.pending_release.exists()
+    assert manifest.read_bytes() == before
+
+
 @pytest.mark.parametrize("drift", ["source", "extra", "missing", "cache-mode", "orphan-pyc", "nested-dir", "symlink", "hardlink"])
 def test_pending_bytecode_cleanup_refuses_other_drift_before_mutation(tmp_path, drift):
     module, transaction, release, manifest, cache, bytecode = _pending_bytecode_release(tmp_path)

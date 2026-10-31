@@ -5144,8 +5144,9 @@ def remove_unattested_recovery_bytecode(
     """Remove only derived additions before restoring a pending selector.
 
     The caller holds the installer/recovery lock. Every attested entry must
-    still match, and every extra must be root-owned CPython bytecode in an
-    unattested cache directory beside an attested source. Preflight the whole
+    still match, and every extra must be root-owned CPython bytecode in a
+    cache directory beside an attested source; an attested cache directory and
+    its recorded files must remain unchanged. Preflight the whole
     tree before removing anything. No manifest or pending journal is rewritten.
     A crash can leave only a subset of these extras, so the same preflight and
     removal are safe to repeat; full ordinary verification remains mandatory.
@@ -5171,6 +5172,7 @@ def remove_unattested_recovery_bytecode(
 
     seen: set[str] = set()
     caches: dict[Path, os.stat_result] = {}
+    removable_caches: set[Path] = set()
     files: dict[Path, os.stat_result] = {}
 
     def inspect(path: Path, relative: str) -> None:
@@ -5181,6 +5183,8 @@ def remove_unattested_recovery_bytecode(
             )
             if observed != expected_by_path[relative]:
                 raise ReleaseRefused(f"release path does not match manifest: {relative}")
+            if observed["kind"] == "dir" and path.name == "__pycache__":
+                caches[path] = path.lstat()
             return
         info = path.lstat()
         if (
@@ -5193,6 +5197,7 @@ def remove_unattested_recovery_bytecode(
             if expected_by_path.get(parent, {}).get("kind") != "dir":
                 raise ReleaseRefused(f"unattested cache parent is not attested: {relative}")
             caches[path] = info
+            removable_caches.add(path)
             return
         match = re.fullmatch(r"(.+)\.cpython-[0-9]+(?:\.opt-[12])?\.pyc", path.name)
         source = path.parent.parent / (match[1] + ".py") if match else None
@@ -5222,6 +5227,8 @@ def remove_unattested_recovery_bytecode(
     # Pin each untrusted-content directory, never follow a replaced symlink.
     # A changed inode/owner/mode refuses before this directory is touched.
     for cache, snapshot in sorted(caches.items()):
+        if cache not in removable_caches and not any(path.parent == cache for path in files):
+            continue
         descriptor = os.open(cache, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
             current = os.fstat(descriptor)
@@ -5242,8 +5249,9 @@ def remove_unattested_recovery_bytecode(
             os.fsync(descriptor)
             if cache.lstat().st_ino != snapshot.st_ino:
                 raise ReleaseRefused("unattested cache moved during recovery")
-            cache.rmdir()
-            _fsync_dir(cache.parent)
+            if cache in removable_caches:
+                cache.rmdir()
+                _fsync_dir(cache.parent)
         finally:
             os.close(descriptor)
 
