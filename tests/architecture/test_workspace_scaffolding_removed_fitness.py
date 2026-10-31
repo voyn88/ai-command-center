@@ -16,6 +16,21 @@ import ast
 from tests.architecture import workspace_scaffolding as scaffolding
 
 
+def test_removed_scaffolding_files_stay_deleted():
+    """The three modules AUDIT-W2-005 deleted must not reappear on disk.
+
+    The import scanner alone cannot catch a silent reintroduction that nothing
+    imports yet — the file existing is already the regression. This half of
+    the gate closes that hole (VOYN-W0-AICC-CLOSURE-WITHOUT-A-GATE-RETRY).
+    """
+    present = scaffolding.find_reintroduced_scaffolding_files()
+    assert not present, (
+        "AUDIT-W2-005 removed these modules as dead scaffolding; they must "
+        "stay deleted (docs/audits/FOUNDER_FUNCTIONAL_AUDIT_9761459_RECONCILIATION.md):\n"
+        + "\n".join(present)
+    )
+
+
 def test_removed_scaffolding_is_never_imported_again():
     """No file in the repository imports any of the three removed modules.
 
@@ -75,3 +90,21 @@ def test_gate_is_not_silently_empty():
     files = scaffolding.iter_python_files()
     assert any(path.name == "app.py" for path in files)
     assert any(path.as_posix().endswith("command_center/tasks_repository.py") for path in files)
+
+
+def test_file_absence_gate_detects_a_reintroduced_module(tmp_path, monkeypatch):
+    """Mutation check: recreating a removed module must trip the absence half.
+
+    Without this, ``find_reintroduced_scaffolding_files`` could return ``[]``
+    unconditionally and the new half of the gate would pass for free.
+    """
+    fake_root = tmp_path / "repo"
+    (fake_root / "command_center" / "ui").mkdir(parents=True)
+    monkeypatch.setattr(scaffolding, "REPO_ROOT", fake_root)
+    assert scaffolding.find_reintroduced_scaffolding_files() == []
+
+    revived = fake_root / "command_center" / "workspace_context.py"
+    revived.write_text("# revived\n", encoding="utf-8")
+    assert scaffolding.find_reintroduced_scaffolding_files() == [
+        "command_center/workspace_context.py"
+    ]

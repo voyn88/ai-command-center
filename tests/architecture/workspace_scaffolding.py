@@ -37,11 +37,29 @@ REMOVED_MODULES: frozenset[str] = frozenset(
     }
 )
 
+#: Paths relative to the repo root that must stay deleted. The import scanner
+#: alone is not enough: re-adding one of these modules without importing it
+#: would leave the gate green while quietly undoing AUDIT-W2-005's removal.
+REMOVED_MODULE_PATHS: tuple[str, ...] = (
+    "command_center/workspace_context.py",
+    "command_center/workspace_service.py",
+    "command_center/ui/panel_registry.py",
+)
+
 
 def _matches_removed(dotted: str) -> bool:
     return dotted in REMOVED_MODULES or any(
         dotted.startswith(f"{removed}.") for removed in REMOVED_MODULES
     )
+
+
+def find_reintroduced_scaffolding_files() -> list[str]:
+    """Return any ``REMOVED_MODULE_PATHS`` that exist again on disk."""
+    return [
+        rel
+        for rel in REMOVED_MODULE_PATHS
+        if (REPO_ROOT / rel).exists()
+    ]
 
 
 def _package_parts(rel_path: str) -> tuple[str, ...]:
