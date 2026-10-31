@@ -380,6 +380,7 @@ def stage_release_tree(
         preflight = _run(
             [
                 str(cfg.runtime_venv / "bin" / "python"),
+                "-B",
                 "-c",
                 (
                     "import aios_db, aios_sdk; from command_center import worker; "
@@ -598,13 +599,17 @@ def refresh_root_helpers(
 
 
 def load_installed_lane_registry(cfg: DeployConfig) -> tuple[str, ...]:
-    """Use the installed root-owned release validator, never candidate code."""
+    """Use the installed validator without mutating its attested release tree.
+
+    Root can write bytecode even inside a frozen release. Explicit -B prevents
+    new cache directories from invalidating the manifest needed for rollback.
+    """
     installed_sha = _current_release_sha(cfg.aicc_root)
     if installed_sha is None:
         raise RuntimeError("no installed release for lane registry validation")
     release = cfg.release_root / installed_sha
     result = _run(
-        [str(cfg.runtime_venv / "bin" / "python"), "-c",
+        [str(cfg.runtime_venv / "bin" / "python"), "-B", "-c",
          ("import json, sys; from pathlib import Path; "
          "from command_center.ops.credential_rotation import load_lane_registry; "
          "print(json.dumps(load_lane_registry(Path(sys.argv[1]), "

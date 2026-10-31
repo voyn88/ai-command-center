@@ -589,3 +589,35 @@ def test_registry_refuses_absent_installed_release(tmp_path, monkeypatch):
     monkeypatch.setattr(module, "_run", lambda *a, **kw: pytest.fail("must not execute candidate"))
     with pytest.raises(RuntimeError, match="no installed release"):
         module.load_installed_lane_registry(_cfg(module, tmp_path))
+
+
+
+def test_registry_import_does_not_pollute_published_release(tmp_path, monkeypatch):
+    import subprocess
+
+    module = _module()
+    cfg = _cfg(module, tmp_path)
+    release = cfg.release_root / SHA_A
+    package = release / "command_center" / "ops"
+    package.mkdir(parents=True)
+    (package.parent / "__init__.py").write_text("")
+    (package / "__init__.py").write_text("")
+    (package / "credential_rotation.py").write_text(
+        "def load_lane_registry(path, **kwargs):\n"
+        "    return ['voyn-aicc-worker@1.service']\n"
+    )
+    before = sorted(str(p.relative_to(release)) for p in release.rglob("*"))
+    monkeypatch.setattr(module, "_current_release_sha", lambda _: SHA_A)
+    # Do not let the parent test environment mask the production failure.
+    monkeypatch.delenv("PYTHONDONTWRITEBYTECODE", raising=False)
+    monkeypatch.delenv("PYTHONPYCACHEPREFIX", raising=False)
+
+    def run(args, **kwargs):
+        return subprocess.run(
+            [sys.executable, *args[1:]], capture_output=True, text=True, check=False,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(module, "_run", run)
+    assert module.load_installed_lane_registry(cfg) == (LANE_1,)
+    assert sorted(str(p.relative_to(release)) for p in release.rglob("*")) == before
