@@ -207,7 +207,7 @@ def list_rules(db_path: Path, *, enabled_only: bool = False, jurisdiction: str |
         params.append(jurisdiction)
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     with _db(db_path) as conn:
-        rows = conn.execute(f"SELECT * FROM rules {where} ORDER BY created_at DESC", params).fetchall()
+        rows = conn.execute(f"SELECT * FROM rules {where} ORDER BY created_at DESC", params).fetchall()  # nosec B608 - `where` is built only from hardcoded clause literals ("enabled = 1", "jurisdiction = ?"); the only actual value (jurisdiction) is bound via `params` and a `?` placeholder
     results = []
     for r in rows:
         d = dict(r)

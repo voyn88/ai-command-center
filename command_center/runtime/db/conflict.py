@@ -162,7 +162,7 @@ def create_conflict(
     with db.connect(db_path) as conn:
         with db.transaction(conn):
             conn.execute(
-                f"INSERT INTO conflict ({columns}) VALUES ({placeholders})",
+                f"INSERT INTO conflict ({columns}) VALUES ({placeholders})",  # nosec B608 - columns/placeholders built only from the hardcoded _CONFLICT_COLUMNS tuple; values passed via the `record` params dict
                 record,
             )
     _mirror_conflict(record)
@@ -263,7 +263,7 @@ def list_conflicts(
     params.extend([limit, offset])
     with db.connect(db_path) as conn:
         rows = conn.execute(
-            f"SELECT * FROM conflict{where} "
+            f"SELECT * FROM conflict{where} "  # nosec B608 - `where` is assembled only from hardcoded clause literals ("kind = ?", "status = ?", "owner = ?", the fixed exclude-projects fragment); every value is bound via `params`
             "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
             params,
         ).fetchall()
@@ -312,7 +312,7 @@ def update_conflict_fields(
             params["conflict_id"] = conflict_id
             params["expected_version"] = expected_version
             cur = conn.execute(
-                f"UPDATE conflict SET {set_clause}, version = version + 1 "
+                f"UPDATE conflict SET {set_clause}, version = version + 1 "  # nosec B608 - `key`s come only from `fields`, whose keys were checked against the fixed _UPDATABLE_CONFLICT_FIELDS allowlist above; values are bound via `params`
                 "WHERE id = :conflict_id AND version = :expected_version",
                 params,
             )
@@ -382,7 +382,7 @@ def _conflict_transition(
     params["conflict_id"] = conflict_id
     params["expected_version"] = expected_version
     cur = conn.execute(
-        f"UPDATE conflict SET {set_clause}, version = version + 1 "
+        f"UPDATE conflict SET {set_clause}, version = version + 1 "  # nosec B608 - `fields` keys are hardcoded literals ("status", "updated_at", "resolved_at") set above, never caller-supplied; values are bound via `params`
         "WHERE id = :conflict_id AND version = :expected_version",
         params,
     )

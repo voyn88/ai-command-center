@@ -211,7 +211,7 @@ def _transition(
         sets.update(extra_sets)
     set_clause = ", ".join(f"{k}=?" for k in sets)
     conn.execute(
-        f"UPDATE alerts SET {set_clause} WHERE id=?",
+        f"UPDATE alerts SET {set_clause} WHERE id=?",  # nosec B608 - set_clause keys come only from "state"/"updated_at" plus hardcoded extra_sets keys passed by module-private callers; values are bound via params
         (*sets.values(), alert_id),
     )
     conn.execute(
@@ -434,7 +434,7 @@ def list_alerts(
         clauses.append("subject_id = ?")
         params.append(subject_id)
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-    sql = f"SELECT * FROM alerts {where} ORDER BY created_at DESC"
+    sql = f"SELECT * FROM alerts {where} ORDER BY created_at DESC"  # nosec B608 - clauses is built only from hardcoded literal fragments ("state = ?", "owner = ?", "overdue = 1", "subject_id = ?"); actual values passed via params list
     with _db(db_path) as conn:
         rows = conn.execute(sql, params).fetchall()
     return [dict(r) for r in rows]

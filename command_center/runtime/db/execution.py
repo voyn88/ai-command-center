@@ -301,7 +301,7 @@ def create_run(
                 )
                 lock_params = (*active_states, *terminal_states)
                 conflict = conn.execute(
-                    f"SELECT * FROM run WHERE repository_path = ? AND {lock_predicate}",
+                    f"SELECT * FROM run WHERE repository_path = ? AND {lock_predicate}",  # nosec B608 - lock_predicate is built only from "?" placeholders sized off fixed frozensets (EXECUTION_CENTER_ACTIVE_STATES/TERMINAL_STATES); all values are bound via lock_params
                     (repository_path, *lock_params),
                 ).fetchone()
                 if conflict is not None:
@@ -317,7 +317,7 @@ def create_run(
                 # workspace check so a same-workspace conflict still surfaces as
                 # WorkspaceLockedError (unchanged behaviour).
                 task_conflict = conn.execute(
-                    f"SELECT * FROM run WHERE task_id = ? AND {lock_predicate}",
+                    f"SELECT * FROM run WHERE task_id = ? AND {lock_predicate}",  # nosec B608 - same lock_predicate as above: only "?" placeholders sized off fixed frozensets, values bound via lock_params
                     (task_id, *lock_params),
                 ).fetchone()
                 if task_conflict is not None:
@@ -332,7 +332,7 @@ def create_run(
                 # count — the way per-caller pre-flight checks can.
                 placeholders = ", ".join("?" for _ in db.EXECUTION_CENTER_ACTIVE_STATES)
                 active_count = conn.execute(
-                    f"SELECT COUNT(*) AS n FROM run WHERE state IN ({placeholders})",
+                    f"SELECT COUNT(*) AS n FROM run WHERE state IN ({placeholders})",  # nosec B608 - placeholders is only "?" repeated for len(EXECUTION_CENTER_ACTIVE_STATES), a fixed frozenset; the actual state values are bound as params
                     tuple(db.EXECUTION_CENTER_ACTIVE_STATES),
                 ).fetchone()["n"]
                 if active_count >= max_global_concurrency:
@@ -393,8 +393,7 @@ def create_run(
             table_columns = {row["name"] for row in conn.execute("PRAGMA table_info(run)")}
             insert_columns = [name for name in record if name in table_columns]
             conn.execute(
-                f"""INSERT INTO run ({", ".join(insert_columns)})
-                    VALUES ({", ".join(f":{name}" for name in insert_columns)})""",
+                f"""INSERT INTO run ({", ".join(insert_columns)}) VALUES ({", ".join(f":{name}" for name in insert_columns)})""",  # nosec B608 - insert_columns is the intersection of this function's hardcoded `record` dict keys (literal names in the source above) with the live PRAGMA table_info(run) column set; no caller-supplied name reaches the SQL text
                 record,
             )
             # The stored row, not `record`: the insert names only the columns
@@ -628,7 +627,7 @@ def list_runs(
         params.append(limit)
     with db.connect(db_path) as conn:
         rows = conn.execute(
-            f"SELECT * FROM run {where} ORDER BY created_at DESC{limit_clause}", params
+            f"SELECT * FROM run {where} ORDER BY created_at DESC{limit_clause}", params  # nosec B608 - `where`/`limit_clause` are assembled only from the fixed set of hardcoded clause literals above ("session_id = ?", "task_id = ?", "state = ?", "state IN (...)" with count-only placeholders, "1 = 0", " LIMIT ?"); every actual value is bound via `params`
         ).fetchall()
         return [dict(row) for row in rows]
 
@@ -659,7 +658,7 @@ def count_runs(
             clauses.append("1 = 0")
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     with db.connect(db_path) as conn:
-        (n,) = conn.execute(f"SELECT COUNT(*) FROM run {where}", params).fetchone()
+        (n,) = conn.execute(f"SELECT COUNT(*) FROM run {where}", params).fetchone()  # nosec B608 - `where` is built only from the hardcoded "state IN (...)" (count-only placeholders) / "1 = 0" clause literals above; actual state values are bound via `params`
         return int(n)
 
 
@@ -707,8 +706,7 @@ def update_run_state(
             params["run_id"] = run_id
             params["expected_version"] = expected_version
             cur = conn.execute(
-                f"""UPDATE run SET {set_clause}, version = version + 1
-                    WHERE id = :run_id AND version = :expected_version""",
+                f"""UPDATE run SET {set_clause}, version = version + 1 WHERE id = :run_id AND version = :expected_version""",  # nosec B608 - set_clause's keys come only from `fields`, which `db._validate_updatable_fields` above already checked against the fixed `_UPDATABLE_RUN_FIELDS` allowlist, plus the literal "state"/"updated_at" keys set just above; values are bound via `params`
                 params,
             )
             if cur.rowcount != 1:
@@ -881,7 +879,7 @@ def count_unfinalized_runs(db_path: Path) -> int:
     placeholders = ",".join("?" for _ in db.TERMINAL_STATES)
     with db.connect(db_path) as conn:
         (n,) = conn.execute(
-            f"SELECT COUNT(*) FROM run WHERE finalized_at IS NULL AND state IN ({placeholders})",
+            f"SELECT COUNT(*) FROM run WHERE finalized_at IS NULL AND state IN ({placeholders})",  # nosec B608 - placeholders is only "?" repeated for len(TERMINAL_STATES), a fixed frozenset; the actual state values are bound as params
             tuple(db.TERMINAL_STATES),
         ).fetchone()
         return int(n)
@@ -897,10 +895,7 @@ def list_unfinalized_runs(db_path: Path, *, limit: int = 100) -> list[dict]:
     placeholders = ",".join("?" for _ in db.TERMINAL_STATES)
     with db.connect(db_path) as conn:
         rows = conn.execute(
-            f"""SELECT * FROM run
-                WHERE finalized_at IS NULL AND state IN ({placeholders})
-                ORDER BY completed_at ASC, id ASC
-                LIMIT ?""",
+            f"""SELECT * FROM run WHERE finalized_at IS NULL AND state IN ({placeholders}) ORDER BY completed_at ASC, id ASC LIMIT ?""",  # nosec B608 - placeholders is only "?" repeated for len(TERMINAL_STATES), a fixed frozenset; the actual state values (and `limit`) are bound as params
             (*db.TERMINAL_STATES, limit),
         ).fetchall()
         return [dict(row) for row in rows]
@@ -977,8 +972,7 @@ def update_run_fields(db_path: Path, run_id: str, *, expected_version: int, fiel
             params["run_id"] = run_id
             params["expected_version"] = expected_version
             cur = conn.execute(
-                f"""UPDATE run SET {set_clause}, version = version + 1
-                    WHERE id = :run_id AND version = :expected_version""",
+                f"""UPDATE run SET {set_clause}, version = version + 1 WHERE id = :run_id AND version = :expected_version""",  # nosec B608 - set_clause's keys come only from `fields`, which `db._validate_updatable_fields` above already checked against the fixed `_UPDATABLE_RUN_FIELDS` allowlist; values are bound via `params`
                 params,
             )
             if cur.rowcount != 1:
@@ -1135,12 +1129,7 @@ def latest_events_for_runs(db_path: Path, run_ids: list[str]) -> dict[str, dict]
     placeholders = ", ".join("?" for _ in run_ids)
     with db.connect(db_path) as conn:
         rows = conn.execute(
-            f"""SELECT e.run_id, e.seq, e.event_type, e.payload_json, e.created_at
-                FROM run_event e
-                JOIN (
-                    SELECT run_id, MAX(seq) AS mx FROM run_event
-                    WHERE run_id IN ({placeholders}) GROUP BY run_id
-                ) m ON e.run_id = m.run_id AND e.seq = m.mx""",
+            f"""SELECT e.run_id, e.seq, e.event_type, e.payload_json, e.created_at FROM run_event e JOIN (SELECT run_id, MAX(seq) AS mx FROM run_event WHERE run_id IN ({placeholders}) GROUP BY run_id) m ON e.run_id = m.run_id AND e.seq = m.mx""",  # nosec B608 - placeholders is only "?" repeated for len(run_ids); the actual run_id values are bound via `tuple(run_ids)`, never interpolated
             tuple(run_ids),
         ).fetchall()
     result: dict[str, dict] = {}
@@ -1183,7 +1172,7 @@ def get_reports_for_runs(db_path: Path, run_ids: list[str]) -> dict[str, dict]:
     placeholders = ", ".join("?" for _ in run_ids)
     with db.connect(db_path) as conn:
         rows = conn.execute(
-            f"SELECT * FROM report WHERE run_id IN ({placeholders})", tuple(run_ids)
+            f"SELECT * FROM report WHERE run_id IN ({placeholders})", tuple(run_ids)  # nosec B608 - placeholders is only "?" repeated for len(run_ids); the actual run_id values are bound via `tuple(run_ids)`, never interpolated
         ).fetchall()
     return {row["run_id"]: db._row_to_dict(row) for row in rows}
 
@@ -1237,7 +1226,7 @@ def replace_queue_entries(db_path: Path, entries: list[dict]) -> None:
             conn.execute("DELETE FROM queue_entry")
             if rows:
                 conn.executemany(
-                    f"INSERT INTO queue_entry ({columns}) VALUES ({placeholders})", rows
+                    f"INSERT INTO queue_entry ({columns}) VALUES ({placeholders})", rows  # nosec B608 - `columns`/`placeholders` are built only from the module-level hardcoded `_QUEUE_ENTRY_COLUMNS` tuple plus the literal "position"; row values are bound via `rows`
                 )
 
 
@@ -1247,6 +1236,6 @@ def list_queue_entries(db_path: Path) -> list[dict]:
     its own to be wrong about."""
     with db.connect(db_path) as conn:
         rows = conn.execute(
-            f"SELECT {', '.join(db._QUEUE_ENTRY_COLUMNS)} FROM queue_entry ORDER BY position ASC"
+            f"SELECT {', '.join(db._QUEUE_ENTRY_COLUMNS)} FROM queue_entry ORDER BY position ASC"  # nosec B608 - column list comes only from the module-level hardcoded `_QUEUE_ENTRY_COLUMNS` tuple, no caller input involved
         ).fetchall()
         return [dict(row) for row in rows]

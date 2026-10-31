@@ -181,7 +181,7 @@ def create_motion(
     with db.connect(db_path) as conn:
         with db.transaction(conn):
             conn.execute(
-                f"INSERT INTO motion ({columns}) VALUES ({placeholders})",
+                f"INSERT INTO motion ({columns}) VALUES ({placeholders})",  # nosec B608 - columns/placeholders built from the hardcoded _MOTION_COLUMNS tuple, values passed via params dict
                 record,
             )
             event = _append_event(
@@ -321,7 +321,7 @@ def list_motions(
     params.extend([limit, offset])
     with db.connect(db_path) as conn:
         rows = conn.execute(
-            f"SELECT * FROM motion{where} "
+            f"SELECT * FROM motion{where} "  # nosec B608 - where is built only from "status = ?"/"project_ref = ?" literals and _exclude_projects_clause's fixed fragment; all values are bound via params
             "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
             params,
         ).fetchall()
@@ -409,7 +409,7 @@ def cast_vote(
                 )
             try:
                 conn.execute(
-                    f"INSERT INTO council_vote ({columns}) VALUES ({placeholders})",
+                    f"INSERT INTO council_vote ({columns}) VALUES ({placeholders})",  # nosec B608 - columns/placeholders built from the hardcoded _VOTE_COLUMNS tuple, values passed via params dict
                     record,
                 )
             except sqlite3.IntegrityError as exc:
@@ -537,7 +537,7 @@ def record_decision(
                 )
             try:
                 conn.execute(
-                    f"INSERT INTO council_decision ({columns}) VALUES ({placeholders})",
+                    f"INSERT INTO council_decision ({columns}) VALUES ({placeholders})",  # nosec B608 - columns/placeholders built from the hardcoded _DECISION_COLUMNS tuple, values passed via params dict
                     record,
                 )
             except sqlite3.IntegrityError as exc:
@@ -613,7 +613,7 @@ def list_decisions(
     params.extend([limit, offset])
     with db.connect(db_path) as conn:
         rows = conn.execute(
-            f"SELECT * FROM council_decision{where} "
+            f"SELECT * FROM council_decision{where} "  # nosec B608 - where is built only from the "outcome = ?" literal and a "motion_id NOT IN (?, ...)" fragment whose placeholder count matches excluded's length; all values bound via params
             "ORDER BY created_at DESC, motion_id DESC LIMIT ? OFFSET ?",
             params,
         ).fetchall()

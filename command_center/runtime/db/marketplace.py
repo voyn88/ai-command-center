@@ -152,7 +152,7 @@ def create_market_item(
     with db.connect(db_path) as conn:
         with db.transaction(conn):
             conn.execute(
-                f"INSERT INTO market_item ({columns}) VALUES ({placeholders})",
+                f"INSERT INTO market_item ({columns}) VALUES ({placeholders})",  # nosec B608 - columns/placeholders are derived from the hardcoded _MARKET_ITEM_COLUMNS tuple; values are bound via the named `record` params.
                 record,
             )
     _mirror_market_item(record)
@@ -224,7 +224,7 @@ def list_market_items(
     params.extend([limit, offset])
     with db.connect(db_path) as conn:
         rows = conn.execute(
-            f"SELECT * FROM market_item{where} "
+            f"SELECT * FROM market_item{where} "  # nosec B608 - `where` is built only from the hardcoded "kind = ?"/"status = ?" fragments joined by " AND "; the actual kind/status values are bound via `?` placeholders in `params`.
             "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
             params,
         ).fetchall()
@@ -311,7 +311,7 @@ def install_market_item(
             columns = ", ".join(_INSTALL_LOG_COLUMNS)
             placeholders = ", ".join(f":{name_}" for name_ in _INSTALL_LOG_COLUMNS)
             conn.execute(
-                f"INSERT INTO market_install_log ({columns}) VALUES ({placeholders})",
+                f"INSERT INTO market_install_log ({columns}) VALUES ({placeholders})",  # nosec B608 - columns/placeholders are derived from the hardcoded _INSTALL_LOG_COLUMNS tuple; values are bound via the named `log_record` params.
                 log_record,
             )
             item_row = conn.execute(

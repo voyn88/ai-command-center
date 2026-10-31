@@ -349,7 +349,7 @@ def _migration_25_add_finalization_claim(conn: sqlite3.Connection) -> None:
         # only today's active/terminal allowlists would let a corrupt or future
         # state silently cross the non-rolling cutover.
         unsafe = conn.execute(
-            "SELECT id, state FROM run WHERE NOT "
+            "SELECT id, state FROM run WHERE NOT "  # nosec B608 - terminal_placeholders is just N "?" markers sized off the hardcoded db.TERMINAL_STATES frozenset; the actual states are bound via the terminal_states params tuple
             f"(state IN ({terminal_placeholders}) AND finalized_at IS NOT NULL) LIMIT 1",
             terminal_states,
         ).fetchone()
@@ -438,7 +438,7 @@ def _bootstrap_finalization_claim_cutover_unlocked(
             terminal_states = tuple(sorted(db.TERMINAL_STATES))
             placeholders = ",".join("?" for _ in terminal_states)
             unsafe = conn.execute(
-                "SELECT id, state FROM run WHERE "
+                "SELECT id, state FROM run WHERE "  # nosec B608 - placeholders is just N "?" markers sized off the hardcoded db.TERMINAL_STATES frozenset; the actual states are bound via the terminal_states params tuple
                 f"state NOT IN ({placeholders}) LIMIT 1",
                 terminal_states,
             ).fetchone()
@@ -451,7 +451,7 @@ def _bootstrap_finalization_claim_cutover_unlocked(
             _create_finalization_claim_schema(conn)
             claimed_at = db.iso_now()
             pending = conn.execute(
-                "SELECT id FROM run WHERE finalized_at IS NULL "
+                "SELECT id FROM run WHERE finalized_at IS NULL "  # nosec B608 - placeholders is just N "?" markers sized off the hardcoded db.TERMINAL_STATES frozenset; the actual states are bound via the terminal_states params tuple
                 f"AND state IN ({placeholders}) ORDER BY id",
                 terminal_states,
             ).fetchall()
