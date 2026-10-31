@@ -52,6 +52,19 @@ from command_center.worker.credential_file import (
 
 _READY = "aicc-ready"
 
+# Shared with ROLLOUT_LOCK_PATH in ops/aicc_staged_worker_rollout.py -- both
+# are root-owned scripts on the same host with no import relationship, so the
+# path is duplicated rather than shared as an import; keep the two in sync by
+# hand. The staged rollout holds this file for its entire duration (creating
+# it before the first lane mutation, removing it in a `finally`) precisely so
+# that a rotation tick which fires anyway -- because its timer had already
+# elapsed before the rollout could stop it, or because it was started
+# directly rather than through the timer -- has a way to notice a rollout is
+# in flight and defer instead of racing it (live 2026-09-08 worker-01: a
+# rotate tick's `try-restart` collided with the rollout's own drain of the
+# canary lane).
+DEFAULT_ROLLOUT_LOCK_PATH = Path("/run/aicc-staged-rollout.lock")
+
 # enroll_rotate_self() grants a fixed one-hour credential. Keep this contract
 # beside the protocol budget so a unit/test change cannot silently make a
 # graceful 3600-second job incompatible with post-rotation recovery.
@@ -826,6 +839,13 @@ def authority_timeout_seconds(config: PostgresConfig) -> float:
 
 
 class RotationController:
+    # Class-level fallback for `RotationController.__new__` bypass-constructed
+    # instances (test_hot_budget_has_no_lane_count_ceiling calls
+    # `_post_rotation_budget` directly without a systemd to query), so
+    # `_activation_waves` can fall back to the full configured registry
+    # instead of raising AttributeError.
+    _rotatable_units: tuple[str, ...] | None = None
+
     def __init__(
         self,
         config: RotationConfig,
@@ -851,6 +871,7 @@ class RotationController:
         self._last_server_now: datetime | None = None
         self._last_server_monotonic: float | None = None
         self._restart_fallback_allowed = False
+        self._rotatable_units: tuple[str, ...] | None = None
 
     @staticmethod
     def _authority_timeout(config: PostgresConfig) -> float:
@@ -883,6 +904,47 @@ class RotationController:
             remaining=remaining,
         )
 
+    def _refresh_rotatable_units(self) -> tuple[str, ...]:
+        """Snapshot which configured lanes are not held down right now.
+
+        Queried once per rotation attempt (right after tunnel readiness is
+        proved) and reused for every wave/budget calculation and fleet
+        activation in that attempt, so a lane cannot flip categories
+        mid-run. A lane that is currently inactive is presumed
+        intentionally held down -- by a staged rollout that has not enabled
+        it yet, or by an operator -- and must never be reloaded or, worse,
+        restarted into existence: `_activate_lane`'s reload-then-restart
+        fallback cannot otherwise tell "this lane crashed, restart it" from
+        "this lane was never started", and blindly restarting the latter is
+        exactly what silently re-activated the staged-off lanes 3/4 on
+        worker-01 mid-rollout (live 2026-09-08). Excluding them here, before
+        any reload/restart is attempted, is what makes that impossible
+        instead of merely unlikely.
+
+        "inactive" -- the exact state the rollout's own drain leaves a
+        staged-off lane in -- is the only state that means "held down".
+        Every other transient state (activating, reloading, deactivating,
+        even failed) is still a rotation candidate: `_wait_workers_healthy`
+        polls it toward `active`/`running` right after this snapshot, and a
+        lane that is merely mid-startup must stay eligible for that wait
+        rather than being excluded before it ever gets the chance.
+        """
+        active: list[str] = []
+        for unit in self.config.worker_units:
+            state = self.systemd.state(unit)
+            if state.active != "inactive":
+                active.append(unit)
+            else:
+                self.audit.emit(
+                    "worker_lane_excluded_not_active",
+                    unit=unit,
+                    active_state=state.active,
+                )
+        if not active:
+            raise RotationError("no worker lane is currently active to rotate")
+        self._rotatable_units = tuple(active)
+        return self._rotatable_units
+
     def _activation_waves(self) -> tuple[tuple[str, ...], ...]:
         """One canary, then one systemd-managed fleet transaction.
 
@@ -892,7 +954,9 @@ class RotationController:
         multi-unit transaction scales with fleet size without spawning a Python
         thread per lane or multiplying the credential deadline by lane count.
         """
-        units = self.config.worker_units
+        units = self._rotatable_units
+        if units is None:
+            units = self.config.worker_units
         if not units:
             return ()
         waves: list[tuple[str, ...]] = [(units[0],)]
@@ -1104,7 +1168,10 @@ class RotationController:
         self.audit.emit("tunnel_ready", unit=self.config.tunnel_unit)
 
     def _wait_workers_healthy(self) -> None:
-        pending = set(self.config.worker_units)
+        units = self._rotatable_units
+        if units is None:
+            units = self.config.worker_units
+        pending = set(units)
         deadline = self.monotonic() + self._bounded_timeout(
             self.config.prerequisite_timeout, "fleet readiness"
         )
@@ -1126,7 +1193,7 @@ class RotationController:
         if pending:
             details = "; ".join(
                 f"{unit}: {last_errors.get(unit, 'not ready')}"
-                for unit in self.config.worker_units
+                for unit in units
                 if unit in pending
             )
             raise RotationError(f"worker readiness failed: {details}")
@@ -1239,7 +1306,8 @@ class RotationController:
                         config,
                         allow_restart=(
                             wave_number == 1
-                            and len(self.config.worker_units) > 1
+                            and len(self._rotatable_units or self.config.worker_units)
+                            > 1
                         ),
                     )
                 except Exception as error:  # noqa: BLE001 - audited below
@@ -1379,6 +1447,7 @@ class RotationController:
         # so keep the durable journal and wait through that bounded race before
         # deciding that neither credential is usable.
         self._wait_tunnel()
+        self._refresh_rotatable_units()
         working: list[tuple[Path, PostgresConfig, datetime, float]] = []
         for path, config in self._recovery_candidates(phase):
             try:
@@ -1517,6 +1586,7 @@ class RotationController:
             remaining_protocol
         ):
             raise RotationError("controller budget is below complete rotation budget")
+        self._refresh_rotatable_units()
         self._wait_workers_healthy()
         # Worker readiness may legitimately consume most of its bounded wait.
         # Refresh the server-clock proof immediately before the mutation.
@@ -1528,7 +1598,7 @@ class RotationController:
             current_remaining,
             authority_timeout,
         )
-        self.audit.emit("rotation_preflight_ok", lanes=len(self.config.worker_units))
+        self.audit.emit("rotation_preflight_ok", lanes=len(self._rotatable_units or ()))
 
         prepared: PreparedCredentialFile | None = None
         committed = False
@@ -1673,7 +1743,7 @@ class RotationController:
                 prepared.discard()
         self.phase_journal.clear()
         self._reset_circuit()
-        self.audit.emit("rotation_succeeded", lanes=len(self.config.worker_units))
+        self.audit.emit("rotation_succeeded", lanes=len(self._rotatable_units or ()))
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -1697,6 +1767,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--failure-retry-window", type=float, default=360.0)
     parser.add_argument("--circuit-failure-threshold", type=int, default=3)
     parser.add_argument("--circuit-cooldown", type=float, default=300.0)
+    parser.add_argument(
+        "--rollout-lock",
+        type=Path,
+        default=DEFAULT_ROLLOUT_LOCK_PATH,
+        help="Marker file the staged worker rollout holds for its duration; "
+        "a rotation tick that finds it present defers rather than racing "
+        "the rollout's own lane mutations.",
+    )
     return parser
 
 
@@ -1707,6 +1785,19 @@ def main(argv: list[str] | None = None) -> int:
     except RotationError as error:
         Audit(args.audit_file).emit("rotation_refused", error=str(error))
         return 78
+    # A staged rollout mutates lanes directly and holds this marker for its
+    # duration; deferring here -- exit 0, not a failure -- keeps
+    # Restart=on-failure from treating a rollout in progress as an incident.
+    # Recovery is exempt: it is cleaning up an ALREADY-interrupted rotation
+    # (a durable phase journal), and leaving that fleet drained until the
+    # rollout finishes is a worse outcome than finishing the recovery.
+    if not args.recover_only and args.rollout_lock is not None and (
+        args.rollout_lock.exists()
+    ):
+        Audit(args.audit_file).emit(
+            "rotation_deferred_staged_rollout", lock=str(args.rollout_lock)
+        )
+        return 0
     # ExecStopPost recovery must finish inside systemd's stop window. Running
     # it under min(controller, stop) budget makes every existing bounded-
     # timeout check enforce that window; an over-large fleet fails closed with

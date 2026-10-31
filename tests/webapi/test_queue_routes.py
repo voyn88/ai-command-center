@@ -156,3 +156,55 @@ def test_audit_refuses_incomplete_requests(client, monkeypatch):
     response = client.post("/api/v1/queue/audit", json={"project_id": "aicc"})
     assert response.status_code == 422
     assert store.enqueued == [], "nothing may reach the queue on a refusal"
+
+
+def test_audit_resolves_repository_path_from_project_config_when_omitted(
+    client, monkeypatch
+):
+    """The one-button UI trigger only knows a project_id — the server must
+    resolve the same path the worker will later confirm the run against
+    (`agent_runner.validate_repository`), not force the caller to know it."""
+    store = FakeWriteStore()
+    monkeypatch.setattr(qmod, "_write_store", lambda: store)
+    monkeypatch.setattr(
+        qmod.project_config,
+        "get_project_config",
+        lambda project_id: {"repository_path": "/configured/aicc"},
+    )
+    body = {"project_id": "aicc", "prompt": "Проверь качество и риски проекта"}
+    response = client.post("/api/v1/queue/audit", json=body)
+    assert response.status_code == 200
+
+    (_queue, _key, payload, _kwargs) = store.enqueued[0]
+    assert payload["repository_path"] == "/configured/aicc"
+
+
+def test_audit_refuses_when_repository_path_not_configured(client, monkeypatch):
+    store = FakeWriteStore()
+    monkeypatch.setattr(qmod, "_write_store", lambda: store)
+    monkeypatch.setattr(
+        qmod.project_config,
+        "get_project_config",
+        lambda project_id: {"repository_path": None},
+    )
+    body = {"project_id": "aicc", "prompt": "Проверь качество и риски проекта"}
+    response = client.post("/api/v1/queue/audit", json=body)
+    assert response.status_code == 422
+    assert store.enqueued == [], "nothing may reach the queue on a refusal"
+
+
+def test_audit_explicit_repository_path_still_honored(client, monkeypatch):
+    """An explicit repository_path in the body must win over project config —
+    existing callers (and the previous request shape) stay unaffected."""
+    store = FakeWriteStore()
+    monkeypatch.setattr(qmod, "_write_store", lambda: store)
+    monkeypatch.setattr(
+        qmod.project_config,
+        "get_project_config",
+        lambda project_id: {"repository_path": "/configured/aicc"},
+    )
+    response = client.post("/api/v1/queue/audit", json=_AUDIT_BODY)
+    assert response.status_code == 200
+
+    (_queue, _key, payload, _kwargs) = store.enqueued[0]
+    assert payload["repository_path"] == _AUDIT_BODY["repository_path"]

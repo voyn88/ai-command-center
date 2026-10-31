@@ -1,6 +1,8 @@
-// Typed client for the owner-gated server queue API (VOYN-W0-APP-CONTROL-S1):
+// Typed client for the owner-gated server queue API (VOYN-W0-APP-CONTROL-S1,
+// plus the audit-enqueue trigger added for S4):
 //   GET  /api/v1/queue/items
 //   GET  /api/v1/queue/items/{id}
+//   POST /api/v1/queue/audit
 //
 // Types mirror the REAL output of
 // `command_center/db/work_queue_read.py` (the columns of the
@@ -106,4 +108,34 @@ export function fetchQueueItems(state?: string): Promise<{ items: QueueItem[] }>
 
 export function fetchQueueItem(workItemId: string): Promise<QueueItemDetail> {
   return request(`/api/v1/queue/items/${encodeURIComponent(workItemId)}`)
+}
+
+export type AuditRequest = {
+  project_id: string
+  prompt: string
+  // Omitted on the one-button path — the server resolves it from the
+  // project's own configured repository_path (see queue_routes.py).
+  repository_path?: string
+}
+
+export type AuditAck = { work_item_id: string; idempotency_key: string }
+
+export async function enqueueAudit(body: AuditRequest): Promise<AuditAck> {
+  const token = getOwnerToken()
+  if (!token) throw new QueueAuthError()
+  const response = await fetch('/api/v1/queue/audit', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(body),
+  })
+  if (response.status === 401) throw new QueueAuthError()
+  if (!response.ok) {
+    const detail = await response.json().catch(() => null)
+    const reason = detail && typeof detail.detail === 'string' ? detail.detail : response.status
+    throw new Error(`POST /api/v1/queue/audit -> ${reason}`)
+  }
+  return (await response.json()) as AuditAck
 }
