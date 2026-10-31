@@ -2761,3 +2761,21 @@ def test_workspace_walk_names_descriptor_exhaustion_honestly(
     with pytest.raises(launcher.LaunchRefused) as refused:
         launcher._prepare_workspace_permissions(workspace)
     assert "ran out of file descriptors" in str(refused.value)
+
+
+def test_installer_never_enables_or_starts_gateway_before_configuration():
+    import shlex
+    text = _installer_text()
+    gateway_units = {"aicc-native-gateway.service", "aicc-gateway-projection.service", "aicc-gateway-projection.timer"}
+    # Check the actual commands, including continuations, rather than a timer-only collection.
+    text = text.replace("\\\n", " ")
+    commands = []
+    for line in text.splitlines():
+        tokens = shlex.split(line, comments=True)
+        if "systemctl" in tokens:
+            command = tokens[tokens.index("systemctl") + 1:]
+            if any(action in command for action in ("enable", "start", "restart")):
+                commands.append(command)
+    assert commands
+    for command in commands:
+        assert not gateway_units.intersection(command)
