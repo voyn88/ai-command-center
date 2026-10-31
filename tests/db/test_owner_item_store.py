@@ -314,66 +314,94 @@ def test_the_family_reconciles_after_every_write(
 def test_every_lost_mirror_write_is_visible_to_reconciliation(
     pg_connection_factory, tmp_path, monkeypatch
 ) -> None:
-    """The lost-write probe, applied to `owner_item`.
+    """The lost-write probe, applied to `owner_item`'s two call sites.
 
-    Two writes per run — one from each write path — and the property under
-    test is the one the incident actually was: a reviewer can delete the mirror
-    call from either `create_owner_item` or `set_owner_item_done` and, on a
-    table with only one write path, a static "every declared mirror has a
-    reachable caller" check would still find the other path's call and stay
-    green. Failing one write at a time and reconciling after each is what
-    catches that a *specific* path lost its call rather than merely that the
-    table has some caller somewhere.
+    This module already imports `each_lost_write_is_noticed` for this test: the
+    other tests drive `_mirror_owner_item` and then read the mirror they wrote,
+    so none of them fails a write and asks whether the *absence* is noticed.
+    The probe does — failing each call site's write in turn and checking
+    reconciliation after each run.
 
-    Both paths upsert the *whole* row, not a delta, so a reconciliation taken
-    only at the end of the scenario is blind to a lost first write: the second
-    write's upsert carries the row's final state regardless, and silently
-    heals whatever the first write failed to mirror. Checked this the hard
-    way — the naive version below, `divergence` computed once after both
-    writes, left index 0 (the `create_owner_item` write) unnoticed even with
-    its mirror call actually failing. `noticed()` has to be true if divergence
-    was visible at *any* stage, which means checking after each write while
-    the failure is still fresh, not just once at the end.
+    Both paths upsert the *whole* row, so a one-row create-then-done scenario
+    cannot prove `create_owner_item`'s call site is covered: `set_owner_item_done`'s
+    upsert writes the complete authoritative row and heals a lost create before
+    post-scenario `noticed()` runs. This scenario uses two rows instead, each
+    mirrored exactly once — `untouched` only through `create_owner_item`, and
+    `finished` with its create's dual-write suppressed so its only mirror write
+    is `set_owner_item_done`'s. Neither loss has a later same-row write to heal
+    it, so `noticed()` observes the mirror after the scenario as the probe
+    contract requires.
+
+    `pg_connection_factory` is per-test (fresh database via `pg_database`). The
+    DELETE between scenario runs is scoped to this probe's two fixed ids so it
+    cannot wipe unrelated rows even if the fixture scope ever widened.
     """
     from command_center.db import owner_item_store
 
+    untouched_id = "probe-untouched"
+    finished_id = "probe-finished"
     mirror = PostgresOwnerItemMirror(connection_factory=pg_connection_factory)
-    state: dict[str, object] = {"runs": 0}
+    runs = 0
+    db_path: Path = tmp_path / "unset.db"
 
     def scenario() -> None:
+        nonlocal runs, db_path
         with pg_connection_factory() as conn:
             with conn.cursor() as cur:
-                cur.execute("DELETE FROM owner_item")
-        db_path = tmp_path / f"runtime-{state['runs']}.db"
-        state["runs"] += 1
+                cur.execute(
+                    "DELETE FROM owner_item WHERE id = ANY(%s)",
+                    ([untouched_id, finished_id],),
+                )
+        db_path = tmp_path / f"runtime-{runs}.db"
+        runs += 1
         wave1.db.migrate(db_path)
-        state["db"] = db_path
-        state["diverged"] = False
-
-        created = wave1.create_owner_item(db_path, title="mirror me")
-        state["diverged"] = state["diverged"] or bool(
-            divergence(wave1.list_owner_items(db_path), mirror)
-        )
-
+        # untouched: created once and never written again, so losing its
+        # create is never healed by a later write to the same row.
+        wave1.create_owner_item(db_path, title="untouched", item_id=untouched_id)
+        # finished: its own create is mirrored with the dual-write suppressed,
+        # so the row's *only* mirror write is set_owner_item_done's — losing
+        # that one is never healed either. Restored by hand (not monkeypatch)
+        # so the suppress cannot nest with the probe's own monkeypatch stack.
+        real_mirror_hook = wave1._mirror_owner_item
+        wave1._mirror_owner_item = lambda record: None
+        try:
+            finished = wave1.create_owner_item(
+                db_path, title="finished", item_id=finished_id
+            )
+        finally:
+            wave1._mirror_owner_item = real_mirror_hook
         wave1.set_owner_item_done(
-            db_path, created["id"], expected_version=created["version"], done=True
-        )
-        state["diverged"] = state["diverged"] or bool(
-            divergence(wave1.list_owner_items(db_path), mirror)
+            db_path, finished["id"], expected_version=finished["version"], done=True
         )
 
     def noticed() -> bool:
-        return bool(state["diverged"])
+        return bool(divergence(wave1.list_owner_items(db_path, limit=1000), mirror))
+
+    targets = (
+        (
+            owner_item_store,
+            ("PostgresOwnerItemMirror",),
+            # Same instance `noticed()` reads: a lost write stays lost on the
+            # object reconciliation observes, and a successful write lands there.
+            lambda: mirror,
+        ),
+    )
+
+    # Negative control through a nested patch that undoes before the probe:
+    # every intentional write lands → reconciliation must stay clean. Without
+    # this, an over-reporting `divergence` would still pass the probe.
+    with monkeypatch.context() as baseline:
+        baseline.setattr(
+            owner_item_store,
+            "PostgresOwnerItemMirror",
+            lambda: mirror,
+        )
+        scenario()
+        assert not noticed(), "clean dual-write must reconcile with zero divergence"
 
     results = each_lost_write_is_noticed(
         monkeypatch,
-        targets=(
-            (
-                owner_item_store,
-                ("PostgresOwnerItemMirror",),
-                lambda: PostgresOwnerItemMirror(connection_factory=pg_connection_factory),
-            ),
-        ),
+        targets=targets,
         scenario=scenario,
         noticed=noticed,
     )
@@ -381,8 +409,9 @@ def test_every_lost_mirror_write_is_visible_to_reconciliation(
     assert [result.target for result in results] == [
         "PostgresOwnerItemMirror",
         "PostgresOwnerItemMirror",
-    ]
-    assert all(result.noticed for result in results), results
+    ], f"expected one probe result per call site, got {[r.target for r in results]}"
+    missed = [result for result in results if not result.noticed]
+    assert not missed, f"lost writes not noticed by reconciliation: {missed}"
 
 
 def test_a_naive_timestamp_is_stored_as_the_instant_the_writer_meant(
