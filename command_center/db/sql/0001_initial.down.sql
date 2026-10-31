@@ -4,6 +4,10 @@
 -- this keeps the downgrade honest about the foreign-key graph instead of
 -- hiding a wrong order behind `DROP ... CASCADE`.
 
+DROP INDEX IF EXISTS idx_counterfactual_alternative_decision;
+DROP INDEX IF EXISTS idx_counterfactual_decision_status;
+DROP INDEX IF EXISTS idx_counterfactual_decision_project;
+DROP INDEX IF EXISTS idx_counterfactual_decision_criticality;
 DROP INDEX IF EXISTS idx_owner_item_project;
 DROP INDEX IF EXISTS idx_owner_item_done;
 DROP INDEX IF EXISTS idx_model_event_model_id;
@@ -68,6 +72,8 @@ DROP INDEX IF EXISTS idx_run_session_id;
 DROP INDEX IF EXISTS idx_session_task_id;
 
 DROP TABLE IF EXISTS owner_item;
+DROP TABLE IF EXISTS counterfactual_alternative;
+DROP TABLE IF EXISTS counterfactual_decision;
 DROP TABLE IF EXISTS model_event;
 DROP TABLE IF EXISTS model_entry;
 DROP TABLE IF EXISTS market_install_log;

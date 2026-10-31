@@ -305,6 +305,23 @@ from command_center.runtime.db.networking import (  # noqa: F401
     set_invitation_status,
     update_contact_fields,
 )
+from command_center.runtime.db.counterfactual_ledger import (  # noqa: F401
+    DECISION_CRITICALITIES,
+    DECISION_STATUSES,
+    DECISION_TRANSITIONS,
+    MIN_ALTERNATIVES_FOR_CRITICAL,
+    CounterfactualDecisionFinalizedError,
+    InvalidCounterfactualDecisionTransitionError,
+    _UPDATABLE_DECISION_FIELDS,
+    add_counterfactual_alternative,
+    count_counterfactual_alternatives,
+    create_counterfactual_decision,
+    finalize_counterfactual_decision,
+    get_counterfactual_decision,
+    list_counterfactual_alternatives,
+    list_counterfactual_decisions,
+    update_counterfactual_decision_fields,
+)
 from command_center.runtime.db.proposal import (  # noqa: F401
     _PROPOSAL_AUTHORITY_FIELDS,
     _PROPOSAL_DECISION_FIELDS,
