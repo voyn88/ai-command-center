@@ -8,7 +8,6 @@ import json
 import os
 import socket
 import subprocess
-import sys
 import threading
 from contextlib import nullcontext
 from dataclasses import dataclass
