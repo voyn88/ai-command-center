@@ -143,7 +143,9 @@ def test_reconcile_enqueues_only_fresh_chunk_retry(monkeypatch):
     monkeypatch.setattr(
         review_merge,
         "_rows",
-        lambda _factory, sql, _params=(): [(TASK, PR)] if "SELECT t.task_id" in sql else [],
+        lambda _factory, sql, _params=(): [(TASK, PR)]
+        if "SELECT t.task_id" in sql or "FROM backlog_task" in sql
+        else [],
     )
     dispatched = []
     report = review_merge.reconcile_review_once(
@@ -196,13 +198,13 @@ def _refusal_reconcile_setup(monkeypatch, *, executor="claude", cascade=None):
     }
 
     def fake_rows(_factory, sql, params=()):
-        if "SELECT t.task_id" in sql:
-            return [(TASK, PR)]
         if "wr.payload FROM work_item" in sql:
             _task_id, key_param, _key_param2 = params
             if key_param == target:
                 return [(target, "succeeded", refusal_result)]
             return []
+        if "SELECT t.task_id" in sql or "FROM backlog_task" in sql:
+            return [(TASK, PR)]
         return []
 
     monkeypatch.setattr(review_merge, "_rows", fake_rows)
@@ -487,3 +489,76 @@ def test_snapshot_revalidates_open_exact_head_after_diff(monkeypatch, change):
 def test_closed_or_unproven_pr_never_fetches_model_diff(monkeypatch, state):
     monkeypatch.setattr(review_merge, "_gh", lambda *a: pytest.fail("no diff fetch"))
     assert review_merge._pr_diff_and_head("/repo", PR, {"state": state}) is None
+
+
+def _reconcile_scan(monkeypatch, snapshot, attempt_rows, *, tasks=None, cfg=None):
+    """Drive an untargeted reconcile over a faked cursor and attempt table."""
+    claims = []
+
+    def fake_rows(_factory, sql, params=()):
+        if "backlog_scan_cursor" in sql:
+            return []
+        if "backlog_scan_claim" in sql:
+            claims.append(params)
+            return []
+        if "i.idempotency_key" in sql:
+            _task_id, prefix, _prefix2 = params
+            return [row for row in attempt_rows if str(row[0]).startswith(prefix)]
+        assert "READY_TO_REVIEW" in sql
+        return list(tasks) if tasks is not None else [(TASK, PR)]
+
+    monkeypatch.setattr(review_merge, "_rows", fake_rows)
+    monkeypatch.setattr(
+        review_merge, "_model_only_review_cascade", lambda: [{"executor": "copilot"}]
+    )
+    monkeypatch.setattr(planner, "repo_route", lambda _: ("AICC", "/repo"))
+    monkeypatch.setattr(review_merge, "_pr_diff_and_head", lambda *_: snapshot)
+    monkeypatch.setattr(review_merge, "_has_accept_marker", lambda *_: (False, snapshot.head))
+    dispatched = []
+    report = review_merge.reconcile_review_once(
+        None, lambda *args: dispatched.append(args), "/repo", cfg
+    )
+    return report, dispatched, claims
+
+
+def test_reconcile_scan_is_bounded_and_rotates(monkeypatch):
+    """A fixed LIMIT window would never examine tasks past the first page, so
+    a stalled review sorting late in the backlog could never be cleared."""
+    snapshot = snap("diff --git a/a b/a\n@@ -1 +1 @@\n-old\n+new\n")
+    cfg = review_merge.ReviewConfig()
+    backlog = [(f"{TASK}-{index:03d}", PR) for index in range(cfg.max_per_tick + 4)]
+    history = [
+        (review_merge._review_key(backlog_task, PR, snapshot), "succeeded",
+         {"result_text": "tool transcript only"})
+        for backlog_task, _pr in backlog
+    ]
+
+    report, dispatched, claims = _reconcile_scan(
+        monkeypatch, snapshot, history, tasks=backlog
+    )
+    assert len(dispatched) == cfg.max_per_tick
+    assert report.skipped == []
+    assert claims and claims[-1][0] == "scan:reconcile_review_once"
+    assert claims[-1][2].startswith(backlog[cfg.max_per_tick - 1][0])
+
+
+def test_reconcile_leaves_the_cursor_before_a_partially_retried_review(monkeypatch):
+    """Chunks left unretried when the budget runs out must be picked up by the
+    next tick, not after a full cursor lap."""
+    snapshot = snap("diff --git a/a b/a\n" + "x\n" * 100_000)
+    chunks = review_merge._review_chunks(snapshot, TASK, PR)
+    assert len(chunks) > 4
+    history = [
+        (review_merge._chunk_review_key(TASK, PR, snapshot, chunk), "succeeded",
+         {"result_text": "tool transcript only"})
+        for chunk in chunks
+    ]
+
+    cfg = review_merge.ReviewConfig(max_per_tick=4)
+    report, dispatched, claims = _reconcile_scan(
+        monkeypatch, snapshot, history, cfg=cfg
+    )
+
+    assert len(dispatched) == 4
+    assert report.skipped == [(TASK, "retry_deferred_write_budget")]
+    assert claims == []

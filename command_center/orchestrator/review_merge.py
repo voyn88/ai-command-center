@@ -1717,29 +1717,49 @@ def reconcile_review_once(
     the current PR snapshot again and enqueues an identical payload under a
     fresh `:retry:N` key when the latest attempt succeeded but lacks a valid
     verdict for that same head SHA.
+
+    The untargeted tick uses the same rotating ``backlog_scan_cursor`` as
+    ``review_once`` and ``publish_review_verdicts``. A fixed
+    ``ORDER BY task_id LIMIT max_per_tick`` page would leave every stalled
+    review past the first page unexamined. A targeted ``task_id`` does not
+    move that shared cursor. If the action budget runs out between chunks of
+    one review, the cursor stays on the previous row so the next tick
+    re-enters this review instead of waiting a full lap.
     """
     from command_center.orchestrator.planner import repo_route
 
     cfg = cfg or ReviewConfig()
     report = LoopReport()
-    where = " AND t.task_id = %s" if task_id is not None else ""
-    params: tuple[Any, ...] = (
-        (task_id, cfg.max_per_tick)
-        if task_id is not None
-        else (cfg.max_per_tick,)
-    )
-    tasks = _rows(
-        factory,
-        "SELECT t.task_id, e.value FROM backlog_task t "
-        "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
-        "WHERE t.status = 'READY_TO_REVIEW'" + where + " ORDER BY t.task_id LIMIT %s",
-        params,
-    )
+    if task_id is not None:
+        # Targeted invocation: never touch the shared scan cursor, and bound
+        # by the action budget rather than the full-scan examination cap.
+        tasks, scan_token = _rows(
+            factory,
+            "SELECT t.task_id, e.value FROM backlog_task t "
+            "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
+            "WHERE t.status = 'READY_TO_REVIEW' AND t.task_id = %s "
+            "ORDER BY e.value LIMIT %s",
+            (task_id, cfg.max_per_tick),
+        ), None
+    else:
+        tasks, scan_token = _scan_tasks(
+            factory,
+            "scan:reconcile_review_once",
+            "SELECT task_id, value FROM ("
+            "  SELECT DISTINCT t.task_id, e.value FROM backlog_task t"
+            "  JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr'"
+            "  WHERE t.status = 'READY_TO_REVIEW') pairs "
+            "WHERE (task_id, value) > (%s, %s) ORDER BY task_id, value LIMIT %s",
+            (), cfg.scan_cap,
+        )
     cascade = _model_only_review_cascade()
+    last_processed = None
     actions = 0
     for current_task_id, pr_url in tasks:
         if actions >= cfg.max_per_tick:
             break
+        prev_processed = last_processed
+        last_processed = (current_task_id, pr_url)
         if not cascade:
             report.skipped.append((current_task_id, "no_review_executor_route"))
             continue
@@ -1780,6 +1800,13 @@ def reconcile_review_once(
         retries_before = actions
         for chunk in chunks:
             if actions >= cfg.max_per_tick:
+                # Budget spent mid-task: leave the cursor BEFORE this row so
+                # the next tick re-enters here and finishes this review's
+                # remaining chunks, instead of making them wait a full
+                # cursor lap (same reasoning as the deferred marker write in
+                # publish_review_verdicts).
+                last_processed = prev_processed
+                report.skipped.append((current_task_id, "retry_deferred_write_budget"))
                 break
             base_key = key if chunk.count == 1 else _chunk_review_key(
                 current_task_id, pr_url, snapshot, chunk
@@ -1823,6 +1850,10 @@ def reconcile_review_once(
             report.skipped.append(
                 (current_task_id, "no_malformed_review_result_eligible_for_retry")
             )
+    if scan_token is not None:
+        _scan_commit(
+            factory, "scan:reconcile_review_once", scan_token, last_processed
+        )
     return report
 
 
