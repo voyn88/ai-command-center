@@ -85,6 +85,15 @@ UNMIRRORED_SCHEMA_TABLES: dict[str, Exclusion] = {
     # reconciliation path is the importer (backlog_store.import_markdown),
     # not the mirror machinery. One exclusion per table so a future table in
     # the family still has to sign in on its own.
+    "monitor_finding": Exclusion(
+        reason=(
+            "PostgreSQL-native control-plane state from birth (0021): what a "
+            "fail-closed monitor measured, written only through the SECURITY "
+            "DEFINER pair and consumed by the planner tick that files a task; "
+            "there is no SQLite incumbent and nothing to dual-write."
+        ),
+        task="VOYN-W0-AICC-PLANNER-AUTO-SPLIT-PIPELINE-TASKS",
+    ),
     "backlog_scan_cursor": Exclusion(
         reason=(
             "PostgreSQL-native tick-scheduler state from birth (0015): the "
@@ -160,6 +169,16 @@ UNMIRRORED_SCHEMA_TABLES: dict[str, Exclusion] = {
         ),
         task="VOYN-W0-BACKLOG-ORCHESTRATOR",
     ),
+    "backlog_task_followup": Exclusion(
+        reason=(
+            "PostgreSQL-native (migration 0032), same shape as "
+            "backlog_task_remediation: follow-up lineage rows exist only "
+            "through backlog_record_followup, written the same transaction as "
+            "the new OPEN task they point at; no SQLite authority ever held "
+            "them, so there is nothing to mirror."
+        ),
+        task="VOYN-W0-AICC-REVIEW-FULLCONTEXT-TRIAGE",
+    ),
     "queue_entry": Exclusion(
         reason=(
             "Mirrored under a contract of its own rather than the shared one: the "
@@ -208,6 +227,25 @@ UNMIRRORED_SCHEMA_TABLES: dict[str, Exclusion] = {
             "that audit a second, eventually-consistent copy."
         ),
         task="VOYN-W0-AICC-SRV-04b",
+    ),
+    "executor_availability": Exclusion(
+        reason=(
+            "PostgreSQL-native authority from birth (0018): there is no SQLite "
+            "predecessor for a fleet-wide fact — the whole point is that it is "
+            "shared by every host, which a per-host SQLite database structurally "
+            "cannot be. A mirror would also fail the contract's own reachable-"
+            "non-test-caller property for the same reason `work_item`'s does."
+        ),
+        task="VOYN-W0-AICC-EXECUTOR-QUOTA-VISIBILITY",
+    ),
+    "executor_availability_event": Exclusion(
+        reason=(
+            "As `executor_availability`: the protocol's own audit, written "
+            "inside the same transaction as the mark/clear it records; "
+            "mirroring it would give that audit a second, eventually-"
+            "consistent copy, and there is still no SQLite source to mirror."
+        ),
+        task="VOYN-W0-AICC-EXECUTOR-QUOTA-VISIBILITY",
     ),
     "principal": Exclusion(
         reason=(
