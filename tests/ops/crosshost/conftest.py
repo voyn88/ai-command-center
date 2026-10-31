@@ -4,8 +4,10 @@ Two guarantees the deployed worker fleet depends on are cross-host claims by
 construction and cannot be exercised honestly from one machine: that a lease
 abandoned by a `SIGKILL`ed worker on one host is picked up by exactly one
 other host, and that a worker cut off from the queue cannot out-argue the
-queue's own lease-expiry decision. See
-`docs/operations/SRV05_LINUX_SYSTEMD_VERIFICATION.md`.
+queue's own lease-expiry decision. Property 13's partition primitive is a
+userspace TCP forwarder on the remote host (not `IPAddressDeny=` / netns,
+which need root or are blocked by apparmor on the hosts this suite targets).
+See `docs/operations/SRV05_LINUX_SYSTEMD_VERIFICATION.md`.
 
 Proving them needs three things a laptop or a CI runner does not have: a
 second real host reachable over SSH, a real `systemd --user` session on that

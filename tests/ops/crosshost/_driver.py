@@ -14,6 +14,7 @@ import json
 import shlex
 import subprocess
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -55,6 +56,25 @@ def override_dsn(dsn: str, **overrides: str) -> str:
     params = conninfo_to_dict(dsn)
     params.update(overrides)
     return make_conninfo(**params)
+
+
+def dsn_host_port(dsn: str) -> tuple[str, int]:
+    """Upstream (host, port) a TCP proxy must forward to for `dsn`."""
+    from psycopg.conninfo import conninfo_to_dict
+
+    params = conninfo_to_dict(dsn)
+    host = params.get("host") or params.get("hostaddr")
+    if not host:
+        raise ValueError(f"DSN has no host/hostaddr to proxy: {dsn!r}")
+    # libpq may hand back a comma-separated host list; the proxy needs one.
+    host = host.split(",")[0].strip()
+    port = int(params.get("port") or 5432)
+    return host, port
+
+
+def proxy_dsn(dsn: str, listen_port: int, listen_host: str = "127.0.0.1") -> str:
+    """Rewrite `dsn` so clients dial the local forwarder instead of Postgres."""
+    return override_dsn(dsn, host=listen_host, port=str(listen_port))
 
 
 def _parse_last_json_line(result: subprocess.CompletedProcess) -> dict:
@@ -191,11 +211,59 @@ def remote_unit_show(target: str, unit: str, *properties: str) -> dict[str, str]
 
 def kill_remote_unit(target: str, unit: str, signal_name: str = "SIGKILL") -> None:
     subprocess.run(
-        ["ssh", *SSH_OPTS, target, "systemctl", "--user", "kill", f"--signal={signal_name}", f"{unit}.service"],
+        [
+            "ssh",
+            *SSH_OPTS,
+            target,
+            "systemctl",
+            "--user",
+            "kill",
+            f"--signal={signal_name}",
+            f"{unit}.service",
+        ],
         check=False,
         capture_output=True,
         timeout=15,
     )
+
+
+def start_remote_tcp_proxy(
+    target: str, remote_probe_path: str, upstream_host: str, upstream_port: int
+) -> tuple[str, int]:
+    """Start a disposable userspace TCP forwarder on `target`; return (unit, port).
+
+    The forwarder is the property-13 partition primitive: stopping it leaves
+    the holder process alive but unable to reach Postgres, without root,
+    netns, or IPAddressDeny=.
+    """
+    unit = remote_unit_name("proxy")
+    result = start_remote_transient_unit(
+        target,
+        unit,
+        [],
+        [
+            "python3",
+            remote_probe_path,
+            # proxy needs no --dsn/--host-label; those are claim-path concerns.
+            "proxy",
+            "--upstream-host",
+            upstream_host,
+            "--upstream-port",
+            str(upstream_port),
+        ],
+    )
+    assert result.returncode == 0, f"proxy systemd-run on {target} failed: {result.stderr}"
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        for entry in remote_unit_journal_json(target, unit):
+            message = entry.get("MESSAGE", "")
+            if not message.startswith("{"):
+                continue
+            payload = json.loads(message)
+            if payload.get("phase") == "proxy_listen":
+                return unit, int(payload["listen_port"])
+        time.sleep(0.2)
+    raise AssertionError(f"proxy unit {unit} on {target} never printed proxy_listen")
 
 
 def stop_and_forget_remote_unit(target: str, unit: str) -> None:

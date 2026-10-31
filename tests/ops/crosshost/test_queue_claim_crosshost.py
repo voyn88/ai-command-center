@@ -15,33 +15,41 @@ genuinely cross-host dimension `tests/db/test_queue_claim.py`'s single-host
 distinct Postgres role on the *same* kernel; this one uses a distinct kernel,
 distinct clock, and a real SSH-bridged process tree.
 
-Property 13 (network-partition arbitration) needs a worker process with real,
-total network connectivity loss while the rest of its host keeps working --
-`IPAddressDeny=` on a `--user` unit is silently a no-op without root
-(confirmed live on this host: "unit configures an IP firewall, but not
-running as root"), and unprivileged network namespaces are blocked here by
-`kernel.apparmor_restrict_unprivileged_userns=1`. `skip_without_root_netns`
-below is a real capability probe, not a hardcoded skip, so this proves itself
-the moment either constraint lifts.
+Property 13 (network-partition arbitration) uses a userspace TCP forwarder
+on the remote host as the partition primitive: the holder dials Postgres
+through `127.0.0.1:<proxy>`, and stopping that forwarder leaves the holder
+process alive with total loss of reachability to the queue while the rest of
+its host -- and this host's direct path to the same database -- keep working.
+That is deliberate. `IPAddressDeny=` on a `--user` unit is a silent no-op
+without root (confirmed live: "unit configures an IP firewall, but not
+running as root"), and unprivileged network namespaces are blocked on both
+hosts by `kernel.apparmor_restrict_unprivileged_userns=1`. A paused or idle
+process standing in for a partition is already covered on one host by
+`tests/db/test_queue_claim.py`'s
+`test_a_partitioned_owner_is_alive_and_still_refused`; this test needs the
+holder still running and still trying to publish after real connectivity loss.
 """
 
 from __future__ import annotations
 
 import json
-import subprocess
+import socket
 import time
 import uuid
 
 import pytest
 
 from tests.ops.crosshost._driver import (
+    dsn_host_port,
     kill_remote_unit,
+    proxy_dsn,
     remote_unit_journal_json,
     remote_unit_name,
     remote_unit_show,
     run_probe_local,
     run_probe_remote,
     stage_probe_remote,
+    start_remote_tcp_proxy,
     start_remote_transient_unit,
     stop_and_forget_remote_unit,
     unstage_probe_remote,
@@ -49,7 +57,7 @@ from tests.ops.crosshost._driver import (
 
 pytestmark = [pytest.mark.serial]
 
-LOCAL_LABEL = "voyn-worker-01"
+LOCAL_LABEL = socket.gethostname().split(".")[0]
 VISIBILITY_SECONDS = 5
 
 
@@ -66,43 +74,54 @@ def remote_claim_holder(remote_host):
     remote_path = stage_probe_remote(remote_host)
     units: list[str] = []
 
-    def _start(dsn: str, queue: str, *, hold_seconds: float = 60) -> str:
-        unit = remote_unit_name("holder")
+    def _start(
+        dsn: str,
+        queue: str,
+        *,
+        hold_seconds: float = 60,
+        extra_args: list[str] | None = None,
+        unit_tag: str = "holder",
+    ) -> str:
+        unit = remote_unit_name(unit_tag)
         units.append(unit)
-        result = start_remote_transient_unit(
+        argv = [
+            "python3",
+            remote_path,
+            "claim",
+            "--dsn",
+            dsn,
+            "--host-label",
             remote_host,
-            unit,
-            [],
-            [
-                "python3",
-                remote_path,
-                "claim",
-                "--dsn",
-                dsn,
-                "--host-label",
-                remote_host,
-                "--queue",
-                queue,
-                "--visibility",
-                str(VISIBILITY_SECONDS),
-                "--hold-seconds",
-                str(hold_seconds),
-            ],
-        )
+            "--queue",
+            queue,
+            "--visibility",
+            str(VISIBILITY_SECONDS),
+            "--hold-seconds",
+            str(hold_seconds),
+        ]
+        if extra_args:
+            argv.extend(extra_args)
+        result = start_remote_transient_unit(remote_host, unit, [], argv)
         assert result.returncode == 0, f"systemd-run on {remote_host} failed: {result.stderr}"
         return unit
 
-    def _await_claim_json(unit: str, timeout: float = 15) -> dict:
+    def _await_phase_json(unit: str, phase: str, timeout: float = 15) -> dict:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             for entry in remote_unit_journal_json(remote_host, unit):
                 message = entry.get("MESSAGE", "")
-                if message.startswith("{"):
-                    return json.loads(message)
+                if not message.startswith("{"):
+                    continue
+                payload = json.loads(message)
+                # Pre-phase field: older probe builds only emitted claim JSON.
+                if payload.get("phase", "claim") == phase:
+                    return payload
             time.sleep(0.3)
-        raise AssertionError(f"{unit} on {remote_host} never printed its claim result")
+        raise AssertionError(
+            f"{unit} on {remote_host} never printed a {phase!r} result"
+        )
 
-    yield _start, _await_claim_json
+    yield _start, _await_phase_json, remote_path
 
     for unit in units:
         stop_and_forget_remote_unit(remote_host, unit)
@@ -118,9 +137,9 @@ def test_no_reclaim_while_the_remote_owner_is_alive(queue_dsn, remote_host, remo
     enqueued = run_probe_local(queue_dsn, LOCAL_LABEL, "enqueue", "--queue", queue, "--key", "only")
     assert enqueued["work_item_id"]
 
-    start, await_claim = remote_claim_holder
+    start, await_phase, _remote_path = remote_claim_holder
     unit = start(queue_dsn, queue, hold_seconds=VISIBILITY_SECONDS + 5)
-    remote_claim = await_claim(unit)
+    remote_claim = await_phase(unit, "claim")
     assert remote_claim["ok"] is True
     assert remote_claim["work_item_id"] == enqueued["work_item_id"]
 
@@ -141,9 +160,9 @@ def test_sigkill_on_remote_host_is_recovered_by_exactly_one_other_host(
     enqueued = run_probe_local(queue_dsn, LOCAL_LABEL, "enqueue", "--queue", queue, "--key", "only")
     work_item_id = enqueued["work_item_id"]
 
-    start, await_claim = remote_claim_holder
+    start, await_phase, _remote_path = remote_claim_holder
     unit = start(queue_dsn, queue, hold_seconds=60)
-    remote_claim = await_claim(unit)
+    remote_claim = await_phase(unit, "claim")
     assert remote_claim["ok"] is True
     stale_attempt_id = remote_claim["attempt_id"]
     stale_token = remote_claim["token"]
@@ -189,43 +208,110 @@ def test_sigkill_on_remote_host_is_recovered_by_exactly_one_other_host(
     assert inspected["attempt_count"] == 2
 
 
-def _unprivileged_root_network_isolation_available() -> bool:
-    """Real capability probe: can we make a `--user` unit's network
-    unreachable without root? Confirmed `False` on this host by direct
-    measurement (see module docstring) -- checked live here rather than
-    hardcoded, so this self-corrects if the host's hardening ever changes."""
-    try:
-        result = subprocess.run(
-            ["unshare", "--net", "--user", "--map-root-user", "--", "true"],
-            check=False,
-            capture_output=True,
-            timeout=5,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        return False
-    return result.returncode == 0
-
-
-skip_without_root_network_isolation = pytest.mark.skipif(
-    not _unprivileged_root_network_isolation_available(),
-    reason="proving a real network partition (not a paused/idle process standing "
-    "in for one, which tests/db/test_queue_claim.py's "
-    "test_a_partitioned_owner_is_alive_and_still_refused already covers on one "
-    "host) needs a worker process with total, kernel-enforced network loss. "
-    "`IPAddressDeny=` on a systemd --user unit is a silent no-op without root "
-    "(measured on this host: 'unit configures an IP firewall, but not running "
-    "as root'), and unprivileged network namespaces are blocked here by "
-    "kernel.apparmor_restrict_unprivileged_userns=1. Tracked as follow-up "
-    "requiring root or a hardening exception on both hosts.",
-)
-
-
-@skip_without_root_network_isolation
+# --- 13. Network-partition arbitration: a still-running owner cut off from
+# the queue cannot out-argue the queue's lease-expiry decision, and must not
+# publish a result after the lease has moved on. Partition primitive is a
+# userspace TCP forwarder on the remote host (see module docstring) -- stop
+# the forwarder, leave the holder alive, let visibility lapse, reclaim from
+# THIS host, and confirm the cut-off owner's later complete is refused.
 def test_network_partition_cannot_out_argue_the_queues_lease_expiry(
     queue_dsn, remote_host, remote_claim_holder
 ):
-    pytest.fail(
-        "root-level network isolation is available on this host but this test "
-        "was never implemented against it -- see the module docstring for what "
-        "property 13 still needs"
+    queue = _queue_name()
+    enqueued = run_probe_local(
+        queue_dsn, LOCAL_LABEL, "enqueue", "--queue", queue, "--key", "partitioned"
     )
+    work_item_id = enqueued["work_item_id"]
+
+    start, await_phase, remote_path = remote_claim_holder
+    upstream_host, upstream_port = dsn_host_port(queue_dsn)
+    proxy_unit, listen_port = start_remote_tcp_proxy(
+        remote_host, remote_path, upstream_host, upstream_port
+    )
+    # Ensure the proxy unit is cleaned up even if the holder fixture's unit
+    # list does not know about it (it is started outside `_start`).
+    try:
+        holder_dsn = proxy_dsn(queue_dsn, listen_port)
+        # Hold long enough that the partition + visibility + reclaim all
+        # finish before the cut-off owner attempts its complete.
+        unit = start(
+            holder_dsn,
+            queue,
+            hold_seconds=VISIBILITY_SECONDS + 10,
+            extra_args=["--then-complete"],
+        )
+        remote_claim = await_phase(unit, "claim")
+        assert remote_claim["ok"] is True
+        assert remote_claim["work_item_id"] == work_item_id
+        stale_attempt_id = remote_claim["attempt_id"]
+        stale_token = remote_claim["token"]
+
+        # Negative control: while the proxied claim is alive, this host gets
+        # nothing -- same exclusion property 12a proves for an unproxied claim.
+        blocked = run_probe_local(queue_dsn, LOCAL_LABEL, "claim", "--queue", queue)
+        assert blocked["ok"] is False
+        assert blocked["reason"] == "no_work"
+
+        # The partition: holder keeps running, its path to the queue dies.
+        partition_at = time.monotonic()
+        kill_remote_unit(remote_host, proxy_unit, signal_name="SIGTERM")
+        stop_and_forget_remote_unit(remote_host, proxy_unit)
+
+        time.sleep(VISIBILITY_SECONDS + 1)
+        reaped = run_probe_local(queue_dsn, LOCAL_LABEL, "reap")
+        assert reaped["reaped"] >= 1
+
+        reclaimed = run_probe_local(queue_dsn, LOCAL_LABEL, "claim", "--queue", queue)
+        assert reclaimed["ok"] is True
+        assert reclaimed["work_item_id"] == work_item_id
+        assert reclaimed["attempt_id"] != stale_attempt_id
+
+        completed = run_probe_local(
+            queue_dsn,
+            LOCAL_LABEL,
+            "complete",
+            "--attempt-id",
+            reclaimed["attempt_id"],
+            "--token",
+            reclaimed["token"],
+        )
+        assert completed["ok"] is True
+        decided_in = time.monotonic() - partition_at
+        # Visibility is 5s; reclaim+complete add a little. Bound it so a
+        # hung or consent-waiting path cannot silently pass.
+        assert decided_in < VISIBILITY_SECONDS + 5, (
+            f"queue took {decided_in:.2f}s to decide after partition; "
+            "expected visibility-bound arbitration without the cut-off host's consent"
+        )
+
+        # Direct path (not through the dead proxy): the cut-off owner's
+        # original token is refused by the queue's bookkeeping.
+        stale_completion = run_probe_remote(
+            remote_host,
+            queue_dsn,
+            remote_host,
+            "complete",
+            "--attempt-id",
+            stale_attempt_id,
+            "--token",
+            stale_token,
+            "--result",
+            '{"ok": true, "from": "stale_direct"}',
+        )
+        assert stale_completion["ok"] is False
+        assert stale_completion["reason"] == "attempt_expired"
+
+        # The holder itself also tried to publish after the hold; that
+        # attempt must not have succeeded (transport failure under partition
+        # is fine; a successful complete would be the failure mode).
+        holder_complete = await_phase(unit, "complete", timeout=VISIBILITY_SECONDS + 15)
+        assert holder_complete["ok"] is False
+
+        inspected = run_probe_local(
+            queue_dsn, LOCAL_LABEL, "inspect", "--work-item-id", work_item_id
+        )
+        assert inspected["state"] == "succeeded"
+        assert inspected["attempt_count"] == 2
+        assert inspected["result_id"], "exactly one result, from the non-partitioned host"
+    finally:
+        stop_and_forget_remote_unit(remote_host, proxy_unit)

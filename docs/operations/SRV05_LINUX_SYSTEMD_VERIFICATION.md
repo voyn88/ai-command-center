@@ -4,11 +4,9 @@
 (`deploy/systemd/aicc-worker.service`, ported to the preprod lane template as
 `voyn-aicc-worker@.service`). This records which of the runtime guarantees that
 deployment leans on are mechanically proven against a real kernel and a real
-systemd — not asserted in a comment, not asserted in a design doc — and which
-one is not, because it needs root or a hardening exception on a host this
-repo's test suite cannot assume it has.
+systemd — not asserted in a comment, not asserted in a design doc.
 
-The proof lives in
+The single-host proof lives in
 [`tests/ops/test_worker_systemd_runtime_platform.py`](../../tests/ops/test_worker_systemd_runtime_platform.py):
 every test below spawns a disposable `systemd-run --user` transient unit (or,
 for PDEATHSIG, a plain `fork()`), asserts the real outcome, and tears itself
@@ -19,7 +17,11 @@ The suite self-skips (`skip_without_live_systemd`) unless
 it, so it stays inert on a CI runner or container without a reachable
 `systemd --user` session instead of failing there.
 
-## Proven (12 of 13)
+The cross-host proof (properties 12–13) lives in
+[`tests/ops/crosshost/`](../../tests/ops/crosshost/): a second real host over
+SSH plus a Postgres both hosts reach.
+
+## Proven (13 of 13)
 
 | # | Property | What the test proves |
 |---|----------|------------------------|
@@ -35,6 +37,7 @@ it, so it stays inert on a CI runner or container without a reachable
 | 10 | `StateDirectory` + `StateDirectoryMode` | The mode `aicc-worker.service` actually declares (`StateDirectoryMode=0700`, read from the unit file rather than hardcoded in the test) is the mode that lands on the created directory — the platform default is `0755`, so this is not a no-op assertion. |
 | 11 | `Type=notify` + `WatchdogSec` | A handler that sends `READY=1` once and then stops pinging the watchdog is aborted (`SIGABRT`) once `WatchdogSec` elapses, and systemd reports `Result=watchdog`. This is the exact failure mode the worker's heartbeat thread (`command_center/worker/daemon.py`) exists to avoid triggering. |
 | 12 | Cross-host failover consistency | A worker `SIGKILL`ed on a real second host over SSH has its claimed queue item picked up by *exactly one* other real host, against a shared Postgres database both hosts reach — not simulated, not mocked. The negative control comes first: while the remote holder is alive and inside its visibility window, a second host claiming the same queue gets `no_work`. Then: `SIGKILL` the remote holder, let the visibility window lapse, `queue_reap()` from the local host, and confirm the local host — and only the local host — reclaims the item; the killed host's original claim token cannot retroactively complete it (`attempt_expired`), because it's the queue's bookkeeping that's authoritative, not either host's memory of what it once held. See [`tests/ops/crosshost/test_queue_claim_crosshost.py`](../../tests/ops/crosshost/test_queue_claim_crosshost.py). |
+| 13 | Network-partition arbitration | A still-running owner on a real second host is cut off from the queue by stopping a userspace TCP forwarder that was its only path to Postgres (`IPAddressDeny=` is a silent no-op without root on `--user` units; unprivileged netns is blocked by `kernel.apparmor_restrict_unprivileged_userns=1` on both hosts this suite targets). The holder keeps running and still tries to `queue_complete` after the hold. Visibility lapses, this host reaps and completes — the queue decides without the cut-off host's consent, inside a visibility-bound window — and both the cut-off owner's later direct-token complete (`attempt_expired`) and its own post-hold complete (`ok=false`, typically `network_unreachable`) fail to publish. Exactly one result lands, from the non-partitioned host. |
 
 Run the single-host suite directly on a host with a real `systemd --user` session:
 
@@ -42,7 +45,7 @@ Run the single-host suite directly on a host with a real `systemd --user` sessio
 pytest tests/ops/test_worker_systemd_runtime_platform.py -v
 ```
 
-Run the cross-host suite (property 12) with a second real host and a shared
+Run the cross-host suite (properties 12–13) with a second real host and a shared
 Postgres reachable from both:
 
 ```
@@ -55,36 +58,3 @@ It self-skips (`remote_host` fixture) unless
 `ssh $AICC_CROSSHOST_SSH_TARGET systemd-run --user --wait -- /bin/true`
 actually succeeds and `AICC_CROSSHOST_PG_ADMIN_DSN` is set — the same
 non-mockable bar the single-host suite sets for its own host.
-
-## Not proven here (1 of 13): network-partition arbitration
-
-When a worker is cut off from the queue, the queue's lease-expiry decision —
-not the partitioned worker's local judgment — must be what determines
-whether its claim is still valid, and the partitioned worker must not
-publish a result after that. `tests/db/test_queue_claim.py`'s
-`test_a_partitioned_owner_is_alive_and_still_refused` already proves the
-queue-side half of this (a still-running, still-communicating owner is
-refused once its lease lapses) on one host. What's missing is the other
-half: an owner with real, total network connectivity loss while the rest of
-its host — and the test process observing it — keeps working, which needs a
-second host and a genuine partition, not a paused or idle process standing
-in for one.
-
-Two real constraints block that here, both confirmed by direct measurement
-rather than assumed:
-
-- `IPAddressDeny=` on a `systemd --user` unit is a silent no-op without root
-  (`systemctl --user` reports "unit configures an IP firewall, but not
-  running as root" and traffic is unaffected).
-- Unprivileged network namespaces (`unshare --net --user`) are blocked by
-  `kernel.apparmor_restrict_unprivileged_userns=1` on both hosts this repo
-  has access to.
-
-`tests/ops/crosshost/test_queue_claim_crosshost.py` carries the test for
-this (`test_network_partition_cannot_out_argue_the_queues_lease_expiry`)
-gated behind a live capability probe
-(`skip_without_root_network_isolation`) rather than a hardcoded skip, so it
-self-activates — and must then actually be implemented against the isolation
-primitive — the moment either constraint lifts on a host with the SSH
-partner this suite needs. Tracked as follow-up requiring root or a hardening
-exception on both hosts.

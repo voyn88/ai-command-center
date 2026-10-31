@@ -26,6 +26,7 @@ import hashlib
 import json
 import os
 import secrets
+import signal
 import subprocess
 import sys
 import time
@@ -62,6 +63,7 @@ def cmd_claim(args: argparse.Namespace) -> int:
     payload = {
         "pid": os.getpid(),
         "host_label": args.host_label,
+        "phase": "claim",
         "ok": ok == "t",
         "reason": reason or None,
         "work_item_id": work_item_id or None,
@@ -71,11 +73,154 @@ def cmd_claim(args: argparse.Namespace) -> int:
         "token": token if ok == "t" else None,
     }
     _emit(payload)
-    if payload["ok"] and args.hold_seconds > 0:
-        # Represents an in-flight worker still holding the attempt: the
-        # process the driver will later SIGKILL, or that a partition will cut
-        # off from the database mid-run.
-        time.sleep(args.hold_seconds)
+    if not payload["ok"] or args.hold_seconds <= 0:
+        return 0
+    # In-flight worker still holding the attempt: the process the driver will
+    # later SIGKILL (property 12), or whose path to the queue a partition will
+    # cut mid-hold (property 13).
+    time.sleep(args.hold_seconds)
+    if not args.then_complete:
+        return 0
+    # Property 13: after the hold (and, under partition, after connectivity
+    # is gone), the cut-off owner still tries to publish. Catch transport
+    # failure as data so the driver can assert the partitioned worker did
+    # not land a result — a crash here would be ambiguous.
+    try:
+        fields = _run_sql(
+            args.dsn,
+            "SELECT ok, reason FROM queue_complete(:'attempt_id', :'token', :'result'::jsonb)",
+            {
+                "attempt_id": payload["attempt_id"],
+                "token": token,
+                "result": args.then_complete_result,
+            },
+        )
+        ok, reason = (fields + ["", ""])[:2]
+        _emit(
+            {
+                "host_label": args.host_label,
+                "phase": "complete",
+                "ok": ok == "t",
+                "reason": reason or None,
+            }
+        )
+    except Exception as exc:  # noqa: BLE001 — transport failure is the partition case
+        _emit(
+            {
+                "host_label": args.host_label,
+                "phase": "complete",
+                "ok": False,
+                "reason": "network_unreachable",
+                "error": str(exc)[:200],
+            }
+        )
+    return 0
+
+
+def cmd_proxy(args: argparse.Namespace) -> int:
+    """Userspace TCP forwarder used as the property-13 partition primitive.
+
+    Listens on 127.0.0.1:<listen-port> (or an ephemeral port when
+    --listen-port 0), relays byte-for-byte to --upstream-host:--upstream-port,
+    and prints one JSON line with the bound port so a driver can rewrite a
+    DSN at it. SIGTERM/SIGINT close the listener and drop every relay — that
+    is the partition: the holder process keeps running, but its next psql
+    against the proxy DSN cannot reach Postgres. No root, no netns, no
+    IPAddressDeny= (all three unavailable to a systemd --user unit on the
+    hosts this suite targets).
+    """
+    import select
+    import socket
+    import threading
+
+    upstream = (args.upstream_host, args.upstream_port)
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind((args.listen_host, args.listen_port))
+    listener.listen(32)
+    listen_port = listener.getsockname()[1]
+    _emit(
+        {
+            "phase": "proxy_listen",
+            "listen_host": args.listen_host,
+            "listen_port": listen_port,
+            "upstream_host": args.upstream_host,
+            "upstream_port": args.upstream_port,
+        }
+    )
+
+    stop = threading.Event()
+    alive: list[socket.socket] = []
+    alive_lock = threading.Lock()
+
+    def _relay(a: socket.socket, b: socket.socket) -> None:
+        try:
+            while not stop.is_set():
+                readable, _, _ = select.select([a], [], [], 0.5)
+                if not readable:
+                    continue
+                data = a.recv(65536)
+                if not data:
+                    break
+                b.sendall(data)
+        except OSError:
+            pass
+        finally:
+            for s in (a, b):
+                try:
+                    s.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                try:
+                    s.close()
+                except OSError:
+                    pass
+
+    def _accept_loop() -> None:
+        listener.settimeout(0.5)
+        while not stop.is_set():
+            try:
+                client, _addr = listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            try:
+                upstream_sock = socket.create_connection(upstream, timeout=5)
+            except OSError:
+                client.close()
+                continue
+            with alive_lock:
+                alive.extend((client, upstream_sock))
+            threading.Thread(
+                target=_relay, args=(client, upstream_sock), daemon=True
+            ).start()
+            threading.Thread(
+                target=_relay, args=(upstream_sock, client), daemon=True
+            ).start()
+
+    acceptor = threading.Thread(target=_accept_loop, daemon=True)
+    acceptor.start()
+
+    def _stop(_signum, _frame) -> None:
+        stop.set()
+
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+    while not stop.is_set():
+        time.sleep(0.2)
+
+    try:
+        listener.close()
+    except OSError:
+        pass
+    with alive_lock:
+        for s in alive:
+            try:
+                s.close()
+            except OSError:
+                pass
+    _emit({"phase": "proxy_stopped", "listen_port": listen_port})
     return 0
 
 
@@ -165,15 +310,40 @@ def cmd_inspect(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dsn", required=True, help="libpq connection string/URI")
-    parser.add_argument("--host-label", required=True, help="which real host ran this")
+    parser.add_argument(
+        "--dsn",
+        default="",
+        help="libpq connection string/URI (required for every action except proxy)",
+    )
+    parser.add_argument(
+        "--host-label",
+        default="",
+        help="which real host ran this (required for every action except proxy)",
+    )
     sub = parser.add_subparsers(dest="action", required=True)
 
     p_claim = sub.add_parser("claim")
     p_claim.add_argument("--queue", required=True)
     p_claim.add_argument("--visibility", type=int, default=60)
     p_claim.add_argument("--hold-seconds", type=float, default=0)
+    p_claim.add_argument(
+        "--then-complete",
+        action="store_true",
+        help="after holding, attempt queue_complete (property 13 partition probe)",
+    )
+    p_claim.add_argument(
+        "--then-complete-result",
+        default='{"ok": true, "from": "partitioned_owner"}',
+        help="jsonb payload the partitioned owner tries to publish",
+    )
     p_claim.set_defaults(func=cmd_claim)
+
+    p_proxy = sub.add_parser("proxy")
+    p_proxy.add_argument("--listen-host", default="127.0.0.1")
+    p_proxy.add_argument("--listen-port", type=int, default=0)
+    p_proxy.add_argument("--upstream-host", required=True)
+    p_proxy.add_argument("--upstream-port", type=int, required=True)
+    p_proxy.set_defaults(func=cmd_proxy)
 
     p_hb = sub.add_parser("heartbeat")
     p_hb.add_argument("--attempt-id", required=True)
@@ -208,6 +378,11 @@ def main(argv: list[str] | None = None) -> int:
     p_inspect.set_defaults(func=cmd_inspect)
 
     args = parser.parse_args(argv)
+    if args.action != "proxy":
+        if not args.dsn:
+            parser.error("--dsn is required for this action")
+        if not args.host_label:
+            parser.error("--host-label is required for this action")
     return args.func(args)
 
 

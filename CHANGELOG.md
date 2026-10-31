@@ -24,25 +24,24 @@ functional application milestones of `app.py`.
   installed as a system unit or needs root. Self-skips off a live
   `systemd --user` session.
 - `docs/operations/SRV05_LINUX_SYSTEMD_VERIFICATION.md`: the proof index —
-  11 of 13 runtime-platform properties proven on one host, and the 2 that
-  are cross-host claims (SIGKILL failover consistency, network-partition
-  arbitration) a single host cannot honestly exercise, tracked as follow-up
-  requiring a second real host.
+  all 13 runtime-platform properties proven (11 on one host; 2 cross-host).
 - `tests/ops/crosshost/`: the cross-host follow-up. Proves property 12
-  (SIGKILL failover consistency) against a real second host over SSH and a
-  Postgres database both hosts reach: a negative control (a claim alive
-  inside its visibility window excludes a second host), then the positive
-  case (`SIGKILL` the remote holder, `queue_reap()` from the local host,
-  confirm exactly one host reclaims the item and the killed host's stale
-  claim token cannot retroactively complete it). Self-skips unless
-  `AICC_CROSSHOST_SSH_TARGET` has a live `systemd --user` session and
-  `AICC_CROSSHOST_PG_ADMIN_DSN` is set. Property 13 (network-partition
-  arbitration) stays unproven: `IPAddressDeny=` on a `--user` unit is a
-  measured no-op without root, and unprivileged network namespaces are
-  blocked here by `kernel.apparmor_restrict_unprivileged_userns=1` — the
-  test is written and gated behind a live capability probe so it
-  self-activates the moment either constraint lifts, but is not itself
-  implemented yet. 12 of 13 runtime-platform properties now proven.
+  (SIGKILL failover consistency) and property 13 (network-partition
+  arbitration) against a real second host over SSH and a Postgres database
+  both hosts reach. Property 12: negative control (a live remote claim
+  excludes a second host), then `SIGKILL` the remote holder, `queue_reap()`
+  from the local host, confirm exactly one host reclaims the item and the
+  killed host's stale claim token cannot retroactively complete it.
+  Property 13: the remote holder dials Postgres only through a userspace
+  TCP forwarder on that host; stopping the forwarder partitions it without
+  root (`IPAddressDeny=` is a no-op on `--user` units; unprivileged netns
+  is blocked by apparmor on both hosts). The cut-off owner keeps running
+  and still tries to publish; the queue reaps and the local host completes
+  inside a visibility-bound window without the cut-off host's consent; both
+  the owner's post-hold complete and a direct stale-token complete fail to
+  publish. Self-skips unless `AICC_CROSSHOST_SSH_TARGET` has a live
+  `systemd --user` session and `AICC_CROSSHOST_PG_ADMIN_DSN` is set.
+  13 of 13 runtime-platform properties now proven.
 
 ### Added (SRV-05 slice 2)
 - `command_center/worker/payloads.py` — versioned `agent_run` payload contract

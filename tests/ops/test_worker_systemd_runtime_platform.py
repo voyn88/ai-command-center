@@ -8,13 +8,12 @@ on the host running this suite, via disposable `systemd-run --user` transient un
 No unit here is installed into the system manager and nothing here needs root: it
 proves the mechanism a `User=`-scoped worker actually gets, not a mocked one.
 
-Two properties the production units also depend on are deliberately NOT covered
+Two properties the production units also depend on are deliberately not covered
 here, because they are cross-host claims a single machine cannot exercise: that a
 lease abandoned by a SIGKILLed worker on one host is picked up by exactly one other
 host, and that a network partition is arbitrated by the queue rather than by either
-host's local judgment. Those need a second real host (paired the way
-`voyn-control-01` pairs with this one) and are tracked separately -- see
-`docs/operations/SRV05_LINUX_SYSTEMD_VERIFICATION.md`.
+host's local judgment. Those live in `tests/ops/crosshost/` against a second real
+host — see `docs/operations/SRV05_LINUX_SYSTEMD_VERIFICATION.md`.
 
 Each test spawns and tears down its own transient unit; nothing here touches a real
 system unit or requires elevated privileges. Timing-sensitive (real subprocesses,
