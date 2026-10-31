@@ -1,0 +1,64 @@
+# AICC Native Gateway v1 -- the read-only HTTPS API the owner's iPhone/Mac
+# app reads (`GET /v1/snapshot`, `/v1/dialogs`, ...); see
+# docs/aicc_native_gateway/GATEWAY_V1.md and
+# docs/operations/NATIVE_GATEWAY_DEPLOY.md.
+#
+# Exposure is the tailnet only: AICC_GATEWAY_BIND is the control host's
+# Tailscale IP (never 0.0.0.0, never a public address), and the certificate
+# is the one `tailscale cert` issues for the host's tailnet name. The
+# gateway's only input is the projection artifact the
+# aicc-gateway-projection timer writes; it holds no database credential and
+# opens no database connection, which is why this unit sources no .env.
+#
+# Installed as a file by the control profile, NOT enabled by the installer:
+# until the operator has written /etc/aicc/native-gateway.env (bind address,
+# TLS paths, device-token registry), the condition below skips the unit
+# instead of restart-looping it into a crash-loop finding.
+[Unit]
+Description=AICC Native Gateway v1 (read-only HTTPS API for the owner apps)
+After=network-online.target tailscaled.service
+Wants=network-online.target tailscaled.service
+ConditionPathExists=/etc/aicc/native-gateway.env
+
+[Service]
+Type=simple
+User=voynadmin
+WorkingDirectory=/opt/aicc/current
+# Defaults; /etc/aicc/native-gateway.env sets AICC_GATEWAY_BIND and may
+# override any of these.
+Environment=AICC_GATEWAY_PORT=8443
+Environment=AICC_GATEWAY_PROJECTION=/var/lib/aicc-gateway/projection.json
+Environment=AICC_GATEWAY_TOKEN_FILE=/etc/aicc/native-gateway/device_tokens.json
+Environment=AICC_GATEWAY_TLS_CERT=/etc/aicc/native-gateway/tls/gateway.crt
+Environment=AICC_GATEWAY_TLS_KEY=/etc/aicc/native-gateway/tls/gateway.key
+EnvironmentFile=/etc/aicc/native-gateway.env
+# serve.py refuses to start without TLS material (there is no plaintext mode);
+# an unset bind address fails here rather than defaulting to anything.
+ExecStart=/bin/bash -c 'exec /opt/aicc/current/.venv/bin/python -m native_gateway.serve --host "$${AICC_GATEWAY_BIND:?AICC_GATEWAY_BIND must be the Tailscale IP}" --port "$${AICC_GATEWAY_PORT}"'
+Restart=always
+# The bind address appears only once tailscaled is up; a short back-off rides
+# that out without hammering.
+RestartSec=10s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=read-only
+ProtectSystem=strict
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

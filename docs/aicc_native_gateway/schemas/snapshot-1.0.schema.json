@@ -169,6 +169,181 @@
       "title": "GoalDTO",
       "type": "object"
     },
+    "MonitorVerdictDTO": {
+      "additionalProperties": false,
+      "description": "The infra monitor's latest verdict: open failure codes, never detail.",
+      "properties": {
+        "failures": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Failures",
+          "type": "array"
+        },
+        "lastSeenAt": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Lastseenat"
+        },
+        "openFindings": {
+          "title": "Openfindings",
+          "type": "integer"
+        },
+        "verdict": {
+          "title": "Verdict",
+          "type": "string"
+        }
+      },
+      "required": [
+        "verdict",
+        "openFindings",
+        "failures"
+      ],
+      "title": "MonitorVerdictDTO",
+      "type": "object"
+    },
+    "OwnerEscalationDTO": {
+      "additionalProperties": false,
+      "description": "A DEFER_TO_USER backlog task: it waits on the owner.",
+      "properties": {
+        "priority": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Priority"
+        },
+        "taskID": {
+          "title": "Taskid",
+          "type": "string"
+        },
+        "title": {
+          "title": "Title",
+          "type": "string"
+        },
+        "updatedAt": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Updatedat"
+        }
+      },
+      "required": [
+        "taskID",
+        "title"
+      ],
+      "title": "OwnerEscalationDTO",
+      "type": "object"
+    },
+    "PipelineHealthDTO": {
+      "additionalProperties": false,
+      "description": "Additive in DTO 1.0 \u2014 the autonomous pipeline's health for the owner.",
+      "properties": {
+        "activeLanes": {
+          "items": {
+            "$ref": "#/$defs/PipelineLaneDTO"
+          },
+          "title": "Activelanes",
+          "type": "array"
+        },
+        "backlogByStatus": {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "title": "Backlogbystatus",
+          "type": "object"
+        },
+        "executorAuthFailures30m": {
+          "title": "Executorauthfailures30M",
+          "type": "integer"
+        },
+        "monitor": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MonitorVerdictDTO"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "observedAt": {
+          "title": "Observedat",
+          "type": "string"
+        },
+        "ownerEscalations": {
+          "items": {
+            "$ref": "#/$defs/OwnerEscalationDTO"
+          },
+          "title": "Ownerescalations",
+          "type": "array"
+        },
+        "queue": {
+          "$ref": "#/$defs/QueueHealthDTO"
+        }
+      },
+      "required": [
+        "observedAt",
+        "queue",
+        "activeLanes",
+        "executorAuthFailures30m",
+        "backlogByStatus",
+        "ownerEscalations"
+      ],
+      "title": "PipelineHealthDTO",
+      "type": "object"
+    },
+    "PipelineLaneDTO": {
+      "additionalProperties": false,
+      "description": "A role holding at least one active, unexpired attempt.",
+      "properties": {
+        "attempts": {
+          "title": "Attempts",
+          "type": "integer"
+        },
+        "heartbeatAgeSeconds": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Heartbeatageseconds"
+        },
+        "role": {
+          "title": "Role",
+          "type": "string"
+        }
+      },
+      "required": [
+        "role",
+        "attempts",
+        "heartbeatAgeSeconds"
+      ],
+      "title": "PipelineLaneDTO",
+      "type": "object"
+    },
     "ProjectDTO": {
       "additionalProperties": false,
       "description": "Additive in DTO 1.0 \u2014 calm per-project rollup for the overview.",
@@ -202,6 +377,48 @@
         "needsAttention"
       ],
       "title": "ProjectDTO",
+      "type": "object"
+    },
+    "QueueHealthDTO": {
+      "additionalProperties": false,
+      "description": "Durable work queue, all queues together.",
+      "properties": {
+        "claimed": {
+          "title": "Claimed",
+          "type": "integer"
+        },
+        "dead": {
+          "title": "Dead",
+          "type": "integer"
+        },
+        "oldestReadyAgeSeconds": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Oldestreadyageseconds"
+        },
+        "ready": {
+          "title": "Ready",
+          "type": "integer"
+        },
+        "succeededLastHour": {
+          "title": "Succeededlasthour",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "ready",
+        "claimed",
+        "dead",
+        "succeededLastHour"
+      ],
+      "title": "QueueHealthDTO",
       "type": "object"
     },
     "TaskDTO": {
@@ -317,6 +534,17 @@
       },
       "title": "Lanes",
       "type": "array"
+    },
+    "pipelineHealth": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PipelineHealthDTO"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
     },
     "projects": {
       "items": {

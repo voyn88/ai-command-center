@@ -2604,7 +2604,16 @@ def test_the_control_profile_installs_the_pr_window_tick(tmp_path):
         "voyn-aicc-remediate.timer",
         "voyn-aicc-pr-window.service",
         "voyn-aicc-pr-window.timer",
+        "aicc-native-gateway.service",
+        "aicc-gateway-projection.service",
+        "aicc-gateway-projection.timer",
     )
+    # The gateway pair is installed but operator-enabled (TLS + device tokens
+    # come first), so the installer never auto-starts it.
+    assert not {
+        "aicc-native-gateway.service",
+        "aicc-gateway-projection.timer",
+    } & set(tx.CONTROL_ONLY_TIMERS)
     for unit in tx.CONTROL_ONLY_UNITS:
         assert f"/etc/systemd/system/{unit}" in control
     # A control-only unit is exactly that: the worker profile neither installs
@@ -2784,3 +2793,21 @@ def test_workspace_walk_names_descriptor_exhaustion_honestly(
     with pytest.raises(launcher.LaunchRefused) as refused:
         launcher._prepare_workspace_permissions(workspace)
     assert "ran out of file descriptors" in str(refused.value)
+
+
+def test_installer_never_enables_or_starts_gateway_before_configuration():
+    import shlex
+    text = _installer_text()
+    gateway_units = {"aicc-native-gateway.service", "aicc-gateway-projection.service", "aicc-gateway-projection.timer"}
+    # Check the actual commands, including continuations, rather than a timer-only collection.
+    text = text.replace("\\\n", " ")
+    commands = []
+    for line in text.splitlines():
+        tokens = shlex.split(line, comments=True)
+        if "systemctl" in tokens:
+            command = tokens[tokens.index("systemctl") + 1:]
+            if any(action in command for action in ("enable", "start", "restart")):
+                commands.append(command)
+    assert commands
+    for command in commands:
+        assert not gateway_units.intersection(command)
