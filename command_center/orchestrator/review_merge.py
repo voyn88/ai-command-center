@@ -2831,7 +2831,8 @@ def _check_is_pending(check: dict[str, Any]) -> bool:
     (`conclusion: AMBIGUOUS`, synthesised by `_latest_checks_by_name`) is
     deliberately not pending: two disagreeing runs are a verdict problem,
     not a timing one."""
-    if check.get("conclusion") is not None:
+    # gh GraphQL serializes an unfinished CheckRun as either null or "".
+    if check.get("conclusion") not in (None, ""):
         return False
     status = check.get("status")
     if status is not None:
@@ -4319,7 +4320,7 @@ def _check_is_red_for_window(check: dict[str, Any]) -> bool:
     a check has actually completed red.
     """
     conclusion = check.get("conclusion")
-    if conclusion is not None:
+    if conclusion not in (None, ""):
         return str(conclusion).upper() not in ("SUCCESS", "NEUTRAL", "SKIPPED")
     state = check.get("state")
     if state is not None:
