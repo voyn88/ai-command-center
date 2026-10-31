@@ -15,6 +15,18 @@ import pytest
 pytest.importorskip("aios_db")
 
 from command_center.db.cli import _review_enqueue, build_parser  # noqa: E402
+from command_center.ops import tick_journal  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _tick_journal_in_tmp(tmp_path, monkeypatch):
+    """Keep the tick journal out of the home of whoever runs the tests.
+
+    The PR-window tick records every run (VOYN-W0-AICC-PR-WINDOW-TIMER-NOT-
+    DEPLOYED-ON-CONTROL), and its default path is the running user's home --
+    correct on the control host, not somewhere a test may write.
+    """
+    monkeypatch.setenv(tick_journal.JOURNAL_PATH_ENV, str(tmp_path / "ticks.jsonl"))
 
 
 def test_queue_reap_takes_no_arguments() -> None:
@@ -164,3 +176,78 @@ def test_backlog_pr_window_reports_a_failed_listing_as_a_failed_tick(monkeypatch
     )
 
     assert cli.main(["backlog-pr-window"]) == 1
+
+
+def test_the_pr_window_tick_records_every_run_it_makes(monkeypatch, capsys) -> None:
+    """VOYN-W0-AICC-PR-WINDOW-TIMER-NOT-DEPLOYED-ON-CONTROL.
+
+    control-01 ran no PR-window timer for over a day while 67 open PRs
+    (752-822) carried no queue-* label and operators labelled them by hand.
+    Nothing on the host distinguished "the timer was never installed" from
+    "the tick ran and had nothing to do": both left no trace at all. The row
+    this asserts is that distinction, and the counts in it are what an
+    operator reads the window size off.
+    """
+    from command_center.db import cli
+    from command_center.orchestrator import review_merge
+
+    monkeypatch.setattr(
+        review_merge,
+        "reconcile_pr_window",
+        lambda repo_path: review_merge.PrWindowReport(
+            active=[(907, "deadbeef"), (908, "cafe")],
+            waiting=[(909, "f00d")],
+            blocked=[(906, "checks_missing")],
+        ),
+    )
+
+    assert cli.main(["backlog-pr-window", "--repo-path", "/opt/aicc/current"]) == 0
+
+    row = tick_journal.read_last_run(cli.PR_WINDOW_TICK)
+    assert row is not None
+    assert row["outcome"] == "ok"
+    assert (row["active"], row["waiting"], row["blocked"]) == (2, 1, 1)
+    assert "error" not in row
+
+
+def test_a_failed_pr_window_tick_is_recorded_as_a_run_that_failed(monkeypatch) -> None:
+    """The run that most needs a record. A tick journalling only its
+    successes is indistinguishable from an uninstalled timer for exactly as
+    long as it keeps failing -- which is how the listing that exceeded
+    GitHub's node limit went unnoticed for days."""
+    from command_center.db import cli
+    from command_center.orchestrator import review_merge
+
+    monkeypatch.setattr(
+        review_merge,
+        "reconcile_pr_window",
+        lambda repo_path: review_merge.PrWindowReport(error="pr_list_failed: 403"),
+    )
+
+    assert cli.main(["backlog-pr-window"]) == 1
+
+    row = tick_journal.read_last_run(cli.PR_WINDOW_TICK)
+    assert row is not None
+    assert row["outcome"] == "failed"
+    assert row["error"] == "pr_list_failed: 403"
+
+
+def test_the_tick_still_labels_when_its_journal_cannot_be_written(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    """Evidence, not a gate. A journal that cannot be written must not turn
+    into a labelling outage -- the outage this whole task exists to end."""
+    from command_center.db import cli
+    from command_center.orchestrator import review_merge
+
+    blocked = tmp_path / "not-a-dir"
+    blocked.write_text("")
+    monkeypatch.setenv(tick_journal.JOURNAL_PATH_ENV, str(blocked / "ticks.jsonl"))
+    monkeypatch.setattr(
+        review_merge,
+        "reconcile_pr_window",
+        lambda repo_path: review_merge.PrWindowReport(active=[(907, "deadbeef")]),
+    )
+
+    assert cli.main(["backlog-pr-window"]) == 0
+    assert "ACTIVE    #907 -> deadbeef" in capsys.readouterr().out
