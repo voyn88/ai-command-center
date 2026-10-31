@@ -1502,6 +1502,7 @@ def test_worker_profile_is_unchanged_and_is_the_default(tmp_path):
             codex_auth=tmp_path / "codex.json",
             resolve_identities=False,
         )
+        if not spec.remove
     }
     assert explicit == default
     assert tx.WORKER_ONLY_TARGETS <= explicit
@@ -1534,11 +1535,18 @@ def test_control_profile_purges_exactly_what_it_drops(tmp_path):
     """Every dropped target is paired with a removal in the same generation,
     and nothing else is removed. A drop alone only stops this transaction
     from writing the file; the file an earlier worker install left on disk
-    stays live without the paired removal."""
-    tx, _control = _specs("control", tmp_path)
+    stays live without the paired removal.
 
-    assert _purged("control", tmp_path) == tx.WORKER_ONLY_TARGETS
-    assert _purged("worker", tmp_path) == set()
+    The legacy /usr/local/sbin probes are the one removal that is NOT a
+    profile drop: they are unversioned, ownerless and failing on whichever
+    host carries them, so both profiles retire them (drift audit item 4).
+    Everything else a control host purges is still exactly what it dropped."""
+    tx, _control = _specs("control", tmp_path)
+    legacy = set(tx.LEGACY_RETIRED_TARGETS)
+
+    assert _purged("control", tmp_path) == tx.WORKER_ONLY_TARGETS | legacy
+    assert _purged("worker", tmp_path) == legacy
+    assert not (tx.WORKER_ONLY_TARGETS & legacy)
     assert _purged_directories("worker", tmp_path) == []
 
 
@@ -1563,7 +1571,9 @@ def test_control_purges_the_worker_only_directories_child_before_parent(tmp_path
     ordered = [spec.target for spec in specs if spec.remove]
     assert ordered[: len(ordered) - len(directories)] == sorted(
         tx.WORKER_ONLY_TARGETS
-    ), "a directory is removed before the files this generation takes out of it"
+    ) + list(tx.LEGACY_RETIRED_TARGETS), (
+        "a directory is removed before the files this generation takes out of it"
+    )
 
     # Operator data created by the agent layer is not an artefact of it.
     for kept in ("/srv/aicc-workspaces", "/srv/aicc-quarantine"):
@@ -2604,13 +2614,21 @@ def test_the_control_profile_installs_the_pr_window_tick(tmp_path):
         "voyn-aicc-remediate.timer",
         "voyn-aicc-pr-window.service",
         "voyn-aicc-pr-window.timer",
+        "voyn-queue-monitor.service",
+        "voyn-queue-monitor.timer",
     )
     for unit in tx.CONTROL_ONLY_UNITS:
         assert f"/etc/systemd/system/{unit}" in control
     # A control-only unit is exactly that: the worker profile neither installs
     # it nor is expected to, and the worker-only drop set is unchanged by it.
+    # Self-deploy is control-only too, but it is not in CONTROL_ONLY_UNITS:
+    # workers stage releases with voyn-aicc-worker-release-deploy, and the
+    # retired worker self-deploy variant is not reinstalled.
     assert control - worker == {
         f"/etc/systemd/system/{unit}" for unit in tx.CONTROL_ONLY_UNITS
+    } | {
+        tx.SELF_DEPLOY_SERVICE_TARGET,
+        f"/etc/systemd/system/{tx.SELF_DEPLOY_TIMER}",
     }
     assert worker - control == tx.WORKER_ONLY_TARGETS
 
@@ -2721,6 +2739,135 @@ def test_the_installer_starts_the_control_timers_after_it_commits(tmp_path):
     assert text.index(enable) < text.index(
         "echo \"AICC_AGENT_PRINCIPAL_ISOLATION_INSTALLED\""
     ), "a failed enable must not be announced as a completed install"
+
+
+# ---------------------------------------------------------------------------
+# VOYN-W0-AICC-SYSTEMD-DRIFT-VERSIONED-UNITS.
+#
+# Drift audit, 2026-08-29: not one systemd unit on either host came from the
+# repository. All 22 versioned units in deploy/systemd/ were unused and the
+# fleet ran hand-made copies under different names -- host
+# voyn-aicc-review.timer against repo aicc-backlog-review.timer, host
+# voyn-aicc-worker.service against the repo's template. So every unit fix
+# merged through the pipeline was inert on the fleet, which is why
+# VOYN-W0-AICC-WORKER-RUNTIMEDIR-COLLISION could exist at all: the repo
+# template already had RuntimeDirectory=voyn-aicc-worker/%i per lane and the
+# host copy did not.
+#
+# The self-deploy tick was the sharpest case. It is the unit whose entire job
+# is "track the repository", and on both hosts it was a pair of symlinks into
+# a directory under the operator's home -- so the tick updated the CODE every
+# five minutes while nothing at all updated the UNITS that run it.
+# ---------------------------------------------------------------------------
+
+
+def test_control_installs_repo_owned_self_deploy_and_workers_use_release_deploy(
+    tmp_path,
+):
+    """Control's self-deploy tick comes from the repository. Workers do not
+    install it: the worker variant stays retired, and the worker host stages
+    releases with voyn-aicc-worker-release-deploy."""
+    tx, worker = _specs("worker", tmp_path)
+    _tx, control = _specs("control", tmp_path)
+
+    assert tx.SELF_DEPLOY_SERVICE_TARGET in control
+    assert f"/etc/systemd/system/{tx.SELF_DEPLOY_TIMER}" in control
+    assert tx.SELF_DEPLOY_SERVICE_TARGET not in worker
+    assert f"/etc/systemd/system/{tx.SELF_DEPLOY_TIMER}" not in worker
+    assert "/etc/systemd/system/voyn-aicc-worker-release-deploy.service" in worker
+    assert tx.SELF_DEPLOY_UNIT_SOURCES == {
+        "control": "voyn-aicc-self-deploy.service"
+    }
+    assert not (
+        Path(__file__).parents[2]
+        / "deploy/systemd/voyn-aicc-self-deploy-worker.service"
+    ).exists()
+    _tx, specs = _profile_specs("control", tmp_path)
+    spec = next(
+        spec for spec in specs if spec.target == tx.SELF_DEPLOY_SERVICE_TARGET
+    )
+    control_unit = Path(spec.source).read_text(encoding="utf-8")
+    assert "--migrate" in control_unit
+    assert "--restart" not in control_unit
+
+
+def test_the_installer_enables_self_deploy_only_on_control(tmp_path):
+    """Workers disable the retired self-deploy tick and enable release
+    deploy. Control enables the repo-owned tick after commit."""
+    tx, _worker = _specs("worker", tmp_path)
+    text = _installer_text()
+    enable = f"systemctl enable --now {tx.SELF_DEPLOY_TIMER}"
+
+    assert text.count(enable) == 1
+    _assert_command_inside_shell_if(
+        text, enable, 'if [ "$install_profile" = "control" ]; then'
+    )
+    assert text.index("run_transaction commit") < text.index(enable)
+    assert text.index("trap - EXIT HUP INT TERM") < text.index(enable)
+    assert "systemctl disable --now voyn-aicc-self-deploy.timer" in text
+    assert "systemctl enable --now voyn-aicc-worker-release-deploy.timer" in text
+
+
+def test_each_profile_installs_and_starts_its_own_fail_closed_probe(tmp_path):
+    """The monitors were the other half of the hand-made layer: the repo
+    shipped both units and nothing installed either, while the unversioned
+    /usr/local/sbin scripts they replace kept failing on every tick."""
+    tx, worker = _specs("worker", tmp_path)
+    _tx, control = _specs("control", tmp_path)
+    text = _installer_text()
+
+    for unit in tx.WORKER_MONITOR_UNITS:
+        assert f"/etc/systemd/system/{unit}" in worker - control
+        assert f"/etc/systemd/system/{unit}" in tx.WORKER_ONLY_TARGETS
+    for unit in ("voyn-queue-monitor.service", "voyn-queue-monitor.timer"):
+        assert f"/etc/systemd/system/{unit}" in control - worker
+        assert unit in tx.CONTROL_ONLY_UNITS
+
+    assert tx.WORKER_MONITOR_TIMER in tx.WORKER_MONITOR_UNITS
+    assert "voyn-queue-monitor.timer" in tx.CONTROL_ONLY_TIMERS
+    _assert_command_inside_shell_if(
+        text,
+        f"systemctl enable --now {tx.WORKER_MONITOR_TIMER}",
+        'if [ "$install_profile" = "worker" ]; then',
+    )
+
+
+def test_the_unversioned_sbin_probes_are_retired_by_the_same_generation(tmp_path):
+    """Root-owned, unreadable to voynadmin, not in git, no owner, and exiting
+    1 on every tick -- one of them probing `claude_supervisor`, a component
+    this architecture no longer runs. Retired through the ordinary removal
+    machinery so the retirement rolls back with the generation that replaces
+    them, rather than as a hand-run `rm` an operator has to remember."""
+    tx, worker = _specs("worker", tmp_path)
+
+    assert tx.LEGACY_RETIRED_TARGETS == (
+        "/usr/local/sbin/voyn-infra-monitor",
+        "/usr/local/sbin/voyn-worker-health",
+    )
+    for profile in ("worker", "control"):
+        assert _purged(profile, tmp_path) >= set(tx.LEGACY_RETIRED_TARGETS)
+    # Retired, not reinstalled somewhere else under the same name.
+    assert not (worker & set(tx.LEGACY_RETIRED_TARGETS))
+    # The replacement says so in its own header, so a reader of either file
+    # finds the other.
+    replacement = (
+        Path(__file__).parents[2] / "deploy/systemd/voyn-infra-monitor.service"
+    ).read_text(encoding="utf-8")
+    assert "/usr/local/sbin" in replacement
+
+
+def test_every_repo_owned_unit_source_exists_and_is_versioned(tmp_path):
+    """A spec whose source is not in the repository installs nothing and
+    fails the transaction on a host, not in CI."""
+    root = Path(__file__).parents[2]
+    for profile in ("worker", "control"):
+        _tx, specs = _profile_specs(profile, tmp_path)
+        for spec in specs:
+            if spec.remove or not spec.target.startswith("/etc/systemd/system/"):
+                continue
+            source = Path(spec.source)
+            assert source.is_file(), f"{profile}: missing source {source}"
+            assert source.is_relative_to(root / "deploy/systemd"), source
 
 
 def test_workspace_walk_holds_descriptors_per_pending_directory_not_per_visited_one(
