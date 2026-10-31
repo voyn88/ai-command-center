@@ -541,6 +541,10 @@ _WORKER_FUNCTIONS = (
     # work itself (VOYN-W0-AICC-PUBLISH-LEASE-CONTENTION-BURNS-ATTEMPT) --
     # see 0022_queue_fail_lease_wait.
     "queue_fail_lease_wait(text, text, text, integer)",
+    # A sibling refund path for host/launcher/provider infrastructure
+    # failures. These are not task attempts, but must still be bounded under
+    # their own wait budget.
+    "queue_fail_infra_wait(text, text, text, integer)",
 )
 
 # Deliberately not `queue_claim`: only a role that PostgreSQL authenticated as a
@@ -579,6 +583,8 @@ _APP_BACKLOG_FUNCTIONS = (
     "backlog_scan_claim(text, text, text)",
     # Triage of raw findings (0008): UNTRIAGED -> OPEN/NEEDS_REFINEMENT/DONE/DECIDED.
     "backlog_triage(text, text, text)",
+    # Evidence hygiene (0030): remove proven malformed PR evidence.
+    "backlog_clear_evidence(text, text, text, text)",
     # 0021: read-only deploy preflight with dispatch's privileges; the task
     # class setter the planner uses for split children and monitor tasks; the
     # monitor-finding record/clear pair (shared with worker hosts, see
@@ -591,6 +597,8 @@ _APP_BACKLOG_FUNCTIONS = (
     # Audit trail for where a record came from (0020); the importer's stamp
     # that a row was migrated rather than authored directly in the store.
     "backlog_record_provenance(text, text, jsonb)",
+    "backlog_owner_decision(text, bigint, text, text)",
+    "backlog_owner_lock(text)",
 )
 
 # The enrolment surface (0003), split by who may do what.

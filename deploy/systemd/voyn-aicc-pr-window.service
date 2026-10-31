@@ -10,14 +10,12 @@
 # red-or-checkless PRs, and #907 on 2026-09-09 -- until an operator labelled
 # them by hand.
 #
-# What this unit needs from the host is therefore, deliberately, almost
-# nothing: the release tree the same install transaction publishes and
-# verifies, and a `gh` the running user is logged in as. In particular NO
-# database credential -- the reconciler reads and writes GitHub only, and
-# `command_center.db backlog-pr-window` runs before any pool is opened for
-# exactly that reason (see command_center/db/cli.py). A tick that needed an
-# EnvironmentFile is a tick that needs a host layout, and needing a host
-# layout is the whole reason this one was never deployed.
+# What this unit needs from the host is therefore, deliberately, the same
+# source clone kept fresh for self-deploy and a `gh` the running user is
+# logged in as. In particular NO database credential -- the reconciler reads
+# and writes GitHub only, and `command_center.db backlog-pr-window` runs
+# before any pool is opened for exactly that reason (see
+# command_center/db/cli.py).
 [Unit]
 Description=AICC PR review-window tick (label every open PR active/waiting/blocked)
 After=network-online.target
@@ -31,13 +29,12 @@ Type=oneshot
 # have them, which is precisely what the control profile guarantees.
 User=voynadmin
 WorkingDirectory=/opt/aicc/current
-# The release tree is a `git archive` of the committed tree, not a clone, so
-# `gh` cannot infer the repository from a remote. Naming it outright is also
-# what keeps this unit free of any host's directory layout. A host that wants
-# a different repository, or a clone as the working directory, overrides
-# either value in the optional env file below.
-Environment=GH_REPO=dimastov-lab/ai-command-center
-Environment=AICC_FLEET_REPO=/opt/aicc/current
+# The release tree is a `git archive`, not a clone. The reconciler's detail
+# calls still run best in a real repository, so use the deploy-managed source
+# clone and name the GitHub repository outright. A host that wants a different
+# repository or clone overrides either value in the optional env file below.
+Environment=GH_REPO=voyn88/ai-command-center
+Environment=AICC_FLEET_REPO=/opt/aicc/source
 Environment=GIT_TERMINAL_PROMPT=0
 EnvironmentFile=-/etc/aicc/pr-window.env
 # Only ever relabels: never merges, approves, or weakens a gate

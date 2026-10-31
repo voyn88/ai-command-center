@@ -88,6 +88,7 @@ Security model:
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import signal
@@ -97,7 +98,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from command_center import models, openai_exec, project_config, storage
@@ -139,6 +140,8 @@ PRINCIPAL_WORKSPACE_ROOTS_FILE = Path("/etc/aicc/agent-workspace-roots")
 # executor" is exactly the drift that hid it; keep this in step with the
 # launcher's TOOLCHAIN_BIN.
 PRINCIPAL_EXECUTOR_BINARIES: dict[str, str] = {
+    "grok": "/usr/libexec/aicc-grok-agent",
+    "cursor": "/opt/aicc/providers/cursor/agent",
     "claude": "/opt/aicc/toolchains/current/bin/claude",
     "codex": "/opt/aicc/toolchains/current/bin/codex",
     # Copilot is DELIBERATELY absent: ADR-0010 keeps it disabled under
@@ -182,6 +185,24 @@ _COPILOT_RETRYABLE_FAILURE_SIGNATURES = (
     "getaddrinfo",
     "econnreset",
 )
+#: Codex pre-task failures reported only as free text on a failed, non-zero
+#: process. Live incident 2026-09-02 / 2026-09-11: the CLI exited 1 with
+#: "ERROR: You've hit your usage limit ... try again at Sep 15th" and an
+#: empty result, the review work item completed "successfully" with that
+#: error as its whole payload, and every review stalled until the quota
+#: window -- the account failed, not the task, and nothing advanced the
+#: cascade to the next executor. Same containment rules as the Copilot list:
+#: consulted only for status == "failed" with a non-zero exit code, so a
+#: successful review that merely DISCUSSES a usage limit cannot match.
+_CODEX_RETRYABLE_FAILURE_SIGNATURES = (
+    "you've hit your usage limit",
+    "usage limit reached",
+    "not logged in",
+    "authentication failed",
+    "unauthorized",
+    "too many requests",
+    "stream disconnected",
+)
 _CODEX_PREFLIGHT_PROMPT = (
     "This is a disposable sandbox capability probe. In the current repository, "
     "create a file named aicc-codex-commit-probe.txt containing exactly "
@@ -192,6 +213,40 @@ _CODEX_PREFLIGHT_PROMPT = (
 )
 _codex_workspace_write_preflight_lock = threading.Lock()
 _codex_workspace_write_preflight_result: tuple[bool, str] | None = None
+
+# Adapted from the existing quota-routing work in PR #1002. Keep the circuit
+# in the worker process: no new scheduler, polling thread, or database writer.
+EXECUTOR_QUOTA_COOLDOWN_SECONDS = 1800
+_executor_exhaustion_lock = threading.Lock()
+_executor_exhausted_until: dict[str, datetime] = {}
+
+
+def record_executor_exhausted(
+    executor: str, *, cooldown_seconds: float = EXECUTOR_QUOTA_COOLDOWN_SECONDS,
+    now: datetime | None = None,
+) -> datetime:
+    if not math.isfinite(cooldown_seconds) or cooldown_seconds <= 0:
+        raise ValueError("executor cooldown must be finite and positive")
+    until = (now or datetime.now(UTC)) + timedelta(seconds=min(cooldown_seconds, 3600))
+    with _executor_exhaustion_lock:
+        until = max(until, _executor_exhausted_until.get(executor, until))
+        _executor_exhausted_until[executor] = until
+    return until
+
+
+def executor_exhausted_until(executor: str, *, now: datetime | None = None) -> datetime | None:
+    moment = now or datetime.now(UTC)
+    with _executor_exhaustion_lock:
+        until = _executor_exhausted_until.get(executor)
+        if until is not None and until <= moment:
+            _executor_exhausted_until.pop(executor)
+            return None
+        return until
+
+
+def clear_executor_exhaustion() -> None:
+    with _executor_exhaustion_lock:
+        _executor_exhausted_until.clear()
 
 
 def disable_codex_workspace_write(detail: str = "") -> None:
@@ -447,12 +502,17 @@ def build_principal_isolation_manifest(
     """
     if executor not in COMMAND_BUILDERS:
         raise RunnerError(f"unknown executor {executor!r}")
+    if executor == "cursor" and task_type in MODEL_ONLY_TASK_TYPES:
+        raise RunnerError("Cursor model-only execution is not supported")
     return {
         "version": 1,
         "run_id": uuid.uuid4().hex,
         "workspace": str(repository_path.resolve(strict=True)),
         "executor": executor,
-        "profile": profile_for_task_type(task_type),
+        "profile": (
+            "model_only" if executor == "grok" and task_type in MODEL_ONLY_TASK_TYPES
+            else profile_for_task_type(task_type)
+        ),
         "prompt": prompt,
         "model": model,
         "timeout_seconds": timeout_seconds,
@@ -1021,11 +1081,34 @@ def build_copilot_command(
 #: real CLI. Caught by exactly those tests when this was first written the
 #: other way.
 COMMAND_BUILDERS: dict[str, str] = {
+    "grok": "build_grok_command",
+    "cursor": "build_cursor_command",
     "claude": "build_command",
     "codex": "build_codex_command",
     "copilot": "build_copilot_command",
     "openai_http": "build_openai_http_command",
 }
+
+
+def build_grok_command(prompt: str, *, task_type: str, model: str | None = None) -> list[str]:
+    if not principal_isolation_required():
+        raise RunnerError("Grok tools require principal isolation")
+    command = [PRINCIPAL_EXECUTOR_BINARIES["grok"], "--model", model or "grok-4.3"]
+    if task_type in MODEL_ONLY_TASK_TYPES:
+        command += ["--no-tools"]
+    return command + ["--", prompt]
+
+
+def build_cursor_command(prompt: str, *, task_type: str, model: str | None = None) -> list[str]:
+    if not principal_isolation_required():
+        raise RunnerError("Cursor requires principal isolation")
+    if task_type in MODEL_ONLY_TASK_TYPES:
+        raise RunnerError("Cursor model-only execution is not supported")
+    command = [PRINCIPAL_EXECUTOR_BINARIES["cursor"], "--print", "--output-format", "text", "--trust"]
+    command += ["--mode", "ask"] if profile_for_task_type(task_type) == PROFILE_READ_ONLY else ["--force"]
+    if model:
+        command += ["--model", model]
+    return command + ["--", prompt]
 
 
 def build_openai_http_command(
@@ -1162,6 +1245,8 @@ class RunResult:
         self.is_error: bool = bool(payload.get("is_error")) if payload else False
         self.api_error_status = payload.get("api_error_status") if payload else None
         self.terminal_reason = payload.get("terminal_reason") if payload else None
+        result_message = payload.get("result") if payload else None
+        self.result_message = result_message if isinstance(result_message, str) else ""
 
     @property
     def result_status(self) -> str:
@@ -1204,20 +1289,51 @@ class RunResult:
     def is_executor_provider_error(self, executor: str) -> bool:
         """Whether the selected CLI positively reports a provider failure.
 
-        Claude exposes structured API fields; Copilot 1.0.x reports its
-        pre-task auth/quota/network failures on stderr. Copilot free-text is
+        Claude exposes structured API fields; Copilot 1.0.x and Codex report
+        pre-task auth/quota/network failures on stderr. Free text is
         considered only for a failed, non-zero process, so a successful
         review that merely discusses a rate limit cannot trigger a retry.
         """
         if self.is_executor_api_error:
             return True
-        if executor != "copilot" or self.status != "failed" or not self.exit_code:
+        if self.status != "failed" or not self.exit_code:
+            return False
+        if executor == "grok":
+            # Our driver emits one fixed diagnostic, never a provider body.
+            # A report discussing HTTP errors must not trigger another run.
+            return self.stderr.strip() in {
+                f"provider HTTP {code}"
+                for code in (401, 403, 429, 500, 502, 503, 504)
+            }
+        signatures = {
+            "cursor": _CODEX_RETRYABLE_FAILURE_SIGNATURES + _COPILOT_RETRYABLE_FAILURE_SIGNATURES,
+            "copilot": _COPILOT_RETRYABLE_FAILURE_SIGNATURES,
+            "codex": _CODEX_RETRYABLE_FAILURE_SIGNATURES,
+        }.get(executor)
+        if signatures is None:
             return False
         diagnostic = f"{self.stdout}\n{self.stderr}".lower()
-        return any(
-            signature in diagnostic
-            for signature in _COPILOT_RETRYABLE_FAILURE_SIGNATURES
-        )
+        return any(signature in diagnostic for signature in signatures)
+
+    def executor_quota_signature(self, executor: str) -> str | None:
+        """Only provider refusals may suspend future calls, never a task report."""
+        if self.status != "failed" or not self.exit_code:
+            return None
+        if executor == "grok":
+            return "HTTP 429" if self.stderr.strip() == "provider HTTP 429" else None
+        signatures = {
+            "claude": ("hit your session limit", "hit your usage limit", "usage limit reached"),
+            "codex": ("hit your usage limit", "usage limit reached"),
+            "cursor": ("hit your usage limit", "usage limit reached", "quota exceeded"),
+            "copilot": ("exceeded your monthly quota", "ai credit usage limit"),
+        }.get(executor, ())
+        if executor == "claude":
+            if not self.is_executor_api_error:
+                return None
+            diagnostic = self.result_message.lower()
+        else:
+            diagnostic = self.stderr[-2000:].lower()
+        return next((phrase for phrase in signatures if phrase in diagnostic), None)
 
     @property
     def is_executor_sandbox_error(self) -> bool:
