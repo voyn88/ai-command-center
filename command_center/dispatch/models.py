@@ -27,6 +27,10 @@ DEFER_PROJECT_BUDGET = "project_budget_exceeded"
 DEFER_AGENT_CAPACITY = "agent_capacity_reached"
 DEFER_NO_ELIGIBLE_EXECUTOR = "no_eligible_executor"
 DEFER_NO_AVAILABLE_EXECUTOR = "no_available_executor"
+# The task's business path (project) has a tail-risk scenario whose priced
+# expected cost of error (probability x impact) currently exceeds the
+# scenario's configured limit. Checked per task, before eligibility/budget.
+DEFER_TAIL_RISK = "tail_risk_limit_exceeded"
 
 DEFER_REASONS = frozenset(
     {
@@ -38,8 +42,17 @@ DEFER_REASONS = frozenset(
         DEFER_AGENT_CAPACITY,
         DEFER_NO_ELIGIBLE_EXECUTOR,
         DEFER_NO_AVAILABLE_EXECUTOR,
+        DEFER_TAIL_RISK,
     }
 )
+
+# An alternative-candidate-only reason: the executor was eligible, available
+# and within every budget guardrail, but a cheaper (or local-preferred)
+# candidate was assigned instead. Never appears as a `DispatchDecision.reason`
+# (that field is always `ASSIGNED` or a member of `DEFER_REASONS`) — only on
+# an `AlternativeCandidate`, where it explains why *this* candidate specifically
+# wasn't the one chosen.
+ALT_NOT_CHEAPEST = "not_selected_more_expensive"
 
 # Human-readable one-liners, kept next to the codes so both the API and the
 # operator UI render the same explanation.
@@ -69,6 +82,16 @@ REASON_EXPLANATIONS: dict[str, str] = {
         "No executor is permitted for this task by project/pin policy."
     ),
     DEFER_NO_AVAILABLE_EXECUTOR: "No permitted executor is currently available.",
+    DEFER_TAIL_RISK: (
+        "This business path has a tail-risk scenario whose priced expected "
+        "cost of error (probability x impact) exceeds its configured limit: "
+        "dispatch is refused until the scenario is revised or the limit is "
+        "raised, never assigned anyway."
+    ),
+    ALT_NOT_CHEAPEST: (
+        "Eligible, available and within budget, but a cheaper (or "
+        "local-preferred) candidate was assigned instead."
+    ),
 }
 
 
@@ -160,6 +183,149 @@ class AgentLimit:
 
 
 @dataclass(frozen=True)
+class TailRiskScenario:
+    """One named tail-risk scenario: a rare-but-costly failure mode for a
+    single business path (a `project_config` project id), priced from two
+    documented assumptions rather than measured — `probability` (the assumed
+    fraction of autonomous operations on this path that trigger the failure)
+    and `impact_usd` (the assumed cost if it does: incident response,
+    regulatory/legal exposure, rework, reputational cost). Their product is
+    `expected_cost_usd`, the tail-risk-adjusted price of operating on this
+    path; `limit_usd` is the ceiling that price must stay under for dispatch
+    to remain open. `0.0` `limit_usd` means "unset" (never blocks), matching
+    every other limit in this policy.
+    """
+
+    id: str
+    label: str
+    business_path: str
+    probability: float
+    impact_usd: float
+    assumptions: str
+    limit_usd: float = 0.0
+
+    @property
+    def expected_cost_usd(self) -> float:
+        return max(0.0, min(1.0, self.probability)) * max(0.0, self.impact_usd)
+
+    def exceeds_limit(self) -> bool:
+        return self.limit_usd > 0 and self.expected_cost_usd > self.limit_usd
+
+    def as_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "label": self.label,
+            "business_path": self.business_path,
+            "probability": self.probability,
+            "impact_usd": self.impact_usd,
+            "assumptions": self.assumptions,
+            "limit_usd": self.limit_usd,
+            "expected_cost_usd": self.expected_cost_usd,
+        }
+
+    @classmethod
+    def from_dict(cls, scenario_id: str, data: object) -> "TailRiskScenario | None":
+        """Fail closed at the entry level: an unparseable scenario is dropped
+        entirely (never silently coerced into one that matches every path),
+        so a malformed edit shrinks the registry rather than widening it."""
+        if not isinstance(data, dict):
+            return None
+        return cls(
+            id=scenario_id,
+            label=str(data.get("label") or scenario_id),
+            business_path=str(data.get("business_path") or ""),
+            probability=_clamp01(data.get("probability")),
+            impact_usd=_non_negative_float(data.get("impact_usd"), 0.0),
+            assumptions=str(data.get("assumptions") or ""),
+            limit_usd=_non_negative_float(data.get("limit_usd"), 0.0),
+        )
+
+
+# The top-5 tail-risk scenarios this system ships with by construction (the
+# acceptance this module exists to satisfy): each names a business path
+# (project id from `project_config.DISPLAY_NAMES`), the probability/impact
+# assumptions used to price it, and the limit that blocks dispatch on that
+# path once the priced cost breaches it. Numbers are deliberately headroomed
+# under their limit — a *default* policy must stay open, not silently wall
+# off a project — so tightening the limit or revising an assumption upward
+# (e.g. after a real incident) is what trips the gate, never the baseline.
+DEFAULT_TAIL_RISK_SCENARIOS: tuple[TailRiskScenario, ...] = (
+    TailRiskScenario(
+        id="aml-autoscore-false-negative",
+        label="Autonomous AML risk-scoring change ships a silent false negative",
+        business_path="AML",
+        probability=0.01,
+        impact_usd=250_000.0,
+        assumptions=(
+            "1-in-100 autonomous merges touching risk_store/rule_engine weaken "
+            "a red-flag rule without a human catching it before the next "
+            "scheduled review; impact is a single missed-alert compliance "
+            "incident (regulatory response, backfill review, remediation)."
+        ),
+        limit_usd=5_000.0,
+    ),
+    TailRiskScenario(
+        id="esf-destructive-migration",
+        label="Autonomous destructive migration on the shared ESF platform",
+        business_path="ESF",
+        probability=0.02,
+        impact_usd=40_000.0,
+        assumptions=(
+            "2% of autonomous ESF schema/migration changes cause a multi-day "
+            "outage for the shared corporate platform; impact is incident "
+            "response plus customer SLA credits."
+        ),
+        limit_usd=2_000.0,
+    ),
+    TailRiskScenario(
+        id="business-billing-misprice",
+        label="Autonomous change to billing/pricing logic misprices customers",
+        business_path="BUSINESS",
+        probability=0.015,
+        impact_usd=60_000.0,
+        assumptions=(
+            "1.5% of autonomous BUSINESS-project pricing/billing changes ship "
+            "a mispricing bug before the next release; impact is refunds, "
+            "churn and support load from the affected billing cycle."
+        ),
+        limit_usd=2_500.0,
+    ),
+    TailRiskScenario(
+        id="aicc-self-hosting-runaway-remediation",
+        label="Self-hosting remediation loop breaks the AICC delivery pipeline",
+        business_path="AICC",
+        probability=0.03,
+        impact_usd=15_000.0,
+        assumptions=(
+            "3% of autonomous changes to AICC's own orchestrator/dispatch code "
+            "(higher change velocity than other paths) break CI/CD for every "
+            "project it delivers; impact is recovery engineering time plus "
+            "delivery downtime across all projects."
+        ),
+        limit_usd=1_500.0,
+    ),
+    TailRiskScenario(
+        id="product-uncaught-regression",
+        label="Autonomous change ships an uncaught customer-facing regression",
+        business_path="PRODUCT",
+        probability=0.02,
+        impact_usd=30_000.0,
+        assumptions=(
+            "2% of autonomous PRODUCT changes ship a regression that isn't "
+            "caught before the next release window; impact is support load, "
+            "refund/credit exposure and brand damage from the affected "
+            "release."
+        ),
+        limit_usd=2_000.0,
+    ),
+)
+
+
+def _default_tail_risk_registry() -> dict[str, TailRiskScenario]:
+    return {s.id: s for s in DEFAULT_TAIL_RISK_SCENARIOS}
+
+
+@dataclass(frozen=True)
 class DispatchPolicy:
     """The config-driven dispatch policy (like the advisor's AutoRule).
 
@@ -178,6 +344,12 @@ class DispatchPolicy:
         default_factory=lambda: dict(DEFAULT_PRIORITY_WEIGHTS)
     )
     local_executor_ids: frozenset[str] = DEFAULT_LOCAL_EXECUTOR_IDS
+    # scenario id -> TailRiskScenario. Empty/garbage falls back to the
+    # top-5 default registry (see `_default_tail_risk_registry`), the same
+    # "never boot with an unset baseline" treatment `priority_weights` gets.
+    tail_risk_scenarios: dict[str, TailRiskScenario] = field(
+        default_factory=_default_tail_risk_registry
+    )
     updated_at: str | None = None
     updated_by: str | None = None
 
@@ -193,6 +365,18 @@ class DispatchPolicy:
     def is_local(self, executor_id: str) -> bool:
         return executor_id in self.local_executor_ids
 
+    def tail_risk_block(self, business_path: str | None) -> "TailRiskScenario | None":
+        """The scenario blocking `business_path`, or None if it's clear.
+
+        Deterministic (sorted by scenario id) so a business path matching
+        more than one breaching scenario always reports the same one."""
+        if not business_path:
+            return None
+        for scenario in sorted(self.tail_risk_scenarios.values(), key=lambda s: s.id):
+            if scenario.business_path == business_path and scenario.exceeds_limit():
+                return scenario
+        return None
+
     def as_dict(self) -> dict:
         return {
             "prefer_local": self.prefer_local,
@@ -204,6 +388,9 @@ class DispatchPolicy:
             "per_project_limits": dict(self.per_project_limits),
             "priority_weights": dict(self.priority_weights),
             "local_executor_ids": sorted(self.local_executor_ids),
+            "tail_risk_scenarios": {
+                k: v.as_dict() for k, v in self.tail_risk_scenarios.items()
+            },
             "updated_at": self.updated_at,
             "updated_by": self.updated_by,
         }
@@ -239,6 +426,12 @@ class DispatchPolicy:
             if isinstance(local_ids, (list, tuple, set, frozenset))
             else DEFAULT_LOCAL_EXECUTOR_IDS
         )
+        scenarios = {
+            scenario.id: scenario
+            for scenario_id, raw in _as_dict(data.get("tail_risk_scenarios")).items()
+            if (scenario := TailRiskScenario.from_dict(str(scenario_id), raw))
+            is not None
+        } or _default_tail_risk_registry()
         return cls(
             prefer_local=data.get("prefer_local", True) is not False,
             cost_matrix=cost_matrix,
@@ -249,9 +442,37 @@ class DispatchPolicy:
             per_project_limits=per_project,
             priority_weights=weights,
             local_executor_ids=local_set,
+            tail_risk_scenarios=scenarios,
             updated_at=data.get("updated_at"),
             updated_by=data.get("updated_by"),
         )
+
+
+@dataclass(frozen=True)
+class AlternativeCandidate:
+    """One executor the engine looked at for a task but did not choose.
+
+    Exists so a `DispatchDecision` can report not just its own outcome but
+    the other options weighed against it — the "why not X instead" half of
+    the explanation, without which "assigned to A" or "deferred" reads as a
+    single unexplained answer rather than a comparison among candidates.
+    """
+
+    executor_id: str
+    cost_per_task_usd: float
+    reason: str  # a DEFER_* code, or ALT_NOT_CHEAPEST
+
+    @property
+    def explanation(self) -> str:
+        return explanation_for(self.reason)
+
+    def as_dict(self) -> dict:
+        return {
+            "executor_id": self.executor_id,
+            "cost_per_task_usd": self.cost_per_task_usd,
+            "reason": self.reason,
+            "explanation": self.explanation,
+        }
 
 
 @dataclass(frozen=True)
@@ -264,6 +485,14 @@ class DispatchDecision:
     reason: str  # ASSIGNED or a DEFER_* code
     assigned_executor: str | None = None
     estimated_cost_usd: float = 0.0
+    # Set only when reason == DEFER_TAIL_RISK: which scenario blocked it.
+    blocked_scenario_id: str | None = None
+    # Other executors the engine weighed for this task, each with its own
+    # reason for not being the one chosen. Empty when the plan never reached
+    # candidate comparison for this task (kill switch, unknown budget, tail
+    # risk, or no permitted/available executor at all) — there is nothing to
+    # compare against in those cases.
+    alternatives: tuple[AlternativeCandidate, ...] = ()
 
     @property
     def assigned(self) -> bool:
@@ -272,6 +501,35 @@ class DispatchDecision:
     @property
     def explanation(self) -> str:
         return explanation_for(self.reason)
+
+    @property
+    def briefing(self) -> str:
+        """A plain-language, spoken-style instruction: the decision, the
+        chain of reasoning behind it, and the alternatives considered — for
+        a caller that wants to explain *why*, not just report the outcome.
+
+        Every sentence is short and declarative (no markdown, no jargon
+        codes) so this string can be read aloud as-is."""
+        if self.assigned:
+            lead = (
+                f"Task {self.task_id} ({self.priority} priority) is assigned "
+                f"to {self.assigned_executor}, at an estimated cost of "
+                f"${self.estimated_cost_usd:.2f}. {self.explanation}"
+            )
+        else:
+            lead = f"Task {self.task_id} ({self.priority} priority) stays queued. {self.explanation}"
+
+        if not self.alternatives:
+            return lead
+
+        verb = "considered" if self.assigned else "considered and rejected"
+        parts = [
+            f"{alt.executor_id} (${alt.cost_per_task_usd:.2f} — {alt.explanation})"
+            for alt in self.alternatives
+        ]
+        count = len(self.alternatives)
+        noun = "alternative" if count == 1 else "alternatives"
+        return f"{lead} {count} other {noun} {verb}: " + "; ".join(parts) + "."
 
     def as_dict(self) -> dict:
         return {
@@ -282,8 +540,52 @@ class DispatchDecision:
             "assigned": self.assigned,
             "assigned_executor": self.assigned_executor,
             "estimated_cost_usd": self.estimated_cost_usd,
+            "blocked_scenario_id": self.blocked_scenario_id,
             "explanation": self.explanation,
+            "alternatives": [alt.as_dict() for alt in self.alternatives],
+            "briefing": self.briefing,
         }
+
+
+# --------------------------------------------------------------------------
+# Spend measurement provenance
+# --------------------------------------------------------------------------
+
+# The trailing-24h spend was actually read.
+SPEND_MEASURED = "measured"
+# The read failed (e.g. a DB outage): there is nothing to report.
+SPEND_UNAVAILABLE = "unavailable"
+
+# `daily_spend_usd`/`projected_spend_usd` are backed by a real reading.
+SPEND_KIND_ACTUAL = "actual"
+# There is no reading and nothing stands in for it: the spend/projected/
+# remaining fields are all `None`. There is deliberately no "assumed ceiling"
+# (or any other stand-in) kind — this contract never substitutes a fabricated
+# figure for one that could not be read, in any field.
+SPEND_KIND_UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class SpendMeasurement:
+    """Provenance for `DispatchPlan.daily_spend_usd`/`projected_spend_usd`.
+
+    Exists so a consumer can tell "this number is a real trailing-24h
+    reading" from "there is no reading" without inferring it from `None`
+    alone — and so that inference is impossible to get wrong, because every
+    `DispatchPlan` must state it explicitly (see the field below: there is no
+    default that could silently claim "measured" for a plan built outside
+    `plan_dispatch`).
+    """
+
+    status: str
+    kind: str
+
+    def as_dict(self) -> dict:
+        return {"status": self.status, "kind": self.kind}
+
+
+SPEND_MEASUREMENT_ACTUAL = SpendMeasurement(SPEND_MEASURED, SPEND_KIND_ACTUAL)
+SPEND_MEASUREMENT_UNAVAILABLE = SpendMeasurement(SPEND_UNAVAILABLE, SPEND_KIND_UNKNOWN)
 
 
 @dataclass(frozen=True)
@@ -292,9 +594,21 @@ class DispatchPlan:
 
     decisions: tuple[DispatchDecision, ...]
     kill_switch_engaged: bool
-    daily_spend_usd: float
+    # None exactly when `budget_unknown` is True: the trailing-24h spend could
+    # not be read, so there is no real figure to report. A caller that reads
+    # this field without checking `budget_unknown` must see "no data" (None),
+    # never a fabricated `0.0` that reads as "nothing spent today".
+    daily_spend_usd: float | None
     max_daily_spend_usd: float
-    projected_spend_usd: float
+    # None in lockstep with `daily_spend_usd`: whatever is unmeasured never
+    # flows into a derived figure either, so `budget_remaining_usd` below
+    # reads "unknown" too rather than a confident (and fabricated) number.
+    projected_spend_usd: float | None
+    # No default: every `DispatchPlan` must say explicitly whether its spend
+    # figures are a real reading, so a caller constructed outside
+    # `plan_dispatch` can't silently inherit a "measured" claim it never
+    # earned.
+    spend_measurement: SpendMeasurement
     # True when the trailing-24h spend could not be read (e.g. a DB outage):
     # dispatch is refused wholesale rather than guessing a spend figure that a
     # zero/unset daily cap or a free executor could silently sail past.
@@ -309,7 +623,9 @@ class DispatchPlan:
         return tuple(d for d in self.decisions if not d.assigned)
 
     @property
-    def budget_remaining_usd(self) -> float:
+    def budget_remaining_usd(self) -> float | None:
+        if self.projected_spend_usd is None:
+            return None
         if self.max_daily_spend_usd <= 0:
             return float("inf")
         return self.max_daily_spend_usd - self.projected_spend_usd
@@ -322,7 +638,10 @@ class DispatchPlan:
             "daily_spend_usd": self.daily_spend_usd,
             "max_daily_spend_usd": self.max_daily_spend_usd,
             "projected_spend_usd": self.projected_spend_usd,
-            "budget_remaining_usd": (None if remaining == float("inf") else remaining),
+            "spend_measurement": self.spend_measurement.as_dict(),
+            "budget_remaining_usd": (
+                None if remaining is None or remaining == float("inf") else remaining
+            ),
             "assignment_count": len(self.assignments),
             "deferred_count": len(self.deferred),
             "decisions": [d.as_dict() for d in self.decisions],
@@ -350,3 +669,11 @@ def _non_negative_float(value: object, default: float) -> float:
         return default
     number = float(value)
     return number if number >= 0 else default
+
+
+def _clamp01(value: object) -> float:
+    """A probability: coerced into `[0, 1]`; anything unparseable is `0.0`
+    (fail closed toward *not* pricing in a risk that was never configured)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0.0
+    return max(0.0, min(1.0, float(value)))

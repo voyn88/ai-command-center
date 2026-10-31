@@ -53,6 +53,19 @@ def reject(sha: str = HEAD, **kwargs) -> dict:
 def test_a_verdict_from_a_different_identity_on_the_current_head_passes() -> None:
     """The one accepting case, so the negatives below are not vacuous."""
     assert evaluate([accept()], HEAD, AUTHOR) == REVIEWER
+    assert evaluate([accept()], HEAD, AUTHOR, merger="merge-bot") == REVIEWER
+
+
+def test_an_accept_published_by_the_merger_is_refused() -> None:
+    """Author-independence is not enough when that other account is the one
+    that will press merge."""
+    with pytest.raises(AcceptanceError, match="would merge this pull request"):
+        evaluate([accept(login="merge-bot")], HEAD, AUTHOR, merger="merge-bot")
+
+
+def test_omitting_the_merger_keeps_the_author_only_gate() -> None:
+    """The Actions job still has no merger to compare against."""
+    assert evaluate([accept(login="merge-bot")], HEAD, AUTHOR) == "merge-bot"
 
 
 def test_a_verdict_may_carry_its_reasoning_below_the_marker() -> None:
@@ -287,7 +300,15 @@ def test_the_gate_re_runs_when_the_verdict_arrives_after_ci() -> None:
 
 def test_the_check_name_is_the_one_branch_protection_can_require() -> None:
     (job,) = _workflow()["jobs"].values()
-    assert job["name"] == "Acceptance gate (independent verdict on exact SHA)"
+    # On a real run the context is exactly the required name. On a label-noise
+    # run (a `queue-*` label event, VOYN-W0-AICC-CI-SELF-CANCEL-SAME-SHA) the
+    # job is skipped under a different name, so a skipped job -- which GitHub
+    # counts as success for required checks -- can never stand in for the
+    # verdict on the head. The guard is asserted in tests/test_release_gate_policy.py.
+    name = job["name"]
+    assert name.endswith("|| 'Acceptance gate (independent verdict on exact SHA)' }}")
+    assert name.startswith("${{ ((github.event_name == 'pull_request' && (github.event.action == 'labeled'")
+    assert "'Gate not run (label noise or outside review window)'" in name
 
 
 def test_the_gate_asks_for_no_more_access_than_it_reads() -> None:

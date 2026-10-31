@@ -139,21 +139,11 @@ def evaluate(
 ) -> str:
     """Return the accepting reviewer's login, or raise with cause and remedy.
 
-    ``merger``, if supplied, is the identity that will actually execute the
-    merge -- for the orchestrator's own merge step (`review_merge._pr_is_
-    mergeable`), the login its `gh` credential resolves to on the pull
-    request's own host, via `_gh_current_login`. It defaults to `None`,
-    meaning "not checked": the GitHub Actions gate that calls this (below,
-    via `assert_accepted`) runs before anything decides who will actually
-    press merge, so it has nothing to compare against and omitting the
-    argument preserves its original author-only behaviour exactly. A caller
-    that DOES know the merger ahead of the merge itself must supply it --
-    an ACCEPT published by that same identity is exactly as unable to prove
-    independence as one published by the author (VOYN-W0-AICC-MARKER-
-    REVIEWER-INDEPENDENCE-REM-REM: author-independence alone still lets one
-    account both approve and execute the merge whenever that account
-    differs from the PR's own author, e.g. an override marker posted by the
-    orchestrator's own bot for someone else's pull request)."""
+    ``merger``, when supplied, is the login that will execute the merge.
+    The Actions gate omits it (nobody has been chosen to merge yet). The
+    orchestrator passes the login ``gh api user`` returns for the pull
+    request's own host. An ACCEPT from that login is not independent.
+    """
     if not isinstance(head_sha, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", head_sha):
         raise AcceptanceError(f"head sha is not a 40-character commit id: {head_sha!r}")
     head = head_sha.lower()
