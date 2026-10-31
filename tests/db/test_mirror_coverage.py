@@ -33,7 +33,6 @@ from pathlib import Path
 import pytest
 
 from command_center.db import roles
-
 from tests.db.mirror_discovery import mirror_classes
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -104,6 +103,23 @@ UNMIRRORED_SCHEMA_TABLES: dict[str, Exclusion] = {
         ),
         task="VOYN-OPS-AICC-PUBLISH-WINDOW-STARVATION",
     ),
+    "tick_skip_event": Exclusion(
+        reason=(
+            "PostgreSQL-native observability ledger from birth (0018): the "
+            "per-tick skip reasons the watchdog reads were previously only "
+            "journal lines; no SQLite authority ever held them, so there is "
+            "nothing for a mirror to copy from."
+        ),
+        task="VOYN-W0-AICC-TICK-STALL-WATCHDOG",
+    ),
+    "tick_stall_escalation": Exclusion(
+        reason=(
+            "PostgreSQL-native (0018): the watchdog's episode ledger exists "
+            "only to make 'exactly one escalation per stall episode' a "
+            "schema property; born in PostgreSQL with no SQLite counterpart."
+        ),
+        task="VOYN-W0-AICC-TICK-STALL-WATCHDOG",
+    ),
     "backlog_task": Exclusion(
         reason=(
             "PostgreSQL-native authority from birth (BO-S1): the incumbent it "
@@ -152,6 +168,16 @@ UNMIRRORED_SCHEMA_TABLES: dict[str, Exclusion] = {
             "SQLite authority ever held them, so there is nothing to mirror."
         ),
         task="VOYN-W0-BACKLOG-ORCHESTRATOR",
+    ),
+    "backlog_task_followup": Exclusion(
+        reason=(
+            "PostgreSQL-native (migration 0032), same shape as "
+            "backlog_task_remediation: follow-up lineage rows exist only "
+            "through backlog_record_followup, written the same transaction as "
+            "the new OPEN task they point at; no SQLite authority ever held "
+            "them, so there is nothing to mirror."
+        ),
+        task="VOYN-W0-AICC-REVIEW-FULLCONTEXT-TRIAGE",
     ),
     "queue_entry": Exclusion(
         reason=(
@@ -202,6 +228,25 @@ UNMIRRORED_SCHEMA_TABLES: dict[str, Exclusion] = {
         ),
         task="VOYN-W0-AICC-SRV-04b",
     ),
+    "executor_availability": Exclusion(
+        reason=(
+            "PostgreSQL-native authority from birth (0018): there is no SQLite "
+            "predecessor for a fleet-wide fact — the whole point is that it is "
+            "shared by every host, which a per-host SQLite database structurally "
+            "cannot be. A mirror would also fail the contract's own reachable-"
+            "non-test-caller property for the same reason `work_item`'s does."
+        ),
+        task="VOYN-W0-AICC-EXECUTOR-QUOTA-VISIBILITY",
+    ),
+    "executor_availability_event": Exclusion(
+        reason=(
+            "As `executor_availability`: the protocol's own audit, written "
+            "inside the same transaction as the mark/clear it records; "
+            "mirroring it would give that audit a second, eventually-"
+            "consistent copy, and there is still no SQLite source to mirror."
+        ),
+        task="VOYN-W0-AICC-EXECUTOR-QUOTA-VISIBILITY",
+    ),
     "principal": Exclusion(
         reason=(
             "PostgreSQL-native authority with no SQLite source: an identity is "
@@ -248,6 +293,39 @@ UNMIRRORED_SCHEMA_TABLES: dict[str, Exclusion] = {
             "second place that evidence could be altered or lost."
         ),
         task="VOYN-W0-AICC-SRV-03",
+    ),
+    "control_plane_heartbeat": Exclusion(
+        reason=(
+            "PostgreSQL-native from birth (0017): the only fact worker-01's "
+            "cross-check reads, and the whole point of that check is that "
+            "`aicc_worker` sees this table on the SAME server the reconciler "
+            "writes it to, live -- an eventually-consistent mirrored copy "
+            "would let the checker report a control-01 tick healthy after "
+            "it had already gone stale there, defeating the check that "
+            "exists precisely to catch staleness."
+        ),
+        task="VOYN-W0-AICC-CONTROL-PLANE-RESILIENCE",
+    ),
+    "control_plane_unit_state": Exclusion(
+        reason=(
+            "PostgreSQL-native (0017): circuit-breaker bookkeeping the "
+            "reconciler reads and writes every tick to decide whether to "
+            "retry a unit right now; no SQLite authority ever held it, and "
+            "a stale mirrored copy could make the breaker re-open on data "
+            "already superseded by the next real tick."
+        ),
+        task="VOYN-W0-AICC-CONTROL-PLANE-RESILIENCE",
+    ),
+    "control_plane_event": Exclusion(
+        reason=(
+            "PostgreSQL-native (0017): the reconciler's own append-only "
+            "action ledger, written in the same transaction as the "
+            "recovery attempt it records -- as `principal_event`, mirroring "
+            "it would give the one audit trail an operator reads to see "
+            "what the reconciler already tried a second, eventually-"
+            "consistent copy that can disagree with the first."
+        ),
+        task="VOYN-W0-AICC-CONTROL-PLANE-RESILIENCE",
     ),
 }
 

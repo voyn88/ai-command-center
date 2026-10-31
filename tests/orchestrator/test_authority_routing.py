@@ -5,7 +5,7 @@ The gate only works if three independently-edited layers agree on the same
 strings:
 
   * the worker's refusal reason (`authority_preflight.AuthorityDecision`),
-  * the backlog's park classifier and resume refusal (migration 0025),
+  * the backlog's park classifier and resume refusal (migration 0036),
   * the payload the planner builds.
 
 A drift in any one of them fails silently and expensively -- an authority
@@ -27,7 +27,7 @@ SQL = (
     / "command_center"
     / "db"
     / "sql"
-    / "0025_backlog_required_authority.up.sql"
+    / "0036_backlog_required_authority.up.sql"
 ).read_text(encoding="utf-8")
 
 _ROUTE = ("proj", "/srv/proj")
@@ -69,7 +69,7 @@ def test_a_split_dispatch_carries_it_too() -> None:
 
 def test_a_task_that_declares_nothing_sends_an_empty_list() -> None:
     """Always present, always a list: absent would make the worker's parse
-    branch on shape as well as content, and a pre-0025 row must still
+    branch on shape as well as content, and a pre-0036 row must still
     dispatch."""
     for task in (_task(), _task(required_authorities=None)):
         payload, _ = _payload_for(task, PlanLimits(), _ROUTE)

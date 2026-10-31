@@ -22,6 +22,17 @@ def test_queue_reap_takes_no_arguments() -> None:
     assert args.command == "queue-reap"
 
 
+def test_control_reconcile_and_watchdog_take_no_arguments() -> None:
+    """The reconciler/watchdog CLI commands (VOYN-W0-AICC-CONTROL-PLANE-
+    RESILIENCE) carry no flags: everything they need (which timers, which
+    units, backoff bounds) is declared in
+    command_center.orchestrator.control_plane_reconciler, not passed in on
+    the command line — the same "operator contract, not a parser test of
+    the reconcile logic itself" split test_cli_queue.py's other tests draw."""
+    assert build_parser().parse_args(["control-reconcile"]).command == "control-reconcile"
+    assert build_parser().parse_args(["control-watchdog"]).command == "control-watchdog"
+
+
 def test_backlog_review_can_target_one_exact_task() -> None:
     args = build_parser().parse_args(
         ["backlog-review", "--repo-path", "/srv/aicc", "--task-id", "VOYN-W0-X"]

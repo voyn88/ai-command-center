@@ -123,7 +123,7 @@ CREATE OR REPLACE FUNCTION backlog_return_to_pool(p_task_id text, p_reason text)
     LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, public AS $$
 DECLARE t backlog_task%ROWTYPE; v backlog_verdict; v_target text; v_prior integer;
         v_split_requested boolean := false;
-        v_technical boolean;
+        v_technical boolean; v_malformed boolean; v_bad_returns integer;
         v_authority boolean;
 BEGIN
     v.ok := false;
@@ -153,8 +153,15 @@ BEGIN
         OR p_reason LIKE 'cascade_exhausted: task_status_failed%'
         OR p_reason LIKE 'cascade_exhausted: executor infrastructure failure%'
         OR p_reason LIKE 'cascade_exhausted: publish_%');
+    v_malformed := p_reason LIKE 'cascade_exhausted: malformed_pr_url%';
+    SELECT count(*) INTO v_bad_returns FROM backlog_event e
+     WHERE e.task_id = p_task_id AND e.event = 'return_to_pool'
+       AND e.outcome = 'granted'
+       AND e.reason LIKE 'cascade_exhausted: malformed_pr_url%';
     v_target := CASE
         WHEN v_authority THEN 'DEFER_TO_USER'
+        WHEN v_malformed AND v_bad_returns >= 1 THEN 'DEFER_TO_USER'
+        WHEN v_malformed THEN 'OPEN'
         WHEN v_technical THEN 'OPEN'
         -- Pipeline class: the second non-technical return asks for a split
         -- (planner dispatches decomposition), the fourth parks. Functional
@@ -167,7 +174,7 @@ BEGIN
     -- An authority block is never a size problem, so it must not be handed to
     -- the decomposer: splitting a task that needs root yields subtasks that
     -- each need root.
-    v_split_requested := (NOT v_technical) AND (NOT v_authority)
+    v_split_requested := (NOT v_technical) AND (NOT v_authority) AND (NOT v_malformed)
                          AND t.task_class = 'pipeline'
                          AND v_prior >= 1 AND v_target = 'OPEN';
 
@@ -186,8 +193,8 @@ BEGIN
 END
 $$;
 
--- Ingest learns the authority trailer. Everything else is 0021's body
--- verbatim; the only additions are `v_auth`/`av` and the branch that records
+-- Ingest learns the authority trailer. The 0030 URL validation remains intact; additions include `v_auth`/`av`
+-- and the branch that records
 -- the declaration and selects the authority park reason.
 CREATE OR REPLACE FUNCTION backlog_ingest_results(p_planner text)
     RETURNS TABLE (task_id text, queue_state text, action text, detail jsonb)
@@ -195,6 +202,7 @@ CREATE OR REPLACE FUNCTION backlog_ingest_results(p_planner text)
 DECLARE r record; t backlog_task%ROWTYPE; tv backlog_verdict; rv backlog_verdict;
         lv backlog_lease_verdict; v_result jsonb; v_pr text; v_sha text;
         v_task_status text; v_split text; sv backlog_verdict;
+        v_pr_shape_ok boolean;
         v_auth text[]; av backlog_verdict; v_reason text;
 BEGIN
     FOR r IN
@@ -290,7 +298,18 @@ BEGIN
             SELECT * INTO t FROM backlog_task b WHERE b.task_id = r.t_id FOR UPDATE;
         END IF;
 
-        IF r.q_state = 'succeeded' AND v_task_status = 'completed' AND v_pr IS NOT NULL THEN
+        -- Untrusted input from the agent's own result text, not something
+        -- GitHub has vouched for (unlike `reconcile_pr_evidence`, which only
+        -- ever records a URL `gh pr list` itself returned). A value not even
+        -- shaped like a real PR URL can never resolve through the GitHub API
+        -- every downstream gate uses -- recording it would move the task to
+        -- READY_TO_REVIEW and strand it there, invisible to every gate,
+        -- forever.
+        v_pr_shape_ok := v_pr IS NULL
+            OR v_pr ~ '^https://github\.com/[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+/pull/[1-9][0-9]*$';
+
+        IF r.q_state = 'succeeded' AND v_task_status = 'completed'
+           AND v_pr IS NOT NULL AND v_pr_shape_ok THEN
             PERFORM backlog_record_evidence(r.t_id, 'pr', v_pr);
             IF v_sha IS NOT NULL THEN
                 PERFORM backlog_record_evidence(r.t_id, 'sha', v_sha);
@@ -313,7 +332,8 @@ BEGIN
                 v_reason := 'cascade_exhausted: ' || CASE
                     WHEN v_task_status IS DISTINCT FROM 'completed'
                         THEN 'task_status_' || coalesce(v_task_status, 'missing')
-                    ELSE 'no_pr_published'
+                    WHEN v_pr IS NULL THEN 'no_pr_published'
+                    ELSE 'malformed_pr_url'
                     END;
             ELSE
                 v_reason := 'cascade_exhausted: ' || coalesce(

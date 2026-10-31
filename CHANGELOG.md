@@ -8,6 +8,68 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Added — Fleet-wide executor quota visibility (`VOYN-W0-AICC-EXECUTOR-QUOTA-VISIBILITY`)
+- `command_center/db/sql/0033_executor_availability.up.sql`: `executor_availability`
+  (current verdict, one row per executor) and `executor_availability_event`
+  (durable audit trail), mutated only through `executor_mark_unavailable` /
+  `executor_mark_available` — the same queue-claim idiom `work_item` already
+  uses, so no role can forge "available" over an account another host just
+  proved exhausted.
+- `command_center/db/executor_availability.py` (`ExecutorAvailabilityStore`):
+  a short (5s) in-process TTL cache in front of the live verdict, mirroring
+  `runtime.providers._probe_cache` — the cooldown itself (minutes-to-hours,
+  `unavailable_until`) lives in Postgres and is compared against Postgres's
+  own `now()`, never a Python-side clock.
+- `command_center/worker/handlers.py`: `_executor_preflight` now composes the
+  existing local CLI check with this fleet-wide fact, before any process is
+  launched. A worker's own provider-failure classification
+  (`providers.classify_failure`, already detecting `"exceeded your monthly
+  quota"` and friends) reports durable failures fleet-wide via
+  `_classify_and_record_provider_failure`, so the NEXT claim — on any host —
+  skips the same exhausted account instead of re-discovering it. Quota
+  exhaustion surfaces as its own machine-readable reason,
+  `executor_quota_exhausted`, never folded into "CLI missing" reasons.
+- `command_center/db/work_queue_read.py`: `executor_availability()` and
+  `escalation_reasons()` — read-aggregations over the same durable tables and
+  the same `aicc_app` read grant `queue_metrics()` already uses, so fleet
+  executor health and escalation-reason counts sit in the same PostgreSQL
+  path as the rest of delivery metrics rather than a bespoke writer.
+- Closes the incident this task is named for: Copilot CLI 1.0.80 returning
+  "You have exceeded your monthly quota" mid-review, burning a queue attempt
+  and process-launch time for zero model work because nothing outlived that
+  one attempt to keep the next claim off the same account.
+
+### Added — the one-button audit, wired into the web UI (`VOYN-W0-APP-CONTROL-S4`)
+
+- `web/src/screens/Tasks.tsx`: an `AuditLauncher` panel above the task list —
+  pick a project, confirm (or edit) the review prompt, one button. A
+  successful enqueue reloads the task list so the new item appears
+  immediately.
+- The launcher owns no credential of its own: a 401 from the audit POST is
+  handed up to the screen (`onAuthRequired`), which locks and renders the
+  same single `TokenGate` a 401 from the queue reads does — so the owner
+  gets an actual unlock control, and a retry uses the replacement key
+  instead of resending the rejected one. The refused draft (project +
+  prompt) rides along and is restored when the screen unlocks, so the retry
+  is one click rather than a retype, and the gate says plainly that the
+  audit was NOT started. (Supersedes PR #421, rejected for exactly this
+  missing recovery path: the panel showed "unlock below" while no unlock
+  control existed.)
+- `web/src/lib/queueApi.ts`: `enqueueAudit`, the typed `POST /api/v1/queue/audit`
+  client (401 raises the same `QueueAuthError` the reads use).
+- `command_center/webapi/queue_routes.py`: `repository_path` is now optional
+  in the audit request — the one-button trigger only knows a `project_id`.
+  When omitted, it resolves from `project_config.get_project_config`, the
+  same source the worker already confirms the run against
+  (`agent_runner.validate_repository`), so the caller never needs to know
+  the server's filesystem layout. An explicit `repository_path` is still
+  honored verbatim.
+- The `execution`-queue enqueue → claim → `agent_run` (review profile) →
+  result → `GET /api/v1/queue/items/{id}` path was verified end-to-end at
+  the code level (SRV-05's worker already claims this queue and shape);
+  the remaining gap is operational — the systemd unit is not yet installed
+  on any host.
+
 ### Fixed — Control ticks have their own GitHub quota (`VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS`)
 - `command_center/orchestrator/gh_access.py`: every `gh` call the review,
   merge and PR-window ticks make now runs under the `voyn-aicc-fleet` App's
