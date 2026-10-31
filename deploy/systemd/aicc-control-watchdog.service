@@ -1,0 +1,51 @@
+# The independent control-plane heartbeat watchdog (VOYN-W0-AICC-CONTROL-
+# PLANE-RESILIENCE's second acceptance clause).
+#
+# Install on worker-01 (a DIFFERENT host from the reconciler -- installing
+# this beside aicc-control-reconciler.service on control-01 defeats its
+# whole purpose):
+#   cp deploy/systemd/aicc-control-watchdog.{service,timer} /etc/systemd/system/
+#   cp deploy/systemd/aicc-control-plane-alert@.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now aicc-control-watchdog.timer
+#
+# Read-only and touches no systemd unit at all: it has no reach to control-01
+# and needs none. `control_plane_heartbeat` is written by EVERY declared
+# tick, including the reconciler's own -- so a reconciler that silently
+# stopped ticking (the planner's exact failure mode on 2026-08-29, recursively
+# applied to the thing meant to catch it) shows up here as one more stale
+# tick_name, the same signal any other stalled tick produces. This is the
+# SECOND of the task's two required supervision paths; the first is
+# aicc-control-reconciler.service's own `Restart=on-failure`, which only
+# covers that process crashing -- it cannot see itself going quiet the way
+# `is-active` alone could not see the planner going quiet.
+#
+# Reaches control-01's PostgreSQL exactly the way voyn-aicc-pgtunnel.service
+# already does: control-01 cannot reach worker-01 over ssh (verified live,
+# see command_center/deployment/self_deploy.py), but worker-01 already
+# initiates that tunnel outbound, and this unit rides the same connection --
+# no new network path, no new credential shape.
+#
+# Privilege: `aicc_worker` holds SELECT on `control_plane_heartbeat` only
+# (command_center/db/roles.py:_WORKER_CONTROL_PLANE_TABLES) -- no INSERT/
+# UPDATE, so a compromised worker-01 cannot forge a fresh `last_ok_at` and
+# hide a real control-01 stall from the host watching for one.
+
+[Unit]
+Description=AI Command Center control-plane heartbeat watchdog (cross-host check)
+After=network-online.target voyn-aicc-pgtunnel.service
+Wants=network-online.target
+OnFailure=aicc-control-plane-alert@%n.service
+
+[Service]
+Type=oneshot
+User=aicc-worker
+Group=aicc-worker
+EnvironmentFile=/etc/aicc/worker.env
+WorkingDirectory=/opt/aicc
+ExecStart=/opt/aicc/.venv/bin/python -m command_center.db control-watchdog
+TimeoutStartSec=60s
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true

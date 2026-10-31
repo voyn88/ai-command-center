@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from command_center import agent_runner, workspace_provisioning
+from command_center import agent_runner, authority_preflight, workspace_provisioning
 from command_center.orchestrator.publish import PublishResult
 from command_center.worker.handlers import build_handlers
 from command_center.worker.payloads import PayloadError, parse_agent_run
@@ -371,7 +371,11 @@ def test_failed_copilot_independent_review_is_retryable_infrastructure(
 
     assert not outcome.ok
     assert outcome.retryable
-    assert "provider/auth/quota" in outcome.reason
+    # VOYN-W0-AICC-EXECUTOR-QUOTA-VISIBILITY: the reason now names the
+    # SPECIFIC provider failure (classified from the CLI's own diagnostic
+    # text), not the generic bucket every provider/auth/quota refusal used to
+    # share -- exactly the distinct machine reason this task exists to add.
+    assert "authentication_failed" in outcome.reason
 
 
 def test_api_error_in_cli_output_is_retryable_not_a_success(
@@ -531,16 +535,21 @@ def test_copilot_preflight_checks_the_copilot_binary(handler, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "diagnostic",
+    "diagnostic,expected_reason",
     [
-        "AI credit usage limit reached",
-        "not logged in; authentication required",
-        "service unavailable",
-        "network error: connection refused",
+        # VOYN-W0-AICC-EXECUTOR-QUOTA-VISIBILITY: `route_failovers` now names
+        # the SPECIFIC provider failure `providers.CopilotProvider.
+        # classify_failure` reads out of the CLI's own diagnostic text, not a
+        # single reason every provider/auth/quota refusal used to share --
+        # each recorded reason is also what would be fleet-marked unavailable.
+        ("AI credit usage limit reached", "quota_limit"),
+        ("not logged in; authentication required", "authentication_failed"),
+        ("service unavailable", "provider_exit_nonzero"),
+        ("network error: connection refused", "network_error"),
     ],
 )
 def test_copilot_provider_failure_switches_inside_the_same_attempt(
-    handler, monkeypatch, diagnostic
+    handler, monkeypatch, diagnostic, expected_reason
 ):
     run_agent, runs = handler
 
@@ -581,9 +590,59 @@ def test_copilot_provider_failure_switches_inside_the_same_attempt(
         {
             "cascade_step": 1,
             "executor": "copilot",
-            "reason": "provider_auth_or_quota",
+            "reason": expected_reason,
         }
     ]
+
+
+@pytest.mark.parametrize("task_type,executor,model", [
+    ("review", "cursor", "auto"),
+    ("independent_review", "grok", "grok-4.3"),
+])
+def test_owner_alternatives_preserve_review_capability_and_replace_old_model(
+    handler, monkeypatch, task_type, executor, model
+):
+    run_agent, runs = handler
+    monkeypatch.setenv("AICC_EXECUTOR_PROFILE", "owner-alternatives")
+    payload = _payload(task_type=task_type, model="claude-old-model", cascade=[
+        {"executor": "claude", "task_type": task_type},
+    ])
+    run_agent(payload, _event(), 1)
+    assert len(runs) == 1
+    assert runs[0]["executor"] == executor
+    assert runs[0]["model"] == model
+    assert runs[0]["task_type"] == task_type
+
+
+def test_alternative_quota_refusal_is_not_repeated_by_the_next_task(handler, monkeypatch):
+    run_agent, _ = handler
+    monkeypatch.setenv("AICC_EXECUTOR_PROFILE", "owner-alternatives")
+    called = []
+    def run(**kwargs):
+        executor = kwargs["executor"]
+        called.append(executor)
+        return agent_runner.RunResult(
+            status="failed" if executor == "cursor" else "completed",
+            exit_code=1 if executor == "cursor" else 0,
+            stdout="" if executor == "cursor" else '{"result":"done"}',
+            stderr="usage limit reached" if executor == "cursor" else "",
+            duration_seconds=0.1, started_at="t0", completed_at="t1",
+        )
+    monkeypatch.setattr(agent_runner, "run_claude_code", run)
+    assert run_agent(_payload(), _event(), 1).ok
+    assert run_agent(_payload(), _event(), 1).ok
+    assert called == ["cursor", "grok", "grok"]
+
+
+def test_exhausted_alternatives_wait_without_launching_models(handler, monkeypatch):
+    run_agent, runs = handler
+    monkeypatch.setenv("AICC_EXECUTOR_PROFILE", "owner-alternatives")
+    agent_runner.record_executor_exhausted("cursor")
+    agent_runner.record_executor_exhausted("grok")
+    outcome = run_agent(_payload(), _event(), 1)
+    assert not outcome.ok and outcome.infra_wait
+    assert "quota exhausted" in outcome.reason
+    assert runs == []
 
 
 def test_codex_usage_limit_switches_inside_the_same_attempt(handler, monkeypatch):
@@ -716,7 +775,10 @@ def test_mutating_provider_failover_requires_unchanged_workspace(
     else:
         assert not outcome.ok and outcome.retryable
         assert [run["executor"] for run in runs] == ["copilot"]
-        assert "provider/auth/quota" in outcome.reason
+        # VOYN-W0-AICC-EXECUTOR-QUOTA-VISIBILITY: the terminal reason now
+        # names the classified cause, not the generic provider/auth/quota
+        # bucket.
+        assert "quota_limit" in outcome.reason
 
 
 def test_unknown_copilot_failure_switches_for_read_only_review(handler, monkeypatch):
@@ -783,7 +845,9 @@ def test_provider_failover_never_crosses_the_workspace_mutability_boundary(
 
     assert not outcome.ok and outcome.retryable
     assert [run["executor"] for run in runs] == ["copilot"]
-    assert "provider/auth/quota" in outcome.reason
+    # VOYN-W0-AICC-EXECUTOR-QUOTA-VISIBILITY: the terminal reason now names
+    # the classified cause, not the generic provider/auth/quota bucket.
+    assert "quota_limit" in outcome.reason
 
 
 def test_genuine_task_failure_with_error_flavoured_text_still_ok(
@@ -1147,6 +1211,134 @@ def test_absent_cascade_keeps_the_single_executor_behaviour(handler) -> None:
     assert runs[-1]["task_type"] == _payload()["task_type"]
 
 
+# -- fleet-wide executor availability (VOYN-W0-AICC-EXECUTOR-QUOTA-VISIBILITY) -
+
+
+class _FakeAvailabilityStore:
+    """A scripted fleet-wide verdict, the same shape
+    `worker.handlers._fleet_availability`/`_classify_and_record_provider_
+    failure` read through — no real database, no cache TTL to wait out."""
+
+    def __init__(self, unavailable: dict | None = None) -> None:
+        self._unavailable = dict(unavailable or {})
+        self.marked: list[tuple[str, str, int]] = []
+        self.cleared: list[str] = []
+
+    def get(self, executor_id, *, use_cache=True):
+        from command_center.db.executor_availability import ExecutorAvailability
+
+        if executor_id in self._unavailable:
+            reason, until = self._unavailable[executor_id]
+            return ExecutorAvailability(executor_id, "unavailable", reason, until)
+        return ExecutorAvailability(executor_id, "available", None, None)
+
+    def mark_unavailable(self, executor_id, reason, ttl_seconds):
+        self.marked.append((executor_id, reason, ttl_seconds))
+
+    def mark_available(self, executor_id):
+        self.cleared.append(executor_id)
+
+
+def test_fleet_marked_unavailable_executor_is_skipped_before_dispatch(
+    handler, monkeypatch
+) -> None:
+    """Acceptance (1): an executor a DIFFERENT host already proved exhausted
+    is excluded from routing for the rest of its cooldown — never even
+    launched — instead of being rediscovered the hard way on every claim."""
+    import command_center.worker.handlers as handlers_module
+
+    run_agent, runs = handler
+    fake_store = _FakeAvailabilityStore(
+        {"claude_code": ("quota_limit", "2026-09-06T09:00:00+00:00")}
+    )
+    monkeypatch.setattr(handlers_module, "_executor_availability_store", fake_store)
+    payload = _cascade_payload()
+    payload["cascade"] = [
+        {"executor": "claude", "task_type": "review"},
+        {"executor": "codex", "task_type": "review"},
+    ]
+    outcome = run_agent(payload, _event(), 1)
+    assert outcome.ok
+    assert outcome.result["cascade_step"] == 2
+    assert outcome.result["executor"] == "codex"
+    assert len(runs) == 1
+    assert runs[0]["executor"] == "codex"
+
+
+def test_fleet_exhaustion_of_every_link_reports_a_distinct_machine_reason(
+    handler, monkeypatch
+) -> None:
+    """Acceptance (2): quota exhaustion reports as its own machine reason,
+    `executor_quota_exhausted`, never folded into the local "cli
+    unavailable"/"cli not found" wording those checks already use."""
+    import command_center.worker.handlers as handlers_module
+
+    run_agent, runs = handler
+    fake_store = _FakeAvailabilityStore(
+        {"claude_code": ("quota_limit", "2026-09-06T09:00:00+00:00")}
+    )
+    monkeypatch.setattr(handlers_module, "_executor_availability_store", fake_store)
+    payload = _payload(cascade=[{"executor": "claude", "task_type": "review"}])
+    outcome = run_agent(payload, _event(), 1)
+    assert not outcome.ok and outcome.retryable
+    assert "executor_quota_exhausted" in outcome.reason
+    assert "quota_limit" in outcome.reason
+    assert runs == []
+
+
+def test_provider_failure_marks_the_executor_unavailable_fleet_wide(
+    handler, monkeypatch
+) -> None:
+    """Acceptance (1): the worker's OWN observation of a provider failure is
+    what feeds the fleet-wide signal a later claim — this host or any other —
+    will read, instead of dying with this one attempt's memory."""
+    import command_center.worker.handlers as handlers_module
+
+    run_agent, _runs = handler
+    fake_store = _FakeAvailabilityStore()
+    monkeypatch.setattr(handlers_module, "_executor_availability_store", fake_store)
+
+    def rate_limited(**kwargs):
+        return agent_runner.RunResult(
+            status="failed",
+            exit_code=4,
+            stdout="",
+            stderr="AI credit usage limit reached",
+            duration_seconds=0.1,
+            started_at="2026-08-23T12:00:00+00:00",
+            completed_at="2026-08-23T12:00:01+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", rate_limited)
+    payload = _cascade_payload()
+    payload["cascade"] = [{"executor": "copilot", "task_type": "review"}]
+    outcome = run_agent(payload, _event(), 1)
+    assert not outcome.ok and outcome.retryable
+    assert fake_store.marked == [("copilot_cli", "quota_limit", 3600)]
+
+
+def test_unreachable_availability_store_fails_open_not_closed(
+    handler, monkeypatch
+) -> None:
+    """An unreachable side channel must never gate a dispatch the local
+    preflight already approved — this system exists to make outages more
+    visible, not to become a second one when its own database is down."""
+    import command_center.worker.handlers as handlers_module
+
+    class _BrokenStore:
+        def get(self, executor_id, *, use_cache=True):
+            raise RuntimeError("connection refused")
+
+        def mark_unavailable(self, executor_id, reason, ttl_seconds):
+            raise RuntimeError("connection refused")
+
+    monkeypatch.setattr(handlers_module, "_executor_availability_store", _BrokenStore())
+    run_agent, runs = handler
+    outcome = run_agent(_payload(), _event(), 1)
+    assert outcome.ok
+    assert len(runs) == 1
+
+
 # -- machine outcome extraction (BO-S3) ---------------------------------------
 
 
@@ -1222,11 +1414,13 @@ def test_lease_unavailable_publish_failure_is_a_lease_wait_not_a_spent_attempt(
     """VOYN-W0-AICC-PUBLISH-LEASE-CONTENTION-BURNS-ATTEMPT, live 2026-09-06
     (wki_55f316db): a guarded publish lost the writer-lease race to a
     sibling lane -- neighbouring publishes for OTHER tasks succeeded
-    04:57-04:58Z while this one got `lease_unavailable`. That names no fault
-    in this run's own (already-committed) work, so the outcome must set
-    `lease_wait=True` -- routing the daemon to the refund-and-bound path
-    instead of spending this item's `max_attempts` on contention it had no
-    part in causing."""
+    04:57-04:58Z while this one got `lease_unavailable`. Same day,
+    second occurrence (wki_e0695c3d): dead-lettered when sibling
+    VOYN-MIN-PROOFLESS held the single writer lease during a same-batch
+    DLQ redrive publish. That names no fault in this run's own
+    (already-committed) work, so the outcome must set `lease_wait=True` --
+    routing the daemon to the refund-and-bound path instead of spending
+    this item's `max_attempts` on contention it had no part in causing."""
     import command_center.worker.handlers as handlers_module
 
     run_agent, _runs = handler
@@ -1296,12 +1490,18 @@ def test_mutating_dispatch_into_a_leased_worktree_is_refused(
 ) -> None:
     """The defect this task names: the worker dispatched into a checkout
     another writer holds, and the collision only surfaced at commit time --
-    by which point the foreign edits were already in the tree."""
+    by which point the foreign edits were already in the tree.
+
+    Contention must set `lease_wait=True` so the refund path absorbs the
+    refusal instead of burning `max_attempts`
+    (VOYN-W0-AICC-PUBLISH-LEASE-CONTENTION-BURNS-ATTEMPT-REM)."""
     run_agent, runs = handler
     worktree = isolated_path(tmp_path)
     lease_tool(_lease_row(worktree))
     outcome = run_agent(_payload(task_type="implementation"), _event())
     assert not outcome.ok and outcome.retryable
+    assert outcome.lease_wait is True
+    assert outcome.infra_wait is False
     assert "claude-worker" in outcome.reason and str(worktree) in outcome.reason
     assert runs == [], "nothing may execute in another writer's checkout"
 
@@ -1351,23 +1551,27 @@ def test_an_unreachable_authority_blocks_rather_than_opens(
 ) -> None:
     """A guard that opens when it cannot see is not a guard. Every failure
     to ask a configured authority -- non-zero exit, unreadable output,
-    missing binary -- refuses the dispatch."""
+    missing binary -- refuses the dispatch. These are substrate failures
+    (`infra_wait`), not writer contention (`lease_wait`)."""
     run_agent, runs = handler
 
     lease_tool("boom: connection refused", exit_code=1)
     refused = run_agent(_payload(task_type="implementation"), _event())
     assert not refused.ok and refused.retryable and runs == []
+    assert refused.lease_wait is False and refused.infra_wait is True
     assert "connection refused" in refused.reason
 
     lease_tool("not json at all")
     unreadable = run_agent(_payload(task_type="implementation"), _event())
     assert not unreadable.ok and unreadable.retryable and runs == []
+    assert unreadable.lease_wait is False and unreadable.infra_wait is True
     assert "unreadable" in unreadable.reason
 
     lease_tool("[]")
     monkeypatch.setenv("VOYN_LEASE_TOOL", str(tmp_path / "does-not-exist"))
     missing = run_agent(_payload(task_type="implementation"), _event())
     assert not missing.ok and missing.retryable and runs == []
+    assert missing.lease_wait is False and missing.infra_wait is True
     assert "unreachable" in missing.reason
 
 
@@ -1663,11 +1867,12 @@ def test_publish_releases_its_own_lease_when_no_full_lifecycle_lease_is_held(
 def test_writer_lease_unavailable_blocks_dispatch_before_the_agent_runs(
     handler, monkeypatch, tmp_path
 ) -> None:
-    """Another writer already holding the repository-level lease (or the
-    authority refusing/unreachable for the acquire specifically, as opposed
-    to `list`) must refuse the dispatch retryably before any workspace is
-    touched or the agent is launched -- the same fail-closed shape
-    `blocking_lease` already has for its own preflight."""
+    """Another writer already holding the task-scoped lease must refuse the
+    dispatch retryably before any workspace is touched or the agent is
+    launched -- the same fail-closed shape `blocking_lease` already has for
+    its own preflight. Contention must set `lease_wait=True` so the refund
+    path (not `max_attempts`) absorbs the refusal
+    (VOYN-W0-AICC-PUBLISH-LEASE-CONTENTION-BURNS-ATTEMPT-REM)."""
     run_agent, runs = handler
     binary = tmp_path / "fake-voyn-lease"
     binary.write_text(
@@ -1689,8 +1894,39 @@ def test_writer_lease_unavailable_blocks_dispatch_before_the_agent_runs(
     outcome = run_agent(_payload(task_type="implementation"), _event())
     assert not outcome.ok
     assert outcome.retryable
+    assert outcome.lease_wait is True
+    assert outcome.infra_wait is False
     assert "writer lease unavailable" in outcome.reason
     assert runs == [], "the agent must not run without the writer lease held"
+
+
+def test_writer_lease_authority_failure_at_dispatch_is_an_infra_wait(
+    handler, monkeypatch, tmp_path
+) -> None:
+    """An acquire that fails without naming a holder is substrate failure,
+    not contention: route to `infra_wait` so the lease-wait budget is not
+    spent down by a down authority."""
+    run_agent, runs = handler
+    binary = tmp_path / "fake-voyn-lease"
+    binary.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "list" ]; then echo "[]"; exit 0; fi\n'
+        'case "$3" in\n'
+        "  acquire) echo 'connection refused' >&2; exit 1 ;;\n"
+        "  *) exit 0 ;;\n"
+        "esac\n"
+    )
+    binary.chmod(0o755)
+    monkeypatch.setenv("VOYN_LEASE_TOOL", str(binary))
+    monkeypatch.setenv("VOYN_LEASE_DSN", "postgresql://authority/present")
+
+    outcome = run_agent(_payload(task_type="implementation"), _event())
+    assert not outcome.ok
+    assert outcome.retryable
+    assert outcome.lease_wait is False
+    assert outcome.infra_wait is True
+    assert "writer lease unavailable" in outcome.reason
+    assert runs == []
 
 
 def test_no_configured_authority_leaves_the_writer_lease_inert_too(
@@ -2656,3 +2892,194 @@ def test_read_only_isolated_checkout_packs_refs_after_a_wholesale_pr_fetch(
     loose_dirs = [p for p in loose.iterdir() if p.is_dir()] if loose.exists() else []
     assert loose_dirs == [], loose_dirs
     handlers_module._remove_read_only_isolated_checkout(target)
+
+
+# ---------------------------------------------------------------------------
+# VOYN-W0-AICC-PRIVILEGED-TASK-ROUTED-TO-UNPRIVILEGED-EXECUTOR
+#
+# 2026-08-30, restored queue: 8 of 13 returns to the pool were
+# `cascade_exhausted: task_status_failed`, and at least one was an agent
+# honestly running `sudo /usr/bin/true` and `sudo -u postgres psql` in its
+# task clone, being told `a password is required`, and failing -- three
+# times, once per cascade link. The worker principal is unprivileged BY
+# DESIGN (ADR-0010). These pin the gate that refuses such a dispatch before
+# a model is ever launched.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def unprivileged_worker(monkeypatch):
+    """The fleet's actual posture: the deployment declares no authority, so
+    the worker holds none."""
+    monkeypatch.delenv(authority_preflight.GRANT_ENV_VAR, raising=False)
+
+
+def test_a_declared_authority_the_worker_lacks_is_refused_with_zero_model_calls(
+    handler, unprivileged_worker
+) -> None:
+    """The whole point: the incident cost three model runs to discover a fact
+    that is decidable from data. It must now cost none."""
+    run_agent, runs = handler
+    outcome = run_agent(
+        _payload(required_authorities=["root", "postgres_role"]), _event(), 1
+    )
+    assert not outcome.ok
+    assert runs == [], "no model may be launched for an authority mismatch"
+    assert outcome.reason.startswith("authority_unavailable:")
+    assert "root" in outcome.reason and "postgres_role" in outcome.reason
+
+
+def test_an_authority_refusal_is_non_retryable(handler, unprivileged_worker) -> None:
+    """Redelivery cannot hand this principal a sudoers entry it is designed
+    never to have, so every further attempt reproduces the identical refusal
+    on the way to the same dead letter -- which is exactly the three-attempt
+    burn measured on the restored queue. Same reasoning `daemon._dispatch`
+    already applies to an unknown payload kind."""
+    run_agent, _ = handler
+    outcome = run_agent(_payload(required_authorities=["root"]), _event(), 1)
+    assert outcome.retryable is False
+    # Not an infra wait either: the substrate is healthy, this is a routing
+    # fact, and refunding the attempt would re-deliver it forever.
+    assert outcome.infra_wait is False and outcome.lease_wait is False
+
+
+def test_the_authority_gate_runs_before_any_other_work(
+    handler, unprivileged_worker, monkeypatch
+) -> None:
+    """Placed first on purpose: no repository validation, no executor
+    preflight, no worktree provisioning. Anything else running first would be
+    work spent on a dispatch that cannot succeed."""
+    run_agent, runs = handler
+
+    def must_not_run(*args, **kwargs):
+        raise AssertionError("validated the repository for a blocked dispatch")
+
+    monkeypatch.setattr(agent_runner, "validate_repository", must_not_run)
+    monkeypatch.setattr(agent_runner, "claude_cli_preflight", must_not_run)
+    outcome = run_agent(_payload(required_authorities=["root"]), _event(), 1)
+    assert not outcome.ok and runs == []
+
+
+def test_a_task_declaring_nothing_is_unchanged(handler, unprivileged_worker) -> None:
+    """Every task that existed before this gate declares nothing, probes
+    nothing and behaves byte-for-byte as it did."""
+    run_agent, runs = handler
+    outcome = run_agent(_payload(), _event(), 1)
+    assert outcome.ok and len(runs) == 1
+
+
+def test_a_held_authority_lets_the_dispatch_through(handler, monkeypatch) -> None:
+    """The gate blocks a MISMATCH, not a declaration: a worker that actually
+    holds what the task asked for runs it normally. This is the
+    route-to-an-executor-that-has-it half of the acceptance."""
+    run_agent, runs = handler
+    monkeypatch.setenv(
+        authority_preflight.GRANT_ENV_VAR, "external_credential"
+    )
+    outcome = run_agent(
+        _payload(required_authorities=["external_credential"]), _event(), 1
+    )
+    assert outcome.ok and len(runs) == 1
+
+
+def test_a_partially_held_grant_still_blocks(handler, monkeypatch) -> None:
+    run_agent, runs = handler
+    monkeypatch.setenv(
+        authority_preflight.GRANT_ENV_VAR, "external_credential"
+    )
+    outcome = run_agent(
+        _payload(required_authorities=["external_credential", "root"]),
+        _event(),
+        1,
+    )
+    assert not outcome.ok and runs == []
+    assert "root" in outcome.reason
+
+
+def test_a_malformed_authority_declaration_is_a_non_retryable_payload_defect() -> None:
+    """Never defaulted to "needs nothing": that would dispatch a privileged
+    task to an unprivileged executor while the author believed they had
+    constrained it -- the incident, with a false audit trail on top."""
+    for bad in (["kubernetes_admin"], "root", {"root": True}, [7]):
+        error = parse_agent_run(_payload(required_authorities=bad))
+        assert isinstance(error, PayloadError), bad
+        assert error.retryable is False, error.reason
+
+
+def test_the_declaration_is_canonicalized_onto_the_request() -> None:
+    request = parse_agent_run(
+        _payload(required_authorities=["postgres_role", "ROOT", "root"])
+    )
+    assert request.required_authorities == ("root", "postgres_role")
+
+
+def test_a_run_that_reports_an_authority_wall_surfaces_it_in_the_result(
+    handler, monkeypatch
+) -> None:
+    """The discovery half: an UNDECLARED requirement becomes declared after
+    exactly one run (ingest records it and parks for the owner) instead of
+    being rediscovered by every remaining cascade link."""
+    run_agent, _ = handler
+
+    def reports_authority(**kwargs):
+        return agent_runner.RunResult(
+            status="completed",
+            exit_code=0,
+            stdout=json.dumps(
+                {
+                    "result": "Cannot proceed: this needs a host postgres role.\n"
+                    "REQUIRES_AUTHORITY: postgres_role"
+                }
+            ),
+            stderr="",
+            duration_seconds=1.0,
+            started_at="2026-08-30T12:00:00+00:00",
+            completed_at="2026-08-30T12:00:01+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", reports_authority)
+    outcome = run_agent(_payload(), _event(), 1)
+    assert outcome.result["required_authorities"] == ["postgres_role"]
+
+
+def test_an_ordinary_run_reports_no_authority_requirement(handler) -> None:
+    """The field is always present and always a list, so the ingest SQL can
+    read it unconditionally; an ordinary run leaves it empty."""
+    run_agent, _ = handler
+    outcome = run_agent(_payload(), _event(), 1)
+    assert outcome.result["required_authorities"] == []
+
+
+def test_prose_about_privileged_commands_never_becomes_a_requirement(
+    handler, monkeypatch
+) -> None:
+    """The regression pin for three rejected prompt-scanning designs, at the
+    handler seam: a run whose own report *discusses* sudo -- including the
+    exact bodies that defeated the verb allow-list, the context-free
+    `-u postgres` match and the guard-window scan -- declares nothing. Only
+    the anchored trailer declares."""
+    run_agent, _ = handler
+
+    def chatty(**kwargs):
+        return agent_runner.RunResult(
+            status="completed",
+            exit_code=0,
+            stdout=json.dumps(
+                {
+                    "result": "Added a test ensuring `sudo rm` is rejected.\n"
+                    "Documented why users must not run `sudo apt`.\n"
+                    "Updated the connection string, then noted "
+                    "`sudo systemctl restart postgres` in the runbook.\n"
+                    "This does not require root access.\n"
+                    "Verified `docker run -u postgres` needs no host role.\n"
+                }
+            ),
+            stderr="",
+            duration_seconds=1.0,
+            started_at="2026-08-30T12:00:00+00:00",
+            completed_at="2026-08-30T12:00:01+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", chatty)
+    outcome = run_agent(_payload(), _event(), 1)
+    assert outcome.result["required_authorities"] == []

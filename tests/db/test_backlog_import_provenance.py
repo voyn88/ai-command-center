@@ -1,7 +1,7 @@
 """The importer acts on the provenance verdict it is handed. Hermetic.
 
 The migration gate's third acceptance criterion ("existing records migrated
-with provenance") is a property of EVERY migrated row, and 0025 now makes the
+with provenance") is a property of EVERY migrated row, and 0037 now makes the
 insert and the stamp one transaction so the database cannot commit half of
 it. That leaves one way the guarantee could still be lost quietly: the Python
 caller taking a `provenance_recorded = false` back and reporting the row as

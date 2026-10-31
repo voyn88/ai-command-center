@@ -39,8 +39,8 @@ class ProvenanceNotRecorded(RuntimeError):
     criterion is a property of every migrated row, and an import run that
     returns a cheerful ``inserted`` count covering a row with no audit trail
     is exactly the silent no-op this class exists to make impossible. The SQL
-    side (0025) refuses to commit such a row at all, so reaching this means
-    the store is talking to something that is not the 0025 function."""
+    side (0037) refuses to commit such a row at all, so reaching this means
+    the store is talking to something that is not the 0037 function."""
 
     def __init__(self, task_id: str) -> None:
         super().__init__(
@@ -194,6 +194,21 @@ class BacklogStore:
         ok, reason, _revision = self._row(
             "SELECT * FROM backlog_record_remediation(%s, %s, %s, %s)",
             (task_id, parent_task_id, pr_url, rejected_head_sha),
+        )
+        return bool(ok), str(reason or "")
+
+    def record_followup(
+        self, task_id: str, parent_task_id: str, pr_url: str, head_sha: str, kind: str
+    ) -> tuple[bool, str]:
+        """Link a follow-up task to a review it did not block. Currently only
+        `kind='minor_findings'`: a CONFIRMED_MINOR finding the auto-accept
+        verifier confirmed real but non-blocking, tracked as ordinary
+        backlog work instead of living only in the PR audit comment. As
+        with `record_remediation`, this is audit lineage, never a readiness
+        gate on either task."""
+        ok, reason, _revision = self._row(
+            "SELECT * FROM backlog_record_followup(%s, %s, %s, %s, %s)",
+            (task_id, parent_task_id, pr_url, head_sha, kind),
         )
         return bool(ok), str(reason or "")
 
@@ -365,7 +380,7 @@ class BacklogStore:
         migration gate's "existing records migrated with provenance"
         acceptance criterion): the Markdown line it was read from, recorded
         once, at the moment the row is created, in the SAME transaction as
-        the insert (0025). A later re-import of the same task updates the row
+        the insert (0037). A later re-import of the same task updates the row
         through this same path but never restamps it — the row was migrated
         once, not once per import run.
 
@@ -396,7 +411,7 @@ class BacklogStore:
         """Stamp rows this Markdown names that carry no provenance event yet,
         returning the ids actually stamped (sorted).
 
-        The reconciliation half of the guarantee, for rows 0025 cannot reach
+        The reconciliation half of the guarantee, for rows 0037 cannot reach
         retroactively: those inserted before the stamp existed at all, and
         those inserted during the window when it was a second, separate round
         trip that a crash between the two could lose. Idempotent — a second
