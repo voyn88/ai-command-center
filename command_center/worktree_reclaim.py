@@ -9,12 +9,14 @@ every mechanism has one at all:
 - `workspace_provisioning.remove_workspace` is called on both the success
   and failure paths of the lease-worker daemon (`worker/handlers.py`) — that
   mechanism is self-cleaning.
-- `portfolio_launch.py`'s own `git worktree remove` fires *only* on rollback
-  of a launch that never actually started (queue-persist failure, or
-  `launch_ready` reporting the run never started). Once a portfolio-launched
-  run starts, nothing on that path — `runtime/supervisor.py`,
-  `runtime/completion.py` — ever calls `remove_workspace` again, on success,
-  on failure, or on abandonment. That worktree lives forever.
+- `portfolio_launch.py`'s rollback now goes through
+  `workspace_provisioning.force_remove_worktree` (the single ephemeral
+  removal site), but that still fires *only* on rollback of a launch that
+  never actually started (queue-persist failure, or `launch_ready`
+  reporting the run never started). Once a portfolio-launched run starts,
+  nothing on that path — `runtime/supervisor.py`, `runtime/completion.py`
+  — ever calls `remove_workspace` again, on success, on failure, or on
+  abandonment. That worktree lives forever.
 - `roadmap/program/ready_tasks.py --prepare-worktrees` creates a worktree
   ahead of a task being picked up and has no counterpart at all.
 - `command_center.daily_audit_backend` is mostly self-cleaning but
