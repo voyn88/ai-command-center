@@ -1276,6 +1276,221 @@ def test_a_unit_that_show_silently_drops_is_a_failed_measurement(monkeypatch) ->
     assert any(f.startswith("unit_health_probe_failed:") for f in report.failures)
 
 
+# --- the probe must not go blind when the host leaks units ---------------
+#
+# worker-01, 2026-10-30 (monitor finding #8349, `unit_health_probe_failed`):
+# systemd garbage-collects an *inactive* per-connection instance but keeps a
+# *failed* one loaded until `reset-failed`, so `aicc-agent-launcher@*.service`
+# instances accumulated without bound. One `systemctl show` over every listed
+# name is then an argv `execve` refuses (~41 000 names of that length on an
+# 8 MiB stack rlimit: E2BIG) and one whole-host `GetAll` inside PID 1 per
+# unit, past any fixed timeout. A fail-closed probe whose cost grows with
+# what the host leaked goes blind exactly when the host is sickest.
+
+#: Measured on the fleet's hosts: the argv+envp bytes `execve` accepts with
+#: an 8 MiB stack rlimit (RLIMIT_STACK / 4) before E2BIG. 41 089 names of
+#: per-connection instance length is the whole allowance.
+KERNEL_ARGV_BYTE_CEILING = 1_766_827
+
+
+def _leaked_host_listing(dead_connections: int) -> str:
+    """A listing shaped like worker-01: a few real services and a landslide
+    of failed per-connection launcher instances."""
+    rows = [
+        "voyn-ollama.service                loaded active     running VOYN Ollama",
+        "voyn-crm.service                   loaded active     running VOYN CRM",
+        "ollama.service                     loaded activating auto-restart Ollama",
+        "voyn-canary.service                loaded failed     failed  VOYN canary",
+    ]
+    rows += [
+        f"aicc-agent-launcher@{index}-27636-984.service"
+        " loaded failed failed AICC launcher"
+        for index in range(dead_connections)
+    ]
+    return "\n".join(rows) + "\n"
+
+
+def _fake_systemctl(listing: str, *, restarts: dict[str, int] | None = None):
+    """A systemctl that refuses an over-long command line exactly as the
+    kernel does, and answers `show` only for what it was asked."""
+    calls: list[list[str]] = []
+    counters = restarts or {}
+    states = dict(infra_monitor.parse_unit_listing(listing))
+
+    def _run(args, **_kwargs):
+        calls.append(args)
+        if sum(len(arg) + 1 for arg in args) > KERNEL_ARGV_BYTE_CEILING:
+            raise OSError(7, "Argument list too long", "systemctl")
+        if args[1] == "list-units":
+            return subprocess.CompletedProcess(args, 0, stdout=listing, stderr="")
+        assert args[1] == "show"
+        requested = args[args.index("--") + 1 :]
+        return subprocess.CompletedProcess(
+            args,
+            0,
+            stdout="\n".join(
+                _show_block(unit, counters.get(unit, 0), states[unit])
+                for unit in requested
+            ),
+            stderr="",
+        )
+
+    return _run, calls
+
+
+def test_a_host_that_leaked_dead_connections_is_still_measured(monkeypatch) -> None:
+    listing = _leaked_host_listing(50_000)
+    run, calls = _fake_systemctl(
+        listing,
+        restarts={"ollama.service": 315_891, "voyn-canary.service": 70_305},
+    )
+    monkeypatch.setattr(infra_monitor.subprocess, "run", run)
+
+    snapshot = infra_monitor.read_unit_health_snapshot(crash_loop_restarts=5)
+
+    # Measured, not failed closed on its own command line.
+    assert snapshot.error is None
+    # Every dead connection is counted from the listing -- one finding with
+    # the full count, not 50 000 findings and not a dropped number.
+    assert snapshot.failed_units == (
+        ("aicc-agent-launcher@*.service", 50_000),
+        ("voyn-canary.service", 1),
+    )
+    # A real service's restart counter still arrives, failed or activating.
+    assert snapshot.crash_loops == (
+        ("ollama.service", 315_891),
+        ("voyn-canary.service", 70_305),
+    )
+
+    report = infra_monitor.evaluate(
+        {}, None, minimum_active_workers=0, max_stalled_seconds=900,
+        prometheus_ready=True, unit_health=snapshot,
+    )
+    assert not any(f.startswith("unit_health_probe_failed") for f in report.failures)
+    assert (
+        "failed_units:2:aicc-agent-launcher@*.service=50000,voyn-canary.service=1"
+        in report.failures
+    )
+
+    # The argv is bounded per call, and the number of calls is bounded by the
+    # units whose finding the listing did not already settle -- not by what
+    # the host leaked.
+    show_calls = [call for call in calls if call[1] == "show"]
+    assert len(show_calls) == 1
+    for call in show_calls:
+        names = call[call.index("--") + 1 :]
+        assert len(names) <= infra_monitor.UNIT_SHOW_BATCH
+        assert sum(len(name) + 1 for name in names) < 64 * 1024
+
+
+def test_the_show_argv_stays_bounded_when_every_unit_must_be_read(monkeypatch) -> None:
+    # Nothing failed, so the listing settles nothing: every one of 3 000
+    # units needs its restart counter, and the probe still never builds a
+    # command line the kernel would refuse.
+    listing = "\n".join(
+        f"voyn-lane-{index}.service loaded active running VOYN lane {index}"
+        for index in range(3_000)
+    )
+    run, calls = _fake_systemctl(listing, restarts={"voyn-lane-7.service": 9})
+    monkeypatch.setattr(infra_monitor.subprocess, "run", run)
+
+    snapshot = infra_monitor.read_unit_health_snapshot(crash_loop_restarts=5)
+
+    assert snapshot.error is None
+    assert snapshot.crash_loops == (("voyn-lane-7.service", 9),)
+    show_calls = [call for call in calls if call[1] == "show"]
+    assert len(show_calls) == -(-3_000 // infra_monitor.UNIT_SHOW_BATCH)
+    assert all(
+        len(call[call.index("--") + 1 :]) <= infra_monitor.UNIT_SHOW_BATCH
+        for call in show_calls
+    )
+    # Every batch carries the whole property set and the `--` terminator.
+    assert all("--property=Id,LoadState,NRestarts,ActiveState" in call for call in show_calls)
+
+
+def test_a_unit_dropped_from_any_batch_is_still_a_failed_measurement(
+    monkeypatch,
+) -> None:
+    listing = "\n".join(
+        f"voyn-lane-{index}.service loaded active running VOYN lane {index}"
+        for index in range(600)
+    )
+    run, _calls = _fake_systemctl(listing)
+
+    def _drop_one(args, **kwargs):
+        completed = run(args, **kwargs)
+        if args[1] == "show" and "voyn-lane-599.service" in args:
+            return subprocess.CompletedProcess(
+                args,
+                0,
+                stdout="\n\n".join(completed.stdout.split("\n\n")[:-1]),
+                stderr="",
+            )
+        return completed
+
+    monkeypatch.setattr(infra_monitor.subprocess, "run", _drop_one)
+    snapshot = infra_monitor.read_unit_health_snapshot(crash_loop_restarts=5)
+    assert snapshot.error is not None and "599 of 600" in snapshot.error
+
+
+def test_the_show_phase_has_one_budget_and_says_how_far_it_got(monkeypatch) -> None:
+    listing = "\n".join(
+        f"voyn-lane-{index}.service loaded active running VOYN lane {index}"
+        for index in range(1_000)
+    )
+    run, _calls = _fake_systemctl(listing)
+    monkeypatch.setattr(infra_monitor.subprocess, "run", run)
+    # A host so large that the second batch starts after the budget is gone.
+    ticks = [0.0, 0.0, infra_monitor.UNIT_SHOW_BUDGET_SECONDS + 1.0]
+    monkeypatch.setattr(
+        infra_monitor.time, "monotonic", lambda: ticks.pop(0) if ticks else 1e6
+    )
+
+    snapshot = infra_monitor.read_unit_health_snapshot(crash_loop_restarts=5)
+
+    assert snapshot.error is not None
+    assert "of 1000 units" in snapshot.error
+    report = infra_monitor.evaluate(
+        {}, None, minimum_active_workers=0, max_stalled_seconds=900,
+        prometheus_ready=True, unit_health=snapshot,
+    )
+    assert any(f.startswith("unit_health_probe_failed:") for f in report.failures)
+
+
+def test_the_listing_carries_the_state_and_survives_the_failed_row_marker() -> None:
+    assert infra_monitor.parse_unit_listing(LIST_UNITS_REAL) == [
+        ("aicc-agent-launcher@2079-27636-984.service", "failed"),
+        ("aicc-agent-launcher@2080-27700-984.service", "failed"),
+        ("ollama.service", "activating"),
+        ("voyn-crm.service", "active"),
+        ("voyn-ollama.service", "active"),
+    ]
+    # A row with no state column keeps the unit on the measured path rather
+    # than letting an unparsable row decide that a unit goes unread.
+    assert infra_monitor.parse_unit_listing("lonely.service\n") == [
+        ("lonely.service", "")
+    ]
+    assert infra_monitor.units_to_show([("lonely.service", "")]) == ["lonely.service"]
+
+
+def test_failed_instances_are_read_up_to_the_cap_then_only_counted() -> None:
+    cap = infra_monitor.FAILED_UNIT_SHOW_CAP
+    listing = [
+        (f"aicc-agent-launcher@{index}-1-984.service", "failed")
+        for index in range(cap + 500)
+    ]
+    listing += [("voyn-canary.service", "failed"), ("voyn-crm.service", "active")]
+
+    asked = infra_monitor.units_to_show(listing)
+
+    # The family is read up to the cap; a non-template failed unit and every
+    # unit the listing did not condemn are always read.
+    family = [name for name in asked if name.startswith("aicc-agent-launcher@")]
+    assert len(family) == cap
+    assert "voyn-canary.service" in asked and "voyn-crm.service" in asked
+    assert asked == sorted(asked)
+
+
 # --- deploy lag: green main versus what production actually runs ----------
 #
 # worker-01, 2026-09-13 14:48 .. 09-14 18:49: six merged PRs sat behind a
