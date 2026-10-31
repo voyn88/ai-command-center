@@ -51,6 +51,16 @@ pr/sha evidence, moving the task to READY_TO_REVIEW. This module is the rest:
 - ``merge_once``: for each PR that carries an ACCEPT marker AND whose required
   checks are green, ``gh pr merge`` it and move the task READY_TO_REVIEW→DONE
   with the merged sha as evidence (via the existing backlog_transition gate).
+  The merge itself runs under ``_merge_app_credentials``' own GitHub App
+  installation -- a third identity, distinct from both the ambient ``gh``
+  credential every read in this module uses and the acceptance identity that
+  posts the marker -- so worker and planner code, which never sees that
+  identity's secrets, has no path to executing ``gh pr merge`` at all
+  (VOYN-W0-AICC-MERGE-GATEWAY-REM-REM-REM). Anything that keeps this tick from
+  even evaluating a merge -- the identity unconfigured, its token failing to
+  mint, a readiness read that never reached the GitHub API -- lands in
+  ``LoopReport.errors``, kept apart from ``skipped`` so a caller can fail
+  loudly instead of it looking like an ordinary not-yet-accepted PR.
   A PR that is only BEHIND main gets `gh pr update-branch`, which mints a
   fresh head with no marker on it -- ``_carry_over_marker_if_patch_id_stable``
   then reposts the ACCEPT marker on that new head, with its own audited
@@ -169,6 +179,15 @@ class LoopReport:
     #: Fresh, bounded identities dispatched to replace succeeded review runs
     #: whose final result cannot be parsed for the current PR head.
     retried: list[tuple[str, str]] = field(default_factory=list)
+    #: (task_id, reason) the tick could not even evaluate, as opposed to
+    #: evaluated-and-not-ready: the merge identity is unconfigured or
+    #: misconfigured, its installation token could not be minted, or a
+    #: readiness lookup failed to reach the GitHub API at all. Kept apart
+    #: from `skipped` deliberately -- see `merge_once`'s docstring
+    #: (VOYN-W0-AICC-MERGE-GATEWAY-REM-REM-REM) -- so a caller can fail loudly
+    #: instead of this looking identical to a PR that just isn't accepted
+    #: yet.
+    errors: list[tuple[str, str]] = field(default_factory=list)
     #: What this tick spent at GitHub and under which identity -- see
     #: `gh_access.GhQuota`. None when the report was built outside a tick
     #: scope (a unit test constructing one by hand).
@@ -623,6 +642,61 @@ def _post_marker_as_bot(
     return True, ""
 
 
+def _merge_app_credentials() -> github_app_auth.GitHubAppCredentials | None:
+    """The merge identity's credentials -- a THIRD GitHub App installation,
+    distinct from both the ambient credential `_gh()` uses for every
+    read-only call in this module and the acceptance identity
+    `_acceptance_app_credentials` mints for posting the marker
+    (VOYN-W0-AICC-MERGE-GATEWAY-REM-REM-REM).
+
+    Before this identity existed, `merge_once` executed `gh pr merge`
+    under the same ambient `gh` credential every other call in this
+    module already shares -- confirmed by reading the code at f289127,
+    unchanged across #345-351: whichever token `gh` was configured with
+    on the host running the tick could both author a pull request and
+    merge it. Splitting the acceptance marker onto its own identity
+    (VOYN-W0-AICC-MARKER-REVIEWER-INDEPENDENCE) closed the self-approval
+    gap in *what gets posted*, but left the actual merge -- the
+    irreversible act -- on the same shared credential. This identity is
+    the sole holder of that capability: worker and planner code never
+    sees `VOYN_MERGE_APP_ID`/`_INSTALLATION_ID`/`_PRIVATE_KEY_PATH`, so
+    nothing outside this one call site in `merge_once` can ever execute
+    `gh pr merge`.
+
+    All three or none, exactly like `_acceptance_app_credentials`: a
+    partial set is a misconfiguration, and unlike that function's
+    same-tick fallback-free skip, an unconfigured or partially configured
+    merge identity here is reported to `LoopReport.errors`, not
+    `skipped` -- this tick's only job is merging, so failing to reach
+    that capability is never indistinguishable from "nothing to merge
+    yet." See `merge_once`."""
+    app_id = os.environ.get("VOYN_MERGE_APP_ID", "")
+    installation_id = os.environ.get("VOYN_MERGE_INSTALLATION_ID", "")
+    key_path = os.environ.get("VOYN_MERGE_PRIVATE_KEY_PATH", "")
+    if not (app_id and installation_id and key_path):
+        return None
+    return github_app_auth.GitHubAppCredentials(app_id, installation_id, Path(key_path))
+
+
+def _merge_pr_as_bot(
+    repo_path: str, pr_url: str, token: str
+) -> subprocess.CompletedProcess[str]:
+    """Run `gh pr merge` authenticated as the merge identity's freshly
+    minted installation token via `GH_TOKEN` -- which `gh` itself
+    prioritizes over any stored `gh auth login` credential for exactly
+    this one subprocess -- rather than switching to a raw REST call.
+    `gh pr merge` already knows how to enqueue a PR on a merge-queue-
+    protected repository instead of merging it synchronously (see
+    `_merged_target_sha`'s docstring); reimplementing that branch against
+    the REST/GraphQL merge endpoints directly would risk silently losing
+    it. The credential is what changes here, not the mechanism."""
+    return subprocess.run(
+        ["gh", "pr", "merge", pr_url, "--squash"],
+        cwd=repo_path, capture_output=True, text=True, check=False, timeout=120,
+        env={**os.environ, "GH_TOKEN": token},
+    )
+
+
 def _rows(factory: Any, sql: str, params: tuple = ()) -> list[tuple]:
     with factory() as conn, conn.cursor() as cur:
         cur.execute(sql, params)
@@ -668,7 +742,7 @@ _REVIEW_INPUT_MARKER = "\nINPUT_ENVELOPE_JSON:\n"
 _MAX_REVIEW_PROMPT_BYTES = 16_000
 _MAX_REVIEW_DIFF_BYTES = 8 * 1024 * 1024
 
-_PR_URL = re.compile(r"^https://github\.com/([^/]+)/([^/]+)/pull/(\d+)$")
+_PR_URL = re.compile(r"https://github\.com/([A-Za-z0-9][A-Za-z0-9-]*)/([A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)")
 
 # Bumped whenever _REVIEW_PROMPT's contract changes in a way that makes an
 # old verdict untrustworthy under the new policy (e.g. what the agent is
@@ -709,7 +783,7 @@ def _verification_review_cascade() -> list[dict[str, Any]]:
 
 
 def _repo_from_pr_url(pr_url: str) -> str | None:
-    match = _PR_URL.match(pr_url)
+    match = _PR_URL.fullmatch(pr_url)
     return match.group(2) if match else None
 
 
@@ -717,10 +791,32 @@ def _owner_repo_number_from_pr_url(pr_url: str) -> tuple[str, str, str] | None:
     """(owner, repo, pr_number) for the GitHub REST API path -- unlike
     `_repo_from_pr_url` (only the repo name, for the review-cycle key), the
     bot-identity marker post below needs the owner too."""
-    match = _PR_URL.match(pr_url)
+    match = _PR_URL.fullmatch(pr_url)
     if match is None:
         return None
     return match.group(1), match.group(2), match.group(3)
+
+
+def _clear_pr_evidence(factory: Any, task_id: str, pr_url: str, reason: str) -> str:
+    """Remove a 'pr' evidence row this tick has already proven can never
+    resolve (VOYN-W0-AICC-REPO-ROUTE-AND-EVIDENCE-HYGIENE) -- e.g. not even
+    shaped like a GitHub PR URL. `backlog_clear_evidence` is idempotent (a
+    row another tick already cleared is `already_absent`, not an error) and,
+    if this was the task's last 'pr' row, sends a READY_TO_REVIEW task back
+    for a fresh attempt itself; the returned verdict reason is folded into
+    the caller's own skip line rather than re-derived here.
+
+    Transient GitHub lookup failures must never call this -- only values
+    proven unresolvable without a successful API response (malformed shape).
+    Merged PRs without acceptance evidence stay skipped as
+    `merged_without_acceptance_evidence` and are never cleared to DONE here.
+    """
+    rows = _rows(
+        factory,
+        "SELECT reason FROM backlog_clear_evidence(%s, 'pr', %s, %s)",
+        (task_id, pr_url, reason),
+    )
+    return rows[0][0] if rows else "unknown"
 
 
 @dataclass(frozen=True, slots=True)
@@ -753,7 +849,7 @@ def _review_key(task_id: str, pr_url: str, snapshot: _PRSnapshot) -> str | None:
     overwritten. Returns None if `pr_url` doesn't parse (caller already
     validates this via `_repo_from_pr_url` before reaching here in
     practice, but a malformed URL must never produce a malformed key)."""
-    match = _PR_URL.match(pr_url)
+    match = _PR_URL.fullmatch(pr_url)
     if (match is None or not re.fullmatch(r"[0-9a-f]{40}", snapshot.base)
             or not re.fullmatch(r"[0-9a-f]{40}", snapshot.head)
             or not re.fullmatch(r"[0-9a-f]{64}", snapshot.digest)):
@@ -1192,7 +1288,7 @@ def _next_retry_key(
     if state != "succeeded" or attempt >= _MAX_RESULT_RETRY_ATTEMPTS:
         return None
     result = _json_object(payload_value)
-    parsed = _parse_verdict((result or {}).get("result_text") or "")
+    parsed = _parse_review_verdict((result or {}).get("result_text") or "")
     if parsed is not None and parsed[1] == expected_head:
         return None
     return f"{base_key}:retry:{attempt + 1}"
@@ -1267,6 +1363,8 @@ def _pr_diff_and_head(
             data = json.loads(view.stdout or "{}") if view.returncode == 0 else {}
         else:
             data = pull
+        if data.get("state") != "open" or data.get("merged_at"):
+            return None
         base, head = data["base"], data["head"]
         base_sha, head_sha = base["sha"], head["sha"]
         same_repo = base["repo"]["full_name"].casefold() == f"{owner}/{repo}".casefold()
@@ -1294,7 +1392,21 @@ def _pr_diff_and_head(
         sum(line.startswith("+") and not line.startswith("+++ ") for line in lines),
         sum(line.startswith("-") and not line.startswith("--- ") for line in lines),
     )
-    return _PRSnapshot.create(text, base_sha, head_sha) if observed == stats else None
+    if observed != stats:
+        return None
+    # A compare is immutable, but the PR can close or move while it is fetched.
+    # Revalidate before scheduling model work against that exact snapshot.
+    refreshed = _gh(["api", f"repos/{owner}/{repo}/pulls/{number}"], repo_path)
+    try:
+        current = json.loads(refreshed.stdout or "{}")
+        if (refreshed.returncode != 0 or current.get("state") != "open"
+                or current.get("merged_at")
+                or current["head"]["sha"] != head_sha
+                or current["base"]["sha"] != base_sha):
+            return None
+    except (KeyError, TypeError, AttributeError, json.JSONDecodeError):
+        return None
+    return _PRSnapshot.create(text, base_sha, head_sha)
 
 
 def _pr_diff_and_head_with_pull(
@@ -1501,7 +1613,17 @@ def _review_once(
             report.skipped.append((task_id, "no_review_executor_route"))
             continue
         repo = _repo_from_pr_url(pr_url)
-        route = repo_route(repo) if repo else None
+        if repo is None:
+            # Not even shaped like a GitHub PR URL -- can never resolve
+            # through any gh call below, so there is nothing to retry
+            # (VOYN-W0-AICC-REPO-ROUTE-AND-EVIDENCE-HYGIENE). A shape-valid
+            # URL whose repo simply has no route table entry is left alone
+            # below: that is an operator fact (add the route), not bogus
+            # evidence.
+            verdict = _clear_pr_evidence(factory, task_id, pr_url, "malformed_pr_url")
+            report.skipped.append((task_id, f"malformed_pr_url:{verdict}: {pr_url!r}"))
+            continue
+        route = repo_route(repo)
         if route is None:
             report.skipped.append((task_id, f"no_repo_route: {pr_url!r}"))
             continue
@@ -1736,6 +1858,30 @@ def _parse_verdict(text: str) -> tuple[str, str] | None:
     return verdict_match.group(1), sha_match.group(1)
 
 
+def _review_has_findings(text: str) -> bool:
+    """Reject trailers/chunk headers alone are malformed, never evidence.
+
+    This validates presence, not the truth or quality of a finding. Nonempty
+    findings still undergo independent verification under the existing policy.
+    """
+    for line in text.splitlines():
+        line = line.strip()
+        if (not line or re.fullmatch(r"Chunk \d+/\d+:", line)
+                or re.fullmatch(r"VERDICT:\s*(?:ACCEPT|REJECT)", line)
+                or re.fullmatch(r"HEAD_SHA:\s*[0-9a-f]{7,40}", line)
+                or re.fullmatch(r"`{3}(?:[a-zA-Z]+)?|[-*_]{3,}", line)):
+            continue
+        return True
+    return False
+
+
+def _parse_review_verdict(text: str) -> tuple[str, str] | None:
+    parsed = _parse_verdict(text)
+    if parsed is not None and parsed[0] == "REJECT" and not _review_has_findings(text):
+        return None
+    return parsed
+
+
 def _latest_review_result(factory: Any, task_id: str, key: str) -> dict[str, Any] | None:
     """The succeeded review-class work result for this exact review-cycle
     key (task, PR, head sha, policy version), or None if no review has
@@ -1787,7 +1933,7 @@ def _chunk_review_rows(
         if current is None or attempt > current[0]:
             newest[base_key] = (attempt, (base_key, *row[1:]))
         result = _json_object(row[3])
-        parsed = _parse_verdict((result or {}).get("result_text") or "")
+        parsed = _parse_review_verdict((result or {}).get("result_text") or "")
         valid = first_valid.get(base_key)
         if parsed is not None and parsed[1] == snapshot.head and (
             valid is None or attempt < valid[0]
@@ -1867,7 +2013,7 @@ def _aggregate_chunk_verdict(
             waiting_reason = waiting_reason or f"review_chunk_not_succeeded:{index}:{state}"
             continue
         text = result.get("result_text") or ""
-        parsed = _parse_verdict(text)
+        parsed = _parse_review_verdict(text)
         if parsed is None:
             waiting_reason = waiting_reason or f"review_chunk_verdict_missing:{index}"
             continue
@@ -2377,6 +2523,8 @@ def _verified_rejection_outcome(
       cleanly must never auto-accept, and parking the task forever would
       recreate exactly the stall this task exists to remove.
     """
+    if not _review_has_findings(findings):
+        return "WAIT", "review_reject_missing_findings"
     key = _verification_key(task_id, pr_url, snapshot, findings)
     if key is None or len(findings.encode("utf-8")) > _MAX_VERIFICATION_FINDINGS_BYTES:
         return "REMEDIATE", findings
@@ -2598,6 +2746,14 @@ def publish_review_verdicts(
             break
         prev_processed = last_processed
         last_processed = (task_id, pr_url)
+        if _repo_from_pr_url(pr_url) is None:
+            # Same shape gate as review_once -- a malformed pr_url would
+            # otherwise fail `gh pr view` and read as an ordinary
+            # `pr_view_failed`, retried forever alongside genuine transient
+            # lookup failures (VOYN-W0-AICC-REPO-ROUTE-AND-EVIDENCE-HYGIENE).
+            verdict = _clear_pr_evidence(factory, task_id, pr_url, "malformed_pr_url")
+            report.skipped.append((task_id, f"malformed_pr_url:{verdict}: {pr_url!r}"))
+            continue
         window = _pr_window_expensive_read_decision(
             repo_path, pr_url, prefix="review_window"
         )
@@ -2641,7 +2797,7 @@ def publish_review_verdicts(
                 report.skipped.append((task_id, "no_review_result_yet"))
                 continue
             text = result.get("result_text") or ""
-            parsed = _parse_verdict(text)
+            parsed = _parse_review_verdict(text)
             if parsed is None:
                 report.skipped.append((task_id, "verdict_or_head_sha_missing_in_review_result"))
                 continue
@@ -2791,7 +2947,8 @@ def _check_is_pending(check: dict[str, Any]) -> bool:
     (`conclusion: AMBIGUOUS`, synthesised by `_latest_checks_by_name`) is
     deliberately not pending: two disagreeing runs are a verdict problem,
     not a timing one."""
-    if check.get("conclusion") is not None:
+    # gh GraphQL serializes an unfinished CheckRun as either null or "".
+    if check.get("conclusion") not in (None, ""):
         return False
     status = check.get("status")
     if status is not None:
@@ -2888,7 +3045,7 @@ def _pr_is_mergeable(
         if not _check_is_green(c) and not _check_is_pending(c)
     ]
     if red:
-        rerun = _rerun_cancelled_latest_runs(repo_path, rollup)
+        rerun = _rerun_cancelled_latest_runs(repo_path, rollup, head)
         if rerun:
             return False, f"checks_cancelled_rerun_requested: {rerun[:3]}"
         return False, f"checks_not_green: {red[:3]}"
@@ -2899,13 +3056,9 @@ def _pr_is_mergeable(
     missing = [name for name in required_checks if name not in present]
     if missing:
         return False, f"checks_missing: {missing[:3]}"
-    rerun, stale_duplicate = _rerun_stale_duplicate_red_runs(
-        repo_path, raw_rollup, required_checks
-    )
-    if rerun:
-        return False, f"stale_duplicate_checks_rerun_requested: {rerun[:3]}"
-    if stale_duplicate:
-        return False, "stale_duplicate_checks_unresolved"
+    # Superseded failures are not retry candidates. Re-running them can
+    # cancel their successful or pending replacements through workflow
+    # concurrency. GitHub's native merge protection remains authoritative.
     return True, head
 
 
@@ -2922,115 +3075,78 @@ _MAX_RUN_ATTEMPTS_FOR_RERUN = 3
 _RUN_ID_IN_DETAILS_URL = re.compile(r"/actions/runs/(\d+)(?:/|$)")
 
 
+def _latest_workflow_runs(repo_path: str, head: str) -> list[dict[str, Any]]:
+    """Select one newest run per workflow on this exact head before retrying.
+
+    A job rollup can still show an old cancelled check while a replacement
+    workflow has not emitted that job yet. Workflow-level state is therefore
+    needed even after `_latest_checks_by_name`. Missing metadata means no
+    retry, never permission to rerun an arbitrary historical failure. A
+    newer skipped label-noise run also suppresses old retries conservatively;
+    GitHub protection, not retrying history, decides whether merge can proceed.
+    """
+    if not re.fullmatch(r"[0-9a-f]{40}", head):
+        return []
+    listing = _gh(
+        ["run", "list", "--commit", head, "--limit", "100", "--json",
+         "databaseId,headSha,workflowName,createdAt,status,conclusion,attempt"],
+        repo_path,
+    )
+    if listing.returncode != 0:
+        return []
+    try:
+        runs = json.loads(listing.stdout or "[]")
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(runs, list):
+        return []
+    latest: dict[str, dict[str, Any]] = {}
+    for run in runs:
+        if not isinstance(run, dict):
+            return []
+        if run.get("headSha") != head:
+            continue
+        name, created = run.get("workflowName"), run.get("createdAt")
+        run_id = run.get("databaseId")
+        if (not isinstance(name, str) or not name
+                or not isinstance(created, str) or not created
+                or not isinstance(run_id, int) or isinstance(run_id, bool)):
+            return []
+        previous = latest.get(name)
+        if previous is None or (created, run_id) > (
+            previous["createdAt"], previous["databaseId"]
+        ):
+            latest[name] = run
+    return list(latest.values())
+
+
 def _rerun_cancelled_latest_runs(
-    repo_path: str, latest_checks: list[dict[str, Any]]
+    repo_path: str, latest_checks: list[dict[str, Any]], head: str
 ) -> list[str]:
-    """Ask GitHub to rerun every workflow run whose LATEST check on the head
-    ended `CANCELLED`, at most `_MAX_RERUNS_PER_PR_PER_TICK` runs and only
-    while the run has fewer than `_MAX_RUN_ATTEMPTS_FOR_RERUN` attempts.
-    Returns the run ids a rerun was requested for. Idempotent by
-    construction: after the request the latest check is queued, not
-    cancelled, so the next tick does not ask again."""
-    run_ids: list[str] = []
+    """Retry only cancelled latest workflows, never their obsolete jobs."""
+    candidates = set()
     for check in latest_checks:
         if str(check.get("conclusion") or "").upper() != "CANCELLED":
             continue
         match = _RUN_ID_IN_DETAILS_URL.search(str(check.get("detailsUrl") or ""))
-        if match is None or match.group(1) in run_ids:
-            continue
-        run_ids.append(match.group(1))
+        if match is not None:
+            candidates.add(match.group(1))
+    if not candidates:
+        return []
     requested: list[str] = []
-    for run_id in run_ids:
+    for run in _latest_workflow_runs(repo_path, head):
+        run_id, attempt = str(run["databaseId"]), run.get("attempt")
+        if (run_id not in candidates or run.get("status") != "completed"
+                or run.get("conclusion") != "cancelled"
+                or not isinstance(attempt, int)
+                or not 1 <= attempt < _MAX_RUN_ATTEMPTS_FOR_RERUN):
+            continue
         if len(requested) >= _MAX_RERUNS_PER_PR_PER_TICK:
             break
-        view = _gh(["run", "view", run_id, "--json", "attempt"], repo_path)
-        if view.returncode != 0:
-            continue
-        try:
-            attempt = int((json.loads(view.stdout or "{}") or {}).get("attempt") or 0)
-        except (ValueError, TypeError, json.JSONDecodeError):
-            continue
-        if attempt >= _MAX_RUN_ATTEMPTS_FOR_RERUN:
-            continue
         rerun = _gh(["run", "rerun", run_id], repo_path)
         if rerun.returncode == 0:
             requested.append(run_id)
     return requested
-
-
-def _check_run_time(check: dict[str, Any]) -> str:
-    return str(check.get("startedAt") or check.get("completedAt") or "")
-
-
-def _rerun_stale_duplicate_red_runs(
-    repo_path: str,
-    rollup: list[dict[str, Any]],
-    required_checks: tuple[str, ...] = _DEFAULT_REQUIRED_MERGE_CHECKS,
-) -> tuple[list[str], bool]:
-    """Rerun older red duplicate workflow runs once a newer duplicate is green.
-
-    GitHub may keep old failed/cancelled check-runs on the same commit after a
-    label-churn or concurrency cancellation. `_latest_checks_by_name` correctly
-    treats the PR's latest check verdict as green, but GitHub's overall rollup
-    can still remain FAILURE until the old run is retried. Clean that stale
-    tail automatically, bounded by the same per-run attempt cap used for latest
-    cancelled checks.
-    """
-    required = set(required_checks)
-    by_name: dict[str, list[dict[str, Any]]] = {}
-    for check in rollup:
-        name = str(check.get("name") or "")
-        if name in required:
-            by_name.setdefault(name, []).append(check)
-
-    run_ids: list[tuple[str, str]] = []
-    for checks in by_name.values():
-        if len(checks) < 2:
-            continue
-        timed = [(check, _check_run_time(check)) for check in checks]
-        if any(not stamp for _check, stamp in timed):
-            continue
-        latest, latest_at = max(timed, key=lambda item: item[1])
-        if not _check_is_green(latest):
-            continue
-        latest_run = _RUN_ID_IN_DETAILS_URL.search(str(latest.get("detailsUrl") or ""))
-        latest_run_id = latest_run.group(1) if latest_run is not None else ""
-        for check, stamp in timed:
-            if stamp >= latest_at or _check_is_green(check):
-                continue
-            conclusion = str(check.get("conclusion") or "").upper()
-            if conclusion not in {"FAILURE", "CANCELLED", "TIMED_OUT"}:
-                continue
-            match = _RUN_ID_IN_DETAILS_URL.search(str(check.get("detailsUrl") or ""))
-            if match is None:
-                continue
-            run_id = match.group(1)
-            if run_id == latest_run_id:
-                continue
-            mode = "--failed" if conclusion == "FAILURE" else ""
-            if (run_id, mode) not in run_ids:
-                run_ids.append((run_id, mode))
-
-    requested: list[str] = []
-    for run_id, mode in run_ids:
-        if len(requested) >= _MAX_RERUNS_PER_PR_PER_TICK:
-            break
-        view = _gh(["run", "view", run_id, "--json", "attempt"], repo_path)
-        if view.returncode != 0:
-            continue
-        try:
-            attempt = int((json.loads(view.stdout or "{}") or {}).get("attempt") or 0)
-        except (ValueError, TypeError, json.JSONDecodeError):
-            continue
-        if attempt >= _MAX_RUN_ATTEMPTS_FOR_RERUN:
-            continue
-        argv = ["run", "rerun", run_id]
-        if mode:
-            argv.append(mode)
-        rerun = _gh(argv, repo_path)
-        if rerun.returncode == 0:
-            requested.append(run_id)
-    return requested, bool(run_ids)
 
 
 def _merge_state(repo_path: str, pr_url: str) -> str:
@@ -3172,7 +3288,7 @@ def _merged_target_sha(repo_path: str, pr_url: str) -> tuple[str | None, str]:
 
 def _rerun_failed_ci_once(repo_path: str, pr_url: str) -> str:
     """Bounded flake retry (VOYN-W0-AICC-CI-FLAKE-AUTO-RERUN): rerun the
-    FAILED jobs of completed-and-failed workflow runs on the PR's current
+    FAILED jobs of the newest completed-and-failed workflow on the current
     head, at most once per run -- GitHub's own run ``attempt`` counter is
     the bound (a run already at attempt >= 2 is never touched again), so a
     genuinely red change costs exactly one extra bounded rerun and can
@@ -3190,19 +3306,10 @@ def _rerun_failed_ci_once(repo_path: str, pr_url: str) -> str:
     branch, head = data.get("headRefName"), data.get("headRefOid")
     if not branch or not head:
         return ""
-    listing = _gh(
-        ["run", "list", "--branch", str(branch), "--limit", "20",
-         "--json", "databaseId,headSha,status,conclusion,attempt"],
-        repo_path,
-    )
-    if listing.returncode != 0:
-        return ""
-    try:
-        runs = json.loads(listing.stdout or "[]")
-    except json.JSONDecodeError:
-        return ""
     dispatched = 0
-    for run in runs if isinstance(runs, list) else []:
+    for run in _latest_workflow_runs(repo_path, str(head)):
+        if dispatched >= _MAX_RERUNS_PER_PR_PER_TICK:
+            break
         if (
             isinstance(run, dict)
             and run.get("headSha") == head
@@ -3763,7 +3870,29 @@ def _merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -
     """Merge every READY_TO_REVIEW task whose PR carries an ACCEPT marker and
     green checks, then close it DONE -- with the TARGET-BRANCH merge commit
     as evidence, only once GitHub reports the PR actually MERGED (see
-    `_merged_target_sha`; a queued merge is a wait, not a completion)."""
+    `_merged_target_sha`; a queued merge is a wait, not a completion).
+
+    This is the gateway VOYN-W0-AICC-MERGE-GATEWAY-REM-REM-REM asks for: the
+    only call site anywhere in this codebase that executes `gh pr merge`,
+    and it does so under `_merge_app_credentials`'s dedicated identity --
+    never the ambient credential `_gh()` uses for everything else here,
+    and never the acceptance identity that posts the marker. Every
+    precondition below is re-read from GitHub on this tick, not trusted
+    from whatever produced the task's `READY_TO_REVIEW` status: PR still
+    OPEN, an ACCEPT marker from a reviewer login that is not the PR's own
+    author standing on the EXACT current head (`_pr_is_mergeable`), every
+    required check terminal-success rather than merely absent-of-failure
+    (`_check_is_green`), and -- on the merged head itself, after the
+    call -- that the marker and checks still hold (`_merged_target_sha`),
+    so an externally merged PR can never be silently blessed DONE.
+
+    Anything that keeps this tick from even EVALUATING those preconditions
+    -- the merge identity unconfigured or partially configured, its
+    installation token failing to mint, or a readiness lookup that never
+    reached the GitHub API at all -- is `errors`, not `skipped`: an
+    ordinary "not accepted yet" PR and "GitHub is unreachable" must never
+    look the same to whatever is watching this loop. See `LoopReport.
+    errors` and `_merge_app_credentials`."""
     cfg = cfg or ReviewConfig()
     report = LoopReport()
     # Window fairness (VOYN-OPS-AICC-PUBLISH-WINDOW-STARVATION, two live
@@ -3797,6 +3926,13 @@ def _merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -
         if actions >= cfg.max_per_tick:
             break
         last_processed = (task_id, pr_url)
+        if _repo_from_pr_url(pr_url) is None:
+            # Same shape gate as review_once/publish_review_verdicts -- a
+            # malformed pr_url fails every `gh pr view` below identically
+            # forever otherwise (VOYN-W0-AICC-REPO-ROUTE-AND-EVIDENCE-HYGIENE).
+            verdict = _clear_pr_evidence(factory, task_id, pr_url, "malformed_pr_url")
+            report.skipped.append((task_id, f"malformed_pr_url:{verdict}: {pr_url!r}"))
+            continue
         # Readiness FIRST: only a PR that already carries an independent ACCEPT
         # marker on its head with green required checks is the merge tick's
         # business. An un-accepted or failing PR is reviewed by the review tick
@@ -3858,6 +3994,14 @@ def _merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -
         if merge_sha is None:
             ready, detail = _pr_is_mergeable(repo_path, pr_url, cfg.required_checks)
             if not ready:
+                if detail.startswith("gh_view_failed"):
+                    # The GitHub API itself was unreachable for this
+                    # readiness read -- not "not accepted yet." Fail
+                    # closed and say so loudly (VOYN-W0-AICC-MERGE-
+                    # GATEWAY-REM-REM-REM): a caller must be able to tell this
+                    # apart from an ordinary skip.
+                    report.errors.append((task_id, detail))
+                    continue
                 if detail.startswith("checks_not_green"):
                     # A failed required check on an ACCEPTED head is the flake
                     # window: retry the failed jobs once (attempt-bounded)
@@ -3911,7 +4055,25 @@ def _merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -
                     )
                 continue
             actions += 1
-            merged = _gh(["pr", "merge", pr_url, "--squash"], repo_path)
+            # The one privileged mutation this whole module exists to
+            # gate: executed under the dedicated merge identity, never the
+            # ambient `_gh()` credential every read above used, and never
+            # the acceptance identity that posted the marker being relied
+            # on (VOYN-W0-AICC-MERGE-GATEWAY-REM-REM-REM). Unconfigured or
+            # partially configured is a misconfiguration of the gateway
+            # itself, not "nothing to do" -- `errors`, not `skipped`, and
+            # it fails closed rather than silently falling back to a
+            # shared credential.
+            merge_creds = _merge_app_credentials()
+            if merge_creds is None:
+                report.errors.append((task_id, "merge_bot_not_configured"))
+                continue
+            try:
+                merge_token = github_app_auth.installation_token(merge_creds)
+            except github_app_auth.AppAuthError as exc:
+                report.errors.append((task_id, f"merge_bot_auth_failed: {exc}"))
+                continue
+            merged = _merge_pr_as_bot(repo_path, pr_url, merge_token)
             # On a merge-queue-protected repo a zero exit only ENQUEUED the
             # PR; on a plain repo it merged synchronously. Either way the
             # target branch, not the exit code, is the authority: DONE only
@@ -3963,6 +4125,16 @@ def _merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -
                 else:
                     conn.rollback()
                     report.skipped.append((task_id, f"transition:{reason}"))
+            except Exception:
+                # Roll back WHILE the transaction is still open -- the
+                # `finally` below flips `autocommit` back to `True`, which
+                # is only valid once no transaction is in progress. Without
+                # this, an exception raised before either explicit
+                # commit/rollback above (e.g. a driver error mid-`execute`)
+                # would hit that `autocommit = True` on an open transaction
+                # and replace the real error with a secondary one.
+                conn.rollback()
+                raise
             finally:
                 conn.autocommit = True
     _scan_commit(factory, "scan:merge_once", scan_token, last_processed)
@@ -4322,7 +4494,7 @@ def _check_is_red_for_window(check: dict[str, Any]) -> bool:
     a check has actually completed red.
     """
     conclusion = check.get("conclusion")
-    if conclusion is not None:
+    if conclusion not in (None, ""):
         return str(conclusion).upper() not in ("SUCCESS", "NEUTRAL", "SKIPPED")
     state = check.get("state")
     if state is not None:

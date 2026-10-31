@@ -24,6 +24,15 @@ def test_no_phantom_executors_in_the_matrix():
             assert link["executor"] in PROVEN_EXECUTORS, (task_class, link)
 
 
+def test_owner_profile_avoids_exhausted_subscription_and_preserves_class(monkeypatch):
+    monkeypatch.setenv('AICC_EXECUTOR_PROFILE', 'owner-alternatives')
+    for task_class, task_type in [('implementation', 'implementation'), ('review', 'review')]:
+        links = cascade_for(task_class)
+        assert [link['executor'] for link in links] == ['cursor', 'grok']
+        assert all(link['task_type'] == task_type for link in links)
+        assert all(link['executor'] in agent_runner.PRINCIPAL_EXECUTOR_BINARIES for link in links)
+
+
 def test_the_implementation_escalation_link_is_a_different_account():
     """VOYN-W0-AICC-EXECUTOR-CODEX: the escalation link used to be a second
     `claude` entry. Live-measured 2026-08-23, that could not work as an

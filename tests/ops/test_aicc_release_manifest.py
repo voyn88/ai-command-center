@@ -767,6 +767,285 @@ def test_recovery_refuses_a_release_that_drifted_since_it_was_recorded(tmp_path)
         transaction.verify_release_selection(f"releases/{RELEASE_ID}")
 
 
+def _pending_bytecode_release(tmp_path):
+    module = _module()
+    transaction, root, _state = _transaction(module, tmp_path)
+    release = root / "opt/aicc/releases" / RELEASE_ID
+    package = release / "command_center/ops"
+    package.mkdir(parents=True)
+    (package / "probe.py").write_text("value = 1\n", encoding="utf-8")
+    manifest = transaction.release_manifest_path(RELEASE_ID)
+    _record(module, release, manifest)
+    cache = package / "__pycache__"
+    cache.mkdir(mode=0o700)
+    bytecode = cache / "probe.cpython-313.pyc"
+    bytecode.write_bytes(b"derived cache bytes")
+    bytecode.chmod(0o600)
+    transaction.pending_release.write_text(f"releases/{RELEASE_ID}\n", encoding="ascii")
+    transaction.pending_release.chmod(0o600)
+    return module, transaction, release, manifest, cache, bytecode
+
+
+def test_pending_selector_recovers_only_unattested_bytecode(tmp_path):
+    module, transaction, release, manifest, cache, bytecode = _pending_bytecode_release(tmp_path)
+    original_manifest = manifest.read_bytes()
+    with pytest.raises(module.ReleaseRefused):
+        transaction.verify_release_selection(f"releases/{RELEASE_ID}")
+
+    transaction._restore_release_selector()
+
+    assert not cache.exists() and not bytecode.exists()
+    assert not transaction.pending_release.exists()
+    assert (release.parent.parent / "current").resolve() == release
+    assert manifest.read_bytes() == original_manifest
+    transaction.verify_release_selection(f"releases/{RELEASE_ID}")
+
+
+def _pending_mixed_bytecode_release(tmp_path):
+    module = _module()
+    transaction, root, _state = _transaction(module, tmp_path)
+    release = root / "opt/aicc/releases" / RELEASE_ID
+    existing = release / "command_center/db/__pycache__"
+    existing.mkdir(parents=True)
+    (existing.parent / "config.py").write_text("value = 1\n")
+    original = existing / "config.cpython-313.pyc"
+    original.write_bytes(b"attested bytecode")
+    package = release / "command_center/ops"
+    package.mkdir()
+    (package / "probe.py").write_text("value = 2\n")
+    manifest = transaction.release_manifest_path(RELEASE_ID)
+    _record(module, release, manifest)
+    extra = existing / "config.cpython-312.pyc"
+    extra.write_bytes(b"derived extra bytecode")
+    extra.chmod(0o600)
+    fresh = package / "__pycache__"
+    fresh.mkdir(mode=0o700)
+    fresh_extra = fresh / "probe.cpython-312.pyc"
+    fresh_extra.write_bytes(b"new cache bytecode")
+    fresh_extra.chmod(0o600)
+    transaction.pending_release.write_text(f"releases/{RELEASE_ID}\n", encoding="ascii")
+    transaction.pending_release.chmod(0o600)
+    return module, transaction, manifest, original, extra, fresh_extra
+
+
+def test_recovery_removes_extra_bytecode_in_attested_and_new_cache_dirs(tmp_path):
+    _module_value, transaction, manifest, original, extra, fresh_extra = _pending_mixed_bytecode_release(tmp_path)
+    original_manifest = manifest.read_bytes()
+    original_bytes = original.read_bytes()
+    cache_mode = original.parent.stat().st_mode
+
+    transaction._restore_release_selector()
+
+    assert not extra.exists() and not fresh_extra.parent.exists()
+    assert original.read_bytes() == original_bytes
+    assert original.parent.stat().st_mode == cache_mode
+    assert manifest.read_bytes() == original_manifest
+    assert not transaction.pending_release.exists()
+    transaction.verify_release_selection(f"releases/{RELEASE_ID}")
+
+
+@pytest.mark.parametrize("drift", ["attested-file", "nested-extra"])
+def test_mixed_cache_recovery_refuses_drift_before_removing_any_extra(tmp_path, drift):
+    module, transaction, manifest, original, extra, fresh_extra = _pending_mixed_bytecode_release(tmp_path)
+    if drift == "attested-file":
+        original.write_bytes(b"modified attested bytecode")
+    else:
+        (original.parent / "nested").mkdir()
+    before = manifest.read_bytes()
+
+    with pytest.raises(module.ReleaseRefused):
+        transaction._restore_release_selector()
+
+    assert extra.exists() and fresh_extra.exists()
+    assert original.exists() and original.parent.is_dir()
+    assert transaction.pending_release.exists()
+    assert manifest.read_bytes() == before
+
+
+@pytest.mark.parametrize("drift", ["source", "extra", "missing", "cache-mode", "orphan-pyc", "nested-dir", "symlink", "hardlink"])
+def test_pending_bytecode_cleanup_refuses_other_drift_before_mutation(tmp_path, drift):
+    module, transaction, release, manifest, cache, bytecode = _pending_bytecode_release(tmp_path)
+    source = cache.parent / "probe.py"
+    if drift == "source":
+        source.write_text("changed\n")
+    elif drift == "extra":
+        (release / "unattested.txt").write_text("keep me\n")
+    elif drift == "missing":
+        source.unlink()
+    elif drift == "cache-mode":
+        cache.chmod(0o777)
+    elif drift == "orphan-pyc":
+        (cache / "unknown.cpython-313.pyc").write_bytes(b"orphan")
+    elif drift == "nested-dir":
+        (cache / "nested").mkdir()
+    elif drift == "symlink":
+        (cache / "probe.cpython-312.pyc").symlink_to(source)
+    elif drift == "hardlink":
+        os.link(bytecode, cache / "probe.cpython-312.pyc")
+    before_manifest = manifest.read_bytes()
+
+    with pytest.raises(module.ReleaseRefused):
+        transaction._restore_release_selector()
+
+    assert bytecode.exists(), "preflight must complete before any deletion"
+    assert transaction.pending_release.exists()
+    assert manifest.read_bytes() == before_manifest
+    assert not (release.parent.parent / "current").exists()
+
+
+def test_pending_bytecode_cleanup_is_retryable_after_partial_removal(tmp_path, monkeypatch):
+    module, transaction, _release, manifest, cache, _bytecode = _pending_bytecode_release(tmp_path)
+    second = cache / "probe.cpython-313.opt-1.pyc"
+    second.write_bytes(b"another derived cache")
+    original_manifest = manifest.read_bytes()
+    unlink = module.os.unlink
+    removed = []
+
+    def interrupted(name, *args, **kwargs):
+        if removed:
+            raise OSError("simulated interruption after first cache removal")
+        result = unlink(name, *args, **kwargs)
+        removed.append(name)
+        return result
+
+    monkeypatch.setattr(module.os, "unlink", interrupted)
+    with pytest.raises(OSError, match="simulated interruption"):
+        transaction._restore_release_selector()
+    assert len(list(cache.iterdir())) == 1
+    assert transaction.pending_release.exists()
+    monkeypatch.setattr(module.os, "unlink", unlink)
+
+    transaction._restore_release_selector()
+
+    assert not cache.exists()
+    assert manifest.read_bytes() == original_manifest
+    transaction.verify_release_selection(f"releases/{RELEASE_ID}")
+
+
+def test_pending_bytecode_cleanup_recovers_empty_cache_after_interruption(tmp_path):
+    _module_value, transaction, _release, manifest, cache, bytecode = _pending_bytecode_release(tmp_path)
+    bytecode.unlink()
+    original_manifest = manifest.read_bytes()
+    transaction._restore_release_selector()
+    assert not cache.exists()
+    assert manifest.read_bytes() == original_manifest
+    transaction.verify_release_selection(f"releases/{RELEASE_ID}")
+
+
+def _standalone_bytecode_deploy(tmp_path):
+    module, transaction, release, manifest, cache, bytecode = _pending_bytecode_release(tmp_path)
+    current_release = release.parent / ("b" * 40)
+    current_release.mkdir()
+    (current_release / "current.py").write_text("value = 2\n")
+    _record(module, current_release, transaction.release_manifest_path("b" * 40), "b" * 40)
+    (release.parent.parent / "current").symlink_to(f"releases/{'b' * 40}")
+    return module, transaction, release, manifest, cache, bytecode, current_release
+
+
+def test_standalone_deploy_recovery_keeps_generic_orphan_wal_refusal(tmp_path):
+    _module_value, transaction, release, manifest, cache, _bytecode, _current = _standalone_bytecode_deploy(tmp_path)
+    original = manifest.read_bytes()
+    with pytest.raises(RuntimeError, match="without install journal"):
+        transaction.recover()
+    assert cache.exists()
+
+    transaction.recover_release_deploy()
+
+    assert not cache.exists() and not transaction.pending_release.exists()
+    assert (release.parent.parent / "current").resolve() == release
+    assert manifest.read_bytes() == original
+    # A crash after marker removal is a no-op on retry.
+    transaction.recover_release_deploy()
+
+
+def _pollute_current_release(current):
+    cache = current / "__pycache__"
+    cache.mkdir(mode=0o700)
+    extra = cache / "current.cpython-312.pyc"
+    extra.write_bytes(b"derived current cache")
+    extra.chmod(0o600)
+    return cache, extra
+
+
+def test_standalone_recovery_repairs_derived_cache_in_both_releases(tmp_path):
+    _module_value, transaction, release, manifest, old_cache, _old_extra, current = _standalone_bytecode_deploy(tmp_path)
+    current_cache, current_extra = _pollute_current_release(current)
+    current_manifest = transaction.release_manifest_path("b" * 40)
+    original_manifests = (manifest.read_bytes(), current_manifest.read_bytes())
+
+    transaction.recover_release_deploy()
+
+    assert not current_cache.exists() and not current_extra.exists()
+    assert not old_cache.exists()
+    assert not transaction.pending_release.exists()
+    assert (release.parent.parent / "current").resolve() == release
+    assert (manifest.read_bytes(), current_manifest.read_bytes()) == original_manifests
+    transaction.verify_release_selection(f"releases/{RELEASE_ID}")
+    transaction.verify_release_selection(f"releases/{'b' * 40}")
+
+
+@pytest.mark.parametrize("hostile_end", ["current", "previous"])
+def test_standalone_recovery_preflights_both_ends_before_any_cache_cleanup(tmp_path, hostile_end):
+    module, transaction, release, manifest, old_cache, old_extra, current = _standalone_bytecode_deploy(tmp_path)
+    current_cache, current_extra = _pollute_current_release(current)
+    hostile_tree = current if hostile_end == "current" else release
+    (hostile_tree / "unrelated.txt").write_text("not derived bytecode\n")
+    original_manifest = manifest.read_bytes()
+
+    with pytest.raises(module.ReleaseRefused):
+        transaction.recover_release_deploy()
+
+    assert old_cache.exists() and old_extra.exists()
+    assert current_cache.exists() and current_extra.exists()
+    assert transaction.pending_release.exists()
+    assert (release.parent.parent / "current").resolve() == current
+    assert manifest.read_bytes() == original_manifest
+
+
+@pytest.mark.parametrize("failure", ["current-drift", "pending-install", "pending-uninstall", "absent-previous"])
+def test_standalone_recovery_preflight_keeps_current_and_cache_intact(tmp_path, failure):
+    _module_value, transaction, release, manifest, cache, bytecode, current = _standalone_bytecode_deploy(tmp_path)
+    if failure == "current-drift":
+        (current / "current.py").write_text("changed\n")
+    elif failure == "pending-install":
+        transaction.pending.write_text("{}")
+    elif failure == "pending-uninstall":
+        (transaction.state_dir / "uninstall.json").write_text("{}")
+    else:
+        transaction.pending_release.write_text("ABSENT\n")
+    original = manifest.read_bytes()
+
+    with pytest.raises(RuntimeError):
+        transaction.recover_release_deploy()
+
+    assert bytecode.exists() and cache.exists()
+    assert transaction.pending_release.exists()
+    assert (release.parent.parent / "current").resolve() == current
+    assert manifest.read_bytes() == original
+
+
+def test_standalone_recovery_repeats_after_selector_was_already_restored(tmp_path):
+    _module_value, transaction, release, _manifest, _cache, _bytecode, _current = _standalone_bytecode_deploy(tmp_path)
+    transaction._restore_release_selector(clear_pending=False)
+    assert transaction.pending_release.exists()
+    assert (release.parent.parent / "current").resolve() == release
+    transaction.recover_release_deploy()
+    assert not transaction.pending_release.exists()
+
+
+def test_installer_standalone_recovery_is_worker_only_and_holds_rollout_lock():
+    source = (Path(__file__).parents[2] / "deploy/install-agent-principal-isolation.sh").read_text()
+    action = source.index("    run_transaction release-deploy-recover")
+    guard = source.rfind('if [ "$install_profile" = "worker" ]', 0, action)
+    assert guard > 0
+    assert '! path_present "$state_dir/pending.json"' in source[guard:action]
+    assert 'path_present "$state_dir/pending-release"' in source[guard:action]
+    assert "trap release_lane_timers EXIT" in source[guard:action]
+    assert "trap 'exit 1' HUP INT TERM" in source[guard:action]
+    assert "hold_lane_timers || exit 1" in source[guard:action]
+    assert action < source.index("  run_transaction recovery-anchor-install")
+
+
 def test_selector_parent_is_fsynced_before_pending_release_is_consumed(
     monkeypatch, tmp_path
 ):
