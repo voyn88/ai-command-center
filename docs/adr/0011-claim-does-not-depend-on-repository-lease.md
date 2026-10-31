@@ -14,16 +14,24 @@ a second, weaker authority at worst.
 
 ## Proof of no dependency
 
-Verified against the checked-out code, not assumed:
+Verified against the checked-out code, not assumed. The mechanical half is
+pinned by `tests/db/test_claim_lease_independence.py` (offline; no Postgres
+and no `voyn-lease` binary), so a later wiring of the platform lease into the
+claim surface fails CI rather than silently reopening a cross-database node.
 
 - **Different databases, no read path between them.** `repo_lease` lives in
-  the AIOS platform database (`aios/migrations/versions/0010_repo_lease.py`).
-  The claim protocol (`command_center/db/sql/0002_queue_claim.up.sql`) lives
-  in AICC's single database. `grep -rn repo_lease command_center/` returns
-  only comments (this file's own header, and two unrelated design-rationale
-  references in `0005_backlog_store.up.sql` / `0006_backlog_planner.up.sql`
-  that cite AIOS's lease-table review as prior art) — no table, view,
-  function or query in AICC reads it.
+  the AIOS platform database (AIOS migration
+  `aios/migrations/versions/0010_repo_lease.py` — AIOS is a sibling
+  repository, not vendored in this checkout). The claim protocol
+  (`command_center/db/sql/0002_queue_claim.up.sql`) lives in AICC's single
+  database. `grep -rn repo_lease command_center/` returns only comments
+  (this file's own header, and two unrelated design-rationale references in
+  `0005_backlog_store.up.sql` / `0006_backlog_planner.up.sql` that cite
+  AIOS's lease-table review as prior art) — no table, view, function or
+  query in AICC reads it. The claim Python surface
+  (`work_queue_store.py`) and the production claim call site
+  (`worker/daemon.py`) likewise import none of `worktree_lease`,
+  `writer_lease`, or `lease_client`.
 - **`repository_id` is provenance, not a gate.** `work_item.repository_id` is
   documented as "OPAQUE PROVENANCE ONLY, read by NO decision in this file"
   and enforced by
@@ -60,7 +68,9 @@ outages is needed in the claim protocol. Claim exclusivity, stale-owner
 redelivery, SIGKILL/partition recovery, durable-ack, bounded retry and DLQ
 are entirely decided by facts local to the AICC database (visibility timeout
 + the `current_attempt_id` fence) and are unaffected by whether the lease
-authority is reachable.
+authority is reachable. (The word "lease" in `work_queue_store`'s heartbeat
+docs means the claim's own visibility window — a local column — not the
+platform `repo_lease`.)
 
 ## Where a real dependency exists, and its explicit behavior
 

@@ -15,6 +15,10 @@ functional application milestones of `app.py`.
   lease — so no failure-compensation layer is needed in the claim protocol.
   Records where a real dependency does exist (the worktree mutation site,
   `worktree_lease`/`writer_lease`) and why it is correctly fail-closed there.
+- `tests/db/test_claim_lease_independence.py`: offline pin that the claim SQL,
+  `work_queue_store`, and the daemon claim call site never reference the
+  platform lease — so a later wiring fails CI instead of reopening a
+  cross-database node.
 - `command_center/db/sql/0002_queue_claim.up.sql`: corrected a stale header
   comment — `principal` is no longer "a design proposal, not a deployed
   table" (`0003_worker_enrollment` created it); the independence conclusion
