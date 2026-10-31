@@ -36,8 +36,9 @@ commits together or rolls back together.
 
 | Unit | Profile | Source |
 | --- | --- | --- |
-| `voyn-aicc-self-deploy.service` | both | `voyn-aicc-self-deploy-worker.service` (worker) / `voyn-aicc-self-deploy.service` (control) |
-| `voyn-aicc-self-deploy.timer` | both | same name |
+| `voyn-aicc-self-deploy.service` | control | `voyn-aicc-self-deploy.service` |
+| `voyn-aicc-self-deploy.timer` | control | same name |
+| `voyn-aicc-worker-release-deploy.{service,timer}` | worker | same name |
 | `voyn-aicc-github-token.{service,timer}` | both | same name |
 | `aicc-principal-recovery.service`, `aicc-agent-launcher.socket`, `aicc-agent-launcher@.service` | worker | same name |
 | `voyn-aicc-worker@.service` + both principal-isolation drop-ins | worker | same name |
@@ -46,13 +47,10 @@ commits together or rolls back together.
 | `voyn-aicc-{review,merge,remediate,pr-window}.{service,timer}` | control | same name |
 | `voyn-queue-monitor.{service,timer}` | control | same name |
 
-Two profiles, one target, different `ExecStart` — that is deliberate for
-self-deploy. The control host owns the database and migrates; the worker host
-holds no DDL privilege and restarts its lanes instead. The timer,
-`hold_lane_timers`, the staged rollout and every runbook name one unit
-(`voyn-aicc-self-deploy.service`), so shipping the worker variant under a name
-of its own would have left the host's hand-made file live under the name
-everything actually uses.
+Control owns the database and installs `voyn-aicc-self-deploy.service`, which
+migrates. Workers do not install that unit: `voyn-aicc-self-deploy-worker`
+stays retired, and the worker host stages immutable releases with
+`voyn-aicc-worker-release-deploy`.
 
 Timers are `enable --now`-ed after the generation commits and after the
 rollback trap is disarmed — a committed file activated afterwards, never an

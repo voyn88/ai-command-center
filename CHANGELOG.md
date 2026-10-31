@@ -16,15 +16,12 @@ functional application milestones of `app.py`.
   through the pipeline was inert on the fleet**, which is how the repo template
   could carry a per-lane `RuntimeDirectory=` while the host copy caused
   `VOYN-W0-AICC-WORKER-RUNTIMEDIR-COLLISION`.
-- `ops/aicc_install_transaction.py`: the self-deploy tick is now repo-owned on
-  both profiles (`SELF_DEPLOY_UNIT_SOURCES`). It was the sharpest case — the
-  one unit whose entire job is "track the repository" was a pair of symlinks
-  into a directory under the operator's home on both hosts, so the tick updated
-  the CODE every five minutes while nothing updated the UNITS that run it. The
-  two variants (control migrates; worker restarts lanes and holds no DDL
-  privilege) install onto the one target the timer, `hold_lane_timers`, the
-  staged rollout and every runbook name. The worker variant is a committed file
-  rather than a commented-out `ExecStart` an operator had to paste back in.
+- `ops/aicc_install_transaction.py`: the control self-deploy tick is now
+  repo-owned. It was the sharpest case — the unit whose entire job is "track
+  the repository" was a symlink into a directory under the operator's home, so
+  the tick updated the CODE every five minutes while nothing updated the UNIT
+  that runs it. Workers do not install that tick: `voyn-aicc-self-deploy-worker`
+  stays retired in favor of root `voyn-aicc-worker-release-deploy`.
 - Each profile's fail-closed probe is repo-owned and enabled after commit:
   `voyn-infra-monitor.{service,timer}` on the worker (and in
   `WORKER_ONLY_TARGETS`, so a control conversion purges it),
@@ -50,6 +47,37 @@ functional application milestones of `app.py`.
   maintenance window and a rehearsed rollback, not a line in an installer that
   runs for other reasons. See
   [`docs/operations/SYSTEMD_UNIT_OWNERSHIP.md`](docs/operations/SYSTEMD_UNIT_OWNERSHIP.md).
+
+### Added — the one-button audit, wired into the web UI (`VOYN-W0-APP-CONTROL-S4`)
+
+- `web/src/screens/Tasks.tsx`: an `AuditLauncher` panel above the task list —
+  pick a project, confirm (or edit) the review prompt, one button. A
+  successful enqueue reloads the task list so the new item appears
+  immediately.
+- The launcher owns no credential of its own: a 401 from the audit POST is
+  handed up to the screen (`onAuthRequired`), which locks and renders the
+  same single `TokenGate` a 401 from the queue reads does — so the owner
+  gets an actual unlock control, and a retry uses the replacement key
+  instead of resending the rejected one. The refused draft (project +
+  prompt) rides along and is restored when the screen unlocks, so the retry
+  is one click rather than a retype, and the gate says plainly that the
+  audit was NOT started. (Supersedes PR #421, rejected for exactly this
+  missing recovery path: the panel showed "unlock below" while no unlock
+  control existed.)
+- `web/src/lib/queueApi.ts`: `enqueueAudit`, the typed `POST /api/v1/queue/audit`
+  client (401 raises the same `QueueAuthError` the reads use).
+- `command_center/webapi/queue_routes.py`: `repository_path` is now optional
+  in the audit request — the one-button trigger only knows a `project_id`.
+  When omitted, it resolves from `project_config.get_project_config`, the
+  same source the worker already confirms the run against
+  (`agent_runner.validate_repository`), so the caller never needs to know
+  the server's filesystem layout. An explicit `repository_path` is still
+  honored verbatim.
+- The `execution`-queue enqueue → claim → `agent_run` (review profile) →
+  result → `GET /api/v1/queue/items/{id}` path was verified end-to-end at
+  the code level (SRV-05's worker already claims this queue and shape);
+  the remaining gap is operational — the systemd unit is not yet installed
+  on any host.
 
 ### Fixed — Control ticks have their own GitHub quota (`VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS`)
 - `command_center/orchestrator/gh_access.py`: every `gh` call the review,
