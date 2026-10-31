@@ -189,3 +189,8 @@ def test_capacity_panel_reflects_a_running_agent(git_repo, configure_project_rep
         assert "claude_code" in captions  # per-agent line
     finally:
         api.request_cancel(run["id"], confirmed=True)
+        # `cancel()` only signals the process group; the supervising daemon
+        # thread still has to persist the terminal state, the report and
+        # `finalized_at` — all under `AICC_DATA_DIR`. Wait for it, so the run
+        # is not still writing there when the data-dir fixture removes it.
+        api.supervisor.wait_for_run(run["id"], timeout=15)

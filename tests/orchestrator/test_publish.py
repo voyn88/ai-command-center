@@ -129,6 +129,44 @@ def test_a_commit_is_pushed_under_the_lease_and_a_pr_opens(repo, monkeypatch):
     assert "--ttl 600" in log
 
 
+def test_closed_pr_of_the_same_branch_does_not_block_a_new_pr(repo, monkeypatch):
+    """VOYN-W0-AICC-PUBLISH-IGNORES-CLOSED-PR-OF-SAME-BRANCH: `gh pr view
+    <branch>` returns the latest PR of the branch even when it is CLOSED
+    (fleet PR #387 for VOYN-W0-AICC-REPORT-319). Publish must treat a
+    non-OPEN PR as "no PR" and create a new one instead of failing with
+    pr_head_sha_mismatch against the retired PR's stale head."""
+    work, bin_, calls = repo
+    _with_path(bin_, monkeypatch)
+    (work / "change.txt").write_text("x\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "work")
+    gh = bin_ / "gh"
+    created = work.parent / "pr.created"
+    gh.write_text(
+        f'#!/bin/sh\necho "gh $*" >> {calls}\n'
+        'case "$2" in\n'
+        f"  view) if [ -f {created} ]; then head=$(git rev-parse HEAD); "
+        'printf \'{"url":"https://github.com/x/y/pull/2",'
+        '"headRefOid":"%s","baseRefName":"main","state":"OPEN"}\\n\' "$head"; '
+        "else "
+        'printf \'{"url":"https://github.com/x/y/pull/1",'
+        '"headRefOid":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",'
+        '"baseRefName":"main","state":"CLOSED"}\\n\'; fi; exit 0 ;;\n'
+        f"  create) touch {created}; echo 'https://github.com/x/y/pull/2'; exit 0 ;;\n"
+        "esac\n"
+    )
+    gh.chmod(0o755)
+    sleeps = []
+
+    result = publish_run(work, _cfg(bin_), sleep=sleeps.append)
+
+    assert result.ok, result.reason
+    assert result.pr_url == "https://github.com/x/y/pull/2"
+    log = calls.read_text()
+    assert "gh pr create" in log
+    assert sleeps == []  # no head-sync retries against the closed PR
+
+
 def test_existing_pr_head_race_fails_before_lease_release(repo, monkeypatch):
     """A `headRefOid` that never converges (a genuinely different commit,
     not eventual-consistency lag) must still fail -- after the bounded
@@ -492,6 +530,32 @@ def test_lease_refusal_does_not_push(repo, monkeypatch):
         check=False,
     ).stdout
     assert "backlog" not in out  # never pushed
+
+
+def test_lease_refusal_names_the_holder_from_stdout_when_stderr_is_empty(
+    repo, monkeypatch
+):
+    """Live 2026-09-06 (wki_55f316db): a guarded publish lost the writer-lease
+    race and the refusal reached the caller with an EMPTY detail --
+    `voyn-lease acquire` had written the holder onto stdout, not stderr, for
+    this refusal shape, and the reason string only ever read `stderr`.
+    `writer_lease._acquire_and_provision_hooks` already falls back to stdout
+    for exactly this; `publish_run` must do the same so a lease refusal
+    always names the holder when the tool reports one."""
+    work, bin_, calls = repo
+    _with_path(bin_, monkeypatch)
+    (work / "c.txt").write_text("x\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "w")
+    (bin_ / "voyn-lease").write_text(
+        f'#!/bin/sh\necho "lease $*" >> {calls}\n'
+        'echo "held by server-worker-b pid 4242" ; exit 3\n'
+    )
+    (bin_ / "voyn-lease").chmod(0o755)
+
+    r = publish_run(work, _cfg(bin_))
+    assert not r.ok and r.reason.startswith("lease_unavailable")
+    assert "held by server-worker-b pid 4242" in r.reason
 
 
 def test_stale_hook_identity_fails_closed_without_pushing(repo, monkeypatch):

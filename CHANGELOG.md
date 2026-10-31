@@ -8,6 +8,112 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Added — the one-button audit, wired into the web UI (`VOYN-W0-APP-CONTROL-S4`)
+
+- `web/src/screens/Tasks.tsx`: an `AuditLauncher` panel above the task list —
+  pick a project, confirm (or edit) the review prompt, one button. A
+  successful enqueue reloads the task list so the new item appears
+  immediately.
+- The launcher owns no credential of its own: a 401 from the audit POST is
+  handed up to the screen (`onAuthRequired`), which locks and renders the
+  same single `TokenGate` a 401 from the queue reads does — so the owner
+  gets an actual unlock control, and a retry uses the replacement key
+  instead of resending the rejected one. The refused draft (project +
+  prompt) rides along and is restored when the screen unlocks, so the retry
+  is one click rather than a retype, and the gate says plainly that the
+  audit was NOT started. (Supersedes PR #421, rejected for exactly this
+  missing recovery path: the panel showed "unlock below" while no unlock
+  control existed.)
+- `web/src/lib/queueApi.ts`: `enqueueAudit`, the typed `POST /api/v1/queue/audit`
+  client (401 raises the same `QueueAuthError` the reads use).
+- `command_center/webapi/queue_routes.py`: `repository_path` is now optional
+  in the audit request — the one-button trigger only knows a `project_id`.
+  When omitted, it resolves from `project_config.get_project_config`, the
+  same source the worker already confirms the run against
+  (`agent_runner.validate_repository`), so the caller never needs to know
+  the server's filesystem layout. An explicit `repository_path` is still
+  honored verbatim.
+- The `execution`-queue enqueue → claim → `agent_run` (review profile) →
+  result → `GET /api/v1/queue/items/{id}` path was verified end-to-end at
+  the code level (SRV-05's worker already claims this queue and shape);
+  the remaining gap is operational — the systemd unit is not yet installed
+  on any host.
+
+### Fixed — Control ticks have their own GitHub quota (`VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS`)
+- `command_center/orchestrator/gh_access.py`: every `gh` call the review,
+  merge and PR-window ticks make now runs under the `voyn-aicc-fleet` App's
+  installation token (`/var/lib/aicc/github/gh`, minted by
+  `voyn-aicc-github-token.timer` and readable by the `aicc-worker` principal
+  the ticks run as) instead of whatever human credential is ambient on
+  control-01. On 2026-09-09 21:15-22:10 UTC that human's shared GraphQL quota
+  was exhausted (`API rate limit already exceeded for user ID 297853521`) and
+  all three ticks failed for an hour. A host without the store falls back to
+  the ambient credential and says so; a refusal from the App falls back per
+  call so a scope it was never granted cannot break a tick.
+- The PR-window tick -- the only loop that touches every open pull request --
+  moved from `gh pr list`/`gh pr view`/`gh pr edit` (GraphQL) to the REST
+  endpoints (`gh api repos/...`), with per-`(repo, PR, head sha)` caching of
+  the details, so an unchanged head costs no API call at all. Its timer went
+  from 5 to 15 minutes; labelling is advisory and no gate reads it.
+- Each tick reports a `QUOTA` line: identity, REST/GraphQL call counts, cache
+  hits, ambient fallbacks, rate-limited calls, and the identity's remaining
+  core/GraphQL budget (read with `gh api rate_limit`, which is exempt from
+  rate limiting).
+- `ops/aicc_github_app_token.py` requests the ticks' additional read scopes
+  (`checks`, `statuses`, `actions`) on top of the lanes' git set, and falls
+  back to the lane set alone if the installation was never granted them --
+  GitHub refuses the whole token otherwise, which would leave the fleet with
+  no credential at all.
+
+
+### Added — Home screen widget snippets (`VOYN-MIN-WIDGET-SNIP`)
+- `AICCNativeCore.WidgetIntentSnippet` / `WidgetFlow` / `WidgetDestination`
+  (`clients/aicc-native/apple/Sources/AICCNativeCore/AICCNativeCore.swift`):
+  a one-status, one-action snapshot for each of the three flows with a single
+  next action on iPhone — Work, Dialogues, Decisions. `Snapshot.
+  widgetSnippets(dialogs:)` always returns exactly three, one per flow, and
+  a widget's one action is always a deep link into the exact item, never a
+  mutation — `POST /v1/commands` is still out of the v1 read-only contract.
+  See `docs/aicc_native/WIDGET_SNIPPETS.md`.
+
+### Added — Decision-memory graph (`VOYN-MIN-GRAPH-SQL`)
+- `command_center/decision_graph_store.py`: a standalone SQLite store for a
+  semantic graph of decisions, errors, dependencies and effects — nodes typed
+  by kind, directed/typed edges, and `path_to_failure()`, one `WITH RECURSIVE`
+  query finding the shortest cycle-safe chain from any node to the nearest
+  reachable failure.
+- `command_center/decision_graph_render.py`: a hand-rolled layered-DAG-to-SVG
+  renderer (no `graphviz`/`pydot`/`networkx` dependency exists in this repo)
+  that highlights the path-to-failure edges in red and draws each incident's
+  corrective decision as a dashed `mitigates` arrow rather than a step on the
+  road to its own fix.
+- `scripts/seed_decision_graph_incidents.py` /
+  `scripts/render_decision_graph.py`: seed the graph from six real incidents
+  mined from this repository's own migration comments, docstrings and commit
+  messages, and render it. The rendered artifact —
+  [`docs/operations/decision_memory_graph.svg`](docs/operations/decision_memory_graph.svg)
+  — is the acceptance criterion: one visual graph with a path-to-failure for
+  past incidents. See `docs/operations/DECISION_MEMORY_GRAPH.md`.
+
+### Added — Executive Time-Machine (`VOYN-MIN-EXEC`)
+- `command_center/decision_time_machine.py`: for a critical decision or
+  incident, one executable `decision package` — hypothesis, alternatives
+  considered (with why each was passed over), the decision and its
+  rationale — created with a pending effect checkpoint already scheduled at
+  each of 1/7/30/90 days out. `record_effect` fills in the actual outcome at
+  a horizon (in any order); `due_checkpoints` surfaces whichever check-ins
+  have passed their due date without being asked; `build_post_mortem`
+  assembles the package into a post-mortem view with a verdict
+  (`validated`/`invalidated`/`mixed`/`pending_data`) computed from the
+  checkpoints recorded so far; `find_similar_packages` matches a new
+  critical event's framing against past packages' actual outcomes (the
+  "application in similar scenarios" acceptance), and
+  `missing_decision_packages` flags any critical event with no package on
+  file yet.
+- `tests/test_decision_time_machine.py`: coverage for checkpoint scheduling,
+  out-of-order effect recording, post-mortem verdict derivation, similar-
+  scenario matching and the critical-event coverage gap check.
+
 ### Added — SRV-04b two-host acceptance record (`VOYN-W0-AICC-CLAIM-TWO-HOST-ACCEPTED`)
 - `docs/srv04b-two-host-acceptance.md`: records a separate, two-physical-host
   acceptance pass of the `0002_queue_claim` protocol against

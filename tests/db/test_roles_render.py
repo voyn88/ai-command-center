@@ -202,13 +202,19 @@ def test_no_role_holds_a_table_privilege_on_the_claim_protocol() -> None:
         assert roles.PRIVILEGES[role]["work_attempt"] == frozenset()
 
 
-def test_the_worker_reaches_the_queue_only_through_the_four_protocol_steps() -> None:
+def test_the_worker_reaches_the_queue_only_through_the_six_protocol_steps() -> None:
     """Two assertions rather than one, because the role now carries two layers.
 
-    The queue half must stay exactly four steps, and the whole set must stay
+    The queue half must stay exactly six steps, and the whole set must stay
     exactly what both tasks declared. A single equality would have to be edited
     by every later task that adds a function, and editing it is indistinguishable
     from widening it.
+
+    `queue_fail_lease_wait` (VOYN-W0-AICC-PUBLISH-LEASE-CONTENTION-BURNS-
+    ATTEMPT) is the fifth: a narrower fail path for a refusal that names no
+    fault in the work itself, kept separate from `queue_fail` so the
+    attempt-count refund it performs can never be reached by a genuine
+    handler failure.
     """
     granted = {s.split("(")[0] for s in roles.FUNCTION_PRIVILEGES[roles.WORKER_ROLE]}
     assert {name for name in granted if name.startswith("queue_")} == {
@@ -216,6 +222,8 @@ def test_the_worker_reaches_the_queue_only_through_the_four_protocol_steps() -> 
         "queue_heartbeat",
         "queue_complete",
         "queue_fail",
+        "queue_fail_lease_wait",
+        "queue_fail_infra_wait",
     }
     # And the enrolment layer: prove its own identity, read only the
     # server-authoritative expiry of that proved credential, rotate its own
@@ -225,9 +233,17 @@ def test_the_worker_reaches_the_queue_only_through_the_four_protocol_steps() -> 
         "queue_heartbeat",
         "queue_complete",
         "queue_fail",
+        "queue_fail_lease_wait",
+        "queue_fail_infra_wait",
         "identity_assert",
         "identity_current_credential",
         "enroll_rotate_self",
+        # 0021: the worker-host fail-closed probe records what it measured
+        # (a finding row keyed by source+failure, and its clearing); neither
+        # reads the backlog nor the queue, and the planner -- not the worker
+        # -- turns a finding into a task.
+        "monitor_record_finding",
+        "monitor_clear_finding",
     }
     assert roles.VIEW_PRIVILEGES[roles.WORKER_ROLE] == {}
 
@@ -283,6 +299,22 @@ def test_the_control_plane_cannot_claim() -> None:
         # scan cursor for the tick windows.
         "backlog_scan_claim",
         "backlog_triage",
+        # 0030: clear proven malformed evidence through the audited function.
+        "backlog_clear_evidence",
+        # 0021: read-only deploy preflight with dispatch's privileges; the
+        # task-class setter (split children, monitor tasks); and the
+        # monitor-finding pair the control-host probe uses.
+        "backlog_dispatch_smoke",
+        "backlog_set_task_class",
+        "monitor_record_finding",
+        "monitor_clear_finding",
+        "monitor_link_task",
+        # VOYN-W0-AICC-BACKLOG-PG-CANONICAL-GATE (0020): the importer's stamp
+        # of where a migrated row came from.
+        "backlog_record_provenance",
+        # 0029: bounded row lock and audited owner decision, no table UPDATE.
+        "backlog_owner_lock",
+        "backlog_owner_decision",
     }
 
 

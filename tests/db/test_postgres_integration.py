@@ -704,6 +704,69 @@ def test_concurrent_role_creation_is_serialized(admin_conn, admin_dsn, psycopg):
             cur.execute(f"DROP ROLE IF EXISTS {role}")
 
 
+def test_concurrent_rig_style_provisioning_is_idempotent(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """The `rig` fixture's own setup shape, raced concurrently.
+
+    VOYN-W0-AICC-FLAKE-RIG-ROLE-SETUP-CONCURRENT-UPDATE: `tests/db/
+    test_backlog_planner.py`'s `rig` fixture (reused by test_backlog_triage.py
+    and test_review_merge.py) calls `roles.apply_bootstrap()` — whose last
+    statement is the `ALTER ROLE aicc_migrator CREATEROLE` DO block — followed
+    by `roles.render_worker_host_role()`, on every single test. Two modules
+    that borrow `rig` without also carrying `test_backlog_planner.py`'s
+    `pytest.mark.serial` marker let pytest-xdist run many of those setups at
+    once against the one Postgres cluster a CI shard provides, which is
+    exactly the shape that surfaced `psycopg.errors.InternalError_: tuple
+    concurrently updated` at fixture setup on PR #873. Both DO blocks are
+    guarded by the same `pg_advisory_xact_lock(7823649102)` and are
+    check-then-act idempotent (`IF NOT ... THEN ALTER/CREATE`), so racing them
+    from many connections at once must produce neither an error nor a
+    partially-applied `aicc_migrator`/`aicc_worker` state — the property the
+    `serial` marker on those two modules exists to never need to rely on.
+    """
+    import threading
+
+    errors: list[Exception] = []
+    host_roles = [f"aicc_test_host_{uuid.uuid4().hex[:16]}" for _ in range(8)]
+    barrier = threading.Barrier(8)
+
+    def run(host_role: str) -> None:
+        try:
+            with psycopg.connect(test_dsn, autocommit=True) as conn:
+                barrier.wait(timeout=30)
+                roles.apply_bootstrap(conn)
+                with conn.cursor() as cur:
+                    for statement in roles.render_worker_host_role(host_role):
+                        cur.execute(statement)
+        except Exception as exc:  # noqa: BLE001 — recorded, asserted below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=run, args=(role,)) for role in host_roles]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=60)
+
+    try:
+        assert errors == [], errors
+        with admin_conn.cursor() as cur:
+            cur.execute(
+                "SELECT rolcreaterole FROM pg_roles WHERE rolname = %s",
+                (roles.MIGRATOR_ROLE,),
+            )
+            assert cur.fetchone()[0] is True
+            for host_role in host_roles:
+                cur.execute(
+                    "SELECT 1 FROM pg_roles WHERE rolname = %s", (host_role,)
+                )
+                assert cur.fetchone() is not None
+    finally:
+        with admin_conn.cursor() as cur:
+            for host_role in host_roles:
+                cur.execute(f"DROP ROLE IF EXISTS {host_role}")
+
+
 def test_new_tables_are_unreachable_until_granted(
     admin_conn, psycopg, test_dsn, role_passwords
 ):
