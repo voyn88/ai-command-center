@@ -1623,3 +1623,179 @@ def test_main_reports_the_host_probes_when_enabled(monkeypatch, capsys) -> None:
     assert any(f.startswith("crash_loop:") for f in payload["failures"])
     assert any(f.startswith("deploy_lag:") for f in payload["failures"])
     assert result == 1
+
+
+def test_executor_auth_failed_threshold_is_inclusive_and_configurable() -> None:
+    below = evaluate(
+        {"voyn-aicc-worker@1.service": "active"},
+        _queue(recent_auth_failed=4),
+        minimum_active_workers=1,
+        max_stalled_seconds=900,
+        prometheus_ready=True,
+    )
+    assert below.ok
+    assert not any(f.startswith("executor_auth_failed") for f in below.failures)
+
+    at = evaluate(
+        {"voyn-aicc-worker@1.service": "active"},
+        _queue(recent_auth_failed=5),
+        minimum_active_workers=1,
+        max_stalled_seconds=900,
+        prometheus_ready=True,
+    )
+    assert "executor_auth_failed:5" in at.failures
+
+    raised = evaluate(
+        {"voyn-aicc-worker@1.service": "active"},
+        _queue(recent_auth_failed=5),
+        minimum_active_workers=1,
+        max_stalled_seconds=900,
+        prometheus_ready=True,
+        max_auth_failed_attempts=10,
+    )
+    assert raised.ok
+
+
+def test_main_notifies_failures_and_resolves_cleared_keys(monkeypatch, capsys) -> None:
+    monkeypatch.setenv("AICC_OWNER_NOTIFY_SOURCE", "control-01")
+    from command_center.ops import owner_notify
+
+    notified: list[tuple] = []
+    resolved: list[tuple] = []
+    open_state = {"monitor:control-01:queue_stalled", "defer:OLD-TASK"}
+
+    monkeypatch.setattr(
+        infra_monitor,
+        "discover_worker_units",
+        lambda: {"voyn-aicc-worker@1.service": "active"},
+    )
+    monkeypatch.setattr(infra_monitor, "prometheus_is_ready", lambda _url: True)
+    monkeypatch.setattr(
+        infra_monitor,
+        "read_queue_snapshot",
+        lambda: _queue(recent_auth_failed=7, recent_succeeded=1),
+    )
+    monkeypatch.setattr(
+        infra_monitor,
+        "read_defer_to_user_tasks",
+        lambda: (("VOYN-NEW", "Need a decision", "P1", None),),
+    )
+    monkeypatch.setattr(
+        infra_monitor,
+        "record_findings",
+        lambda source, failures, detail: None,
+    )
+
+    def _notify(key, title, message, *, priority="default", tags=(), click_url=None):
+        notified.append((key, title, message, priority))
+        open_state.add(key)
+        return True
+
+    def _resolve(key, title, message):
+        resolved.append((key, title, message))
+        open_state.discard(key)
+        return True
+
+    monkeypatch.setattr(owner_notify, "notify", _notify)
+    monkeypatch.setattr(owner_notify, "resolve", _resolve)
+    monkeypatch.setattr(owner_notify, "open_keys", lambda: frozenset(open_state))
+
+    result = infra_monitor.main(
+        [
+            "--minimum-active-workers",
+            "1",
+            "--prometheus-url",
+            "http://m/ready",
+            "--record-findings",
+            "control-01",
+            "--max-auth-failed-attempts",
+            "5",
+        ]
+    )
+    out = json.loads(capsys.readouterr().out)
+    assert "executor_auth_failed:7" in out["failures"]
+    assert result == 1
+
+    auth = [n for n in notified if n[0] == "monitor:control-01:executor_auth_failed"]
+    assert len(auth) == 1
+    assert auth[0][3] == "urgent"
+    assert "OWNER_NOTIFICATIONS.md" in auth[0][2]
+
+    defer = [n for n in notified if n[0] == "defer:VOYN-NEW"]
+    assert defer == [
+        ("defer:VOYN-NEW", "Нужно решение: VOYN-NEW", "Need a decision", "high")
+    ]
+
+    assert (
+        "monitor:control-01:queue_stalled",
+        "AICC resolved: queue_stalled",
+        "queue_stalled cleared on control-01",
+    ) in resolved
+    assert (
+        "defer:OLD-TASK",
+        "Решено: OLD-TASK",
+        "DEFER_TO_USER cleared for OLD-TASK",
+    ) in resolved
+
+
+def test_notify_owner_of_report_does_not_change_failures(monkeypatch) -> None:
+    from command_center.ops import owner_notify
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        owner_notify, "notify", lambda *a, **k: calls.append("notify") or True
+    )
+    monkeypatch.setattr(
+        owner_notify, "resolve", lambda *a, **k: calls.append("resolve") or True
+    )
+    monkeypatch.setattr(owner_notify, "open_keys", lambda: frozenset())
+
+    report = evaluate(
+        {"voyn-aicc-worker@1.service": "active"},
+        _queue(recent_auth_failed=9),
+        minimum_active_workers=1,
+        max_stalled_seconds=900,
+        prometheus_ready=True,
+    )
+    before = report.failures
+    infra_monitor.notify_owner_of_report(report, source="control-01")
+    assert report.failures == before
+    assert calls == ["notify"]
+
+
+def test_notify_owner_unknown_defer_backlog_keeps_defer_keys_open(monkeypatch) -> None:
+    """A failed DEFER_TO_USER read (None) must not tell the owner 'resolved'."""
+    from command_center.ops import owner_notify
+
+    resolved: list[str] = []
+    monkeypatch.setattr(owner_notify, "notify", lambda *a, **k: True)
+    monkeypatch.setattr(
+        owner_notify, "resolve", lambda key, *a, **k: resolved.append(key) or True
+    )
+    monkeypatch.setattr(
+        owner_notify, "open_keys", lambda: frozenset({"defer:OPEN-TASK"})
+    )
+    report = evaluate(
+        {"voyn-aicc-worker@1.service": "active"},
+        _queue(),
+        minimum_active_workers=1,
+        max_stalled_seconds=900,
+        prometheus_ready=True,
+    )
+    infra_monitor.notify_owner_of_report(report, source="control-01", defer_tasks=None)
+    assert resolved == []
+
+
+def test_unprobed_queue_alert_is_not_resolved(monkeypatch):
+    from command_center.ops import owner_notify
+    resolved = []
+    monkeypatch.setattr(owner_notify, "open_keys", lambda: {"monitor:host:queue_stalled"})
+    monkeypatch.setattr(owner_notify, "resolve", lambda *a, **k: resolved.append(a))
+    report = evaluate({}, None, minimum_active_workers=0, max_stalled_seconds=900, prometheus_ready=True)
+    infra_monitor.notify_owner_of_report(report, source="host", defer_tasks=None)
+    assert resolved == []
+
+
+def test_notify_identity_does_not_depend_on_recording_flag(monkeypatch):
+    monkeypatch.setenv("AICC_OWNER_NOTIFY_SOURCE", "stable")
+    assert infra_monitor.notify_source("recording-destination") == infra_monitor.notify_source("") == "stable"
