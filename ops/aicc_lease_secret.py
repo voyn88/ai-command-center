@@ -315,18 +315,14 @@ def _install_from_args(args: argparse.Namespace) -> int:
 
 def _verify_from_args(args: argparse.Namespace) -> int:
     worker_env = Path(args.worker_env) if args.worker_env else None
-    provenance = verify_lease_secret(
+    verify_lease_secret(
         pgpass_path=Path(args.pgpass_path),
         provenance_path=Path(args.provenance_path),
         worker_env_path=worker_env,
     )
-    print(
-        "LEASE_SECRET_OK "
-        f"user={provenance['pg_user']} "
-        f"host={provenance['pg_host']}:{provenance['pg_port']} "
-        f"dbname={provenance['pg_dbname']} "
-        f"installed_by={provenance['installed_by']}"
-    )
+    # Presence only. The pgpass line and provenance fields stay off stdout:
+    # CodeQL treats values that flowed out of the secret file as sensitive.
+    print("LEASE_SECRET_OK")
     return 0
 
 

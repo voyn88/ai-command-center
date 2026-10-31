@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import os
 import sys
@@ -64,6 +65,31 @@ def test_install_and_verify_round_trip(tmp_path):
     assert recorded["installed_by"] == "unit-test"
     assert "password" not in provenance.read_text(encoding="utf-8")
     assert "lease-secret" not in provenance.read_text(encoding="utf-8")
+
+
+def test_verify_cli_reports_presence_without_secret_material(tmp_path, capsys):
+    module = _module()
+    pgpass = tmp_path / "voyn_lease_pgpass"
+    provenance = tmp_path / "voyn_lease_pgpass.provenance"
+    module.install_lease_pgpass(
+        line=_line(module),
+        installed_by="unit-test",
+        pgpass_path=pgpass,
+        provenance_path=provenance,
+        installed_at="2026-09-14T18:55:00Z",
+    )
+    rc = module._verify_from_args(
+        argparse.Namespace(
+            pgpass_path=str(pgpass),
+            provenance_path=str(provenance),
+            worker_env="",
+        )
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert out.strip() == "LEASE_SECRET_OK"
+    assert "lease-secret" not in out  # pragma: allowlist secret
+    assert "voyn_lease_client" not in out
 
 
 def test_worker_db_user_is_refused_on_install(tmp_path):
