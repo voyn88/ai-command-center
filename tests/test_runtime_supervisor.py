@@ -1537,6 +1537,36 @@ def test_process_exit_before_deadline_is_not_timed_out_by_slow_finalization(
 # --------------------------------------------------------------------------
 
 
+def _stub_capture_identity(monkeypatch):
+    """`ps -o lstart=` is unavailable in some sandboxed hosts; stub launch-time
+    identity capture so these lock tests exercise the SQLite path, not `ps`."""
+
+    def _fake(pid, *, timeout=5.0):
+        return identity.ProcessIdentity(
+            pid=pid, start_time="Thu Jan  1 00:00:00 2026", command="fake-claude"
+        )
+
+    monkeypatch.setattr(supervisor.identity, "capture_identity", _fake)
+
+
+def _seed_stale_running_workspace_lock(sup, repository_path: str) -> dict:
+    stale_task = db.create_task(sup.db_path, project="AIOS", title="stale", task_type="implementation")
+    stale_session = db.create_session(
+        sup.db_path, task_id=stale_task["id"], project="AIOS", repository_path=repository_path
+    )
+    stale_run = db.create_run(
+        sup.db_path, session_id=stale_session["id"], task_id=stale_task["id"], project="AIOS",
+        task_type="implementation", repository_path=repository_path, prompt="p0", is_resume=False,
+    )
+    stale_run = db.update_run_state(
+        sup.db_path, stale_run["id"], expected_version=stale_run["version"], new_state="QUEUED"
+    )
+    return db.update_run_state(
+        sup.db_path, stale_run["id"], expected_version=stale_run["version"], new_state="RUNNING",
+        fields={"pid": None, "process_start_identity": None, "started_at": "2026-01-01T00:00:00"},
+    )
+
+
 def test_workspace_locked_error_is_a_supervisor_error():
     """Every existing caller that already catches `supervisor.SupervisorError`
     (e.g. `app.py`'s launch handlers) must catch this without a new except
@@ -1545,8 +1575,9 @@ def test_workspace_locked_error_is_a_supervisor_error():
 
 
 def test_start_raw_raises_workspace_locked_error_when_workspace_already_active(
-    git_repo, configure_project_repo, fake_claude
+    git_repo, configure_project_repo, fake_claude, monkeypatch
 ):
+    _stub_capture_identity(monkeypatch)
     fake_claude["FAKE_CLAUDE_EXTRA_SLEEP"] = "5"
     configure_project_repo("AIOS", git_repo)
     sup = supervisor.Supervisor()
@@ -1569,33 +1600,19 @@ def test_start_raw_raises_workspace_locked_error_when_workspace_already_active(
 
 
 def test_start_raw_self_heals_a_same_host_crashed_workspace_lock(
-    git_repo, configure_project_repo, fake_claude
+    git_repo, configure_project_repo, fake_claude, monkeypatch
 ):
     """A row left RUNNING with no `pid` recorded (the state a crashed
     Supervisor leaves behind — see `db.create_run`'s `enforce_workspace_lock`
     docstring) must not permanently occupy the workspace lock on the *same*
-    host: `start_raw` reconciles once and retries before raising
-    `WorkspaceLockedError`, so the very next launch attempt against that
-    workspace self-heals instead of requiring an operator to call
-    `reconcile()` out of band first."""
+    host: `start_raw` reconciles (honouring the absence grace) and retries
+    before raising `WorkspaceLockedError`, so the very next launch attempt
+    against that workspace self-heals instead of requiring an operator to
+    call `reconcile()` out of band first."""
+    _stub_capture_identity(monkeypatch)
     configure_project_repo("AIOS", git_repo)
     sup = supervisor.Supervisor()
-
-    stale_task = db.create_task(sup.db_path, project="AIOS", title="stale", task_type="implementation")
-    stale_session = db.create_session(
-        sup.db_path, task_id=stale_task["id"], project="AIOS", repository_path=str(git_repo)
-    )
-    stale_run = db.create_run(
-        sup.db_path, session_id=stale_session["id"], task_id=stale_task["id"], project="AIOS",
-        task_type="implementation", repository_path=str(git_repo), prompt="p0", is_resume=False,
-    )
-    stale_run = db.update_run_state(
-        sup.db_path, stale_run["id"], expected_version=stale_run["version"], new_state="QUEUED"
-    )
-    db.update_run_state(
-        sup.db_path, stale_run["id"], expected_version=stale_run["version"], new_state="RUNNING",
-        fields={"pid": None, "process_start_identity": None, "started_at": "2026-01-01T00:00:00"},
-    )
+    stale_run = _seed_stale_running_workspace_lock(sup, str(git_repo))
 
     run = sup.start_raw(
         project="AIOS", repository_path=str(git_repo), task_type="implementation", prompt="p1", confirmed=True,
@@ -1607,29 +1624,63 @@ def test_start_raw_self_heals_a_same_host_crashed_workspace_lock(
         sup.cancel(run["id"], confirmed=True, grace_seconds=2)
 
 
+def test_start_raw_self_heals_stale_workspace_lock_across_reconcile_absence_grace(
+    git_repo, configure_project_repo, fake_claude, monkeypatch
+):
+    """Production grace is 5s: a single reconcile only *suspects* a gone row.
+    `start_raw` must wait the grace out and clear the lock, not raise after
+    one no-op reconcile+retry (the bug the zero-grace suite fixture hides)."""
+    _stub_capture_identity(monkeypatch)
+    configure_project_repo("AIOS", git_repo)
+    sup = supervisor.Supervisor()
+    # Short but non-zero: exercises the poll loop without a 5s wall clock.
+    sup._reconcile_absence_grace = 0.1
+    stale_run = _seed_stale_running_workspace_lock(sup, str(git_repo))
+
+    started = time.monotonic()
+    run = sup.start_raw(
+        project="AIOS", repository_path=str(git_repo), task_type="implementation", prompt="p1", confirmed=True,
+    )
+    elapsed = time.monotonic() - started
+    try:
+        assert run["state"] == "RUNNING"
+        assert db.get_run(sup.db_path, stale_run["id"])["state"] == "INTERRUPTED"
+        # Must have waited roughly the grace window (not returned in << grace).
+        assert elapsed >= 0.1
+    finally:
+        sup.cancel(run["id"], confirmed=True, grace_seconds=2)
+
+
 def test_start_raw_still_raises_workspace_locked_error_when_conflict_is_genuinely_alive(
-    git_repo, configure_project_repo, fake_claude
+    git_repo, configure_project_repo, fake_claude, monkeypatch
 ):
     """The self-heal reconcile-and-retry in `start_raw` must not paper over a
     conflict that is genuinely still active: reconciling a run this same
     Supervisor instance is actively supervising is a no-op (see
     `Supervisor.reconcile`'s own `self._active`/`self._launching` guards), so
     the retry must still lose and raise `WorkspaceLockedError` against the
-    same conflicting run — proving this is a bounded, single retry, not a
-    loop that eventually forces the launch through."""
+    same conflicting run — proving this is a bounded heal, not a loop that
+    eventually forces the launch through. Even with a non-zero absence grace,
+    a live owned conflict must fail closed immediately (no grace wait)."""
+    _stub_capture_identity(monkeypatch)
     fake_claude["FAKE_CLAUDE_EXTRA_SLEEP"] = "5"
     configure_project_repo("AIOS", git_repo)
     sup = supervisor.Supervisor()
+    # Non-zero grace: would cost ~seconds if the heal incorrectly waited on a
+    # live owned conflict the way it waits on a crashed predecessor.
+    sup._reconcile_absence_grace = 2.0
     first = sup.start_raw(
         project="AIOS", repository_path=str(git_repo), task_type="implementation", prompt="p1", confirmed=True
     )
     try:
+        started = time.monotonic()
         with pytest.raises(supervisor.WorkspaceLockedError) as excinfo:
             sup.start_raw(
                 project="AIOS", repository_path=str(git_repo), task_type="implementation", prompt="p2",
                 confirmed=True,
             )
         assert excinfo.value.conflicting_run["id"] == first["id"]
+        assert time.monotonic() - started < 1.0
     finally:
         sup.cancel(first["id"], confirmed=True, grace_seconds=2)
 

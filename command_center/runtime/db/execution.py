@@ -263,13 +263,14 @@ def create_run(
     calls `Supervisor.reconcile()` against *this* `db_path` and proves, via a
     local pid check, that the row is dead — which by construction can only
     ever happen on the host that created the row (`Supervisor.start_raw`
-    self-heals this by reconciling once and retrying on a same-host
-    conflict — see its docstring). Real cross-host mutual exclusion needs a
-    shared, host-aware lease authority outside this process's own SQLite file
-    (`resolve_db_path`); that capability is deliberately not built here — see
-    the `repo_lease` reference in `command_center/db/sql/0002_queue_claim.
-    up.sql` and `docs/AIOS_BOUNDARY.md` for why this module (the legacy local
-    execution engine) does not grow it itself."""
+    self-heals this by reconciling-and-retrying across the reconcile absence
+    grace on a same-host conflict — see its docstring). Real cross-host
+    mutual exclusion needs a shared, host-aware lease authority outside this
+    process's own SQLite file (`resolve_db_path`); that capability is
+    deliberately not built here — see the `repo_lease` reference in
+    `command_center/db/sql/0002_queue_claim.up.sql` and `docs/AIOS_BOUNDARY.md`
+    for why this module (the legacy local execution engine) does not grow it
+    itself (SRV-04a)."""
     if provider_route is not None:
         if not provider_route or any(not item for item in provider_route):
             raise ValueError("provider_route must contain non-empty provider ids")

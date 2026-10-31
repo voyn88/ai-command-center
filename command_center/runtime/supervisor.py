@@ -48,6 +48,7 @@ import signal
 import subprocess
 import threading
 import time
+from collections.abc import Callable
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -837,7 +838,7 @@ class Supervisor:
 
         try:
             run = _attempt_create_run()
-        except (db.WorkspaceLockedError, db.TaskAlreadyActiveError):
+        except (db.WorkspaceLockedError, db.TaskAlreadyActiveError) as first_exc:
             # `enforce_workspace_lock` and the per-task lock above have no expiry
             # or heartbeat (see `db.create_run`'s own docstring): a row left
             # PREPARED/QUEUED/RUNNING by a Supervisor that crashed on *this* host
@@ -845,9 +846,18 @@ class Supervisor:
             # `reconcile()`, which today only runs opportunistically (once at app
             # startup, or on an open dashboard's refresh tick — see `app.py`'s
             # `get_execution_center_api`). Rather than requiring every caller of
-            # `start_raw` to remember to reconcile first, self-heal here:
-            # reconcile once (a no-op if the conflicting run is genuinely still
-            # alive) and retry exactly once before surfacing the conflict.
+            # `start_raw` to remember to reconcile first, self-heal here.
+            #
+            # `reconcile()` deliberately debounces "looks gone" observations by
+            # `_reconcile_absence_grace` so a peer mid-launch (pid still None) or
+            # mid-finalization is not INTERRUPTED out from under its owner. A
+            # single reconcile+retry is therefore not enough in production: the
+            # first pass only records the suspicion. Poll reconcile+retry until
+            # the grace elapses (or the conflicting run proves live / owned by
+            # us), so a crashed same-host predecessor is actually terminalized
+            # before we surface WorkspaceLockedError / TaskAlreadyActiveError.
+            # When tests zero the grace, the first reconcile already clears and
+            # the loop exits on the first retry — same shape as before.
             #
             # This does not reach across hosts: `reconcile()` can only prove a
             # *local* pid is gone, and `repository_path` above is this process's
@@ -859,14 +869,11 @@ class Supervisor:
             # `command_center/db/sql/0002_queue_claim.up.sql` and the
             # already-accepted `command_center/worker/worktree_lease.py` pattern
             # for the queue-dispatch path) and is out of scope for this frozen
-            # local engine (`docs/AIOS_BOUNDARY.md`).
-            self.reconcile()
-            try:
-                run = _attempt_create_run()
-            except db.WorkspaceLockedError as exc:
-                raise WorkspaceLockedError(exc.conflicting_run) from exc
-            except db.TaskAlreadyActiveError as exc:
-                raise TaskAlreadyActiveError(exc.conflicting_run) from exc
+            # local engine (`docs/AIOS_BOUNDARY.md`). Full cross-host exclusion
+            # is tracked as SRV-04a's `repo_lease` migration.
+            run = self._retry_create_run_after_stale_lock(
+                _attempt_create_run, first_exc
+            )
 
         # Executor capability preflight (Required fix 5). The decision itself is
         # already persisted on the run row's `capability_*`/`command_policy`
@@ -2204,6 +2211,63 @@ class Supervisor:
             )
 
         return db.get_run(self.db_path, run_id)
+
+    @staticmethod
+    def _run_looks_absent_for_lock_heal(run: dict) -> bool:
+        """True when a conflicting active row looks like a crashed predecessor
+        rather than a live peer: no pid was ever recorded, or the recorded pid
+        is provably gone. UNKNOWN (unreadable `ps`) is treated as live — we
+        must not wait-and-steal a lock we cannot prove is free."""
+        pid = run.get("pid")
+        if pid is None:
+            return True
+        status = identity.query_identity(pid).status
+        return status in {
+            identity.ProcessQueryStatus.ABSENT,
+            identity.ProcessQueryStatus.ZOMBIE,
+        }
+
+    def _retry_create_run_after_stale_lock(
+        self,
+        attempt: Callable[[], dict],
+        first_exc: db.WorkspaceLockedError | db.TaskAlreadyActiveError,
+    ) -> dict:
+        """Reconcile-and-retry loop used by `start_raw` after a workspace/task
+        lock conflict. See the call site for the cross-host scope limit.
+
+        `attempt` is the zero-arg closure that runs `db.create_run` under
+        `_active_lock` and registers the new id in `_launching`.
+        """
+        def _reraise(exc: db.WorkspaceLockedError | db.TaskAlreadyActiveError) -> None:
+            if isinstance(exc, db.WorkspaceLockedError):
+                raise WorkspaceLockedError(exc.conflicting_run) from exc
+            raise TaskAlreadyActiveError(exc.conflicting_run) from exc
+
+        grace = max(float(self._reconcile_absence_grace), 0.0)
+        # Slightly past `grace` so a post-sleep reconcile is strictly outside
+        # reconcile's `(now - first_seen) < grace` debounce even when
+        # `first_seen` was stamped a few ms after this deadline was computed.
+        deadline = time.monotonic() + grace + (0.05 if grace > 0 else 0.0)
+        while True:
+            self.reconcile()
+            try:
+                return attempt()
+            except (db.WorkspaceLockedError, db.TaskAlreadyActiveError) as retry_exc:
+                conflict = retry_exc.conflicting_run
+                conflict_id = conflict["id"]
+                # A run this instance owns (or is mid-launch for) is a real
+                # conflict — reconcile will never clear it (see reconcile's
+                # `_active`/`_launching` guards), so waiting cannot help.
+                if conflict_id in self._active or conflict_id in self._launching:
+                    _reraise(retry_exc)
+                if not self._run_looks_absent_for_lock_heal(conflict):
+                    _reraise(retry_exc)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    _reraise(retry_exc)
+                # Poll frequently so a peer that CAS's terminal mid-grace is
+                # noticed promptly, without busy-spinning.
+                time.sleep(min(0.05, remaining))
 
     def _orphan_past_deadline(self, run: dict) -> bool:
         """Whether an adopted orphan (a RUNNING row from a previous incarnation of
