@@ -674,6 +674,19 @@ def test_bootstrap_and_transaction_use_one_fixed_host_lock_path():
     assert transaction.INSTALL_LOCK == bootstrap["DEFAULT_INSTALL_LOCK"]
 
 
+def test_transaction_git_calls_pin_http_1_1():
+    """Checked directly here, not only via the cross-file drift test in
+    test_aicc_release_manifest.py: this module's own hardened Git calls
+    (`_git_blob_oid`, `_git_tree_blobs`) must carry the HTTP/1.1 pin, since an
+    anonymous `git-upload-pack` POST from this datacenter's egress IPs was
+    observed 401ing over HTTP/2 while the same POST succeeded over HTTP/1.1
+    (voyn-worker-01, 2026-09-02)."""
+    module = _module()
+    assert "-c" in module.GIT_CONFIG_FREE
+    index = module.GIT_CONFIG_FREE.index("http.version=HTTP/1.1")
+    assert module.GIT_CONFIG_FREE[index - 1] == "-c"
+
+
 def test_uninstall_wal_blocks_install_and_resumes_after_registry_removal(tmp_path):
     module = _module()
     state = tmp_path / "state"
