@@ -8,6 +8,41 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Added — Linux systemd runtime platform proof (`VOYN-W0-AICC-SRV-05-LINUX-VERIFIED`)
+- `tests/ops/test_worker_systemd_runtime_platform.py`: proves, against a real
+  kernel and a real `systemd --user` session (not a mock), the mechanisms the
+  worker unit depends on — `systemd-analyze verify` on both unit files,
+  `Restart=always`/`StartLimitBurst` pacing (a clean `exit(0)` still restarts
+  and still trips the limit), the `KillMode=control-group` vs `KillMode=process`
+  cgroup-kill distinction, `PR_SET_PDEATHSIG`, `MemoryMax` OOM-kill,
+  `TasksMax` EAGAIN, `LimitAS`/`RLIMIT_AS` (a Linux-only guarantee — it does
+  not hold on macOS), seccomp (`SystemCallFilter` kills with `SIGSYS` where
+  DAC alone would return `EPERM`), journald's unforgeable trusted fields,
+  `StateDirectoryMode` landing on disk as declared, and `Type=notify` +
+  `WatchdogSec` aborting a handler that stops petting the watchdog. Each test
+  spawns and tears down its own disposable transient unit; nothing is
+  installed as a system unit or needs root. Self-skips off a live
+  `systemd --user` session.
+- `docs/operations/SRV05_LINUX_SYSTEMD_VERIFICATION.md`: the proof index —
+  all 13 runtime-platform properties proven (11 on one host; 2 cross-host).
+- `tests/ops/crosshost/`: the cross-host follow-up. Proves property 12
+  (SIGKILL failover consistency) and property 13 (network-partition
+  arbitration) against a real second host over SSH and a Postgres database
+  both hosts reach. Property 12: negative control (a live remote claim
+  excludes a second host), then `SIGKILL` the remote holder, `queue_reap()`
+  from the local host, confirm exactly one host reclaims the item and the
+  killed host's stale claim token cannot retroactively complete it.
+  Property 13: the remote holder dials Postgres only through a userspace
+  TCP forwarder on that host; stopping the forwarder partitions it without
+  root (`IPAddressDeny=` is a no-op on `--user` units; unprivileged netns
+  is blocked by apparmor on both hosts). The cut-off owner keeps running
+  and still tries to publish; the queue reaps and the local host completes
+  inside a visibility-bound window without the cut-off host's consent; both
+  the owner's post-hold complete and a direct stale-token complete fail to
+  publish. Self-skips unless `AICC_CROSSHOST_SSH_TARGET` has a live
+  `systemd --user` session and `AICC_CROSSHOST_PG_ADMIN_DSN` is set.
+  13 of 13 runtime-platform properties now proven.
+
 ### Added — the one-button audit, wired into the web UI (`VOYN-W0-APP-CONTROL-S4`)
 
 - `web/src/screens/Tasks.tsx`: an `AuditLauncher` panel above the task list —
