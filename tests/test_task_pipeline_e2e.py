@@ -26,6 +26,8 @@ a property already covered directly in `test_completion_scenarios.py`.
 
 from __future__ import annotations
 
+import contextlib
+
 import pytest
 
 from command_center import (
@@ -41,6 +43,7 @@ from command_center.runtime import api as runtime_api
 from command_center.runtime import completion as completion_domain
 from command_center.runtime import db as runtime_db
 from command_center.runtime import scheduler
+from command_center.runtime import supervisor as supervisor_runtime
 from command_center.runtime.github import FakeGitHubClient
 from tests.completion_helpers import build_repo, git, merge_into_main
 from tests.test_task_pipeline import _drain_runs
@@ -329,13 +332,28 @@ def test_dispatcher_restart_mid_run_yields_no_duplicates(tmp_path, api, fake_cla
     # in-process watcher finish, then reconstruct the exact crash window it
     # would have left behind: the run row still RUNNING, the pid dead --
     # precisely the state `Supervisor.reconcile()` exists to classify.
-    api.supervisor.wait_for_run(run_id, timeout=30)
+    finished = api.supervisor.wait_for_run(run_id, timeout=30)
+    assert finished["state"] in runtime_db.TERMINAL_STATES, finished["state"]
     with runtime_db.connect(api.db_path) as conn:
         with runtime_db.transaction(conn):
             conn.execute(
-                "UPDATE run SET state=?, completed_at=NULL, failure_reason=NULL, exit_code=NULL WHERE id=?",
+                "UPDATE run SET state=?, completed_at=NULL, finalized_at=NULL, "
+                "failure_reason=NULL, exit_code=NULL WHERE id=?",
                 ("RUNNING", run_id),
             )
+            conn.execute(
+                "UPDATE run_finalization_claim SET owner_token=?, owner_pid=?, "
+                "owner_identity=?, completed_at=NULL WHERE run_id=?",
+                ("dead-owner", 999_999_999, "dead-start|dead-command", run_id),
+            )
+    # A real dispatcher restart creates a new Python process, so its
+    # process-local ownership registry starts empty.  This E2E test keeps the
+    # restart inside one pytest process; explicitly reproduce that one piece
+    # of process-boundary state after the old watcher has finished.  Creating
+    # a second API facade alone must *not* clear the registry: other tests
+    # intentionally prove that same-process facades cannot steal live claims.
+    with supervisor_runtime._PROCESS_OWNED_RUNS_GUARD:
+        supervisor_runtime._PROCESS_OWNED_RUNS.discard(run_id)
     del api  # the old dispatcher, and its in-memory Popen registry, are gone
 
     # ------------------------------------- restart: fresh dispatcher instance
@@ -513,3 +531,153 @@ def test_daily_spend_budget_gates_new_launches_only(tmp_path, api, fake_claude):
     )
     ungated = task_pipeline.tick(tmp_path, api, configs, github=FakeGitHubClient(), advance_wait_seconds=60)
     assert [d.task_id for d in ungated.launched()] == ["s"]
+
+
+def test_daily_spend_usd_tolerates_dict_and_malformed_payloads(tmp_path, monkeypatch, caplog):
+    """A `jsonb`-backed read (the PostgreSQL mirror, VOYN-W0-AICC-SRV-01B) hands
+    back a `payload` that is already a decoded `dict`, not JSON text, and
+    `json.loads(dict)` raises `TypeError`. A prior version caught `TypeError`
+    alongside `ValueError` and silently `continue`d — every row in the batch
+    was dropped with no error and no log line, so the spend cap read 0 and
+    stopped gating without ever saying so. A dict-shaped row must be summed
+    like any other, and a genuinely malformed JSON-text row must be skipped
+    *and logged*, without knocking out the well-formed rows around it."""
+
+    class _FakeCursor:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def fetchall(self):
+            return self._rows
+
+    class _FakeConn:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def execute(self, *_args, **_kwargs):
+            return _FakeCursor(self._rows)
+
+    rows = [
+        {"payload": '{"type": "result", "total_cost_usd": 2.0}'},
+        {"payload": {"type": "result", "total_cost_usd": 3.5}},
+        {"payload": "{not valid json"},
+    ]
+
+    @contextlib.contextmanager
+    def _fake_connect(_db_path):
+        yield _FakeConn(rows)
+
+    monkeypatch.setattr(task_pipeline.runtime_db, "connect", _fake_connect)
+
+    with caplog.at_level("WARNING"):
+        total = task_pipeline.daily_spend_usd(tmp_path / "runtime.db")
+
+    assert total == pytest.approx(5.5)
+    assert "unparseable" in caplog.text
+
+
+def test_daily_spend_usd_skips_valid_json_that_is_not_an_object(tmp_path, monkeypatch, caplog):
+    """Regression for VOYN-W0-AICC-SPEND-CAP-NONDICT-JSON: `.get` must not run
+    on a non-dict payload.
+
+    Two realistic sources of non-dict values reach this loop:
+
+    * SQLite JSON *text* that still matches `LIKE '%total_cost_usd%'` — e.g.
+      `'[{"total_cost_usd": 1}]'` or `'"…total_cost_usd…"'`. Bare scalars like
+      `'42'` / `'true'` / `'null'` are *not* selected by that predicate; they
+      are exercised here as already-decoded jsonb values instead.
+    * A `jsonb` read that hands back a decoded list/str/int/bool/null
+      directly (no `json.loads` step).
+
+    The `isinstance(payload, dict)` guard from #418 (SPEND-CAP-ZERO) skips
+    each of those shapes with a "not an object" warning; a well-formed object
+    row in the same batch must still contribute to the sum.
+    """
+
+    class _FakeCursor:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def fetchall(self):
+            return self._rows
+
+    class _FakeConn:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def execute(self, *_args, **_kwargs):
+            return _FakeCursor(self._rows)
+
+    rows = [
+        # LIKE-matching JSON text → list / str after loads
+        {"payload": '[{"total_cost_usd": 1}]'},
+        {"payload": '"total_cost_usd"'},
+        # Already-decoded jsonb scalars/collections (no LIKE text involved)
+        {"payload": [{"total_cost_usd": 9}]},
+        {"payload": 42},
+        {"payload": True},
+        {"payload": False},
+        {"payload": None},
+        {"payload": '{"type": "result", "total_cost_usd": 2.0}'},
+    ]
+
+    @contextlib.contextmanager
+    def _fake_connect(_db_path):
+        yield _FakeConn(rows)
+
+    monkeypatch.setattr(task_pipeline.runtime_db, "connect", _fake_connect)
+
+    with caplog.at_level("WARNING"):
+        total = task_pipeline.daily_spend_usd(tmp_path / "runtime.db")
+
+    assert total == pytest.approx(2.0)
+    assert caplog.text.count("not an object") == 7
+    for shape in ("list", "str", "int", "bool", "NoneType"):
+        assert shape in caplog.text
+
+
+def test_daily_spend_usd_skips_like_matching_list_payload_in_sqlite(tmp_path, api, caplog):
+    """End-to-end on the live SQLite path: one `run_event` whose payload_json
+    is the LIKE-matching array `[{"total_cost_usd": 1}]` must be skipped (and
+    logged), not raise AttributeError, while a sibling object row still sums.
+    """
+    task = runtime_db.create_task(
+        api.db_path, project="AIOS", title="nondict-payload", task_type="implementation"
+    )
+    session = runtime_db.create_session(
+        api.db_path, task_id=task["id"], project="AIOS", repository_path="/tmp/x"
+    )
+    odd = runtime_db.create_run(
+        api.db_path, session_id=session["id"], task_id=task["id"],
+        project="AIOS", task_type="implementation", repository_path="/tmp/x",
+        prompt="odd", is_resume=False,
+    )
+    good = runtime_db.create_run(
+        api.db_path, session_id=session["id"], task_id=task["id"],
+        project="AIOS", task_type="implementation", repository_path="/tmp/x",
+        prompt="good", is_resume=False,
+    )
+    now = models.iso_now()
+    with runtime_db.connect(api.db_path) as conn:
+        with runtime_db.transaction(conn):
+            conn.execute(
+                """INSERT INTO run_event (run_id, seq, event_type, payload_json, created_at)
+                   VALUES (?, 1, 'stream_event', ?, ?)""",
+                (odd["id"], '[{"total_cost_usd": 1}]', now),
+            )
+            conn.execute(
+                """INSERT INTO run_event (run_id, seq, event_type, payload_json, created_at)
+                   VALUES (?, 1, 'stream_event', ?, ?)""",
+                (good["id"], '{"type": "result", "total_cost_usd": 2.0}', now),
+            )
+            conn.execute(
+                "UPDATE run SET state='COMPLETED', completed_at=? WHERE id IN (?, ?)",
+                (now, odd["id"], good["id"]),
+            )
+
+    with caplog.at_level("WARNING"):
+        total = task_pipeline.daily_spend_usd(api.db_path)
+
+    assert total == pytest.approx(2.0)
+    assert "not an object" in caplog.text
+    assert "list" in caplog.text

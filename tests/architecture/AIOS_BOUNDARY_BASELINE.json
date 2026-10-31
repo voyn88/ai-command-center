@@ -84,12 +84,6 @@
       "audit",
       "orchestration"
     ],
-    "command_center/db/audit_store.py": [
-      "audit"
-    ],
-    "command_center/db/provenance_store.py": [
-      "audit"
-    ],
     "command_center/db/work_queue_store.py": [
       "queue"
     ],
@@ -136,6 +130,9 @@
       "memory"
     ],
     "command_center/orchestrator/__init__.py": [
+      "orchestration"
+    ],
+    "command_center/orchestrator/gh_access.py": [
       "orchestration"
     ],
     "command_center/orchestrator/github_app_auth.py": [
@@ -314,9 +311,6 @@
     ],
     "command_center/task_pipeline.py": [
       "orchestration"
-    ],
-    "command_center/tasks_repository.py": [
-      "memory"
     ],
     "command_center/webapi/queue_routes.py": [
       "queue"
