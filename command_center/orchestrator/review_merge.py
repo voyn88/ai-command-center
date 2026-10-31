@@ -1288,7 +1288,7 @@ def _next_retry_key(
     if state != "succeeded" or attempt >= _MAX_RESULT_RETRY_ATTEMPTS:
         return None
     result = _json_object(payload_value)
-    parsed = _parse_verdict((result or {}).get("result_text") or "")
+    parsed = _parse_review_verdict((result or {}).get("result_text") or "")
     if parsed is not None and parsed[1] == expected_head:
         return None
     return f"{base_key}:retry:{attempt + 1}"
@@ -1363,6 +1363,8 @@ def _pr_diff_and_head(
             data = json.loads(view.stdout or "{}") if view.returncode == 0 else {}
         else:
             data = pull
+        if data.get("state") != "open" or data.get("merged_at"):
+            return None
         base, head = data["base"], data["head"]
         base_sha, head_sha = base["sha"], head["sha"]
         same_repo = base["repo"]["full_name"].casefold() == f"{owner}/{repo}".casefold()
@@ -1390,7 +1392,21 @@ def _pr_diff_and_head(
         sum(line.startswith("+") and not line.startswith("+++ ") for line in lines),
         sum(line.startswith("-") and not line.startswith("--- ") for line in lines),
     )
-    return _PRSnapshot.create(text, base_sha, head_sha) if observed == stats else None
+    if observed != stats:
+        return None
+    # A compare is immutable, but the PR can close or move while it is fetched.
+    # Revalidate before scheduling model work against that exact snapshot.
+    refreshed = _gh(["api", f"repos/{owner}/{repo}/pulls/{number}"], repo_path)
+    try:
+        current = json.loads(refreshed.stdout or "{}")
+        if (refreshed.returncode != 0 or current.get("state") != "open"
+                or current.get("merged_at")
+                or current["head"]["sha"] != head_sha
+                or current["base"]["sha"] != base_sha):
+            return None
+    except (KeyError, TypeError, AttributeError, json.JSONDecodeError):
+        return None
+    return _PRSnapshot.create(text, base_sha, head_sha)
 
 
 def _pr_diff_and_head_with_pull(
@@ -1842,6 +1858,30 @@ def _parse_verdict(text: str) -> tuple[str, str] | None:
     return verdict_match.group(1), sha_match.group(1)
 
 
+def _review_has_findings(text: str) -> bool:
+    """Reject trailers/chunk headers alone are malformed, never evidence.
+
+    This validates presence, not the truth or quality of a finding. Nonempty
+    findings still undergo independent verification under the existing policy.
+    """
+    for line in text.splitlines():
+        line = line.strip()
+        if (not line or re.fullmatch(r"Chunk \d+/\d+:", line)
+                or re.fullmatch(r"VERDICT:\s*(?:ACCEPT|REJECT)", line)
+                or re.fullmatch(r"HEAD_SHA:\s*[0-9a-f]{7,40}", line)
+                or re.fullmatch(r"`{3}(?:[a-zA-Z]+)?|[-*_]{3,}", line)):
+            continue
+        return True
+    return False
+
+
+def _parse_review_verdict(text: str) -> tuple[str, str] | None:
+    parsed = _parse_verdict(text)
+    if parsed is not None and parsed[0] == "REJECT" and not _review_has_findings(text):
+        return None
+    return parsed
+
+
 def _latest_review_result(factory: Any, task_id: str, key: str) -> dict[str, Any] | None:
     """The succeeded review-class work result for this exact review-cycle
     key (task, PR, head sha, policy version), or None if no review has
@@ -1893,7 +1933,7 @@ def _chunk_review_rows(
         if current is None or attempt > current[0]:
             newest[base_key] = (attempt, (base_key, *row[1:]))
         result = _json_object(row[3])
-        parsed = _parse_verdict((result or {}).get("result_text") or "")
+        parsed = _parse_review_verdict((result or {}).get("result_text") or "")
         valid = first_valid.get(base_key)
         if parsed is not None and parsed[1] == snapshot.head and (
             valid is None or attempt < valid[0]
@@ -1973,7 +2013,7 @@ def _aggregate_chunk_verdict(
             waiting_reason = waiting_reason or f"review_chunk_not_succeeded:{index}:{state}"
             continue
         text = result.get("result_text") or ""
-        parsed = _parse_verdict(text)
+        parsed = _parse_review_verdict(text)
         if parsed is None:
             waiting_reason = waiting_reason or f"review_chunk_verdict_missing:{index}"
             continue
@@ -2483,6 +2523,8 @@ def _verified_rejection_outcome(
       cleanly must never auto-accept, and parking the task forever would
       recreate exactly the stall this task exists to remove.
     """
+    if not _review_has_findings(findings):
+        return "WAIT", "review_reject_missing_findings"
     key = _verification_key(task_id, pr_url, snapshot, findings)
     if key is None or len(findings.encode("utf-8")) > _MAX_VERIFICATION_FINDINGS_BYTES:
         return "REMEDIATE", findings
@@ -2755,7 +2797,7 @@ def publish_review_verdicts(
                 report.skipped.append((task_id, "no_review_result_yet"))
                 continue
             text = result.get("result_text") or ""
-            parsed = _parse_verdict(text)
+            parsed = _parse_review_verdict(text)
             if parsed is None:
                 report.skipped.append((task_id, "verdict_or_head_sha_missing_in_review_result"))
                 continue
