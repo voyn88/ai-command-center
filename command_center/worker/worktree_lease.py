@@ -48,6 +48,7 @@ import json
 import os
 import socket
 import subprocess
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -86,16 +87,42 @@ def _covers(leased: str | None, repository: Path) -> bool:
     return repository == path or repository.is_relative_to(path)
 
 
-def _process_start(pid: int) -> str | None:
-    """Field 22 of ``/proc/<pid>/stat`` -- the same identity token the lease
-    authority stores. Parsed past the last ``)`` because ``comm`` is
-    parenthesised and may itself contain spaces, which a naive split would
-    mis-column."""
+_STAT_FIELD_PPID = 1
+_STAT_FIELD_START = 19
+
+
+def _read_stat_fields(pid: int) -> list[str] | None:
+    """``/proc/<pid>/stat``'s fields past the parenthesised ``comm``, split on
+    whitespace, or ``None`` when the file cannot be read.
+
+    This is the one seam between process identity and the real filesystem.
+    ``_process_start`` and ``_ancestry`` both go through it rather than
+    reading ``/proc`` directly, for two reasons: platforms with no ``/proc``
+    (macOS) get a single place to fail soft instead of every call site
+    guessing, and tests that need a deterministic ancestry chain can
+    monkeypatch ``_stat_reader`` instead of depending on a real process tree.
+    ``comm`` is parsed past the last ``)`` because it is parenthesised and may
+    itself contain spaces, which a naive split would mis-column.
+    """
     try:
         stat = Path(f"/proc/{pid}/stat").read_text()
-        fields = stat[stat.rindex(")") + 2 :].split()
-        return fields[19]
-    except (OSError, ValueError, IndexError):
+    except OSError:
+        return None
+    return stat[stat.rindex(")") + 2 :].split()
+
+
+_stat_reader: Callable[[int], list[str] | None] = _read_stat_fields
+
+
+def _process_start(pid: int) -> str | None:
+    """The identity token the lease authority stores for ``pid`` -- field 22
+    of ``/proc/<pid>/stat`` (index 19 once split past ``comm``)."""
+    fields = _stat_reader(pid)
+    if fields is None:
+        return None
+    try:
+        return fields[_STAT_FIELD_START]
+    except IndexError:
         return None
 
 
@@ -111,11 +138,16 @@ def _ancestry() -> dict[int, str | None]:
     seen: dict[int, str | None] = {}
     pid = os.getpid()
     while pid > 0 and pid not in seen:
-        seen[pid] = _process_start(pid)
+        fields = _stat_reader(pid)
         try:
-            stat = Path(f"/proc/{pid}/stat").read_text()
-            pid = int(stat[stat.rindex(")") + 2 :].split()[1])
-        except (OSError, ValueError, IndexError):
+            seen[pid] = fields[_STAT_FIELD_START] if fields is not None else None
+        except IndexError:
+            seen[pid] = None
+        if fields is None:
+            break
+        try:
+            pid = int(fields[_STAT_FIELD_PPID])
+        except (ValueError, IndexError):
             break
     return seen
 
