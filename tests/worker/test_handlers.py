@@ -302,6 +302,63 @@ def test_principal_isolation_failure_is_retryable_not_a_task_result(
     assert outcome.retryable
     assert "agent principal isolation" in outcome.reason
     assert not removed, "ambiguous launcher failure must preserve task-local work"
+    # An UNMARKED launcher failure may be permanent (a missing group, a dead
+    # socket unit), so it keeps spending the attempt budget and can reach the
+    # dead-letter queue. Only the broker's transient marker earns a refund --
+    # see the next test.
+    assert outcome.lease_wait is False
+
+
+def test_a_launcher_workspace_walk_race_is_refunded_not_a_spent_attempt(
+    handler, monkeypatch, tmp_path
+) -> None:
+    """VOYN-W0-AICC-LAUNCHER-WORKSPACE-WALK-RACES-VENV-WRITES, live
+    2026-09-09: the broker's pre-bind walk lost a race with a writer under the
+    task venv (`workspace entry changed while opening:
+    .venv/lib/python3.12/site-packages/...`). Failing that walk closed is
+    correct -- root must not chown an inode whose identity moved -- but it
+    names no fault in the task, so every redelivery hit it again until the
+    cascade was exhausted and the task parked into DEFER_TO_USER with its PR
+    already published. The broker marks such a refusal transient on its fixed
+    failure envelope and the outcome must take the refund-and-bound exit
+    (`lease_wait=True`) instead of this item's `max_attempts`."""
+    run_agent, _ = handler
+    removed: list[tuple] = []
+    monkeypatch.setattr(
+        workspace_provisioning,
+        "remove_workspace",
+        lambda *args, **kwargs: removed.append(args),
+    )
+
+    def launcher_raced(**kwargs):
+        return agent_runner.RunResult(
+            status="failed",
+            exit_code=125,
+            stdout="",
+            stderr=(
+                "AICC_AGENT_LAUNCH_INFRA_FAILURE: transient: workspace entry "
+                "changed while opening: "
+                ".venv/lib/python3.12/site-packages/pkg/__init__.py"
+            ),
+            duration_seconds=0.1,
+            started_at="2026-09-09T20:00:00+00:00",
+            completed_at="2026-09-09T20:00:00+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", launcher_raced)
+    outcome = run_agent(
+        _payload(
+            task_type="implementation",
+            repository_path=str(tmp_path / "repo"),
+        ),
+        _event(),
+        1,
+    )
+    assert not outcome.ok
+    assert outcome.retryable is True
+    assert outcome.lease_wait is True
+    assert "agent principal isolation" in outcome.reason
+    assert not removed, "a raced launch must still preserve task-local work"
 
 
 def test_successful_review_may_quote_principal_failure_marker(
