@@ -9,7 +9,7 @@
 -- itself raises. That is what "reversible" means here, and it is the reason
 -- this file exists rather than a stub.
 
-CREATE FUNCTION backlog_dispatch(
+CREATE OR REPLACE FUNCTION backlog_dispatch(
     p_task_id text, p_planner text, p_ttl_seconds integer,
     p_wip_limit integer, p_payload jsonb, p_max_attempts integer DEFAULT 3
 ) RETURNS backlog_dispatch_verdict
