@@ -346,12 +346,11 @@ def test_every_lost_mirror_write_is_visible_to_reconciliation(
 
     def scenario() -> None:
         nonlocal runs, db_path
-        with pg_connection_factory() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "DELETE FROM owner_item WHERE id = ANY(%s)",
-                    ([untouched_id, finished_id],),
-                )
+        with pg_connection_factory() as conn, conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM owner_item WHERE id = ANY(%s)",
+                ([untouched_id, finished_id],),
+            )
         db_path = tmp_path / f"runtime-{runs}.db"
         runs += 1
         wave1.db.migrate(db_path)
@@ -431,8 +430,7 @@ def test_a_naive_timestamp_is_stored_as_the_instant_the_writer_meant(
 
     mirror.upsert(_row("tz", created_at=written, updated_at=written))
 
-    with pg_connection_factory() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT created_at FROM owner_item WHERE id = 'tz'")
-            stored = cur.fetchone()[0]
+    with pg_connection_factory() as conn, conn.cursor() as cur:
+        cur.execute("SELECT created_at FROM owner_item WHERE id = 'tz'")
+        stored = cur.fetchone()[0]
     assert stored == expected
