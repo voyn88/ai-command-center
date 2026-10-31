@@ -12,6 +12,7 @@ they did against the single module.
 
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 import time
@@ -24,6 +25,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 import command_center.runtime.db as db  # facade (late-bound; see docstring)
+
+_LOG = logging.getLogger(__name__)
 
 
 def _new_session_id() -> str:
@@ -705,13 +708,37 @@ def apply_runtime_retention(db_path: Path, *, retention_days: int) -> int:
     return removed
 
 
+#: Where the automatic retention path (below) writes its backup and cold
+#: archive. Required, on top of `AICC_RUNTIME_RETENTION_DAYS`, to delete
+#: anything: every `db.migrate()` call site is a service construction, not a
+#: deliberate operator action, so the automatic path refuses to run the bare,
+#: archive-less `apply_runtime_retention` delete it used to
+#: (VOYN-W0-AICC-RETENTION-NO-DRYRUN). Set to run `maintenance.rehearse`
+#: instead — the identical sequence against a throwaway copy, proving the
+#: original byte-identical afterward — to validate a retention window before
+#: trusting it to delete for real on a given install.
+RUNTIME_RETENTION_ARCHIVE_DIR_ENV = "AICC_RUNTIME_RETENTION_ARCHIVE_DIR"
+RUNTIME_RETENTION_DRY_RUN_ENV = "AICC_RUNTIME_RETENTION_DRY_RUN"
+
+
 def maybe_apply_runtime_retention(db_path: Path) -> None:
     """Apply retention iff the operator set `AICC_RUNTIME_RETENTION_DAYS` to a
     positive integer. Default (unset / <= 0) is a no-op, so this never changes
     behavior for existing installs or the test suite.
 
-    A companion `AICC_RUNTIME_VACUUM_ON_START=1` runs `VACUUM` after pruning to
-    reclaim disk. VACUUM rewrites the whole database under an exclusive lock, so
+    Routes through `maintenance.archive_and_prune` — backup, cold archive,
+    integrity check, all in the same transaction scope as the delete — the
+    same rollback-safe sequence the deliberate maintenance path uses, never
+    the bare `apply_runtime_retention` delete on its own. That also means
+    `AICC_RUNTIME_RETENTION_ARCHIVE_DIR` must be set; without it, this skips
+    entirely (no archive, no deletion) rather than delete without one. With
+    `AICC_RUNTIME_RETENTION_DRY_RUN=1`, it calls `maintenance.rehearse`
+    instead: the identical sequence against a throwaway copy of the database,
+    which raises rather than returns if the original turns out not to be
+    byte-identical afterward.
+
+    A companion `AICC_RUNTIME_VACUUM_ON_START=1` reclaims disk after a clean
+    prune. VACUUM rewrites the whole database under an exclusive lock, so
     it is opt-in and should only be enabled on a single-host install that can
     pause other writers briefly.
     """
@@ -724,8 +751,33 @@ def maybe_apply_runtime_retention(db_path: Path) -> None:
         return
     if retention_days <= 0:
         return
+    archive_dir = os.environ.get(RUNTIME_RETENTION_ARCHIVE_DIR_ENV)
+    if not archive_dir:
+        _LOG.warning(
+            "AICC_RUNTIME_RETENTION_DAYS=%s is set but %s is not; skipping "
+            "automatic retention rather than deleting without an archive. "
+            "Set both, or run maintenance.archive_and_prune/rehearse "
+            "deliberately instead.",
+            raw,
+            RUNTIME_RETENTION_ARCHIVE_DIR_ENV,
+        )
+        return
+    vacuum = os.environ.get("AICC_RUNTIME_VACUUM_ON_START") == "1"
+    dry_run = os.environ.get(RUNTIME_RETENTION_DRY_RUN_ENV) == "1"
+
+    # Imported here, not at module scope: `maintenance` imports the `db`
+    # facade package, which imports this module — a module-level import would
+    # be a cycle broken only by import order.
+    from command_center.runtime import maintenance
+
+    run = maintenance.rehearse if dry_run else maintenance.archive_and_prune
     try:
-        db.apply_runtime_retention(db_path, retention_days=retention_days)
+        run(
+            db_path,
+            retention_days=retention_days,
+            archive_dir=Path(archive_dir),
+            vacuum=vacuum,
+        )
     except ValueError:
         # An unusable `AICC_RUNTIME_TZ`. This path runs inside `migrate()`, on
         # every service construction, so it must not take the app down — but it
@@ -733,9 +785,16 @@ def maybe_apply_runtime_retention(db_path: Path) -> None:
         # safe half of that trade; the operator's next deliberate
         # `apply_runtime_retention` call raises and says why.
         return
-    if os.environ.get("AICC_RUNTIME_VACUUM_ON_START") == "1":
-        with db.connect(db_path) as conn:
-            conn.execute("VACUUM")
+    except maintenance.MaintenanceError:
+        # Backup, archive/delete-count mismatch, integrity check or rehearsal
+        # byte-identity all raise this. Same trade as the `ValueError` above:
+        # this runs on every service construction, so it logs and skips
+        # rather than taking the app down or deleting on an unproven path.
+        _LOG.exception(
+            "automatic runtime retention failed against %s; left as-is",
+            db_path,
+        )
+        return
 
 
 def current_schema_version(db_path: Path) -> int:
@@ -747,3 +806,23 @@ def current_schema_version(db_path: Path) -> int:
 
 def _row_to_dict(row: sqlite3.Row | None) -> dict | None:
     return dict(row) if row is not None else None
+
+
+def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    """Whether `name` is a table in `conn`'s database, via `sqlite_master`.
+
+    Centralizes a `sqlite_master` lookup that was duplicated, each time
+    re-typed by hand, across the schema/provenance/execution guards that let
+    `create_run` and its migrations work against a database migrated only
+    part-way (see `create_run`'s `provenance_table`/`provider_route_table`
+    guards and `_migration_25_add_finalization_claim`'s preexisting-table
+    check) — those tables do not exist yet on such a database, and an
+    unguarded read against them raises instead of finding nothing.
+    """
+    return (
+        conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (name,),
+        ).fetchone()
+        is not None
+    )
