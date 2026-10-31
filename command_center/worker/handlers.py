@@ -810,11 +810,21 @@ def _run_agent(
             # `repository`. Checked before provisioning: the path is
             # computed deterministically above with no filesystem access, so
             # this can run whether or not the worktree exists yet.
-            # Retryable: a lease is a temporary claim, so redelivery lands
-            # once it is released, bounded by the item's own max_attempts.
+            # A held worktree is contention with no fault in this item's
+            # work -- refund via `lease_wait` (same budget as a publish
+            # `lease_unavailable`, VOYN-W0-AICC-PUBLISH-LEASE-CONTENTION-
+            # BURNS-ATTEMPT-REM). Authority unreachable/refused is the
+            # substrate, not contention -- `infra_wait`.
             held = blocking_lease(isolated_workspace)
             if held is not None:
-                return HandlerOutcome(ok=False, reason=held, retryable=True)
+                contention = held.startswith("worktree ")
+                return HandlerOutcome(
+                    ok=False,
+                    reason=held,
+                    retryable=True,
+                    lease_wait=contention,
+                    infra_wait=not contention,
+                )
 
             # Full-lifecycle writer lease. `blocking_lease` above is a
             # deliberately read-only preflight (its own docstring: "it never
@@ -885,15 +895,26 @@ def _run_agent(
                     # own `finally`.
                     full_lifecycle_lease_held = True
                 except writer_lease.WriterLeaseUnavailable as exc:
-                    # Another writer already holds the repository's lease,
-                    # or the authority refused/could not be reached: a data
-                    # refusal, not a defect -- the attempt returns to the
-                    # pool and a later delivery retries once the lease
-                    # clears, bounded by max_attempts.
+                    # Another writer already holds this task's lease, or the
+                    # authority refused/could not be reached: a data refusal,
+                    # not a defect in the work. Routing through the ordinary
+                    # retryable path spent `max_attempts` on contention (or
+                    # on a down authority) -- the same burn the publish-side
+                    # `lease_unavailable` path used to inflict on finished
+                    # work (live 2026-09-06 wki_55f316db / wki_e0695c3d).
+                    # Contention refunds via `lease_wait`; an authority /
+                    # tool failure refunds via `infra_wait`.
+                    detail = str(exc).lower()
+                    contention = any(
+                        marker in detail
+                        for marker in ("held", "active", "lease_unavailable")
+                    )
                     return HandlerOutcome(
                         ok=False,
                         reason=f"writer lease unavailable: {exc}",
                         retryable=True,
+                        lease_wait=contention,
+                        infra_wait=not contention,
                     )
 
             base_branch = (
