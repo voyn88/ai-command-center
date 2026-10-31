@@ -873,10 +873,31 @@ class Planner:
                 "FROM backlog_eligible"
             )
             gate = self._reuse_gate(candidates)
-            for (
-                task_id, wave, priority, title, body, repo, dispatchable, task_class,
-                required_authorities,
-            ) in candidates:
+            for row in candidates:
+                if len(row) >= 9:
+                    (
+                        task_id,
+                        wave,
+                        priority,
+                        title,
+                        body,
+                        repo,
+                        dispatchable,
+                        task_class,
+                        required_authorities,
+                    ) = row[:9]
+                else:
+                    (
+                        task_id,
+                        wave,
+                        priority,
+                        title,
+                        body,
+                        repo,
+                        dispatchable,
+                        task_class,
+                    ) = row[:8]
+                    required_authorities = None
                 if limits.only_task_id is not None and task_id != limits.only_task_id:
                     continue
                 if len(report.dispatched) >= limits.max_dispatches_per_tick:
