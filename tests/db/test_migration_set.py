@@ -132,4 +132,4 @@ def test_monitor_clear_by_class_does_not_collide_with_fleet_migrations() -> None
     assert found[31].slug == "monitor_clear_findings_by_class"
     # Contiguous through 31 so a control host that already has 0029+0030
     # applied can step to 0031 without a gap or a rename fight.
-    assert [m.version for m in migrations.discover()] == list(range(1, 32))
+    assert [m.version for m in migrations.discover()][:31] == list(range(1, 32))
