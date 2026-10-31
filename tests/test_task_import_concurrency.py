@@ -171,19 +171,49 @@ def test_import_lock_times_out_with_a_clear_error_instead_of_hanging(tmp_path):
 
 @pytest.mark.serial  # many concurrent registry writers on a lock deadline; flaky when xdist saturates all cores
 def test_registry_stays_valid_json_after_many_concurrent_imports(tmp_path):
+    """Each batch takes its own N-separate-lock-cycles path through
+    `apply_task_package` (see that function's docstring), so with 8 batches
+    queued behind one file lock, a batch can — legitimately, per
+    `apply_task_package`'s own documented contract — raise `TaskImportError`
+    if its cumulative wait exceeds `lock_timeout`. Left uncaught, that
+    exception only prints a traceback from inside the thread and the
+    assertions below then fail on a confusing "ids don't match" message that
+    hides the real cause. Capturing it via `errors` (same idiom as
+    `test_two_different_packages_imported_concurrently_both_survive_threaded`
+    above) makes that failure mode diagnosable instead of mysterious."""
     task_id_batches = [[f"BULK-{i}-1", f"BULK-{i}-2"] for i in range(8)]
     start = threading.Barrier(len(task_id_batches))
+    errors: list[Exception] = []
 
     def run(task_ids: list[str]) -> None:
         parsed, validation = _package(*task_ids)
         start.wait()
-        ti.apply_task_package(tmp_path, parsed, validation)
+        try:
+            ti.apply_task_package(tmp_path, parsed, validation)
+        except Exception as exc:  # noqa: BLE001 - surfaced via `errors`
+            errors.append(exc)
 
     threads = [threading.Thread(target=run, args=(batch,)) for batch in task_id_batches]
     for t in threads:
         t.start()
+    # `join(timeout=...)` here is a *test* deadline, not a product one — it
+    # must comfortably exceed the worst-case time `apply_task_package` itself
+    # is allowed to take, or a slow-but-correct run reads as a false failure.
+    # 8 batches x 2 items = 16 sequential lock cycles funnelled through one
+    # file lock, close to 3x the 6 lock cycles in
+    # `test_two_different_packages_imported_concurrently_both_survive_threaded`
+    # (which budgets 15s for that smaller workload). Sizing this one at 15s
+    # too left it with far less headroom per lock cycle than its sibling, so
+    # it was the one that flaked under ordinary CI scheduling jitter even
+    # though the underlying lock (proved correct by the other tests in this
+    # module) was never at fault. 45s keeps a bounded, deterministic deadline
+    # — no unbounded wait, no retry loop — while giving each of the 16 cycles
+    # the same per-cycle margin as the smaller sibling test.
     for t in threads:
-        t.join(timeout=15)
+        t.join(timeout=45)
+
+    assert not any(t.is_alive() for t in threads), "a batch import did not finish within the join deadline"
+    assert not errors, errors
 
     tasks_file = tasks_repository.tasks_file_path(tmp_path)
     data = json.loads(tasks_file.read_text(encoding="utf-8"))  # raises if partially written

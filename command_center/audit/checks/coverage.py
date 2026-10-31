@@ -6,13 +6,21 @@ When no coverage data exists it raises a single ``info`` finding recording the
 gap (rather than silently passing — "no data" is itself worth surfacing). Real
 and in-repo: it consumes coverage data the project already produces, never runs
 the test-suite itself, and makes no network call.
+
+Parsed with ``defusedxml`` rather than the stdlib ``xml.etree.ElementTree``:
+a ``coverage.xml`` is produced by the project's own tooling in the common
+case, but this check also runs over arbitrary target trees (audit scope is
+operator-supplied), so a crafted report — e.g. a billion-laughs entity-
+expansion payload — must not be able to turn a coverage read into a DoS.
 """
 
 from __future__ import annotations
 
-import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import ClassVar
+
+import defusedxml.ElementTree as ET
+from defusedxml.common import DefusedXmlException
 
 from command_center.audit.checks.base import Check
 from command_center.audit.types import CheckContext, Finding, default_owner_for
@@ -26,10 +34,11 @@ _DEFAULT_MIN_COVERAGE = 0.80
 
 def _parse_line_rate(report: Path) -> float | None:
     """The overall ``line-rate`` (0..1) from a Cobertura XML report, or ``None``
-    if the file is absent/unparseable/has no rate."""
+    if the file is absent/unparseable/has no rate/is a malicious payload
+    (billion-laughs and similar entity-expansion attacks)."""
     try:
         root = ET.parse(report).getroot()
-    except (OSError, ET.ParseError):
+    except (OSError, ET.ParseError, DefusedXmlException):
         return None
     raw = root.get("line-rate")
     if raw is None:

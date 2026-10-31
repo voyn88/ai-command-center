@@ -109,6 +109,30 @@ def test_coverage_check_info_when_no_report(tmp_path: Path) -> None:
     assert findings[0].severity == "info"
 
 
+def test_coverage_check_billion_laughs_is_not_a_dos(tmp_path: Path) -> None:
+    """A crafted ``coverage.xml`` with nested entity expansion must not blow up
+    memory/CPU. The check should treat it like any other unparseable report
+    (an ``info`` finding), not hang or crash."""
+    (tmp_path / "coverage.xml").write_text(
+        '<?xml version="1.0"?>\n'
+        "<!DOCTYPE coverage [\n"
+        ' <!ENTITY lol "lol">\n'
+        ' <!ENTITY lol2 "&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;">\n'
+        ' <!ENTITY lol3 "&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;">\n'
+        ' <!ENTITY lol4 "&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;">\n'
+        ' <!ENTITY lol5 "&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;">\n'
+        ' <!ENTITY lol6 "&lol5;&lol5;&lol5;&lol5;&lol5;&lol5;&lol5;&lol5;&lol5;&lol5;">\n'
+        ' <!ENTITY lol7 "&lol6;&lol6;&lol6;&lol6;&lol6;&lol6;&lol6;&lol6;&lol6;&lol6;">\n'
+        ' <!ENTITY lol8 "&lol7;&lol7;&lol7;&lol7;&lol7;&lol7;&lol7;&lol7;&lol7;&lol7;">\n'
+        ' <!ENTITY lol9 "&lol8;&lol8;&lol8;&lol8;&lol8;&lol8;&lol8;&lol8;&lol8;&lol8;">\n'
+        "]>\n"
+        '<coverage line-rate="0.9">&lol9;</coverage>\n'
+    )
+    findings = CoverageCheck().run(_ctx(tmp_path))
+    assert len(findings) == 1
+    assert findings[0].severity == "info"
+
+
 # --- ruff parser robustness -----------------------------------------------
 
 

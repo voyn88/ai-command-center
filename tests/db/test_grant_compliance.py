@@ -440,29 +440,22 @@ def test_worker_can_call_queue_redrive_without_grants(
 
 
 # ---------------------------------------------------------------------------
-# The backlog store (0005, BO-S1): behavioural proof, not just catalog diff
+# The same defect in the backlog domain: a worker resurrecting its own park
+# via backlog_resume_deferred without grants (roles.py TODO, post-#321 slice)
 # ---------------------------------------------------------------------------
-#
-# roles.py's `_APP_BACKLOG_TABLES`/`_WORKER_BACKLOG_TABLES` comment promised
-# this suite's provisioning coverage would extend to the backlog tables "in
-# the first post-#321 slice" (BO-S1, #326) — the generic catalog-diff tests
-# above already exercise `backlog_task` et al because `ALL_TABLES`/`PRIVILEGES`
-# include them, but that promise was specifically about a *behavioural*
-# check, the same kind `test_worker_cannot_call_queue_redrive_*` gives the
-# queue-claim tables: connect as the role, run the query, observe what the
-# database itself allows — not just that the catalog says so. Closed here
-# (BO-S4) rather than at BO-S1 to keep that PR's surface reviewable, per the
-# comment's own deferral.
 
 
-def test_worker_cannot_read_backlog_task_when_grants_are_applied(
+def test_worker_cannot_call_backlog_resume_deferred_when_grants_are_applied(
     admin_conn, psycopg, test_dsn, role_passwords
 ):
-    """A compromised execution host must not be able to read the programme's
-    plan: `_WORKER_BACKLOG_TABLES` declares `backlog_task` (and its siblings)
-    as `_NONE` for `aicc_worker`. Unlike function EXECUTE, PostgreSQL grants
-    no table privilege to PUBLIC by default, so there is no "without grants"
-    mirror here — the worker has no path to this table under any state.
+    """With grants applied, the worker role must not reach backlog_resume_deferred.
+
+    ``backlog_resume_deferred`` is the backlog store's own audited exit from a
+    parked task (DEFER_TO_USER) — the same shape as ``queue_redrive`` for the
+    work queue, declared to ``aicc_app`` only (``roles._APP_BACKLOG_FUNCTIONS``).
+    A worker has no legitimate reason to un-park a task, let alone one whose
+    own dispatch parked it — resurrecting it would be indistinguishable from a
+    worker reviving its own dead letter.
     """
     _provision(admin_conn, psycopg, test_dsn, role_passwords)
 
@@ -472,7 +465,78 @@ def test_worker_cannot_read_backlog_task_when_grants_are_applied(
     ) as conn:
         with conn.cursor() as cur:
             with pytest.raises(Exception, match="permission denied"):
-                cur.execute("SELECT task_id FROM backlog_task LIMIT 1")
+                # A non-existent task id is fine: the denial must happen
+                # before any data check.
+                cur.execute("SELECT public.backlog_resume_deferred('nonexistent_task')")
+
+
+def test_worker_can_call_backlog_resume_deferred_without_grants(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """Without grants the PUBLIC EXECUTE default reaches backlog_resume_deferred too.
+
+    Same defect as ``test_worker_can_call_queue_redrive_without_grants``, in the
+    backlog domain: a migrated-but-ungranted database leaves every SECURITY
+    DEFINER function reachable by any role through PostgreSQL's PUBLIC EXECUTE
+    default, so an execution host could resurrect a task out of DEFER_TO_USER
+    with no audit trail pinning that decision to an operator.
+    """
+    _migrate_only(admin_conn, psycopg, test_dsn, role_passwords)
+
+    # backlog_resume_deferred exists in the database after migrations.
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "SELECT p.proname FROM pg_proc p "
+            "JOIN pg_namespace n ON n.oid = p.pronamespace "
+            "WHERE n.nspname = 'public' AND p.proname = 'backlog_resume_deferred'"
+        )
+        assert cur.fetchone() is not None, (
+            "backlog_resume_deferred must exist after migrations"
+        )
+
+    # Without grants, worker reaches backlog_resume_deferred through PUBLIC
+    # EXECUTE. The call may succeed or fail for data reasons (there is no
+    # 'nonexistent_task' row), but it must not fail with "permission denied"
+    # — that is the defect.
+    with psycopg.connect(
+        _as_role(test_dsn, roles.WORKER_ROLE, role_passwords),
+        autocommit=True,
+    ) as conn:
+        with conn.cursor() as cur:
+            try:
+                cur.execute("SELECT public.backlog_resume_deferred('nonexistent_task')")
+            except Exception as exc:
+                assert "permission denied" not in str(exc).lower(), (
+                    f"Worker got permission denied even WITHOUT grants — "
+                    f"the defect is already fixed or the test setup is wrong: {exc}"
+                )
+
+
+# ---------------------------------------------------------------------------
+# Same shape, for the READY_TO_REVIEW recovery path (0018): a worker must
+# not be able to unstick its own evidence-free READY_TO_REVIEW row either.
+# ---------------------------------------------------------------------------
+
+
+def test_worker_cannot_call_backlog_recover_stuck_ready_to_review_when_grants_are_applied(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """With grants applied, the worker role must not reach
+    ``backlog_recover_stuck_ready_to_review``: it is declared to ``aicc_app``
+    only (``roles._APP_BACKLOG_FUNCTIONS``), the same posture as
+    ``backlog_resume_deferred``. A worker has no legitimate reason to move
+    its own stuck READY_TO_REVIEW task back to OPEN."""
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+
+    with psycopg.connect(
+        _as_role(test_dsn, roles.WORKER_ROLE, role_passwords),
+        autocommit=True,
+    ) as conn:
+        with conn.cursor() as cur:
+            with pytest.raises(Exception, match="permission denied"):
+                cur.execute(
+                    "SELECT public.backlog_recover_stuck_ready_to_review('nonexistent_task')"
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -539,3 +603,23 @@ def test_compliance_fails_for_function_outside_the_policy(
         "Expected a violation for worker reaching 'undeclared_helper', "
         "but got none.\nAll violations:\n" + "\n".join(violations)
     )
+
+
+def test_worker_cannot_read_backlog_task_when_grants_are_applied(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """A compromised execution host must not be able to read the programme's
+    plan: `_WORKER_BACKLOG_TABLES` declares `backlog_task` (and its siblings)
+    as `_NONE` for `aicc_worker`. Unlike function EXECUTE, PostgreSQL grants
+    no table privilege to PUBLIC by default, so there is no "without grants"
+    mirror here — the worker has no path to this table under any state.
+    """
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+
+    with psycopg.connect(
+        _as_role(test_dsn, roles.WORKER_ROLE, role_passwords),
+        autocommit=True,
+    ) as conn:
+        with conn.cursor() as cur:
+            with pytest.raises(Exception, match="permission denied"):
+                cur.execute("SELECT task_id FROM backlog_task LIMIT 1")

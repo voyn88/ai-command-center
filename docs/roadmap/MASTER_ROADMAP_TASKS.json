@@ -10,7 +10,7 @@
   },
   "human_readable_companion": "docs/roadmap/MASTER_PRODUCT_ROADMAP.md",
   "scope": {
-    "horizon": "H1 — committed next (DR-ROADMAP-AUTHORITY-001 §6)",
+    "horizon": "H1 — committed next, with P00 autonomy cleanup before unattended backlog execution",
     "project": "AICC only — the sole in-scope-to-build product (§3)",
     "excluded": [
       "H2 candidates (AICC-D2-001..004, AICC-GIT-001, AICC-INT-001, ADR 0001 Tier B) — committed only per item after the AICC-GOV-F4A triage (§7 Deferred)",
@@ -34,7 +34,7 @@
     ],
     "source": "command_center/pipeline_settings.py DEFAULT_MAX_GLOBAL_CONCURRENCY / DEFAULT_MAX_AGENT_CONCURRENCY / MIN_CONCURRENCY / MAX_CONCURRENCY",
     "wave_cap_applied": 2,
-    "note": "Waves are scheduled at the live default cap of 2. Raising max_global_concurrency does not widen a wave that is limited by file-level conflicts instead."
+    "note": "Waves are scheduled at the live default cap of 2. Raising max_global_concurrency does not widen a wave that is limited by file-level conflicts instead. P00 cleanup rows were inserted ahead of the previous schedule so unattended autonomy has guardrails before normal backlog execution."
   },
   "worktree_constraints": {
     "rule": "One agent = one task = one branch = one worktree (CURRENT_STATE.md Global Operating Rule 2).",
@@ -50,6 +50,30 @@
     "hygiene_note": "77 worktrees are already registered (7 of them daily-audit worktrees, 1 prunable). Run `git worktree prune` and reclaim finished worktrees before scheduling a wave, or worktree provisioning competes for disk with abandoned trees."
   },
   "parallel_schedule": [
+    {
+      "wave": "P00A",
+      "tasks": [
+        "AICC-AUTO-P00-SUPERVISOR",
+        "AICC-AUTO-P00-FAILURE-CLASSIFIER"
+      ],
+      "bound_by": "capacity"
+    },
+    {
+      "wave": "P00B",
+      "tasks": [
+        "AICC-AUTO-P00-SMOKE-ROLLBACK",
+        "AICC-AUTO-P00-AUTO-SPLIT"
+      ],
+      "bound_by": "dependencies and capacity"
+    },
+    {
+      "wave": "P00C",
+      "tasks": [
+        "AICC-AUTO-P00-BUDGETS",
+        "AICC-APP-H1-COMMAND-SURFACE"
+      ],
+      "bound_by": "autonomy cleanup dependency"
+    },
     {
       "wave": "P01",
       "tasks": [
@@ -201,8 +225,8 @@
       "reason": "The audit reconciliation classified it Still Open with the note 'This is stage D2 of the frozen scope'. Decomposing AICC-D1-001 into D1A-D4 makes the same work appear twice; the D2 stage tasks carry it with finer granularity and explicit acceptance criteria. Kept here for traceability; it is not a separate row."
     }
   ],
-  "import_guidance": "NOT IMPORTED and NOT LAUNCHED. This package supersedes docs/audits/FOUNDER_AUDIT_9761459_STILL_OPEN_IMPORT_PACKAGE.json — import one or the other, never both, since 13 ids are shared by design for dedup stability. Rows with status 'Done' are historical traceability; a founder may filter them out before applying. Any apply must go through scripts/import_tasks.py --apply or the in-app uploader, re-validated against the live store first, and must not precede AICC-GOV-F2.",
-  "task_count": 34,
+  "import_guidance": "NOT IMPORTED and NOT LAUNCHED. This package supersedes docs/audits/FOUNDER_AUDIT_9761459_STILL_OPEN_IMPORT_PACKAGE.json — import one or the other, never both, since 13 ids are shared by design for dedup stability. Rows with status 'Done' are historical traceability; a founder may filter them out before applying. Any apply must go through scripts/import_tasks.py --apply or the in-app uploader, re-validated against the live store first. The five AICC-AUTO-P00-* Critical rows are the only top-priority rows and should precede unattended backlog execution.",
+  "task_count": 40,
   "tasks": [
     {
       "id": "AICC-D1A",
@@ -944,12 +968,302 @@
       "parallel_slot": 2
     },
     {
+      "id": "AICC-AUTO-P00-SUPERVISOR",
+      "title": "P00 — Backlog supervisor selects and advances the next safest work",
+      "goal": "Build a backlog-supervisor tick that chooses the next autonomous task by priority, dependency readiness, repo route, current queue pressure, and recent failure history, then records why it did or did not dispatch work.",
+      "prompt": "Build a backlog-supervisor tick that chooses the next autonomous task by priority, dependency readiness, repo route, current queue pressure, and recent failure history, then records why it did or did not dispatch work.\n\nDefinition of Done: A scheduled supervisor tick can explain the chosen next backlog item, skip unsafe or blocked rows with durable evidence, and dispatch only one bounded slice per repo/window; tests cover dependency order, repo route, queue pressure, and no-work cases.\n\nForbidden scope: No bypass of existing review, acceptance, merge, or deployment gates. No direct database writes outside existing store APIs.\n\nEvidence / current state at main a007fccf: PR #943 added remediation for stale acceptance/check blockers, but the system still needs a higher-level supervisor that decides what the backlog should do next instead of relying on manual launch order.",
+      "priority": "Critical",
+      "depends_on": [],
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-worktrees/codex-backlog-supervisor-p00",
+      "branch": "codex/backlog-supervisor-p00",
+      "components": [
+        "command_center/orchestrator/planner.py",
+        "command_center/db/work_queue_store.py",
+        "deploy/systemd/"
+      ],
+      "definition_of_done": "A scheduled supervisor tick can explain the chosen next backlog item, skip unsafe or blocked rows with durable evidence, and dispatch only one bounded slice per repo/window; tests cover dependency order, repo route, queue pressure, and no-work cases.",
+      "forbidden_scope": "No bypass of existing review, acceptance, merge, or deployment gates. No direct database writes outside existing store APIs.",
+      "evidence": "PR #943 added remediation for stale acceptance/check blockers, but the system still needs a higher-level supervisor that decides what the backlog should do next instead of relying on manual launch order.",
+      "blocks": [
+        "AICC-APP-H1-COMMAND-SURFACE"
+      ],
+      "soft_blocks": [],
+      "ready_to_start": true,
+      "ready_reason": "No unmet dependency; this is part of the P00 autonomy cleanup before launching the autonomous backlog run.",
+      "downstream_chain_length": 4,
+      "parallel_group": "P00A",
+      "parallel_slot": 1,
+      "status": "Backlog",
+      "task_type": "implementation",
+      "project": "AICC",
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "base_branch": "main",
+      "track": "autonomy-hardening",
+      "stage": "P00",
+      "horizon": "H1",
+      "soft_depends_on": [],
+      "folds_in": [],
+      "source": "Founder request 2026-09-13: hands-off autonomy backlog cleanup",
+      "authority": "Founder priority override 2026-09-13",
+      "decomposes": [],
+      "reconciled_against_commit": "a007fccf",
+      "conflicts_with": [],
+      "conflict_files": {},
+      "on_critical_path": false,
+      "critical_path_position": null,
+      "target_version": "autonomy-p00"
+    },
+    {
+      "id": "AICC-AUTO-P00-FAILURE-CLASSIFIER",
+      "title": "P00 — Failure classifier separates flaky infra from real code defects",
+      "goal": "Classify failed checks and runtime failures into flaky/transient, infrastructure, semantic code defect, policy blocker, and needs-human-decision buckets, feeding remediation and supervisor decisions.",
+      "prompt": "Classify failed checks and runtime failures into flaky/transient, infrastructure, semantic code defect, policy blocker, and needs-human-decision buckets, feeding remediation and supervisor decisions.\n\nDefinition of Done: Given representative GitHub check failures, worker failures, merge conflicts, stale acceptance, and policy blocks, the classifier returns a stable category and recommended next action; tests prove flaky rerun cases do not spawn code-fix tasks and real defects do.\n\nForbidden scope: No LLM-only opaque classification without persisted evidence. No automatic approval or merge decision from the classifier alone.\n\nEvidence / current state at main a007fccf: PR #943 can rerun or remediate known blockers, but it does not yet provide a shared failure taxonomy for the rest of the autonomous loop.",
+      "priority": "Critical",
+      "depends_on": [],
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-worktrees/codex-failure-classifier-p00",
+      "branch": "codex/failure-classifier-p00",
+      "components": [
+        "command_center/orchestrator/review_merge.py",
+        "command_center/orchestrator/planner.py"
+      ],
+      "definition_of_done": "Given representative GitHub check failures, worker failures, merge conflicts, stale acceptance, and policy blocks, the classifier returns a stable category and recommended next action; tests prove flaky rerun cases do not spawn code-fix tasks and real defects do.",
+      "forbidden_scope": "No LLM-only opaque classification without persisted evidence. No automatic approval or merge decision from the classifier alone.",
+      "evidence": "PR #943 can rerun or remediate known blockers, but it does not yet provide a shared failure taxonomy for the rest of the autonomous loop.",
+      "blocks": [
+        "AICC-AUTO-P00-SMOKE-ROLLBACK",
+        "AICC-AUTO-P00-BUDGETS",
+        "AICC-APP-H1-COMMAND-SURFACE"
+      ],
+      "soft_blocks": [],
+      "ready_to_start": true,
+      "ready_reason": "No unmet dependency; this is part of the P00 autonomy cleanup before launching the autonomous backlog run.",
+      "downstream_chain_length": 3,
+      "parallel_group": "P00A",
+      "parallel_slot": 2,
+      "status": "Backlog",
+      "task_type": "implementation",
+      "project": "AICC",
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "base_branch": "main",
+      "track": "autonomy-hardening",
+      "stage": "P00",
+      "horizon": "H1",
+      "soft_depends_on": [],
+      "folds_in": [],
+      "source": "Founder request 2026-09-13: hands-off autonomy backlog cleanup",
+      "authority": "Founder priority override 2026-09-13",
+      "decomposes": [],
+      "reconciled_against_commit": "a007fccf",
+      "conflicts_with": [],
+      "conflict_files": {},
+      "on_critical_path": false,
+      "critical_path_position": null,
+      "target_version": "autonomy-p00"
+    },
+    {
+      "id": "AICC-AUTO-P00-SMOKE-ROLLBACK",
+      "title": "P00 — Post-merge smoke with automatic stop or rollback path",
+      "goal": "After a merge/deploy, run a bounded production smoke and either mark the change healthy or stop the autonomous lane and open a rollback/remediation task with evidence.",
+      "prompt": "After a merge/deploy, run a bounded production smoke and either mark the change healthy or stop the autonomous lane and open a rollback/remediation task with evidence.\n\nDefinition of Done: A merged PR produces a post-merge smoke record tied to the merge SHA; green smoke keeps autonomy running, red smoke creates an actionable rollback/remediation task and prevents further risky dispatch until reconciled.\n\nForbidden scope: No destructive rollback without an existing verified previous release target. No suppression of safety gates or audit logs.\n\nEvidence / current state at main a007fccf: The current pipeline verifies PR and merge-group checks, but the hands-off run still needs runtime proof after merge before continuing confidently.",
+      "priority": "Critical",
+      "depends_on": [
+        "AICC-AUTO-P00-SUPERVISOR",
+        "AICC-AUTO-P00-FAILURE-CLASSIFIER"
+      ],
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-worktrees/codex-post-merge-smoke-rollback-p00",
+      "branch": "codex/post-merge-smoke-rollback-p00",
+      "components": [
+        "command_center/deployment/",
+        "command_center/orchestrator/review_merge.py",
+        "deploy/systemd/"
+      ],
+      "definition_of_done": "A merged PR produces a post-merge smoke record tied to the merge SHA; green smoke keeps autonomy running, red smoke creates an actionable rollback/remediation task and prevents further risky dispatch until reconciled.",
+      "forbidden_scope": "No destructive rollback without an existing verified previous release target. No suppression of safety gates or audit logs.",
+      "evidence": "The current pipeline verifies PR and merge-group checks, but the hands-off run still needs runtime proof after merge before continuing confidently.",
+      "blocks": [
+        "AICC-APP-H1-COMMAND-SURFACE"
+      ],
+      "soft_blocks": [],
+      "ready_to_start": false,
+      "ready_reason": "Blocked by unfinished dependencies: AICC-AUTO-P00-SUPERVISOR, AICC-AUTO-P00-FAILURE-CLASSIFIER.",
+      "downstream_chain_length": 2,
+      "parallel_group": "P00B",
+      "parallel_slot": 1,
+      "status": "Backlog",
+      "task_type": "implementation",
+      "project": "AICC",
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "base_branch": "main",
+      "track": "autonomy-hardening",
+      "stage": "P00",
+      "horizon": "H1",
+      "soft_depends_on": [],
+      "folds_in": [],
+      "source": "Founder request 2026-09-13: hands-off autonomy backlog cleanup",
+      "authority": "Founder priority override 2026-09-13",
+      "decomposes": [],
+      "reconciled_against_commit": "a007fccf",
+      "conflicts_with": [],
+      "conflict_files": {},
+      "on_critical_path": false,
+      "critical_path_position": null,
+      "target_version": "autonomy-p00"
+    },
+    {
+      "id": "AICC-AUTO-P00-AUTO-SPLIT",
+      "title": "P00 — Auto-split oversized backlog items into safe slices",
+      "goal": "Detect oversized or ambiguous backlog items before dispatch, split them into ordered executable slices, and park the parent until its children close.",
+      "prompt": "Detect oversized or ambiguous backlog items before dispatch, split them into ordered executable slices, and park the parent until its children close.\n\nDefinition of Done: A too-large backlog row is converted into child rows with dependencies, repo route, acceptance criteria, and parent lineage; planner dispatches children instead of the parent; tests cover idempotent repeated split attempts.\n\nForbidden scope: No silent semantic rewriting of user intent. Ambiguous product decisions must be parked as needs-human-decision, not guessed.\n\nEvidence / current state at main a007fccf: The backlog contains broad product and autonomy items; hands-off execution needs a deterministic way to make them small before agents start work.",
+      "priority": "Critical",
+      "depends_on": [
+        "AICC-AUTO-P00-SUPERVISOR"
+      ],
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-worktrees/codex-auto-split-backlog-p00",
+      "branch": "codex/auto-split-backlog-p00",
+      "components": [
+        "command_center/orchestrator/planner.py",
+        "command_center/db/sql/0021_pipeline_auto_split_smoke_monitor_findings.up.sql"
+      ],
+      "definition_of_done": "A too-large backlog row is converted into child rows with dependencies, repo route, acceptance criteria, and parent lineage; planner dispatches children instead of the parent; tests cover idempotent repeated split attempts.",
+      "forbidden_scope": "No silent semantic rewriting of user intent. Ambiguous product decisions must be parked as needs-human-decision, not guessed.",
+      "evidence": "The backlog contains broad product and autonomy items; hands-off execution needs a deterministic way to make them small before agents start work.",
+      "blocks": [
+        "AICC-APP-H1-COMMAND-SURFACE"
+      ],
+      "soft_blocks": [],
+      "ready_to_start": false,
+      "ready_reason": "Blocked by unfinished dependencies: AICC-AUTO-P00-SUPERVISOR.",
+      "downstream_chain_length": 2,
+      "parallel_group": "P00B",
+      "parallel_slot": 2,
+      "status": "Backlog",
+      "task_type": "implementation",
+      "project": "AICC",
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "base_branch": "main",
+      "track": "autonomy-hardening",
+      "stage": "P00",
+      "horizon": "H1",
+      "soft_depends_on": [],
+      "folds_in": [],
+      "source": "Founder request 2026-09-13: hands-off autonomy backlog cleanup",
+      "authority": "Founder priority override 2026-09-13",
+      "decomposes": [],
+      "reconciled_against_commit": "a007fccf",
+      "conflicts_with": [],
+      "conflict_files": {},
+      "on_critical_path": false,
+      "critical_path_position": null,
+      "target_version": "autonomy-p00"
+    },
+    {
+      "id": "AICC-AUTO-P00-BUDGETS",
+      "title": "P00 — Autonomy budgets, rate limits, and kill switches",
+      "goal": "Add per-window limits for autonomous PR creation, reruns, remediation attempts, CPU/GitHub usage, and consecutive failures, with visible stop reasons and safe resume controls.",
+      "prompt": "Add per-window limits for autonomous PR creation, reruns, remediation attempts, CPU/GitHub usage, and consecutive failures, with visible stop reasons and safe resume controls.\n\nDefinition of Done: The autonomous loop refuses to exceed configured PR/rerun/remediation/failure budgets, records the refusal reason, and exposes a resume path; tests cover budget exhaustion, reset windows, and per-repo isolation.\n\nForbidden scope: No global unlimited autonomous mode. No hidden defaults that can create unbounded PRs or reruns.\n\nEvidence / current state at main a007fccf: Before launching the backlog unattended, the system needs explicit limits so hands-off execution remains controlled and observable.",
+      "priority": "Critical",
+      "depends_on": [
+        "AICC-AUTO-P00-SUPERVISOR",
+        "AICC-AUTO-P00-FAILURE-CLASSIFIER"
+      ],
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-worktrees/codex-autonomy-budgets-p00",
+      "branch": "codex/autonomy-budgets-p00",
+      "components": [
+        "command_center/orchestrator/planner.py",
+        "command_center/orchestrator/review_merge.py",
+        "deploy/systemd/"
+      ],
+      "definition_of_done": "The autonomous loop refuses to exceed configured PR/rerun/remediation/failure budgets, records the refusal reason, and exposes a resume path; tests cover budget exhaustion, reset windows, and per-repo isolation.",
+      "forbidden_scope": "No global unlimited autonomous mode. No hidden defaults that can create unbounded PRs or reruns.",
+      "evidence": "Before launching the backlog unattended, the system needs explicit limits so hands-off execution remains controlled and observable.",
+      "blocks": [
+        "AICC-APP-H1-COMMAND-SURFACE"
+      ],
+      "soft_blocks": [],
+      "ready_to_start": false,
+      "ready_reason": "Blocked by unfinished dependencies: AICC-AUTO-P00-SUPERVISOR, AICC-AUTO-P00-FAILURE-CLASSIFIER.",
+      "downstream_chain_length": 2,
+      "parallel_group": "P00C",
+      "parallel_slot": 1,
+      "status": "Backlog",
+      "task_type": "implementation",
+      "project": "AICC",
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "base_branch": "main",
+      "track": "autonomy-hardening",
+      "stage": "P00",
+      "horizon": "H1",
+      "soft_depends_on": [],
+      "folds_in": [],
+      "source": "Founder request 2026-09-13: hands-off autonomy backlog cleanup",
+      "authority": "Founder priority override 2026-09-13",
+      "decomposes": [],
+      "reconciled_against_commit": "a007fccf",
+      "conflicts_with": [],
+      "conflict_files": {},
+      "on_critical_path": false,
+      "critical_path_position": null,
+      "target_version": "autonomy-p00"
+    },
+    {
+      "id": "AICC-APP-H1-COMMAND-SURFACE",
+      "title": "H1 — AICC desktop and mobile command surface for all operational data",
+      "goal": "Build the AICC application into the primary desktop and mobile command surface: all backlog, PR, merge, deploy, agent, runtime health, evidence, permissions, and audit data visible and controllable from the app.",
+      "prompt": "Build the AICC application into the primary desktop and mobile command surface: all backlog, PR, merge, deploy, agent, runtime health, evidence, permissions, and audit data visible and controllable from the app.\n\nDefinition of Done: Desktop and mobile surfaces show the same canonical operational state; an operator can inspect backlog, queue, PRs, merges, deploys, worker health, evidence, and stop/resume controls without using GitHub or shell for routine operation; browser/mobile/desktop acceptance tests cover the core workflows.\n\nForbidden scope: No direct privileged GitHub, database, SSH, or systemd access from clients; all controls go through authenticated, audited AICC/AIOS APIs. No web-wrapper-only replacement for native desktop quality.\n\nEvidence / current state at main a007fccf: Founder requested the next priority after autonomy cleanup: finish AICC desktop and mobile so all data lands there and the system can be managed from the app.",
+      "priority": "High",
+      "depends_on": [
+        "AICC-AUTO-P00-SUPERVISOR",
+        "AICC-AUTO-P00-FAILURE-CLASSIFIER",
+        "AICC-AUTO-P00-SMOKE-ROLLBACK",
+        "AICC-AUTO-P00-AUTO-SPLIT",
+        "AICC-AUTO-P00-BUDGETS"
+      ],
+      "workspace_path": "/Users/dmitrijcernikov/Projects/ai-command-center-worktrees/codex-aicc-app-command-surface-h1",
+      "branch": "codex/aicc-app-command-surface-h1",
+      "components": [
+        "command_center/desktop/",
+        "web/src/",
+        "clients/aicc-native/",
+        "command_center/api/",
+        "command_center/webapi/"
+      ],
+      "definition_of_done": "Desktop and mobile surfaces show the same canonical operational state; an operator can inspect backlog, queue, PRs, merges, deploys, worker health, evidence, and stop/resume controls without using GitHub or shell for routine operation; browser/mobile/desktop acceptance tests cover the core workflows.",
+      "forbidden_scope": "No direct privileged GitHub, database, SSH, or systemd access from clients; all controls go through authenticated, audited AICC/AIOS APIs. No web-wrapper-only replacement for native desktop quality.",
+      "evidence": "Founder requested the next priority after autonomy cleanup: finish AICC desktop and mobile so all data lands there and the system can be managed from the app.",
+      "blocks": [],
+      "soft_blocks": [],
+      "ready_to_start": false,
+      "ready_reason": "Blocked by unfinished dependencies: AICC-AUTO-P00-SUPERVISOR, AICC-AUTO-P00-FAILURE-CLASSIFIER, AICC-AUTO-P00-SMOKE-ROLLBACK, AICC-AUTO-P00-AUTO-SPLIT, AICC-AUTO-P00-BUDGETS.",
+      "downstream_chain_length": 1,
+      "parallel_group": "P00C",
+      "parallel_slot": 2,
+      "status": "Backlog",
+      "task_type": "implementation",
+      "project": "AICC",
+      "repository_path": "/Users/dmitrijcernikov/Projects/ai-command-center",
+      "base_branch": "main",
+      "track": "autonomy-hardening",
+      "stage": "P00",
+      "horizon": "H1",
+      "soft_depends_on": [],
+      "folds_in": [],
+      "source": "Founder request 2026-09-13: hands-off autonomy backlog cleanup",
+      "authority": "Founder priority override 2026-09-13",
+      "decomposes": [],
+      "reconciled_against_commit": "a007fccf",
+      "conflicts_with": [],
+      "conflict_files": {},
+      "on_critical_path": false,
+      "critical_path_position": null,
+      "target_version": "autonomy-p00"
+    },
+    {
       "id": "AICC-GOV-F2",
       "title": "F2 — Restore data/tasks.json project-id integrity",
       "goal": "Re-validate and remap every live task whose `project` value does not resolve against models.PROJECT_IDS, through scripts/import_tasks.py, so the data-integrity success gate can pass.",
-      "prompt": "Re-validate and remap every live task whose `project` value does not resolve against models.PROJECT_IDS, through scripts/import_tasks.py, so the data-integrity success gate can pass.\n\nDefinition of Done: 100% of rows in the live data/tasks.json carry a `project` that resolves via project_config.normalize_project_id; the remap is performed through the validating scripts/import_tasks.py / command_center.task_import pipeline (never by direct JSON replacement); tasks_repository.validate_tasks emits no unknown-project warning on load; the founder approves the per-row remapping table before it is applied.\n\nForbidden scope: No extension of PROJECT_NAME_ALIASES or PROJECT_IDS to make bad values resolve (DR-ROADMAP-AUTHORITY-001 §7 R4 — that needs the F3 ADR). No direct write to tasks.json.\n\nEvidence / current state at main bd9f05b: DR-ROADMAP-AUTHORITY-001 §2.3 records this success gate as currently FAILING, §7 R1(d) attributes it to the rejected roadmap/program importer, and §8 F2 flags it for the founder. ROADMAP_RECONCILIATION.md Conflict 2 (HIGH, ACTIVE) measured 26 of 56 live rows with non-resolving `project` values. This checkout carries only data/*.example.* files, so the live store at /Users/dmitrijcernikov/Projects/ai-command-center/data/tasks.json must be re-measured at execution time — the 26/56 figure is the last recorded measurement, not a current one. Highest priority in the package: §7 A3 puts the registry/import-integrity Blocker ahead of any new feature work.",
+      "prompt": "Re-validate and remap every live task whose `project` value does not resolve against models.PROJECT_IDS, through scripts/import_tasks.py, so the data-integrity success gate can pass.\n\nDefinition of Done: 100% of rows in the live data/tasks.json carry a `project` that resolves via project_config.normalize_project_id; the remap is performed through the validating scripts/import_tasks.py / command_center.task_import pipeline (never by direct JSON replacement); tasks_repository.validate_tasks emits no unknown-project warning on load; the founder approves the per-row remapping table before it is applied.\n\nForbidden scope: No extension of PROJECT_NAME_ALIASES or PROJECT_IDS to make bad values resolve (DR-ROADMAP-AUTHORITY-001 §7 R4 — that needs the F3 ADR). No direct write to tasks.json.\n\nEvidence / current state at main bd9f05b: DR-ROADMAP-AUTHORITY-001 §2.3 records this success gate as currently FAILING, §7 R1(d) attributes it to the rejected roadmap/program importer, and §8 F2 flags it for the founder. ROADMAP_RECONCILIATION.md Conflict 2 (HIGH, ACTIVE) measured 26 of 56 live rows with non-resolving `project` values. This checkout carries only data/*.example.* files, so the live store at /Users/dmitrijcernikov/Projects/ai-command-center/data/tasks.json must be re-measured at execution time — the 26/56 figure is the last recorded measurement, not a current one.",
       "status": "Backlog",
-      "priority": "Critical",
+      "priority": "High",
       "task_type": "remediation",
       "project": "AICC",
       "depends_on": [],
@@ -967,7 +1281,7 @@
       ],
       "definition_of_done": "100% of rows in the live data/tasks.json carry a `project` that resolves via project_config.normalize_project_id; the remap is performed through the validating scripts/import_tasks.py / command_center.task_import pipeline (never by direct JSON replacement); tasks_repository.validate_tasks emits no unknown-project warning on load; the founder approves the per-row remapping table before it is applied.",
       "forbidden_scope": "No extension of PROJECT_NAME_ALIASES or PROJECT_IDS to make bad values resolve (DR-ROADMAP-AUTHORITY-001 §7 R4 — that needs the F3 ADR). No direct write to tasks.json.",
-      "evidence": "DR-ROADMAP-AUTHORITY-001 §2.3 records this success gate as currently FAILING, §7 R1(d) attributes it to the rejected roadmap/program importer, and §8 F2 flags it for the founder. ROADMAP_RECONCILIATION.md Conflict 2 (HIGH, ACTIVE) measured 26 of 56 live rows with non-resolving `project` values. This checkout carries only data/*.example.* files, so the live store at /Users/dmitrijcernikov/Projects/ai-command-center/data/tasks.json must be re-measured at execution time — the 26/56 figure is the last recorded measurement, not a current one. Highest priority in the package: §7 A3 puts the registry/import-integrity Blocker ahead of any new feature work.",
+      "evidence": "DR-ROADMAP-AUTHORITY-001 §2.3 records this success gate as currently FAILING, §7 R1(d) attributes it to the rejected roadmap/program importer, and §8 F2 flags it for the founder. ROADMAP_RECONCILIATION.md Conflict 2 (HIGH, ACTIVE) measured 26 of 56 live rows with non-resolving `project` values. This checkout carries only data/*.example.* files, so the live store at /Users/dmitrijcernikov/Projects/ai-command-center/data/tasks.json must be re-measured at execution time — the 26/56 figure is the last recorded measurement, not a current one. Backlog hygiene update 2026-09-13: priority lowered from Critical to High; the five AICC-AUTO-P00-* rows are now the only Critical rows before unattended backlog execution.",
       "folds_in": [],
       "source": "docs/roadmap/FINAL_GOAL_AND_ROADMAP_AUTHORITY.md §8",
       "authority": "DR-ROADMAP-AUTHORITY-001",
@@ -978,7 +1292,7 @@
       "conflicts_with": [],
       "conflict_files": {},
       "ready_to_start": true,
-      "ready_reason": "No unmet dependency; the finding is re-verified as still open against main at bd9f05b.",
+      "ready_reason": "Ready, but no longer Critical after the P00 autonomy cleanup; run after the five hands-off autonomy controls unless direct data-integrity work is explicitly requested.",
       "on_critical_path": false,
       "critical_path_position": null,
       "downstream_chain_length": 1,

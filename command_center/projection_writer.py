@@ -53,7 +53,7 @@ def write_atomically(destination: Path, text: str) -> None:
         dir=destination.parent, prefix=f".{destination.name}."
     )
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
             handle.write(text)
             # Both halves are required and neither implies the other:
             # `flush` moves the bytes out of Python's buffer into the
