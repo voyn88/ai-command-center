@@ -100,6 +100,8 @@ _REPO_BY_FAMILY: dict[str, str | None] = {
     "MIN": "ai-command-center", "UX": "ai-command-center",
     "AGT": "ai-command-center", "IOS": "ai-command-center",
     "BACKLOG": "ai-command-center", "APP": "ai-command-center",
+    # VOYN Logistics CRM delivery lane
+    "CRM": "voyn-logistics-crm",
     # Non-code families: no repo, reported not dispatched
     "OPS": None, "CI": None, "INFRA": None, "COMMON": None, "PLAN": None,
     "COM": None, "STAGE": None, "G": None, "EXT": None, "AI": None,
