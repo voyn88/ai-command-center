@@ -2054,6 +2054,14 @@ def test_review_pin_currency_same_head_open_vs_changed_closed_transient(
             "merged_at": "2026-10-31T00:00:00Z",
             "head": {"sha": head},
         },
+        # Valid head with missing/null/unknown state is unproven, not stale.
+        "missing_state": {"head": {"sha": head}},
+        "null_state": {"state": None, "merged_at": None, "head": {"sha": head}},
+        "unknown_state": {
+            "state": "reopened",
+            "merged_at": None,
+            "head": {"sha": head},
+        },
     }
 
     def run_case(name, *, returncode=0):
@@ -2078,6 +2086,12 @@ def test_review_pin_currency_same_head_open_vs_changed_closed_transient(
     assert status == "stale" and "merged" in detail
     status, detail = run_case("same", returncode=1)
     assert status == "transient" and detail.startswith("review_pin_transient:")
+    for name in ("missing_state", "null_state", "unknown_state"):
+        status, detail = run_case(name)
+        assert status == "transient", name
+        assert detail.startswith("review_pin_transient:")
+        assert "state unproven" in detail
+        assert "review_pin_stale" not in detail
 
 
 def test_review_head_checkout_failure_is_retryable(handler, monkeypatch) -> None:
@@ -2336,7 +2350,9 @@ def _git_repo_with_one_commit(path: Path) -> str:
 
 
 def _git(*argv: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(["git", *argv], capture_output=True, text=True)
+    return subprocess.run(
+        ["git", *argv], capture_output=True, text=True, check=False
+    )
 
 
 def test_read_only_isolated_checkout_is_a_detached_clone_without_origin_at_the_source_head(

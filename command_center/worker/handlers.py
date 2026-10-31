@@ -145,8 +145,10 @@ def _review_pin_currency(
     from the local clone's origin (never from a payload URL).
 
     Returns ``("current", head)``, ``("stale", "review_pin_stale:...")``, or
-    ``("transient", "review_pin_transient:...")``. Definitive stale must not
-    call a model; transient preserves bounded infra retry.
+    ``("transient", "review_pin_transient:...")``. Definitive stale
+    (proven closed/merged, or open head moved) must not call a model;
+    missing/null/unknown PR ``state`` is unproven and stays transient
+    infra wait. Transient preserves bounded infra retry.
     """
     if not isinstance(pr_number, str) or not re.fullmatch(r"[0-9]{1,10}", pr_number):
         return "stale", f"review_pin_stale: invalid pr_number {pr_number!r}"
@@ -156,8 +158,10 @@ def _review_pin_currency(
     if owned is None:
         return (
             "transient",
-            "review_pin_transient: no github origin on clone "
-            "(cannot establish trusted PR authority)",
+            (
+                "review_pin_transient: no github origin on clone "
+                "(cannot establish trusted PR authority)"
+            ),
         )
     owner, repo = owned
     proc = gh_access.run(
@@ -187,17 +191,31 @@ def _review_pin_currency(
             "transient",
             f"review_pin_transient: pull head sha malformed: {current_head!r}",
         )
-    if state != "open" or merged_at:
-        label = "merged" if merged_at else repr(state)
+    # Only proven closed/merged (or a moved open head below) is definitive
+    # stale. Missing/null/unknown ``state`` is unproven -- keep as infra wait
+    # rather than permanently refusing a pin that may still be open.
+    if merged_at:
         return (
             "stale",
-            f"review_pin_stale: pull {pr_number} is {label}, not open at {head_sha}",
+            f"review_pin_stale: pull {pr_number} is merged, not open at {head_sha}",
+        )
+    if state == "closed":
+        return (
+            "stale",
+            f"review_pin_stale: pull {pr_number} is 'closed', not open at {head_sha}",
+        )
+    if state != "open":
+        return (
+            "transient",
+            f"review_pin_transient: pull {pr_number} state unproven: {state!r}",
         )
     if current_head != head_sha:
         return (
             "stale",
-            f"review_pin_stale: pull {pr_number} head is {current_head}, "
-            f"queued pin was {head_sha}",
+            (
+                f"review_pin_stale: pull {pr_number} head is {current_head}, "
+                f"queued pin was {head_sha}"
+            ),
         )
     return "current", current_head
 
