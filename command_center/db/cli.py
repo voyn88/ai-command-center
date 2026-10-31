@@ -104,6 +104,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Parse and report without touching the database.",
     )
+    imp.add_argument(
+        "--backfill-provenance",
+        action="store_true",
+        help="Stamp rows this file names that carry no provenance event "
+        "(rows migrated before the stamp was written with the insert); "
+        "reconcile only, no upserts.",
+    )
     sub.add_parser("backlog-status", help="Task counts by status from the store.")
     export = sub.add_parser(
         "backlog-export",
@@ -124,6 +131,14 @@ def build_parser() -> argparse.ArgumentParser:
         "eligible tasks to the execution queue (run by aicc-backlog-planner.timer).",
     )
     plan.add_argument("--wip-limit", type=int, default=4)
+    plan.add_argument(
+        "--repo-path",
+        default=".",
+        help="This host's own checkout. The pre-dispatch reuse gate reads its "
+        "default branch to see whether a remediation task's parent is already "
+        "merged (VOYN-W0-AICC-DISPATCH-REUSE-GATE); an empty value turns the "
+        "gate off and dispatches every candidate.",
+    )
     plan.add_argument(
         "--dry-run",
         action="store_true",
@@ -186,6 +201,27 @@ def build_parser() -> argparse.ArgumentParser:
         default=".",
         help="Directory to run gh in. A clone, or any directory when GH_REPO "
         "names the repository (the deploy-managed unit uses the release tree).",
+    )
+
+    watchdog = sub.add_parser(
+        "backlog-watchdog",
+        help="One watchdog tick (VOYN-W0-AICC-TICK-STALL-WATCHDOG): read the "
+        "persisted tick_skip_event history, detect any (task, reason) pair "
+        "skipped in N consecutive ticks of one kind, and escalate each stall "
+        "episode exactly once as a new OPEN backlog task "
+        "(aicc-backlog-watchdog.timer). Never mutates the stalled items.",
+    )
+    watchdog.add_argument(
+        "--threshold",
+        type=int,
+        default=5,
+        help="Consecutive same-reason ticks before a stall escalates (default 5).",
+    )
+    watchdog.add_argument(
+        "--window",
+        type=int,
+        default=50,
+        help="Recent ticks per kind the detector reads (default 50).",
     )
 
     self_deploy = sub.add_parser(
@@ -269,6 +305,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     fleet_suspend.add_argument(
         "--reason", required=True, help="Audited reason for the suspension."
+    )
+
+    # The control-plane reconciler (VOYN-W0-AICC-CONTROL-PLANE-RESILIENCE).
+    # Two distinct commands for two distinct hosts/roles -- see
+    # command_center.orchestrator.control_plane_reconciler's module docstring
+    # for why they must not collapse into one.
+    sub.add_parser(
+        "control-reconcile",
+        help="One control-plane reconciler tick: re-assert every declared "
+        "timer active, quarantine known-sabotaging leftover units, restart "
+        "a service whose heartbeat has gone stale despite an active timer, "
+        "and record this tick's own heartbeat "
+        "(aicc-control-reconciler.timer, control-01, aicc_app).",
+    )
+    sub.add_parser(
+        "control-watchdog",
+        help="Independent cross-check of every declared tick's heartbeat: "
+        "read-only, touches no systemd unit, and runs on a DIFFERENT host "
+        "than the reconciler so a reconciler that silently stopped ticking "
+        "cannot hide its own stall the way the planner's timer did on "
+        "2026-08-29 (aicc-control-watchdog.timer, worker-01, aicc_worker).",
     )
 
     down = sub.add_parser("downgrade", help="Revert migrations down to a version.")
@@ -395,9 +452,20 @@ def main(argv: list[str] | None = None) -> int:
 
             if args.command == "queue-reap":
                 from command_center.db.work_queue_admin import WorkQueueAdmin
+                from command_center.orchestrator.control_plane_reconciler import (
+                    record_heartbeat,
+                )
 
                 reaped = WorkQueueAdmin(lambda: nullcontext(conn)).reap()
                 print(f"reaped {reaped} lapsed attempt(s)")
+                # Heartbeat every completed tick, not only one that reaped
+                # something -- the reconciler's staleness check needs to
+                # distinguish "the tick stopped running" from "the tick ran
+                # and found nothing to do" (VOYN-W0-AICC-CONTROL-PLANE-
+                # RESILIENCE).
+                record_heartbeat(
+                    lambda: nullcontext(conn), "queue-reap", detail=f"reaped={reaped}"
+                )
                 return 0
 
             if args.command == "queue-dlq":
@@ -487,7 +555,10 @@ def main(argv: list[str] | None = None) -> int:
                 from pathlib import Path
 
                 from command_center.db.backlog_parser import parse_backlog
-                from command_center.db.backlog_store import BacklogStore
+                from command_center.db.backlog_store import (
+                    BacklogStore,
+                    ProvenanceNotRecorded,
+                )
 
                 text = Path(args.path).read_text(encoding="utf-8")
                 if args.parse_only:
@@ -497,7 +568,25 @@ def main(argv: list[str] | None = None) -> int:
                         print(f"UNPARSED line {line_no}: {reason} :: {excerpt}")
                     print(f"unparsed: {len(parsed.unparsed)} lines")
                     return 0
-                report = BacklogStore(lambda: nullcontext(conn)).import_markdown(text)
+                store = BacklogStore(lambda: nullcontext(conn))
+                if args.backfill_provenance:
+                    # The operator's lever for rows 0025 cannot reach
+                    # retroactively: an import finds them `unchanged` and so
+                    # never stamps them, however many times it is re-run.
+                    stamped = store.backfill_markdown_provenance(text)
+                    for task_id in stamped:
+                        print(f"STAMPED {task_id}: markdown_import_backfill")
+                    print(f"backfilled {len(stamped)} record(s)")
+                    return 0
+                try:
+                    report = store.import_markdown(text)
+                except ProvenanceNotRecorded as exc:
+                    # Never a partial success: the run stopped at the first
+                    # row that was created without the audit record the
+                    # migration gate requires, and the count printed above
+                    # this line would have claimed otherwise.
+                    print(f"ABORTED at {exc.task_id}: {exc}", file=sys.stderr)
+                    return 1
                 print(
                     f"inserted {report.inserted}, updated {report.updated}, "
                     f"unchanged {report.unchanged}"
@@ -539,6 +628,9 @@ def main(argv: list[str] | None = None) -> int:
             if args.command == "backlog-plan":
                 from contextlib import nullcontext as _nc
 
+                from command_center.orchestrator.control_plane_reconciler import (
+                    record_heartbeat,
+                )
                 from command_center.orchestrator.planner import PlanLimits, plan_once
 
                 if args.smoke:
@@ -560,10 +652,18 @@ def main(argv: list[str] | None = None) -> int:
                             )
                     return 0
                 report = plan_once(
-                    lambda: _nc(conn), PlanLimits(wip_limit=args.wip_limit)
+                    lambda: _nc(conn),
+                    PlanLimits(wip_limit=args.wip_limit),
+                    source_path=args.repo_path or None,
                 )
                 if report.planner_busy:
                     print("planner lease held elsewhere; nothing done")
+                    # A lease held by a sibling control host is this tick
+                    # completing correctly, not the planner going quiet --
+                    # heartbeat it the same as a normal pass, or the
+                    # reconciler would mistake healthy lease contention for
+                    # the 2026-08-29 stall it exists to catch.
+                    record_heartbeat(lambda: _nc(conn), "backlog-plan", detail="busy")
                     return 0
                 if report.review_window_full is not None:
                     print(
@@ -582,6 +682,14 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"SPLIT     {task_id}: dispatched in decomposition mode")
                 for task_id, failure in report.monitor_tasks:
                     print(f"MONITOR   {task_id}: task for finding {failure}")
+                for task_id, evidence in report.superseded:
+                    print(f"SUPERSEDED {task_id}: closed, not dispatched -- {evidence}")
+                if report.prevented_duplicate_dispatches:
+                    print(
+                        "reuse gate prevented "
+                        f"{report.prevented_duplicate_dispatches} duplicate "
+                        "dispatch(es) this tick"
+                    )
                 for task_id, work_item in report.dispatched:
                     print(f"DISPATCHED {task_id} -> {work_item}")
                 for task_id, action in report.ingested:
@@ -594,12 +702,24 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"REFUSED   {task_id}: {reason}")
                 for task_id, reason in report.undispatchable:
                     print(f"NO-REPO   {task_id}: {reason}")
+                record_heartbeat(
+                    lambda: _nc(conn),
+                    "backlog-plan",
+                    detail=f"dispatched={len(report.dispatched)} "
+                    f"ingested={len(report.ingested)}",
+                )
                 return 0
 
             if args.command == "backlog-review":
                 from contextlib import nullcontext as _nc
 
                 from command_center.db.work_queue_store import WorkQueueStore
+                from command_center.orchestrator.control_plane_reconciler import (
+                    record_heartbeat,
+                )
+
+                from command_center.orchestrator import watchdog as _watchdog
+
                 from command_center.orchestrator import gh_access
                 from command_center.orchestrator.review_merge import (
                     publish_review_verdicts,
@@ -610,6 +730,7 @@ def main(argv: list[str] | None = None) -> int:
 
                 store = WorkQueueStore(lambda: _nc(conn))
                 enqueue = _review_enqueue(store)
+                tick_id = _watchdog.new_tick_id()
                 # One quota scope for the WHOLE tick: the four steps below
                 # all call `gh`, so counting them separately would tell an
                 # operator nothing about what the tick as a whole spent --
@@ -661,6 +782,10 @@ def main(argv: list[str] | None = None) -> int:
                         print(f"REMEDIATE {task_id} -> {new_task_id}")
                     for task_id, reason in marker_report.skipped:
                         print(f"SKIP      {task_id}: {reason}")
+                _watchdog.record_skips(conn, "pr_evidence", tick_id, evidence.skipped)
+                _watchdog.record_skips(conn, "review", tick_id, report.skipped)
+                _watchdog.record_skips(conn, "review_retry", tick_id, retry_report.skipped)
+                _watchdog.record_skips(conn, "review_marker", tick_id, marker_report.skipped)
                 # Printed AFTER the scope closes: the remaining-budget half
                 # of the line is read on the way out (`gh api rate_limit`,
                 # which does not itself consume quota).
@@ -692,11 +817,22 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"SKIP      {task_id}: {reason}")
                 if report.quota is not None:
                     print(report.quota.line())
+                record_heartbeat(
+                    lambda: _nc(conn),
+                    "backlog-review",
+                    detail=f"reviewed={len(report.reviewed)} "
+                    f"markers={len(marker_report.reviewed)}",
+                )
                 return 0
 
             if args.command == "backlog-merge":
                 from contextlib import nullcontext as _nc
 
+                from command_center.orchestrator.control_plane_reconciler import (
+                    record_heartbeat,
+                )
+
+                from command_center.orchestrator import watchdog as _watchdog
                 from command_center.orchestrator.review_merge import merge_once
 
                 report = merge_once(lambda: _nc(conn), args.repo_path)
@@ -704,6 +840,14 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"MERGED    {task_id} -> {head}")
                 for task_id, reason in report.skipped:
                     print(f"SKIP      {task_id}: {reason}")
+                record_heartbeat(
+                    lambda: _nc(conn),
+                    "backlog-merge",
+                    detail=f"merged={len(report.merged)}",
+                )
+                _watchdog.record_skips(
+                    conn, "merge", _watchdog.new_tick_id(), report.skipped
+                )
                 for task_id, reason in report.errors:
                     print(f"ERROR     {task_id}: {reason}", file=sys.stderr)
                 if report.quota is not None:
@@ -716,6 +860,36 @@ def main(argv: list[str] | None = None) -> int:
                 # retrying forever unaware (VOYN-W0-AICC-MERGE-GATEWAY-
                 # REM-REM-REM).
                 return 1 if report.errors else 0
+
+            if args.command == "backlog-watchdog":
+                from contextlib import nullcontext as _nc
+
+                from command_center.orchestrator.watchdog import (
+                    WatchdogConfig,
+                    watchdog_once,
+                )
+
+                report = watchdog_once(
+                    lambda: _nc(conn),
+                    WatchdogConfig(threshold=args.threshold, window=args.window),
+                )
+                for episode, new_task_id in report.escalated:
+                    print(
+                        f"ESCALATE  {episode.task_id} -> {new_task_id}: "
+                        f"{episode.tick_kind} repeated {episode.reason!r} "
+                        f"x{episode.consecutive}"
+                    )
+                for episode in report.already_escalated:
+                    print(
+                        f"ALREADY   {episode.task_id}: {episode.tick_kind} "
+                        f"{episode.reason!r} x{episode.consecutive}"
+                    )
+                for task_id, reason in report.refused:
+                    print(f"REFUSED   {task_id}: {reason}")
+                # A refused escalation is a real finding: the stall is
+                # detected but could not reach the inbox. Non-zero so the
+                # timer run goes red for the operator.
+                return 1 if report.refused else 0
 
             if args.command == "backlog-merge-reconcile":
                 from contextlib import nullcontext as _nc
@@ -737,6 +911,73 @@ def main(argv: list[str] | None = None) -> int:
                 # Non-zero exit surfaces a real finding to a human/CI without
                 # ever touching the database -- report-only stays report-only.
                 return 1 if report.suspect else 0
+
+            if args.command == "control-reconcile":
+                from contextlib import nullcontext as _nc
+
+                from command_center.orchestrator.control_plane_reconciler import (
+                    ESCALATION_EXIT_CODE,
+                    ReconcileConfig,
+                    SubprocessSystemctl,
+                    reconcile_once,
+                )
+
+                # `command_timeout` governs both how long each `sudo -n
+                # systemctl` call is allowed to hang (SubprocessSystemctl)
+                # and the bounded-backoff circuit breaker inside the tick
+                # itself (reconcile_once) -- one ReconcileConfig, not two
+                # values that could drift apart.
+                recon_config = ReconcileConfig()
+                report = reconcile_once(
+                    SubprocessSystemctl(timeout=recon_config.command_timeout),
+                    lambda: _nc(conn),
+                    config=recon_config,
+                )
+                for name in report.ok:
+                    print(f"OK         {name}")
+                for name in report.restarted:
+                    print(f"RESTARTED  {name}")
+                for name in report.reenabled:
+                    print(f"REENABLED  {name}")
+                for name in report.quarantined:
+                    print(f"QUARANTINE {name}")
+                # A bounded retry still in flight exits 0 on purpose -- it is
+                # not yet an escalation -- but it must not be SILENT, which
+                # is the whole failure class this task exists to close.
+                for name in report.retrying:
+                    print(f"RETRY      {name}")
+                for name in report.circuit_open_skipped:
+                    print(f"COOLDOWN   {name}")
+                for name, reason in report.escalated:
+                    print(f"ESCALATE   {name}: {reason}")
+                # ESCALATION_EXIT_CODE, not 1: the unit pins this exact code
+                # in `RestartPreventExitStatus=` so a designed escalation
+                # goes straight to `failed` and fires `OnFailure=` (the
+                # owner-visible alert), while an unhandled crash -- which
+                # Python exits 1 for -- still gets `Restart=on-failure`'s
+                # bounded retry. Both are "non-zero"; only the exit code
+                # tells systemd which one happened.
+                return 0 if report.healthy else ESCALATION_EXIT_CODE
+
+            if args.command == "control-watchdog":
+                from contextlib import nullcontext as _nc
+
+                from command_center.orchestrator.control_plane_reconciler import (
+                    ESCALATION_EXIT_CODE,
+                    check_heartbeats_once,
+                )
+
+                report = check_heartbeats_once(lambda: _nc(conn))
+                for name in report.ok:
+                    print(f"OK    {name}")
+                for name, age in report.stale:
+                    age_desc = "never recorded" if age == float("inf") else f"{age:.0f}s old"
+                    print(f"STALE {name}: {age_desc}")
+                # Same code as control-reconcile for the same reason, even
+                # though aicc-control-watchdog.service sets no `Restart=`:
+                # one escalation code across both ticks means an operator
+                # (or a log shipper) reads one number, not two.
+                return 0 if report.healthy else ESCALATION_EXIT_CODE
 
             if args.command == "downgrade":
                 if not args.confirmed:

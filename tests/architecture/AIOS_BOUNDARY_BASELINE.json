@@ -84,6 +84,9 @@
       "audit",
       "orchestration"
     ],
+    "command_center/db/executor_availability.py": [
+      "orchestration"
+    ],
     "command_center/db/work_queue_store.py": [
       "queue"
     ],
@@ -132,6 +135,9 @@
     "command_center/orchestrator/__init__.py": [
       "orchestration"
     ],
+    "command_center/orchestrator/control_plane_reconciler.py": [
+      "orchestration"
+    ],
     "command_center/orchestrator/gh_access.py": [
       "orchestration"
     ],
@@ -149,6 +155,9 @@
       "orchestration"
     ],
     "command_center/orchestrator/routing.py": [
+      "orchestration"
+    ],
+    "command_center/orchestrator/watchdog.py": [
       "orchestration"
     ],
     "command_center/pipeline_settings.py": [

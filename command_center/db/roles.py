@@ -120,9 +120,12 @@ ALL_TABLES: tuple[str, ...] = (
     "audit_finding",
     "audit_run",
     "backlog_dependency",
+    "backlog_duplicate",
     "backlog_event",
     "backlog_evidence",
     "backlog_task",
+    "backlog_task_followup",
+
     "monitor_finding",
     "backlog_task_remediation",
     "backlog_scan_cursor",
@@ -132,11 +135,16 @@ ALL_TABLES: tuple[str, ...] = (
     "completion_validation",
     "conflict",
     "contact",
+    "control_plane_event",
+    "control_plane_heartbeat",
+    "control_plane_unit_state",
     "council_decision",
     "council_event",
     "council_vote",
     "digest_item",
     "enrollment_ticket",
+    "executor_availability",
+    "executor_availability_event",
     "market_install_log",
     "market_item",
     "message",
@@ -163,6 +171,11 @@ ALL_TABLES: tuple[str, ...] = (
     "schema_migration",
     "session",
     "task",
+    # The tick-stall watchdog's observability ledgers (0018): plain
+    # append-only data with no state machine to defend, so they take the
+    # blanket app-role default below rather than the function-only idiom.
+    "tick_skip_event",
+    "tick_stall_escalation",
     "work_attempt",
     "work_event",
     "work_item",
@@ -190,13 +203,17 @@ IDENTITY_SEQUENCES: MappingProxyType[str, str] = MappingProxyType(
         "backlog_event": "backlog_event_event_id_seq",
         "backlog_evidence": "backlog_evidence_evidence_id_seq",
         "completion_event": "completion_event_id_seq",
+        "control_plane_event": "control_plane_event_event_id_seq",
         "completion_validation": "completion_validation_id_seq",
         "council_event": "council_event_id_seq",
+        "executor_availability_event": "executor_availability_event_id_seq",
         "model_event": "model_event_id_seq",
         "principal_event": "principal_event_id_seq",
         "proposal_event": "proposal_event_id_seq",
         "proposal_evidence": "proposal_evidence_id_seq",
         "run_event": "run_event_id_seq",
+        "tick_skip_event": "tick_skip_event_id_seq",
+        "tick_stall_escalation": "tick_stall_escalation_id_seq",
         "work_event": "work_event_id_seq",
         "worker_host_fingerprint": "worker_host_fingerprint_id_seq",
     }
@@ -275,6 +292,40 @@ _FINALIZATION_CLAIM_TABLES: dict[str, frozenset[str]] = {
     "run_finalization_claim": _NONE,
 }
 
+# The control-plane reconciler's tables (0035). `aicc_app` gets the blanket
+# default (control-01 runs the reconciler and the ticks it watches over under
+# that credential), so only the worker's narrower policy is declared here.
+#
+# `control_plane_heartbeat` is readable by `aicc_worker` and nothing else --
+# it is the one fact worker-01's independent cross-check exists to read
+# (VOYN-W0-AICC-CONTROL-PLANE-RESILIENCE's second acceptance clause: "a
+# reconciler that dies the same way is no reconciler", so the check that
+# catches it must not depend on the same host or the same credential). It
+# gets no write privilege: a compromised execution host must not be able to
+# forge a fresh `last_ok_at` and hide a real stall from the host watching
+# for one.
+#
+# `control_plane_unit_state` (the circuit-breaker bookkeeping) and
+# `control_plane_event` (the action ledger) are the reconciler's own
+# internal state, not evidence a cross-check needs -- staleness in the
+# heartbeat is the whole signal.
+_WORKER_CONTROL_PLANE_TABLES: dict[str, frozenset[str]] = {
+    "control_plane_heartbeat": _READ,
+    "control_plane_unit_state": _NONE,
+    "control_plane_event": _NONE,
+}
+
+# Fleet-wide executor availability (0033, VOYN-W0-AICC-EXECUTOR-QUOTA-VISIBILITY):
+# the control plane READS both the live verdict and its history, for the same
+# dashboards/metrics reason it reads `work_item`/`work_event`. Neither table
+# holds a secret or a capability, so a plain table grant (not a redacted view)
+# is enough — unlike `work_attempt`, there is nothing here worth hiding from a
+# role that can already read it.
+_APP_EXECUTOR_TABLES: dict[str, frozenset[str]] = {
+    "executor_availability": _READ,
+    "executor_availability_event": _READ,
+}
+
 # Fail-closed monitor findings (0021): every write travels through a SECURITY
 # DEFINER function -- record/clear (control plane and worker hosts, so the
 # worker-host probe can record) and monitor_link_task (control plane only,
@@ -303,20 +354,24 @@ _MONITOR_FINDING_TABLES: dict[str, frozenset[str]] = {
 _APP_BACKLOG_TABLES: dict[str, frozenset[str]] = {
     "backlog_task": _READ,
     "backlog_dependency": _READ,
+    "backlog_duplicate": _READ,
     "backlog_evidence": _READ,
     "backlog_event": _READ,
     "backlog_writer_lease": _READ,
     "backlog_task_remediation": _READ,
+    "backlog_task_followup": _READ,
     "backlog_scan_cursor": _READ,
 }
 
 _WORKER_BACKLOG_TABLES: dict[str, frozenset[str]] = {
     "backlog_task": _NONE,
     "backlog_dependency": _NONE,
+    "backlog_duplicate": _NONE,
     "backlog_evidence": _NONE,
     "backlog_event": _NONE,
     "backlog_writer_lease": _NONE,
     "backlog_task_remediation": _NONE,
+    "backlog_task_followup": _NONE,
     "backlog_scan_cursor": _NONE,
 }
 
@@ -480,6 +535,14 @@ _WORKER_TABLES: dict[str, frozenset[str]] = {
     "work_attempt": _NONE,
     "work_result": _NONE,
     "work_event": _NONE,
+    # Fleet-wide executor availability (0018): a worker reads the live verdict
+    # directly (a plain SELECT — this table holds nothing sensitive, unlike
+    # `work_attempt`), but mutates ONLY through `executor_mark_unavailable` /
+    # `executor_mark_available`, so a compromised host cannot forge
+    # "available" over an account it knows to be exhausted, or erase the
+    # history of having said so.
+    "executor_availability": _READ,
+    "executor_availability_event": _NONE,
 }
 
 # View grants, split by contributing task the same way `PRIVILEGES`' table
@@ -537,6 +600,9 @@ _WORKER_FUNCTIONS = (
     # 0021: the worker-host fail-closed probe records what it measured.
     "monitor_record_finding(text, text, jsonb)",
     "monitor_clear_finding(text)",
+    # 0031: and clears the classes it measured GREEN, without waiting for
+    # every other probe on the same host to go green too.
+    "monitor_clear_findings_except(text, text[])",
     # A second, narrower fail path for a refusal that names no fault in the
     # work itself (VOYN-W0-AICC-PUBLISH-LEASE-CONTENTION-BURNS-ATTEMPT) --
     # see 0022_queue_fail_lease_wait.
@@ -562,6 +628,7 @@ _APP_BACKLOG_FUNCTIONS = (
     "backlog_transition(text, text, bigint)",
     "backlog_record_evidence(text, text, text)",
     "backlog_record_remediation(text, text, text, text)",
+    "backlog_record_followup(text, text, text, text, text)",
     "backlog_add_dependency(text, text)",
     "backlog_lease_acquire(text, text, integer)",
     "backlog_lease_heartbeat(text, text, integer)",
@@ -578,11 +645,26 @@ _APP_BACKLOG_FUNCTIONS = (
     # evidence (0018); the pr-evidence check is the gate, so granting it
     # does not grant a generic READY_TO_REVIEW unstick.
     "backlog_recover_stuck_ready_to_review(text)",
+    # OPEN -> DONE for a remediation task whose parent's work is already
+    # merged (0025, VOYN-W0-AICC-DISPATCH-REUSE-GATE). The remediation
+    # lineage and the OPEN-only rule are the gate, so granting it does not
+    # grant a generic "close any task".
+    "backlog_close_superseded(text, text, text, text, text)",
     # The persisted scan cursor for the tick windows (0015): returns this
     # tick's offset and advances atomically per invocation.
     "backlog_scan_claim(text, text, text)",
     # Triage of raw findings (0008): UNTRIAGED -> OPEN/NEEDS_REFINEMENT/DONE/DECIDED.
     "backlog_triage(text, text, text)",
+    # The same decision one state over (0025): OPEN -> DECIDED for a task a
+    # dedup scan proved is a duplicate, with the canonical task recorded as a
+    # foreign key. `backlog_triage` reaches 'duplicate' only from UNTRIAGED,
+    # so without this an OPEN duplicate had no exit at all; the mandatory,
+    # existing canonical is the gate, so granting this does not grant a
+    # generic OPEN -> DECIDED.
+    "backlog_mark_duplicate(text, text, text)",
+    # VOYN-W0-AICC-DISPATCH-REUSE-GATE (0040): close remediation superseded by merged work.
+    "backlog_close_superseded(text, text, text, text, text)",
+
     # Evidence hygiene (0030): remove proven malformed PR evidence.
     "backlog_clear_evidence(text, text, text, text)",
     # 0021: read-only deploy preflight with dispatch's privileges; the task
@@ -593,12 +675,43 @@ _APP_BACKLOG_FUNCTIONS = (
     "backlog_set_task_class(text, text)",
     "monitor_record_finding(text, text, jsonb)",
     "monitor_clear_finding(text)",
+    # 0031: per-class clearing, shared with worker hosts for the same reason
+    # as the record/clear pair above.
+    "monitor_clear_findings_except(text, text[])",
     "monitor_link_task(bigint, text)",
-    # Audit trail for where a record came from (0020); the importer's stamp
+    # Audit trail for where a record came from (0023); the importer's stamp
     # that a row was migrated rather than authored directly in the store.
     "backlog_record_provenance(text, text, jsonb)",
+    # The importer's atomic insert-and-stamp (0037). Granted INSTEAD of
+    # leaving the importer to pair `backlog_upsert_task` with a separate
+    # `backlog_record_provenance` call: one transaction is what makes "no
+    # migrated row without its provenance" a property rather than a habit.
+    "backlog_import_task(text, text, text, text, text, text, text, text, "
+    "text, jsonb)",
+
+    # 0037: declare the authority a task needs beyond an unprivileged
+    # workspace. Granted to the control plane because the OWNER path matters
+    # as much as the discovered one -- marking a task "this needs root"
+    # before it is ever dispatched is what makes the block cost zero model
+    # calls. The closed vocabulary inside the function is the gate, so
+    # granting it does not grant arbitrary task mutation.
+    "backlog_declare_required_authority(text, text[])",
+
+    # 0029: explicit human decisions on parked tasks; never a shortcut past
+    # review gates. Control-plane only -- workers must not unlock a deferral.
     "backlog_owner_decision(text, bigint, text, text)",
     "backlog_owner_lock(text)",
+)
+
+# Fleet-wide executor availability (0018): the worker is the sole observer of
+# a provider account's own failures, so it is the sole role that may report
+# one unavailable. There is no `_APP_EXECUTOR_FUNCTIONS`: the control plane
+# reads through the plain table grant above and never claims to know an
+# executor's live state first-hand (the same reasoning that keeps `aicc_app`
+# off `queue_claim()`).
+_WORKER_EXECUTOR_FUNCTIONS = (
+    "executor_mark_unavailable(text, text, integer)",
+    "executor_mark_available(text)",
 )
 
 # The enrolment surface (0003), split by who may do what.
@@ -638,6 +751,11 @@ _OPERATOR_FUNCTIONS = (
     "enroll_sweep_expired()",
     "identity_revoke_principal(text, text)",
     "identity_sweep_expired()",
+    # The same administrative shape as readmitting a host: an incident-scale
+    # override no worker or control-plane compromise should be able to grant
+    # itself. `executor_mark_unavailable` is deliberately absent here — only
+    # a worker directly observes a provider account's own failure.
+    "executor_mark_available(text)",
 )
 
 FUNCTION_PRIVILEGES: MappingProxyType[str, tuple[str, ...]] = MappingProxyType(
@@ -647,7 +765,9 @@ FUNCTION_PRIVILEGES: MappingProxyType[str, tuple[str, ...]] = MappingProxyType(
         # failure mode of getting it wrong — a role that may execute nothing —
         # is silent in each task's own suite.
         APP_ROLE: _APP_FUNCTIONS + _APP_ENROLMENT_FUNCTIONS + _APP_BACKLOG_FUNCTIONS,
-        WORKER_ROLE: _WORKER_FUNCTIONS + _WORKER_ENROLMENT_FUNCTIONS,
+        WORKER_ROLE: (
+            _WORKER_FUNCTIONS + _WORKER_ENROLMENT_FUNCTIONS + _WORKER_EXECUTOR_FUNCTIONS
+        ),
         OPERATOR_ROLE: _OPERATOR_FUNCTIONS,
     }
 )
@@ -681,6 +801,8 @@ PRIVILEGES: MappingProxyType[str, MappingProxyType[str, frozenset[str]]] = (
                         and table not in _APP_ENROLMENT_TABLES
                         and table not in _APP_BACKLOG_TABLES
                         and table not in _FINALIZATION_CLAIM_TABLES
+                        and table not in _APP_EXECUTOR_TABLES
+
                         and table not in _MONITOR_FINDING_TABLES
                     },
                     # Declared policies. A second task adding rows here for a
@@ -690,6 +812,8 @@ PRIVILEGES: MappingProxyType[str, MappingProxyType[str, frozenset[str]]] = (
                     _APP_ENROLMENT_TABLES,
                     _APP_BACKLOG_TABLES,
                     _FINALIZATION_CLAIM_TABLES,
+                    _APP_EXECUTOR_TABLES,
+
                     _MONITOR_FINDING_TABLES,
                 )
             ),
@@ -699,6 +823,7 @@ PRIVILEGES: MappingProxyType[str, MappingProxyType[str, frozenset[str]]] = (
                     _WORKER_ENROLMENT_TABLES,
                     _WORKER_BACKLOG_TABLES,
                     _FINALIZATION_CLAIM_TABLES,
+                    _WORKER_CONTROL_PLANE_TABLES,
                 )
             ),
             # No blanket default: this role is not a general-purpose one, and
@@ -1064,7 +1189,15 @@ def _require_function_signature(signature: str) -> None:
     for argument in (a.strip() for a in rest[:-1].split(",")):
         if not argument:
             continue
-        _require_identifier(argument)
+        # An array type is `text[]`, which is not a bare identifier and must
+        # not be rejected as one: 0031's per-class finding clear takes the
+        # keep-list as `text[]`. Only the brackets are allowed through, and
+        # only as a suffix, so nothing but `[` and `]` ever reaches the
+        # interpolated statement beyond what the identifier rule permits.
+        element = argument
+        while element.endswith("[]"):
+            element = element[:-2]
+        _require_identifier(element)
 
 
 def _require_identifier(name: str) -> None:
