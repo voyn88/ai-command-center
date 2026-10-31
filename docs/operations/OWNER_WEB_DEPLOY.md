@@ -35,7 +35,8 @@ minute while visible and prevents overlapping polls.
 - Public endpoint: missing/wrong owner password returns 401 for `/`, `/api/backlog`
   and an asset URL. Correct credentials return the SPA and current canonical task
   count. A direct backend request without the upstream key returns 401.
-- POST/PUT/DELETE/PATCH routes return 405 even with the upstream key.
+- In read-only mode, POST/PUT/DELETE/PATCH routes return 405 even with the
+  upstream key; owner command paths require the separate command credential.
 
 Deploy the exact built source revision into a separate versioned directory.
 Start and check it before switching the authenticated edge upstream. Keep the

@@ -1,8 +1,8 @@
-"""Read-only server deployment of the existing React client.
+"""Server deployment of the existing React client, with optional owner commands.
 
-The authenticated edge supplies a private upstream credential. This factory
-has no database credential, scheduler, local task store, or mutation routes.
-Its input is the canonical backlog export, never a second task database.
+The authenticated edge supplies separate private read and command credentials.
+Reads use the canonical backlog export. Explicitly enabled commands use the
+canonical database and planner; neither mode creates a local task store.
 """
 from __future__ import annotations
 
