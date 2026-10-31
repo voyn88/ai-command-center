@@ -108,6 +108,14 @@ def render_dependency_graph(task: dict, tasks_by_id: dict[str, dict]) -> None:
     if dot is None:
         st.caption("Нет связанных задач.")
         return
+    # The graph below is an image with no text alternative — plain-language
+    # sentences come first so a non-technical reader (or a screen reader)
+    # gets "why this matters" without needing to parse a node/arrow diagram.
+    narrative = task_view.dependency_narrative(task, tasks_by_id)
+    if narrative:
+        st.markdown("**Почему это важно**")
+        for line in narrative:
+            st.caption(f"- {line}")
     st.graphviz_chart(dot)
 
 
