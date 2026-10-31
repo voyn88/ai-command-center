@@ -691,7 +691,7 @@ def test_codex_usage_limit_switches_inside_the_same_attempt(handler, monkeypatch
         {
             "cascade_step": 1,
             "executor": "codex",
-            "reason": "provider_auth_or_quota",
+            "reason": "quota_limit",
         }
     ]
 
@@ -722,7 +722,7 @@ def test_codex_usage_limit_on_the_last_link_is_infra_not_success(handler, monkey
 
     assert not outcome.ok and outcome.retryable and outcome.infra_wait
     assert [run["executor"] for run in runs] == ["codex"]
-    assert "provider/auth/quota" in outcome.reason
+    assert "quota_limit" in outcome.reason
 
 
 @pytest.mark.parametrize("workspace_unchanged", [True, False])
