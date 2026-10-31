@@ -186,8 +186,8 @@ def test_sigterm_finishes_the_item_in_hand_and_claims_no_more() -> None:
 
     original_execute = daemon._execute
 
-    def execute_then_stop(work):
-        original_execute(work)
+    def execute_then_stop(work, sent_at):
+        original_execute(work, sent_at)
         daemon.request_stop()  # the signal arrives while item 1 is in hand
 
     daemon._execute = execute_then_stop  # type: ignore[method-assign]
@@ -1399,7 +1399,7 @@ def _beat_until_lost(
     # `_execute`'s to own in production (both the beat thread and the deadline
     # watch read it); here the beat loop is driven on its own, so the test
     # constructs it and the loop is the only reader.
-    deadline = _LeaseDeadline(window, clock)
+    deadline = _LeaseDeadline(window, clock, clock())
     daemon._heartbeat_loop(
         _work({"kind": "slow"}),
         deadline,
@@ -1550,7 +1550,7 @@ def test_a_beat_the_server_accepted_moves_the_deadline() -> None:
     )
     daemon._heartbeat_loop(
         _work({"kind": "slow"}),
-        _LeaseDeadline(window, clock),
+        _LeaseDeadline(window, clock, clock()),
         threading.Event(),
         threading.Event(),
         cancel,
@@ -1652,7 +1652,9 @@ def _execute_against_a_black_hole(
     if notifications is not None:
         daemon._notify = notifications.append  # type: ignore[method-assign]
     run = threading.Thread(
-        target=daemon._execute, args=(_work({"kind": "slow"}),), daemon=True
+        target=daemon._execute,
+        args=(_work({"kind": "slow"}), time.monotonic()),
+        daemon=True,
     )
     run.start()
     assert handler_done.wait(window * 6), (
@@ -1820,7 +1822,7 @@ def _execute_one(store, handler, window: int = 3) -> None:
     daemon = WorkerDaemon(
         store, {"slow": handler}, WorkerConfig(visibility_seconds=window)
     )
-    daemon._execute(_work({"kind": "slow"}))
+    daemon._execute(_work({"kind": "slow"}), time.monotonic())
 
 
 def test_an_unanswered_beat_is_not_a_refused_beat() -> None:

@@ -51,6 +51,17 @@ Design decisions, each traceable to the shipped substrate:
   nothing renews and threw away a ``queue_fail`` the database would have
   accepted (VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED, ``monitor_finding``
   #41318).
+* **And the clock starts when the lane ASKS, not when the server answers.**
+  The window is granted from the server's own ``now()``, somewhere inside a
+  call the lane is still waiting on, so the request instant is at or before
+  the grant and the answer's is at or after it. Dating from the answer made
+  ``remaining <= 0`` prove a lapse and made ``remaining > 0`` -- the test the
+  handler actually runs under -- prove nothing, so the lane outran the
+  server's lease by the reply's own delay, which is unbounded in exactly the
+  fault this machinery exists for. Dating from the request costs one round
+  trip of a window sized with a whole beat of margin, and is affordable only
+  because the split above stopped a lapse from discarding the outcome
+  (VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED, ``monitor_finding`` #41477).
 * **Shutdown finishes the item in hand.** SIGTERM stops *claiming*; the
   current attempt runs to completion inside systemd's stop timeout. A second
   signal — or the timeout's SIGKILL — abandons it, and the lease expiry plus
@@ -207,39 +218,72 @@ class _LeaseDeadline:
     is still its own" -- enough to stop the work, and not a verdict on whether
     a report would be accepted. Only `_queue_owns` decides that; see
     `WorkerDaemon._execute`.
+
+    AND IT IS DATED FROM THE REQUEST, NOT FROM THE ANSWER
+    (VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED, monitor_finding #41477). This is
+    the half of the rule the three fixes above never touched, and it is the
+    one that decides WHICH WAY the clock is wrong when it is wrong.
+
+    The server grants a window of ``visibility_seconds`` from its own ``now()``
+    inside `queue_claim`/`queue_heartbeat`. Call that instant ``G``. The lane
+    sends the call at ``S`` and reads the answer at ``A``, and the only thing
+    it knows for certain is ``S <= G <= A``. So::
+
+        dated from A:   lane deadline = A + V  >=  G + V = the server's
+        dated from S:   lane deadline = S + V  <=  G + V = the server's
+
+    Dating from ``A`` is what this class did, and the comment that chose it
+    argued -- correctly -- that it makes ``remaining <= 0`` PROVE the lapse.
+    What it does not make is the test the handler actually runs under:
+    ``remaining > 0`` then proves nothing at all, and the lane keeps executing
+    for ``A - G`` past a lease the server has already let go. ``A - G`` is the
+    reply's own delay, it is bounded by nothing on this side, and it is
+    largest in exactly the fault this machinery exists for.
+
+    Dating from ``S`` costs at most one round trip of lease per beat, against
+    a cadence that is sized with a whole beat interval of margin on purpose
+    (`beat_interval_seconds`), and it is only AFFORDABLE because of #41318:
+    running out of lease no longer discards the outcome, it offers it, and
+    `_queue_owns` decides. Before that split this direction would have thrown
+    away writable runs on a slow reply -- 0029's cost -- which is why the
+    order these findings were fixed in is the order they had to be fixed in.
     """
 
-    __slots__ = ("_window", "_monotonic", "_lock", "_granted_at")
+    __slots__ = ("_window", "_monotonic", "_lock", "_requested_at")
 
-    def __init__(self, window: float, monotonic: Callable[[], float]) -> None:
+    def __init__(
+        self, window: float, monotonic: Callable[[], float], requested_at: float
+    ) -> None:
         self._window = float(window)
         self._monotonic = monotonic
         # Plain assignment of a float is atomic under the GIL, but the lock is
         # cheap and the invariant -- a reader never sees a half-written grant
         # -- is the one this type exists to hold across threads.
         self._lock = threading.Lock()
-        # `queue_claim` has just granted a window, and this is constructed
-        # before the attempt's threads start, so construction is a
-        # conservative stand-in for that grant: the real one is no later.
-        self._granted_at = monotonic()
+        # The instant the CLAIM WAS ASKED FOR, passed in rather than read here
+        # (monitor_finding #41477): this object is built after `queue_claim`
+        # has answered, so `monotonic()` at construction is already past the
+        # grant, and a default would have quietly reproduced the very skew
+        # this type was changed to remove.
+        self._requested_at = float(requested_at)
 
-    def renew(self, answered_at: float | None = None) -> None:
-        """Re-date the lease to when a beat the server ACCEPTED answered.
+    def renew(self, sent_at: float) -> None:
+        """Re-date the lease to when a beat the server ACCEPTED was SENT.
 
-        ``answered_at`` is passed by the beat loop as the instant the call
-        returned, so the timestamp is the answer's and not that of whatever
-        the loop did next.
+        ``sent_at`` is captured by the beat loop immediately before the call,
+        so it is at or before the instant the server granted the renewal --
+        which is what makes this deadline land at or before the server's. The
+        answer's arrival is the other side of that round trip and is the one
+        timestamp this must not be given; see the class docstring.
         """
         with self._lock:
-            self._granted_at = (
-                self._monotonic() if answered_at is None else answered_at
-            )
+            self._requested_at = sent_at
 
     def remaining(self) -> float:
         """Seconds of lease left. ``<= 0`` means the attempt is no longer
         ours and anything it goes on to do is unaccountable."""
         with self._lock:
-            return self._window - (self._monotonic() - self._granted_at)
+            return self._window - (self._monotonic() - self._requested_at)
 
 
 @dataclass(frozen=True, slots=True)
@@ -504,6 +548,16 @@ class WorkerDaemon:
                     # STATUS travels with every claim-path ping so a status
                     # written by a dying drain cycle can never stick.
                     self._notify("WATCHDOG=1\nSTATUS=aicc-ready")
+                    # WHEN THE WINDOW WAS ASKED FOR, which is where the
+                    # attempt's lease clock starts (monitor_finding #41477).
+                    # `queue_claim` dates `visible_until` from the server's
+                    # `now()`, somewhere inside this call; taking the instant
+                    # before it means the lane's deadline is at or before the
+                    # server's rather than a round trip after it. `_execute`
+                    # takes it as an argument for the same reason
+                    # `_LeaseDeadline` does -- a default read at construction
+                    # is already past the grant.
+                    claim_sent_at = self._monotonic()
                     try:
                         claimed = self._store.claim(
                             self._config.queue,
@@ -567,7 +621,7 @@ class WorkerDaemon:
                     self._sleep(min(self._config.idle_max_seconds, cap))
                     continue
                 idle = self._config.idle_min_seconds
-                self._execute(claimed)
+                self._execute(claimed, claim_sent_at)
         finally:
             self._reload_stop.set()
             self._reload_requested.set()
@@ -579,7 +633,7 @@ class WorkerDaemon:
         # not a crash — TimeoutStopSec pacing instead of watchdog action.
         self._notify("STOPPING=1")
 
-    def _execute(self, work: ClaimedWork) -> None:
+    def _execute(self, work: ClaimedWork, claim_sent_at: float) -> None:
         # TWO EVENTS, BECAUSE TWO DIFFERENT LEASES CAN BE LOST AND ONLY ONE OF
         # THEM FORBIDS THE REPORT (VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED,
         # monitor_finding #14016).
@@ -681,7 +735,16 @@ class WorkerDaemon:
         # HERE, and read by both of the threads below. Constructed before
         # either starts, so the window is dated from the claim rather than
         # from whenever a thread happened to be scheduled.
-        deadline = _LeaseDeadline(self._config.visibility_seconds, self._monotonic)
+        #
+        # AND DATED FROM WHEN THE CLAIM WAS ASKED FOR, which is `claim_sent_at`
+        # and is why it is a parameter (monitor_finding #41477). `queue_claim`
+        # grants the window from the server's own `now()`, inside the call the
+        # caller is still waiting on, so every instant available HERE is
+        # already past that grant -- and a lease clock that starts late ends
+        # late, which is a lane executing an item the reaper has handed back.
+        deadline = _LeaseDeadline(
+            self._config.visibility_seconds, self._monotonic, claim_sent_at
+        )
         beat = threading.Thread(
             target=self._heartbeat_loop,
             args=(work, deadline, lease_unproven, queue_lease_lost, cancel, beat_stop),
@@ -1092,6 +1155,14 @@ class WorkerDaemon:
             # unit cures a wedged process and cures nothing about a DB outage,
             # which the lease-lapse logic above already handles.
             self._notify("WATCHDOG=1")
+            # THE INSTANT THE BEAT WAS SENT, captured before the call because
+            # that is the only timestamp this loop can take that is at or
+            # BEFORE the grant it is about to ask for (monitor_finding
+            # #41477). `queue_heartbeat` dates the new `visible_until` from
+            # the server's `now()`, which falls somewhere inside this round
+            # trip; dating the lane's copy from here therefore lands at or
+            # before the server's, whatever the reply path does afterwards.
+            sent_at = self._monotonic()
             try:
                 alive = self._store.heartbeat(work)
             except Exception:
@@ -1103,11 +1174,6 @@ class WorkerDaemon:
                 # stale with no trace.
                 logger.exception("heartbeat error for attempt %s", work.attempt_id)
                 continue
-            # The instant the answer arrived, captured before anything else
-            # this loop does, because that instant is the quantity: the server
-            # granted the renewal somewhere inside the round trip, so this is
-            # at or after the grant.
-            answered_at = self._monotonic()
             # Only a beat the SERVER ACCEPTED moves the deadline, and `alive`
             # is how `queue_heartbeat` says so. A refusal is an answer, but it
             # is the answer "this attempt is not yours" -- re-dating the lease
@@ -1122,4 +1188,29 @@ class WorkerDaemon:
                 # nothing else (monitor_finding #41318).
                 self._stop_the_handler(queue_lease_lost, cancel)
                 return
-            deadline.renew(answered_at)
+            # DATED FROM THE SEND, NOT FROM THIS INSTANT (VOYN-MON-CONTROL-01-
+            # QUEUE-QUEUE-STALLED, monitor_finding #41477). This line read
+            # `answered_at`, the instant the call returned, on the argument
+            # that the grant is at or before it and the test therefore PROVES
+            # a lapse. It does -- and the proof is for the wrong half. What
+            # the handler runs under is `remaining > 0`, and dating from the
+            # answer makes the lane's deadline LATER than the server's by the
+            # reply's own delay, so every second of that delay is a lane
+            # executing an item whose lease the server has already let go.
+            #
+            # MEASURED through this loop against a real PostgreSQL 16 server,
+            # with one beat that REACHED the server and committed and whose
+            # reply was held 3s (the deployed shape is `lease_client`'s own
+            # 120s allowance against a 300s window, and the overrun scales
+            # with the delay, not with the window):
+            #
+            #     dated from the answer  lane gave up 3.01s PAST the server's
+            #                            `visible_until`
+            #     dated from the send    at or before it, every run
+            #
+            # `aicc-queue-reaper.timer` hands the item back inside that
+            # overrun, and the rest is the chain `_lease_deadline_loop`
+            # catalogues: two lanes' worth of work against one recorded
+            # claim, `spare_capacity` true against a fleet with no free lane,
+            # and a `queue_stalled` no fleet action reaches.
+            deadline.renew(sent_at)

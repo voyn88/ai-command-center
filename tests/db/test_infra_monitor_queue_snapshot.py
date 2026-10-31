@@ -959,7 +959,9 @@ def _blipping(store: WorkQueueStore, failures: int) -> list[str]:
     return beats
 
 
-def _beat_through(store: WorkQueueStore, work: ClaimedWork, window: float):
+def _beat_through(
+    store: WorkQueueStore, work: ClaimedWork, window: float, claim_sent_at: float
+):
     """Run the production beat loop over one claim for a whole window plus a
     beat, and report whether it gave the lease up."""
     import threading
@@ -975,7 +977,11 @@ def _beat_through(store: WorkQueueStore, work: ClaimedWork, window: float):
     daemon = WorkerDaemon(
         store, {}, WorkerConfig(queue=QUEUE, visibility_seconds=int(window))
     )
-    deadline = _LeaseDeadline(int(window), time.monotonic)
+    # Dated from before the claim this helper is handed, which is the
+    # conservative stand-in `_execute` gets from its own caller: the server
+    # granted the window inside that call, so any instant before it is at or
+    # before the grant (monitor_finding #41477).
+    deadline = _LeaseDeadline(int(window), time.monotonic, claim_sent_at)
     # Three events, as `_execute` passes them: the cancellation the handler
     # waits on, and the two narrow facts that say WHY -- `queue_lease_lost`
     # (the server refused a beat, the only thing that may discard an outcome)
@@ -1029,11 +1035,17 @@ def test_a_tunnel_restart_of_the_tolerated_length_keeps_the_lane_attended(
     reaper handed the item to another lane, the side effects re-ran and
     `queue_claim` had already charged `attempt_count` for the delivery that
     was taken away."""
+    import time
+
     from command_center.db.work_queue_admin import WorkQueueAdmin
     from command_center.worker.daemon import TOLERATED_FAILED_BEATS
 
     measure, app, worker, age = monitor
     app.enqueue(QUEUE, idempotency_key="long-run", payload={"kind": "agent_run"})
+    # The claim's own send instant: the lease clock starts at or before the
+    # grant, never after it (monitor_finding #41477), which is what `_execute`
+    # does with the value `run_forever` hands it.
+    claim_sent_at = time.monotonic()
     claimed = _claim(worker, visibility=BLIP_WINDOW)
     age(
         "UPDATE work_item SET updated_at = now() - interval '40 minutes' "
@@ -1042,7 +1054,7 @@ def test_a_tunnel_restart_of_the_tolerated_length_keeps_the_lane_attended(
     )
 
     beats = _blipping(worker, TOLERATED_FAILED_BEATS)
-    lost = _beat_through(worker, claimed, BLIP_WINDOW)
+    lost = _beat_through(worker, claimed, BLIP_WINDOW, claim_sent_at)
 
     assert beats[:TOLERATED_FAILED_BEATS] == ["raised"] * TOLERATED_FAILED_BEATS
     assert "refused" not in beats, f"the recovery beat arrived too late: {beats}"
@@ -1077,15 +1089,21 @@ def test_a_blip_past_the_tolerance_still_hands_the_item_back(monitor) -> None:
     This is what keeps the recovery path honest -- an outage longer than the
     fleet is built to absorb must still reach the reaper, which is the only
     exit from the class `lapsed_claim_age_seconds` measures."""
+    import time
+
     from command_center.db.work_queue_admin import WorkQueueAdmin
     from command_center.worker.daemon import TOLERATED_FAILED_BEATS
 
     measure, app, worker, _age = monitor
     app.enqueue(QUEUE, idempotency_key="long-blip", payload={"kind": "agent_run"})
+    # The claim's own send instant: the lease clock starts at or before the
+    # grant, never after it (monitor_finding #41477), which is what `_execute`
+    # does with the value `run_forever` hands it.
+    claim_sent_at = time.monotonic()
     claimed = _claim(worker, visibility=BLIP_WINDOW)
 
     beats = _blipping(worker, TOLERATED_FAILED_BEATS + 1)
-    lost = _beat_through(worker, claimed, BLIP_WINDOW)
+    lost = _beat_through(worker, claimed, BLIP_WINDOW, claim_sent_at)
 
     assert lost, f"a blip past the tolerance must stop the work: {beats}"
 
@@ -1401,6 +1419,10 @@ def test_the_beat_loop_admits_the_lapse_inside_the_window_it_was_granted(
 
     measure, app, worker, _age = monitor
     app.enqueue(QUEUE, idempotency_key="black-holed", payload={"kind": "agent_run"})
+    # The claim's own send instant: the lease clock starts at or before the
+    # grant, never after it (monitor_finding #41477), which is what `_execute`
+    # does with the value `run_forever` hands it.
+    claim_sent_at = time.monotonic()
     claimed = _claim(worker, visibility=BLIP_WINDOW)
 
     interval = beat_interval_seconds(BLIP_WINDOW)
@@ -1436,7 +1458,7 @@ def test_the_beat_loop_admits_the_lapse_inside_the_window_it_was_granted(
     cancel = threading.Event()
     beat_stop = threading.Event()
     started = time.monotonic()
-    deadline = _LeaseDeadline(BLIP_WINDOW, time.monotonic)
+    deadline = _LeaseDeadline(BLIP_WINDOW, time.monotonic, claim_sent_at)
     threads = [
         threading.Thread(
             target=daemon._heartbeat_loop,
@@ -1590,6 +1612,9 @@ def test_a_beat_that_commits_without_answering_leaves_the_write_acceptable(
     # what is being measured from "one lane abandoned its item" to "both did".
     other = _claim(worker, visibility=600)
     app.enqueue(QUEUE, idempotency_key="lane-two", payload={"kind": "slow"})
+    # The claim's own send instant, as `run_forever` takes it: the lease clock
+    # starts at or before the server's grant (monitor_finding #41477).
+    claim_sent_at = time.monotonic()
     claimed = _claim(worker, visibility=UNANSWERED_WINDOW)
     app.enqueue(QUEUE, idempotency_key="queued", payload={"kind": "slow"})
     age(
@@ -1628,7 +1653,9 @@ def test_a_beat_that_commits_without_answering_leaves_the_write_acceptable(
         {"slow": slow},
         WorkerConfig(queue=QUEUE, visibility_seconds=UNANSWERED_WINDOW),
     )
-    run = threading.Thread(target=daemon._execute, args=(claimed,), daemon=True)
+    run = threading.Thread(
+        target=daemon._execute, args=(claimed, claim_sent_at), daemon=True
+    )
     run.start()
     run.join(timeout=UNANSWERED_WINDOW * 4)
     assert not run.is_alive(), f"`_execute` never returned; beats at {beats}"
