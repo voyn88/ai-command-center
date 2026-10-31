@@ -1508,6 +1508,12 @@ def _review_once(
         window = _pr_window_expensive_read_decision(
             repo_path, pr_url, prefix="review_window"
         )
+        # Closed/merged PRs still return allowed=True so merge_once can
+        # complete or reject them; review must not spend a cascade on a PR
+        # that can no longer land a verdict.
+        if window.reason == "pr_not_open":
+            report.skipped.append((task_id, "pr_not_open"))
+            continue
         if not window.allowed:
             report.skipped.append((task_id, window.reason))
             continue
@@ -1629,6 +1635,9 @@ def reconcile_review_once(
         window = _pr_window_expensive_read_decision(
             repo_path, pr_url, prefix="review_window"
         )
+        if window.reason == "pr_not_open":
+            report.skipped.append((current_task_id, "pr_not_open"))
+            continue
         if not window.allowed:
             report.skipped.append((current_task_id, window.reason))
             continue
@@ -3118,6 +3127,44 @@ def _merge_window_open_pr_snapshot(
     }, None
 
 
+def _reject_stale_ready_task(factory: Any, task_id: str) -> bool:
+    """READY_TO_REVIEW → REJECTED with no remediation spawn.
+
+    Used when the linked PR is closed unmerged, or merged without the
+    acceptance evidence this loop requires: there is nothing left for
+    review/merge to do, and leaving the task in READY_TO_REVIEW forever
+    is what stranded 22 of 97 review-queue rows
+    (VOYN-W0-AICC-REVIEW-SOURCE-REFRESH-EROFS-KILLS-ALL-REVIEWS). Never
+    blesses DONE — that path still requires acceptance evidence.
+    """
+    with factory() as conn:
+        conn.autocommit = False
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT revision FROM backlog_task "
+                    "WHERE task_id = %s AND status = 'READY_TO_REVIEW'",
+                    (task_id,),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    conn.rollback()
+                    return False
+                revision = row[0]
+                cur.execute(
+                    "SELECT ok, reason FROM backlog_transition(%s, 'REJECTED', %s)",
+                    (task_id, revision),
+                )
+                ok, _reason = cur.fetchone()
+            if ok:
+                conn.commit()
+                return True
+            conn.rollback()
+            return False
+        finally:
+            conn.autocommit = True
+
+
 def _merged_target_sha(repo_path: str, pr_url: str) -> tuple[str | None, str]:
     """The PR's actual merge commit on the target branch, or None until
     GitHub reports the PR MERGED.
@@ -3148,7 +3195,14 @@ def _merged_target_sha(repo_path: str, pr_url: str) -> tuple[str | None, str]:
         data = json.loads(view.stdout or "{}")
     except json.JSONDecodeError:
         return None, "pr_view_failed"
-    if not isinstance(data, dict) or data.get("state") != "MERGED":
+    if not isinstance(data, dict):
+        return None, "not_merged"
+    state = data.get("state")
+    if state == "CLOSED":
+        # Closed without merge — nothing left for the autonomous merge
+        # gates; the caller rejects the READY_TO_REVIEW row.
+        return None, "pr_closed_unmerged"
+    if state != "MERGED":
         return None, "not_merged"
     oid = str((data.get("mergeCommit") or {}).get("oid") or "")
     if not re.fullmatch(r"[0-9a-f]{40}", oid):
@@ -3852,7 +3906,15 @@ def _merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -
             merge_sha, merge_reason = None, "not_merged"
         else:
             merge_sha, merge_reason = _merged_target_sha(repo_path, pr_url)
-        if merge_sha is None and merge_reason == "merged_without_acceptance_evidence":
+        if merge_sha is None and merge_reason in (
+            "merged_without_acceptance_evidence",
+            "pr_closed_unmerged",
+        ):
+            # Still never DONE without acceptance evidence — but clear the
+            # stale READY_TO_REVIEW row so the review queue can move
+            # (closed unmerged, or merged around the gates).
+            if _reject_stale_ready_task(factory, task_id):
+                actions += 1
             report.skipped.append((task_id, merge_reason))
             continue
         if merge_sha is None:
@@ -4432,6 +4494,41 @@ def _remove_pr_window_labels(
     return ok
 
 
+def _set_queue_labels(repo_path: str, pr: dict[str, Any], desired: str) -> bool:
+    """Delta-only write for ``queue-active`` / ``queue-waiting-review``.
+
+    The PR-window tick owns promotion of hand-queued waiting PRs into the
+    active set up to ``max_active`` by age; without this, queue labels set
+    by an operator never advanced and 60+ PRs waited forever
+    (VOYN-W0-AICC-REVIEW-SOURCE-REFRESH-EROFS-KILLS-ALL-REVIEWS).
+    """
+    if desired not in {_QUEUE_ACTIVE_LABEL, _QUEUE_WAITING_REVIEW_LABEL}:
+        return False
+    parsed = _owner_repo_number_from_pr_url(str(pr.get("url") or ""))
+    if parsed is None:
+        return False
+    owner, repo, number = parsed
+    queue_labels = {_QUEUE_ACTIVE_LABEL, _QUEUE_WAITING_REVIEW_LABEL}
+    current = _pr_window_labels(pr) & queue_labels
+    if current == {desired}:
+        return True
+    issues = f"repos/{owner}/{repo}/issues/{number}/labels"
+    ok = True
+    for name in sorted(current - {desired}):
+        removed = _gh(
+            ["api", "--method", "DELETE", f"{issues}/{urllib.parse.quote(name)}"],
+            repo_path,
+        )
+        ok = ok and removed.returncode == 0
+    if desired not in current:
+        added = _gh(
+            ["api", "--method", "POST", issues, "-f", f"labels[]={desired}"],
+            repo_path,
+        )
+        ok = ok and added.returncode == 0
+    return ok
+
+
 def reconcile_pr_window(
     repo_path: str, cfg: PrWindowConfig | None = None
 ) -> PrWindowReport:
@@ -4487,33 +4584,58 @@ def _reconcile_pr_window(
     details_used = 0
     blocked_refreshes_used = 0
     blocked_refresh_budget = max(cfg.blocked_refresh_budget, 0)
+    queue_waiting_prs: list[dict[str, Any]] = []
+    ordinary_prs: list[dict[str, Any]] = []
     for pr in listed_prs:
         number = int(pr.get("number") or 0)
         head = str(pr.get("headRefOid") or "")
         labels = _pr_window_labels(pr)
-        active_now = cfg.label_active in labels or _QUEUE_ACTIVE_LABEL in labels
-        queue_active_now = _QUEUE_ACTIVE_LABEL in labels
-        queue_waiting_now = _QUEUE_WAITING_REVIEW_LABEL in labels
-        blocked_now = (
-            cfg.label_blocked in labels
-            and not active_now
-            and not (queue_active_now or queue_waiting_now)
-        )
-        window_full = selected >= cfg.max_active
-        needs_merge_state = active_now or not window_full
-        if queue_active_now:
+        if _QUEUE_ACTIVE_LABEL in labels:
+            # Sticky: an already queue-active PR keeps its slot (and may
+            # briefly overshoot max_active) rather than churning labels.
             selected += 1
             report.active.append((number, head))
             _remove_pr_window_labels(
                 repo_path, pr, cfg, {cfg.label_waiting, cfg.label_blocked}
             )
             continue
-        if queue_waiting_now:
-            report.waiting.append((number, head))
+        if _QUEUE_WAITING_REVIEW_LABEL in labels:
+            queue_waiting_prs.append(pr)
+            continue
+        ordinary_prs.append(pr)
+
+    # Hand-queued waiting PRs promote into free active slots by age before
+    # ordinary (unlabelled / review-window-*) candidates compete for them.
+    queue_waiting_prs.sort(
+        key=lambda pr: (str(pr.get("createdAt") or ""), int(pr.get("number") or 0))
+    )
+    for pr in queue_waiting_prs:
+        number = int(pr.get("number") or 0)
+        head = str(pr.get("headRefOid") or "")
+        if selected < cfg.max_active:
+            selected += 1
+            report.active.append((number, head))
+            _set_queue_labels(repo_path, pr, _QUEUE_ACTIVE_LABEL)
             _remove_pr_window_labels(
-                repo_path, pr, cfg, {cfg.label_active, cfg.label_blocked}
+                repo_path,
+                pr,
+                cfg,
+                {cfg.label_waiting, cfg.label_blocked, cfg.label_active},
             )
             continue
+        report.waiting.append((number, head))
+        _remove_pr_window_labels(
+            repo_path, pr, cfg, {cfg.label_active, cfg.label_blocked}
+        )
+
+    for pr in ordinary_prs:
+        number = int(pr.get("number") or 0)
+        head = str(pr.get("headRefOid") or "")
+        labels = _pr_window_labels(pr)
+        active_now = cfg.label_active in labels
+        blocked_now = cfg.label_blocked in labels and not active_now
+        window_full = selected >= cfg.max_active
+        needs_merge_state = active_now or not window_full
         # A cache hit costs no API call, so it costs no detail budget
         # either: the budget exists to bound this tick's GitHub traffic, and
         # a PR whose head has not moved since the last tick generates none.

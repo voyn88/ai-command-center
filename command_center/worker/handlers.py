@@ -747,15 +747,24 @@ def _run_agent(
                     repository, pr_number=request.review_head_pr_number
                 )
                 if not ok:
+                    # Source-mirror lag / EROFS / fetch substrate — not a
+                    # fact about the task. Refund the attempt
+                    # (VOYN-W0-AICC-REVIEW-SOURCE-REFRESH-EROFS-KILLS-ALL-REVIEWS).
                     return HandlerOutcome(
-                        ok=False, reason=failure or "?", retryable=True
+                        ok=False,
+                        reason=failure or "?",
+                        retryable=True,
+                        infra_wait=True,
                     )
                 checkout, failure, retryable = _read_only_isolated_checkout(
                     repository, pin_sha=request.review_head_sha
                 )
                 if checkout is None:
                     return HandlerOutcome(
-                        ok=False, reason=failure or "?", retryable=retryable
+                        ok=False,
+                        reason=failure or "?",
+                        retryable=retryable,
+                        infra_wait=retryable,
                     )
                 stack.callback(_remove_read_only_isolated_checkout, checkout)
                 run_repository = checkout
@@ -782,11 +791,19 @@ def _run_agent(
             # shared clone cannot be handed to the launcher.
             ok, failure = _refresh_read_only_source(repository)
             if not ok:
-                return HandlerOutcome(ok=False, reason=failure or "?", retryable=True)
+                return HandlerOutcome(
+                    ok=False,
+                    reason=failure or "?",
+                    retryable=True,
+                    infra_wait=True,
+                )
             checkout, failure, retryable = _read_only_isolated_checkout(repository)
             if checkout is None:
                 return HandlerOutcome(
-                    ok=False, reason=failure or "?", retryable=retryable
+                    ok=False,
+                    reason=failure or "?",
+                    retryable=retryable,
+                    infra_wait=retryable,
                 )
             stack.callback(_remove_read_only_isolated_checkout, checkout)
             run_repository = checkout

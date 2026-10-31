@@ -2057,7 +2057,7 @@ def test_read_only_source_refresh_failure_is_retryable_before_attempt(
 
     outcome = run_agent(_payload(task_type="review", untrusted=True), _event())
 
-    assert not outcome.ok and outcome.retryable
+    assert not outcome.ok and outcome.retryable and outcome.infra_wait
     assert "source clone fetch failed" in outcome.reason
     assert runs == []
 
