@@ -1,0 +1,12 @@
+[Unit]
+Description=Mint the GitHub App installation token for the AICC fleet lanes
+Documentation=file:///opt/aicc/current/ops/aicc_github_app_token.py
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# App and installation ids are host configuration (deploy/aicc/github-app.env);
+# the private key is root-only host state the owner places by hand.
+EnvironmentFile=/etc/aicc/github-app.env
+ExecStart=/usr/local/sbin/aicc-github-app-token

@@ -1,0 +1,29 @@
+{
+  "source_run": 32670477010,
+  "default_seconds": 0.15,
+  "durations": {
+    "tests/architecture/test_aios_boundary_fitness.py::test_engine_inventory_matches_frozen_baseline": 8.08,
+    "tests/test_app_streamlit.py::test_create_task_persists_for_every_canonical_project_when_markdown_generation_fails[AICC]": 14.26,
+    "tests/test_app_streamlit.py::test_create_task_persists_for_every_canonical_project_when_markdown_generation_fails[AICOS]": 11.69,
+    "tests/test_app_streamlit.py::test_create_task_persists_for_every_canonical_project_when_markdown_generation_fails[AIOS]": 13.85,
+    "tests/test_app_streamlit.py::test_create_task_persists_for_every_canonical_project_when_markdown_generation_fails[AML]": 13.94,
+    "tests/test_app_streamlit.py::test_create_task_persists_for_every_canonical_project_when_markdown_generation_fails[BANK]": 13.75,
+    "tests/test_app_streamlit.py::test_create_task_persists_for_every_canonical_project_when_markdown_generation_fails[BUSINESS]": 14.77,
+    "tests/test_app_streamlit.py::test_create_task_persists_for_every_canonical_project_when_markdown_generation_fails[ECOSYSTEM]": 13.53,
+    "tests/test_app_streamlit.py::test_create_task_persists_for_every_canonical_project_when_markdown_generation_fails[ESF]": 13.74,
+    "tests/test_app_streamlit.py::test_create_task_persists_for_every_canonical_project_when_markdown_generation_fails[LEGAL]": 14.0,
+    "tests/test_app_streamlit.py::test_create_task_persists_for_every_canonical_project_when_markdown_generation_fails[PERSONAL]": 13.52,
+    "tests/test_app_streamlit.py::test_create_task_persists_for_every_canonical_project_when_markdown_generation_fails[PRODUCT]": 13.57,
+    "tests/test_app_streamlit.py::test_launcher_requires_a_separate_ack_for_dirty_tree_and_branch_mismatch": 29.72,
+    "tests/test_app_streamlit.py::test_launcher_forgets_previous_acknowledgements_when_reopened": 20.43,
+    "tests/test_app_streamlit.py::test_kanban_task_delete_requires_explicit_confirmation": 16.51,
+    "tests/test_board_user_journey.py::test_create_task_from_console_then_it_appears_and_launches": 18.88,
+    "tests/test_execution_center_ui.py::test_cancelled_status_eventually_displayed": 35.78,
+    "tests/test_execution_center_ui.py::test_cancel_requires_confirmation_before_calling_api": 34.23,
+    "tests/test_execution_center_ui.py::test_sensitive_launch_accepted_with_confirmation": 24.45,
+    "tests/test_execution_center_ui.py::test_launch_calls_start_run_with_expected_inputs": 20.57,
+    "tests/test_execution_center_ui.py::test_sensitive_launch_blocked_without_extra_confirmation": 20.03,
+    "tests/test_runtime_db.py::test_concurrent_first_time_migration_is_safe_under_a_genuine_barrier_synchronized_race": 13.64,
+    "tests/test_runtime_supervisor.py::test_timeout_escalates_to_sigkill_when_sigterm_ignored": 11.33
+  }
+}

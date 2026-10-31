@@ -198,8 +198,7 @@ def _probe_uncached(executable: str, args: list[str], *, provider_id: str) -> tu
         result = subprocess.run(
             [executable, *args],
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             text=True,
             timeout=5,
             shell=False,
@@ -974,7 +973,7 @@ class OllamaProvider:
         # `ollama list` is the cheapest proof that the local daemon is actually
         # reachable. Without it the binary exists but every run would fail on
         # first token with a connection error.
-        daemon_ok, listing = _probe(executable, ["list"], provider_id=self.id)
+        daemon_ok, _listing = _probe(executable, ["list"], provider_id=self.id)
         if not daemon_ok:
             return ProviderAvailability(
                 self.id,
@@ -1264,8 +1263,11 @@ class CopilotProvider:
         # here, so it cannot honour the untrusted->read-only downgrade the other
         # providers apply. Fail closed rather than grant full, unattended tool
         # access to attacker-influenced (imported) input, unless the operator has
-        # explicitly elevated this task.
-        if untrusted and not operator_elevated:
+        # explicitly elevated this task. The sole exception is the dedicated
+        # independent-review task type: its exact diff is already in the prompt,
+        # and --available-tools= enforces a model-only launch with zero tools.
+        model_only = task_type in agent_runner.MODEL_ONLY_TASK_TYPES
+        if untrusted and not operator_elevated and not model_only:
             raise RuntimeError(
                 "Copilot cannot run an untrusted (imported) task: it has no "
                 "read-only tool mode, so it fails closed instead of granting "
@@ -1289,9 +1291,12 @@ class CopilotProvider:
             "--no-remote-export",
             "--no-custom-instructions",
             "--disable-builtin-mcps",
-            "--allow-all-tools",
             "-C", str(repository_path),
         ]
+        if model_only:
+            argv.append("--available-tools=")
+        else:
+            argv.append("--allow-all-tools")
         if model:
             argv.extend(["--model", model])
 

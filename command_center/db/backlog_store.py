@@ -19,6 +19,7 @@ exactly what the no-substring rule forbids acting on; edges enter through
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -87,10 +88,62 @@ class BacklogStore:
         )
         return bool(ok), str(reason or ""), revision
 
+    def resume_deferred(self, task_id: str) -> tuple[bool, str, int | None]:
+        """DEFER_TO_USER -> OPEN through the 0014 machine gate: granted only
+        for a task whose latest park was a technical `cascade_exhausted:%`
+        return_to_pool, within the bounded resume budget. Owner-decision
+        parks and machine-evidence-free parks come back as refusals
+        (`owner_decision_park` / `no_machine_park_evidence`), audited."""
+        ok, reason, revision = self._row(
+            "SELECT * FROM backlog_resume_deferred(%s)", (task_id,)
+        )
+        return bool(ok), str(reason or ""), revision
+
+    def recover_stuck_ready_to_review(self, task_id: str) -> tuple[bool, str, int | None]:
+        """READY_TO_REVIEW -> OPEN through the 0018 machine gate: granted only
+        for a task that is currently READY_TO_REVIEW with NO `pr` evidence on
+        record -- the stuck state a completed-but-unpublished run (0011) or
+        any future bug in the same corner could leave behind, invisible to
+        both `backlog_transition` (no READY_TO_REVIEW -> OPEN adjacency) and
+        `backlog_return_to_pool` (IN_PROGRESS only). A task with `pr`
+        evidence already recorded is refused (`has_pr_evidence`) and left to
+        the real review/merge path."""
+        ok, reason, revision = self._row(
+            "SELECT * FROM backlog_recover_stuck_ready_to_review(%s)", (task_id,)
+        )
+        return bool(ok), str(reason or ""), revision
+
+    def record_provenance(
+        self, task_id: str, source: str, detail: dict[str, Any] | None = None
+    ) -> bool:
+        """Audit WHERE a record came from -- a thin append to ``backlog_event``
+        so an operator can answer "was this migrated, and from where" by
+        reading ``list_events`` instead of guessing from timestamps."""
+        row = self._row(
+            "SELECT backlog_record_provenance(%s, %s, %s)",
+            (task_id, source, json.dumps(detail) if detail is not None else None),
+        )
+        return bool(row[0])
+
     def record_evidence(self, task_id: str, kind: str, value: str) -> tuple[bool, str]:
         ok, reason, _revision = self._row(
             "SELECT * FROM backlog_record_evidence(%s, %s, %s)",
             (task_id, kind, value),
+        )
+        return bool(ok), str(reason or "")
+
+    def record_remediation(
+        self, task_id: str, parent_task_id: str, pr_url: str, rejected_head_sha: str
+    ) -> tuple[bool, str]:
+        """Link a freshly-created remediation task to the rejected task it
+        follows up on. Audit lineage, not a readiness gate -- unlike
+        `add_dependency`, this never affects when the planner may dispatch
+        `task_id` (0010's rationale: the parent is REJECTED, a terminal leaf
+        that can never become DONE, so a readiness dependency on it would
+        block the remediation task forever)."""
+        ok, reason, _revision = self._row(
+            "SELECT * FROM backlog_record_remediation(%s, %s, %s, %s)",
+            (task_id, parent_task_id, pr_url, rejected_head_sha),
         )
         return bool(ok), str(reason or "")
 
@@ -231,7 +284,14 @@ class BacklogStore:
         """Reconcile the Markdown projection. Idempotent by construction:
         ``backlog_upsert_task`` reports ``changed=false`` for an identical
         record, so a second run over the same text yields ``changed == 0`` —
-        measurable, not hoped for."""
+        measurable, not hoped for.
+
+        Every newly-inserted row is stamped with its provenance (the
+        migration gate's "existing records migrated with provenance"
+        acceptance criterion): the Markdown line it was read from, recorded
+        once, at the moment the row is created. A later re-import of the
+        same task updates the row through this same path but never restamps
+        it — the row was migrated once, not once per import run."""
         parsed = parse_backlog(text)
         report = ImportReport(unparsed=list(parsed.unparsed))
         for task in parsed.tasks:
@@ -242,6 +302,9 @@ class BacklogStore:
                 report.unchanged += 1
             elif reason == "inserted":
                 report.inserted += 1
+                self.record_provenance(
+                    task.task_id, "markdown_import", {"line_no": task.line_no}
+                )
             else:
                 report.updated += 1
         return report

@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>AICCGatewayPinB64</key>
+	<string>$(AICC_GATEWAY_PIN_B64)</string>
+	<key>AICCServerURL</key>
+	<string>$(AICC_SERVER_URL)</string>
+	<key>CFBundleDisplayName</key>
+	<string>AICC</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>AICC подключается к вашему серверу AICC в локальной сети, чтобы показывать состояние задач.</string>
+</dict>
+</plist>

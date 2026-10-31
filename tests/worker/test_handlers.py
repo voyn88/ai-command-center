@@ -7,16 +7,20 @@ from __future__ import annotations
 import json
 import os
 import socket
+import subprocess
+import sys
 import threading
-from datetime import datetime, timedelta, timezone
+from contextlib import nullcontext
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
-from command_center import agent_runner
+from command_center import agent_runner, workspace_provisioning
 from command_center.orchestrator.publish import PublishResult
 from command_center.worker.handlers import build_handlers
-from command_center.worker.payloads import parse_agent_run, PayloadError
+from command_center.worker.payloads import PayloadError, parse_agent_run
 
 
 def _payload(**overrides):
@@ -37,13 +41,51 @@ def _event() -> threading.Event:
     return threading.Event()
 
 
+def isolated_path(repository: Path, backlog_task: str = "proj") -> Path:
+    """The isolated worktree path `_run_agent` derives for a mutating
+    dispatch of `repository`/`backlog_task` -- mirrors
+    `handlers._isolated_workspace_path` (`<repo>-worktrees/backlog-<task>`)
+    so a test can predict where the lease gate and provisioning will look
+    without importing the private helper itself."""
+    return workspace_provisioning.task_workspace_path(
+        repository, f"backlog/{backlog_task}"
+    )
+
+
+@dataclass(frozen=True)
+class _FakeEvidence:
+    workspace_path: str
+    expected_branch: str
+    remote_url: str
+    start_sha: str
+    base_sha: str
+    remote_task_sha: str | None
+    workspace_device: int
+    workspace_inode: int
+    provision_outcome: str
+
+
 @pytest.fixture
 def handler(monkeypatch, tmp_path):
-    """The agent_run handler with every external seam faked to succeed."""
+    """The agent_run handler with every external seam faked to succeed.
+
+    Workspace provisioning is faked too, at the same seam level as
+    `run_claude_code`: these are generic outcome-discipline tests, not
+    isolation tests, and a real `git worktree add` would need an actual
+    repository under `tmp_path` for every one of them. The fake hands back
+    exactly the path `_run_agent` asked for (`spec.workspace_path`), so the
+    dispatch flow -- including which path reaches `run_claude_code` and the
+    lease gate -- is unchanged from a real provision; only the git mutation
+    itself is skipped. Real provisioning end-to-end (a real repo, a real
+    worktree, real cleanup) is exercised separately in
+    `test_isolated_workspace.py`.
+    """
     monkeypatch.setattr(
         agent_runner, "validate_repository", lambda project_id, path: tmp_path
     )
-    monkeypatch.setattr(agent_runner, "claude_cli_preflight", lambda: (True, "ok"))
+    monkeypatch.setattr(
+        agent_runner, "claude_cli_preflight", lambda binary=None: (True, "ok")
+    )
     runs: list[dict] = []
 
     def fake_run(**kwargs):
@@ -59,6 +101,47 @@ def handler(monkeypatch, tmp_path):
         )
 
     monkeypatch.setattr(agent_runner, "run_claude_code", fake_run)
+    monkeypatch.setattr(
+        workspace_provisioning,
+        "provision_and_verify",
+        lambda spec: _FakeEvidence(
+            workspace_path=spec.workspace_path,
+            expected_branch=spec.expected_branch or "",
+            remote_url=str(tmp_path),
+            start_sha="0" * 40,
+            base_sha="0" * 40,
+            remote_task_sha=None,
+            workspace_device=1,
+            workspace_inode=1,
+            provision_outcome="cloned",
+        ),
+    )
+    monkeypatch.setattr(
+        workspace_provisioning,
+        "trusted_publish_clone",
+        lambda workspace, **kwargs: nullcontext(Path(workspace)),
+    )
+    monkeypatch.setattr(
+        workspace_provisioning,
+        "task_workspace_candidate_sha",
+        lambda workspace, **kwargs: "0" * 40,
+    )
+    monkeypatch.setattr(
+        workspace_provisioning,
+        "checkpoint_dirty_task_workspace",
+        lambda workspace, **kwargs: ("0" * 40, False),
+    )
+    monkeypatch.setattr(
+        workspace_provisioning,
+        "checkpoint_task_workspace",
+        lambda workspace, **kwargs: kwargs["previous_start_sha"],
+    )
+    monkeypatch.setattr(
+        workspace_provisioning, "task_workspace_is_unchanged", lambda *a, **kw: True
+    )
+    monkeypatch.setattr(
+        workspace_provisioning, "remove_workspace", lambda *a, **kw: "removed"
+    )
     # The writer-lease gate is a real external seam: it shells out to the
     # lease tool whenever VOYN_LEASE_DSN names an authority, and this host
     # has one. Unset it here so the default fixture stays hermetic -- the
@@ -78,9 +161,7 @@ def lease_tool(monkeypatch, tmp_path):
     def install(stdout: str = "[]", exit_code: int = 0):
         binary = tmp_path / "fake-voyn-lease"
         binary.write_text(
-            "#!/bin/sh\n"
-            f"cat <<'JSON'\n{stdout}\nJSON\n"
-            f"exit {exit_code}\n"
+            f"#!/bin/sh\ncat <<'JSON'\n{stdout}\nJSON\nexit {exit_code}\n"
         )
         binary.chmod(0o755)
         monkeypatch.setenv("VOYN_LEASE_TOOL", str(binary))
@@ -98,9 +179,7 @@ def _lease_row(worktree, **overrides) -> str:
         "session_id": "sess-1",
         "worktree": str(worktree),
         "process_pid": 4242,
-        "expires_at": (
-            datetime.now(timezone.utc) + timedelta(minutes=5)
-        ).isoformat(),
+        "expires_at": (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
     }
     row.update(overrides)
     return json.dumps([row])
@@ -121,9 +200,11 @@ def test_missing_fields_are_named() -> None:
     assert "project_id" in error.reason and "prompt" in error.reason
 
 
-def test_timeout_beyond_visibility_ceiling_is_refused() -> None:
+def test_timeout_beyond_agent_run_ceiling_is_refused() -> None:
     error = parse_agent_run(_payload(timeout_seconds=3601))
     assert isinstance(error, PayloadError) and "3600" in error.reason
+    assert "agent_runner" in error.reason and "run-length ceiling" in error.reason
+    assert "queue" not in error.reason and "visibility" not in error.reason
     assert isinstance(parse_agent_run(_payload(timeout_seconds=True)), PayloadError)
 
 
@@ -186,6 +267,644 @@ def test_runner_never_started_is_retryable(handler, monkeypatch) -> None:
     assert not outcome.ok and outcome.retryable
 
 
+def test_principal_isolation_failure_is_retryable_not_a_task_result(
+    handler, monkeypatch, tmp_path
+) -> None:
+    run_agent, _ = handler
+    removed: list[tuple] = []
+    monkeypatch.setattr(
+        workspace_provisioning,
+        "remove_workspace",
+        lambda *args, **kwargs: removed.append(args),
+    )
+
+    def launcher_refused(**kwargs):
+        return agent_runner.RunResult(
+            status="failed",
+            exit_code=125,
+            stdout="",
+            stderr="AICC_AGENT_LAUNCH_INFRA_FAILURE: launcher socket unavailable",
+            duration_seconds=0.1,
+            started_at="2026-08-24T00:00:00+00:00",
+            completed_at="2026-08-24T00:00:00+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", launcher_refused)
+    outcome = run_agent(
+        _payload(
+            task_type="implementation",
+            repository_path=str(tmp_path / "repo"),
+        ),
+        _event(),
+        1,
+    )
+    assert not outcome.ok
+    assert outcome.retryable
+    assert "agent principal isolation" in outcome.reason
+    assert not removed, "ambiguous launcher failure must preserve task-local work"
+
+
+def test_successful_review_may_quote_principal_failure_marker(
+    handler, monkeypatch
+) -> None:
+    """Reviewing launcher code must not make its literal look like transport failure."""
+    run_agent, _ = handler
+
+    def accepted_review(**kwargs):
+        return agent_runner.RunResult(
+            status="completed",
+            exit_code=0,
+            stdout=json.dumps(
+                {
+                    "result": (
+                        "The diff contains AICC_AGENT_LAUNCH_INFRA_FAILURE: "
+                        "as data.\nVERDICT: ACCEPT\nHEAD_SHA: " + "a" * 40
+                    )
+                }
+            ),
+            stderr="model trace quoted AICC_AGENT_LAUNCH_INFRA_FAILURE: data",
+            duration_seconds=0.1,
+            started_at="2026-08-29T00:00:00+00:00",
+            completed_at="2026-08-29T00:00:00+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", accepted_review)
+
+    outcome = run_agent(_payload(task_type="independent_review"), _event(), 1)
+
+    assert outcome.ok
+    assert outcome.result["status"] == "completed"
+    assert outcome.result["head_sha"] == "a" * 40
+
+
+def test_failed_copilot_independent_review_is_retryable_infrastructure(
+    handler, monkeypatch
+) -> None:
+    run_agent, _ = handler
+
+    def failed_copilot(**kwargs):
+        return agent_runner.RunResult(
+            status="failed",
+            exit_code=1,
+            stdout="",
+            stderr="Error: No authentication information found",
+            duration_seconds=0.1,
+            started_at="2026-08-29T00:00:00+00:00",
+            completed_at="2026-08-29T00:00:00+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", failed_copilot)
+    outcome = run_agent(
+        _payload(
+            task_type="independent_review",
+            cascade=[
+                {
+                    "executor": "copilot",
+                    "task_type": "independent_review",
+                    "capability": "model_only",
+                }
+            ],
+        ),
+        _event(),
+        1,
+    )
+
+    assert not outcome.ok
+    assert outcome.retryable
+    assert "provider/auth/quota" in outcome.reason
+
+
+def test_api_error_in_cli_output_is_retryable_not_a_success(
+    handler, monkeypatch
+) -> None:
+    """Incident 2026-08-21 16:09 UTC (control-01/worker-01): a shared
+    Claude-CLI account hit its session/rate limit mid-fleet. The process
+    still started and exited non-zero *with* stdout, so the pre-existing
+    "process never started" check (`exit_code is None and not stdout`) never
+    fired and the run fell through to `ok=True` -- an infrastructure failure
+    recorded as a genuine task success, so it was never retried. 142 backlog
+    tasks cascade-exhausted their retry budget from this exact payload,
+    captured verbatim from the live incident DB."""
+    run_agent, _ = handler
+
+    rate_limited_stdout = json.dumps(
+        {
+            "is_error": True,
+            "duration_api_ms": 0,
+            "num_turns": 1,
+            "stop_reason": "stop_sequence",
+            "total_cost_usd": 0,
+            "usage": {
+                "input_tokens": 4,
+                "output_tokens": 12,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+            },
+            "terminal_reason": "api_error",
+            "fast_mode_disabled_reason": "sdk_opt_in_required",
+            "subtype": "success",
+            "api_error_status": 429,
+            "result": "You've hit your session limit · resets 4:10pm (UTC)",
+            "type": "result",
+            "duration_ms": 410,
+            "uuid": "6f1c9c2e-6b1a-4b0a-9b7e-1f2c3d4e5f60",
+        }
+    )
+
+    def rate_limited(**kwargs):
+        return agent_runner.RunResult(
+            status="failed",
+            exit_code=1,
+            stdout=rate_limited_stdout,
+            stderr="",
+            duration_seconds=0.41,
+            started_at="2026-08-21T16:09:00+00:00",
+            completed_at="2026-08-21T16:09:00+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", rate_limited)
+    outcome = run_agent(_payload(), _event(), 1)
+    assert not outcome.ok
+    assert outcome.retryable
+    assert outcome.infra_wait
+    assert "executor infrastructure failure" in outcome.reason
+    assert "session limit" in outcome.reason
+
+
+def test_bwrap_loopback_result_is_retryable_infrastructure_failure(
+    handler, monkeypatch
+):
+    run_agent, _runs = handler
+    payload = _cascade_payload()
+    payload["task_type"] = "implementation"
+    payload["cascade"] = [
+        {"executor": "codex", "task_type": "implementation"},
+        {"executor": "claude", "task_type": "implementation"},
+    ]
+    monkeypatch.setattr(
+        agent_runner, "_codex_workspace_write_preflight_result", (True, "")
+    )
+
+    seen = []
+
+    def bwrap_then_fallback(**kwargs):
+        seen.append(kwargs["executor"])
+        if kwargs["executor"] == "codex":
+            return agent_runner.RunResult(
+                status="failed",
+                exit_code=0,
+                stdout="",
+                stderr="bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted",
+                duration_seconds=0.01,
+                started_at="2026-08-23T12:00:00+00:00",
+                completed_at="2026-08-23T12:00:01+00:00",
+            )
+        return agent_runner.RunResult(
+            status="completed",
+            exit_code=0,
+            stdout='{"result": "fallback done"}',
+            stderr="",
+            duration_seconds=0.01,
+            started_at="2026-08-23T12:00:02+00:00",
+            completed_at="2026-08-23T12:00:03+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", bwrap_then_fallback)
+    outcome = run_agent(payload, _event(), 1)
+    assert outcome.ok
+    assert outcome.result["cascade_step"] == 2
+    assert seen == ["codex", payload["cascade"][1]["executor"]]
+    assert outcome.result["route_failovers"] == [
+        {
+            "cascade_step": 1,
+            "executor": "codex",
+            "reason": "codex_workspace_sandbox",
+        }
+    ]
+    assert agent_runner.codex_workspace_write_preflight()[0] is False
+
+
+def test_codex_workspace_preflight_skips_to_fallback_without_spending_attempt(
+    handler, monkeypatch
+):
+    run_agent, runs = handler
+    payload = _cascade_payload()
+    payload["task_type"] = "implementation"
+    payload["cascade"] = [
+        {"executor": "codex", "task_type": "implementation"},
+        {"executor": "claude", "task_type": "implementation"},
+    ]
+    monkeypatch.setattr(
+        agent_runner, "codex_workspace_write_preflight", lambda: (False, "bwrap")
+    )
+    outcome = run_agent(payload, _event(), 1)
+    assert outcome.ok
+    assert outcome.result["cascade_step"] == 2
+    assert runs[0]["executor"] == payload["cascade"][1]["executor"]
+
+
+def test_copilot_preflight_checks_the_copilot_binary(handler, monkeypatch):
+    run_agent, runs = handler
+    checked = []
+
+    def preflight(binary=None):
+        checked.append(binary)
+        return False, "not logged in"
+
+    monkeypatch.setattr(agent_runner, "claude_cli_preflight", preflight)
+    payload = _cascade_payload()
+    payload["cascade"][0] = {"executor": "copilot", "task_type": "review"}
+    outcome = run_agent(payload, _event(), 1)
+    assert not outcome.ok and outcome.retryable
+    # The unavailable copilot no longer dead-ends the attempt: the cascade
+    # falls through to the remaining links (review finding on b311666), so
+    # the copilot binary is probed FIRST and the terminal reason belongs to
+    # the last exhausted candidate.
+    # Pin the WHOLE probe sequence, not just the first link: copilot is tried
+    # first, then the one remaining claude candidate (default binary), and the
+    # cascade neither stops early nor probes anything extra.
+    assert checked == [agent_runner.COPILOT_BINARY, None]
+    # The terminal reason must belong to the LAST exhausted candidate (claude),
+    # not the copilot link that merely started the cascade.
+    assert "claude cli unavailable" in outcome.reason
+    assert runs == []
+
+
+@pytest.mark.parametrize(
+    "diagnostic",
+    [
+        "AI credit usage limit reached",
+        "not logged in; authentication required",
+        "service unavailable",
+        "network error: connection refused",
+    ],
+)
+def test_copilot_provider_failure_switches_inside_the_same_attempt(
+    handler, monkeypatch, diagnostic
+):
+    run_agent, runs = handler
+
+    def failed_copilot(**kwargs):
+        if kwargs["executor"] == "copilot":
+            return agent_runner.RunResult(
+                status="failed",
+                exit_code=4,
+                stdout="",
+                stderr=diagnostic,
+                duration_seconds=0.1,
+                started_at="2026-08-23T12:00:00+00:00",
+                completed_at="2026-08-23T12:00:01+00:00",
+            )
+        runs.append(kwargs)
+        return agent_runner.RunResult(
+            status="completed",
+            exit_code=0,
+            stdout='{"result": "done"}',
+            stderr="",
+            duration_seconds=0.1,
+            started_at="2026-08-23T12:00:01+00:00",
+            completed_at="2026-08-23T12:00:02+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", failed_copilot)
+    payload = _cascade_payload()
+    payload["cascade"] = [
+        {"executor": "copilot", "task_type": "review"},
+        {"executor": "claude", "task_type": "review"},
+    ]
+    outcome = run_agent(payload, _event(), 1)
+
+    assert outcome.ok
+    assert runs[-1]["executor"] == "claude"
+    assert outcome.result["cascade_step"] == 2
+    assert outcome.result["route_failovers"] == [
+        {
+            "cascade_step": 1,
+            "executor": "copilot",
+            "reason": "provider_auth_or_quota",
+        }
+    ]
+
+
+@pytest.mark.parametrize("task_type,executor,model", [
+    ("review", "cursor", "auto"),
+    ("independent_review", "grok", "grok-4.3"),
+])
+def test_owner_alternatives_preserve_review_capability_and_replace_old_model(
+    handler, monkeypatch, task_type, executor, model
+):
+    run_agent, runs = handler
+    monkeypatch.setenv("AICC_EXECUTOR_PROFILE", "owner-alternatives")
+    payload = _payload(task_type=task_type, model="claude-old-model", cascade=[
+        {"executor": "claude", "task_type": task_type},
+    ])
+    run_agent(payload, _event(), 1)
+    assert len(runs) == 1
+    assert runs[0]["executor"] == executor
+    assert runs[0]["model"] == model
+    assert runs[0]["task_type"] == task_type
+
+
+def test_alternative_quota_refusal_is_not_repeated_by_the_next_task(handler, monkeypatch):
+    run_agent, _ = handler
+    monkeypatch.setenv("AICC_EXECUTOR_PROFILE", "owner-alternatives")
+    called = []
+    def run(**kwargs):
+        executor = kwargs["executor"]
+        called.append(executor)
+        return agent_runner.RunResult(
+            status="failed" if executor == "cursor" else "completed",
+            exit_code=1 if executor == "cursor" else 0,
+            stdout="" if executor == "cursor" else '{"result":"done"}',
+            stderr="usage limit reached" if executor == "cursor" else "",
+            duration_seconds=0.1, started_at="t0", completed_at="t1",
+        )
+    monkeypatch.setattr(agent_runner, "run_claude_code", run)
+    assert run_agent(_payload(), _event(), 1).ok
+    assert run_agent(_payload(), _event(), 1).ok
+    assert called == ["cursor", "grok", "grok"]
+
+
+def test_exhausted_alternatives_wait_without_launching_models(handler, monkeypatch):
+    run_agent, runs = handler
+    monkeypatch.setenv("AICC_EXECUTOR_PROFILE", "owner-alternatives")
+    agent_runner.record_executor_exhausted("cursor")
+    agent_runner.record_executor_exhausted("grok")
+    outcome = run_agent(_payload(), _event(), 1)
+    assert not outcome.ok and outcome.infra_wait
+    assert "quota exhausted" in outcome.reason
+    assert runs == []
+
+
+def test_codex_usage_limit_switches_inside_the_same_attempt(handler, monkeypatch):
+    """Live 2026-09-11: Codex quota used to complete the review as succeeded
+    with an empty result. It must failover like Copilot, not publish."""
+    run_agent, runs = handler
+
+    def failed_codex(**kwargs):
+        if kwargs["executor"] == "codex":
+            return agent_runner.RunResult(
+                status="failed",
+                exit_code=1,
+                stdout="",
+                stderr=(
+                    "ERROR: You've hit your usage limit. Visit "
+                    "https://chatgpt.com/codex/settings/usage to purchase more "
+                    "credits or try again at Sep 15th, 2026 1:24 AM."
+                ),
+                duration_seconds=0.1,
+                started_at="2026-09-11T12:00:00+00:00",
+                completed_at="2026-09-11T12:00:03+00:00",
+            )
+        runs.append(kwargs)
+        return agent_runner.RunResult(
+            status="completed",
+            exit_code=0,
+            stdout='{"result": "done"}',
+            stderr="",
+            duration_seconds=0.1,
+            started_at="2026-09-11T12:00:03+00:00",
+            completed_at="2026-09-11T12:00:04+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", failed_codex)
+    payload = _cascade_payload()
+    payload["cascade"] = [
+        {"executor": "codex", "task_type": "review"},
+        {"executor": "claude", "task_type": "review"},
+    ]
+    outcome = run_agent(payload, _event(), 1)
+
+    assert outcome.ok
+    assert runs[-1]["executor"] == "claude"
+    assert outcome.result["cascade_step"] == 2
+    assert outcome.result["route_failovers"] == [
+        {
+            "cascade_step": 1,
+            "executor": "codex",
+            "reason": "provider_auth_or_quota",
+        }
+    ]
+
+
+def test_codex_usage_limit_on_the_last_link_is_infra_not_success(handler, monkeypatch):
+    run_agent, runs = handler
+
+    def failed_codex(**kwargs):
+        runs.append(kwargs)
+        return agent_runner.RunResult(
+            status="failed",
+            exit_code=1,
+            stdout="",
+            stderr=(
+                "ERROR: You've hit your usage limit. Visit "
+                "https://chatgpt.com/codex/settings/usage to purchase more "
+                "credits or try again at Sep 15th, 2026 1:24 AM."
+            ),
+            duration_seconds=0.1,
+            started_at="2026-09-11T12:00:00+00:00",
+            completed_at="2026-09-11T12:00:03+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", failed_codex)
+    payload = _cascade_payload()
+    payload["cascade"] = [{"executor": "codex", "task_type": "review"}]
+    outcome = run_agent(payload, _event(), 1)
+
+    assert not outcome.ok and outcome.retryable and outcome.infra_wait
+    assert [run["executor"] for run in runs] == ["codex"]
+    assert "provider/auth/quota" in outcome.reason
+
+
+@pytest.mark.parametrize("workspace_unchanged", [True, False])
+def test_mutating_provider_failover_requires_unchanged_workspace(
+    handler, monkeypatch, workspace_unchanged
+):
+    run_agent, runs = handler
+    monkeypatch.setattr(
+        workspace_provisioning,
+        "task_workspace_is_unchanged",
+        lambda *args, **kwargs: workspace_unchanged,
+    )
+
+    def quota_then_success(**kwargs):
+        runs.append(kwargs)
+        if kwargs["executor"] == "copilot":
+            return agent_runner.RunResult(
+                status="failed",
+                exit_code=4,
+                stdout="",
+                stderr="AI credit usage limit reached",
+                duration_seconds=0.1,
+                started_at="2026-08-23T12:00:00+00:00",
+                completed_at="2026-08-23T12:00:01+00:00",
+            )
+        return agent_runner.RunResult(
+            status="completed",
+            exit_code=0,
+            stdout='{"result": "done"}',
+            stderr="",
+            duration_seconds=0.1,
+            started_at="2026-08-23T12:00:01+00:00",
+            completed_at="2026-08-23T12:00:02+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", quota_then_success)
+    payload = _cascade_payload()
+    payload["task_type"] = "implementation"
+    payload["cascade"] = [
+        {"executor": "copilot", "task_type": "implementation"},
+        {"executor": "claude", "task_type": "implementation"},
+    ]
+
+    outcome = run_agent(payload, _event(), 1)
+
+    if workspace_unchanged:
+        assert outcome.ok
+        assert [run["executor"] for run in runs] == ["copilot", "claude"]
+        assert outcome.result["cascade_step"] == 2
+    else:
+        assert not outcome.ok and outcome.retryable
+        assert [run["executor"] for run in runs] == ["copilot"]
+        assert "provider/auth/quota" in outcome.reason
+
+
+def test_unknown_copilot_failure_switches_for_read_only_review(handler, monkeypatch):
+    run_agent, runs = handler
+
+    def failed_copilot(**kwargs):
+        if kwargs["executor"] != "copilot":
+            runs.append(kwargs)
+            return agent_runner.RunResult(
+                status="completed",
+                exit_code=0,
+                stdout='{"result": "done"}',
+                stderr="",
+                duration_seconds=0.1,
+                started_at="2026-08-23T12:00:01+00:00",
+                completed_at="2026-08-23T12:00:02+00:00",
+            )
+        return agent_runner.RunResult(
+            status="failed",
+            exit_code=9,
+            stdout="",
+            stderr="unexpected provider-side failure",
+            duration_seconds=0.1,
+            started_at="2026-08-23T12:00:00+00:00",
+            completed_at="2026-08-23T12:00:01+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", failed_copilot)
+    payload = _cascade_payload()
+    payload["cascade"][0] = {"executor": "copilot", "task_type": "review"}
+    outcome = run_agent(payload, _event(), 1)
+    assert outcome.ok
+    assert outcome.result["cascade_step"] == 2
+    assert runs[-1]["executor"] == "claude"
+
+
+def test_provider_failover_never_crosses_the_workspace_mutability_boundary(
+    handler, monkeypatch
+):
+    run_agent, runs = handler
+
+    def quota_failure(**kwargs):
+        runs.append(kwargs)
+        return agent_runner.RunResult(
+            status="failed",
+            exit_code=4,
+            stdout="",
+            stderr="AI credit usage limit reached",
+            duration_seconds=0.1,
+            started_at="2026-08-23T12:00:00+00:00",
+            completed_at="2026-08-23T12:00:01+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", quota_failure)
+    payload = _payload(
+        task_type="review",
+        cascade=[
+            {"executor": "copilot", "task_type": "review"},
+            {"executor": "claude", "task_type": "implementation"},
+        ],
+    )
+
+    outcome = run_agent(payload, _event(), 1)
+
+    assert not outcome.ok and outcome.retryable
+    assert [run["executor"] for run in runs] == ["copilot"]
+    assert "provider/auth/quota" in outcome.reason
+
+
+def test_genuine_task_failure_with_error_flavoured_text_still_ok(
+    handler, monkeypatch
+) -> None:
+    """Regression guard for the fix above: a run that genuinely executed and
+    the agent's own report happens to mention "error"/"rate limit" in free
+    text -- but the CLI's structured payload carries neither `is_error` nor
+    `terminal_reason: "api_error"` -- must still be `ok=True`, never
+    reclassified as an infrastructure failure. Detection must key off the
+    CLI's own structured signal, not a broad heuristic on `result_text`."""
+    run_agent, _ = handler
+
+    genuinely_failed_stdout = json.dumps(
+        {
+            "is_error": False,
+            "subtype": "success",
+            "type": "result",
+            "result": (
+                "Ran the test suite: 3 failures remain in "
+                "test_rate_limit_handling.py. Could not resolve the "
+                "underlying error in the time available."
+            ),
+            "num_turns": 14,
+            "duration_ms": 240000,
+            "total_cost_usd": 0.42,
+        }
+    )
+
+    def genuinely_failed(**kwargs):
+        return agent_runner.RunResult(
+            status="failed",
+            exit_code=1,
+            stdout=genuinely_failed_stdout,
+            stderr="pytest exited 1",
+            duration_seconds=240.0,
+            started_at="2026-08-19T12:00:00+00:00",
+            completed_at="2026-08-19T12:04:00+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", genuinely_failed)
+    outcome = run_agent(_payload(), _event(), 1)
+    assert outcome.ok
+    assert outcome.result["status"] == "failed"
+
+
+def test_non_json_stdout_fails_safe_not_misclassified(handler, monkeypatch) -> None:
+    """`run.stdout` isn't always pure JSON (e.g. a stream-json/NDJSON shape,
+    or plain text). When it can't be positively parsed as the CLI's
+    structured result object, the new detection must never trigger as a
+    fallback default -- only a confirmed signal is retryable, per
+    `agent_runner._parse_cli_result_payload`'s fail-safe contract."""
+    run_agent, _ = handler
+
+    def not_json(**kwargs):
+        return agent_runner.RunResult(
+            status="failed",
+            exit_code=1,
+            stdout="Error: rate limit api_error 429\nsomething went wrong",
+            stderr="",
+            duration_seconds=1.0,
+            started_at="2026-08-19T12:00:00+00:00",
+            completed_at="2026-08-19T12:00:01+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", not_json)
+    outcome = run_agent(_payload(), _event(), 1)
+    assert outcome.ok
+    assert outcome.result["status"] == "failed"
+
+
 def test_untrusted_mutating_task_is_refused_not_downgraded(handler) -> None:
     """Audit D7 at the queue boundary: refusal with the reason named, not a
     silent read-only downgrade that half-executes and looks completed."""
@@ -213,6 +932,68 @@ def test_lease_lost_before_execution_refuses_to_start(handler) -> None:
     lost.set()
     outcome = run_agent(_payload(), lost)
     assert not outcome.ok and outcome.retryable and runs == []
+
+
+def test_run_claude_code_receives_lease_lost_as_cancel_event(handler) -> None:
+    """VOYN-W0-AICC-FORCED-AGENT-CANCELLATION: the same `lease_lost` event
+    checked once before the subprocess starts must also reach the runner as
+    `cancel_event`, so a lease lost mid-run can actually stop it — not just
+    be noticed once it exits on its own."""
+    run_agent, runs = handler
+    event = _event()
+    run_agent(_payload(), event, 1)
+    assert len(runs) == 1
+    assert runs[0]["cancel_event"] is event
+
+
+def test_lease_lost_mid_run_discards_outcome_and_never_publishes(
+    handler, monkeypatch
+) -> None:
+    """VOYN-W0-AICC-FORCED-AGENT-CANCELLATION requirement 3b: a lease that
+    dies WHILE the agent is running (not just before it starts) must not let
+    the same attempt's outcome reach `publish_run` (a real `git push` + PR
+    create) or be reported as ok. `run_claude_code` itself does not return
+    until the process group is confirmed terminated (see
+    `agent_runner._terminate_process_group`); this test fakes that return
+    with `status="cancelled"` and the event already set — the shape a real
+    mid-run cancellation leaves behind — and asserts the handler treats it as
+    unaccountable rather than a completed run worth publishing."""
+    import command_center.worker.handlers as handlers_module
+
+    run_agent, _runs = handler
+    monkeypatch.setenv("AICC_PUBLISH_DEPLOY_KEY", "/dev/null")
+    publish_calls: list = []
+
+    def fake_publish(repository, cfg):
+        publish_calls.append(cfg)
+        return PublishResult(ok=True, branch=f"backlog/{cfg.task}")
+
+    monkeypatch.setattr(handlers_module, "publish_run", fake_publish)
+
+    event = _event()
+
+    def cancelled_run(**kwargs):
+        # Simulate the daemon's heartbeat thread setting `lease_lost` while
+        # the subprocess was still in flight -- by the time `run_claude_code`
+        # returns, cancellation has already been confirmed.
+        event.set()
+        return agent_runner.RunResult(
+            status="cancelled",
+            exit_code=None,
+            stdout="",
+            stderr="",
+            duration_seconds=3.0,
+            started_at="2026-08-21T12:00:00+00:00",
+            completed_at="2026-08-21T12:00:03+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", cancelled_run)
+
+    outcome = run_agent(_payload(task_type="implementation"), event, 1)
+
+    assert not outcome.ok
+    assert outcome.retryable
+    assert publish_calls == []
 
 
 def test_long_output_travels_as_tails(handler, monkeypatch) -> None:
@@ -264,7 +1045,7 @@ def test_every_payload_defect_is_non_retryable() -> None:
     payloads through max_attempts (review finding 2)."""
     defects = [
         _payload(prompt="", project_id=None),  # missing fields
-        _payload(timeout_seconds=7200),  # beyond visibility ceiling
+        _payload(timeout_seconds=7200),  # beyond agent_runner's run-length ceiling
         _payload(model=123),  # wrong type
         _payload(untrusted="yes"),  # wrong type
     ]
@@ -314,28 +1095,86 @@ def test_cascade_second_attempt_takes_the_second_link(handler) -> None:
     assert outcome.result["cascade_step"] == 2
 
 
-def test_cascade_clamps_at_the_tail(handler) -> None:
-    """Past the last link the tail keeps serving until the attempt budget
-    (the cascade's own length, set by the planner) dead-letters the item."""
+def test_cascade_wraps_past_the_tail_instead_of_clamping(handler) -> None:
+    """VOYN-W0-AICC-REDRIVE-CLAMP-RESETS-TO-LAST-LINK: `queue_redrive` widens
+    `max_attempts` without resetting `attempt_count`, so `attempt_no` keeps
+    climbing past the cascade's own length across redrives. Clamping to the
+    last index (the old behaviour) meant every redriven attempt ran the same
+    final link regardless of the cascade's design. Wrapping modulo the
+    cascade length instead means attempt 7 on a 2-link cascade lands back on
+    step 1, not stuck on step 2 forever."""
     run_agent, runs = handler
     outcome = run_agent(_cascade_payload(), _event(), 7)
     assert outcome.ok
-    assert runs[-1]["model"] == "stronger-model"
+    assert runs[-1]["model"] is None
+    assert outcome.result["cascade_step"] == 1
+
+
+def test_redriven_item_with_fresh_attempts_restarts_the_cascade(handler) -> None:
+    """The acceptance case: a 3-link cascade fully exhausted (dead-lettered
+    at attempt_count == max_attempts == 3) and then redriven starts its
+    first fresh attempt (attempt_no 4) back at cascade step 1 -- and its
+    second fresh attempt (attempt_no 5) at step 2 -- rather than clamping
+    every redriven attempt onto the last link."""
+    run_agent, runs = handler
+    payload = _cascade_payload(
+        cascade=[
+            {"executor": "claude", "task_type": "review"},
+            {"executor": "claude", "task_type": "review", "model": "step-2"},
+            {"executor": "claude", "task_type": "review", "model": "step-3"},
+        ]
+    )
+
+    outcome = run_agent(payload, _event(), 4)
+    assert outcome.ok
+    assert runs[-1]["model"] is None
+    assert outcome.result["cascade_step"] == 1
+
+    outcome = run_agent(payload, _event(), 5)
+    assert outcome.ok
+    assert runs[-1]["model"] == "step-2"
+    assert outcome.result["cascade_step"] == 2
 
 
 def test_unavailable_executor_is_a_routing_signal_not_a_task_error(handler) -> None:
     """BO-S2a decision: a link naming an executor this host cannot run is a
     RETRYABLE refusal — the attempt returns to the pool and the next delivery
-    selects the next link. Nothing may have executed."""
+    selects the next link. Nothing may have executed.
+
+    Uses a deliberately never-real name: `codex` used to stand in for
+    "unavailable" here, but it became a genuinely wired executor
+    (VOYN-W0-AICC-EXECUTOR-CODEX), so reusing it would silently invert what
+    this test asserts -- the very kind of stale-example rot that makes a
+    green test meaningless."""
+    run_agent, runs = handler
+    payload = _cascade_payload()
+    payload["cascade"][0]["executor"] = "no-such-executor"
+    outcome = run_agent(payload, _event(), 1)
+    assert not outcome.ok and outcome.retryable is True
+    assert "executor_unavailable" in outcome.reason
+    assert "no-such-executor" in outcome.reason
+    assert runs == [], "an unavailable executor must not execute anything"
+    # The same payload on attempt 2 runs the second (available) link.
+    assert run_agent(payload, _event(), 2).ok
+
+
+def test_a_wired_executor_is_dispatched_under_its_own_name(handler) -> None:
+    """VOYN-W0-AICC-EXECUTOR-CODEX: an executor present in
+    `agent_runner.COMMAND_BUILDERS` must actually RUN (and be recorded as
+    itself in the result), not be refused as unavailable. Without this the
+    escalation link is inert and every task still funnels into the one
+    account whose quota exhaustion this route exists to escape."""
     run_agent, runs = handler
     payload = _cascade_payload()
     payload["cascade"][0]["executor"] = "codex"
     outcome = run_agent(payload, _event(), 1)
-    assert not outcome.ok and outcome.retryable is True
-    assert "executor_unavailable" in outcome.reason and "codex" in outcome.reason
-    assert runs == [], "an unavailable executor must not execute anything"
-    # The same payload on attempt 2 runs the second (available) link.
-    assert run_agent(payload, _event(), 2).ok
+    assert outcome.ok, outcome.reason
+    assert len(runs) == 1, "the wired executor must actually execute"
+    assert runs[0]["executor"] == "codex", (
+        "the executor must be passed through to the runner, not silently "
+        "defaulted to claude"
+    )
+    assert outcome.result["executor"] == "codex"
 
 
 def test_malformed_cascade_is_a_non_retryable_payload_defect(handler) -> None:
@@ -427,6 +1266,60 @@ def test_publish_falls_back_to_project_id_without_a_backlog_task_id(
     assert captured[0].task == "proj"  # _payload()'s project_id
 
 
+def test_lease_unavailable_publish_failure_is_a_lease_wait_not_a_spent_attempt(
+    handler, monkeypatch
+) -> None:
+    """VOYN-W0-AICC-PUBLISH-LEASE-CONTENTION-BURNS-ATTEMPT, live 2026-09-06
+    (wki_55f316db): a guarded publish lost the writer-lease race to a
+    sibling lane -- neighbouring publishes for OTHER tasks succeeded
+    04:57-04:58Z while this one got `lease_unavailable`. Same day,
+    second occurrence (wki_e0695c3d): dead-lettered when sibling
+    VOYN-MIN-PROOFLESS held the single writer lease during a same-batch
+    DLQ redrive publish. That names no fault in this run's own
+    (already-committed) work, so the outcome must set `lease_wait=True` --
+    routing the daemon to the refund-and-bound path instead of spending
+    this item's `max_attempts` on contention it had no part in causing."""
+    import command_center.worker.handlers as handlers_module
+
+    run_agent, _runs = handler
+    monkeypatch.setenv("AICC_PUBLISH_DEPLOY_KEY", "/dev/null")
+
+    def fake_publish(repository, cfg):
+        return PublishResult(
+            ok=False,
+            reason="lease_unavailable: held by server-worker-b pid 4242",
+        )
+
+    monkeypatch.setattr(handlers_module, "publish_run", fake_publish)
+
+    outcome = run_agent(_payload(task_type="implementation"), _event(), 1)
+    assert not outcome.ok and outcome.retryable is True
+    assert outcome.lease_wait is True
+    assert outcome.infra_wait is False
+    assert "lease_unavailable" in outcome.reason
+
+
+def test_other_publish_failures_are_not_lease_waits(handler, monkeypatch) -> None:
+    """Only `lease_unavailable` names contention with no fault of its own;
+    every other publish failure (a bad push, a dead `gh`) must keep spending
+    the ordinary attempt budget -- a regression here would let a genuinely
+    broken publish retry forever off a budget nothing spends down."""
+    import command_center.worker.handlers as handlers_module
+
+    run_agent, _runs = handler
+    monkeypatch.setenv("AICC_PUBLISH_DEPLOY_KEY", "/dev/null")
+
+    def fake_publish(repository, cfg):
+        return PublishResult(ok=False, reason="push_failed: non-fast-forward")
+
+    monkeypatch.setattr(handlers_module, "publish_run", fake_publish)
+
+    outcome = run_agent(_payload(task_type="implementation"), _event(), 1)
+    assert not outcome.ok and outcome.retryable is True
+    assert outcome.lease_wait is False
+    assert outcome.infra_wait is False
+
+
 def test_a_bare_hex_string_is_not_a_head_sha(handler, monkeypatch) -> None:
     """Only the labelled trailer counts: a transcript is full of object ids,
     and guessing which one is the head is the substring-matching the rules
@@ -455,12 +1348,19 @@ def test_mutating_dispatch_into_a_leased_worktree_is_refused(
 ) -> None:
     """The defect this task names: the worker dispatched into a checkout
     another writer holds, and the collision only surfaced at commit time --
-    by which point the foreign edits were already in the tree."""
+    by which point the foreign edits were already in the tree.
+
+    Contention must set `lease_wait=True` so the refund path absorbs the
+    refusal instead of burning `max_attempts`
+    (VOYN-W0-AICC-PUBLISH-LEASE-CONTENTION-BURNS-ATTEMPT-REM)."""
     run_agent, runs = handler
-    lease_tool(_lease_row(tmp_path))
+    worktree = isolated_path(tmp_path)
+    lease_tool(_lease_row(worktree))
     outcome = run_agent(_payload(task_type="implementation"), _event())
     assert not outcome.ok and outcome.retryable
-    assert "claude-worker" in outcome.reason and str(tmp_path) in outcome.reason
+    assert outcome.lease_wait is True
+    assert outcome.infra_wait is False
+    assert "claude-worker" in outcome.reason and str(worktree) in outcome.reason
     assert runs == [], "nothing may execute in another writer's checkout"
 
 
@@ -490,10 +1390,11 @@ def test_expired_other_host_and_other_path_leases_do_not_block(
 ) -> None:
     """Three ways a row can name this path without holding it."""
     run_agent, runs = handler
-    stale = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+    stale = (datetime.now(UTC) - timedelta(minutes=1)).isoformat()
+    worktree = isolated_path(tmp_path)
     for row in (
-        _lease_row(tmp_path, expires_at=stale),
-        _lease_row(tmp_path, host="some-other-worker"),
+        _lease_row(worktree, expires_at=stale),
+        _lease_row(worktree, host="some-other-worker"),
         _lease_row(tmp_path.parent / "a-different-checkout"),
     ):
         runs.clear()
@@ -508,23 +1409,27 @@ def test_an_unreachable_authority_blocks_rather_than_opens(
 ) -> None:
     """A guard that opens when it cannot see is not a guard. Every failure
     to ask a configured authority -- non-zero exit, unreadable output,
-    missing binary -- refuses the dispatch."""
+    missing binary -- refuses the dispatch. These are substrate failures
+    (`infra_wait`), not writer contention (`lease_wait`)."""
     run_agent, runs = handler
 
     lease_tool("boom: connection refused", exit_code=1)
     refused = run_agent(_payload(task_type="implementation"), _event())
     assert not refused.ok and refused.retryable and runs == []
+    assert refused.lease_wait is False and refused.infra_wait is True
     assert "connection refused" in refused.reason
 
     lease_tool("not json at all")
     unreadable = run_agent(_payload(task_type="implementation"), _event())
     assert not unreadable.ok and unreadable.retryable and runs == []
+    assert unreadable.lease_wait is False and unreadable.infra_wait is True
     assert "unreadable" in unreadable.reason
 
     lease_tool("[]")
     monkeypatch.setenv("VOYN_LEASE_TOOL", str(tmp_path / "does-not-exist"))
     missing = run_agent(_payload(task_type="implementation"), _event())
     assert not missing.ok and missing.retryable and runs == []
+    assert missing.lease_wait is False and missing.infra_wait is True
     assert "unreachable" in missing.reason
 
 
@@ -545,6 +1450,15 @@ def _own_start(pid: int) -> str:
     return stat[stat.rindex(")") + 2 :].split()[19]
 
 
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="reads /proc/<pid>/stat directly, the same seamless-fallback shape "
+    "worktree_lease._process_start itself uses in production (fails soft to "
+    "None off Linux, never crashes there) -- but this test's own fixture "
+    "helper, _own_start, has no such fallback, so it must skip rather than "
+    "fail where /proc does not exist. Linux CI (the real deployment target) "
+    "keeps full coverage; see VOYN-W0-AICC-LEASE-TEST-PROC-MACOS-SKIP.",
+)
 def test_a_lease_held_by_our_own_supervisor_does_not_block(
     handler, lease_tool, tmp_path
 ) -> None:
@@ -557,7 +1471,11 @@ def test_a_lease_held_by_our_own_supervisor_does_not_block(
     """
     run_agent, runs = handler
     pid = os.getpid()
-    lease_tool(_lease_row(tmp_path, process_pid=pid, process_start=_own_start(pid)))
+    lease_tool(
+        _lease_row(
+            isolated_path(tmp_path), process_pid=pid, process_start=_own_start(pid)
+        )
+    )
     outcome = run_agent(_payload(task_type="implementation"), _event())
     assert outcome.ok, outcome.reason
     assert len(runs) == 1, "the dispatch was refused by its own supervisor's lease"
@@ -574,7 +1492,11 @@ def test_a_recycled_pid_matching_an_ancestor_still_blocks(
     """
     run_agent, runs = handler
     lease_tool(
-        _lease_row(tmp_path, process_pid=os.getpid(), process_start="not-our-start")
+        _lease_row(
+            isolated_path(tmp_path),
+            process_pid=os.getpid(),
+            process_start="not-our-start",
+        )
     )
     outcome = run_agent(_payload(task_type="implementation"), _event())
     assert not outcome.ok and outcome.retryable
@@ -586,10 +1508,1245 @@ def test_a_lease_with_no_identity_token_still_blocks(
 ) -> None:
     """An unverifiable match is not a match: the row names our pid, but with
     no ``process_start`` on either side to confirm it, the gate fails closed."""
-    run_agent, runs = handler
-    row = json.loads(_lease_row(tmp_path, process_pid=os.getpid()))
+    run_agent, _runs = handler
+    row = json.loads(_lease_row(isolated_path(tmp_path), process_pid=os.getpid()))
     row[0].pop("process_start", None)
     lease_tool(json.dumps(row))
     outcome = run_agent(_payload(task_type="implementation"), _event())
     assert not outcome.ok and outcome.retryable
+
+
+# -- full-lifecycle writer lease (VOYN-W0-AICC-LEASE-FULL-LIFECYCLE-FENCE) ----
+
+
+def test_mutating_dispatch_holds_the_writer_lease_before_provisioning(
+    handler, monkeypatch, tmp_path
+) -> None:
+    """The writer lease must be acquired (and the pre-push hook's identity
+    provisioned) BEFORE the workspace is provisioned and the agent runs --
+    not only around `publish_run`'s own push -- and released only once the
+    whole dispatch is done. `blocking_lease`'s own `list` preflight must run
+    first (it is the read-only check for a lease held by someone ELSE);
+    `acquire`/`install-hooks` (this task's lease, held by us) follow it."""
+    run_agent, runs = handler
+    calls = tmp_path / "lease-calls.log"
+    binary = tmp_path / "fake-voyn-lease"
+    # `blocking_lease` calls plain `[tool, "list"]` (no `--repo`/identity
+    # flags -- it is a read-only preflight over every lease, not one this
+    # process's own identity); the writer lease's `acquire`/`install-hooks`/
+    # `release` go through `lease_client.lease_argv`'s
+    # `--repo <path> <verb> --repository ... --owner ...` shape instead. One
+    # script answers both: it always emits `[]` (the only thing `list`
+    # reads) and exits 0.
+    binary.write_text(f"#!/bin/sh\necho \"$*\" >> {calls}\necho '[]'\nexit 0\n")
+    binary.chmod(0o755)
+    monkeypatch.setenv("VOYN_LEASE_TOOL", str(binary))
+    monkeypatch.setenv("VOYN_LEASE_DSN", "postgresql://authority/present")
+
+    outcome = run_agent(_payload(task_type="implementation"), _event())
+    assert outcome.ok, outcome.reason
+    assert len(runs) == 1
+
+    lines = calls.read_text().splitlines()
+    assert lines and lines[0] == "list", "blocking_lease's preflight runs first"
+
+    def _first(verb: str) -> int:
+        # `--repo <path> <verb> ...` -- the verb is the third token.
+        return next(i for i, line in enumerate(lines) if line.split()[2:3] == [verb])
+
+    def _last(verb: str) -> int:
+        return max(i for i, line in enumerate(lines) if line.split()[2:3] == [verb])
+
+    assert _first("acquire") >= 1
+    assert _first("release") >= 1
+    assert 0 < _first("acquire") < _first("release"), (
+        "the writer lease is acquired before provisioning/running the agent "
+        "and released only once the dispatch is fully done"
+    )
+    # VOYN-W0-AICC-LEASE-SCOPE-PER-TASK: the hook identity file lives in the
+    # clone's COMMON git dir, so a task-scoped lease must not write it --
+    # only `publish_run` does, immediately before its push. See
+    # `test_hold_never_touches_the_clone_wide_hook_identity_file`.
+    assert not any(line.split()[2:3] == ["install-hooks"] for line in lines), (
+        "the full-lifecycle lease must not provision the clone-wide hook identity file"
+    )
+
+
+def test_the_full_lifecycle_lease_is_scoped_to_the_task_not_the_repository(
+    handler, monkeypatch, tmp_path
+) -> None:
+    """VOYN-W0-AICC-LEASE-SCOPE-PER-TASK. Measured 2026-08-23: 96 of 115
+    returns-to-pool in three hours were `VOYN_LEASE_REFUSED active` -- tasks
+    refusing each other because the lease keyed on the repository, even
+    though #346 gave each task its own worktree and they share no mutable
+    state during the agent run. The scope must carry the task id."""
+    run_agent, _runs = handler
+    calls = tmp_path / "lease-calls.log"
+    binary = tmp_path / "fake-voyn-lease"
+    binary.write_text(f"#!/bin/sh\necho \"$*\" >> {calls}\necho '[]'\nexit 0\n")
+    binary.chmod(0o755)
+    monkeypatch.setenv("VOYN_LEASE_TOOL", str(binary))
+    monkeypatch.setenv("VOYN_LEASE_DSN", "postgresql://authority/present")
+
+    outcome = run_agent(
+        _payload(task_type="implementation", backlog_task_id="VOYN-W0-SCOPED"),
+        _event(),
+    )
+    assert outcome.ok, outcome.reason
+
+    scopes = {
+        line.split("--repository ", 1)[1].split()[0]
+        for line in calls.read_text().splitlines()
+        if "--repository " in line
+    }
+    assert scopes, "no identity-bearing lease call was made"
+    assert all("VOYN-W0-SCOPED" in scope for scope in scopes), (
+        f"the lease scope must name the task, got {scopes}"
+    )
+
+
+def test_publish_does_not_release_a_lease_the_caller_still_holds(
+    handler, monkeypatch, tmp_path
+) -> None:
+    """Independent-review finding on VOYN-W0-AICC-LEASE-FULL-LIFECYCLE-FENCE:
+    the first revision let `publish_run` release the writer lease
+    unconditionally in its own `finally`, dropping it mid-dispatch -- before
+    this function's own post-publish work and `remove_workspace`'s worktree
+    cleanup, both still inside the caller's `stack`. When the full-lifecycle
+    lease was actually acquired (`VOYN_LEASE_DSN` configured), `publish_run`
+    must be called with `release_lease=False` so the one real release stays
+    with the caller's own `stack.close()`."""
+    import command_center.worker.handlers as handlers_module
+
+    run_agent, _runs = handler
+    monkeypatch.setenv("AICC_PUBLISH_DEPLOY_KEY", "/dev/null")
+    binary = tmp_path / "fake-voyn-lease"
+    binary.write_text('#!/bin/sh\nif [ "$1" = "list" ]; then echo \'[]\'; fi\nexit 0\n')
+    binary.chmod(0o755)
+    monkeypatch.setenv("VOYN_LEASE_TOOL", str(binary))
+    monkeypatch.setenv("VOYN_LEASE_DSN", "postgresql://authority/present")
+
+    captured: list = []
+
+    def fake_publish(repository, cfg):
+        captured.append(cfg)
+        return PublishResult(ok=True, branch=f"backlog/{cfg.task}")
+
+    monkeypatch.setattr(handlers_module, "publish_run", fake_publish)
+
+    # No `backlog_task_id`, so `_task_lease_scope` falls back to the bare
+    # project and the two leases ARE the same row -- the case where the
+    # caller's own release is the only correct one.
+    outcome = run_agent(_payload(task_type="implementation"), _event(), 1)
+    assert outcome.ok, outcome.reason
+    assert captured and captured[0].release_lease is False
+
+
+def test_publish_releases_its_own_lease_when_the_scopes_differ(
+    handler, monkeypatch, tmp_path
+) -> None:
+    """VOYN-W0-AICC-LEASE-SCOPE-PER-TASK, caught in independent review before
+    merge: once the full-lifecycle lease became task-scoped
+    (`<project>:<task>`) while `publish_run` stayed repository-scoped
+    (`<project>`), they are two DIFFERENT lease rows. `release_lease=False`
+    -- correct while both keys were the repository -- would then leave
+    `<project>` held by nobody's `finally`: `writer_lease._release` only ever
+    releases its own `<project>:<task>`. The row would leak on the first
+    mutating task and refuse every later push with `VOYN_LEASE_REFUSED
+    active` for the worker process's whole lifetime, un-reapable because
+    `--auto-takeover` and `ops/lease_reap.sh` both require a DEAD recorded
+    holder and this one is alive.
+
+    So the flag must follow whether the two scopes name the same row, not
+    whether an outer lease merely exists."""
+    import command_center.worker.handlers as handlers_module
+
+    run_agent, _runs = handler
+    monkeypatch.setenv("AICC_PUBLISH_DEPLOY_KEY", "/dev/null")
+    binary = tmp_path / "fake-voyn-lease"
+    binary.write_text('#!/bin/sh\nif [ "$1" = "list" ]; then echo \'[]\'; fi\nexit 0\n')
+    binary.chmod(0o755)
+    monkeypatch.setenv("VOYN_LEASE_TOOL", str(binary))
+    monkeypatch.setenv("VOYN_LEASE_DSN", "postgresql://authority/present")
+
+    captured: list = []
+
+    def fake_publish(repository, cfg):
+        captured.append(cfg)
+        return PublishResult(ok=True, branch=f"backlog/{cfg.task}")
+
+    monkeypatch.setattr(handlers_module, "publish_run", fake_publish)
+
+    outcome = run_agent(
+        _payload(task_type="implementation", backlog_task_id="VOYN-W0-SCOPED"),
+        _event(),
+        1,
+    )
+    assert outcome.ok, outcome.reason
+    assert captured, "publish_run was never called"
+    assert captured[0].release_lease is True, (
+        "publish holds a different lease row than the caller, so it must "
+        "release its own or the repository-scoped row leaks"
+    )
+    # And the two really are different rows -- otherwise this test would pass
+    # for the wrong reason.
+    assert captured[0].repository != handlers_module._task_lease_scope(
+        parse_agent_run(
+            _payload(task_type="implementation", backlog_task_id="VOYN-W0-SCOPED")
+        )
+    )
+
+
+def test_publish_releases_its_own_lease_when_no_full_lifecycle_lease_is_held(
+    handler, monkeypatch
+) -> None:
+    """Symmetric case: no `VOYN_LEASE_DSN` means no full-lifecycle lease was
+    ever acquired (the `handler` fixture already unsets it), so
+    `publish_run` must keep its own default `release_lease=True` -- nothing
+    else will ever release that lease if it doesn't."""
+    import command_center.worker.handlers as handlers_module
+
+    run_agent, _runs = handler
+    monkeypatch.setenv("AICC_PUBLISH_DEPLOY_KEY", "/dev/null")
+
+    captured: list = []
+
+    def fake_publish(repository, cfg):
+        captured.append(cfg)
+        return PublishResult(ok=True, branch=f"backlog/{cfg.task}")
+
+    monkeypatch.setattr(handlers_module, "publish_run", fake_publish)
+
+    outcome = run_agent(_payload(task_type="implementation"), _event(), 1)
+    assert outcome.ok, outcome.reason
+    assert captured and captured[0].release_lease is True
+
+
+def test_writer_lease_unavailable_blocks_dispatch_before_the_agent_runs(
+    handler, monkeypatch, tmp_path
+) -> None:
+    """Another writer already holding the task-scoped lease must refuse the
+    dispatch retryably before any workspace is touched or the agent is
+    launched -- the same fail-closed shape `blocking_lease` already has for
+    its own preflight. Contention must set `lease_wait=True` so the refund
+    path (not `max_attempts`) absorbs the refusal
+    (VOYN-W0-AICC-PUBLISH-LEASE-CONTENTION-BURNS-ATTEMPT-REM)."""
+    run_agent, runs = handler
+    binary = tmp_path / "fake-voyn-lease"
+    binary.write_text(
+        "#!/bin/sh\n"
+        # `blocking_lease` calls plain `[tool, "list"]` ($1=list, no
+        # `--repo`); the writer lease's calls go through `--repo <path>
+        # <verb> ...` ($3=verb). Distinguish on whichever positional
+        # argument actually carries the verb for that call shape.
+        'if [ "$1" = "list" ]; then echo "[]"; exit 0; fi\n'
+        'case "$3" in\n'
+        "  acquire) echo 'lease already held by another writer' >&2; exit 1 ;;\n"
+        "  *) exit 0 ;;\n"
+        "esac\n"
+    )
+    binary.chmod(0o755)
+    monkeypatch.setenv("VOYN_LEASE_TOOL", str(binary))
+    monkeypatch.setenv("VOYN_LEASE_DSN", "postgresql://authority/present")
+
+    outcome = run_agent(_payload(task_type="implementation"), _event())
+    assert not outcome.ok
+    assert outcome.retryable
+    assert outcome.lease_wait is True
+    assert outcome.infra_wait is False
+    assert "writer lease unavailable" in outcome.reason
+    assert runs == [], "the agent must not run without the writer lease held"
+
+
+def test_writer_lease_authority_failure_at_dispatch_is_an_infra_wait(
+    handler, monkeypatch, tmp_path
+) -> None:
+    """An acquire that fails without naming a holder is substrate failure,
+    not contention: route to `infra_wait` so the lease-wait budget is not
+    spent down by a down authority."""
+    run_agent, runs = handler
+    binary = tmp_path / "fake-voyn-lease"
+    binary.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "list" ]; then echo "[]"; exit 0; fi\n'
+        'case "$3" in\n'
+        "  acquire) echo 'connection refused' >&2; exit 1 ;;\n"
+        "  *) exit 0 ;;\n"
+        "esac\n"
+    )
+    binary.chmod(0o755)
+    monkeypatch.setenv("VOYN_LEASE_TOOL", str(binary))
+    monkeypatch.setenv("VOYN_LEASE_DSN", "postgresql://authority/present")
+
+    outcome = run_agent(_payload(task_type="implementation"), _event())
+    assert not outcome.ok
+    assert outcome.retryable
+    assert outcome.lease_wait is False
+    assert outcome.infra_wait is True
+    assert "writer lease unavailable" in outcome.reason
     assert runs == []
+
+
+def test_no_configured_authority_leaves_the_writer_lease_inert_too(
+    handler, tmp_path
+) -> None:
+    """Symmetric with `test_no_configured_authority_leaves_the_gate_inert`
+    for `blocking_lease`: a host with no `VOYN_LEASE_DSN` has no lease
+    authority to acquire a lease from either, so the full-lifecycle lease
+    must not block it (it already inherits the ambient absence of
+    `VOYN_LEASE_TOOL`/`VOYN_LEASE_DSN` from the `handler` fixture)."""
+    run_agent, runs = handler
+    outcome = run_agent(_payload(task_type="implementation"), _event())
+    assert outcome.ok, outcome.reason
+    assert len(runs) == 1
+
+
+# -- VOYN-W0-AICC-REVIEW-AUTO-ACCEPT: head-pinned verification checkout ------
+
+
+def test_review_head_payload_fields_parse_and_validate() -> None:
+    request = parse_agent_run(
+        _payload(review_head={"pr_number": "42", "head_sha": "a" * 40})
+    )
+    assert request.review_head_pr_number == "42"
+    assert request.review_head_sha == "a" * 40
+
+    absent = parse_agent_run(_payload())
+    assert absent.review_head_sha is None and absent.review_head_pr_number is None
+
+    for bad in (
+        "not-a-dict",
+        {"pr_number": "42"},
+        {"pr_number": "42", "head_sha": "short"},
+        {"pr_number": "x", "head_sha": "a" * 40},
+        {"pr_number": 42, "head_sha": "a" * 40},
+    ):
+        error = parse_agent_run(_payload(review_head=bad))
+        assert isinstance(error, PayloadError) and not error.retryable, bad
+
+
+def test_review_head_runs_in_the_pinned_checkout_and_cleans_up(
+    handler, monkeypatch, tmp_path
+) -> None:
+    """The verification agent must execute in the detached checkout at the
+    PR's exact head -- not the shared repository -- and the checkout must be
+    removed on every exit path (the ExitStack owns the removal)."""
+    from command_center.worker import handlers as handlers_module
+
+    run_agent, runs = handler
+    pin = tmp_path / "verify-42-pin"
+    removed: list[tuple] = []
+    monkeypatch.setattr(
+        handlers_module,
+        "_review_head_checkout",
+        lambda repository, pr_number, head_sha: (pin, None),
+    )
+    monkeypatch.setattr(
+        handlers_module,
+        "_remove_review_head_checkout",
+        lambda repository, target: removed.append((repository, target)),
+    )
+    outcome = run_agent(
+        _payload(
+            task_type="verification_review",
+            untrusted=True,
+            review_head={"pr_number": "42", "head_sha": "b" * 40},
+        ),
+        _event(),
+    )
+    assert outcome.ok, outcome.reason
+    assert runs[0]["repository_path"] == pin
+    assert removed == [(tmp_path, pin)]
+
+
+def test_review_head_checkout_is_removed_on_failure_paths_too(
+    handler, monkeypatch, tmp_path
+) -> None:
+    """Cleanup is owned by the handler's ExitStack, so it must run when the
+    agent run FAILS and when the runner RAISES -- not only after a success
+    (independent review of this change, chunk 1 at 32bf893: a success-only
+    test would pass an implementation that leaks the worktree on failure)."""
+    from command_center.worker import handlers as handlers_module
+
+    run_agent, _runs = handler
+    pin = tmp_path / "verify-42-pin"
+    removed: list[tuple] = []
+    monkeypatch.setattr(
+        handlers_module,
+        "_review_head_checkout",
+        lambda repository, pr_number, head_sha: (pin, None),
+    )
+    monkeypatch.setattr(
+        handlers_module,
+        "_remove_review_head_checkout",
+        lambda repository, target: removed.append((repository, target)),
+    )
+    payload = _payload(
+        task_type="verification_review",
+        untrusted=True,
+        review_head={"pr_number": "42", "head_sha": "b" * 40},
+    )
+
+    def failed_run(**kwargs):
+        return agent_runner.RunResult(
+            status="failed",
+            exit_code=1,
+            stdout="",
+            stderr="agent died",
+            duration_seconds=0.1,
+            started_at="2026-08-26T12:00:00+00:00",
+            completed_at="2026-08-26T12:00:01+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", failed_run)
+    run_agent(payload, _event())
+    assert removed == [(tmp_path, pin)]
+
+    def raising_run(**kwargs):
+        raise RuntimeError("runner blew up")
+
+    removed.clear()
+    monkeypatch.setattr(agent_runner, "run_claude_code", raising_run)
+    with pytest.raises(RuntimeError):
+        run_agent(payload, _event())
+    assert removed == [(tmp_path, pin)]
+
+
+def test_review_head_pin_is_refused_for_a_mutating_task(handler) -> None:
+    """A mutating run pinned to a detached head has no branch to publish --
+    the combination is a payload defect, never silently ignored."""
+    run_agent, runs = handler
+    outcome = run_agent(
+        _payload(
+            task_type="implementation",
+            untrusted=False,
+            review_head={"pr_number": "42", "head_sha": "b" * 40},
+        ),
+        _event(),
+    )
+    assert not outcome.ok and not outcome.retryable
+    assert "review_head" in outcome.reason
+    assert runs == []
+
+
+def test_review_head_checkout_failure_is_retryable(handler, monkeypatch) -> None:
+    from command_center.worker import handlers as handlers_module
+
+    run_agent, runs = handler
+    monkeypatch.setattr(
+        handlers_module,
+        "_review_head_checkout",
+        lambda repository, pr_number, head_sha: (None, "fetch failed"),
+    )
+    outcome = run_agent(
+        _payload(
+            task_type="verification_review",
+            untrusted=True,
+            review_head={"pr_number": "42", "head_sha": "b" * 40},
+        ),
+        _event(),
+    )
+    assert not outcome.ok and outcome.retryable
+    assert "fetch failed" in outcome.reason
+    assert runs == []
+
+
+def test_review_head_checkout_builds_a_detached_worktree_at_the_exact_sha(
+    tmp_path,
+) -> None:
+    """Real git end to end: fetch refs/pull/<n>/head from origin, add the
+    detached worktree at the exact sha, verify, and remove -- the seam the
+    faked tests above stand on."""
+    import subprocess
+
+    from command_center.worker.handlers import (
+        _remove_review_head_checkout,
+        _review_head_checkout,
+    )
+
+    def git(cwd, *args):
+        return subprocess.run(
+            ["git", "-C", str(cwd), *args],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    git(tmp_path, "init", "-q", str(origin))
+    git(
+        origin,
+        "-c",
+        "user.email=t@t",
+        "-c",
+        "user.name=t",
+        "commit",
+        "--allow-empty",
+        "-q",
+        "-m",
+        "base",
+    )
+    git(
+        origin,
+        "-c",
+        "user.email=t@t",
+        "-c",
+        "user.name=t",
+        "commit",
+        "--allow-empty",
+        "-q",
+        "-m",
+        "pr head",
+    )
+    head_sha = git(origin, "rev-parse", "HEAD")
+    git(origin, "update-ref", "refs/pull/7/head", head_sha)
+    git(origin, "reset", "-q", "--hard", "HEAD~1")
+
+    clone = tmp_path / "clone"
+    subprocess.run(
+        ["git", "clone", "-q", str(origin), str(clone)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert git(clone, "rev-parse", "HEAD") != head_sha
+
+    checkout, failure = _review_head_checkout(clone, "7", head_sha)
+    assert failure is None
+    assert checkout is not None and checkout.is_dir()
+    assert git(checkout, "rev-parse", "HEAD") == head_sha
+
+    _remove_review_head_checkout(clone, checkout)
+    assert not checkout.exists()
+
+    missing, failure = _review_head_checkout(clone, "7", "f" * 40)
+    assert missing is None and "unreachable" in failure
+
+
+def test_read_only_run_under_isolation_uses_a_detached_clone_in_the_principal_root(
+    handler, monkeypatch, tmp_path
+) -> None:
+    """VOYN-W0-AICC-READ-ONLY-RUNS-NEED-AN-ISOLATED-WORKSPACE: under principal
+    isolation the launcher admits only workspaces inside the principal root
+    and cannot see /home, so a review handed the shared clone died with
+    "[Errno 2] No such file or directory: '/home/voynadmin'" (worker-01,
+    2026-09-08). The run executes in the throwaway clone and the ExitStack
+    removes it on every exit path."""
+    from command_center import agent_runner
+    from command_center.worker import handlers as handlers_module
+
+    run_agent, runs = handler
+    monkeypatch.setattr(agent_runner, "principal_isolation_required", lambda: True)
+    monkeypatch.setattr(
+        agent_runner, "principal_executor_preflight", lambda executor: (True, "ok")
+    )
+    monkeypatch.setattr(
+        handlers_module, "_refresh_read_only_source", lambda *a, **kw: (True, None)
+    )
+    clone = tmp_path / "root" / "ro-repo-abc"
+    removed: list[Path] = []
+    asked: list[Path] = []
+
+    def fake_checkout(repository):
+        asked.append(repository)
+        return clone, None, False
+
+    monkeypatch.setattr(handlers_module, "_read_only_isolated_checkout", fake_checkout)
+    monkeypatch.setattr(
+        handlers_module,
+        "_remove_read_only_isolated_checkout",
+        lambda target: removed.append(target),
+    )
+    outcome = run_agent(_payload(task_type="review", untrusted=True), _event())
+    assert outcome.ok, outcome.reason
+    assert asked == [tmp_path]
+    assert runs[0]["repository_path"] == clone
+    assert removed == [clone]
+
+
+def test_read_only_run_outside_isolation_keeps_the_shared_clone(
+    handler, monkeypatch, tmp_path
+) -> None:
+    from command_center import agent_runner
+    from command_center.worker import handlers as handlers_module
+
+    run_agent, runs = handler
+    monkeypatch.setattr(agent_runner, "principal_isolation_required", lambda: False)
+    monkeypatch.setattr(
+        handlers_module,
+        "_read_only_isolated_checkout",
+        lambda repository: (_ for _ in ()).throw(
+            AssertionError("must not clone outside isolation")
+        ),
+    )
+    outcome = run_agent(_payload(task_type="review", untrusted=True), _event())
+    assert outcome.ok, outcome.reason
+    assert runs[0]["repository_path"] == tmp_path
+
+
+def test_read_only_isolated_checkout_failure_is_retryable(handler, monkeypatch) -> None:
+    from command_center import agent_runner
+    from command_center.worker import handlers as handlers_module
+
+    run_agent, runs = handler
+    monkeypatch.setattr(agent_runner, "principal_isolation_required", lambda: True)
+    monkeypatch.setattr(
+        agent_runner, "principal_executor_preflight", lambda executor: (True, "ok")
+    )
+    monkeypatch.setattr(
+        handlers_module, "_refresh_read_only_source", lambda *a, **kw: (True, None)
+    )
+    monkeypatch.setattr(
+        handlers_module,
+        "_read_only_isolated_checkout",
+        lambda repository: (
+            None,
+            "read-only isolated checkout clone failed: boom",
+            True,
+        ),
+    )
+    outcome = run_agent(_payload(task_type="review", untrusted=True), _event())
+    assert not outcome.ok and outcome.retryable
+    assert "read-only isolated checkout clone failed" in outcome.reason
+    assert runs == []
+    monkeypatch.setattr(
+        handlers_module,
+        "_read_only_isolated_checkout",
+        lambda repository: (
+            None,
+            "isolated workspace root is unavailable: gone",
+            False,
+        ),
+    )
+    outcome = run_agent(_payload(task_type="review", untrusted=True), _event())
+    assert not outcome.ok and not outcome.retryable, (
+        "a permanent cause must not spin the cascade"
+    )
+
+
+def test_read_only_source_refresh_failure_is_retryable_before_attempt(
+    handler, monkeypatch
+) -> None:
+    from command_center import agent_runner
+    from command_center.worker import handlers as handlers_module
+
+    run_agent, runs = handler
+    monkeypatch.setattr(agent_runner, "principal_isolation_required", lambda: True)
+    monkeypatch.setattr(
+        agent_runner, "principal_executor_preflight", lambda executor: (True, "ok")
+    )
+    monkeypatch.setattr(
+        handlers_module,
+        "_refresh_read_only_source",
+        lambda *a, **kw: (False, "source clone fetch failed: network"),
+    )
+    monkeypatch.setattr(
+        handlers_module,
+        "_read_only_isolated_checkout",
+        lambda *a, **kw: (_ for _ in ()).throw(
+            AssertionError("must not clone stale source")
+        ),
+    )
+
+    outcome = run_agent(_payload(task_type="review", untrusted=True), _event())
+
+    assert not outcome.ok and outcome.retryable
+    assert "source clone fetch failed" in outcome.reason
+    assert runs == []
+
+
+def _git_repo_with_one_commit(path: Path) -> str:
+    path.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(path)], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(path),
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "--allow-empty",
+            "-q",
+            "-m",
+            "one",
+        ],
+        check=True,
+    )
+    return subprocess.run(
+        ["git", "-C", str(path), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
+
+def _git(*argv: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(["git", *argv], capture_output=True, text=True)
+
+
+def test_read_only_isolated_checkout_is_a_detached_clone_without_origin_at_the_source_head(
+    tmp_path, monkeypatch
+) -> None:
+    """Real git: the clone lands under the principal root, HEAD is DETACHED at
+    the source HEAD (not merely equal), `origin` -- which named the hidden
+    source path -- is gone, and the source is untouched."""
+    from command_center import agent_runner
+    from command_center.worker import handlers as handlers_module
+
+    source = tmp_path / "source"
+    head = _git_repo_with_one_commit(source)
+    root = tmp_path / "root"
+    root.mkdir()
+    monkeypatch.setattr(agent_runner, "principal_workspace_root", lambda: root)
+    target, failure, retryable = handlers_module._read_only_isolated_checkout(source)
+    assert (failure, retryable) == (None, False) and target is not None
+    assert target.parent == root and target.name.startswith("ro-source-")
+    assert _git("-C", str(target), "rev-parse", "HEAD").stdout.strip() == head
+    assert _git("-C", str(target), "symbolic-ref", "-q", "HEAD").returncode != 0, (
+        "HEAD must be detached"
+    )
+    assert "origin" not in _git("-C", str(target), "remote").stdout.split()
+    assert (
+        str(target)
+        not in _git("-C", str(source), "worktree", "list", "--porcelain").stdout
+    )
+    handlers_module._remove_read_only_isolated_checkout(target)
+    assert not target.exists()
+
+
+def test_read_only_isolated_checkout_works_from_a_source_on_a_detached_head(
+    tmp_path, monkeypatch
+):
+    from command_center import agent_runner
+    from command_center.worker import handlers as handlers_module
+
+    source = tmp_path / "source"
+    head = _git_repo_with_one_commit(source)
+    assert _git("-C", str(source), "checkout", "-q", "--detach", head).returncode == 0
+    root = tmp_path / "root"
+    root.mkdir()
+    monkeypatch.setattr(agent_runner, "principal_workspace_root", lambda: root)
+    target, failure, _ = handlers_module._read_only_isolated_checkout(source)
+    assert failure is None and target is not None
+    assert _git("-C", str(target), "rev-parse", "HEAD").stdout.strip() == head
+    handlers_module._remove_read_only_isolated_checkout(target)
+
+
+def test_read_only_isolated_checkout_source_git_refuses_is_permanent_and_leaves_nothing(
+    tmp_path, monkeypatch
+) -> None:
+    """The real failure branches, not a monkeypatched helper: a source git
+    cannot read is a permanent condition (no retry loop) and no clone is
+    left behind under the root."""
+    from command_center import agent_runner
+    from command_center.worker import handlers as handlers_module
+
+    root = tmp_path / "root"
+    root.mkdir()
+    monkeypatch.setattr(agent_runner, "principal_workspace_root", lambda: root)
+    missing = tmp_path / "missing-source"
+    target, failure, retryable = handlers_module._read_only_isolated_checkout(missing)
+    assert target is None and failure and retryable is False
+    assert list(root.iterdir()) == []
+    monkeypatch.setattr(
+        agent_runner,
+        "principal_workspace_root",
+        lambda: (_ for _ in ()).throw(agent_runner.RunnerError("no root")),
+    )
+    target, failure, retryable = handlers_module._read_only_isolated_checkout(tmp_path)
+    assert target is None and "root is unavailable" in failure and retryable is False
+
+
+def test_remove_read_only_isolated_checkout_reports_a_leak_instead_of_hiding_it(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    import logging
+
+    from command_center.worker import handlers as handlers_module
+
+    target = tmp_path / "ro-x"
+    target.mkdir()
+    (target / "f").write_text("x", encoding="utf-8")
+
+    def failing_rmtree(path, onerror=None, **kwargs):
+        onerror(os.unlink, str(target / "f"), (OSError, OSError("busy"), None))
+
+    monkeypatch.setattr(handlers_module, "_rmtree", failing_rmtree)
+    with caplog.at_level(logging.ERROR, logger="command_center.worker.handlers"):
+        handlers_module._remove_read_only_isolated_checkout(target)
+    assert any(
+        "was not fully removed" in record.message and "busy" in record.message
+        for record in caplog.records
+    )
+
+
+def test_review_head_pin_under_isolation_runs_in_a_clone_detached_at_the_pin(
+    handler, monkeypatch, tmp_path
+) -> None:
+    """Isolation isolates the pinned verification review instead of disabling
+    it (review of 5361b78a): the detached clone is pinned to the requested
+    sha, the bound clone is never touched."""
+    from command_center import agent_runner
+    from command_center.worker import handlers as handlers_module
+
+    run_agent, runs = handler
+    monkeypatch.setattr(agent_runner, "principal_isolation_required", lambda: True)
+    monkeypatch.setattr(
+        agent_runner, "principal_executor_preflight", lambda executor: (True, "ok")
+    )
+    monkeypatch.setattr(
+        handlers_module, "_refresh_read_only_source", lambda *a, **kw: (True, None)
+    )
+    monkeypatch.setattr(
+        handlers_module,
+        "_review_head_checkout",
+        lambda *a: (_ for _ in ()).throw(
+            AssertionError("must not touch the bound clone")
+        ),
+    )
+    clone = tmp_path / "root" / "ro-pinned"
+    asked: list[tuple] = []
+    removed: list[Path] = []
+    monkeypatch.setattr(
+        handlers_module,
+        "_read_only_isolated_checkout",
+        lambda repository, pin_sha=None: (
+            asked.append((repository, pin_sha)),
+            (clone, None, False),
+        )[1],
+    )
+    monkeypatch.setattr(
+        handlers_module,
+        "_remove_read_only_isolated_checkout",
+        lambda target: removed.append(target),
+    )
+    outcome = run_agent(
+        _payload(
+            task_type="verification_review",
+            untrusted=True,
+            review_head={"pr_number": "42", "head_sha": "b" * 40},
+        ),
+        _event(),
+    )
+    assert outcome.ok, outcome.reason
+    assert asked == [(tmp_path, "b" * 40)]
+    assert runs[0]["repository_path"] == clone
+    assert removed == [clone]
+
+
+def test_read_only_isolated_checkout_pins_to_the_requested_sha_or_waits_for_it(
+    tmp_path, monkeypatch
+):
+    """Real git: a pin to an older commit detaches there; a pin the bound
+    clone does not hold yet is a retryable wait, never a permanent refusal."""
+    from command_center import agent_runner
+    from command_center.worker import handlers as handlers_module
+
+    source = tmp_path / "source"
+    first = _git_repo_with_one_commit(source)
+    assert (
+        _git(
+            "-C",
+            str(source),
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "--allow-empty",
+            "-q",
+            "-m",
+            "two",
+        ).returncode
+        == 0
+    )
+    head = _git("-C", str(source), "rev-parse", "HEAD").stdout.strip()
+    assert head != first
+    root = tmp_path / "root"
+    root.mkdir()
+    monkeypatch.setattr(agent_runner, "principal_workspace_root", lambda: root)
+    target, failure, _ = handlers_module._read_only_isolated_checkout(
+        source, pin_sha=first
+    )
+    assert failure is None and target is not None
+    assert _git("-C", str(target), "rev-parse", "HEAD").stdout.strip() == first
+    assert _git("-C", str(target), "symbolic-ref", "-q", "HEAD").returncode != 0
+    handlers_module._remove_read_only_isolated_checkout(target)
+    missing = "c" * 40
+    target, failure, retryable = handlers_module._read_only_isolated_checkout(
+        source, pin_sha=missing
+    )
+    assert (
+        target is None and retryable is True and "not in the bound clone yet" in failure
+    )
+    assert list(root.iterdir()) == []
+
+
+def test_read_only_source_refresh_fast_forwards_the_bound_clone(tmp_path) -> None:
+    """Real git: a stale source clone advances before an isolated review
+    clones from it. Fetch-only would leave HEAD on the old commit."""
+    from command_center.worker import handlers as handlers_module
+
+    origin = tmp_path / "origin"
+    source = tmp_path / "source"
+    _git_repo_with_one_commit(origin)
+    assert _git("clone", "-q", str(origin), str(source)).returncode == 0
+    old_head = _git("-C", str(source), "rev-parse", "HEAD").stdout.strip()
+    assert (
+        _git(
+            "-C",
+            str(origin),
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "--allow-empty",
+            "-q",
+            "-m",
+            "two",
+        ).returncode
+        == 0
+    )
+    new_head = _git("-C", str(origin), "rev-parse", "HEAD").stdout.strip()
+    assert old_head != new_head
+
+    ok, failure = handlers_module._refresh_read_only_source(source)
+
+    assert (ok, failure) == (True, None)
+    assert _git("-C", str(source), "rev-parse", "HEAD").stdout.strip() == new_head
+
+
+def test_review_head_refresh_fetches_the_pull_ref_before_isolated_pin(
+    tmp_path, monkeypatch
+) -> None:
+    """A pinned isolated review cannot fetch from inside the agent boundary,
+    so the worker source refresh must make refs/pull/<n>/head reachable
+    before `_read_only_isolated_checkout(..., pin_sha=...)` checks it."""
+    from command_center import agent_runner
+    from command_center.worker import handlers as handlers_module
+
+    origin = tmp_path / "origin"
+    source = tmp_path / "source"
+    _git_repo_with_one_commit(origin)
+    assert _git("clone", "-q", str(origin), str(source)).returncode == 0
+    assert (
+        _git(
+            "-C",
+            str(origin),
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "--allow-empty",
+            "-q",
+            "-m",
+            "pr head",
+        ).returncode
+        == 0
+    )
+    pin = _git("-C", str(origin), "rev-parse", "HEAD").stdout.strip()
+    assert (
+        _git("-C", str(origin), "update-ref", "refs/pull/7/head", pin).returncode == 0
+    )
+    assert _git("-C", str(origin), "reset", "-q", "--hard", "HEAD~1").returncode == 0
+    assert (
+        _git("-C", str(source), "cat-file", "-e", f"{pin}^{{commit}}").returncode != 0
+    )
+
+    ok, failure = handlers_module._refresh_read_only_source(source, pr_number="7")
+
+    assert (ok, failure) == (True, None)
+    assert (
+        _git("-C", str(source), "cat-file", "-e", f"{pin}^{{commit}}").returncode == 0
+    )
+    root = tmp_path / "root"
+    root.mkdir()
+    monkeypatch.setattr(agent_runner, "principal_workspace_root", lambda: root)
+    target, failure, retryable = handlers_module._read_only_isolated_checkout(
+        source, pin_sha=pin
+    )
+    assert (failure, retryable) == (None, False) and target is not None
+    assert _git("-C", str(target), "rev-parse", "HEAD").stdout.strip() == pin
+    handlers_module._remove_read_only_isolated_checkout(target)
+
+
+# -- infra-class failures refund the attempt --------------------------------
+# (VOYN-W0-AICC-INFRA-FAILURES-BURN-TASK-ATTEMPTS, worker-01 2026-09-14)
+
+
+def _implementation_cascade_payload():
+    payload = _payload(task_type="implementation")
+    payload["cascade"] = [
+        {"executor": "claude", "task_type": "implementation"},
+        {"executor": "codex", "task_type": "implementation"},
+    ]
+    return payload
+
+
+def test_preflight_failover_wraps_back_to_an_earlier_healthy_link(
+    handler, monkeypatch
+) -> None:
+    """Attempt 2 selects the second link by construction; when THAT executor
+    is the one that is down, the healthy first link must still serve the
+    delivery instead of the attempt being spent on a routing fact."""
+    run_agent, runs = handler
+    monkeypatch.setattr(
+        agent_runner, "codex_workspace_write_preflight", lambda: (False, "quota")
+    )
+    outcome = run_agent(_implementation_cascade_payload(), _event(), 2)
+    assert outcome.ok
+    assert outcome.result["cascade_step"] == 1
+    assert runs[0]["executor"] == "claude"
+
+
+def test_no_healthy_cascade_link_is_an_infra_wait_not_a_spent_attempt(
+    handler, monkeypatch
+) -> None:
+    run_agent, runs = handler
+    monkeypatch.setattr(
+        agent_runner, "codex_workspace_write_preflight", lambda: (False, "quota")
+    )
+    monkeypatch.setattr(
+        agent_runner, "claude_cli_preflight", lambda binary=None: (False, "expired")
+    )
+    outcome = run_agent(_implementation_cascade_payload(), _event(), 1)
+    assert not outcome.ok and outcome.retryable and outcome.infra_wait
+    assert "unavailable" in outcome.reason
+    assert runs == []
+
+
+def _checkpoint_mismatch(spec):
+    raise workspace_provisioning.WorkspaceVerificationError(
+        failed_step="task_workspace_checkpoint",
+        remediation="Recover the uncheckpointed branch through trusted operator review.",
+        expected_workspace=str(spec.workspace_path),
+        actual_workspace=str(spec.workspace_path),
+        expected_branch=spec.expected_branch,
+        detail="saved HEAD 1111111 differs from signed checkpoint 2222222",
+    )
+
+
+def test_uncheckpointed_clone_is_quarantined_and_the_attempt_refunded(
+    handler, monkeypatch
+) -> None:
+    run_agent, runs = handler
+    monkeypatch.setattr(
+        workspace_provisioning, "provision_and_verify", _checkpoint_mismatch
+    )
+    quarantined: list[str] = []
+
+    def fake_quarantine(workspace):
+        quarantined.append(str(workspace))
+        return f"{workspace}.quarantined"
+
+    monkeypatch.setattr(
+        workspace_provisioning, "quarantine_task_workspace", fake_quarantine
+    )
+    outcome = run_agent(_payload(task_type="implementation"), _event(), 1)
+    assert not outcome.ok and outcome.retryable and outcome.infra_wait
+    assert "task_workspace_checkpoint" in outcome.reason
+    assert "quarantined at" in outcome.reason
+    assert len(quarantined) == 1
+    assert runs == []
+
+
+def test_uncheckpointed_clone_that_cannot_be_quarantined_still_spends_the_attempt(
+    handler, monkeypatch
+) -> None:
+    """Fail closed: if the clone could not be moved aside, the next delivery
+    would hit the same mismatch, so the bounded attempt budget must apply."""
+    run_agent, runs = handler
+    monkeypatch.setattr(
+        workspace_provisioning, "provision_and_verify", _checkpoint_mismatch
+    )
+    monkeypatch.setattr(
+        workspace_provisioning, "quarantine_task_workspace", lambda workspace: None
+    )
+    outcome = run_agent(_payload(task_type="implementation"), _event(), 1)
+    assert not outcome.ok and outcome.retryable and not outcome.infra_wait
+    assert "could not be quarantined" in outcome.reason
+    assert runs == []
+
+
+def test_other_verification_failures_keep_the_ordinary_retry_path(
+    handler, monkeypatch
+) -> None:
+    def branch_missing(spec):
+        raise workspace_provisioning.WorkspaceVerificationError(
+            failed_step="base_branch_present",
+            remediation="Create the base branch.",
+            expected_workspace=str(spec.workspace_path),
+            actual_workspace=str(spec.workspace_path),
+            expected_branch=spec.expected_branch,
+            detail="base branch is missing",
+        )
+
+    run_agent, runs = handler
+    monkeypatch.setattr(workspace_provisioning, "provision_and_verify", branch_missing)
+    outcome = run_agent(_payload(task_type="implementation"), _event(), 1)
+    assert not outcome.ok and outcome.retryable and not outcome.infra_wait
+    assert runs == []
+
+
+def test_unknown_executor_name_in_cascade_is_a_task_fact_not_an_infra_wait(
+    handler, monkeypatch
+) -> None:
+    run_agent, runs = handler
+    payload = _payload(task_type="implementation")
+    payload["cascade"] = [
+        {"executor": "codex", "task_type": "implementation"},
+        {"executor": "no-such-executor", "task_type": "implementation"},
+    ]
+    monkeypatch.setattr(
+        agent_runner, "codex_workspace_write_preflight", lambda: (False, "quota")
+    )
+    outcome = run_agent(payload, _event(), 1)
+    assert not outcome.ok and outcome.retryable and not outcome.infra_wait
+    assert "no-such-executor" in outcome.reason
+    assert runs == []
+
+
+def test_uncheckpointed_clone_is_left_in_place_when_the_lease_is_lost(
+    handler, monkeypatch
+) -> None:
+    run_agent, runs = handler
+    monkeypatch.setattr(
+        workspace_provisioning, "provision_and_verify", _checkpoint_mismatch
+    )
+    called: list[str] = []
+    monkeypatch.setattr(
+        workspace_provisioning,
+        "quarantine_task_workspace",
+        lambda workspace: called.append(str(workspace)) or "q",
+    )
+    lost = _event()
+    lost.set()
+    outcome = run_agent(_payload(task_type="implementation"), lost, 1)
+    assert not outcome.ok and outcome.retryable and not outcome.infra_wait
+    assert "lease lost" in outcome.reason
+    assert called == [] and runs == []
+
+
+def test_lease_lost_during_quarantine_restores_the_clone(handler, monkeypatch) -> None:
+    run_agent, runs = handler
+    monkeypatch.setattr(
+        workspace_provisioning, "provision_and_verify", _checkpoint_mismatch
+    )
+    lost = _event()
+    restored: list[tuple[str, str]] = []
+
+    def quarantine(workspace):
+        lost.set()  # the lease evaporates while the move is in flight
+        return f"{workspace}.quarantined"
+
+    monkeypatch.setattr(workspace_provisioning, "quarantine_task_workspace", quarantine)
+    monkeypatch.setattr(
+        workspace_provisioning,
+        "restore_quarantined_task_workspace",
+        lambda q, w: restored.append((str(q), str(w))) or True,
+    )
+    outcome = run_agent(_payload(task_type="implementation"), lost, 1)
+    assert not outcome.ok and outcome.retryable and not outcome.infra_wait
+    assert "clone restored" in outcome.reason
+    assert len(restored) == 1 and runs == []
+def _commit_on_pr_ref(source, number: int, filename: str) -> str:
+    """A commit reachable ONLY through refs/remotes/origin/pr/<number>/head,
+    the layout the host source mirror produces for review heads."""
+    (source / filename).write_text(f"{filename}\n")
+    assert _git("-C", str(source), "add", filename).returncode == 0
+    assert (
+        _git(
+            "-C", str(source), "-c", "user.email=t@t", "-c", "user.name=t",
+            "commit", "-q", "-m", filename,
+        ).returncode
+        == 0
+    )
+    sha = _git("-C", str(source), "rev-parse", "HEAD").stdout.strip()
+    assert (
+        _git(
+            "-C", str(source), "update-ref", f"refs/remotes/origin/pr/{number}/head", sha
+        ).returncode
+        == 0
+    )
+    assert _git("-C", str(source), "reset", "-q", "--hard", "HEAD~1").returncode == 0
+    return sha
+
+
+def test_read_only_isolated_checkout_fetches_only_the_pinned_pr_ref(
+    tmp_path, monkeypatch
+) -> None:
+    """Real git: the pin lives only under a mirrored pr ref. The clone must
+    reach it by fetching THAT ref, not every pr ref -- ~900 loose
+    `refs/remotes/source-pr/<N>/head` directories put the clone past the
+    launcher's 256-pending-directory walk budget (worker-01, 2026-09-14)."""
+    from command_center import agent_runner
+    from command_center.worker import handlers as handlers_module
+
+    source = tmp_path / "source"
+    _git_repo_with_one_commit(source)
+    pinned = _commit_on_pr_ref(source, 7, "seven.txt")
+    for number in range(100, 140):
+        _commit_on_pr_ref(source, number, f"pr-{number}.txt")
+    root = tmp_path / "root"
+    root.mkdir()
+    monkeypatch.setattr(agent_runner, "principal_workspace_root", lambda: root)
+    target, failure, _ = handlers_module._read_only_isolated_checkout(
+        source, pin_sha=pinned
+    )
+    assert failure is None and target is not None
+    assert _git("-C", str(target), "rev-parse", "HEAD").stdout.strip() == pinned
+    loose = target / ".git" / "refs" / "remotes" / "source-pr"
+    loose_dirs = [p for p in loose.iterdir() if p.is_dir()] if loose.exists() else []
+    assert loose_dirs == [], loose_dirs
+    handlers_module._remove_read_only_isolated_checkout(target)
+
+
+def test_read_only_isolated_checkout_packs_refs_after_a_wholesale_pr_fetch(
+    tmp_path, monkeypatch
+) -> None:
+    """When no ref points at the pin exactly (an older head still reachable
+    from a pr ref) the wholesale fetch is the fallback -- and its loose ref
+    directories must be packed away before the launcher walks the clone."""
+    from command_center import agent_runner
+    from command_center.worker import handlers as handlers_module
+
+    source = tmp_path / "source"
+    _git_repo_with_one_commit(source)
+    older = _commit_on_pr_ref(source, 7, "seven.txt")
+    assert _git("-C", str(source), "checkout", "-q", older).returncode == 0
+    (source / "eight.txt").write_text("eight\n")
+    assert _git("-C", str(source), "add", "eight.txt").returncode == 0
+    assert (
+        _git(
+            "-C", str(source), "-c", "user.email=t@t", "-c", "user.name=t",
+            "commit", "-q", "-m", "newer",
+        ).returncode
+        == 0
+    )
+    newer = _git("-C", str(source), "rev-parse", "HEAD").stdout.strip()
+    assert (
+        _git("-C", str(source), "update-ref", "refs/remotes/origin/pr/7/head", newer)
+        .returncode
+        == 0
+    )
+    assert _git("-C", str(source), "checkout", "-q", "-").returncode == 0
+    for number in range(100, 130):
+        _commit_on_pr_ref(source, number, f"pr-{number}.txt")
+    root = tmp_path / "root"
+    root.mkdir()
+    monkeypatch.setattr(agent_runner, "principal_workspace_root", lambda: root)
+    target, failure, _ = handlers_module._read_only_isolated_checkout(
+        source, pin_sha=older
+    )
+    assert failure is None and target is not None
+    assert _git("-C", str(target), "rev-parse", "HEAD").stdout.strip() == older
+    loose = target / ".git" / "refs" / "remotes" / "source-pr"
+    loose_dirs = [p for p in loose.iterdir() if p.is_dir()] if loose.exists() else []
+    assert loose_dirs == [], loose_dirs
+    handlers_module._remove_read_only_isolated_checkout(target)

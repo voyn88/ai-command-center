@@ -1,0 +1,15 @@
+[Unit]
+Description=AICC preprod PostgreSQL SSH tunnel
+After=network-online.target tailscaled.service
+Wants=network-online.target tailscaled.service
+
+[Service]
+Type=simple
+User=aicc-worker
+EnvironmentFile=/etc/aicc/pgtunnel.env
+ExecStart=/usr/bin/ssh -NT -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=yes -L 127.0.0.1:5433:127.0.0.1:5433 ${AICC_CONTROL_SSH_TARGET}
+Restart=always
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

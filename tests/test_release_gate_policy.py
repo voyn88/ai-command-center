@@ -2,19 +2,48 @@
 
 from __future__ import annotations
 
+import os
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
 import yaml
 
-
 ROOT = Path(__file__).resolve().parents[1]
 CI_WORKFLOW = ROOT / ".github/workflows/ci.yml"
 BOUNDARY_WORKFLOW = ROOT / ".github/workflows/arch-fitness.yml"
 
+LABEL_NOISE = (
+    "github.event_name == 'pull_request' && (github.event.action == 'labeled' "
+    "|| github.event.action == 'unlabeled') && !startsWith(github.event.label.name, "
+    "'release-gate-canary-') && !(github.event.action == 'labeled' && "
+    "(github.event.label.name == 'review-window:active' || github.event.label.name == 'queue-active'))"
+)
+OUTSIDE_WINDOW = (
+    "github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, "
+    "'review-window:active') && !contains(github.event.pull_request.labels.*.name, 'queue-active') "
+    "&& !startsWith(github.event.label.name, 'release-gate-canary-')"
+)
+#: The guard every gated job negates: label noise OR outside the review window.
+LABEL_NOISE_GUARD = f"({LABEL_NOISE}) || ({OUTSIDE_WINDOW})"
+
+
+def _context_name(job: dict) -> str:
+    """The check-run name a non-noise run reports. Required-context jobs carry
+    the label-noise rename (see test_label_noise_never_cancels_or_reruns_the_head_gates)."""
+    name = job["name"]
+    prefix = "${{ (" + LABEL_NOISE_GUARD + ") && 'Gate not run (label noise or outside review window)' || '"
+    if name.startswith(prefix) and name.endswith("' }}"):
+        return name[len(prefix):-len("' }}")]
+    return name
+
+
 EXPECTED_CONTEXTS = {
-    "quality-gates": "Quality gates (whitespace · Ruff · compile · pytest)",
+    "prepare": "Prepare CI shared inputs",
+    "quality-gates": "Linux quality shard ${{ matrix.shard }} of 4",
+    "manifest-gate": "Linux manifest gate (exactly once)",
+    "coverage-gate": "Main coverage aggregation",
     "windows-quality-gates": "Windows quality gates (Ruff · compile · pytest)",
     "security-gates": "Security gates (workflow policy · provenance · supply chain)",
     "build-gates": "Build gates (web production)",
@@ -28,14 +57,26 @@ EXPECTED_CONTEXTS = {
 }
 
 EXPECTED_STEPS = {
-    # The required test gate runs as a parallel body (pytest-xdist) plus a short
-    # serial tail; both together run every test exactly once.
+    # Four fixed shards run the core partition while exactly one matrix member
+    # owns each non-parallel partition. The manifest gate proves the nodeid
+    # union is non-empty and exactly-once before Final can pass.
     "quality-gates": {
-        "Pytest + coverage (parallel)",
+        "Pytest core shard",
         "Pytest (serial tail)",
         "Real-browser E2E",
+        "Publish actual test collection receipt",
     },
-    "impact-fast-check": {"Select impacted tests", "Run impacted tests (parallel)"},
+    "prepare": {
+        "Fetch and verify exact accepted AIOS SDK and DB artifacts",
+        "Build exactly-once test manifest",
+        "Publish prepared SDK, DB, and test manifest",
+    },
+    "manifest-gate": {"Verify actual collections equal planned partition"},
+    "coverage-gate": {"PR and merge-group coverage policy"},
+    "impact-fast-check": {
+        "Select impacted tests",
+        "Run impacted tests (parallel body + serial tail)",
+    },
     "windows-quality-gates": {"Desktop pytest-qt suite", "Real-browser E2E"},
     "security-gates": {
         "Release gate policy",
@@ -117,7 +158,12 @@ def test_release_context_names_and_workflow_coverage_are_exact() -> None:
 
     assert set(ci["jobs"]) == set(EXPECTED_CONTEXTS) - {"boundary-fitness"}
     assert set(boundary["jobs"]) == {"boundary-fitness"}
-    assert {job_id: job["name"] for job_id, job in jobs.items()} == EXPECTED_CONTEXTS
+    assert {job_id: _context_name(job) for job_id, job in jobs.items()} == EXPECTED_CONTEXTS
+    assert ci["jobs"]["quality-gates"]["needs"] == "prepare"
+    assert set(ci["jobs"]["manifest-gate"]["needs"]) == {
+        "prepare",
+        "quality-gates",
+    }
 
     # The exact trigger set, and it is a security statement rather than
     # bookkeeping: every entry here is a context in which these gates run with
@@ -174,6 +220,144 @@ def test_release_context_names_and_workflow_coverage_are_exact() -> None:
     for job_id, required_steps in EXPECTED_STEPS.items():
         step_names = {step.get("name") for step in jobs[job_id]["steps"]}
         assert required_steps <= step_names
+
+
+def test_impact_fast_check_uses_the_mandatory_two_phase_serial_split() -> None:
+    impact = _workflow(CI_WORKFLOW)["jobs"]["impact-fast-check"]
+    (step,) = [
+        step
+        for step in impact["steps"]
+        if step.get("name") == "Run impacted tests (parallel body + serial tail)"
+    ]
+    command = step["run"]
+
+    assert 'run_phase -q -m "not serial" -n auto --dist loadscope' in command
+    assert "run_phase -q -m serial -p no:xdist" in command
+    assert 'if [ "$rc" -eq 5 ]' in command
+    assert 'if [ "${#selected[@]}" -eq 0 ]' in command
+    assert 'read -r path || [ -n "$path" ]' in command
+    assert '[ -n "$path" ] && selected+=("$path")' in command
+    assert "xargs" not in "\n".join(
+        line for line in command.splitlines() if not line.lstrip().startswith("#")
+    )
+
+
+def test_deploy_only_fast_path_covers_pr_window_unit_policy_changes() -> None:
+    ci = _workflow(CI_WORKFLOW)
+    prepare_steps = ci["jobs"]["prepare"]["steps"]
+    (scope_step,) = [
+        step for step in prepare_steps if step.get("id") == "change-scope"
+    ]
+    scope_command = scope_step["run"]
+
+    for path in (
+        "deploy/systemd/voyn-aicc-merge\\.(service|timer)",
+        "deploy/systemd/voyn-aicc-pr-window\\.service",
+        "deploy/systemd/voyn-aicc-review\\.(service|timer)",
+        "tests/ops/test_agent_principal_isolation\\.py",
+    ):
+        assert path in scope_command
+
+    quality = ci["jobs"]["quality-gates"]
+    (fast_step,) = [
+        step
+        for step in quality["steps"]
+        if step.get("name") == "Deploy-only fast path"
+    ]
+    fast_command = fast_step["run"]
+
+    assert "tests/ops/test_agent_principal_isolation.py" in fast_command
+    assert (
+        "test_the_pr_window_unit_carries_no_host_layout_of_its_own"
+        in fast_command
+    )
+    assert "test_the_review_and_merge_units_are_immutable_control_ticks" in fast_command
+    assert "test_the_control_profile_installs_the_pr_window_tick" in fast_command
+
+
+def _impact_script() -> str:
+    impact = _workflow(CI_WORKFLOW)["jobs"]["impact-fast-check"]
+    (step,) = [
+        step
+        for step in impact["steps"]
+        if step.get("name") == "Run impacted tests (parallel body + serial tail)"
+    ]
+    return step["run"]
+
+
+def _run_impact_script(
+    tmp_path: Path, selection: str, *, parallel_rc: int = 0, serial_rc: int = 0
+) -> tuple[subprocess.CompletedProcess[str], str]:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    calls = tmp_path / "pytest-calls.txt"
+    fake_pytest = bin_dir / "pytest"
+    fake_pytest.write_text(
+        """#!/usr/bin/env bash
+printf 'CALL\\n' >> "$PYTEST_CALLS"
+printf '<%s>\\n' "$@" >> "$PYTEST_CALLS"
+if [[ " $* " == *' -m not serial '* ]]; then
+  exit "$PARALLEL_RC"
+fi
+exit "$SERIAL_RC"
+""",
+        encoding="utf-8",
+    )
+    fake_pytest.chmod(0o755)
+    (tmp_path / "selected-tests.txt").write_text(selection, encoding="utf-8", newline="\n")
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+        "PYTEST_CALLS": str(calls),
+        "PARALLEL_RC": str(parallel_rc),
+        "SERIAL_RC": str(serial_rc),
+    }
+    result = subprocess.run(
+        ["bash", "-eo", "pipefail", "-c", _impact_script()],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result, calls.read_text(encoding="utf-8") if calls.exists() else ""
+
+
+def test_impact_script_keeps_unterminated_last_path_and_skips_blank_lines(
+    tmp_path: Path,
+) -> None:
+    result, calls = _run_impact_script(
+        tmp_path, "tests/first.py\n\ntests/last.py"
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert calls.count("CALL\n") == 2
+    assert calls.count("<tests/first.py>\n") == 2
+    assert calls.count("<tests/last.py>\n") == 2
+    assert "<>" not in calls
+
+
+def test_impact_script_neutralizes_only_no_tests_collected(tmp_path: Path) -> None:
+    no_tests, calls = _run_impact_script(
+        tmp_path, "tests/only.py\n", parallel_rc=5, serial_rc=5
+    )
+    assert no_tests.returncode == 0
+    assert calls.count("CALL\n") == 2
+
+    failed_dir = tmp_path / "failed"
+    failed_dir.mkdir()
+    failed, failed_calls = _run_impact_script(
+        failed_dir, "tests/only.py\n", parallel_rc=1
+    )
+    assert failed.returncode == 1
+    assert failed_calls.count("CALL\n") == 1
+
+
+def test_impact_script_refuses_an_empty_selection(tmp_path: Path) -> None:
+    result, calls = _run_impact_script(tmp_path, "\n\n")
+
+    assert result.returncode == 1
+    assert calls == ""
 
 
 SECRET_REFERENCE = re.compile(r"\$\{\{\s*secrets\.([A-Za-z_][A-Za-z0-9_]*)[^}]*\}\}")
@@ -257,7 +441,9 @@ def test_every_step_holding_a_repository_secret_first_proves_its_code_is_ours() 
             offenders.append((path.name, job_id, step.get("name"), first))
             continue
         if "GITHUB_TOKEN" not in _secret_names(step.get("env", {})):
-            offenders.append((path.name, job_id, step.get("name"), "guard has no GITHUB_TOKEN"))
+            offenders.append(
+                (path.name, job_id, step.get("name"), "guard has no GITHUB_TOKEN")
+            )
     assert not offenders, (
         "steps receive a repository secret without first proving the checked-out "
         f"code was authored here: {offenders}"
@@ -281,7 +467,9 @@ def test_a_refused_guard_actually_stops_the_step() -> None:
         if shell in ABORTING_SHELLS:
             continue
         inherited = ((job.get("defaults") or {}).get("run") or {}).get("shell")
-        offenders.append((path.name, job_id, step.get("name"), shell or f"inherited:{inherited}"))
+        offenders.append(
+            (path.name, job_id, step.get("name"), shell or f"inherited:{inherited}")
+        )
     assert not offenders, (
         "steps hand over a repository secret under a shell that does not abort on the "
         f"guard's refusal; declare `shell: bash`: {offenders}"
@@ -307,7 +495,10 @@ def test_repository_secrets_are_never_scoped_wider_than_a_single_step() -> None:
             if job.get("uses"):
                 passed = job.get("secrets")
                 assert passed != "inherit", (path.name, job_id, "secrets: inherit")
-                assert not _secret_names(passed or {}) - EPHEMERAL_SECRETS, (path.name, job_id)
+                assert not _secret_names(passed or {}) - EPHEMERAL_SECRETS, (
+                    path.name,
+                    job_id,
+                )
 
 
 def test_the_trust_guard_exists_where_the_workflows_expect_it() -> None:
@@ -370,7 +561,7 @@ def test_a_new_workflow_with_merge_group_and_unguarded_secret_fails_the_suite(
     suite stayed green (`10 passed, 1 skipped`). Enumeration from the directory
     must make that file fail the guard check.
     """
-    import tests.test_release_gate_policy as policy
+    import tests.test_release_gate_policy as policy  # noqa: PLW0406 -- patch module globals
 
     workflows = tmp_path / ".github" / "workflows"
     workflows.mkdir(parents=True)
@@ -405,7 +596,7 @@ def test_a_new_merge_group_workflow_with_an_unpinned_action_fails_sha_pin(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """SHA pinning follows the directory too, not the two known filenames."""
-    import tests.test_release_gate_policy as policy
+    import tests.test_release_gate_policy as policy  # noqa: PLW0406 -- patch module globals
 
     workflows = tmp_path / ".github" / "workflows"
     workflows.mkdir(parents=True)
@@ -421,10 +612,14 @@ def test_a_new_merge_group_workflow_with_an_unpinned_action_fails_sha_pin(
 
 def test_every_required_context_has_a_deliberate_failure_canary() -> None:
     jobs = _all_jobs()
-    for job_id in CANARY_LABELS:
+    for job_id, canary_label in CANARY_LABELS.items():
         job = jobs[job_id]
-        (canary,) = [step for step in job["steps"] if step.get("name") == "Deliberate failure canary"]
-        assert CANARY_LABELS[job_id] in canary["if"]
+        (canary,) = [
+            step
+            for step in job["steps"]
+            if step.get("name") == "Deliberate failure canary"
+        ]
+        assert canary_label in canary["if"]
         assert canary["run"].strip() == "exit 1"
 
 
@@ -439,16 +634,22 @@ def test_final_gate_is_fail_closed_for_every_upstream_result() -> None:
     final_gate = _workflow(CI_WORKFLOW)["jobs"]["final-gate"]
     required = {
         "quality-gates",
+        "manifest-gate",
+        "coverage-gate",
         "windows-quality-gates",
         "security-gates",
         "build-gates",
     }
 
-    assert final_gate["if"] == "always()"
+    # `always()` so every upstream result is asserted; the label-noise guard
+    # only skips the whole run for a `queue-*` label event (see below).
+    assert final_gate["if"] == "${{ always() && !(" + LABEL_NOISE_GUARD + ") }}"
     assert set(final_gate["needs"]) == required
 
     (assertion_step,) = [
-        step for step in final_gate["steps"] if step.get("name") == "Assert required checks"
+        step
+        for step in final_gate["steps"]
+        if step.get("name") == "Assert required checks"
     ]
     script = assertion_step["run"]
     for job_id in required:
@@ -463,3 +664,58 @@ def test_final_gate_is_fail_closed_for_every_upstream_result() -> None:
         for negative_result in ("failure", "cancelled", "skipped"):
             results = success | {job_id: negative_result}
             assert not accepted(results), (job_id, negative_result)
+
+
+
+def test_label_noise_never_cancels_or_reruns_the_head_gates():
+    """VOYN-W0-AICC-CI-SELF-CANCEL-SAME-SHA: `labeled`/`unlabeled` stay in the
+    trigger set for the `release-gate-canary-*` labels, but the queue
+    reconciler and operators move `queue-*` labels constantly. Reproduced
+    3x on 2026-09-06 (PRs 649, 672, 762) and all night 2026-09-07/08: every
+    label change started a second run on the same SHA inside the same
+    concurrency group, `cancel-in-progress` killed the live run, its
+    `always()` jobs then held the group so the replacement sat `pending`,
+    and the cancelled check-runs left every window PR `checks_not_green`.
+
+    A noise run therefore (1) gets a group of its own, (2) skips every job,
+    and (3) renames the required-context job so a skipped job under the real
+    name (which GitHub counts as success) can never mask a failed head."""
+    for workflow_name, required_job in (
+        ("ci.yml", "final-gate"),
+        ("acceptance-gate.yml", "acceptance-gate"),
+        ("arch-fitness.yml", "boundary-fitness"),
+    ):
+        workflow = _workflow(ROOT / ".github/workflows" / workflow_name)
+        # The group is exactly the pre-existing key plus the noise suffix: a
+        # noise run gets its own run id as group, every other run shares the
+        # head's group as before.
+        group = workflow["concurrency"]["group"]
+        assert group.endswith(
+            f"-${{{{ ({LABEL_NOISE_GUARD}) && github.run_id || 'head' }}}}"
+        ), (workflow_name, group)
+        # Every job's condition is one of three exact forms, all of which are
+        # `<prior condition> && !(guard)`: the guard is the outermost
+        # conjunct, so a true guard skips the job whatever the prior term
+        # says. A substring check would also pass `x || !(guard)`, which does
+        # not skip on noise (adversarial review on 47ff7d9c).
+        allowed = {
+            f"${{{{ !({LABEL_NOISE_GUARD}) }}}}",
+            f"${{{{ always() && !({LABEL_NOISE_GUARD}) }}}}",
+            f"${{{{ github.event_name == 'pull_request' && !({LABEL_NOISE_GUARD}) }}}}",
+        }
+        for job_id, job in workflow["jobs"].items():
+            assert str(job.get("if", "")) in allowed, (workflow_name, job_id, job.get("if"))
+        # The required context is renamed only on a noise run, and only to the
+        # no-op name; on every other run it is exactly the name branch
+        # protection requires.
+        required_name = workflow["jobs"][required_job]["name"]
+        real_name = EXPECTED_CONTEXTS.get(required_job) or {
+            "acceptance-gate": "Acceptance gate (independent verdict on exact SHA)",
+        }[required_job]
+        assert required_name == (
+            f"${{{{ ({LABEL_NOISE_GUARD}) && 'Gate not run (label noise or outside review window)' || '{real_name}' }}}}"
+        ), (workflow_name, required_name)
+    # Never traded for dropping the canary triggers: the release-gate canaries
+    # still need a fresh event carrying the label.
+    ci = _workflow(CI_WORKFLOW)
+    assert {"labeled", "unlabeled"} <= set(ci["on"]["pull_request"]["types"])

@@ -26,12 +26,12 @@ def _force_available(monkeypatch):
     monkeypatch.setattr(providers.CopilotProvider, "availability", lambda self: avail)
 
 
-def _launch(tmp_path, **kwargs):
+def _launch(tmp_path, *, task_type="implementation", **kwargs):
     return providers.CopilotProvider().build_launch(
         repository_path=tmp_path,
         session_id="s",
         prompt="p",
-        task_type="implementation",
+        task_type=task_type,
         is_resume=False,
         model=None,
         **kwargs,
@@ -54,3 +54,12 @@ def test_copilot_untrusted_but_operator_elevated_launches(tmp_path, monkeypatch)
     _force_available(monkeypatch)
     spec = _launch(tmp_path, untrusted=True, operator_elevated=True)
     assert "--allow-all-tools" in list(spec.argv)
+
+
+def test_copilot_untrusted_independent_review_is_model_only(tmp_path, monkeypatch):
+    _force_available(monkeypatch)
+    spec = _launch(tmp_path, task_type="independent_review", untrusted=True)
+
+    assert "--available-tools=" in spec.argv
+    assert "--allow-all-tools" not in spec.argv
+    assert "--allow-tool" not in spec.argv
