@@ -1205,6 +1205,8 @@ def test_grok_driver_installs_from_release_as_worker_only_helper(tmp_path):
     assert driver.source == repo / "ops/aicc_grok_agent.py"
     assert (driver.mode, driver.uid, driver.gid) == (0o755, 0, 0)
     assert driver.target in module.WORKER_ONLY_TARGETS
+    targets = list(specs)
+    assert targets.index(driver.target) < targets.index("/usr/libexec/aicc-agent-launcher")
 
 
 def test_recovery_generator_is_a_permanent_pretransaction_anchor(tmp_path):
