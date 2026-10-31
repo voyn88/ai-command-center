@@ -320,9 +320,9 @@ def test_the_control_plane_cannot_claim() -> None:
         # VOYN-W0-AICC-BACKLOG-PG-CANONICAL-GATE (0020): the importer's stamp
         # of where a migrated row came from.
         "backlog_record_provenance",
-        # 0029: explicit human decisions on parked tasks.
-        "backlog_owner_decision",
+        # 0029: bounded row lock and audited owner decision, no table UPDATE.
         "backlog_owner_lock",
+        "backlog_owner_decision",
     }
 
 
