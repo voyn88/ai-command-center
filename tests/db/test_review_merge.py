@@ -2374,21 +2374,27 @@ def test_failed_checks_on_an_accepted_head_get_one_bounded_rerun(rig, monkeypatc
             return sp.CompletedProcess(argv, 0, body, "")
         if argv[:2] == ["run", "list"]:
             return sp.CompletedProcess(argv, 0, json.dumps([
-                {"databaseId": 11, "headSha": head, "status": "completed",
+                {"workflowName": "CI", "createdAt": "2026-10-31T01:00:00Z",
+                 "databaseId": 11, "headSha": head, "status": "completed",
                  "conclusion": "failure", "attempt": 1},
-                {"databaseId": 12, "headSha": head, "status": "completed",
+                {"workflowName": "Lint", "createdAt": "2026-10-31T01:00:00Z",
+                 "databaseId": 12, "headSha": head, "status": "completed",
                  "conclusion": "failure", "attempt": 2},
-                {"databaseId": 13, "headSha": "7" * 40, "status": "completed",
+                {"workflowName": "Other-head", "createdAt": "2026-10-31T01:00:00Z",
+                 "databaseId": 13, "headSha": "7" * 40, "status": "completed",
                  "conclusion": "failure", "attempt": 1},
-                {"databaseId": 14, "headSha": head, "status": "in_progress",
+                {"workflowName": "Build", "createdAt": "2026-10-31T01:00:00Z",
+                 "databaseId": 14, "headSha": head, "status": "in_progress",
                  "conclusion": None, "attempt": 1},
                 # Concurrency-cancelled required run: strands the head out
                 # of the merge queue exactly like a failure (live: PR #602)
                 # and must get a FULL rerun -- `--failed` would rerun
                 # nothing, a cancelled run has no failed jobs.
-                {"databaseId": 15, "headSha": head, "status": "completed",
+                {"workflowName": "Acceptance", "createdAt": "2026-10-31T01:00:00Z",
+                 "databaseId": 15, "headSha": head, "status": "completed",
                  "conclusion": "cancelled", "attempt": 1},
-                {"databaseId": 16, "headSha": head, "status": "completed",
+                {"workflowName": "Deploy", "createdAt": "2026-10-31T01:00:00Z",
+                 "databaseId": 16, "headSha": head, "status": "completed",
                  "conclusion": "cancelled", "attempt": 2},
             ]), "")
         if argv[:2] == ["run", "rerun"]:

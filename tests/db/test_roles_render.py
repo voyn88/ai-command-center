@@ -299,6 +299,8 @@ def test_the_control_plane_cannot_claim() -> None:
         # scan cursor for the tick windows.
         "backlog_scan_claim",
         "backlog_triage",
+        # 0030: clear proven malformed evidence through the audited function.
+        "backlog_clear_evidence",
         # 0021: read-only deploy preflight with dispatch's privileges; the
         # task-class setter (split children, monitor tasks); and the
         # monitor-finding pair the control-host probe uses.

@@ -668,7 +668,7 @@ _REVIEW_INPUT_MARKER = "\nINPUT_ENVELOPE_JSON:\n"
 _MAX_REVIEW_PROMPT_BYTES = 16_000
 _MAX_REVIEW_DIFF_BYTES = 8 * 1024 * 1024
 
-_PR_URL = re.compile(r"^https://github\.com/([^/]+)/([^/]+)/pull/(\d+)$")
+_PR_URL = re.compile(r"https://github\.com/([A-Za-z0-9][A-Za-z0-9-]*)/([A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)")
 
 # Bumped whenever _REVIEW_PROMPT's contract changes in a way that makes an
 # old verdict untrustworthy under the new policy (e.g. what the agent is
@@ -709,7 +709,7 @@ def _verification_review_cascade() -> list[dict[str, Any]]:
 
 
 def _repo_from_pr_url(pr_url: str) -> str | None:
-    match = _PR_URL.match(pr_url)
+    match = _PR_URL.fullmatch(pr_url)
     return match.group(2) if match else None
 
 
@@ -717,10 +717,32 @@ def _owner_repo_number_from_pr_url(pr_url: str) -> tuple[str, str, str] | None:
     """(owner, repo, pr_number) for the GitHub REST API path -- unlike
     `_repo_from_pr_url` (only the repo name, for the review-cycle key), the
     bot-identity marker post below needs the owner too."""
-    match = _PR_URL.match(pr_url)
+    match = _PR_URL.fullmatch(pr_url)
     if match is None:
         return None
     return match.group(1), match.group(2), match.group(3)
+
+
+def _clear_pr_evidence(factory: Any, task_id: str, pr_url: str, reason: str) -> str:
+    """Remove a 'pr' evidence row this tick has already proven can never
+    resolve (VOYN-W0-AICC-REPO-ROUTE-AND-EVIDENCE-HYGIENE) -- e.g. not even
+    shaped like a GitHub PR URL. `backlog_clear_evidence` is idempotent (a
+    row another tick already cleared is `already_absent`, not an error) and,
+    if this was the task's last 'pr' row, sends a READY_TO_REVIEW task back
+    for a fresh attempt itself; the returned verdict reason is folded into
+    the caller's own skip line rather than re-derived here.
+
+    Transient GitHub lookup failures must never call this -- only values
+    proven unresolvable without a successful API response (malformed shape).
+    Merged PRs without acceptance evidence stay skipped as
+    `merged_without_acceptance_evidence` and are never cleared to DONE here.
+    """
+    rows = _rows(
+        factory,
+        "SELECT reason FROM backlog_clear_evidence(%s, 'pr', %s, %s)",
+        (task_id, pr_url, reason),
+    )
+    return rows[0][0] if rows else "unknown"
 
 
 @dataclass(frozen=True, slots=True)
@@ -753,7 +775,7 @@ def _review_key(task_id: str, pr_url: str, snapshot: _PRSnapshot) -> str | None:
     overwritten. Returns None if `pr_url` doesn't parse (caller already
     validates this via `_repo_from_pr_url` before reaching here in
     practice, but a malformed URL must never produce a malformed key)."""
-    match = _PR_URL.match(pr_url)
+    match = _PR_URL.fullmatch(pr_url)
     if (match is None or not re.fullmatch(r"[0-9a-f]{40}", snapshot.base)
             or not re.fullmatch(r"[0-9a-f]{40}", snapshot.head)
             or not re.fullmatch(r"[0-9a-f]{64}", snapshot.digest)):
@@ -1501,7 +1523,17 @@ def _review_once(
             report.skipped.append((task_id, "no_review_executor_route"))
             continue
         repo = _repo_from_pr_url(pr_url)
-        route = repo_route(repo) if repo else None
+        if repo is None:
+            # Not even shaped like a GitHub PR URL -- can never resolve
+            # through any gh call below, so there is nothing to retry
+            # (VOYN-W0-AICC-REPO-ROUTE-AND-EVIDENCE-HYGIENE). A shape-valid
+            # URL whose repo simply has no route table entry is left alone
+            # below: that is an operator fact (add the route), not bogus
+            # evidence.
+            verdict = _clear_pr_evidence(factory, task_id, pr_url, "malformed_pr_url")
+            report.skipped.append((task_id, f"malformed_pr_url:{verdict}: {pr_url!r}"))
+            continue
+        route = repo_route(repo)
         if route is None:
             report.skipped.append((task_id, f"no_repo_route: {pr_url!r}"))
             continue
@@ -2598,6 +2630,14 @@ def publish_review_verdicts(
             break
         prev_processed = last_processed
         last_processed = (task_id, pr_url)
+        if _repo_from_pr_url(pr_url) is None:
+            # Same shape gate as review_once -- a malformed pr_url would
+            # otherwise fail `gh pr view` and read as an ordinary
+            # `pr_view_failed`, retried forever alongside genuine transient
+            # lookup failures (VOYN-W0-AICC-REPO-ROUTE-AND-EVIDENCE-HYGIENE).
+            verdict = _clear_pr_evidence(factory, task_id, pr_url, "malformed_pr_url")
+            report.skipped.append((task_id, f"malformed_pr_url:{verdict}: {pr_url!r}"))
+            continue
         window = _pr_window_expensive_read_decision(
             repo_path, pr_url, prefix="review_window"
         )
@@ -2791,7 +2831,8 @@ def _check_is_pending(check: dict[str, Any]) -> bool:
     (`conclusion: AMBIGUOUS`, synthesised by `_latest_checks_by_name`) is
     deliberately not pending: two disagreeing runs are a verdict problem,
     not a timing one."""
-    if check.get("conclusion") is not None:
+    # gh GraphQL serializes an unfinished CheckRun as either null or "".
+    if check.get("conclusion") not in (None, ""):
         return False
     status = check.get("status")
     if status is not None:
@@ -2888,7 +2929,7 @@ def _pr_is_mergeable(
         if not _check_is_green(c) and not _check_is_pending(c)
     ]
     if red:
-        rerun = _rerun_cancelled_latest_runs(repo_path, rollup)
+        rerun = _rerun_cancelled_latest_runs(repo_path, rollup, head)
         if rerun:
             return False, f"checks_cancelled_rerun_requested: {rerun[:3]}"
         return False, f"checks_not_green: {red[:3]}"
@@ -2899,13 +2940,9 @@ def _pr_is_mergeable(
     missing = [name for name in required_checks if name not in present]
     if missing:
         return False, f"checks_missing: {missing[:3]}"
-    rerun, stale_duplicate = _rerun_stale_duplicate_red_runs(
-        repo_path, raw_rollup, required_checks
-    )
-    if rerun:
-        return False, f"stale_duplicate_checks_rerun_requested: {rerun[:3]}"
-    if stale_duplicate:
-        return False, "stale_duplicate_checks_unresolved"
+    # Superseded failures are not retry candidates. Re-running them can
+    # cancel their successful or pending replacements through workflow
+    # concurrency. GitHub's native merge protection remains authoritative.
     return True, head
 
 
@@ -2922,115 +2959,78 @@ _MAX_RUN_ATTEMPTS_FOR_RERUN = 3
 _RUN_ID_IN_DETAILS_URL = re.compile(r"/actions/runs/(\d+)(?:/|$)")
 
 
+def _latest_workflow_runs(repo_path: str, head: str) -> list[dict[str, Any]]:
+    """Select one newest run per workflow on this exact head before retrying.
+
+    A job rollup can still show an old cancelled check while a replacement
+    workflow has not emitted that job yet. Workflow-level state is therefore
+    needed even after `_latest_checks_by_name`. Missing metadata means no
+    retry, never permission to rerun an arbitrary historical failure. A
+    newer skipped label-noise run also suppresses old retries conservatively;
+    GitHub protection, not retrying history, decides whether merge can proceed.
+    """
+    if not re.fullmatch(r"[0-9a-f]{40}", head):
+        return []
+    listing = _gh(
+        ["run", "list", "--commit", head, "--limit", "100", "--json",
+         "databaseId,headSha,workflowName,createdAt,status,conclusion,attempt"],
+        repo_path,
+    )
+    if listing.returncode != 0:
+        return []
+    try:
+        runs = json.loads(listing.stdout or "[]")
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(runs, list):
+        return []
+    latest: dict[str, dict[str, Any]] = {}
+    for run in runs:
+        if not isinstance(run, dict):
+            return []
+        if run.get("headSha") != head:
+            continue
+        name, created = run.get("workflowName"), run.get("createdAt")
+        run_id = run.get("databaseId")
+        if (not isinstance(name, str) or not name
+                or not isinstance(created, str) or not created
+                or not isinstance(run_id, int) or isinstance(run_id, bool)):
+            return []
+        previous = latest.get(name)
+        if previous is None or (created, run_id) > (
+            previous["createdAt"], previous["databaseId"]
+        ):
+            latest[name] = run
+    return list(latest.values())
+
+
 def _rerun_cancelled_latest_runs(
-    repo_path: str, latest_checks: list[dict[str, Any]]
+    repo_path: str, latest_checks: list[dict[str, Any]], head: str
 ) -> list[str]:
-    """Ask GitHub to rerun every workflow run whose LATEST check on the head
-    ended `CANCELLED`, at most `_MAX_RERUNS_PER_PR_PER_TICK` runs and only
-    while the run has fewer than `_MAX_RUN_ATTEMPTS_FOR_RERUN` attempts.
-    Returns the run ids a rerun was requested for. Idempotent by
-    construction: after the request the latest check is queued, not
-    cancelled, so the next tick does not ask again."""
-    run_ids: list[str] = []
+    """Retry only cancelled latest workflows, never their obsolete jobs."""
+    candidates = set()
     for check in latest_checks:
         if str(check.get("conclusion") or "").upper() != "CANCELLED":
             continue
         match = _RUN_ID_IN_DETAILS_URL.search(str(check.get("detailsUrl") or ""))
-        if match is None or match.group(1) in run_ids:
-            continue
-        run_ids.append(match.group(1))
+        if match is not None:
+            candidates.add(match.group(1))
+    if not candidates:
+        return []
     requested: list[str] = []
-    for run_id in run_ids:
+    for run in _latest_workflow_runs(repo_path, head):
+        run_id, attempt = str(run["databaseId"]), run.get("attempt")
+        if (run_id not in candidates or run.get("status") != "completed"
+                or run.get("conclusion") != "cancelled"
+                or not isinstance(attempt, int)
+                or not 1 <= attempt < _MAX_RUN_ATTEMPTS_FOR_RERUN):
+            continue
         if len(requested) >= _MAX_RERUNS_PER_PR_PER_TICK:
             break
-        view = _gh(["run", "view", run_id, "--json", "attempt"], repo_path)
-        if view.returncode != 0:
-            continue
-        try:
-            attempt = int((json.loads(view.stdout or "{}") or {}).get("attempt") or 0)
-        except (ValueError, TypeError, json.JSONDecodeError):
-            continue
-        if attempt >= _MAX_RUN_ATTEMPTS_FOR_RERUN:
-            continue
         rerun = _gh(["run", "rerun", run_id], repo_path)
         if rerun.returncode == 0:
             requested.append(run_id)
     return requested
-
-
-def _check_run_time(check: dict[str, Any]) -> str:
-    return str(check.get("startedAt") or check.get("completedAt") or "")
-
-
-def _rerun_stale_duplicate_red_runs(
-    repo_path: str,
-    rollup: list[dict[str, Any]],
-    required_checks: tuple[str, ...] = _DEFAULT_REQUIRED_MERGE_CHECKS,
-) -> tuple[list[str], bool]:
-    """Rerun older red duplicate workflow runs once a newer duplicate is green.
-
-    GitHub may keep old failed/cancelled check-runs on the same commit after a
-    label-churn or concurrency cancellation. `_latest_checks_by_name` correctly
-    treats the PR's latest check verdict as green, but GitHub's overall rollup
-    can still remain FAILURE until the old run is retried. Clean that stale
-    tail automatically, bounded by the same per-run attempt cap used for latest
-    cancelled checks.
-    """
-    required = set(required_checks)
-    by_name: dict[str, list[dict[str, Any]]] = {}
-    for check in rollup:
-        name = str(check.get("name") or "")
-        if name in required:
-            by_name.setdefault(name, []).append(check)
-
-    run_ids: list[tuple[str, str]] = []
-    for checks in by_name.values():
-        if len(checks) < 2:
-            continue
-        timed = [(check, _check_run_time(check)) for check in checks]
-        if any(not stamp for _check, stamp in timed):
-            continue
-        latest, latest_at = max(timed, key=lambda item: item[1])
-        if not _check_is_green(latest):
-            continue
-        latest_run = _RUN_ID_IN_DETAILS_URL.search(str(latest.get("detailsUrl") or ""))
-        latest_run_id = latest_run.group(1) if latest_run is not None else ""
-        for check, stamp in timed:
-            if stamp >= latest_at or _check_is_green(check):
-                continue
-            conclusion = str(check.get("conclusion") or "").upper()
-            if conclusion not in {"FAILURE", "CANCELLED", "TIMED_OUT"}:
-                continue
-            match = _RUN_ID_IN_DETAILS_URL.search(str(check.get("detailsUrl") or ""))
-            if match is None:
-                continue
-            run_id = match.group(1)
-            if run_id == latest_run_id:
-                continue
-            mode = "--failed" if conclusion == "FAILURE" else ""
-            if (run_id, mode) not in run_ids:
-                run_ids.append((run_id, mode))
-
-    requested: list[str] = []
-    for run_id, mode in run_ids:
-        if len(requested) >= _MAX_RERUNS_PER_PR_PER_TICK:
-            break
-        view = _gh(["run", "view", run_id, "--json", "attempt"], repo_path)
-        if view.returncode != 0:
-            continue
-        try:
-            attempt = int((json.loads(view.stdout or "{}") or {}).get("attempt") or 0)
-        except (ValueError, TypeError, json.JSONDecodeError):
-            continue
-        if attempt >= _MAX_RUN_ATTEMPTS_FOR_RERUN:
-            continue
-        argv = ["run", "rerun", run_id]
-        if mode:
-            argv.append(mode)
-        rerun = _gh(argv, repo_path)
-        if rerun.returncode == 0:
-            requested.append(run_id)
-    return requested, bool(run_ids)
 
 
 def _merge_state(repo_path: str, pr_url: str) -> str:
@@ -3172,7 +3172,7 @@ def _merged_target_sha(repo_path: str, pr_url: str) -> tuple[str | None, str]:
 
 def _rerun_failed_ci_once(repo_path: str, pr_url: str) -> str:
     """Bounded flake retry (VOYN-W0-AICC-CI-FLAKE-AUTO-RERUN): rerun the
-    FAILED jobs of completed-and-failed workflow runs on the PR's current
+    FAILED jobs of the newest completed-and-failed workflow on the current
     head, at most once per run -- GitHub's own run ``attempt`` counter is
     the bound (a run already at attempt >= 2 is never touched again), so a
     genuinely red change costs exactly one extra bounded rerun and can
@@ -3190,19 +3190,10 @@ def _rerun_failed_ci_once(repo_path: str, pr_url: str) -> str:
     branch, head = data.get("headRefName"), data.get("headRefOid")
     if not branch or not head:
         return ""
-    listing = _gh(
-        ["run", "list", "--branch", str(branch), "--limit", "20",
-         "--json", "databaseId,headSha,status,conclusion,attempt"],
-        repo_path,
-    )
-    if listing.returncode != 0:
-        return ""
-    try:
-        runs = json.loads(listing.stdout or "[]")
-    except json.JSONDecodeError:
-        return ""
     dispatched = 0
-    for run in runs if isinstance(runs, list) else []:
+    for run in _latest_workflow_runs(repo_path, str(head)):
+        if dispatched >= _MAX_RERUNS_PER_PR_PER_TICK:
+            break
         if (
             isinstance(run, dict)
             and run.get("headSha") == head
@@ -3797,6 +3788,13 @@ def _merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -
         if actions >= cfg.max_per_tick:
             break
         last_processed = (task_id, pr_url)
+        if _repo_from_pr_url(pr_url) is None:
+            # Same shape gate as review_once/publish_review_verdicts -- a
+            # malformed pr_url fails every `gh pr view` below identically
+            # forever otherwise (VOYN-W0-AICC-REPO-ROUTE-AND-EVIDENCE-HYGIENE).
+            verdict = _clear_pr_evidence(factory, task_id, pr_url, "malformed_pr_url")
+            report.skipped.append((task_id, f"malformed_pr_url:{verdict}: {pr_url!r}"))
+            continue
         # Readiness FIRST: only a PR that already carries an independent ACCEPT
         # marker on its head with green required checks is the merge tick's
         # business. An un-accepted or failing PR is reviewed by the review tick
@@ -4322,7 +4320,7 @@ def _check_is_red_for_window(check: dict[str, Any]) -> bool:
     a check has actually completed red.
     """
     conclusion = check.get("conclusion")
-    if conclusion is not None:
+    if conclusion not in (None, ""):
         return str(conclusion).upper() not in ("SUCCESS", "NEUTRAL", "SKIPPED")
     state = check.get("state")
     if state is not None:

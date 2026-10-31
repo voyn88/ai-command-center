@@ -583,6 +583,8 @@ _APP_BACKLOG_FUNCTIONS = (
     "backlog_scan_claim(text, text, text)",
     # Triage of raw findings (0008): UNTRIAGED -> OPEN/NEEDS_REFINEMENT/DONE/DECIDED.
     "backlog_triage(text, text, text)",
+    # Evidence hygiene (0030): remove proven malformed PR evidence.
+    "backlog_clear_evidence(text, text, text, text)",
     # 0021: read-only deploy preflight with dispatch's privileges; the task
     # class setter the planner uses for split children and monitor tasks; the
     # monitor-finding record/clear pair (shared with worker hosts, see

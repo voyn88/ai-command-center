@@ -27,7 +27,13 @@ from typing import Any
 from command_center.orchestrator.routing import cascade_for
 from command_center.worker.payloads import AGENT_RUN_SCHEMA_VERSION
 
-__all__ = ["PlanLimits", "PlanReport", "plan_once"]
+__all__ = [
+    "PlanLimits",
+    "PlanReport",
+    "RepoRouteAudit",
+    "audit_repo_routes",
+    "plan_once",
+]
 
 _PLANNER_AUTHORITY = "planner:global"
 
@@ -503,3 +509,44 @@ class Planner:
 
 def plan_once(connection_factory: Any, limits: PlanLimits = PlanLimits()) -> PlanReport:
     return Planner(connection_factory).plan_once(limits)
+
+
+@dataclass(slots=True)
+class RepoRouteAudit:
+    """Read-only route inventory; gaps require configuration reconciliation."""
+
+    #: (task_id, repo or "") — OPEN, kind='task', repo missing or unrouted.
+    open_unrouted: list[tuple[str, str]] = field(default_factory=list)
+    #: (task_id, repo or "") — READY_TO_REVIEW, repo missing or unrouted.
+    ready_to_review_unrouted: list[tuple[str, str]] = field(default_factory=list)
+
+
+def audit_repo_routes(connection_factory: Any) -> RepoRouteAudit:
+    """Every OPEN or READY_TO_REVIEW task's repo, checked against the route
+    table `repo_route()` reads (VOYN-W0-AICC-REPO-ROUTE-AND-EVIDENCE-
+    HYGIENE). The planner and review ticks already refuse to act on an
+    unrouted repo rather than dead-lettering into one; this is the
+    complementary read the ticket asked for -- the operator's answer to
+    "which routes are actually missing," across both statuses in one pass,
+    without waiting for either tick's own report to surface it."""
+    audit = RepoRouteAudit()
+    with connection_factory() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT task_id, repo FROM backlog_task "
+            "WHERE kind = 'task' AND status = 'OPEN' "
+            "ORDER BY task_id"
+        )
+        open_rows = cur.fetchall()
+        cur.execute(
+            "SELECT task_id, repo FROM backlog_task "
+            "WHERE kind = 'task' AND status = 'READY_TO_REVIEW' "
+            "ORDER BY task_id"
+        )
+        review_rows = cur.fetchall()
+    for task_id, repo in open_rows:
+        if not repo or repo_route(repo) is None:
+            audit.open_unrouted.append((task_id, repo or ""))
+    for task_id, repo in review_rows:
+        if not repo or repo_route(repo) is None:
+            audit.ready_to_review_unrouted.append((task_id, repo or ""))
+    return audit
