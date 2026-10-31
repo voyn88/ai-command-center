@@ -2,7 +2,20 @@
   "schemaVersion":"1.0","revision":"fixture-001","generatedAt":"2026-08-24T00:00:00Z","freshness":"fresh",
   "tasks":[
     {"id":"VOYN-EXAMPLE-001","title":"Acceptance awaiting","blocker":null,"evidence":{"headSHA":"abc123","pullRequest":"#42","ci":"verified","acceptance":"pending","mergedSHA":null,"deployedSHA":null}},
-    {"id":"VOYN-EXAMPLE-002","title":"Evidence gap","blocker":"Canary has not been verified","evidence":{"headSHA":"def456","pullRequest":"#43","ci":"verified","acceptance":"verified","mergedSHA":"fedcba","deployedSHA":null}}
+    {"id":"VOYN-EXAMPLE-002","title":"Evidence gap","blocker":"Canary has not been verified","evidence":{"headSHA":"def456","pullRequest":"#43","ci":"verified","acceptance":"verified","mergedSHA":"fedcba","deployedSHA":null},
+      "story":{
+        "timeline":[
+          {"id":"step-1","occurredAt":"2026-08-23T22:00:00Z","headline":"Change merged into main"},
+          {"id":"step-2","occurredAt":"2026-08-23T23:00:00Z","headline":"Canary deployment started"},
+          {"id":"step-3","occurredAt":"2026-08-24T00:00:00Z","headline":"Canary verification did not confirm health"}
+        ],
+        "causeChain":[
+          {"cause":"the canary has not been verified","effect":"the release cannot be marked deployed"},
+          {"cause":"the release is not marked deployed","effect":"the change is not yet visible to customers"}
+        ],
+        "risk":"medium",
+        "riskExplanation":"No customer impact yet; the change is paused before rollout until canary health is confirmed."
+      }}
   ],
   "lanes":[{"id":"worker-01","state":"healthy","heartbeatAgeSeconds":3}],
   "events":[{"id":"evt-001","occurredAt":"2026-08-24T00:00:00Z","summary":"CI completed on exact head","correlationID":"VOYN-EXAMPLE-001"}]

@@ -86,6 +86,15 @@ UNMIRRORED_SCHEMA_TABLES: dict[str, Exclusion] = {
     # reconciliation path is the importer (backlog_store.import_markdown),
     # not the mirror machinery. One exclusion per table so a future table in
     # the family still has to sign in on its own.
+    "monitor_finding": Exclusion(
+        reason=(
+            "PostgreSQL-native control-plane state from birth (0021): what a "
+            "fail-closed monitor measured, written only through the SECURITY "
+            "DEFINER pair and consumed by the planner tick that files a task; "
+            "there is no SQLite incumbent and nothing to dual-write."
+        ),
+        task="VOYN-W0-AICC-PLANNER-AUTO-SPLIT-PIPELINE-TASKS",
+    ),
     "backlog_scan_cursor": Exclusion(
         reason=(
             "PostgreSQL-native tick-scheduler state from birth (0015): the "
