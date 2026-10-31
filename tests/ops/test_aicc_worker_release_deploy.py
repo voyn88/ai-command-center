@@ -112,6 +112,7 @@ def _deploy(module, cfg, *, previous: str | None = SHA_A, **kwargs):
         "hold_timers": lambda: None,
         "release_timers": lambda: None,
         "clear_pending": lambda: None,
+        "preflight": lambda *a, **k: None,
         "load_lanes": lambda *a, **k: (LANE_1,),
         "show": lambda unit, prop: "inactive" if prop == "ActiveState" else "",
     }
@@ -176,7 +177,7 @@ def test_deploy_calls_publish_verify_select_rollout_in_order(tmp_path):
     )
 
     assert report.outcome == "DEPLOYED"
-    assert report.steps[:4] == ["publish", "verify", "select", "rollout"]
+    assert report.steps[:5] == ["publish", "verify", "idle_preflight", "select", "rollout"]
     assert order == [
         "lock",
         f"publish:{SHA_B}",
@@ -644,24 +645,21 @@ def test_rollout_stop_uses_drain_budget_not_readiness_budget(monkeypatch):
 
     monkeypatch.setattr(module, "_run", run)
     ok, detail = module.rollout_active_lanes(
-        (LANE_1,), readiness_timeout=120, drain_timeout=3700,
+        (LANE_1,), readiness_timeout=120, drain_timeout=30,
         poll_interval=0.01, show=show,
     )
     assert (ok, detail) == (True, "ready:1")
-    assert calls == [(["systemctl", "stop", LANE_1], 3700),
-                     (["systemctl", "start", LANE_1], 150)]
+    assert calls == [(["systemctl", "stop", LANE_1], 30),
+                     (["systemctl", "start", LANE_1], 225)]
 
 
-def test_deploy_unit_allows_two_worker_drain_windows():
-    import re
+def test_deploy_budget_defers_busy_workers_instead_of_waiting_for_jobs():
     root = Path(__file__).parents[2]
-    worker = (root / "deploy/systemd/voyn-aicc-worker@.service").read_text()
     deploy = (root / "deploy/systemd/voyn-aicc-worker-release-deploy.service").read_text()
-    worker_stop = int(re.search(r"TimeoutStopSec=([0-9]+)s", worker).group(1))
-    deploy_total = int(re.search(r"TimeoutStartSec=([0-9]+)s", deploy).group(1))
     cfg = _module().DeployConfig()
-    assert cfg.drain_timeout > worker_stop
-    assert deploy_total >= 2 * (cfg.drain_timeout + 2 * cfg.readiness_timeout + 30) + 1200
+    assert cfg.drain_timeout == 30
+    assert "TimeoutStartSec=1800s" in deploy
+    assert 2 * (cfg.drain_timeout + 225 + cfg.readiness_timeout) + 300 < 1800
 
 
 def test_pending_release_prevents_false_noop_and_helper_refresh(tmp_path, monkeypatch):
@@ -740,3 +738,98 @@ def test_failed_rollback_is_reported_once_and_preserves_pending_recovery(tmp_pat
     assert report.detail.startswith("rollback_failed:stop_failed:lane2:")
     assert calls == [True]
     assert (cfg.state_dir / "pending-release").exists()
+
+@pytest.mark.parametrize("failure", ["busy", "legacy", "old_ack", "pid", "budget", "rotation"])
+def test_idle_preflight_refuses_before_select_and_resumes(tmp_path, failure):
+    module = _module()
+    cfg = _cfg(module, tmp_path)
+    signals, selected, released = [], [], []
+    now = [0.0]
+    status = ["aicc-drained-idle" if failure == "old_ack" else "aicc-ready"]
+    pid = ["42"]
+
+    def show(unit, prop):
+        if "credential-" in unit:
+            return "active" if failure == "rotation" else "inactive"
+        return {"ActiveState": "active", "SubState": "running",
+                "MainPID": pid[0], "StatusText": status[0]}[prop]
+
+    def signal(args):
+        signals.append(args)
+        if "--signal=SIGUSR1" in args:
+            status[0] = "aicc-drained" if failure == "legacy" else "aicc-ready"
+            if failure == "pid":
+                pid[0] = "43"
+        return SimpleNamespace(returncode=0)
+
+    def sleep(seconds):
+        now[0] += 31
+
+    def preflight(config, units, gated, **kwargs):
+        module.idle_preflight(config, units, gated, show=show, systemctl=signal,
+                              remaining=lambda _: 1 if failure == "budget" else 3600,
+                              clock=lambda: now[0], sleeper=sleep)
+
+    report = _deploy(module, cfg, show=show, stage=lambda *_: None,
+                     preflight=preflight, select=selected.append,
+                     resume=lambda gated, **kw: module.resume_gated_lanes(
+                         gated, show=show, systemctl=signal),
+                     release_timers=lambda: released.append(True))
+    assert report.outcome == "REFUSED"
+    assert not selected
+    assert released == [True]
+    assert any("--signal=SIGHUP" in args for args in signals) == (failure in {"busy", "legacy"})
+
+
+def test_idle_ack_selects_after_all_lanes_and_unwinds_selection_failure(tmp_path):
+    module = _module()
+    cfg = _cfg(module, tmp_path)
+    statuses = {LANE_1: "aicc-ready", LANE_2: "aicc-ready"}
+    signals = []
+
+    def show(unit, prop):
+        if "credential-" in unit:
+            return "inactive"
+        return {"ActiveState": "active", "SubState": "running",
+                "MainPID": "42", "StatusText": statuses[unit]}[prop]
+
+    def signal(args):
+        signals.append(args)
+        statuses[args[-1]] = "aicc-drained-idle"
+        return SimpleNamespace(returncode=0)
+
+    def preflight(config, units, gated, **kwargs):
+        module.idle_preflight(config, units, gated, show=show, systemctl=signal,
+                              remaining=lambda _: 3600)
+
+    def select(sha):
+        assert all(value == "aicc-drained-idle" for value in statuses.values())
+        raise RuntimeError("selector refusal")
+
+    report = _deploy(module, cfg, load_lanes=lambda *a, **k: (LANE_1, LANE_2),
+                     show=show, stage=lambda *_: None, preflight=preflight,
+                     select=select, resume=lambda gated, **kw: module.resume_gated_lanes(
+                         gated, show=show, systemctl=signal))
+    assert report.outcome == "REFUSED"
+    assert sum("--signal=SIGHUP" in args for args in signals) == 2
+
+
+def test_credential_probe_uses_installed_runtime_without_secret_output(tmp_path, monkeypatch):
+    module = _module()
+    cfg = _cfg(module, tmp_path)
+    monkeypatch.setattr(module, "_current_release_sha", lambda _: SHA_A)
+    calls = []
+
+    def run(args, **kwargs):
+        calls.append((args, kwargs))
+        return SimpleNamespace(returncode=0, stdout="1200.5\n")
+
+    monkeypatch.setattr(module, "_run", run)
+    assert module.credential_remaining_seconds(cfg) == 1200.5
+    args, kwargs = calls[0]
+    assert args[:3] == [str(cfg.runtime_venv / "bin/python"), "-B", "-c"]
+    assert "/var/lib/voyn-aicc-credential-rotation/worker.env" in args[3]
+    assert kwargs["cwd"] == str(cfg.release_root / SHA_A)
+    monkeypatch.setattr(module, "_run", lambda *a, **k: SimpleNamespace(returncode=1, stdout="secret"))
+    with pytest.raises(RuntimeError, match="^credential_budget_unavailable$"):
+        module.credential_remaining_seconds(cfg)

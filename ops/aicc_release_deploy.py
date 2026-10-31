@@ -103,7 +103,7 @@ class DeployConfig:
     remote_url: str | None = None
     rollout_lock_path: Path = Path("/run/aicc-staged-rollout.lock")
     readiness_timeout: float = 120.0
-    drain_timeout: float = 3700.0
+    drain_timeout: float = 30.0
     poll_interval: float = 0.5
     git_timeout: int = 300
     trusted_uid: int = 0
@@ -631,12 +631,113 @@ def load_installed_lane_registry(cfg: DeployConfig) -> tuple[str, ...]:
     return tuple(lanes)
 
 
+def credential_remaining_seconds(cfg: DeployConfig) -> float:
+    """Probe the installed credential authority without exposing credentials."""
+    installed_sha = _current_release_sha(cfg.aicc_root)
+    if installed_sha is None:
+        raise RuntimeError("credential_budget_unavailable")
+    release = cfg.release_root / installed_sha
+    result = _run(
+        [str(cfg.runtime_venv / "bin" / "python"), "-B", "-c",
+         ("from command_center.ops.credential_rotation import "
+         "PsycopgCredentialAuthority, _postgres_config; "
+         "from command_center.worker.credential_file import read_environment_file; "
+         "c = _postgres_config(read_environment_file("
+         "'/var/lib/voyn-aicc-credential-rotation/worker.env')); "
+         "print(PsycopgCredentialAuthority().current_expiry(c)[1])")],
+        timeout=60, cwd=str(release),
+        env={**os.environ, "PYTHONPATH": str(release)},
+    )
+    if result.returncode != 0:
+        raise RuntimeError("credential_budget_unavailable")
+    try:
+        remaining = float(result.stdout.strip())
+    except ValueError:
+        raise RuntimeError("credential_budget_invalid") from None
+    if not 0 < remaining < float("inf"):
+        raise RuntimeError("credential_budget_invalid")
+    return remaining
+
+
+def _lane_signal(args: list[str]) -> subprocess.CompletedProcess[str]:
+    return _run(["systemctl", *args], timeout=30)
+
+
+def idle_preflight(
+    cfg: DeployConfig, units: tuple[str, ...], gated: dict[str, str], *,
+    show=None, systemctl=None, remaining=None,
+    clock=time.monotonic, sleeper=time.sleep,
+) -> None:
+    """Close claim gates and prove idle before changing the release selector.
+
+    Legacy aicc-drained acknowledges only the gate, not an unsettled attempt.
+    A pre-existing idle acknowledgement is not evidence for this request.
+    """
+    show = show or _systemctl_show
+    systemctl = systemctl or _lane_signal
+    for service in ("voyn-aicc-credential-rotation.service",
+                    "voyn-aicc-credential-rescue.service"):
+        if show(service, "ActiveState") != "inactive":
+            raise RuntimeError("credential_rotation_not_idle")
+    started = clock()
+    available = (remaining or credential_remaining_seconds)(cfg)
+    budget = len(units) * (cfg.drain_timeout + 225 + cfg.readiness_timeout) + 300
+    if available <= budget + 30:
+        raise RuntimeError("credential_budget_insufficient")
+    for unit in units:
+        pid = show(unit, "MainPID")
+        if (not pid.isdigit() or int(pid) <= 0
+                or show(unit, "ActiveState") != "active"
+                or show(unit, "SubState") != "running"
+                or not show(unit, "StatusText").startswith(_READY)):
+            raise RuntimeError(f"lane_not_ready_for_drain:{unit}")
+        # Record before signalling: even an ambiguous command failure must unwind.
+        gated[unit] = pid
+        result = systemctl(["kill", "--kill-who=main", "--signal=SIGUSR1", unit])
+        if result.returncode:
+            raise RuntimeError(f"drain_signal_failed:{unit}")
+    deadline = clock() + 30
+    while units:
+        pending = []
+        for unit in units:
+            if (show(unit, "MainPID") != gated[unit]
+                    or show(unit, "ActiveState") != "active"
+                    or show(unit, "SubState") != "running"):
+                raise RuntimeError(f"drain_identity_changed:{unit}")
+            if show(unit, "StatusText") != "aicc-drained-idle":
+                pending.append(unit)
+        if not pending:
+            break
+        if clock() >= deadline:
+            raise RuntimeError("lanes_busy_or_idle_protocol_unavailable")
+        sleeper(cfg.poll_interval)
+    if available - (clock() - started) <= budget:
+        raise RuntimeError("credential_budget_insufficient")
+
+
+def resume_gated_lanes(gated: dict[str, str], *, show=None, systemctl=None) -> list[str]:
+    """Resume only the original processes; never signal a replacement worker."""
+    show = show or _systemctl_show
+    systemctl = systemctl or _lane_signal
+    failed: list[str] = []
+    for unit, pid in gated.items():
+        try:
+            if (show(unit, "MainPID") == pid
+                    and show(unit, "ActiveState") == "active"):
+                result = systemctl(["kill", "--kill-who=main", "--signal=SIGHUP", unit])
+                if result.returncode:
+                    failed.append(unit)
+        except Exception:  # noqa: BLE001 - unwind must preserve the original refusal
+            failed.append(unit)
+    return failed
+
+
 def rollout_active_lanes(
     units: tuple[str, ...],
     *,
     readiness_timeout: float,
     poll_interval: float,
-    drain_timeout: float = 3700.0,
+    drain_timeout: float = 30.0,
     show: Callable[[str, str], str] | None = None,
     systemctl: Callable[[list[str]], subprocess.CompletedProcess[str]] | None = None,
     clock: Callable[[], float] = time.monotonic,
@@ -650,10 +751,9 @@ def rollout_active_lanes(
     def _systemctl(args: list[str]) -> subprocess.CompletedProcess[str]:
         if systemctl is not None:
             return systemctl(args)
-        # Draining an in-flight agent follows worker TimeoutStopSec=3660s,
-        # not the much shorter post-start readiness deadline.
-        timeout = drain_timeout if args[0] == "stop" else readiness_timeout + 30
-        return _run(["systemctl", *args], timeout=max(60, int(timeout)))
+        # Only preflight-proven idle workers reach stop; busy work is deferred.
+        timeout = drain_timeout if args[0] == "stop" else 225
+        return _run(["systemctl", *args], timeout=max(1, int(timeout)))
 
     ready_count = 0
     for unit in units:
@@ -697,6 +797,8 @@ def deploy_once(
     resolve_sha: Callable[[DeployConfig], str] | None = None,
     dependency_gate: Callable[[DeployConfig, str | None, str], str | None] | None = None,
     current_sha: Callable[[DeployConfig], str | None] | None = None,
+    preflight: Callable[..., None] | None = None,
+    resume: Callable[..., None] | None = None,
 ) -> DeployReport:
     """One deploy tick. Prints nothing; caller prints `report.line()`."""
     cfg = cfg or DeployConfig()
@@ -820,6 +922,7 @@ def deploy_once(
         for unit in stopped:
             report.steps.append(f"untouched:{unit}")
 
+        gated: dict[str, str] = {}
         try:
             if hold_timers is not None:
                 hold_timers()
@@ -828,6 +931,8 @@ def deploy_once(
                     rollout_mod = _load_staged_rollout()
                 rollout_mod.hold_lane_mutating_timers(rollout_mod.Systemd())
 
+            (preflight or idle_preflight)(cfg, to_restart, gated, show=show)
+            report.steps.append("idle_preflight")
             if select is not None:
                 select(target)
             else:
@@ -862,6 +967,12 @@ def deploy_once(
                 return finish("ROLLED_BACK", f"rollout_failed:{exc}")
             return finish("REFUSED", f"rollout_lock_or_select_failed:{exc}")
         finally:
+            try:
+                resume_failed = (resume or resume_gated_lanes)(gated, show=show)
+                if resume_failed:
+                    report.steps.append("resume_failed:" + ",".join(resume_failed))
+            except Exception:  # noqa: BLE001 - preserve original deploy failure
+                report.steps.append("resume_failed")
             if lock_written and release_timers is not None:
                 release_timers()
             elif lock_written and rollout_mod is not None:
