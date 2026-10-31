@@ -59,14 +59,21 @@ def render_master_backlog_page(path: str | None = None) -> None:
     projection = backlog_client.load_projection(path)
 
     if not projection.exists:
-        st.warning(
-            "Мастер-бэклог не подключён. Укажите путь к файлу "
-            f"`VOYN_TASKS_BACKLOG.md` в переменной окружения "
-            f"`{backlog_client.MASTER_BACKLOG_ENV}` — ACC прочитает его как "
-            "read-only проекцию, не создавая второго хранилища."
-        )
-        if projection.source_path is not None:
-            st.caption(f"Ожидался файл: `{projection.source_path}` (не найден).")
+        if projection.read_error is not None:
+            st.error(
+                f"Мастер-бэклог найден (`{projection.source_path}`), но не может "
+                f"быть прочитан: {projection.read_error}. Проверьте права доступа "
+                "и кодировку файла (ожидается UTF-8)."
+            )
+        else:
+            st.warning(
+                "Мастер-бэклог не подключён. Укажите путь к файлу "
+                f"`VOYN_TASKS_BACKLOG.md` в переменной окружения "
+                f"`{backlog_client.MASTER_BACKLOG_ENV}` — ACC прочитает его как "
+                "read-only проекцию, не создавая второго хранилища."
+            )
+            if projection.source_path is not None:
+                st.caption(f"Ожидался файл: `{projection.source_path}` (не найден).")
         return
 
     st.info(
@@ -114,6 +121,12 @@ def render_master_backlog_page(path: str | None = None) -> None:
         "Порядок, в котором Backlog Engine выдаёт задачи исполнителям: "
         "по приоритету, затем по волне. Claim/lease происходит в Backlog API."
     )
+    _QUEUE_DISPLAY_LIMIT = 50
+    if len(queue) > _QUEUE_DISPLAY_LIMIT:
+        st.caption(
+            f"Показаны первые {_QUEUE_DISPLAY_LIMIT} из {len(queue)} записей "
+            "очереди (см. метрику выше для полного числа)."
+        )
     st.dataframe(
         [
             {
@@ -123,7 +136,7 @@ def render_master_backlog_page(path: str | None = None) -> None:
                 "задача": rec.title,
                 "домен": rec.parallel_domain,
             }
-            for rec in queue[:50]
+            for rec in queue[:_QUEUE_DISPLAY_LIMIT]
         ],
         width="stretch",
         hide_index=True,
