@@ -60,6 +60,23 @@ class HandlerOutcome:
     result: dict[str, Any] = field(default_factory=dict)
     reason: str = ""
     retryable: bool = True
+    # True only for a refusal that names no fault in the work itself -- a
+    # writer-lease race lost to a sibling lane, not a broken commit or a bad
+    # payload (VOYN-W0-AICC-PUBLISH-LEASE-CONTENTION-BURNS-ATTEMPT: a
+    # publish that lost that race used to fail through the ordinary
+    # `retryable=True` path, which spends this item's `max_attempts` on
+    # contention it had no part in causing and can dead-letter already
+    # -finished work). Routes to `queue_fail_lease_wait` instead of
+    # `queue_fail`: it refunds the attempt `queue_claim` already spent for
+    # this delivery and counts the wait against its own bounded budget
+    # instead. Meaningless when `ok` is True and implies `retryable` --
+    # there is no such thing as a non-retryable lease wait.
+    lease_wait: bool = False
+    # Same refund semantics for failures in the host/launcher/provider
+    # substrate. These are not task attempts: a missing systemd socket, a
+    # broken sandbox, or a provider outage says the work did not get a fair
+    # execution slot.
+    infra_wait: bool = False
 
 
 class Handler(Protocol):
@@ -296,12 +313,35 @@ class WorkerDaemon:
                 work.attempt_id,
             )
             return
-        if outcome.ok:
-            accepted = self._store.complete(work, outcome.result)
-        else:
-            accepted = self._store.fail(
-                work, reason=outcome.reason, retryable=outcome.retryable
+        try:
+            if outcome.ok:
+                accepted = self._store.complete(work, outcome.result)
+            elif outcome.lease_wait:
+                accepted = self._store.fail_lease_wait(work, reason=outcome.reason)
+            elif outcome.infra_wait:
+                accepted = self._store.fail_infra_wait(work, reason=outcome.reason)
+            else:
+                accepted = self._store.fail(
+                    work, reason=outcome.reason, retryable=outcome.retryable
+                )
+        except Exception:
+            # The handler successfully decided an outcome -- what it admits --
+            # but persisting it raised (a DB hiccup, a dropped connection, a
+            # result the driver cannot encode): the same class of failure
+            # `_dispatch` already guards for a raising HANDLER. Uncaught here,
+            # it would propagate out of `run_forever`'s loop and kill the
+            # whole daemon over the one attempt it was reporting, taking every
+            # other queued item down with it -- mirroring the non-object-
+            # payload crash this module already closed once. The lease is
+            # left to lapse on its own (visibility expiry, then the reaper),
+            # exactly like the stale-owner refusal below; a later delivery
+            # retries.
+            logger.exception(
+                "attempt %s: writing the outcome raised; the attempt's lease "
+                "will lapse and a later delivery will retry",
+                work.attempt_id,
             )
+            return
         if not accepted:
             # The database refused the report: the lease lapsed between our
             # last successful beat and this write, and the attempt belongs to

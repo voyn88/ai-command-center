@@ -11,12 +11,15 @@ its *contents* between tests rather than re-pointing it.
 
 from __future__ import annotations
 
+import errno
 import os
 import shutil
 import shlex
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -67,15 +70,185 @@ def _immediate_reconcile(monkeypatch):
     monkeypatch.setattr(supervisor, "_RECONCILE_ABSENCE_GRACE_SECONDS", 0.0)
 
 
+# --------------------------------------------------------------------------
+# Removing the data dir out from under the runtime's own daemon threads
+# (VOYN-W0-AICC-FLAKY-TEST-DATA-DIR-TEARDOWN-RACE)
+# --------------------------------------------------------------------------
+#
+# A plain `shutil.rmtree(_TEST_DATA_DIR)` at teardown assumes the test body
+# returning means nothing is writing there any more. It does not. A v2 run is
+# supervised by `run-supervisor-<run_id>`, a daemon thread nobody joins, and
+# that thread keeps writing to `<data dir>/runtime.db` *after* every signal a
+# test can practically wait on: `db.create_report` (the report row) is followed
+# by the `finalized_at` stamp, and `finalized_at` in turn is deliberately the
+# *last* write of finalization rather than part of the terminal-state update
+# (see `db.execution.mark_run_finalized`). Between them SQLite is holding
+# `runtime.db-wal`/`runtime.db-shm` open, and it recreates both by name the
+# moment the writing connection touches the database again.
+#
+# So `rmtree` walked the tree, emptied it, and then failed to `rmdir` the root
+# because the supervisor thread had just put the WAL pair back:
+#
+#   OSError: [Errno 39] Directory not empty: /tmp/aicc_test_data__76sgqu0
+#     leftovers = ['runtime.db-shm', 'runtime.db-wal']
+#     threads   = ['MainThread', 'run-supervisor-0ffe92c1ff...']
+#
+# That surfaced as an ERROR at teardown, which fails the whole CI shard: the
+# shard publishes no collection receipt, and the Linux manifest gate and final
+# merge gate fail with it. Reproduced here at 2 runs in 40 of
+# `test_board_user_journey.py::test_attention_triage_fix_relaunches_a_failed_task`,
+# whose `_wait_for_report` waits on exactly the report row above.
+#
+# The fix is to stop guessing and wait for the writers themselves. `rmtree` is
+# retried on the transient errnos afterwards as defence in depth, never as the
+# mechanism — a retry alone would still delete a live run's database out from
+# under it and leak the damage into the next test.
+
+#: Bounded, run-scoped daemon threads the runtime starts that can still write
+#: into `AICC_DATA_DIR` after the test body returns. Every one of them ends on
+#: its own (readers and the stdin writer end with the child's pipes, the
+#: timeout watchdog on `leader_exited_event`), so waiting for them terminates.
+#: `aicc-background-sync` is unbounded and is signalled to stop first, below.
+_BACKGROUND_WRITER_THREAD_PREFIXES: tuple[str, ...] = (
+    "run-supervisor-",
+    "run-stdout-",
+    "run-stderr-",
+    "run-stdin-",
+    "run-timeout-",
+    "run-launch-recovery-",
+    "task-pipeline-advance",
+    "aicc-background-sync",
+    "agent-runner-io",
+)
+
+#: Generous against the slowest observed finalization (a run with a real
+#: `git commit` to make finalizes in ~150 ms) and never actually waited when
+#: the suite is well behaved: the poll below returns on its first pass.
+_WRITER_QUIESCE_TIMEOUT_SECONDS = 15.0
+_WRITER_QUIESCE_POLL_SECONDS = 0.005
+
+#: ~1 s of retries. Only reachable for a writer this module cannot see, since
+#: everything it can see has already been waited for.
+_RMTREE_ATTEMPTS = 40
+_RMTREE_RETRY_SLEEP_SECONDS = 0.025
+
+#: `ENOTEMPTY` is the observed failure (a file reappeared under a directory
+#: being removed); `EBUSY` and `ENOENT` are the other two ways a concurrent
+#: writer or deleter can make one `rmtree` pass fail while the next succeeds.
+_TRANSIENT_RMTREE_ERRNOS = frozenset({errno.ENOTEMPTY, errno.EBUSY, errno.ENOENT})
+
+#: The real clock, captured at import, because this teardown runs *before*
+#: `monkeypatch`'s undo. A test is free to patch `time.monotonic` on the shared
+#: `time` module — `tests/ops/test_agent_principal_isolation.py` drives a
+#: SIGTERM escalation with `monkeypatch.setattr(launcher.time, "monotonic",
+#: lambda: next(iter((0.0, 0.0, 11.0, 11.0, 12.0))))`, and `launcher.time` *is*
+#: the `time` module, so the patch is global. Calling `time.monotonic()` from a
+#: fixture teardown that runs while that patch is still installed exhausts the
+#: iterator and raises `StopIteration`, which surfaces as a teardown ERROR (and
+#: as `RuntimeError: generator raised StopIteration` through pytest-qt's
+#: teardown hook) — the same shard-killing shape this task exists to remove.
+#: Binding the functions here keeps the wait on a clock no test can replace.
+_monotonic = time.monotonic
+_sleep = time.sleep
+
+
+def live_background_writers() -> list[str]:
+    """Everything in this process that could still write into the data dir.
+
+    Two sources, because neither alone is complete. `supervisor.
+    _PROCESS_OWNED_RUNS` is the authoritative one: a run id is discarded from
+    it in `_release_active`, which runs only after `_complete_owned_terminal_
+    finalization` has returned — i.e. after the last durable write and after
+    the connection that made it was closed. An empty set is therefore a real
+    "no supervised run is mid-write", not a guess about timing. Thread names
+    cover the rest of the lifecycle (readers, the timeout watchdog, launch
+    recovery, a pipeline advance) that holds no run id but still owns an open
+    handle under the data dir.
+    """
+    from command_center.runtime import supervisor
+
+    with supervisor._PROCESS_OWNED_RUNS_GUARD:
+        owned_runs = sorted(supervisor._PROCESS_OWNED_RUNS)
+    live_threads = sorted(
+        thread.name
+        for thread in threading.enumerate()
+        if thread.is_alive() and thread.name.startswith(_BACKGROUND_WRITER_THREAD_PREFIXES)
+    )
+    return [f"run:{run_id}" for run_id in owned_runs] + [f"thread:{name}" for name in live_threads]
+
+
+def _stop_unbounded_pollers() -> None:
+    """Signal the pollers that would otherwise never finish.
+
+    `task_pipeline`'s background sync loops on `stop.wait(interval)`, so setting
+    its stop event ends it at the next wake and the wait below then joins it.
+    Looked up through `sys.modules` rather than imported: a test run that never
+    touched `task_pipeline` should not import it just to stop a poller that
+    cannot exist.
+    """
+    task_pipeline = sys.modules.get("command_center.task_pipeline")
+    if task_pipeline is not None:
+        task_pipeline.stop_background_sync()
+
+
+def quiesce_background_writers(
+    timeout: float = _WRITER_QUIESCE_TIMEOUT_SECONDS,
+) -> list[str]:
+    """Wait for every known background writer to finish; report the stragglers.
+
+    Returns the empty list once nothing is left, or the writers still live when
+    `timeout` expired — a leaked run or thread, which the caller names in its
+    error rather than racing silently.
+    """
+    _stop_unbounded_pollers()
+    deadline = _monotonic() + max(timeout, 0.0)
+    while True:
+        writers = live_background_writers()
+        if not writers:
+            return []
+        if _monotonic() >= deadline:
+            return writers
+        _sleep(_WRITER_QUIESCE_POLL_SECONDS)
+
+
+def remove_data_dir_when_quiet(
+    directory: Path,
+    *,
+    quiesce_timeout: float = _WRITER_QUIESCE_TIMEOUT_SECONDS,
+) -> None:
+    """`shutil.rmtree(directory)`, but not while a runtime writer is still live."""
+    stragglers = quiesce_background_writers(quiesce_timeout)
+    last_error: OSError | None = None
+    for _ in range(_RMTREE_ATTEMPTS):
+        if not directory.exists():
+            return
+        try:
+            shutil.rmtree(directory)
+            return
+        except OSError as error:
+            if error.errno not in _TRANSIENT_RMTREE_ERRNOS:
+                raise
+            last_error = error
+            _sleep(_RMTREE_RETRY_SLEEP_SECONDS)
+    leftovers = sorted(entry.name for entry in directory.iterdir()) if directory.is_dir() else []
+    raise AssertionError(
+        f"Could not remove the isolated data dir {directory}: something kept "
+        f"writing into it. Leftover entries: {leftovers or '(none)'}. Known "
+        f"background writers still live: {stragglers or '(none)'}. All live "
+        f"threads: {sorted(thread.name for thread in threading.enumerate())}. "
+        "A test that launches a run must let it finish (or cancel and wait for "
+        "it) before it returns — see `Supervisor.wait_for_run` and "
+        "`db.wait_for_run_finalized`."
+    ) from last_error
+
+
 @pytest.fixture(autouse=True)
 def isolated_data_dir():
-    if _TEST_DATA_DIR.exists():
-        shutil.rmtree(_TEST_DATA_DIR)
+    remove_data_dir_when_quiet(_TEST_DATA_DIR)
     _TEST_DATA_DIR.mkdir(parents=True, exist_ok=True)
     _clear_execution_center_singleton_cache()
     yield _TEST_DATA_DIR
-    if _TEST_DATA_DIR.exists():
-        shutil.rmtree(_TEST_DATA_DIR)
+    remove_data_dir_when_quiet(_TEST_DATA_DIR)
 
 
 def _clear_execution_center_singleton_cache() -> None:

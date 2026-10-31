@@ -138,6 +138,46 @@ def _apply_action(case: dict[str, Any], action: str, note: str, *, confirmed: bo
         st.rerun()
 
 
+@st.dialog("Мгновенное закрытие по playbook")
+def _instant_closure_dialog(case: dict[str, Any], initial_note: str) -> None:
+    st.warning(f"Закрыть в 1 клик: **{case['id']} · {case['customer']}**")
+    st.caption(
+        f"Playbook «{aml_store.INSTANT_PLAYBOOK_ID}»: сценарий {case['scenario']}, "
+        f"риск {case['risk']}. Роль: {st.session_state.aml_role} · пользователь: {st.session_state.aml_actor}"
+    )
+    reason = st.text_area(
+        "Обоснование закрытия",
+        value=initial_note,
+        placeholder="Укажите, почему алерт не требует расследования…",
+        key=f"aml_instant_reason_{case['id']}",
+    )
+    confirmed = st.checkbox(
+        "Я проверил(а) материалы и подтверждаю закрытие по playbook",
+        key=f"aml_instant_confirm_{case['id']}",
+    )
+    if st.button(
+        "Закрыть в 1 клик",
+        type="primary",
+        icon=":material/bolt:",
+        disabled=not confirmed or not reason.strip(),
+        key=f"aml_instant_submit_{case['id']}",
+    ):
+        try:
+            report = aml_store.run_instant_closure(
+                case["id"],
+                actor=st.session_state.aml_actor,
+                role=st.session_state.aml_role,
+                reason=reason,
+                expected_version=case["version"],
+                confirmed=True,
+            )
+        except aml_store.AmlStoreError as exc:
+            st.error(str(exc))
+        else:
+            st.session_state.aml_last_instant_report = report
+            st.rerun()
+
+
 @st.dialog("Подтвердите критическое действие")
 def _critical_action_dialog(case: dict[str, Any], action: str, action_label: str, initial_note: str) -> None:
     st.warning(f"{action_label}: **{case['id']} · {case['customer']}**")
@@ -377,11 +417,26 @@ def _render_investigation(cases: list[dict[str, Any]]) -> None:
                 _critical_action_dialog(case, "close", "Подтвердить закрытие кейса", note)
             if case_sar is not None:
                 st.caption(f"Связанное сообщение: {case_sar['id']} · {case_sar['status']}")
+            if aml_store.instant_closure_eligible(case):
+                st.divider()
+                st.caption("Кейс соответствует критериям playbook «низкий/средний риск, Unusual activity».")
+                if st.button(
+                    "⚡ Закрыть в 1 клик",
+                    width="stretch",
+                    key=f"aml_instant_close_{case['id']}",
+                    disabled=st.session_state.aml_role != "MLRO",
+                ):
+                    _instant_closure_dialog(case, note)
     st.markdown("##### Хронология кейса")
     events = aml_store.list_audit_events(case["id"])
     st.dataframe(events, hide_index=True, key=f"aml_case_timeline_{case['id']}",
                  column_config={"id": None, "occurred_at": "Время", "actor": "Инициатор", "role": "Роль",
                                 "event": "Событие", "details": "Комментарий", "case_id": None})
+    last_report = st.session_state.get("aml_last_instant_report")
+    if last_report is not None and last_report["case_id"] == case["id"]:
+        st.markdown("##### Авто-отчёт о закрытии по playbook")
+        st.success(f"Отчёт {last_report['id']} сформирован автоматически на основании трассы решений выше.")
+        st.markdown(aml_store.render_incident_report_markdown(last_report))
 
 
 def _render_reporting(cases: list[dict[str, Any]]) -> None:
