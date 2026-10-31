@@ -103,6 +103,7 @@ class DeployConfig:
     remote_url: str | None = None
     rollout_lock_path: Path = Path("/run/aicc-staged-rollout.lock")
     readiness_timeout: float = 120.0
+    drain_timeout: float = 3700.0
     poll_interval: float = 0.5
     git_timeout: int = 300
     trusted_uid: int = 0
@@ -635,6 +636,7 @@ def rollout_active_lanes(
     *,
     readiness_timeout: float,
     poll_interval: float,
+    drain_timeout: float = 3700.0,
     show: Callable[[str, str], str] | None = None,
     systemctl: Callable[[list[str]], subprocess.CompletedProcess[str]] | None = None,
     clock: Callable[[], float] = time.monotonic,
@@ -648,7 +650,10 @@ def rollout_active_lanes(
     def _systemctl(args: list[str]) -> subprocess.CompletedProcess[str]:
         if systemctl is not None:
             return systemctl(args)
-        return _run(["systemctl", *args], timeout=max(60, int(readiness_timeout) + 30))
+        # Draining an in-flight agent follows worker TimeoutStopSec=3660s,
+        # not the much shorter post-start readiness deadline.
+        timeout = drain_timeout if args[0] == "stop" else readiness_timeout + 30
+        return _run(["systemctl", *args], timeout=max(60, int(timeout)))
 
     ready_count = 0
     for unit in units:
@@ -727,6 +732,9 @@ def deploy_once(
     # Serialize mirror, publication, selector, rollback and helper refresh,
     # including NOOP retries, against the installer and other deploys.
     try:
+        pending = cfg.state_dir / "pending-release"
+        if pending.exists() or pending.is_symlink():
+            return finish("REFUSED", "pending_release_recovery_required")
         try:
             (ensure_mirror or ensure_bare_mirror)(cfg)
             target = (resolve_sha or resolve_target_sha)(cfg)
@@ -745,6 +753,32 @@ def deploy_once(
         report.previous_sha = previous or ""
 
         if previous == target and (cfg.release_root / target).is_dir():
+            # A selector match alone does not prove a completed deployment.
+            # Revalidate the attested tree and live lanes before reporting NOOP
+            # or refreshing privileged helpers from the selected release.
+            try:
+                _tx().verify_release_manifest(
+                    cfg.release_root / target,
+                    cfg.state_dir / "releases" / f"{target}.json",
+                    target,
+                    repo_root=cfg.bare_mirror,
+                    trusted_uid=cfg.trusted_uid,
+                    trusted_gid=cfg.trusted_gid,
+                )
+                lanes = (
+                    load_installed_lane_registry(cfg) if load_lanes is None else
+                    load_lanes(cfg.lane_registry, expected_uid=cfg.trusted_uid,
+                               expected_gid=cfg.trusted_gid)
+                )
+                for unit in active_registered_lanes(lanes, show=show):
+                    if not _wait_lane_ready(
+                        unit, timeout=cfg.readiness_timeout,
+                        poll_interval=cfg.poll_interval,
+                        show=show or _systemctl_show,
+                    ):
+                        return finish("REFUSED", f"current_lane_not_ready:{unit}")
+            except Exception as exc:  # noqa: BLE001 - NOOP must fail closed
+                return finish("REFUSED", f"current_release_unverified:{exc}")
             try:
                 refreshed = refresh_root_helpers(cfg, target, install_tx=_install_tx)
             except OSError as exc:
@@ -808,20 +842,23 @@ def deploy_once(
                     to_restart,
                     readiness_timeout=cfg.readiness_timeout,
                     poll_interval=cfg.poll_interval,
+                    drain_timeout=cfg.drain_timeout,
                     show=show,
                 )
             report.steps.append("rollout")
             if not ok:
-                _rollback_selector(
-                    _tx(),
-                    cfg,
-                    restore_previous=restore_previous,
-                )
+                try:
+                    _rollback_selector(_tx(), cfg, restore_previous=restore_previous)
+                except Exception as exc:  # noqa: BLE001 - preserve pending recovery
+                    return finish("REFUSED", f"rollback_failed:{detail}:{exc}")
                 report.steps.append("rollback")
                 return finish("ROLLED_BACK", detail)
         except Exception as exc:  # noqa: BLE001
             if "select" in report.steps:
-                _rollback_selector(_tx(), cfg, restore_previous=restore_previous)
+                try:
+                    _rollback_selector(_tx(), cfg, restore_previous=restore_previous)
+                except Exception as rollback_exc:  # noqa: BLE001
+                    return finish("REFUSED", f"rollback_failed:{exc}:{rollback_exc}")
                 return finish("ROLLED_BACK", f"rollout_failed:{exc}")
             return finish("REFUSED", f"rollout_lock_or_select_failed:{exc}")
         finally:
@@ -900,6 +937,7 @@ def main(argv: list[str] | None = None) -> int:
         default=defaults.rollout_lock_path,
     )
     parser.add_argument("--readiness-timeout", type=float, default=120.0)
+    parser.add_argument("--drain-timeout", type=float, default=defaults.drain_timeout)
     args = parser.parse_args(argv)
     cfg = DeployConfig(
         bare_mirror=args.bare_mirror,
@@ -913,6 +951,7 @@ def main(argv: list[str] | None = None) -> int:
         branch=args.branch,
         rollout_lock_path=args.rollout_lock,
         readiness_timeout=args.readiness_timeout,
+        drain_timeout=args.drain_timeout,
         trusted_uid=os.geteuid() if hasattr(os, "geteuid") else 0,
         trusted_gid=os.getegid() if hasattr(os, "getegid") else 0,
     )
