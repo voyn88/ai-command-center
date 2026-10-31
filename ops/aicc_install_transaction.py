@@ -192,6 +192,65 @@ class FileState:
 
 
 UNINSTALL_JOURNAL_VERSION = 2
+#: Every action the CLI accepts. Named here rather than inline in `main()` so
+#: a set that claims to guard a subset of them -- `UNINSTALL_BLOCKED_ACTIONS`
+#: below -- can be checked against the surface it is guarding: an action
+#: spelled one way in the guard and another way on the command line is a guard
+#: that refuses a string no operator can type.
+CLI_ACTIONS = (
+    "validate",
+    "prepare",
+    "apply",
+    "commit",
+    "quiesce",
+    "quiesce-worker-only",
+    "validate-control-authority",
+    "revoke-worker-authority",
+    "install",
+    "recover",
+    "recover-boot",
+    "recover-uninstall-boot",
+    "recover-uninstall-safe",
+    "rollback",
+    "uninstall",
+    "uninstall-begin",
+    "uninstall-arm",
+    "uninstall-complete",
+    "uninstall-select-baseline",
+    "uninstall-status",
+    "release-record",
+    "release-verify",
+    "release-publish",
+    "release-reconcile",
+    "release-deploy-recover",
+    "release-select",
+    "recovery-anchor-install",
+)
+#: Every step of the install path: the staged sequence (`validate`, `prepare`,
+#: `apply`, `commit`), its single-shot form (`install`), and the two
+#: control-profile authority steps that run between prepare and apply. While
+#: an uninstall journal is open the baseline this path builds against is
+#: mid-teardown, so the path is refused at its first step rather than at the
+#: first one that happens to write. `validate` is in here for that reason and
+#: not because it mutates anything -- it does not; it is where the refusal is
+#: cheapest to deliver. `recovery-anchor-install` has its own, separate guard
+#: at the top of `_dispatch`; the recover/rollback/uninstall/release actions
+#: are deliberately absent, because those are how an open journal gets closed.
+#: "install" belongs here for the same reason "apply" and "commit" do, and
+#: leaving it out (as head 0f331fbb did) let the one action the refusal message
+#: names walk straight past the refusal.
+UNINSTALL_BLOCKED_ACTIONS = frozenset(
+    {
+        "validate",
+        "prepare",
+        "apply",
+        "commit",
+        "install",
+        "quiesce-worker-only",
+        "validate-control-authority",
+        "revoke-worker-authority",
+    }
+)
 
 #: Generation-manifest format this build WRITES.
 #:
@@ -5944,16 +6003,10 @@ def _dispatch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
             args.baseline_selector
         )
         return 0
-    if _path_present(args.state_dir / "uninstall.json") and args.action in {
-        "validate",
-        "prepare",
-        "apply",
-        "commit",
-        "install",
-        "quiesce-worker-only",
-        "validate-control-authority",
-        "revoke-worker-authority",
-    }:
+    if (
+        _path_present(args.state_dir / "uninstall.json")
+        and args.action in UNINSTALL_BLOCKED_ACTIONS
+    ):
         raise RuntimeError("unfinished uninstall journal blocks installation")
     if args.action == "install" and args.profile == "control":
         raise RuntimeError(
@@ -6033,35 +6086,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "action",
-        choices=(
-            "validate",
-            "prepare",
-            "apply",
-            "commit",
-            "quiesce",
-            "quiesce-worker-only",
-            "validate-control-authority",
-            "revoke-worker-authority",
-            "install",
-            "recover",
-            "recover-boot",
-            "recover-uninstall-boot",
-            "recover-uninstall-safe",
-            "rollback",
-            "uninstall",
-            "uninstall-begin",
-            "uninstall-arm",
-            "uninstall-complete",
-            "uninstall-select-baseline",
-            "uninstall-status",
-            "release-record",
-            "release-verify",
-            "release-publish",
-            "release-reconcile",
-            "release-select",
-            "release-deploy-recover",
-            "recovery-anchor-install",
-        ),
+        choices=CLI_ACTIONS,
     )
     parser.add_argument("--repo-root", type=Path, default=Path("/opt/aicc"))
     parser.add_argument("--root", type=Path, default=Path("/"))

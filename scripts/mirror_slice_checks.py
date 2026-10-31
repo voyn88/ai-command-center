@@ -174,11 +174,22 @@ def collect_statements() -> dict[str, list[dict]]:
                 mirror.list_records()
                 if spec.identity:
                     mirror.resync_identity()
-                # Whole-predicate deletes exist on one table today; probe the
-                # capability wherever a store exposes it rather than naming it.
-                for extra in ("delete_day",):
-                    if hasattr(mirror, extra):
-                        getattr(mirror, extra)("2026-08-14")
+                # Whole-predicate deletes -- `delete_day`, `delete_task` -- are
+                # declared directly on a mirror subclass, never inherited from
+                # `PostgresTableMirror`, and each takes one positional value
+                # the way `delete_where`'s own `value` argument does. This used
+                # to name `delete_day` in a hardcoded tuple while claiming to
+                # probe "wherever a store exposes it rather than naming it" --
+                # a second method, `delete_task`, existed the whole time and
+                # was never in the tuple, so `cmd_statements`'s diff had zero
+                # signal for changes to its generated SQL. Finding every extra
+                # method by introspecting what the subclass itself defines
+                # makes that claim true instead of aspirational.
+                base_methods = set(vars(PostgresTableMirror))
+                for name, member in vars(attribute).items():
+                    if name.startswith("_") or name in base_methods or not callable(member):
+                        continue
+                    getattr(mirror, name)("2026-08-14")
                 if spec.table in out:
                     raise SystemExit(
                         f"two mirrors declare `{spec.table}`: {attribute.__name__} and an "
@@ -321,18 +332,43 @@ def cmd_counts(args: argparse.Namespace) -> int:
 # --- perturbation sweep --------------------------------------------------------
 
 
+def _evidence_db_extras() -> list[str]:
+    """The exact `--with` pins `evidence.py` probes with, loaded from there.
+
+    This file used to retype the list instead of reusing it, and the copies
+    had already drifted: this one pinned `psycopg-pool` but not `psycopg`
+    itself, so under `uv` the sweep's ephemeral environment never had the
+    driver `tests/db/conftest.py` gates every PostgreSQL test on
+    (`pytest.importorskip("psycopg")`). Every such test skipped silently, the
+    baseline read green, and `cmd_sweep` reported every hook UNNOTICED
+    regardless of what actually covered it — the exact failure mode
+    `evidence.py`'s own docstring warns two copies of this list would produce.
+
+    Loaded by path rather than by adding `scripts/` to `sys.path`, for the same
+    reason `evidence.py`'s own tests do: this is a script, not a package.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "_evidence_extras_for_slice_checks", Path(__file__).resolve().with_name("evidence.py")
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return list(module._DB_EXTRAS)
+
+
 def _pytest_command(suite: str) -> list[str]:
     """`uv` when it is there, this interpreter when it is not — see
     `scripts/evidence.py` for why the hard-coded form was a defect."""
     if shutil.which("uv"):
-        # `pytest` resolved alongside the extra, for the reason `evidence.py`
-        # documents: without it uv takes pytest from PATH and the extra never
-        # reaches the interpreter. This file pointed at that explanation while
+        # `pytest` resolved alongside the extras, for the reason `evidence.py`
+        # documents: without it uv takes pytest from PATH and the extras never
+        # reach the interpreter. This file pointed at that explanation while
         # keeping the broken form — review noticed the mismatch between the
         # comment and the command.
         return [
             "uv", "run",
-            "--with", "psycopg-pool>=3.2,<4",
+            *_evidence_db_extras(),
             "--with", "pytest",
             "pytest", suite, "-q",
         ]

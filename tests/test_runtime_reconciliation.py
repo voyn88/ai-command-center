@@ -342,9 +342,19 @@ def test_reconcile_skips_a_run_this_instance_has_registered_as_launching(tmp_pat
 
 def test_reconcile_does_not_use_claude_agents_registry(tmp_path, monkeypatch):
     """Reconciliation must never shell out to `claude agents --json` — the
-    Supervisor's own SQLite `run` table is its lifecycle registry."""
+    Supervisor's own SQLite `run` table is its lifecycle registry.
+
+    A RUNNING row must actually be present for this to mean anything: with no
+    rows to classify, the per-row branch this guards never runs, and the
+    assertion holds vacuously regardless of what that branch does.
+    """
     db_path = tmp_path / "runtime.db"
     db.migrate(db_path)
+
+    dead = subprocess.Popen(["true"])
+    dead.wait()
+    time.sleep(0.2)  # ensure `ps`/procfs no longer reports it
+    run = _make_running_row(db_path, pid=dead.pid, process_start_identity=None)
 
     def fail_if_called(*args, **kwargs):
         raise AssertionError(f"reconcile() must not invoke subprocess: {args!r}")
@@ -353,8 +363,11 @@ def test_reconcile_does_not_use_claude_agents_registry(tmp_path, monkeypatch):
     monkeypatch.setattr(supervisor.subprocess, "run", fail_if_called)
 
     sup = supervisor.Supervisor(db_path)
-    outcomes = sup.reconcile()  # no RUNNING rows at all — must not touch subprocess either
-    assert outcomes == []
+    outcomes = sup.reconcile()
+
+    assert len(outcomes) == 1
+    assert outcomes[0]["classification"] == "INTERRUPTED"
+    assert db.get_run(db_path, run["id"])["state"] == "INTERRUPTED"
 
 
 def test_reconcile_continues_after_one_run_persistence_failure(tmp_path, monkeypatch):
@@ -455,10 +468,12 @@ def test_reconcile_never_clobbers_a_run_that_resolves_during_grace(tmp_path):
 # --------------------------------------------------------------------------
 # Adopted-orphan timeout enforcement (audit P0/H2): a RUNNING row from a
 # previous incarnation of this app whose process is still alive is adopted (left
-# RUNNING) — but it is not re-registered, so its timeout watchdog is gone. Left
-# alone it runs forever, holding its workspace lock and a global slot. reconcile
-# enforces its timeout: past the deadline it SIGKILLs the (identity-verified)
-# process group and terminalizes the row, releasing the lock and slot.
+# RUNNING) — but it is not re-registered, so its timeout watchdog is gone. Past
+# the deadline, reconcile only terminalizes the row once the process is
+# independently re-confirmed gone — a database identity is not a live
+# ownership handle, so a still-alive orphan is never sent a signal and stays
+# adopted RUNNING past its own deadline (see
+# `test_reconcile_reaps_an_orphan_past_its_timeout` below).
 # --------------------------------------------------------------------------
 
 
