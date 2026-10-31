@@ -757,9 +757,11 @@ def test_idle_preflight_refuses_before_select_and_resumes(tmp_path, failure):
     def signal(args):
         signals.append(args)
         if "--signal=SIGUSR1" in args:
-            status[0] = "aicc-drained" if failure == "legacy" else "aicc-ready"
+            status[0] = {"legacy": "aicc-drained", "busy": "aicc-drained-busy"}.get(failure, "aicc-ready")
             if failure in {"pid", "idle_pid"}:
                 pid[0] = "43"
+        if "--signal=SIGHUP" in args:
+            status[0] = "aicc-ready"
         return SimpleNamespace(returncode=0)
 
     def sleep(seconds):
@@ -775,7 +777,7 @@ def test_idle_preflight_refuses_before_select_and_resumes(tmp_path, failure):
                      resume=lambda gated, **kw: module.resume_gated_lanes(
                          gated, show=show, systemctl=signal),
                      release_timers=lambda: released.append(True))
-    assert report.outcome == "REFUSED"
+    assert report.outcome == ("DEFERRED" if failure == "busy" else "REFUSED")
     assert not selected
     assert released == [True]
     assert any("--signal=SIGHUP" in args for args in signals) == (failure in {"busy", "legacy", "idle_lost"})
@@ -858,6 +860,69 @@ def test_idle_handoff_requires_signal_and_original_pid(tmp_path, initial_status)
                           systemctl=signal, remaining=lambda _: 3600)
     assert gated == {LANE_1: "42"}
     assert signals == [["kill", "--kill-who=main", "--signal=SIGUSR1", LANE_1]]
+
+
+@pytest.mark.parametrize("failure", ["resume", "resume_exception", "timer", "pid", "pid_after_resume", "reload"])
+def test_busy_deferral_requires_successful_cleanup(tmp_path, failure):
+    module = _module()
+    cfg = _cfg(module, tmp_path, readiness_timeout=0.01)
+    selected, restored = [], []
+    pid = ["43" if failure == "pid" else "42"]
+
+    def preflight(config, units, gated, **kwargs):
+        gated[LANE_1] = "42"
+        raise module.BusyLanes("lanes_busy")
+
+    def resume(*args, **kwargs):
+        if failure == "resume_exception":
+            raise RuntimeError("resume broke")
+        if failure == "pid_after_resume":
+            pid[0] = "43"
+        return [LANE_1] if failure == "resume" else []
+
+    def release():
+        restored.append(True)
+        if failure == "timer":
+            raise RuntimeError("timer broke")
+
+    report = _deploy(module, cfg, stage=lambda *_: None, preflight=preflight,
+                     show=lambda u, p: {"ActiveState": "active", "StatusText": "aicc-reload-failed" if failure == "reload" else "aicc-ready", "MainPID": pid[0]}.get(p, "running"),
+                     select=selected.append, resume=resume, release_timers=release)
+    assert report.outcome == "REFUSED"
+    if failure in {"reload", "pid_after_resume"}:
+        assert report.detail == "busy_resume_not_ready"
+    assert not selected
+    assert restored == [True]
+
+
+@pytest.mark.parametrize("outcome,code", [("DEFERRED", 0), ("REFUSED", 1), ("ROLLED_BACK", 1)])
+def test_cli_distinguishes_deferral_from_failure(monkeypatch, outcome, code):
+    module = _module()
+    monkeypatch.setattr(module, "deploy_once", lambda _: module.DeployReport(outcome=outcome))
+    assert module.main([]) == code
+
+
+def test_busy_resume_pid_change_between_guard_and_signal_is_not_success(tmp_path):
+    module = _module()
+    cfg = _cfg(module, tmp_path)
+    reads, signals = [], []
+
+    def preflight(config, units, gated, **kwargs):
+        gated[LANE_1] = "42"
+        raise module.BusyLanes("lanes_busy")
+
+    def show(unit, prop):
+        if prop == "MainPID":
+            reads.append(True)
+            return "42" if len(reads) == 1 else "43"
+        return {"ActiveState": "active", "SubState": "running", "StatusText": "aicc-ready"}[prop]
+
+    report = _deploy(module, cfg, stage=lambda *_: None, preflight=preflight, show=show,
+                     resume=lambda gated, **kw: module.resume_gated_lanes(
+                         gated, show=show, systemctl=lambda args: signals.append(args)))
+    assert report.outcome == "REFUSED"
+    assert report.detail == "busy_resume_not_ready"
+    assert not signals
 
 
 def test_noop_does_not_adopt_maintenance_idle_status(tmp_path):

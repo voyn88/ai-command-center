@@ -266,9 +266,9 @@ def test_credential_hot_reload_does_not_wait_for_or_signal_the_running_job() -> 
     assert handler_started.wait(timeout=5)
     daemon.request_drain()
     deadline = time.monotonic() + 5
-    while "STATUS=aicc-drained" not in pings and time.monotonic() < deadline:
+    while "STATUS=aicc-drained-busy" not in pings and time.monotonic() < deadline:
         time.sleep(0.01)
-    assert "STATUS=aicc-drained" in pings
+    assert "STATUS=aicc-drained-busy" in pings
     daemon.request_reload()
     assert reload_done.wait(timeout=5)
     handler_release.set()
@@ -277,7 +277,7 @@ def test_credential_hot_reload_does_not_wait_for_or_signal_the_running_job() -> 
     assert not worker.is_alive()
     assert events == ["handler", "reload", "handler-finished"]
     assert pings.count("READY=1") == 2
-    assert "STATUS=aicc-drained" in pings
+    assert "STATUS=aicc-drained-busy" in pings
     assert ("complete", "wat-1", {}) in store.calls
 
 
@@ -809,7 +809,7 @@ def test_drain_idle_waits_for_claim_handler_and_outcome_persistence():
         notices.append(message)
         if "STATUS=aicc-drained-idle" in message:
             idle_ack.set()
-        elif "STATUS=aicc-drained" in message:
+        elif "STATUS=aicc-drained-busy" in message:
             busy_ack.set()
 
     daemon = WorkerDaemon(store, {"slow": handler},
@@ -860,7 +860,7 @@ def test_completion_after_reload_cannot_overwrite_ready_with_stale_idle():
 
     def notify(message):
         notices.append(message)
-        if message == "STATUS=aicc-drained":
+        if message == "STATUS=aicc-drained-busy":
             busy.set()
         if busy.is_set() and message == "STATUS=aicc-ready":
             reloaded.set()

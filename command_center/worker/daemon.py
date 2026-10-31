@@ -17,7 +17,8 @@ Design decisions, each traceable to the shipped substrate:
   signal — or the timeout's SIGKILL — abandons it, and the lease expiry plus
   the control plane's reaper make that abandonment safe by construction.
 * **Drain ACK does not imply idle.** ``aicc-drained`` retains its legacy
-  meaning (claim gate closed, possibly busy). ``aicc-drained-idle`` additionally
+  meaning (claim gate closed, possibly busy). ``aicc-drained-busy`` explicitly
+  identifies unsettled local work. ``aicc-drained-idle`` additionally
   proves that no claim/handler/report is in flight. A handled outcome-write
   failure is left to the canonical lease expiry/reaper, as on the normal loop;
   it is not permanent evidence of work still running inside this process.
@@ -186,7 +187,7 @@ class WorkerDaemon:
     def _drained_status(self) -> str:
         """Caller holds the gate lock, including while emitting this status."""
         if self._attempt_active:
-            return "aicc-drained"  # legacy ACK: claims closed, not necessarily idle
+            return "aicc-drained-busy"  # claims closed; an attempt is still unsettled
         return "aicc-drained-idle"
 
     def _drain_coordinator_loop(self) -> None:
