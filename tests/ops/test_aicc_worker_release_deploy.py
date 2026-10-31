@@ -36,6 +36,29 @@ LANE_2 = "voyn-aicc-worker@2.service"
 LANE_3 = "voyn-aicc-worker@3.service"
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="installed helpers require fcntl")
+@pytest.mark.parametrize("installed", [False, True])
+def test_helper_loaders_source_and_installed_layout(tmp_path, monkeypatch, installed):
+    module = _module()
+    source_ops = Path(module.__file__).parent
+    for name in ("aicc_install_transaction", "aicc_staged_worker_rollout"):
+        filename = name.replace("_", "-") if installed else name + ".py"
+        (tmp_path / filename).write_bytes((source_ops / (name + ".py")).read_bytes())
+        monkeypatch.delitem(sys.modules, name, raising=False)
+    monkeypatch.setattr(module, "_OPS_DIR", tmp_path)
+    try:
+        tx = module._load_install_transaction()
+        rollout = module._load_staged_rollout()
+        assert callable(tx.verify_release_manifest)
+        assert Path(tx.__file__).parent == tmp_path
+        assert Path(rollout.__file__).parent == tmp_path
+        assert module._load_install_transaction() is tx
+        assert module._load_staged_rollout() is rollout
+    finally:
+        for name in ("aicc_install_transaction", "aicc_staged_worker_rollout"):
+            sys.modules.pop(name, None)
+
+
 def _cfg(module, tmp_path, **overrides):
     kwargs = {
         "bare_mirror": tmp_path / "mirror.git",

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.machinery
 import importlib.util
 import os
 import re
@@ -49,10 +50,14 @@ _ROOT_HELPERS: tuple[tuple[str, str], ...] = (
 
 def _load_install_transaction():
     path = _OPS_DIR / "aicc_install_transaction.py"
+    if not path.is_file():
+        path = _OPS_DIR / "aicc-install-transaction"
     name = "aicc_install_transaction"
     if name in sys.modules:
         return sys.modules[name]
-    spec = importlib.util.spec_from_file_location(name, path)
+    spec = importlib.util.spec_from_file_location(
+        name, path, loader=importlib.machinery.SourceFileLoader(name, str(path))
+    )
     if spec is None or spec.loader is None:
         raise RuntimeError("cannot load aicc_install_transaction")
     module = importlib.util.module_from_spec(spec)
@@ -63,10 +68,14 @@ def _load_install_transaction():
 
 def _load_staged_rollout():
     path = _OPS_DIR / "aicc_staged_worker_rollout.py"
+    if not path.is_file():
+        path = _OPS_DIR / "aicc-staged-worker-rollout"
     name = "aicc_staged_worker_rollout"
     if name in sys.modules:
         return sys.modules[name]
-    spec = importlib.util.spec_from_file_location(name, path)
+    spec = importlib.util.spec_from_file_location(
+        name, path, loader=importlib.machinery.SourceFileLoader(name, str(path))
+    )
     if spec is None or spec.loader is None:
         raise RuntimeError("cannot load aicc_staged_worker_rollout")
     module = importlib.util.module_from_spec(spec)
