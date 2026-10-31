@@ -7,6 +7,23 @@ Wants=network-online.target
 Type=oneshot
 User=voynadmin
 WorkingDirectory=/home/voynadmin/aicc-preprod/repo
+# This timer is one of LANE_MUTATING_TIMERS (ops/aicc_staged_worker_rollout.py):
+# a staged rollout stops it for its duration so a refresh cannot move the
+# source tree underneath the rollout's own mutations. The condition below
+# covers the tick that was already queued when the timer was stopped --
+# the same belt-and-suspenders the rotation and self-deploy units carry,
+# and held to the same text by tests/ops/test_rollout_lock_consistency.py.
+# `[ -e ]` alone was the first version of this and it is the wrong test: a
+# rollout killed outright (SIGKILL, OOM, power) never runs the `finally` that
+# removes its lock, and an existence-only condition turns that one crash into
+# a unit that is skipped every firing until the host reboots and clears the
+# tmpfs. So the lock carries the rollout's pid and a holder that is gone is
+# not a holder. Every other answer stays "held" (exit 1 = skipped, not
+# failed): absent /proc entry aside, an unreadable lock or one whose contents
+# are not a plain number defers, because deferring a tick that could have run
+# costs one interval and running one that should have deferred costs the
+# canceled systemd job this exists to prevent.
+ExecCondition=/bin/sh -c 'lock=/run/aicc-staged-rollout.lock; [ -e "$$lock" ] || exit 0; holder=$$(cat "$$lock" 2>/dev/null) || exit 1; case "$$holder" in ""|*[!0-9]*|0*) exit 1 ;; esac; [ -d "/proc/$$holder" ] && exit 1; exit 0'
 ExecStart=/home/voynadmin/aicc-preprod/repo/.venv/bin/python -m command_center.ops.source_clone_refresh --repo /home/voynadmin/aicc-preprod/repo
 ExecStart=/home/voynadmin/aicc-preprod/repo/.venv/bin/python -m command_center.ops.source_clone_refresh --repo /home/voynadmin/Projects/ai-command-center
 ExecStart=/home/voynadmin/aicc-preprod/repo/.venv/bin/python -m command_center.ops.source_clone_refresh --repo /home/voynadmin/Projects/aios

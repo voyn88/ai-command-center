@@ -1467,6 +1467,206 @@ def test_worker_to_control_is_one_generation_with_one_rollback_boundary():
     )
 
 
+def _lane_timer_shell() -> str:
+    """The installer's own hold/release code, lifted verbatim.
+
+    Every other assertion about this transaction reads the script as text,
+    which is the right tool for ORDER but useless for BEHAVIOUR: the defect
+    these tests exist for -- an unchecked `printf`/`chmod`/`mv` inside a
+    function called as `hold_lane_timers || ...`, where `set -e` is
+    suppressed for the whole body -- is invisible to any amount of reading
+    and obvious the moment the function actually runs against a /run it
+    cannot write (review of 25487a7). So this runs it.
+    """
+    text = _installer_text()
+    start = text.index('lane_mutating_timers="')
+    end = text.index("\n}\n", text.index("release_lane_timers() {")) + len("\n}\n")
+    return text[start:end]
+
+
+def _timer_harness(tmp_path, *, missing=(), refuse_stop=(), lock=None) -> Path:
+    """A fake `systemctl` on PATH plus the extracted functions, so a test can
+    drive a hold/release the way the installer does."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    log = tmp_path / "systemctl.log"
+    (bin_dir / "systemctl").write_text(
+        "#!/bin/sh\n"
+        f'printf "%s\\n" "$*" >>{log}\n'
+        'if [ "$1" = "show" ]; then\n'
+        f'  case " {" ".join(missing)} " in\n'
+        '    *" $2 "*) echo not-found; exit 0 ;;\n'
+        "  esac\n"
+        "  echo loaded; exit 0\n"
+        "fi\n"
+        'if [ "$1" = "stop" ]; then\n'
+        f'  case " {" ".join(refuse_stop)} " in\n'
+        '    *" $2 "*) exit 1 ;;\n'
+        "  esac\n"
+        "fi\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    (bin_dir / "systemctl").chmod(0o755)
+    script = tmp_path / "drive.sh"
+    lock_path = tmp_path / "rollout.lock" if lock is None else lock
+    script.write_text(
+        "#!/bin/sh\nset -eu\n"
+        + _lane_timer_shell()
+        + f"\nrollout_lock={lock_path}\n"
+        + 'if hold_lane_timers; then echo HELD; else echo HOLD_FAILED; fi\n'
+        + 'release_lane_timers\necho DONE\n',
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    return script
+
+
+def _drive_timers(tmp_path, script) -> tuple[str, list[str]]:
+    result = subprocess.run(
+        ["/bin/sh", str(script)],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PATH": f"{tmp_path / 'bin'}:{os.environ['PATH']}"},
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    log = tmp_path / "systemctl.log"
+    calls = log.read_text(encoding="utf-8").splitlines() if log.exists() else []
+    return result.stdout, calls
+
+
+def test_installer_hold_stops_every_lane_mutating_timer_and_writes_the_lock(
+    tmp_path,
+):
+    lock = tmp_path / "rollout.lock"
+    stdout, calls = _drive_timers(tmp_path, _timer_harness(tmp_path, lock=lock))
+
+    assert "HELD" in stdout
+    stops = [call for call in calls if call.startswith("stop ")]
+    assert stops == [
+        "stop voyn-aicc-credential-rotation.timer",
+        "stop voyn-aicc-self-deploy.timer",
+        "stop voyn-aicc-source-clone-refresh.timer",
+    ]
+    # Released again, and the lock gone with it -- a transaction must never
+    # exit leaving rotation or self-deploy paused.
+    assert [call for call in calls if call.startswith("start ")] == [
+        "start voyn-aicc-credential-rotation.timer",
+        "start voyn-aicc-self-deploy.timer",
+        "start voyn-aicc-source-clone-refresh.timer",
+    ]
+    assert not lock.exists()
+
+
+def test_installer_hold_fails_closed_when_the_lock_cannot_be_written(tmp_path):
+    """The defect this file's text assertions could not see: the two
+    `systemctl stop` calls were carefully checked while the `printf`/`chmod`/
+    `mv` that actually creates the lock had no error handling at all, in a
+    function whose body runs with errexit suppressed. A /run it cannot write
+    produced a transaction that believed it held both layers of defense while
+    the second was silently absent -- and `run_release || exit 1` never fired,
+    because the function itself did not fail."""
+    blocker = tmp_path / "not-a-directory"
+    blocker.write_text("", encoding="utf-8")
+    lock = blocker / "rollout.lock"  # every write below is ENOTDIR
+
+    stdout, calls = _drive_timers(tmp_path, _timer_harness(tmp_path, lock=lock))
+
+    assert "HOLD_FAILED" in stdout and "HELD" not in stdout
+    # Fail-closed in the honest sense: the timers it stopped on the way in
+    # are running again before it reports the failure.
+    assert [call for call in calls if call.startswith("start ")] == [
+        "start voyn-aicc-credential-rotation.timer",
+        "start voyn-aicc-self-deploy.timer",
+        "start voyn-aicc-source-clone-refresh.timer",
+    ]
+    assert not lock.exists()
+
+
+def test_installer_hold_restarts_the_timers_it_already_stopped_on_a_refusal(
+    tmp_path,
+):
+    stdout, calls = _drive_timers(
+        tmp_path,
+        _timer_harness(tmp_path, refuse_stop=("voyn-aicc-self-deploy.timer",)),
+    )
+
+    assert "HOLD_FAILED" in stdout
+    assert [call for call in calls if call.startswith("start ")] == [
+        "start voyn-aicc-credential-rotation.timer"
+    ]
+    # The third timer is never stopped: the hold gives up at the refusal
+    # rather than disabling more guardrails on its way out.
+    assert "stop voyn-aicc-source-clone-refresh.timer" not in calls
+
+
+def test_installer_hold_skips_timers_this_host_has_not_installed(tmp_path):
+    """A fresh bootstrap installs the unit files further down the script, in
+    `run_transaction apply`. `systemctl stop` on a not-found unit is an
+    error, not a no-op, so an absent timer is skipped -- and not started at
+    release either, since this transaction never stopped it."""
+    stdout, calls = _drive_timers(
+        tmp_path,
+        _timer_harness(
+            tmp_path,
+            missing=(
+                "voyn-aicc-self-deploy.timer",
+                "voyn-aicc-source-clone-refresh.timer",
+            ),
+        ),
+    )
+
+    assert "HELD" in stdout
+    assert [call for call in calls if call.startswith("stop ")] == [
+        "stop voyn-aicc-credential-rotation.timer"
+    ]
+    assert [call for call in calls if call.startswith("start ")] == [
+        "start voyn-aicc-credential-rotation.timer"
+    ]
+
+
+def test_installer_hold_refuses_while_a_live_rollout_holds_the_lock(tmp_path):
+    lock = tmp_path / "rollout.lock"
+    lock.write_text(f"{os.getpid()}\n", encoding="utf-8")
+
+    stdout, calls = _drive_timers(tmp_path, _timer_harness(tmp_path, lock=lock))
+
+    assert "HOLD_FAILED" in stdout
+    # Refused before touching a single timer -- the rollout that holds the
+    # lock is the one that gets to hand them back.
+    assert [call for call in calls if call.startswith(("stop ", "start "))] == []
+    assert lock.read_text(encoding="utf-8") == f"{os.getpid()}\n"
+
+
+def test_installer_hold_takes_over_a_crashed_rollouts_lock(tmp_path):
+    """A rollout killed outright never removes its lock. Treating that as a
+    live holder would block every later install on the host until it
+    reboots; a holder that is gone is not a holder."""
+    lock = tmp_path / "rollout.lock"
+    dead = subprocess.Popen([sys.executable, "-c", ""])
+    dead.wait()
+    lock.write_text(f"{dead.pid}\n", encoding="utf-8")
+
+    stdout, _calls = _drive_timers(tmp_path, _timer_harness(tmp_path, lock=lock))
+
+    assert "HELD" in stdout
+    assert not lock.exists()  # released at the end of the run
+
+
+def test_the_source_clone_refresh_timer_is_started_outside_the_held_span():
+    """It is one of LANE_MUTATING_TIMERS, so `enable --now` inside the hold
+    would start the very timer this transaction just stopped and hand the
+    rollout step back the race it is holding the timers to avoid."""
+    lines = [line.strip() for line in _installer_text().splitlines()]
+    hold = lines.index("hold_lane_timers || {")
+    commit = lines.index("run_transaction commit")
+    release = lines.index("release_lane_timers", commit)
+    enable = lines.index("systemctl enable --now voyn-aicc-source-clone-refresh.timer")
+
+    assert hold < commit < release < enable
+
+
 def test_lane_timers_are_held_before_apply_and_released_after_commit():
     """Both lane-mutating timers, and the shared rollout lock, must be held
     for the transaction's full mutating span -- prepare through commit -- not

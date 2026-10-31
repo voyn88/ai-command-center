@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import Protocol
 
 from command_center.db.config import PostgresConfig, load_config
+from command_center.ops.rollout_lock import ROLLOUT_LOCK_PATH, rollout_lock_is_held
 from command_center.worker.credential_file import (
     PreparedCredentialFile,
     parse_environment_text,
@@ -52,18 +53,19 @@ from command_center.worker.credential_file import (
 
 _READY = "aicc-ready"
 
-# Shared with ROLLOUT_LOCK_PATH in ops/aicc_staged_worker_rollout.py -- both
-# are root-owned scripts on the same host with no import relationship, so the
-# path is duplicated rather than shared as an import; keep the two in sync by
-# hand. The staged rollout holds this file for its entire duration (creating
-# it before the first lane mutation, removing it in a `finally`) precisely so
+# The staged rollout holds this file for its entire duration (creating it
+# before the first lane mutation, removing it in a `finally`) precisely so
 # that a rotation tick which fires anyway -- because its timer had already
 # elapsed before the rollout could stop it, or because it was started
 # directly rather than through the timer -- has a way to notice a rollout is
 # in flight and defer instead of racing it (live 2026-09-08 worker-01: a
 # rotate tick's `try-restart` collided with the rollout's own drain of the
-# canary lane).
-DEFAULT_ROLLOUT_LOCK_PATH = Path("/run/aicc-staged-rollout.lock")
+# canary lane). Imported, not re-spelled: a marker whose consumers disagree
+# about its path or about what "held" means is not a lock (see
+# command_center/ops/rollout_lock.py, and the consistency test that holds
+# the copies outside this package -- the rollout script, the installer
+# shell, the units -- to the same value).
+DEFAULT_ROLLOUT_LOCK_PATH = ROLLOUT_LOCK_PATH
 
 # enroll_rotate_self() grants a fixed one-hour credential. Keep this contract
 # beside the protocol budget so a unit/test change cannot silently make a
@@ -839,13 +841,6 @@ def authority_timeout_seconds(config: PostgresConfig) -> float:
 
 
 class RotationController:
-    # Class-level fallback for `RotationController.__new__` bypass-constructed
-    # instances (test_hot_budget_has_no_lane_count_ceiling calls
-    # `_post_rotation_budget` directly without a systemd to query), so
-    # `_activation_waves` can fall back to the full configured registry
-    # instead of raising AttributeError.
-    _rotatable_units: tuple[str, ...] | None = None
-
     def __init__(
         self,
         config: RotationConfig,
@@ -904,7 +899,7 @@ class RotationController:
             remaining=remaining,
         )
 
-    def _refresh_rotatable_units(self) -> tuple[str, ...]:
+    def _refresh_rotatable_units(self, *, require_active: bool = True) -> tuple[str, ...]:
         """Snapshot which configured lanes are not held down right now.
 
         Queried once per rotation attempt (right after tunnel readiness is
@@ -928,6 +923,19 @@ class RotationController:
         polls it toward `active`/`running` right after this snapshot, and a
         lane that is merely mid-startup must stay eligible for that wait
         rather than being excluded before it ever gets the chance.
+
+        Excluding a lane never strands it on the old credential: the
+        credential lives in ONE EnvironmentFile shared by the whole
+        template family, and a lane that is not running has no pool to
+        swap -- it reads the committed file when it is next started, by
+        the rollout that is holding it down or by the operator who is.
+        The reload exists for the processes that are already up; skipping
+        it for a process that is not is the whole point.
+
+        `require_active=False` is the recovery caller (see
+        `recover_interrupted`): an interrupted rotation must be finished
+        even when EVERY lane is currently held down, so "no live lane"
+        becomes an audited empty snapshot instead of a refusal.
         """
         active: list[str] = []
         for unit in self.config.worker_units:
@@ -940,7 +948,7 @@ class RotationController:
                     unit=unit,
                     active_state=state.active,
                 )
-        if not active:
+        if not active and require_active:
             raise RotationError("no worker lane is currently active to rotate")
         self._rotatable_units = tuple(active)
         return self._rotatable_units
@@ -1447,7 +1455,21 @@ class RotationController:
         # so keep the durable journal and wait through that bounded race before
         # deciding that neither credential is usable.
         self._wait_tunnel()
-        self._refresh_rotatable_units()
+        # Recovery is exempt from the rollout-lock defer in `main()` on
+        # purpose: it is cleaning up an ALREADY-interrupted rotation, and
+        # leaving that fleet on an ambiguous credential until the rollout
+        # finishes is the worse outcome. That exemption has to hold all the
+        # way down, so this snapshot must not reintroduce the refusal
+        # through a side door: a rollout mid-drain is exactly the state in
+        # which every configured lane can read `inactive` at once, and
+        # `require_active=True` would abort the recovery right there
+        # (review of 25487a7). The lanes that ARE down still get the
+        # credential -- it is a file, and they read it when the rollout
+        # starts them -- so an empty snapshot simply means there is no
+        # running pool left to reopen, which recovery records and completes.
+        rotatable = self._refresh_rotatable_units(require_active=False)
+        if not rotatable:
+            self.audit.emit("rotation_recovery_no_live_lane")
         working: list[tuple[Path, PostgresConfig, datetime, float]] = []
         for path, config in self._recovery_candidates(phase):
             try:
@@ -1790,10 +1812,16 @@ def main(argv: list[str] | None = None) -> int:
     # Restart=on-failure from treating a rollout in progress as an incident.
     # Recovery is exempt: it is cleaning up an ALREADY-interrupted rotation
     # (a durable phase journal), and leaving that fleet drained until the
-    # rollout finishes is a worse outcome than finishing the recovery.
-    if not args.recover_only and args.rollout_lock is not None and (
-        args.rollout_lock.exists()
-    ):
+    # rollout finishes is a worse outcome than finishing the recovery. That
+    # exemption is honoured all the way down -- `recover_interrupted` takes
+    # its lane snapshot with `require_active=False` so a fully drained fleet
+    # cannot abort the recovery this branch just let through.
+    #
+    # `rollout_lock_is_held` rather than `.exists()`: a rollout killed
+    # outright (SIGKILL, OOM, power) never runs its `finally`, and an
+    # existence-only test would turn that into rotation refusing every
+    # tick until the host reboots.
+    if not args.recover_only and rollout_lock_is_held(args.rollout_lock):
         Audit(args.audit_file).emit(
             "rotation_deferred_staged_rollout", lock=str(args.rollout_lock)
         )

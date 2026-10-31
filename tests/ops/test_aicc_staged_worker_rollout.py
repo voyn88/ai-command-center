@@ -938,6 +938,118 @@ def test_write_and_remove_rollout_lock_round_trip(tmp_path, monkeypatch):
     module.remove_rollout_lock()
 
 
+def _dead_pid() -> int:
+    """A pid that is provably not running: forked, reaped, and never reused
+    while this test holds the slot."""
+    child = subprocess.Popen([sys.executable, "-c", ""])
+    child.wait()
+    return child.pid
+
+
+def test_a_failed_lock_write_hands_the_timers_back(tmp_path, monkeypatch):
+    """The acquire has two halves -- stop the timers, write the lock -- and
+    they used to sit OUTSIDE the try/finally that releases them. A lock write
+    that failed (full or read-only /run, a rollout already holding it) left
+    the process exiting with the timers stopped and nothing left to start
+    them: rotation and self-deploy paused forever by a rollout that never
+    even began (review of 25487a7). Whatever the acquire actually took, the
+    release gives back."""
+    module = _module()
+    monkeypatch.setattr(
+        module, "ROLLOUT_LOCK_PATH", tmp_path / "read-only" / "rollout.lock"
+    )
+
+    def refuse_to_write() -> None:
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(module, "write_rollout_lock", refuse_to_write)
+    units = ("voyn-aicc-worker@1.service",)
+    systemd = FakeSystemd(units)
+
+    with pytest.raises(OSError, match="read-only file system"):
+        module.rollout(
+            systemd,
+            units,
+            agent_user="aicc-agent",
+            privileged_users=("root", "voynadmin"),
+            uid_for_user=_uid,
+            process_uid=lambda pid: 1002,
+            process_environment=lambda pid: (
+                "AICC_AGENT_PRINCIPAL_ISOLATION=required",
+            ),
+        )
+
+    for timer in module.LANE_MUTATING_TIMERS:
+        assert systemd.states[timer]["ActiveState"] == "active", timer
+    # ...and no lane was mutated on the way out: the failure is before the
+    # first `enable`, so there is nothing for the outer transaction to undo.
+    assert not [
+        call
+        for call in systemd.calls
+        if call[0] in {"enable", "disable"} and call[-1] not in
+        module.LANE_MUTATING_TIMERS
+    ]
+
+
+def test_write_rollout_lock_refuses_while_another_rollout_holds_it(
+    tmp_path, monkeypatch
+):
+    """Two rollouts mutating the same lanes at once is the collision this
+    lock exists to prevent, and the second silently overwriting the first's
+    marker would make its `finally` remove a lock the first still needs."""
+    module = _module()
+    lock_path = tmp_path / "aicc-staged-rollout.lock"
+    monkeypatch.setattr(module, "ROLLOUT_LOCK_PATH", lock_path)
+    lock_path.write_text(f"{os.getpid()}\n", encoding="utf-8")
+
+    with pytest.raises(module.RolloutError, match="already holds"):
+        module.write_rollout_lock()
+
+    # The live holder's own marker is left exactly as it was.
+    assert lock_path.read_text(encoding="utf-8") == f"{os.getpid()}\n"
+
+
+def test_write_rollout_lock_takes_over_a_crashed_rollouts_lock(
+    tmp_path, monkeypatch
+):
+    """A rollout killed outright (SIGKILL, OOM, power) never runs the
+    `finally` that removes its lock. Refusing on that leftover file would let
+    one crash block every future rollout, rotation and self-deploy on the
+    host until it reboots; a holder that is gone is not a holder."""
+    module = _module()
+    lock_path = tmp_path / "aicc-staged-rollout.lock"
+    monkeypatch.setattr(module, "ROLLOUT_LOCK_PATH", lock_path)
+    lock_path.write_text(f"{_dead_pid()}\n", encoding="utf-8")
+
+    module.write_rollout_lock()
+
+    assert lock_path.read_text(encoding="utf-8") == f"{os.getpid()}\n"
+
+
+@pytest.mark.parametrize(
+    "contents,held",
+    [
+        ("", True),
+        ("   \n", True),
+        ("not-a-pid\n", True),
+        ("-1\n", True),
+        ("0\n", True),
+    ],
+)
+def test_an_unreadable_holder_still_counts_as_held(
+    tmp_path, monkeypatch, contents, held
+):
+    """Staleness is an escape hatch for a dead holder, not a general excuse
+    to proceed: every ambiguous lock defers, because deferring costs one
+    timer interval and proceeding costs a canceled systemd job."""
+    module = _module()
+    lock_path = tmp_path / "aicc-staged-rollout.lock"
+    monkeypatch.setattr(module, "ROLLOUT_LOCK_PATH", lock_path)
+    lock_path.write_text(contents, encoding="utf-8")
+
+    assert module.rollout_lock_is_held() is held
+
+
 def test_rollout_with_timers_already_held_does_not_touch_timers_or_lock(
     tmp_path, monkeypatch
 ):

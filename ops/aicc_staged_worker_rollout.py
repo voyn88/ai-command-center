@@ -82,14 +82,20 @@ LANE_MUTATING_TIMERS = (
     "voyn-aicc-source-clone-refresh.timer",
 )
 
-# Shared with DEFAULT_ROLLOUT_LOCK_PATH in command_center/ops/
-# credential_rotation.py and rollout_lock_path in
-# command_center/deployment/self_deploy.py -- three root-owned/host-local
-# programs with no import relationship, so the path is duplicated rather
-# than shared as an import; keep all three in sync by hand. Held for the
-# same duration as LANE_MUTATING_TIMERS, as a second, independent defense:
-# a tick already in flight when the timers are stopped, or one started
-# directly rather than through its timer, still sees this file and defers.
+# The same lock command_center/ops/rollout_lock.py defines for the two
+# consumers that live inside the package. This script cannot import it: it
+# runs under /usr/bin/python3 with only ops/ on sys.path, on hosts (and at
+# moments during a bootstrap) where no venv and no repo checkout of
+# `command_center` exists yet. So the value is restated here -- and
+# tests/ops/test_rollout_lock_consistency.py fails the build the moment
+# this copy, the shell installer's, or either systemd unit's drifts from
+# that one definition, which is what makes "keep them in sync by hand"
+# something other than a wish.
+#
+# Held for the same duration as LANE_MUTATING_TIMERS, as a second,
+# independent defense: a tick already in flight when the timers are
+# stopped, or one started directly rather than through its timer, still
+# sees this file and defers.
 ROLLOUT_LOCK_PATH = Path("/run/aicc-staged-rollout.lock")
 
 
@@ -499,14 +505,75 @@ def release_lane_mutating_timers(systemd: Systemd) -> None:
         systemd.run("start", timer, check=False)
 
 
+def rollout_lock_holder_is_alive(pid: int) -> bool:
+    """Is the process that wrote the lock still running?
+
+    Behaviourally identical to `command_center.ops.rollout_lock`'s function
+    of the same name (tests/ops/test_rollout_lock_consistency.py holds the
+    two to the same answers), restated here because this script runs with
+    only ops/ on its path. /proc rather than `os.kill(pid, 0)`: the readers
+    are unprivileged service users and the holder is root, so kill(2) would
+    answer EPERM -- "alive", but indistinguishable from "gone" unless every
+    caller remembers to unpack errno. No /proc to ask means "alive", so an
+    unanswerable question never downgrades a real lock to a stale one.
+    """
+    if pid <= 0:
+        return True
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return True
+    return (proc / str(pid)).exists()
+
+
+def rollout_lock_is_held() -> bool:
+    """True while a LIVE rollout holds the lock -- stale locks are not held.
+
+    A rollout killed outright (SIGKILL, OOM, power) never runs the `finally`
+    that removes this file. An existence-only test turns that crash into a
+    permanent wedge: rotation and self-deploy refuse every tick, and a
+    second rollout can never take over, until the host reboots and the
+    tmpfs clears. Every ambiguous case still answers "held" -- unreadable
+    file, content that is not a plain positive integer, a live pid -- because
+    deferring a tick that could have run costs one interval, while running
+    one that should have deferred costs the canceled-job collision this
+    mechanism exists to prevent.
+    """
+    try:
+        raw = ROLLOUT_LOCK_PATH.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    holder = raw.strip()
+    # A plain positive integer with no leading zero: the exact set a POSIX
+    # `case` can test for, so the shell copies in the installer and in the
+    # units' ExecCondition answer identically (0 and 0123 are "ambiguous",
+    # not "pid 0" and "pid 123").
+    if not holder.isdigit() or holder.startswith("0"):
+        return True
+    return rollout_lock_holder_is_alive(int(holder))
+
+
 def write_rollout_lock() -> None:
     """Create the marker file rotation/self-deploy check before mutating.
 
-    World-readable by design: the rotator and self-deploy run as unprivileged
-    service users and only need to observe that the file exists, never its
-    contents. Written via temp-then-rename so a concurrent reader never
-    observes a partially written file.
+    Refuses while a LIVE rollout already holds it: two rollouts mutating the
+    same lanes at once is the very collision this lock exists to prevent,
+    and the second one silently overwriting the first one's marker would
+    make its eventual `finally` remove a lock the first still needs. A lock
+    whose holder is gone is taken over rather than waited on -- that is the
+    crashed-predecessor case, and refusing it would hand a crash the power
+    to block every future rollout on the host.
+
+    World-readable by design: the rotator and self-deploy run as
+    unprivileged service users and only need to observe the holder's pid.
+    Written via temp-then-rename so a concurrent reader never observes a
+    partially written file.
     """
+    if rollout_lock_is_held():
+        raise RolloutError(
+            f"another staged rollout already holds {ROLLOUT_LOCK_PATH}"
+        )
     ROLLOUT_LOCK_PATH.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
     temporary = ROLLOUT_LOCK_PATH.with_name(f".{ROLLOUT_LOCK_PATH.name}.{os.getpid()}")
     temporary.write_text(f"{os.getpid()}\n", encoding="utf-8")
@@ -1169,10 +1236,21 @@ def rollout(
     # have already handed the timers back. Skipping the inner hold/release
     # when the caller already holds it is what keeps that second, outer
     # restore covered too, instead of just this function's mutations.
+    timers_held_here = False
     if not timers_already_held:
         hold_lane_mutating_timers(systemd)
-        write_rollout_lock()
+        timers_held_here = True
     try:
+        # Inside the protected span, not beside it. `write_rollout_lock` can
+        # fail -- a full or read-only /run, a live rollout already holding
+        # the lock -- and when it did so above the `try` the timers were
+        # already stopped with nothing left to start them again: rotation
+        # and self-deploy stayed paused forever on a rollout that never even
+        # began (review of 25487a7). `timers_held_here` is what makes the
+        # acquire and the release symmetric: whatever this call actually
+        # took, the `finally` gives back.
+        if timers_held_here:
+            write_rollout_lock()
         try:
             agent_uid = uid_for_user(agent_user)
             privileged_uids = frozenset(uid_for_user(user) for user in privileged_users)
@@ -1230,7 +1308,7 @@ def rollout(
         # would hand them back before that caller's own later steps (e.g. the
         # installer's `commit`, or its `recover` on a later failure) are
         # done needing them held.
-        if not timers_already_held:
+        if timers_held_here:
             remove_rollout_lock()
             release_lane_mutating_timers(systemd)
 
