@@ -2621,8 +2621,14 @@ def test_the_control_profile_installs_the_pr_window_tick(tmp_path):
         assert f"/etc/systemd/system/{unit}" in control
     # A control-only unit is exactly that: the worker profile neither installs
     # it nor is expected to, and the worker-only drop set is unchanged by it.
+    # Self-deploy is control-only too, but it is not in CONTROL_ONLY_UNITS:
+    # workers stage releases with voyn-aicc-worker-release-deploy, and the
+    # retired worker self-deploy variant is not reinstalled.
     assert control - worker == {
         f"/etc/systemd/system/{unit}" for unit in tx.CONTROL_ONLY_UNITS
+    } | {
+        tx.SELF_DEPLOY_SERVICE_TARGET,
+        f"/etc/systemd/system/{tx.SELF_DEPLOY_TIMER}",
     }
     assert worker - control == tx.WORKER_ONLY_TARGETS
 

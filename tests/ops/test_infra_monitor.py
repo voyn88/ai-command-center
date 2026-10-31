@@ -1683,11 +1683,12 @@ def test_the_fleets_actual_shape_is_four_separate_findings(tmp_path) -> None:
     _fake_host(root, "worker", skip=(absent_target,))
     units = root / "etc/systemd/system"
 
-    home_unit = tmp_path / "operator-home/voyn-aicc-self-deploy.service"
+    handmade = "voyn-aicc-worker-release-deploy.service"
+    home_unit = tmp_path / "operator-home" / handmade
     home_unit.parent.mkdir(parents=True)
     home_unit.write_text("[Service]\nExecStart=/bin/true\n", encoding="utf-8")
-    (units / "voyn-aicc-self-deploy.service").unlink()
-    (units / "voyn-aicc-self-deploy.service").symlink_to(home_unit)
+    (units / handmade).unlink()
+    (units / handmade).symlink_to(home_unit)
     (units / "voyn-aicc-worker@.service").write_text(
         "[Service]\n# the fix that merged and never arrived\n", encoding="utf-8"
     )
@@ -1697,7 +1698,9 @@ def test_the_fleets_actual_shape_is_four_separate_findings(tmp_path) -> None:
     )
 
     assert snapshot.error is None
-    assert snapshot.unmanaged == ("/etc/systemd/system/voyn-aicc-self-deploy.service",)
+    assert snapshot.unmanaged == (
+        "/etc/systemd/system/voyn-aicc-worker-release-deploy.service",
+    )
     assert snapshot.diverged == ("/etc/systemd/system/voyn-aicc-worker@.service",)
     assert snapshot.absent == (absent_target,)
     assert snapshot.retired == ()
@@ -1706,7 +1709,7 @@ def test_the_fleets_actual_shape_is_four_separate_findings(tmp_path) -> None:
                       prometheus_ready=True, unit_drift=snapshot)
     assert not report.ok
     assert report.failures == (
-        "unit_hand_made:1:voyn-aicc-self-deploy.service",
+        "unit_hand_made:1:voyn-aicc-worker-release-deploy.service",
         "unit_drift:1:voyn-aicc-worker@.service",
         "unit_absent:1:voyn-aicc-github-token.timer",
     )
@@ -1746,9 +1749,9 @@ def test_a_control_host_still_carrying_the_worker_agent_layer_is_drift(
 
 def test_the_probe_reads_the_installers_own_spec_list_not_a_second_copy() -> None:
     """A drift probe with its own list of unit names is a second thing to
-    drift. The authority is `default_specs`, so the self-deploy tick the
-    installer now owns -- the crutch the audit named -- is judged without
-    anyone adding it here."""
+    drift. The authority is `default_specs`. Control owns self-deploy;
+    workers own release-deploy. Neither name is copied into this test's
+    expectation except as the check that the spec list is what gets judged."""
     worker = {
         spec.target
         for spec in infra_monitor.load_install_specs(str(REPO_ROOT), profile="worker")
@@ -1760,8 +1763,12 @@ def test_the_probe_reads_the_installers_own_spec_list_not_a_second_copy() -> Non
         if not spec.remove
     }
 
-    assert "/etc/systemd/system/voyn-aicc-self-deploy.service" in worker & control
-    assert "/etc/systemd/system/voyn-aicc-self-deploy.timer" in worker & control
+    assert "/etc/systemd/system/voyn-aicc-self-deploy.service" in control - worker
+    assert "/etc/systemd/system/voyn-aicc-self-deploy.timer" in control - worker
+    assert (
+        "/etc/systemd/system/voyn-aicc-worker-release-deploy.service"
+        in worker - control
+    )
     assert "/etc/systemd/system/voyn-infra-monitor.timer" in worker - control
     assert "/etc/systemd/system/voyn-queue-monitor.timer" in control - worker
 
