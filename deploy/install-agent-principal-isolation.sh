@@ -700,7 +700,17 @@ trap - EXIT HUP INT TERM
 # the tick is a no-op. This is what makes "deployed" true of the PR
 # review-window labeller instead of "someone typed it once on 2026-09-09"
 # (VOYN-W0-AICC-PR-WINDOW-RECONCILER-NOT-DEPLOYED-ON-CONTROL).
+#
+# voyn-prometheus-recovery.timer is here for the same reason and nothing
+# else: it has existed in deploy/systemd since 2026-09-05 (#614) and no
+# installer ever enabled it, so the control host's Prometheus had no recovery
+# path for the Tailscale-listener race and the queue monitor measured
+# `prometheus_unready` (monitor_finding #41637) with nothing retrying behind
+# it. `--now` also starts it, and its already-elapsed OnBootSec fires at once,
+# so a Prometheus that is down when the installer runs comes back here; the
+# ordering/restart drop-in the generation installed above shapes every start
+# after the `systemctl daemon-reload` further up.
 if [ "$install_profile" = "control" ]; then
-  systemctl enable --now voyn-aicc-review.timer voyn-aicc-merge.timer voyn-aicc-remediate.timer voyn-aicc-credential-rescue.timer voyn-aicc-pr-window.timer
+  systemctl enable --now voyn-aicc-review.timer voyn-aicc-merge.timer voyn-aicc-remediate.timer voyn-aicc-credential-rescue.timer voyn-aicc-pr-window.timer voyn-prometheus-recovery.timer
 fi
 echo "AICC_AGENT_PRINCIPAL_ISOLATION_INSTALLED"

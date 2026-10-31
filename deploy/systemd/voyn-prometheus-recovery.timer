@@ -2,6 +2,19 @@
 # starts before that address necessarily exists and uses Restart=on-abnormal,
 # which does not retry an ordinary exit(1). This timer starts the unchanged,
 # vendor-owned service after boot and rearms after it becomes inactive.
+#
+# It is the OUTER retry: slow (a minute after the unit goes inactive), with no
+# budget to spend, so it recovers a Prometheus that is down for any reason --
+# including one whose own restart budget is spent. The inner one, and the fix
+# for the boot race itself, is the ordering-and-restart drop-in
+# prometheus-tailscale-recovery.conf.
+#
+# Installed AND enabled by the control profile of the install transaction
+# (CONTROL_ONLY_UNITS / CONTROL_ONLY_TIMERS), because from 2026-09-05 (#614)
+# until now this file was only ever a file: nothing on control-01 installed it,
+# so Prometheus had no recovery path at all and the queue monitor measured
+# `prometheus_unready` (monitor_finding #41637) with nothing retrying behind
+# it. A unit nothing installs is not a recovery mechanism.
 [Unit]
 Description=Recover Prometheus after the Tailscale listener is available
 After=network-online.target tailscaled.service

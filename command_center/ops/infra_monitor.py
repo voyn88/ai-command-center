@@ -13,7 +13,7 @@ import json
 import os
 import subprocess
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlsplit
@@ -172,6 +172,57 @@ class DeployLagSnapshot:
         if not self.undeployed_commits:
             return False
         return (self.lag_seconds or 0.0) > self.grace_seconds
+
+
+@dataclass(frozen=True, slots=True)
+class PrometheusSnapshot:
+    """Why the metrics endpoint is or is not ready, and over how many samples.
+
+    `prometheus_ready` was a bare boolean, so `prometheus_unready` was the
+    whole finding: control-01 recorded monitor_finding #41637 with no status
+    code, no errno and no sample count, and "Prometheus exited 1 at boot and
+    nothing restarts it" (the live cause -- the recovery tick for the
+    Tailscale listener race was a repo file nothing installed) arrived
+    spelled exactly like "one SYN was dropped on the tailnet". Prometheus is
+    reached across the tailnet here, by a probe that took one 5-second
+    sample every two minutes, so a single lost packet opened a finding and a
+    task of its own.
+
+    So: the verdict keeps its failure CODE -- identity is the code before
+    the first ':' (`finding_key`, 440f3181) and one cause stays one finding
+    -- and the reason rides in the detail. And an unready sample is
+    confirmed by re-probing before it is believed, which is the same rule
+    the merge tick learned on pending checks (#996: a check that is still
+    running is pending, not red). Fail-closed is unchanged: exhausting the
+    attempts reports unready, and the attempt count travels with it.
+    """
+
+    ready: bool
+    status: int | None = None
+    error: str | None = None
+    attempts: int = 1
+
+    @classmethod
+    def of(cls, value: bool | PrometheusSnapshot) -> PrometheusSnapshot:
+        """Accept a measurement or a bare verdict, so a caller that only has
+        a boolean (every pre-existing one) keeps working unchanged."""
+        if isinstance(value, PrometheusSnapshot):
+            return value
+        return cls(ready=bool(value))
+
+    @property
+    def reason(self) -> str:
+        """The detail behind `prometheus_unready:`; empty when there is none."""
+        if self.ready:
+            return ""
+        parts = []
+        if self.error is not None:
+            parts.append(self.error)
+        if self.status is not None:
+            parts.append(f"http_{self.status}")
+        if self.attempts > 1:
+            parts.append(f"{self.attempts}_attempts")
+        return ":".join(parts)
 
 
 @dataclass(frozen=True, slots=True)
@@ -885,7 +936,22 @@ def read_deploy_lag_snapshot(
         )
 
 
-def prometheus_is_ready(url: str) -> bool:
+#: Samples `read_prometheus_snapshot` takes before it believes an unready
+#: answer, and the pause between them. Three samples two seconds apart is
+#: bounded by the per-sample timeout (5 s) at ~19 s worst case -- an order of
+#: magnitude inside the two-minute tick, so a confirmed outage is still
+#: reported on the tick that found it.
+PROMETHEUS_ATTEMPTS = 3
+PROMETHEUS_RETRY_SECONDS = 2.0
+
+#: A URL this probe will not fetch at all (not http(s), no host, or carrying
+#: credentials). It is a configuration fault, not a transient one: re-probing
+#: cannot change the answer, so the retry loop stops on it.
+PROMETHEUS_UNSUPPORTED_URL = "unsupported_url"
+
+
+def probe_prometheus(url: str) -> PrometheusSnapshot:
+    """One sample of the readiness endpoint, carrying why it said no."""
     connection: http.client.HTTPConnection | None = None
     try:
         parsed = urlsplit(url)
@@ -895,7 +961,7 @@ def prometheus_is_ready(url: str) -> bool:
             or parsed.username is not None
             or parsed.password is not None
         ):
-            return False
+            return PrometheusSnapshot(ready=False, error=PROMETHEUS_UNSUPPORTED_URL)
         client = (
             http.client.HTTPSConnection
             if parsed.scheme == "https"
@@ -908,12 +974,59 @@ def prometheus_is_ready(url: str) -> bool:
         connection.request("GET", target)
         response = connection.getresponse()
         body = response.read(256).decode("utf-8", errors="replace")
-        return response.status == 200 and "ready" in body.lower()
-    except _PROMETHEUS_ERRORS:
-        return False
+        if response.status != 200:
+            return PrometheusSnapshot(ready=False, status=response.status)
+        if "ready" not in body.lower():
+            # 200 from something that is not the readiness endpoint (a proxy
+            # error page, a different service on the port) is not readiness.
+            return PrometheusSnapshot(
+                ready=False, status=response.status, error="body_not_ready"
+            )
+        return PrometheusSnapshot(ready=True, status=response.status)
+    except _PROMETHEUS_ERRORS as exc:
+        return PrometheusSnapshot(ready=False, error=_probe_error(exc))
     finally:
         if connection is not None:
             connection.close()
+
+
+def _probe_error(exc: BaseException) -> str:
+    """The exception as one line of finding detail: the class is what names
+    the cause (`ConnectionRefusedError` = nothing listening, `TimeoutError` =
+    listening and not answering), the message is context."""
+    detail = " ".join(f"{type(exc).__name__} {exc}".split())
+    return detail[:120]
+
+
+def read_prometheus_snapshot(
+    url: str,
+    *,
+    attempts: int = PROMETHEUS_ATTEMPTS,
+    retry_seconds: float = PROMETHEUS_RETRY_SECONDS,
+) -> PrometheusSnapshot:
+    """Sample until ready or out of attempts, and report which it was.
+
+    An unready answer is re-probed rather than believed on the first sample:
+    see `PrometheusSnapshot`. Still fail-closed -- the loop ends on the
+    attempt budget, never on a timer, and the last sample is the verdict.
+    """
+    snapshot = probe_prometheus(url)
+    taken = 1
+    while (
+        not snapshot.ready
+        and taken < max(attempts, 1)
+        and snapshot.error != PROMETHEUS_UNSUPPORTED_URL
+    ):
+        time.sleep(max(retry_seconds, 0.0))
+        snapshot = probe_prometheus(url)
+        taken += 1
+    return replace(snapshot, attempts=taken)
+
+
+def prometheus_is_ready(url: str) -> bool:
+    """One sample, as a verdict with no detail. `read_prometheus_snapshot`
+    is what the monitor uses; this stays for callers that want the bool."""
+    return probe_prometheus(url).ready
 
 
 def evaluate(
@@ -922,7 +1035,7 @@ def evaluate(
     *,
     minimum_active_workers: int,
     max_stalled_seconds: float,
-    prometheus_ready: bool,
+    prometheus_ready: bool | PrometheusSnapshot,
     max_recent_dead: int = 0,
     pr_window: PrWindowSnapshot | None = None,
     source_clone: SourceCloneSnapshot | None = None,
@@ -930,11 +1043,18 @@ def evaluate(
     deploy_lag: DeployLagSnapshot | None = None,
 ) -> MonitorReport:
     active_workers = sum(state == "active" for state in worker_states.values())
+    prometheus = PrometheusSnapshot.of(prometheus_ready)
     failures: list[str] = []
     if active_workers < minimum_active_workers:
         failures.append(f"active_workers:{active_workers}<{minimum_active_workers}")
-    if not prometheus_ready:
-        failures.append("prometheus_unready")
+    if not prometheus.ready:
+        # One failure CODE, so one open finding and one task however the
+        # endpoint failed; the status, errno and sample count ride behind
+        # the colon where `finding_key` does not look.
+        reason = prometheus.reason
+        failures.append(
+            f"prometheus_unready:{reason}" if reason else "prometheus_unready"
+        )
 
     # An old last-success timestamp is normal when there is no work. It becomes
     # context in the report once work appears; the oldest pending item is the
@@ -1025,7 +1145,7 @@ def evaluate(
         active_workers=active_workers,
         discovered_workers=len(worker_states),
         queue=queue,
-        prometheus_ready=prometheus_ready,
+        prometheus_ready=prometheus.ready,
         failures=tuple(failures),
         pr_window=pr_window,
         source_clone=source_clone,
@@ -1062,6 +1182,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum dead-lettered items allowed in the trailing hour.",
     )
     parser.add_argument("--prometheus-url", required=True)
+    parser.add_argument(
+        "--prometheus-attempts",
+        type=_positive_int,
+        default=PROMETHEUS_ATTEMPTS,
+        help=(
+            "Readiness samples taken before an unready answer is believed "
+            f"(default {PROMETHEUS_ATTEMPTS}, 1 disables confirmation). A "
+            "single lost packet on the tailnet is not an outage; an outage "
+            "survives every sample."
+        ),
+    )
     parser.add_argument(
         "--skip-workers",
         action="store_true",
@@ -1113,11 +1244,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--record-findings",
         metavar="SOURCE",
-        default="",
+        default=os.environ.get("AICC_MONITOR_FINDING_SOURCE", ""),
         help=(
             "Record every failure as an open monitor_finding under this source "
             "(and clear the source's findings when healthy), so the planner turns "
-            "a red monitor into a pipeline task instead of a failed unit."
+            "a red monitor into a pipeline task instead of a failed unit. "
+            "Defaults to $AICC_MONITOR_FINDING_SOURCE, which is how a unit whose "
+            "ExecStart a public repository cannot restate (leak_guard.sh) turns "
+            "recording on; empty records nothing."
         ),
     )
     parser.add_argument(
@@ -1208,7 +1342,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         workers = {} if args.skip_workers else discover_worker_units()
         queue = None if args.skip_queue else read_queue_snapshot()
-        metrics_ready = prometheus_is_ready(args.prometheus_url)
+        metrics = read_prometheus_snapshot(
+            args.prometheus_url, attempts=args.prometheus_attempts
+        )
         pr_window = (
             read_pr_window_snapshot(
                 args.pr_window_repo,
@@ -1243,7 +1379,7 @@ def main(argv: list[str] | None = None) -> int:
             queue,
             minimum_active_workers=args.minimum_active_workers,
             max_stalled_seconds=args.max_stalled_seconds,
-            prometheus_ready=metrics_ready,
+            prometheus_ready=metrics,
             max_recent_dead=args.max_recent_dead,
             pr_window=pr_window,
             source_clone=source_clone,
