@@ -1,6 +1,6 @@
 # Three "schema versions" — what each number actually is
 
-Snapshot: 2026-09-02, against `main` tip (`c9d2e23`). Written for
+Historical snapshot: 2026-09-02, against `main` tip (`c9d2e23`). Written for
 VOYN-W0-AICC-SCHEMA-VERSION-DRIFT-REM after the 2026-08-20 backlog triage
 (`VOYN-W0-BACKLOG-RECONCILE-ALL`) flagged three numbers — 16, 23, 14 — as if
 they were three readings of one drifting value, and asked separately what the
@@ -202,3 +202,11 @@ to pass on every CI run since.
    default — query the live source (`schema.py`, `health.py`, or
    `python -m command_center.db status`) before trusting a number in a
    document, including this one.
+
+## Rechecked 2026-10-31
+
+At `main@8831718c49d3`, the independently measured counters are SQLite **25** and PostgreSQL **30**. The earlier snapshot above describes its named commit, not the current checkout.
+
+PostgreSQL reached 16 with `ad5425f` (#473), then 17 with `d3aec4c` (#605), and 30 after `0030_repo_route_and_evidence_hygiene` (#1024). SQLite stayed at 25 while those later PostgreSQL migrations accumulated. These are separate ledgers; a matching number is not schema parity. The SRV-01b table-count literal 16 is a third, unrelated historical measurement.
+
+Recompute both values against the deployed commit instead of carrying a prose number forward: read `command_center/runtime/db/schema.py::SCHEMA_VERSION`, then run `python -m command_center.db status` and inspect `command_center/db/sql/*.up.sql`. The live parity gate continues to compare actual schemas and its explicit table exceptions. An older SQLite binary fails closed on a newer file; it does not migrate that file backward.
