@@ -5359,8 +5359,6 @@ WORKER_ONLY_TARGETS = frozenset(
         "/etc/systemd/system/aicc-agent-launcher@.service",
         "/etc/systemd/system/voyn-aicc-source-clone-refresh.service",
         "/etc/systemd/system/voyn-aicc-source-clone-refresh.timer",
-        "/etc/systemd/system/voyn-aicc-credential-rotation.service",
-        "/etc/systemd/system/voyn-aicc-credential-rotation.timer",
         "/etc/systemd/system/voyn-aicc-worker-release-deploy.service",
         "/etc/systemd/system/voyn-aicc-worker-release-deploy.timer",
         "/etc/aicc/agent-workspace-roots",
@@ -5510,7 +5508,8 @@ def default_specs(
     home and still follow. Credential rotation is deliberately NOT among
     them and NOT a home-symlink follow-on: it is worker-only substrate
     (lanes + worker.env + pgtunnel) and is purged from a control host via
-    `CONTROL_PURGE_UNITS` / `WORKER_ONLY_TARGETS`.
+    `CONTROL_PURGE_UNITS` (its unit files are not installed by this
+    transaction, so they are not `WORKER_ONLY_TARGETS`).
 
     What the transition does and does not remove, stated exactly, because
     "the agent principal is absent" is a claim this cannot make:
