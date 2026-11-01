@@ -33,6 +33,11 @@ _STATUS_VOCABULARY = (
     "DECIDED",
 )
 
+#: The two buckets `backlog_defer_classification` (0031) ever assigns —
+#: kept here so an empty bucket still renders as 0 instead of vanishing
+#: from the defer-report endpoint (same contract as `_STATUS_VOCABULARY`).
+_DEFER_BUCKETS = ("infra_induced_safe_to_retry", "genuine_owner_decision")
+
 MAX_LIMIT = 500
 
 
@@ -48,6 +53,16 @@ def get_status_counts() -> schemas.BacklogStatusCounts:
     for status, count in live.items():
         counts.setdefault(status, count)
     return schemas.BacklogStatusCounts(counts=counts, total=sum(counts.values()))
+
+
+def get_defer_report() -> schemas.BacklogDeferReport:
+    live = BacklogStore().defer_report()
+    counts = {bucket: live.get(bucket, 0) for bucket in _DEFER_BUCKETS}
+    # A bucket outside the known pair (a future migration's new value)
+    # still surfaces rather than being silently dropped.
+    for bucket, count in live.items():
+        counts.setdefault(bucket, count)
+    return schemas.BacklogDeferReport(counts=counts, total=sum(counts.values()))
 
 
 def list_tasks(

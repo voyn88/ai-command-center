@@ -174,6 +174,7 @@ ALL_TABLES: tuple[str, ...] = (
 # schema assertions compare `ALL_TABLES` against `BASE TABLE` rows: folding the
 # two together would make a view able to stand in for a dropped table.
 ALL_VIEWS: tuple[str, ...] = (
+    "backlog_defer_classification",
     "backlog_eligible",
     "enrollment_ticket_public",
     "principal_credential_public",
@@ -499,6 +500,7 @@ _APP_ENROLMENT_VIEWS: dict[str, frozenset[str]] = {
     "principal_credential_public": _READ,
 }
 _APP_BACKLOG_VIEWS: dict[str, frozenset[str]] = {
+    "backlog_defer_classification": _READ,
     "backlog_eligible": _READ,
 }
 _OPERATOR_ENROLMENT_VIEWS: dict[str, frozenset[str]] = {
