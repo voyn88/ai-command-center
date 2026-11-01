@@ -28,7 +28,7 @@ functional application milestones of `app.py`.
   attempt budget. The Codex workspace-write probe records a quota refusal the
   same way, instead of re-probing the exhausted account on every mutating
   dispatch.
-- `0031_infra_wait_quota_detail`: `queue_fail_infra_wait` takes an optional
+- `0033_infra_wait_quota_detail`: `queue_fail_infra_wait` takes an optional
   `jsonb` detail, merged into the `work_event` audit row under the counters
   it cannot overwrite. A refusal writes no result row, so this is how
   "executor X is out of quota until T" and "these links were skipped without

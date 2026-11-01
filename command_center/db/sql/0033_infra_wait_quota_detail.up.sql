@@ -1,4 +1,4 @@
--- 0031 (renumbered from PR #1002's 0025 after main took 0025-0030; rebuilt on
+-- 0033 (renumbered from PR #1002's 0025 after main took 0025-0032; rebuilt on
 -- 0028's atomic-refund body so neither change is lost).
 --
 -- The infra-wait audit row carries the caller's own evidence.
@@ -23,7 +23,7 @@
 -- not replacing it -- the counters stay exactly where readers already look,
 -- and `p_detail` cannot overwrite them because the server-decided keys are
 -- applied last. The parameter defaults to NULL, so a worker still running
--- the pre-0031 four-argument call resolves to this same function and writes
+-- the pre-0033 four-argument call resolves to this same function and writes
 -- the same row it wrote before: the rolling deploy needs no ordering beyond
 -- the usual migrate-then-ship.
 DROP FUNCTION IF EXISTS queue_fail_infra_wait(text, text, text, integer);

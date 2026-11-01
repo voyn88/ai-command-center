@@ -1446,7 +1446,7 @@ def test_redrive_clears_both_wait_budgets_it_widens_the_attempts_for(
 def test_infra_wait_merges_the_callers_detail_into_the_audit_row(
     admin_conn, psycopg, test_dsn, role_passwords
 ):
-    """0031: the refund's own counters say an attempt was given back; only the
+    """0033: the refund's own counters say an attempt was given back; only the
     caller can say WHY. A refusal writes no `work_result` row -- `queue_complete`
     is the only path that does -- so quota-aware routing's evidence (which
     executor is exhausted, until when this worker withholds it) travels in the
