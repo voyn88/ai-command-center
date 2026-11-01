@@ -15,22 +15,22 @@ costs an agent a full diagnose → fix → new SHA → CI → review cycle.
 
 - Interactive writers: `make prepush` (the full band, including the
   impacted-test phases — a human running their own code).
-- Agents may run it inside their own sandboxed run (the script is in their
-  worktree); nothing on the publish path enforces that today.
+- Agents may run this worktree copy inside their own sandboxed run.
 - `publish_run` (`command_center/orchestrator/publish.py`) does **not**
-  execute this script: in that credentialed worker context the worktree is
-  candidate content, and executing it would be candidate-controlled host
-  command execution (verification finding on head `254154a`). The publish
-  side enforces only `_static_quality_gate` — ruff (parse + lint, catches
-  syntax errors) from the worker's own trusted interpreter with explicit
-  argv and a minimal explicit env, treating the tree strictly as data. A red
-  gate refuses the publish with `reason=quality_band_failed: …` before the
-  lease is acquired. Enforced pre-push impacted tests for the agent path
-  require an allowlisted profile in the privileged principal-isolation
-  launcher — that is VOYN-W0-AICC-SANDBOX-PREPUSH-TESTS, a separate,
-  security-designed task; until it lands, the impacted-test half of the
-  red-rate reduction is delivered by CI (authoritative) and interactive
-  `make prepush` only.
+  execute this worktree copy: in that credentialed worker context the
+  worktree is candidate content (verification finding on head `254154a`).
+  The publish side instead:
+  1. runs `_static_quality_gate` — ruff from the worker's trusted
+     interpreter (tree as DATA only);
+  2. runs the leak guard from the worker's trusted install;
+  3. runs the impacted-test phase under the allowlisted `quality_band`
+     profile of the privileged principal-isolation launcher
+     (VOYN-W0-AICC-SANDBOX-PREPUSH-TESTS): fixed argv pointing at the
+     root-owned `/usr/libexec/aicc-quality-band` (installed from
+     `ops/aicc_quality_band.sh`), candidate worktree bind-mounted as
+     `/workspace`, no model credentials, no network. A red sandbox run
+     refuses the publish before the lease; broker/infra unavailability
+     defers to CI via the exact principal-isolation transport envelope.
 
 ## What it is not
 

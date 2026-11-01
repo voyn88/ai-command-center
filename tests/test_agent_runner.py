@@ -1,9 +1,11 @@
+import json
 import os
 import signal
 import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -1335,3 +1337,211 @@ def test_a_codex_task_failure_without_a_signature_stays_a_task_failure():
 def test_an_unknown_executor_never_matches_free_text_signatures():
     run = _provider_error_run(stderr="unauthorized")
     assert run.is_executor_provider_error("claude") is False
+
+
+# --- quality_band gate (VOYN-W0-AICC-SANDBOX-PREPUSH-TESTS) --------------------
+
+
+def test_build_quality_band_manifest_shape(tmp_path):
+    manifest = agent_runner.build_quality_band_manifest(repository_path=tmp_path)
+    assert set(manifest) == {
+        "version",
+        "run_id",
+        "workspace",
+        "executor",
+        "profile",
+        "prompt",
+        "model",
+        "timeout_seconds",
+    }
+    assert manifest["version"] == 1
+    assert manifest["executor"] == agent_runner.QUALITY_BAND_EXECUTOR
+    assert manifest["profile"] == agent_runner.QUALITY_BAND_PROFILE
+    assert manifest["model"] is None
+    assert manifest["prompt"] == "quality-band"
+    assert manifest["workspace"] == str(tmp_path.resolve())
+    assert 30 <= manifest["timeout_seconds"] <= 3600
+
+
+def test_quality_band_gate_defers_when_isolation_not_enabled(monkeypatch, tmp_path):
+    monkeypatch.delenv(agent_runner.PRINCIPAL_ISOLATION_REQUIRED_ENV, raising=False)
+    result = agent_runner.run_quality_band_gate(tmp_path)
+    assert result.is_principal_isolation_error
+    assert result.exit_code == 125
+    assert result.stdout == ""
+
+
+def test_quality_band_gate_defers_when_executor_not_deployed(monkeypatch, tmp_path):
+    monkeypatch.setenv(agent_runner.PRINCIPAL_ISOLATION_REQUIRED_ENV, "required")
+    monkeypatch.setattr(
+        agent_runner,
+        "principal_executor_preflight",
+        lambda executor: (False, "isolated executor binary is unavailable: /usr/libexec/aicc-quality-band"),
+    )
+    result = agent_runner.run_quality_band_gate(tmp_path)
+    assert result.is_principal_isolation_error
+    assert result.exit_code == 125
+    assert result.stdout == ""
+
+
+def test_quality_band_gate_defers_when_the_launcher_binary_is_missing(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv(agent_runner.PRINCIPAL_ISOLATION_REQUIRED_ENV, "required")
+    monkeypatch.setattr(
+        agent_runner, "principal_executor_preflight", lambda executor: (True, "")
+    )
+    monkeypatch.setattr(
+        agent_runner, "PRINCIPAL_ISOLATION_LAUNCHER", "/nonexistent/aicc-agent-launcher"
+    )
+    result = agent_runner.run_quality_band_gate(tmp_path)
+    assert result.is_principal_isolation_error
+    assert result.exit_code == 125
+
+
+def test_quality_band_gate_clean_run_uses_restricted_launcher_env(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv(agent_runner.PRINCIPAL_ISOLATION_REQUIRED_ENV, "required")
+    monkeypatch.setattr(
+        agent_runner, "principal_executor_preflight", lambda executor: (True, "")
+    )
+    seen: dict[str, object] = {}
+
+    class _Proc:
+        returncode = 0
+
+        def communicate(self, input=None, timeout=None):
+            return ("QUALITY_BAND: pass\n", "")
+
+    def fake_popen(command, **kwargs):
+        seen["command"] = command
+        seen["env"] = kwargs.get("env")
+        seen["cwd"] = kwargs.get("cwd")
+        seen["close_fds"] = kwargs.get("close_fds")
+        seen["input_preview"] = None
+        return _Proc()
+
+    # Capture stdin payload via a wrapper communicate is enough; also patch
+    # Popen to record kwargs.
+    real_communicate = _Proc.communicate
+
+    def communicate(self, input=None, timeout=None):
+        seen["input_preview"] = input
+        return real_communicate(self, input=input, timeout=timeout)
+
+    _Proc.communicate = communicate
+    monkeypatch.setattr(agent_runner.subprocess, "Popen", fake_popen)
+
+    result = agent_runner.run_quality_band_gate(tmp_path)
+    assert result.status == "completed"
+    assert result.exit_code == 0
+    assert seen["command"] == [agent_runner.PRINCIPAL_ISOLATION_LAUNCHER, "--client"]
+    assert seen["cwd"] == Path("/")
+    assert seen["close_fds"] is True
+    assert set(seen["env"]) == {"PATH", "LANG", "LC_ALL"}
+    assert seen["env"]["PATH"] == "/usr/bin:/bin"
+    payload = json.loads(seen["input_preview"])
+    assert payload["executor"] == "quality_band"
+    assert payload["profile"] == "quality_band"
+    assert payload["model"] is None
+
+
+def test_quality_band_gate_red_run_is_a_refusal_not_a_deferral(monkeypatch, tmp_path):
+    monkeypatch.setenv(agent_runner.PRINCIPAL_ISOLATION_REQUIRED_ENV, "required")
+    monkeypatch.setattr(
+        agent_runner, "principal_executor_preflight", lambda executor: (True, "")
+    )
+
+    class _Proc:
+        returncode = 1
+
+        def communicate(self, input=None, timeout=None):
+            return ("QUALITY_BAND: fail phase=tests\n", "")
+
+    monkeypatch.setattr(
+        agent_runner.subprocess, "Popen", lambda *a, **k: _Proc()
+    )
+    result = agent_runner.run_quality_band_gate(tmp_path)
+    assert result.status == "failed"
+    assert result.exit_code == 1
+    assert not result.is_principal_isolation_error
+
+
+def test_quality_band_gate_timeout_fails_closed(monkeypatch, tmp_path):
+    monkeypatch.setenv(agent_runner.PRINCIPAL_ISOLATION_REQUIRED_ENV, "required")
+    monkeypatch.setattr(
+        agent_runner, "principal_executor_preflight", lambda executor: (True, "")
+    )
+
+    class _Proc:
+        returncode = None
+
+        def communicate(self, input=None, timeout=None):
+            if timeout is not None and timeout <= agent_runner.QUALITY_BAND_TIMEOUT_SECONDS:
+                raise subprocess.TimeoutExpired(cmd="launcher", timeout=timeout)
+            return ("", "")
+
+    monkeypatch.setattr(
+        agent_runner.subprocess, "Popen", lambda *a, **k: _Proc()
+    )
+    monkeypatch.setattr(
+        agent_runner, "_terminate_process_group", lambda *a, **k: None
+    )
+    result = agent_runner.run_quality_band_gate(tmp_path, timeout_seconds=30)
+    assert result.status == "timed_out"
+    assert not result.is_principal_isolation_error
+
+
+def test_quality_band_gate_defers_on_broker_infrastructure_failure(
+    monkeypatch, tmp_path
+):
+    """Deferral uses the exact transport envelope, never a substring search."""
+    monkeypatch.setenv(agent_runner.PRINCIPAL_ISOLATION_REQUIRED_ENV, "required")
+    monkeypatch.setattr(
+        agent_runner, "principal_executor_preflight", lambda executor: (True, "")
+    )
+    marker = agent_runner._PRINCIPAL_ISOLATION_FAILURE
+
+    class _Proc:
+        returncode = 125
+
+        def communicate(self, input=None, timeout=None):
+            return ("", f"{marker}: workspace is quarantined\n")
+
+    monkeypatch.setattr(
+        agent_runner.subprocess, "Popen", lambda *a, **k: _Proc()
+    )
+    result = agent_runner.run_quality_band_gate(tmp_path)
+    assert result.is_principal_isolation_error
+
+
+def test_quality_band_gate_marker_in_stdout_with_ordinary_exit_still_refuses(
+    monkeypatch, tmp_path
+):
+    """Adversarial coverage for the discriminator (review of 8e667b0 chunk 4/5).
+
+    A naive ``marker in stdout+stderr`` check would treat this as infra and
+    defer. The exact envelope requires exit 125, empty stdout, and a
+    marker-prefixed stderr line — so a failing run that merely prints the
+    marker to stdout must still be a refusal.
+    """
+    monkeypatch.setenv(agent_runner.PRINCIPAL_ISOLATION_REQUIRED_ENV, "required")
+    monkeypatch.setattr(
+        agent_runner, "principal_executor_preflight", lambda executor: (True, "")
+    )
+    marker = agent_runner._PRINCIPAL_ISOLATION_FAILURE
+
+    class _Proc:
+        returncode = 1
+
+        def communicate(self, input=None, timeout=None):
+            return (f"{marker}: spoofed by candidate\n", "QUALITY_BAND: fail\n")
+
+    monkeypatch.setattr(
+        agent_runner.subprocess, "Popen", lambda *a, **k: _Proc()
+    )
+    result = agent_runner.run_quality_band_gate(tmp_path)
+    assert result.status == "failed"
+    assert result.exit_code == 1
+    assert not result.is_principal_isolation_error

@@ -2784,3 +2784,113 @@ def test_workspace_walk_names_descriptor_exhaustion_honestly(
     with pytest.raises(launcher.LaunchRefused) as refused:
         launcher._prepare_workspace_permissions(workspace)
     assert "ran out of file descriptors" in str(refused.value)
+
+
+# --- quality_band profile (VOYN-W0-AICC-SANDBOX-PREPUSH-TESTS) -----------------
+
+
+def test_quality_band_executor_and_profile_must_be_paired(launcher, tmp_path):
+    valid = _manifest(tmp_path, executor="quality_band", profile="quality_band", model=None)
+    assert launcher._load_manifest((json.dumps(valid) + "\n").encode()) == valid
+    for poisoned in (
+        {**valid, "profile": "trusted_development"},
+        {**valid, "executor": "codex"},
+        {**valid, "model": "gpt-4"},
+    ):
+        with pytest.raises(launcher.LaunchRefused):
+            launcher._load_manifest((json.dumps(poisoned) + "\n").encode())
+
+
+def test_quality_band_provider_command_is_fixed_argv_with_no_manifest_derived_args(
+    launcher, tmp_path
+):
+    manifest = _manifest(
+        tmp_path,
+        executor="quality_band",
+        profile="quality_band",
+        prompt="--malicious-option",
+        model=None,
+    )
+    command = launcher._provider_command(manifest)
+    assert command == [launcher.EXECUTOR_BINARIES["quality_band"]]
+    assert "--malicious-option" not in command
+    assert "quality-band" not in command
+
+
+def test_quality_band_systemd_unit_denies_network_and_omits_auth_group(
+    launcher, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(launcher, "_validate_environment_file", lambda *a, **kw: False)
+    manifest = _manifest(
+        tmp_path, executor="quality_band", profile="quality_band", model=None
+    )
+    command = launcher._systemd_command(
+        manifest,
+        Path("/run/aicc-agent-homes/qb"),
+        "aicc-agent-qb.service",
+        "aicc-agent-launcher@qb.service",
+        tmp_path.parent,
+        tmp_path,
+    )
+    assert "--property=SupplementaryGroups=aicc-workspace" in command
+    assert not any(
+        "aicc-agent-auth" in part for part in command if part.startswith("--property=SupplementaryGroups=")
+    )
+    assert "--property=RestrictAddressFamilies=AF_UNIX" in command
+    assert not any(
+        "AF_INET" in part
+        for part in command
+        if part.startswith("--property=RestrictAddressFamilies=")
+    )
+    assert "--property=IPAddressDeny=any" in command
+    assert f"--property=BindPaths={tmp_path}:/workspace" in command
+    assert "--property=ReadWritePaths=/workspace /agent-home" in command
+    assert not any(part.startswith("--property=EnvironmentFile=") for part in command)
+    # Fixed trusted binary only after the `--` separator.
+    assert command[command.index("--") + 1 :] == [
+        launcher.EXECUTOR_BINARIES["quality_band"]
+    ]
+
+
+def test_quality_band_home_is_owned_by_workspace_group_not_auth_group(
+    tmp_path, monkeypatch, launcher
+):
+    """Adversarial review of 8e667b0: home mode 0770 keyed to aicc-agent-auth
+    while SupplementaryGroups omitted that group made /agent-home unreachable.
+    quality_band homes must use aicc-workspace to match the granted group."""
+    homes = tmp_path / "runs"
+    homes.mkdir()
+    monkeypatch.setattr(launcher, "EPHEMERAL_HOME_ROOT", homes)
+    gids = {"aicc-workspace": 42, "aicc-agent-auth": 99}
+    monkeypatch.setattr(
+        launcher.grp,
+        "getgrnam",
+        lambda name: SimpleNamespace(gr_gid=gids[name]),
+    )
+    chowns: list[tuple[object, ...]] = []
+
+    def record_chown(path, uid, gid):
+        chowns.append((Path(path), uid, gid))
+
+    monkeypatch.setattr(launcher.os, "chown", record_chown)
+    home, staged = launcher._prepare_agent_home("quality_band", "b" * 32)
+    assert staged is None
+    assert home == homes / ("b" * 32)
+    assert home.is_dir()
+    assert chowns == [(home, 0, 42)]
+    assert all(gid != 99 for _path, _uid, gid in chowns)
+
+
+def test_quality_band_agent_exit_125_is_remapped_before_response(launcher):
+    """Broker-reserved infra envelope must be unreachable from agent output.
+
+    A candidate-influenced .venv / test that exits 125 and prints the FAILURE
+    marker would otherwise force publish to defer.
+    """
+    assert launcher._sandbox_reported_exit_code("quality_band", 125) == 1
+    assert launcher._sandbox_reported_exit_code("quality_band", 1) == 1
+    assert launcher._sandbox_reported_exit_code("quality_band", 0) == 0
+    # Model executors keep a real 125 (e.g. the provider CLI's own code) —
+    # only quality_band remaps, because only its publish gate defers on the
+    # infra envelope.
+    assert launcher._sandbox_reported_exit_code("codex", 125) == 125

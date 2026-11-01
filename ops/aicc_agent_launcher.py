@@ -83,6 +83,10 @@ EXECUTOR_BINARIES = {
     "cursor": "/opt/aicc/providers/cursor/agent",
     "claude": f"{TOOLCHAIN_BIN}/claude",
     "codex": f"{TOOLCHAIN_BIN}/codex",
+    # Fixed trusted script (not candidate-tree content). Runs impacted tests
+    # under the isolated principal with no model credentials and no network
+    # (VOYN-W0-AICC-SANDBOX-PREPUSH-TESTS).
+    "quality_band": "/usr/libexec/aicc-quality-band",
 }
 SYSTEMD_RUN = "/usr/bin/systemd-run"
 SYSTEMCTL = "/usr/bin/systemctl"
@@ -110,7 +114,9 @@ OUTPUT_TRUNCATED_MARKER = b"[aicc-agent-launcher: earlier agent output dropped; 
 MAX_GIT_INDEX_BYTES = 64 * 1024 * 1024
 MAX_GIT_INDEX_ENTRIES = 1_000_000
 MAX_MODEL_AUTH_BYTES = 16 * 1024 * 1024
-PROFILES = frozenset({"read_only", "trusted_development", "model_only"})
+PROFILES = frozenset(
+    {"read_only", "trusted_development", "model_only", "quality_band"}
+)
 MODEL_RE = re.compile(r"[A-Za-z0-9_.:/-]{1,128}")
 RUN_ID_RE = re.compile(r"[a-f0-9]{32}")
 BROKER_UNIT_RE = re.compile(r"aicc-agent-launcher@[^/]{1,200}\.service")
@@ -146,6 +152,9 @@ PROVIDER_AGENT_ENV_KEYS = {
         {"ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_MODEL"}
     ),
     "codex": frozenset({"OPENAI_API_KEY"}),
+    # No provider credentials: the quality-band unit runs a fixed local
+    # script against the bound workspace only.
+    "quality_band": frozenset(),
 }
 FORBIDDEN_ENV_PREFIXES = (
     "AICC_PG_",
@@ -242,13 +251,24 @@ def _load_manifest(raw: bytes) -> dict[str, Any]:
         raise LaunchRefused("profile is not allowlisted")
     if value["profile"] == "model_only" and value["executor"] != "grok":
         raise LaunchRefused("executor does not support the model-only profile")
+    # quality_band is a fixed pairing: the executor is the trusted script and
+    # the profile is the no-credential / no-network sandbox. Mixing either
+    # half with a model profile would either grant credentials to a test run
+    # or starve a model agent of its auth.
+    if (value["executor"] == "quality_band") != (value["profile"] == "quality_band"):
+        raise LaunchRefused("quality_band executor/profile must be paired")
     prompt = value["prompt"]
     if not isinstance(prompt, str) or not prompt or "\x00" in prompt:
         raise LaunchRefused("prompt must be a non-empty NUL-free string")
     if len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
         raise LaunchRefused("prompt is too large")
     model = value["model"]
-    if model is not None and (
+    # quality_band ignores the model field; require it null so a caller cannot
+    # smuggle a provider selection through an unused knob.
+    if value["executor"] == "quality_band":
+        if model is not None:
+            raise LaunchRefused("quality_band does not accept a model")
+    elif model is not None and (
         not isinstance(model, str) or not MODEL_RE.fullmatch(model)
     ):
         raise LaunchRefused("model is invalid")
@@ -405,7 +425,7 @@ def _validated_workspace(value: str, roots: tuple[Path, ...]) -> Path:
 def _validate_environment_file(path: Path, executor: str) -> bool:
     if not _private_agent_environment(path, optional=True):
         return False
-    allowed = COMMON_AGENT_ENV_KEYS | PROVIDER_AGENT_ENV_KEYS[executor]
+    allowed = COMMON_AGENT_ENV_KEYS | PROVIDER_AGENT_ENV_KEYS.get(executor, frozenset())
     for line_no, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         stripped = raw.strip()
         if not stripped or stripped.startswith("#"):
@@ -579,7 +599,30 @@ def _prepare_agent_home(executor: str, run_id: str) -> tuple[Path, bytes | None]
     file into a per-run tmpfs-backed path and removes it after cgroup exit.
     Return the home and exact staged bytes, retained only in broker memory
     for the teardown comparison (never in the agent-writable home).
+
+    ``quality_band`` needs a writable home (XDG/cache paths the script may
+    touch) but never a model credential: its unit is granted only the
+    ``aicc-workspace`` supplementary group, so the home directory's group
+    must be ``aicc-workspace`` too. Keying it to ``aicc-agent-auth`` while
+    omitting that group from SupplementaryGroups made ``/agent-home``
+    mode-0770-unreachable to the sandboxed process (adversarial review of
+    8e667b0).
     """
+    home = EPHEMERAL_HOME_ROOT / run_id
+    if executor == "quality_band":
+        try:
+            workspace_gid = grp.getgrnam("aicc-workspace").gr_gid
+        except KeyError as exc:
+            raise LaunchRefused("aicc-workspace group does not exist") from exc
+        try:
+            home.mkdir(mode=0o770)
+            os.chown(home, 0, workspace_gid)
+            os.chmod(home, 0o770)  # nosec B103
+        except (FileExistsError, OSError) as exc:
+            shutil.rmtree(home, ignore_errors=True)
+            raise LaunchRefused("cannot prepare ephemeral model home") from exc
+        return home, None
+
     try:
         # A DEDICATED group for ephemeral model-credential homes. The shared
         # aicc-workspace output group also contains the guarded publisher and
@@ -592,7 +635,6 @@ def _prepare_agent_home(executor: str, run_id: str) -> tuple[Path, bytes | None]
         raise LaunchRefused("aicc-agent-auth group does not exist") from exc
     source = MODEL_AUTH_SOURCES.get(executor)
     if executor in {"grok", "cursor"}:
-        home = EPHEMERAL_HOME_ROOT / run_id
         home.mkdir(mode=0o770)
         os.chown(home, 0, auth_gid)
         # Only the isolated dynamic agent UID joins this auth group; home is per run.
@@ -604,7 +646,6 @@ def _prepare_agent_home(executor: str, run_id: str) -> tuple[Path, bytes | None]
         source, expected_uid=0, expected_gid=0, exact_mode=0o600
     )
 
-    home = EPHEMERAL_HOME_ROOT / run_id
     try:
         home.mkdir(mode=0o700)
         target = home / MODEL_AUTH_TARGETS[executor]
@@ -992,6 +1033,10 @@ def _provider_command(manifest: dict[str, Any]) -> list[str]:
     prompt = manifest["prompt"]
     model = manifest["model"]
     binary = EXECUTOR_BINARIES[executor]
+    if executor == "quality_band":
+        # Fixed argv: the trusted script only. No prompt, model, or any
+        # other manifest-derived argument can reach the sandboxed process.
+        return [binary]
     if executor == "claude":
         command = [
             binary,
@@ -1100,6 +1145,11 @@ def _systemd_command(
 ) -> list[str]:
     executor = manifest["executor"]
     timeout = int(manifest["timeout_seconds"])
+    is_quality_band = executor == "quality_band"
+    workspace_writable = manifest["profile"] in {
+        "trusted_development",
+        "quality_band",
+    }
     # No nesting hazard in this list: EPHEMERAL_HOME_ROOT is
     # /run/aicc-agent-homes -- a SIBLING of /run/aicc-agent-launcher, not a
     # child, so systemd never overmounts a parent before lstat'ing a nested
@@ -1149,7 +1199,14 @@ def _systemd_command(
         "--setenv=GIT_CONFIG_VALUE_0=/workspace",
         "--setenv=GIT_TERMINAL_PROMPT=0",
         "--setenv=GCM_INTERACTIVE=never",
-        "--property=SupplementaryGroups=aicc-workspace aicc-agent-auth",
+        # quality_band never stages model auth, so aicc-agent-auth is not
+        # granted. The home directory is group-owned by aicc-workspace to
+        # match (see _prepare_agent_home).
+        (
+            "--property=SupplementaryGroups=aicc-workspace"
+            if is_quality_band
+            else "--property=SupplementaryGroups=aicc-workspace aicc-agent-auth"
+        ),
         "--property=UMask=0007",
         "--property=NoNewPrivileges=yes",
         "--property=CapabilityBoundingSet=",
@@ -1171,7 +1228,13 @@ def _systemd_command(
         "--property=LockPersonality=yes",
         "--property=KeyringMode=private",
         "--property=RemoveIPC=yes",
-        "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK",
+        # quality_band needs no network: impacted tests run locally. Keep
+        # AF_UNIX for systemd/journal and deny every IP family.
+        (
+            "--property=RestrictAddressFamilies=AF_UNIX"
+            if is_quality_band
+            else "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK"
+        ),
         "--property=KillMode=control-group",
         "--property=Delegate=no",
         "--property=MemoryMax=6G",
@@ -1186,19 +1249,28 @@ def _systemd_command(
         # argument supplied by the publisher.
         (
             f"--property=BindPaths={workspace_source}:/workspace"
-            if manifest["profile"] == "trusted_development"
+            if workspace_writable
             else f"--property=BindReadOnlyPaths={workspace_source}:/workspace"
         ),
         f"--property=BindPaths={agent_home}:/agent-home",
         (
             "--property=ReadWritePaths=/workspace /agent-home"
-            if manifest["profile"] == "trusted_development"
+            if workspace_writable
             else "--property=ReadWritePaths=/agent-home"
         ),
     ]
-    for env_file in (COMMON_ENV_FILE, PROVIDER_ENV_FILES[executor]):
-        if _validate_environment_file(env_file, executor):
-            command.append(f"--property=EnvironmentFile={env_file}")
+    if is_quality_band:
+        command.append("--property=IPAddressDeny=any")
+    else:
+        # Defensive .get(): quality_band has no provider env file and must
+        # not KeyError if a future caller forgets the early return above.
+        provider_env = PROVIDER_ENV_FILES.get(executor)
+        env_files: list[Path] = [COMMON_ENV_FILE]
+        if provider_env is not None:
+            env_files.append(provider_env)
+        for env_file in env_files:
+            if _validate_environment_file(env_file, executor):
+                command.append(f"--property=EnvironmentFile={env_file}")
     command += ["--", *_provider_command(manifest)]
     return command
 
@@ -1954,7 +2026,9 @@ def _serve_connected_socket(sock: socket.socket) -> int:
         stdout, stderr = result.get("value", (b"", b""))  # type: ignore[assignment]
         response = {
             "version": 1,
-            "exit_code": proc.returncode,
+            "exit_code": _sandbox_reported_exit_code(
+                manifest["executor"], proc.returncode
+            ),
             "stdout_b64": base64.b64encode(stdout).decode("ascii"),
             "stderr_b64": base64.b64encode(stderr).decode("ascii"),
         }
@@ -2018,6 +2092,25 @@ def _serve_connected_socket(sock: socket.socket) -> int:
         if workspace_fd is not None:
             os.close(workspace_fd)
     return _deliver_response(sock, response)
+
+
+def _sandbox_reported_exit_code(executor: str, returncode: int | None) -> int | None:
+    """Map an agent process exit code into the client-visible response code.
+
+    Exit 125 + empty stdout + FAILURE-marker stderr is the broker's
+    LaunchRefused transport envelope. ``quality_band`` runs candidate-
+    influenced code (``.venv``, tests); if that code exits 125 and emits the
+    marker, a publish gate that defers on the envelope would fail open.
+    Remap agent-produced 125 so only the broker's own LaunchRefused paths
+    can produce the infra envelope (adversarial review of the REM round).
+    """
+    if (
+        executor == "quality_band"
+        and isinstance(returncode, int)
+        and returncode == 125
+    ):
+        return 1
+    return returncode
 
 
 def _deliver_response(sock: socket.socket, response: dict[str, Any]) -> int:

@@ -807,3 +807,194 @@ def test_candidate_leak_guard_copy_is_never_executed(repo, monkeypatch):
 
     assert r.ok, r.reason
     assert not marker.exists(), "candidate leak_guard executed in publisher"
+
+
+# --- sandboxed quality-band gate (VOYN-W0-AICC-SANDBOX-PREPUSH-TESTS) ---------
+
+
+def _isolated(monkeypatch):
+    """Force the isolation path past preflight so the gate under test is the
+    only variable (adversarial review of d464f62: without this, an 'off'
+    bypass test can pass via the 'executor not deployed' deferral)."""
+    monkeypatch.setenv("AICC_AGENT_PRINCIPAL_ISOLATION", "required")
+    monkeypatch.setattr(
+        "command_center.agent_runner.principal_executor_preflight",
+        lambda executor: (True, ""),
+    )
+
+
+def test_quality_band_gate_env_off_bypasses_even_with_isolation_enabled(
+    repo, monkeypatch
+):
+    """VOYN_QUALITY_BAND=off must short-circuit even when isolation+executor
+    are available — prove it with _isolated so a missing off-switch cannot
+    hide behind the 'not deployed' deferral (review of d464f62 chunk 5/6)."""
+    work, bin_, _ = repo
+    _with_path(bin_, monkeypatch)
+    _isolated(monkeypatch)
+    monkeypatch.setenv("VOYN_QUALITY_BAND", "off")
+
+    def boom(*_a, **_k):
+        raise AssertionError("run_quality_band_gate must not be called when off")
+
+    monkeypatch.setattr(
+        "command_center.agent_runner.run_quality_band_gate", boom
+    )
+    (work / "ok.py").write_text("X = 1\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "clean")
+
+    r = publish_run(work, _cfg(bin_))
+    assert r.ok, r.reason
+
+
+def test_quality_band_gate_still_runs_when_candidate_deletes_prepush_dir(
+    repo, monkeypatch
+):
+    """REM review of 1b23b22: gating on candidate scripts/ci/prepush/ let any
+    PR delete that directory and silently skip the sandbox gate. Absence of
+    the directory must NOT disable the gate."""
+    work, bin_, calls = repo
+    _with_path(bin_, monkeypatch)
+    _isolated(monkeypatch)
+    # No scripts/ci/prepush/ in the worktree — and do not create one.
+    assert not (work / "scripts" / "ci" / "prepush").exists()
+    (work / "ok.py").write_text("X = 1\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "no prepush dir")
+
+    refused = []
+
+    def fake_gate(repo_path, **_kwargs):
+        refused.append(repo_path)
+        from command_center import agent_runner
+
+        return agent_runner.RunResult(
+            status="failed",
+            exit_code=1,
+            stdout="QUALITY_BAND: fail phase=tests\n",
+            stderr="",
+            duration_seconds=0.1,
+            started_at="2026-01-01T00:00:00Z",
+            completed_at="2026-01-01T00:00:01Z",
+        )
+
+    monkeypatch.setattr(
+        "command_center.agent_runner.run_quality_band_gate", fake_gate
+    )
+
+    r = publish_run(work, _cfg(bin_))
+    assert refused, "sandbox gate must run even without candidate prepush dir"
+    assert not r.ok
+    assert r.reason.startswith("quality_band_failed:")
+    assert not calls.exists()
+
+
+def test_quality_band_gate_refuses_red_sandbox_run_before_lease(repo, monkeypatch):
+    work, bin_, calls = repo
+    _with_path(bin_, monkeypatch)
+    _isolated(monkeypatch)
+    (work / "ok.py").write_text("X = 1\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "clean for static; red for sandbox")
+
+    from command_center import agent_runner
+
+    monkeypatch.setattr(
+        "command_center.agent_runner.run_quality_band_gate",
+        lambda *_a, **_k: agent_runner.RunResult(
+            status="failed",
+            exit_code=1,
+            stdout="QUALITY_BAND: fail phase=tests\n",
+            stderr="",
+            duration_seconds=0.1,
+            started_at="2026-01-01T00:00:00Z",
+            completed_at="2026-01-01T00:00:01Z",
+        ),
+    )
+    r = publish_run(work, _cfg(bin_))
+    assert not r.ok
+    assert r.reason.startswith("quality_band_failed:")
+    assert not calls.exists()
+
+
+def test_quality_band_gate_defers_on_broker_infrastructure_failure(repo, monkeypatch):
+    work, bin_, calls = repo
+    _with_path(bin_, monkeypatch)
+    _isolated(monkeypatch)
+    (work / "ok.py").write_text("X = 1\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "clean")
+
+    from command_center import agent_runner
+
+    marker = agent_runner._PRINCIPAL_ISOLATION_FAILURE
+    monkeypatch.setattr(
+        "command_center.agent_runner.run_quality_band_gate",
+        lambda *_a, **_k: agent_runner.RunResult(
+            status="failed",
+            exit_code=125,
+            stdout="",
+            stderr=f"{marker}: socket unavailable\n",
+            duration_seconds=0.1,
+            started_at="2026-01-01T00:00:00Z",
+            completed_at="2026-01-01T00:00:01Z",
+        ),
+    )
+    r = publish_run(work, _cfg(bin_))
+    assert r.ok, r.reason
+    # Infra deferral still proceeds to lease/push; calls log is written.
+    assert calls.exists()
+
+
+def test_quality_band_gate_full_chain_candidate_cannot_spoof_a_deferral(
+    repo, monkeypatch
+):
+    """End-to-end: marker in stdout + ordinary failing exit must refuse.
+
+    Covers the class of bypass where a candidate (or a naive gate
+    implementation) treats any appearance of the infra marker as a deferral.
+    """
+    work, bin_, calls = repo
+    _with_path(bin_, monkeypatch)
+    _isolated(monkeypatch)
+    (work / "ok.py").write_text("X = 1\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "clean static")
+
+    from command_center import agent_runner
+
+    marker = agent_runner._PRINCIPAL_ISOLATION_FAILURE
+    monkeypatch.setattr(
+        "command_center.agent_runner.run_quality_band_gate",
+        lambda *_a, **_k: agent_runner.RunResult(
+            status="failed",
+            exit_code=1,
+            stdout=f"{marker}: spoofed by candidate tree\n",
+            stderr="QUALITY_BAND: fail phase=tests\n",
+            duration_seconds=0.1,
+            started_at="2026-01-01T00:00:00Z",
+            completed_at="2026-01-01T00:00:01Z",
+        ),
+    )
+    r = publish_run(work, _cfg(bin_))
+    assert not r.ok
+    assert r.reason.startswith("quality_band_failed:")
+    assert not calls.exists()
+
+
+def test_quality_band_gate_defers_when_executor_not_deployed_on_host(
+    repo, monkeypatch
+):
+    work, bin_, _ = repo
+    _with_path(bin_, monkeypatch)
+    monkeypatch.setenv("AICC_AGENT_PRINCIPAL_ISOLATION", "required")
+    # Do NOT patch principal_executor_preflight: on this fixture host the
+    # quality_band binary is absent, so the real preflight reports not
+    # deployed and the gate must defer (publish proceeds).
+    (work / "ok.py").write_text("X = 1\n")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "clean")
+
+    r = publish_run(work, _cfg(bin_))
+    assert r.ok, r.reason
