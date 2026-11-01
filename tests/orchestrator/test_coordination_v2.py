@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from command_center.orchestrator import coordination as coord
 from command_center.orchestrator.coordination import (
     apply_advisory_order,
     build_candidate_snapshot,
@@ -21,7 +22,7 @@ from command_center.orchestrator.coordination import (
 
 def coordinate_once(factory, enqueue, *args, **kwargs):
     factory.__self__.enqueue_callback = enqueue
-    return _coordinate_once(factory, *args, **kwargs)
+    return _coordinate_once(factory, coord.CoordinationLimits(repository_path="/srv/test-repo"), *args, **kwargs)
 
 
 def test_unchanged_snapshot_skips_model_call():
@@ -521,3 +522,17 @@ def test_parse_coordination_result_parametrized(text, eligible, ok):
         assert err is None and ordered is not None
     else:
         assert ordered is None and err
+
+
+def test_missing_repository_path_is_checked_only_when_enabled():
+    def forbidden_factory():
+        raise AssertionError("invalid configuration must not reach database")
+
+    assert _coordinate_once(forbidden_factory, environ={}).skipped == "disabled"
+    assert _coordinate_once(
+        forbidden_factory,
+        environ={"AICC_COORDINATOR_V2": "1", "AICC_COORDINATOR_V2_STOP": "1"},
+    ).stopped
+    assert _coordinate_once(
+        forbidden_factory, environ={"AICC_COORDINATOR_V2": "1"},
+    ).rejected == "repository_path_required"

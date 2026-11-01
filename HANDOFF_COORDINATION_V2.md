@@ -56,6 +56,7 @@ Activation (owner-operated, after migrate + deploy of this SHA):
 2. Re-assert grants (`upgrade` already does).
 3. Set on the control-plane host env (e.g. `/etc/aicc/app.env`):
    - `AICC_COORDINATOR_V2=1`
+   - Existing `AICC_FLEET_REPO` or explicit `backlog-plan --repo-path` must supply the repository path.
 4. Ensure workers can run Grok model-only (existing #1071 install).
 5. Leave `AICC_COORDINATOR_V2_STOP` unset.
 
@@ -121,7 +122,9 @@ recovery uses the same bounded pre-queue budget; a changed snapshot gets its own
 budget. Read-only worker payload parsing and app-role enqueue were exercised
 against disposable PostgreSQL with normal conftest, not a production cluster.
 
-The original hardcoded repository_path remains a deployment prerequisite;
-these regressions validate payload syntax and DB authority, not live broker
-workspace access. Production coordination remains disabled. No provider call,
+The repository path now comes from the existing AICC_FLEET_REPO configuration
+or explicit backlog-plan --repo-path; enabled coordination rejects an empty
+path before DB access. Both disabled and STOP mode also bypass advisory reads
+and preserve the original planner ordering. Live broker workspace access still
+requires activation verification. Production coordination remains disabled. No provider call,
 service change, publication or deployment was performed by this follow-up.

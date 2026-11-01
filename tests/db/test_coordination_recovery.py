@@ -94,7 +94,10 @@ def test_missing_item_recovery_is_bounded_and_reuses_key(admin_conn):
 def test_app_role_can_enqueue_and_worker_can_parse_payload(admin_conn, connect_as):
     from contextlib import contextmanager
 
-    from command_center.orchestrator.coordination import coordinate_once
+    from command_center.orchestrator.coordination import (
+        CoordinationLimits,
+        coordinate_once,
+    )
     from command_center.worker.payloads import AgentRunRequest, parse_agent_run
 
     _prepare(admin_conn)
@@ -106,7 +109,7 @@ def test_app_role_can_enqueue_and_worker_can_parse_payload(admin_conn, connect_a
             yield conn
 
     report = coordinate_once(
-        factory,
+        factory, CoordinationLimits(repository_path="/srv/test-repo"),
         environ={"AICC_COORDINATOR_V2": "1"},
         load_candidates=lambda: [{"task_id": "VOYN-A", "wave": "1", "title": "a"}],
     )
@@ -119,8 +122,47 @@ def test_app_role_can_enqueue_and_worker_can_parse_payload(admin_conn, connect_a
     assert payload["cascade"][0]["capability"] == "model_only"
     assert task_id == "VOYN-AICC-COORD-V2" and attempts == 1
     again = coordinate_once(
-        factory,
+        factory, CoordinationLimits(repository_path="/srv/test-repo"),
         environ={"AICC_COORDINATOR_V2": "1"},
         load_candidates=lambda: [{"task_id": "VOYN-A", "wave": "1", "title": "a"}],
     )
     assert again.skipped == "inflight_pending"
+
+
+def test_planner_disabled_and_stopped_skip_advisory_read(admin_conn, connect_as, monkeypatch):
+    import json
+    from contextlib import contextmanager
+
+    from command_center.db.backlog_parser import ParsedTask
+    from command_center.db.backlog_store import BacklogStore
+    from command_center.orchestrator import planner
+
+    roles.apply_bootstrap(admin_conn)
+    with connect_as(roles.MIGRATOR_ROLE) as migrator:
+        migrations.upgrade(migrator)
+        roles.apply_table_grants(migrator)
+
+    @contextmanager
+    def factory():
+        with connect_as(roles.APP_ROLE) as conn:
+            yield conn
+
+    store = BacklogStore(factory)
+    for task_id in ("VOYN-A", "VOYN-B"):
+        assert store.upsert_task(ParsedTask(
+            task_id=task_id, wave="0", priority="P0", status="OPEN", kind="task",
+            title=task_id, body="test", repo="test-repo", line_no=1,
+        ))[0]
+    monkeypatch.setenv("AICC_PLANNER_REPO_ROUTES", json.dumps({"test-repo": ["AICC", "/srv/test-repo"]}))
+    reads = []
+    monkeypatch.setattr(planner, "load_advisory_order", lambda _factory: reads.append(True) or ["VOYN-B", "VOYN-A"])
+    monkeypatch.delenv("AICC_COORDINATOR_V2", raising=False)
+    monkeypatch.delenv("AICC_COORDINATOR_V2_STOP", raising=False)
+    # A zero dispatch budget still runs the actual candidate-ordering path.
+    planner.plan_once(factory, planner.PlanLimits(max_dispatches_per_tick=0))
+    assert reads == []
+    monkeypatch.setenv("AICC_COORDINATOR_V2", "1")
+    monkeypatch.setenv("AICC_COORDINATOR_V2_STOP", "1")
+    report = planner.plan_once(factory, planner.PlanLimits(max_dispatches_per_tick=1))
+    assert reads == []
+    assert [task for task, _ in report.dispatched] == ["VOYN-A"]

@@ -64,7 +64,7 @@ class CoordinationLimits:
     queue: str = "execution"
     #: project_id / repository_path for the model-only agent_run payload.
     project_id: str = "AICC"
-    repository_path: str = "/home/voynadmin/Projects/ai-command-center"
+    repository_path: str = ""
 
 
 @dataclass(slots=True)
@@ -434,6 +434,9 @@ def coordinate_once(
         report.skipped = "disabled"
         return report
     report.enabled = True
+    if not isinstance(limits.repository_path, str) or not limits.repository_path.strip():
+        report.rejected = "repository_path_required"
+        return report
 
     candidates = (
         load_candidates() if load_candidates is not None else _load_candidates(factory, limits)

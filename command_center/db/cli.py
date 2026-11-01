@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from contextlib import nullcontext
 from typing import Any
@@ -124,6 +125,10 @@ def build_parser() -> argparse.ArgumentParser:
         "eligible tasks to the execution queue (run by aicc-backlog-planner.timer).",
     )
     plan.add_argument("--wip-limit", type=int, default=4)
+    plan.add_argument(
+        "--repo-path", default=os.environ.get("AICC_FLEET_REPO", ""),
+        help="Configured repository path for opt-in coordination (AICC_FLEET_REPO).",
+    )
     plan.add_argument(
         "--dry-run",
         action="store_true",
@@ -597,9 +602,14 @@ def main(argv: list[str] | None = None) -> int:
                 # Coordination v2 runs AFTER the planner lease is released so a
                 # model call never blocks planner:global. Opt-in / stop switches
                 # live in coordination.coordinate_once; default is no-op.
-                from command_center.orchestrator.coordination import coordinate_once
+                from command_center.orchestrator.coordination import (
+                    CoordinationLimits,
+                    coordinate_once,
+                )
 
-                coord = coordinate_once(lambda: _nc(conn))
+                coord = coordinate_once(
+                    lambda: _nc(conn), CoordinationLimits(repository_path=args.repo_path)
+                )
                 if coord.stopped:
                     print(f"COORD     stopped ({coord.skipped})")
                 elif coord.enqueued:
