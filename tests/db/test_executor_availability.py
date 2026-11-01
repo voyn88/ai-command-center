@@ -220,3 +220,18 @@ def test_list_all_reflects_the_same_self_expiry_as_get(stores) -> None:
     verdicts = {v.executor_id: v for v in app.list_all()}
     assert verdicts["codex"].available
     assert not verdicts["copilot_cli"].available
+
+
+def test_literal_statements_match_live_fragments():
+    """The static SQL used on the read paths must equal the fragment-built
+    form, so the _LIVE_* semantics cannot drift."""
+    from command_center.db import executor_availability as ea
+
+    assert ea._GET_ONE_SQL == (
+        "SELECT " + ea._LIVE_SELECT_FRAGMENT
+        + " FROM executor_availability WHERE executor_id = %s"
+    )
+    assert ea._LIST_ALL_SQL == (
+        "SELECT executor_id, " + ea._LIVE_SELECT_FRAGMENT
+        + " FROM executor_availability ORDER BY executor_id"
+    )
