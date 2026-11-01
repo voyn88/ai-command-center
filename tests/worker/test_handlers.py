@@ -602,7 +602,7 @@ def test_copilot_provider_failure_switches_inside_the_same_attempt(
 
 @pytest.mark.parametrize("task_type,executor,model", [
     ("review", "cursor", "auto"),
-    ("independent_review", "grok", "grok-4.3"),
+    ("independent_review", "grok", "grok-4.6"),
 ])
 def test_owner_alternatives_preserve_review_capability_and_replace_old_model(
     handler, monkeypatch, task_type, executor, model
