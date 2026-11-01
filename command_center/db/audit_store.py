@@ -19,24 +19,25 @@ nothing extra. Two tables in one family with different answers to the same
 question is exactly why "does this table have a runnable reconciliation entry
 point?" is a per-table check rather than a per-slice one.
 
-**Why this file is in the AIOS boundary baseline.** The frozen-engine detector
-classifies it under `audit`, and it does so on the **name alone**: `audit` is
-deliberately absent from `CORROBORATED_NAME_CATEGORIES`, because unlike
-`memory`/`queue` it has no behavioural substitute, and the module states that
-corroborating a name without one is a straight loss of coverage. This module
-adds no audit capability — it declares two `MirroredTable`s and two mirror
-classes over tables that already exist, with no statement of its own — so the
-match is the false positive `docs/AIOS_BOUNDARY.md` calls Direction 2. Its
-preferred remedy, renaming, is unavailable: any name keeping the token still
-trips, and a name without it would be wrong for a module about `audit_run` and
-`audit_finding`. So the baseline carries the entry, justified here and in the
-PR that added it, per the documented procedure.
+**Why this file is not in the AIOS boundary baseline.** The frozen-engine
+detector's `audit` name signature used to classify on the name alone, which
+made this module — two `MirroredTable`s and two mirror classes over tables
+that already exist, with no statement of its own — the false positive
+`docs/AIOS_BOUNDARY.md` calls Direction 2. Renaming, the usual remedy, was
+unavailable: any name keeping the token still trips, and a name without it
+would be wrong for a module about `audit_run` and `audit_finding`.
 
-The first version of this slice withdrew these two tables instead, on the
-belief that a baseline edit needed a separate architectural decision. It does
-not: the doc asks for an ordinary reviewed PR, which is the process that was
-already running. Pausing was right; discarding the work was the wrong
-destination for it, and independent review said so.
+`VOYN-W0-AICC-AUDIT-CATEGORY-CORROBORATION` closed that gap the way `memory`
+and `queue` already had one: `_behaves_like_an_audit_engine` in
+`tests/architecture/aios_boundary.py` corroborates the `audit` name against a
+single, positively-validated shape — a module that is nothing but imports,
+constant table declarations and well-formed `PostgresTableMirror` subclasses.
+This file matches it, so it dropped out of
+`tests/architecture/AIOS_BOUNDARY_BASELINE.json` instead of carrying a
+justified entry in it. A module that adds so much as a bare function call, a
+lambda, or a mirror subclass with anything beyond `spec = ...` in its body
+does not match the shape and keeps classifying, so the exemption cannot be
+used to smuggle an actual audit engine past the gate.
 """
 
 from __future__ import annotations

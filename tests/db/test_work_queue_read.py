@@ -14,6 +14,7 @@ Skipped wholesale unless ``AICC_TEST_PG_ADMIN_DSN`` is set — see ``conftest``.
 from __future__ import annotations
 
 import secrets
+import time
 
 import pytest
 
@@ -138,3 +139,80 @@ def test_worker_role_cannot_enqueue(stores, psycopg) -> None:
     _app_write, _app_read, worker = stores
     with pytest.raises(psycopg.Error):
         worker.enqueue(QUEUE, idempotency_key="worker-try", payload={})
+
+
+def test_queue_metrics_excludes_a_delayed_only_queue_from_backlog(stores) -> None:
+    """A queue holding only future work has nothing claimable: `ready` must
+    read 0, not a count of not-yet-claimable rows, and there is no oldest
+    claimable item to report an age for."""
+    app_write, app_read, _worker = stores
+    app_write.enqueue(
+        QUEUE, idempotency_key="delayed-only", payload={"kind": "x"},
+        delay_seconds=3600,
+    )
+    row = app_read.queue_metrics()[0]
+    assert row["queue"] == QUEUE
+    assert row["ready"] == 0
+    assert row["oldest_ready_seconds"] is None
+
+
+def test_queue_metrics_ready_count_ignores_delayed_items(stores) -> None:
+    """A queue mixing one claimable item with one delayed item must report
+    backlog depth of 1, matching what a worker could actually claim — not 2,
+    which is what counting every `state = 'ready'` row regardless of
+    `available_at` would produce."""
+    app_write, app_read, _worker = stores
+    app_write.enqueue(QUEUE, idempotency_key="claimable-1", payload={"kind": "x"})
+    app_write.enqueue(
+        QUEUE, idempotency_key="delayed-1", payload={"kind": "x"},
+        delay_seconds=3600,
+    )
+    row = app_read.queue_metrics()[0]
+    assert row["ready"] == 1
+    assert row["oldest_ready_seconds"] is not None
+    assert row["oldest_ready_seconds"] >= 0
+
+
+def test_queue_metrics_oldest_ready_seconds_is_the_minimum_available_at(
+    stores,
+) -> None:
+    """Two claimable items with meaningfully different `available_at` values:
+    the reported age must track the OLDER one. Swapping `min` for `max` in
+    the aggregation would instead report an age near zero here."""
+    app_write, app_read, _worker = stores
+    app_write.enqueue(QUEUE, idempotency_key="older-1", payload={"kind": "x"})
+    time.sleep(2)
+    app_write.enqueue(QUEUE, idempotency_key="newer-1", payload={"kind": "x"})
+
+    row = app_read.queue_metrics()[0]
+    assert row["ready"] == 2
+    assert row["oldest_ready_seconds"] >= 1.5, (
+        "reporting the newest item's age instead of the oldest's would read near zero"
+    )
+
+
+def test_queue_metrics_counts_every_state_independently(stores) -> None:
+    """One item in each of the four states, told apart by `min`/`max` in
+    aggregation swapping, or ready-count/claimable-count confusion cannot
+    coincidentally pass a test that leaves any state at zero."""
+    app_write, app_read, worker = stores
+    app_write.enqueue(QUEUE, idempotency_key="will-succeed", payload={"kind": "succeed"})
+    app_write.enqueue(
+        QUEUE, idempotency_key="will-die", payload={"kind": "die"}, max_attempts=1
+    )
+    app_write.enqueue(QUEUE, idempotency_key="will-stay-claimed", payload={"kind": "stay_claimed"})
+    app_write.enqueue(QUEUE, idempotency_key="will-stay-ready", payload={"kind": "stay_ready"})
+
+    claims = [worker.claim(QUEUE, visibility_seconds=60) for _ in range(3)]
+    assert all(isinstance(c, ClaimedWork) for c in claims)
+    by_kind = {c.payload["kind"]: c for c in claims}
+
+    assert worker.complete(by_kind["succeed"], {"ok": True}) is True
+    assert worker.fail(by_kind["die"], reason="boom", retryable=False) is True
+    # by_kind["stay_claimed"] is left claimed; "will-stay-ready" was never claimed.
+
+    row = app_read.queue_metrics()[0]
+    assert row["succeeded"] == 1
+    assert row["dead"] == 1
+    assert row["claimed"] == 1
+    assert row["ready"] == 1

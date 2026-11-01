@@ -1,0 +1,8 @@
+# AICC Native Gateway v1 runtime dependencies.
+# Deliberately separate from the Streamlit app and companion requirements:
+# the gateway is its own server contour and must stay independently
+# deployable.  Version bands match requirements-web.txt / requirements-dev.txt
+# so a combined environment resolves without conflicts.
+fastapi>=0.115,<1.0
+uvicorn>=0.30,<1.0
+pydantic>=2.7,<3.0

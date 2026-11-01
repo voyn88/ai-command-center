@@ -23,6 +23,12 @@ without needing a new script per scenario:
 - `FAKE_CLAUDE_STDERR`: a line to print to stderr before exiting, if set.
 - `FAKE_CLAUDE_IGNORE_SIGTERM`: if "1", installs a SIGTERM handler that does
   nothing, so a test can exercise the grace-period -> SIGKILL escalation.
+- `FAKE_CLAUDE_READY_FILE`: if set, a file written immediately *after* the
+  signal disposition above is installed. A test that cancels before this file
+  exists is racing the handler: the process still carries the default SIGTERM
+  disposition, dies on the first signal, and no escalation happens — which then
+  looks like an escalation bug and is not one. Wait for this file, not a fixed
+  sleep.
 - `FAKE_CLAUDE_EXTRA_SLEEP`: extra seconds to sleep after emitting all lines,
   before exiting (default 0) — gives a test time to cancel mid-flight.
 - `FAKE_CLAUDE_HOLD_FILE`: if set, a file whose continued existence keeps the
@@ -54,6 +60,12 @@ DEFAULT_LINES = [
 def main() -> int:
     if os.environ.get("FAKE_CLAUDE_IGNORE_SIGTERM") == "1":
         signal.signal(signal.SIGTERM, lambda signum, frame: None)
+
+    ready_file = os.environ.get("FAKE_CLAUDE_READY_FILE")
+    if ready_file:
+        # Written after the disposition above is in place, never before.
+        with open(ready_file, "w", encoding="utf-8") as handle:
+            handle.write("ready")
 
     lines_file = os.environ.get("FAKE_CLAUDE_LINES_FILE")
     lines_env = os.environ.get("FAKE_CLAUDE_LINES")

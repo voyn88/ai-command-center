@@ -118,6 +118,52 @@ def sorted_timeline(task: dict) -> list[dict]:
     return sorted(task.get("timeline") or [], key=lambda event: event.get("ts", ""), reverse=True)
 
 
+def dependency_narrative(task: dict, tasks_by_id: dict[str, dict]) -> list[str]:
+    """Plain-language sentences explaining why this task's dependency chain
+    matters, for a reader who has never seen `depends_on`/`blocks`/
+    `parent_task_id` and shouldn't need to. Each sentence names the concrete
+    other task and the concrete consequence ("X waits on Y" / "finishing this
+    unblocks Z"), never the graph jargon.
+
+    This is the accessible counterpart to `dependency_graph_dot`: a
+    Graphviz chart is an image with no text alternative, so a screen-reader
+    user (or anyone who just doesn't read node-and-arrow diagrams) gets
+    nothing from it today. Returns `[]` under the same "nothing to explain"
+    condition `dependency_graph_dot` uses to return `None`, so callers can
+    share one empty-state check.
+    """
+    lines: list[str] = []
+
+    def label(other_id: str, other: dict | None) -> str:
+        title = other.get("title") if other else None
+        return title or f"(задача {other_id[:8]} удалена)"
+
+    depends_on = task.get("depends_on") or []
+    unmet = set(models.unmet_dependencies(task, tasks_by_id))
+    for dep_id in depends_on:
+        title = label(dep_id, tasks_by_id.get(dep_id))
+        if dep_id in unmet:
+            lines.append(f"Эта задача ждёт «{title}»: пока та не будет готова, эта не начнётся.")
+        else:
+            lines.append(f"«{title}» уже готово — эта задача может продолжаться.")
+
+    edges = models.derive_dependency_edges(task, list(tasks_by_id.values()))
+    for blocked_id in edges["blocks"]:
+        title = label(blocked_id, tasks_by_id.get(blocked_id))
+        lines.append(f"Пока эта задача не будет готова, не сможет начаться «{title}».")
+
+    parent_id = task.get("parent_task_id")
+    if parent_id:
+        title = label(parent_id, tasks_by_id.get(parent_id))
+        lines.append(f"Это часть более крупной задачи «{title}» — от этого шага зависит, когда та будет готова.")
+
+    for child_id in edges["children"]:
+        title = label(child_id, tasks_by_id.get(child_id))
+        lines.append(f"У этой задачи есть подзадача «{title}» — её ход тоже влияет на общий результат.")
+
+    return lines
+
+
 def dependency_graph_dot(task: dict, tasks_by_id: dict[str, dict]) -> str | None:
     """Builds Graphviz DOT source for a task's dependency neighborhood
     (depends_on / blocks / parent / children). Returns `None` when there is

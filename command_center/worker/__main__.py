@@ -10,6 +10,7 @@ with backoff", which is why auth failure exits instead of retrying.
 from __future__ import annotations
 
 import logging
+import os
 import sys
 
 
@@ -21,6 +22,7 @@ def main() -> int:
     from command_center.db import pool
     from command_center.db.config import ConfigError, load_config
     from command_center.db.work_queue_store import WorkQueueStore
+    from command_center.worker.credential_file import read_environment_file
     from command_center.worker.daemon import WorkerDaemon
     from command_center.worker.handlers import build_handlers
 
@@ -35,7 +37,19 @@ def main() -> int:
         print(f"worker: cannot reach PostgreSQL: {error}", file=sys.stderr)
         return 3
 
-    daemon = WorkerDaemon(WorkQueueStore(), handlers=build_handlers())
+    def reload_credentials() -> None:
+        path = os.environ.get("AICC_WORKER_ENV_FILE", "")
+        if not path:
+            raise ConfigError("AICC_WORKER_ENV_FILE is required for credential reload")
+        values = dict(os.environ)
+        values.update(read_environment_file(path))
+        pool.replace_pool(load_config(values))
+
+    daemon = WorkerDaemon(
+        WorkQueueStore(),
+        handlers=build_handlers(),
+        reload_credentials=reload_credentials,
+    )
     daemon.install_signal_handlers()
     try:
         daemon.run_forever()

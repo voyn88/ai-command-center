@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the repo-owned VOYN infrastructure monitor every two minutes
+
+[Timer]
+OnBootSec=90s
+OnUnitInactiveSec=2min
+RandomizedDelaySec=15s
+Persistent=true
+Unit=voyn-infra-monitor.service
+
+[Install]
+WantedBy=timers.target

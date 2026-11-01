@@ -10,10 +10,25 @@ case; the bad case is the working tree already carrying somebody else's edits
 by then.
 
 This module answers one question -- "is the path we are about to write into
-covered by a live lease?" -- and answers it fail-closed. It never acquires
-anything: the worker is not the lease holder and must not become one here.
-``publish_run`` takes the lease for the push and releases it in a ``finally``,
-so a lease taken around the run would be dropped early by that release.
+covered by a live lease *held by someone else*?" -- and answers it
+fail-closed. It never acquires anything itself, deliberately: this check runs
+before the caller has decided whether to become a writer at all, and a
+process that both lists and acquires in the same breath could observe its own
+about-to-be-taken lease and refuse itself.
+
+That used to be the whole story, and for a while it left a real gap open: the
+gate ran once, before ``run_claude_code``, and nothing held the path for the
+run itself -- provisioning, the agent editing files, tests, up to
+``request.timeout_seconds`` of wall clock -- so a second dispatch into the
+same path could still land in the window between this check passing and the
+run finishing (VOYN-W0-AICC-WORKTREE-LEASE-TOCTOU). That window is closed now,
+but not by this module: ``worker.writer_lease.hold()`` acquires a real,
+renewed-in-the-background lease immediately after this preflight passes (see
+``worker.handlers``), and holds it through provisioning, the run, and
+``publish_run``, releasing only once the whole dispatch is done. This module
+stays the fast, read-only check for a lease already held by *another*
+writer -- the point check is sufficient for that question precisely because
+the held-lock question it does not answer is answered elsewhere.
 
 Scope, stated rather than assumed:
 

@@ -1,0 +1,38 @@
+{
+  "projection_version": "1",
+  "revision": "r-000042",
+  "generated_at": "2026-08-26T00:00:00Z",
+  "degraded": false,
+  "projects": [
+    {"id": "aicc", "name": "AI Command Center", "state": "active", "active_tasks": 3, "needs_attention": 1},
+    {"id": "aios", "name": "AIOS Platform", "state": "active", "active_tasks": 2, "needs_attention": 0}
+  ],
+  "tasks": [
+    {
+      "id": "VOYN-EXAMPLE-001",
+      "title": "Example delivery",
+      "blocker": null,
+      "evidence": {"head_sha": "abc123", "pr": "#42", "ci": "passed", "acceptance": "pending", "merged_sha": null, "deployed_sha": null}
+    },
+    {
+      "id": "VOYN-EXAMPLE-002",
+      "title": "Blocked migration",
+      "blocker": "Waiting for owner decision",
+      "evidence": {"head_sha": null, "pr": null, "ci": "unknown", "acceptance": "unknown", "merged_sha": null, "deployed_sha": null}
+    }
+  ],
+  "lanes": [
+    {"id": "worker-01/lane-1", "state": "active", "heartbeat_age_seconds": 12},
+    {"id": "worker-01/lane-2", "state": "idle", "heartbeat_age_seconds": 45}
+  ],
+  "events": [
+    {"id": "evt-001", "occurred_at": "2026-08-25T23:58:00Z", "summary": "PR #42 opened", "correlation_id": "VOYN-EXAMPLE-001"},
+    {"id": "evt-002", "occurred_at": "2026-08-25T23:59:00Z", "summary": "CI passed on abc123", "correlation_id": "VOYN-EXAMPLE-001"}
+  ],
+  "dialogs": [
+    {"id": "dlg-001", "title": "Morning review", "state": "open", "last_activity_at": "2026-08-25T23:50:00Z", "message_count": 8, "last_summary": "Reviewed overnight deliveries; one item needs an owner decision."}
+  ],
+  "decisions": [
+    {"id": "dec-001", "title": "Adopt merge queue", "status": "accepted", "decided_at": "2026-08-23T05:20:00Z", "summary": "Serialize integration through the platform merge queue."}
+  ]
+}

@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import pytest
 
-from command_center.runtime import db, legacy_import
+from command_center.runtime import db, legacy_import, reports
 
 
 def _legacy_run(**overrides) -> dict:
@@ -53,7 +53,8 @@ def test_import_creates_task_session_run_and_report(tmp_path):
     assert task["legacy_task_id"] == "legacy-task-1"
 
     report = db.get_report(db_path, run["id"])
-    assert report["path"] == "reports/AIOS/legacy-report.md"
+    assert report["path"] != "reports/AIOS/legacy-report.md"
+    assert reports.resolve_report_path(report["path"]).is_file()
 
 
 def test_import_is_idempotent(tmp_path):
@@ -137,11 +138,13 @@ def test_import_handles_run_with_no_task_id(tmp_path):
     assert db.get_task(db_path, run["task_id"]) is not None
 
 
-def test_import_with_no_report_path_creates_no_report_row(tmp_path):
+def test_import_with_no_report_path_generates_durable_report(tmp_path):
     db_path = tmp_path / "runtime.db"
     legacy = [_legacy_run(report_path=None)]
     created = legacy_import.import_legacy_runs(db_path, legacy_runs=legacy)
-    assert db.get_report(db_path, created[0]) is None
+    report = db.get_report(db_path, created[0])
+    assert report is not None
+    assert db.get_run(db_path, created[0])["finalized_at"] is not None
 
 
 def test_import_defaults_to_agent_runner_load_runs(tmp_path, monkeypatch):

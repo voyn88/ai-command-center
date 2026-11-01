@@ -132,6 +132,55 @@ def test_run_unknown_check_is_client_error(client) -> None:
     assert r.status_code == 400
 
 
+# --- auto-trigger ----------------------------------------------------------
+
+
+def test_auto_trigger_runs_when_never_run_before(client, events) -> None:
+    r = client.post("/api/v1/audit/auto-trigger", json={"project": "AICC"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ran"] is True
+    assert body["reason"] is None
+    assert body["run"]["status"] == "completed"
+    assert len(body["findings"]) == 3
+    assert any(isinstance(e, AuditRunCompleted) for e in events)
+
+
+def test_auto_trigger_skips_when_run_recently(client) -> None:
+    first = client.post("/api/v1/audit/auto-trigger", json={"project": "AICC"}).json()
+    assert first["ran"] is True
+
+    second = client.post("/api/v1/audit/auto-trigger", json={"project": "AICC"}).json()
+    assert second["ran"] is False
+    assert second["reason"] == "not_due"
+    assert second["run"] is None
+    assert second["findings"] == []
+
+
+def test_auto_trigger_min_interval_override_allows_back_to_back_runs(client) -> None:
+    payload = {"project": "AICC", "min_interval_seconds": 0}
+    first = client.post("/api/v1/audit/auto-trigger", json=payload).json()
+    second = client.post("/api/v1/audit/auto-trigger", json=payload).json()
+    assert first["ran"] is True
+    assert second["ran"] is True
+
+
+def test_auto_trigger_skips_sensitive_project_without_error(client) -> None:
+    for project in ("BANK", "LEGAL"):
+        r = client.post("/api/v1/audit/auto-trigger", json={"project": project})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["ran"] is False
+        assert body["reason"] == "sensitive_project"
+
+
+def test_auto_trigger_unknown_check_is_client_error(client) -> None:
+    r = client.post(
+        "/api/v1/audit/auto-trigger", json={"project": "AICC", "checks": ["nope"]}
+    )
+    assert r.status_code == 400
+
+
 def test_run_marks_failed_when_finding_persist_raises_mid_loop(monkeypatch) -> None:
     # A raise while persisting findings must not leave a dangling ``running``
     # run: the finalize loop is guarded so the run is marked ``failed`` and the

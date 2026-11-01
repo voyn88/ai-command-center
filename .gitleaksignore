@@ -1,0 +1,10 @@
+# Fingerprints of proven-fake findings the full-history secret scan may hit.
+# Each entry is commit:file:rule:line — the narrowest identity gitleaks
+# supports; an entry silences exactly one occurrence and nothing else.
+#
+# Test-fixture password in test_pool_rotation.py (branch
+# backlog/VOYN-W0-AICC-PSYCOPG-DSN-REDACT, authored by the task agent): the
+# literal "s3cr3t-and-plenty-long-enough-01" is a synthetic value exercising
+# pool-rebuild auth, not a credential. With fetch-depth: 0 the scan job sees
+# every branch, so this one line failed the Secret scan of every open PR.
+3c26b48129a731973fc1c078f5447968f5c22558:tests/db/test_pool_rotation.py:generic-api-key:168

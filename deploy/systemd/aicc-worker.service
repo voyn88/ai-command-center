@@ -26,7 +26,10 @@ Type=notify
 WatchdogSec=240s
 User=aicc-worker
 Group=aicc-worker
+SupplementaryGroups=aicc-workspace
 EnvironmentFile=/etc/aicc/worker.env
+Environment=HOME=/var/lib/aicc-worker
+Environment=XDG_CONFIG_HOME=/var/lib/aicc-worker/config
 WorkingDirectory=/opt/aicc
 ExecStart=/opt/aicc/.venv/bin/python -m command_center.worker
 
@@ -49,8 +52,31 @@ TimeoutStopSec=330s
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
+# The preprod clone source lives under /home/voynadmin; ProtectHome
+# presents an empty /home, so the ONE directory the worker must read
+# is bind-mounted back read-only -- secrets in the rest of the home
+# stay invisible (review finding on 63cb072).
+BindReadOnlyPaths=/home/voynadmin/Projects/ai-command-center
 PrivateTmp=true
+PrivateDevices=true
+ProtectProc=invisible
+ProcSubset=pid
+ProtectControlGroups=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+LockPersonality=true
+KeyringMode=private
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+UMask=0077
 StateDirectory=aicc-worker
+StateDirectoryMode=0700
+ReadWritePaths=/srv/aicc-workspaces
 # Resource envelope (SRV-05): declared limits, enforced by cgroups — which,
 # unlike the mount/network sandbox directives, apply for user units too.
 # Acceptance of the *sandbox* directives is measurement-from-inside per

@@ -216,12 +216,15 @@ def _collect_at(ref: str) -> dict[str, list[dict]]:
                 raise SystemExit(f"probe failed at {ref}:\n{result.stderr}")
             return json.loads(result.stdout)
         finally:
-            subprocess.run(
-                ["git", "worktree", "remove", "--force", str(tree)],
-                cwd=ROOT,
-                check=False,
-                capture_output=True,
-            )
+            # Shared force-removal site (VOYN-W0-AICC-WORKTREE-LEAK-RETRY):
+            # a bare `remove --force` here, with no fallback, was one of the
+            # eight hand-rolled removal call sites the leak audit found --
+            # if it refused, this throwaway worktree's `.git/worktrees/<name>`
+            # entry dangled in ROOT forever with nothing left to revisit it.
+            sys.path.insert(0, str(ROOT))
+            from command_center import workspace_provisioning
+
+            workspace_provisioning.force_remove_worktree(ROOT, tree)
 
 
 def cmd_statements(args: argparse.Namespace) -> int:

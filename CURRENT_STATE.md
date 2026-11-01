@@ -44,9 +44,13 @@ Current position:
 - Checked-in CI validates committed-diff whitespace, Ruff, byte compilation and pytest on Python
   3.14. Informational, non-blocking `mypy` and coverage steps run alongside the deterministic
   quartet but do not gate the merge.
-- Runtime history retention is **off by default**: `AICC_RUNTIME_RETENTION_DAYS=<N>` prunes
-  `run_event` rows for terminal runs older than `N` days on startup, and
-  `AICC_RUNTIME_VACUUM_ON_START=1` reclaims disk with `VACUUM` afterward.
+- Runtime history retention is **off by default**: `AICC_RUNTIME_RETENTION_DAYS=<N>` archives and
+  prunes `run_event` rows for terminal runs older than `N` days on startup, routed through the same
+  backup/archive/integrity-checked sequence as the deliberate maintenance path — it also requires
+  `AICC_RUNTIME_RETENTION_ARCHIVE_DIR` (no archive dir, no deletion) and honors
+  `AICC_RUNTIME_RETENTION_DRY_RUN=1` to rehearse against a copy first
+  (VOYN-W0-AICC-RETENTION-NO-DRYRUN). `AICC_RUNTIME_VACUUM_ON_START=1` reclaims disk with `VACUUM`
+  afterward.
 - `data/chats.json` and `data/activity.jsonl` remain active application stores alongside SQLite;
   legacy synchronous execution and the `data/runs.jsonl` journal also remain present.
 - Founder Functional Audit `9761459` is **closed** (2026-08-07), merge-verified against

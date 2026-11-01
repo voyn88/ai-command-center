@@ -1,0 +1,37 @@
+# The worktree prune sweep (VOYN-W0-AICC-ISOLATED-WORKTREE-PER-ATTEMPT
+# hardening follow-up): the periodic caller of
+# `command_center.worktree_sweep`, which reconciles dangling
+# `.git/worktrees/<name>` metadata that `workspace_provisioning.
+# remove_workspace`'s own inline prune cannot reach (a dirty worktree left
+# in place, a refused removal, or a worker killed before cleanup ever ran).
+#
+# Install (same host as aicc-worker, beside it):
+#   cp deploy/systemd/aicc-worktree-prune.{service,timer} /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now aicc-worktree-prune.timer
+#
+# Identity: runs as the same user as aicc-worker (not aicc-app) because it
+# needs read/write access to the configured repositories' `.git` directories
+# on this host's filesystem, not a PostgreSQL credential — it never opens a
+# database connection. Sandboxing mirrors aicc-worker.service for the same
+# reason: repository paths are operator-configured, host-local locations
+# (frequently under a user's home directory), so the access this unit needs
+# is exactly the access the worker unit it runs alongside already has.
+
+[Unit]
+Description=AI Command Center worktree metadata prune sweep
+After=network.target
+
+[Service]
+Type=oneshot
+User=aicc-worker
+Group=aicc-worker
+WorkingDirectory=/opt/aicc
+ExecStart=/opt/aicc/.venv/bin/python -m command_center.worktree_sweep
+# A sweep tick that cannot finish in this window is a failed tick, not an
+# incident: the next tick retries against the same repositories.
+TimeoutStartSec=120s
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true

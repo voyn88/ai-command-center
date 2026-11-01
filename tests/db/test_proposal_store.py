@@ -68,6 +68,11 @@ def _create(db_path: Path, **overrides) -> dict:
 def test_the_proposal_family_reconciles_after_every_write(
     pg_connection_factory, tmp_path, monkeypatch
 ) -> None:
+    """Two proposals, not one. A hook that only mirrors the proposal it was
+    just called against would still pass a single-proposal check — the second
+    proposal's rows are the only thing that can catch that, which is why every
+    stage reconciles both proposals' children against the complete table
+    rather than one proposal's slice of it."""
     _patch(monkeypatch, pg_connection_factory)
     proposals = PostgresProposalMirror(connection_factory=pg_connection_factory)
     events = PostgresProposalEventMirror(connection_factory=pg_connection_factory)
@@ -75,22 +80,29 @@ def test_the_proposal_family_reconciles_after_every_write(
 
     db_path = tmp_path / "runtime.db"
     proposal_db.db.migrate(db_path)
+    other = _create(db_path, title="other")
+    proposal_db.append_proposal_evidence(
+        db_path,
+        other["id"],
+        kind="observation",
+        source="ci",
+        summary="the other proposal's own evidence",
+        observed_at=SAMPLE_AT,
+    )
+    proposal_db.append_proposal_event(db_path, other["id"], "noted", message="the other proposal's own event")
 
     def reconciled(stage: str, proposal_id: str) -> None:
-        stored = proposal_db.get_proposal(db_path, proposal_id)
-        assert proposal_divergence([stored] if stored else [], proposals) == [], stage
-        assert (
-            proposal_event_divergence(
-                proposal_db.list_proposal_events_stored(db_path, proposal_id), events
-            )
-            == []
-        ), stage
-        assert (
-            proposal_evidence_divergence(
-                proposal_db.list_proposal_evidence_stored(db_path, proposal_id), evidence
-            )
-            == []
-        ), stage
+        assert proposal_divergence(proposal_db.list_proposals(db_path), proposals) == [], stage
+        stored_evidence = [
+            *proposal_db.list_proposal_evidence_stored(db_path, proposal_id),
+            *proposal_db.list_proposal_evidence_stored(db_path, other["id"]),
+        ]
+        assert proposal_evidence_divergence(stored_evidence, evidence) == [], stage
+        stored_events = [
+            *proposal_db.list_proposal_events_stored(db_path, proposal_id),
+            *proposal_db.list_proposal_events_stored(db_path, other["id"]),
+        ]
+        assert proposal_event_divergence(stored_events, events) == [], stage
 
     created = _create(db_path)
     reconciled("proposal created", created["id"])

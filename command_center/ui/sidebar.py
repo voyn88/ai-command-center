@@ -30,6 +30,10 @@ NAV_GROUPS: tuple[tuple[str, tuple[str, ...], bool], ...] = (
     # projects, git. Chat/reports/generated/context are no longer their own
     # sidebar entries — they live inside the project view (task 02661825).
     ("Основное", ("dashboard", "command", "kanban", "task_deps", "execution_center", "projects", "git_center"), True),
+    # A single, plain-language destination for a board member or investor
+    # (VOYN-MIN-BOARD-LAUNCH) — kept out of "Основное" so the operator's core
+    # five-destination scan is not diluted by a screen operators don't need.
+    ("Для руководства", ("board_view",), False),
     ("Планирование", ("waves", "create"), False),
     ("Аналитика", ("runs", "agents", "portfolio"), False),
 )

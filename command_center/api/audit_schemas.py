@@ -50,6 +50,34 @@ class AuditRunList(BaseModel):
     offset: int
 
 
+class AutoTriggerRequest(BaseModel):
+    """POST body for ``/audit/auto-trigger``: fire a pass for ``project`` only
+    when it is *due* (no run within the trigger interval). Lets an unattended
+    caller — a short-interval script, a pre-commit gate, a UI tick — call this
+    on every occurrence without hammering the checks or the store: a call that
+    lands before the interval elapses is a cheap, side-effect-free no-op.
+    ``min_interval_seconds`` overrides the service default for this call only
+    (mainly for tests and one-off scripts)."""
+
+    project: str
+    checks: list[str] | None = None
+    min_interval_seconds: int | None = None
+
+
+class AutoTriggerResult(BaseModel):
+    """The outcome of one auto-trigger decision. ``ran`` is ``False`` for a
+    deliberate, expected skip — ``reason`` is ``"not_due"`` (interval not
+    elapsed) or ``"sensitive_project"`` (BANK/LEGAL) — never for an error; an
+    error still raises like ``/audit/run`` does."""
+
+    project: str
+    ran: bool
+    reason: str | None = None
+    run: AuditRun | None = None
+    findings: list[AuditFinding] = Field(default_factory=list)
+    deduped: int = 0
+
+
 class AuditFindingList(BaseModel):
     """A page of audit findings."""
 

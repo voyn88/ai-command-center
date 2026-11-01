@@ -21,7 +21,7 @@ from pathlib import Path
 import pytest
 from streamlit.testing.v1 import AppTest
 
-from command_center import agent_runner, execution_queue, git_info, models, project_config, report_parser, storage, task_view, workspace_home
+from command_center import agent_runner, backlog_client, execution_queue, git_info, models, project_config, report_parser, storage, task_view, workspace_home
 from command_center.runtime import db as runtime_db
 from command_center.runtime import reports as runtime_reports
 from command_center.runtime import supervisor as runtime_supervisor
@@ -31,15 +31,14 @@ APP_PATH = str(Path(__file__).resolve().parent.parent / "app.py")
 
 
 def _wait_for_run_terminal(db_path, run_id: str, *, timeout: float = 10.0) -> dict:
-    """Poll `runtime.db` directly until `run_id` reaches a terminal state
-    *and* — for the states that produce one (`COMPLETED`/`FAILED`/
-    `CANCELLED`) — its report row exists too, not just `state` (set partway
-    through `Supervisor._supervise`, before report-saving, which is the
-    background thread's last write before it exits). Waiting for state alone
-    leaves that thread still running past this test's teardown, racing the
-    next test's fixtures (e.g. `isolated_reports_dir` reverting `REPORTS_ROOT`
-    out from under it) — the same hazard `tests/test_execution_center_ui.py`'s
-    `_wait_for_report` guards against.
+    """Poll `runtime.db` until `run_id` reaches durable finalization.
+
+    Terminal state and even the report row are intentionally visible before
+    ``finalized_at``: the supervisor still has lifecycle/auto-commit/report
+    work to finish in that interval.  Returning before the durability marker
+    lets fixture teardown remove ``AICC_DATA_DIR`` while that daemon thread is
+    still writing SQLite WAL/SHM files.  ``finalized_at`` is the canonical
+    cross-process boundary that says all of those writes are already durable.
 
     Deliberately does not go through any `Supervisor`/`ExecutionCenterAPI`
     instance: `st.cache_resource` (used by `app.get_execution_center_api()`)
@@ -53,15 +52,51 @@ def _wait_for_run_terminal(db_path, run_id: str, *, timeout: float = 10.0) -> di
     that hazard entirely."""
     import time
 
-    report_producing_states = {"COMPLETED", "FAILED", "CANCELLED"}
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         run = runtime_db.get_run(db_path, run_id)
-        if run is not None and run["state"] in runtime_db.TERMINAL_STATES:
-            if run["state"] not in report_producing_states or runtime_db.get_report(db_path, run_id) is not None:
-                return run
+        if (
+            run is not None
+            and run["state"] in runtime_db.TERMINAL_STATES
+            and run.get("finalized_at") is not None
+        ):
+            return run
         time.sleep(0.05)
     raise AssertionError(f"run {run_id!r} did not reach a settled terminal state within {timeout}s")
+
+
+def test_wait_for_run_terminal_uses_finalization_watermark(monkeypatch, tmp_path):
+    """A report-visible terminal row is not yet safe for fixture teardown."""
+    import threading
+
+    marker_allowed = threading.Event()
+    pre_marker_observed = threading.Event()
+    waiter_finished = threading.Event()
+    result: list[dict] = []
+
+    def fake_get_run(_db_path, _run_id):
+        if not marker_allowed.is_set():
+            pre_marker_observed.set()
+            return {"state": "COMPLETED", "finalized_at": None}
+        return {"state": "COMPLETED", "finalized_at": "2026-08-30T03:00:00Z"}
+
+    monkeypatch.setattr(runtime_db, "get_run", fake_get_run)
+
+    def wait_for_finalization():
+        result.append(_wait_for_run_terminal(tmp_path / "runtime.db", "run-1", timeout=2))
+        waiter_finished.set()
+
+    waiter = threading.Thread(target=wait_for_finalization)
+    waiter.start()
+    assert pre_marker_observed.wait(timeout=1)
+    assert not waiter_finished.is_set(), (
+        "terminal state without finalized_at incorrectly released teardown"
+    )
+
+    marker_allowed.set()
+    waiter.join(timeout=1)
+    assert not waiter.is_alive()
+    assert result[0]["finalized_at"] is not None
 
 
 def _at_on_page(page_key: str, **extra_session_state) -> AppTest:
@@ -71,6 +106,21 @@ def _at_on_page(page_key: str, **extra_session_state) -> AppTest:
         at.session_state[key] = value
     at.run()
     return at
+
+
+def test_real_app_routes_initial_tasks_through_board_fallback(monkeypatch):
+    calls = []
+    real_board_tasks = backlog_client.board_tasks
+
+    def observed_board_tasks(local_tasks, path=None):
+        calls.append(local_tasks)
+        return real_board_tasks(local_tasks, path)
+
+    monkeypatch.setattr(backlog_client, "board_tasks", observed_board_tasks)
+    at = _at_on_page("dashboard")
+
+    assert not at.exception
+    assert len(calls) == 1
 
 
 def _seed_task(**overrides) -> dict:

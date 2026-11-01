@@ -456,3 +456,14 @@ def list_validation_results(db_path: Path, run_id: str, *, attempt: int | None =
                 (run_id,),
             ).fetchall()
         return [dict(row) for row in rows]
+
+
+def list_validation_results_stored(db_path: Path) -> list[dict]:
+    """Every `completion_validation` row across every run, in the shape SQLite
+    stores. `list_validation_results` takes a `run_id` because every caller in
+    this package wants one run's attempts; reconciliation wants the opposite —
+    the whole table, so that a mirror missing another run's rows is visible
+    instead of simply never being asked about."""
+    with db.connect(db_path) as conn:
+        rows = conn.execute("SELECT * FROM completion_validation ORDER BY id ASC").fetchall()
+        return [dict(row) for row in rows]

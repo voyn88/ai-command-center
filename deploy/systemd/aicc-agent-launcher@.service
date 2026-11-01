@@ -1,0 +1,73 @@
+[Unit]
+Description=AICC root-owned agent launcher connection %i
+After=aicc-agent-launcher.socket
+# A per-connection instance is an EVENT, not a host service: once the answer
+# is on the wire its unit has nothing left to say. Without this, an instance
+# that ends non-zero stays in PID 1's unit table as `failed` until someone
+# runs `reset-failed` -- and those corpses are cumulative, so the host
+# unit-health probe read a week of them as a standing `failed_units` finding
+# (worker-01, monitor_finding 2051) that no repair could ever clear. The
+# broker no longer reports the AGENT's exit code as its own (see
+# `_deliver_response`), so what remains here is a genuine broker fault: it is
+# journalled, it reaches the worker as a launch refusal (infra-class, retried
+# and refunded), and it does not have to also be permanent systemd state. The
+# transient agent unit this one supervises is collected the same way
+# (`systemd-run --collect`).
+#
+# CollectMode= is a [Unit] directive (systemd.unit(5)). Under [Service],
+# where this arrived first, systemd does not fail the unit -- it logs
+# "Unknown key name 'CollectMode' in section 'Service', ignoring" and leaves
+# the default CollectMode=inactive in force, so the reaping rule silently did
+# not exist and `failed_units` came back (monitor_finding 2295). The
+# installer proves PID 1's effective value after daemon-reload rather than
+# trusting this line.
+CollectMode=inactive-or-failed
+
+[Service]
+Type=exec
+ExecStart=/usr/libexec/aicc-agent-launcher --serve-socket
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+User=root
+Group=root
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectControlGroups=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+# No RestrictSUIDSGID here: this root broker deliberately sets the setgid bit
+# on every workspace directory (fchmod 2770, so files the agent creates
+# inherit the aicc-workspace group the worker reads them through), and
+# RestrictSUIDSGID turns exactly that chmod into EPERM -- every isolated
+# launch died with "[Errno 1] Operation not permitted" (worker-01,
+# 2026-09-08). The AGENT's transient unit keeps its own RestrictSUIDSGID.
+LockPersonality=yes
+KeyringMode=private
+RestrictAddressFamilies=AF_UNIX
+# Every entry is declared in deploy/tmpfiles.d/aicc-agent.conf and the
+# socket unit re-creates that declaration (systemd-tmpfiles --create) before
+# it accepts the first connection: this namespace is built before ExecStart,
+# so a path only the launcher creates refused the connection with
+# 226/NAMESPACE (worker-01, 2026-09-08). Strict entries, deliberately: a
+# '-' would only let the namespace come up around an ABSENT path, and a
+# directory created afterwards never becomes writable inside it (review of
+# 5736dd6c) -- the connection would fail one step later instead.
+# /var/lib/aicc-agent: the model-auth store the broker writes a refreshed
+# provider credential back into at teardown. Without it the write-back hit
+# EROFS under ProtectSystem=strict, the rotated refresh token died with the
+# ephemeral home, and Claude was dead again after its first refresh
+# (worker-01 2026-09-09 06:38 UTC).
+ReadWritePaths=/run/aicc-agent-launcher /run/aicc-agent-homes /run/aicc-agent-workspace-binds /srv/aicc-workspaces /srv/aicc-quarantine /var/lib/aicc-agent
+UMask=0077
+MemoryMax=256M
+TasksMax=64
+TimeoutStopSec=30s

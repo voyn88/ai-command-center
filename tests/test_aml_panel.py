@@ -141,3 +141,53 @@ def test_mlro_reporting_exposes_sar_approval_flow():
 
     assert not at.exception
     assert any(button.label == "Проверить и утвердить" for button in at.button)
+
+
+_INSTANT_ELIGIBLE_CASE = {
+    "id": "AML-2026-2001", "customer": "Delta Retail LLC", "country": "Латвия",
+    "risk": "medium", "score": 58, "status": "new", "amount": 42_500,
+    "currency": "EUR", "opened": "Сегодня, 10:00", "owner": "Не назначен",
+    "scenario": "Unusual activity",
+    "summary": "Оборот немного превысил среднемесячный профиль клиента.",
+    "factors": ("Оборот x1,4 к среднему",),
+    "transactions": (("29.07 · 10:00", "Входящий перевод", "+ 42 500 EUR", "Regular counterparty"),),
+}
+
+
+def test_instant_closure_button_visible_for_eligible_case_and_gated_by_role():
+    aml_store.seed_cases((_INSTANT_ELIGIBLE_CASE,))
+    at = _at_on_aml_page(
+        aml_view="investigation", aml_investigation_case="AML-2026-2001",
+        aml_role="MLRO", aml_actor="Maria MLRO",
+    )
+    instant_close = next(button for button in at.button if button.label == "⚡ Закрыть в 1 клик")
+    assert not instant_close.disabled
+
+    at = _at_on_aml_page(
+        aml_view="investigation", aml_investigation_case="AML-2026-2001",
+        aml_role="Analyst", aml_actor="AML Analyst",
+    )
+    instant_close = next(button for button in at.button if button.label == "⚡ Закрыть в 1 клик")
+    assert instant_close.disabled
+
+
+def test_instant_closure_button_hidden_for_ineligible_case():
+    at = _at_on_aml_page(aml_view="investigation", aml_investigation_case="AML-2026-0418", aml_role="MLRO")
+    assert not any(button.label == "⚡ Закрыть в 1 клик" for button in at.button)
+
+
+def test_instant_closure_report_renders_after_playbook_runs():
+    aml_store.seed_cases((_INSTANT_ELIGIBLE_CASE,))
+    report = aml_store.run_instant_closure(
+        "AML-2026-2001", actor="Maria MLRO", role="MLRO",
+        reason="Соответствует критериям playbook, ложное срабатывание.",
+        expected_version=0, confirmed=True,
+    )
+    at = _at_on_aml_page(
+        aml_view="investigation", aml_investigation_case="AML-2026-2001",
+        aml_role="MLRO", aml_actor="Maria MLRO", aml_last_instant_report=report,
+    )
+    assert not at.exception
+    assert any("Авто-отчёт о закрытии по playbook" in markdown.value for markdown in at.markdown)
+    assert any(report["id"] in success.value for success in at.success)
+    assert any("Трасса решений" in markdown.value for markdown in at.markdown)

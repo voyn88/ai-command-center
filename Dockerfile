@@ -22,7 +22,10 @@ COPY scripts/aml-entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
 # Директория для данных — монтируется как том
-RUN mkdir -p /data
+RUN groupadd --gid 10001 aicc \
+    && useradd --uid 10001 --gid aicc --create-home --shell /usr/sbin/nologin aicc \
+    && mkdir -p /data \
+    && chown aicc:aicc /data
 ENV AICC_DATA_DIR=/data
 
 # Streamlit не должен открывать браузер в контейнере
@@ -30,6 +33,9 @@ ENV STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
 ENV STREAMLIT_SERVER_HEADLESS=true
 
 EXPOSE 8501
+
+# The service has no need for root after its image layers are assembled.
+USER aicc
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
     CMD curl -f http://localhost:8501/_stcore/health || exit 1

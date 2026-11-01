@@ -15,6 +15,9 @@ from fastapi import APIRouter, HTTPException, Query
 
 from command_center.advisor import api as advisor_api
 from command_center.advisor.schemas import AdvisorRunRequest, AdvisorRunResponse
+from command_center.arena import api as arena_api
+from command_center.arena.schemas import DuelRunRequest, DuelRunResponse
+from command_center.arena.scorer import TooFewVariantsError
 from command_center.api import models, schemas
 from command_center.api import wave1_schemas as w
 from command_center.api import wave1_service as service
@@ -122,6 +125,24 @@ def list_advisor_proposals(
     return service.list_proposals(
         project=project, status=status, kind=kind, limit=limit, offset=offset
     )
+
+
+# --------------------------------------------------------------------------
+# Арена — agent-duel engine (VOYN-AGT-SELF-PLAY)
+# --------------------------------------------------------------------------
+
+
+@router.post("/arena/duel", response_model=DuelRunResponse)
+def run_duel(payload: DuelRunRequest) -> DuelRunResponse:
+    """Run a duel: score every submitted solution variant for the same case
+    on explainability, quality, time, cost and correctness, and return the
+    ranking with a winner and an explained rationale. Rejected with ``400``
+    when fewer than three variants are submitted — a duel is a comparison,
+    not a solo run."""
+    try:
+        return arena_api.run_duel(payload)
+    except TooFewVariantsError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 # --------------------------------------------------------------------------

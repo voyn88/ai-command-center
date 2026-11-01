@@ -45,11 +45,13 @@ timeout, so the authentication path adds no new supply-chain surface.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 #: Environment variable naming the platform's base URL, e.g.
 #: ``https://platform.internal``. Absent means "this deployment cannot
@@ -88,9 +90,55 @@ class PlatformUnavailable(RuntimeError):
     """
 
 
+class PlatformURLError(RuntimeError):
+    """``AICC_PLATFORM_URL`` is set to a value unsafe to use as the identity
+    authority's address.
+
+    Deliberately distinct from :class:`PlatformUnavailable`: that one means
+    "we could not reach the platform right now", a transient condition a
+    retry might clear. This one means the operator's configuration itself is
+    wrong — a bearer credential is about to be sent to a scheme that does not
+    encrypt it — and no retry fixes that. It is intentionally left uncaught
+    by the request-handling path (unlike ``PlatformUnavailable``), so it
+    surfaces loudly instead of masquerading as a routine 503 outage.
+    """
+
+
+def _is_loopback_host(host: str) -> bool:
+    if host in {"localhost", "localhost.localdomain"}:
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 def platform_base_url() -> str | None:
+    """The validated platform base URL, or ``None`` if unconfigured.
+
+    ``https`` is the only scheme accepted for a real deployment: the
+    forwarded credential is a live bearer token, and anything else ships it
+    in cleartext to whatever sits on the network path. The one exception is
+    ``http`` to a literal loopback address, the supported shape for local
+    development against a platform stub running on the same host. Any other
+    scheme — plain ``http`` to a routable host, or something outlandish like
+    ``file`` — raises :class:`PlatformURLError` rather than being sent.
+    """
     value = os.environ.get(PLATFORM_URL_ENV, "").strip()
-    return value.rstrip("/") or None
+    if not value:
+        return None
+    url = value.rstrip("/")
+    parsed = urlsplit(url)
+    if parsed.scheme == "https":
+        return url
+    if parsed.scheme == "http" and _is_loopback_host(parsed.hostname or ""):
+        return url
+    raise PlatformURLError(
+        f"{PLATFORM_URL_ENV}={value!r} is not a safe identity-authority "
+        "address: expected 'https://...', or 'http://' to a loopback host "
+        "for local development, but got scheme "
+        f"{parsed.scheme!r} for host {parsed.hostname!r}."
+    )
 
 
 def _http_get_json(url: str, token: str, timeout: float) -> tuple[int, bytes]:
@@ -101,7 +149,7 @@ def _http_get_json(url: str, token: str, timeout: float) -> tuple[int, bytes]:
     ``HTTPError`` is *not* an outage: it carries a real status line, so it is
     returned as a status for the caller to interpret.
     """
-    request = urllib.request.Request(  # noqa: S310 - scheme is operator-configured
+    request = urllib.request.Request(  # noqa: S310 - scheme validated by platform_base_url()
         url, headers={"Authorization": f"Bearer {token}", "Accept": "application/json"}
     )
     try:

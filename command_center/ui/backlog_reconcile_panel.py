@@ -16,12 +16,25 @@ from pathlib import Path
 import streamlit as st
 
 from command_center import backlog_reconcile, tasks_repository
+from command_center.ui import confirm_dialog
 
 _KIND_LABEL = {
     backlog_reconcile.KIND_SELF_COMPLETED: "прогон уже завершён",
     backlog_reconcile.KIND_DUPLICATE_OF_DONE: "дубль завершённой",
     backlog_reconcile.KIND_DUPLICATE_OPEN: "дубль открытой",
 }
+
+
+def _delete_finding(root: Path, finding) -> None:
+    tasks_repository.delete_task(root, finding.task_id)
+    # Cascade the runtime.db footprint too so a reconciled delete leaves no
+    # orphan session/run/report rows (audit AR-1). Ideally routed through the
+    # ExecutionCenterAPI facade; done inline here as this panel holds no api
+    # handle (tracked under AR-7).
+    from command_center.runtime import db as runtime_db
+
+    runtime_db.delete_task(runtime_db.resolve_db_path(root), finding.task_id)
+    st.toast(f"Удалено: {finding.title}")
 
 
 def _scoped(tasks: list[dict], project: str | None) -> list[dict]:
@@ -82,19 +95,23 @@ def render_backlog_reconcile_panel(
                 type="primary" if finding.is_delete else "secondary",
             )
             if done_clicked:
+                # Reversible (a Review-lane task can be moved back), so this
+                # stays a single immediate click — no gate.
                 tasks_repository.update_task_status(
                     root, finding.task_id, "Review"
                 )
                 st.toast(f"На проверку: {finding.title}")
                 st.rerun()
-            if delete_clicked:
-                tasks_repository.delete_task(root, finding.task_id)
-                # Cascade the runtime.db footprint too so a reconciled delete
-                # leaves no orphan session/run/report rows (audit AR-1). Ideally
-                # routed through the ExecutionCenterAPI facade; done inline here
-                # as this panel holds no api handle (tracked under AR-7).
-                from command_center.runtime import db as runtime_db
 
-                runtime_db.delete_task(runtime_db.resolve_db_path(root), finding.task_id)
-                st.toast(f"Удалено: {finding.title}")
-                st.rerun()
+            delete_key_prefix = f"{key_prefix}_delete_{finding.task_id}"
+            if delete_clicked:
+                confirm_dialog.open_confirmation(delete_key_prefix)
+
+            confirm_dialog.render_destructive_confirmation(
+                key_prefix=delete_key_prefix,
+                dialog_title="Подтверждение удаления",
+                warning=f"Задача «{finding.title}» (`{finding.task_id}`) будет удалена. Это действие нельзя отменить.",
+                checkbox_label="Я подтверждаю удаление этой задачи.",
+                confirm_label="Подтвердить удаление",
+                on_confirm=lambda finding=finding: _delete_finding(root, finding),
+            )

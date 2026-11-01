@@ -15,7 +15,7 @@
 
 import { getOwnerToken, QueueAuthError } from './queueApi'
 
-export type BacklogTask = {
+export type BacklogStoreTask = {
   task_id: string
   wave: string
   priority: string | null
@@ -38,10 +38,10 @@ export function fetchBacklogStatus(): Promise<BacklogStatusCounts> {
   })
 }
 
-export function fetchBacklogTasks(limit = 200): Promise<{ tasks: BacklogTask[]; total: number }> {
+export function fetchBacklogTasks(limit = 200): Promise<{ tasks: BacklogStoreTask[]; total: number }> {
   return fetch(`/api/v1/backlog/tasks?limit=${limit}`).then((response) => {
     if (!response.ok) throw new Error(`GET /api/v1/backlog/tasks -> ${response.status}`)
-    return response.json() as Promise<{ tasks: BacklogTask[]; total: number }>
+    return response.json() as Promise<{ tasks: BacklogStoreTask[]; total: number }>
   })
 }
 
@@ -61,7 +61,7 @@ export type BacklogEvidence = {
 }
 
 export type BacklogTaskDetail = {
-  task: BacklogTask
+  task: BacklogStoreTask
   events: BacklogEvent[]
   evidence: BacklogEvidence[]
 }
@@ -148,3 +148,25 @@ export function reassignBacklogTask(
 ): Promise<{ task_id: string; reason: string; revision: number }> {
   return authedPost(`/api/v1/backlog/tasks/${encodeURIComponent(taskId)}/reassign`, body)
 }
+
+export type BacklogTask = {
+  id: string; title: string; status: string; priority: string | null
+  project: string; updated_at: string
+}
+export type BacklogSnapshot = {
+  source: 'server_backlog'; read_only: boolean; updated_at: string
+  stale: boolean; total: number; tasks: BacklogTask[]; counts: Record<string, number>
+  commands_enabled?: boolean
+}
+export async function fetchBacklog(signal?: AbortSignal): Promise<BacklogSnapshot> {
+  const response = await fetch('/api/backlog', { signal, cache: 'no-store' })
+  if (!response.ok) throw new Error('Не удалось обновить задачи')
+  return response.json()
+}
+export const statusNames: Record<string, string> = {
+  OPEN: 'Запланировано', IN_PROGRESS: 'В работе', READY_TO_REVIEW: 'На проверке',
+  DEFER_TO_USER: 'Нужно ваше решение', DONE: 'Завершено', REJECTED: 'Отклонено',
+  DECIDED: 'Решение принято', NEEDS_REFINEMENT: 'Нужно уточнить',
+  UNTRIAGED: 'Новая задача', SPLIT: 'Разделено на задачи', 'PO-Approved': 'Одобрено',
+}
+export const statusName = (status: string) => statusNames[status] || status

@@ -34,3 +34,13 @@ httpx>=0.27,<1.0
 playwright>=1.55,<2.0
 # Local axe-core bundle for real-browser WCAG checks (no CDN/network at test time).
 axe-playwright-python==0.1.8
+# Coverage-derived test<->source dependency cache for the local dev loop
+# (`make test-impacted`). Complements, does not replace, `scripts/ci/
+# test_impact/select_tests.py`'s static-AST selector: testmon's map is built
+# from *actual* coverage data (catches dynamic imports and runtime-only
+# dependencies the static walker cannot see), at the cost of needing a prior
+# full run to seed `.testmondata`. Local-only, like `test-fast` above --
+# CI's required gate is untouched and keeps running the full suite every
+# time; testmon only ever narrows a LOCAL iteration loop, never a merge
+# decision.
+pytest-testmon>=2.1,<3.0

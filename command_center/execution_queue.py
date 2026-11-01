@@ -69,6 +69,7 @@ from command_center import (
     pipeline_settings,
     project_config,
     storage,
+    tasks_repository,
     workspace_provisioning,
 )
 from command_center.runtime import db as runtime_db
@@ -268,6 +269,8 @@ def enqueue(entries: list[dict], task: dict, tasks_by_id: dict[str, dict]) -> li
     task_id = task.get("id")
     if task_id is None:
         return entries
+    if tasks_repository.is_master_projection_task(task):
+        return entries
     if task.get("status") == "Done":
         return entries
     if any(e.get("task_id") == task_id and e.get("state") in OPEN_STATES for e in entries):
@@ -309,6 +312,9 @@ def evaluate_readiness(entries: list[dict], tasks_by_id: dict[str, dict]) -> lis
         if task is None:
             entry["state"] = STATE_CANCELLED
             entry["reason"] = "задача больше не существует"
+        elif tasks_repository.is_master_projection_task(task):
+            entry["state"] = STATE_CANCELLED
+            entry["reason"] = "read-only master backlog task"
         elif task.get("status") == "Done":
             entry["state"] = STATE_CANCELLED
             entry["reason"] = "задача уже завершена"
@@ -368,6 +374,7 @@ def waiting_entries(entries: list[dict]) -> list[dict]:
 LAUNCH_OK = "launched"
 LAUNCH_SKIP_TASK_DONE = "task_already_done"
 LAUNCH_SKIP_TASK_NOT_FOUND = "task_not_found"
+LAUNCH_SKIP_READ_ONLY_MASTER = "read_only_master_task"
 LAUNCH_SKIP_WORKSPACE_NOT_CONFIGURED = "workspace_not_configured"
 LAUNCH_SKIP_BLOCKED = "launch_blocked"
 LAUNCH_SKIP_NEEDS_CONFIRMATION = "needs_confirmation"
@@ -629,6 +636,17 @@ def launch_ready(
                     False,
                     message="задача не найдена",
                     reason_code=LAUNCH_SKIP_TASK_NOT_FOUND,
+                )
+            )
+            continue
+        if tasks_repository.is_master_projection_task(task):
+            results.append(
+                LaunchAttemptResult(
+                    entry["id"],
+                    task_id,
+                    False,
+                    message="read-only master backlog task — запуск отклонён",
+                    reason_code=LAUNCH_SKIP_READ_ONLY_MASTER,
                 )
             )
             continue

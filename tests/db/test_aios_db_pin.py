@@ -50,7 +50,15 @@ def test_every_ci_job_installs_the_pinned_wheel(lock: dict) -> None:
     db_fetches = workflow.count("scripts/fetch_aios_sdk_artifact.py --lock aios-db.lock.json")
     assert db_fetches == sdk_fetches > 0
 
-    assert workflow.count(f"/.artifacts/{lock['wheel_filename']}") == sdk_fetches
+    # Every job that names the wheel must actually get it, but there are now
+    # two honest ways to: fetch it, or install the one the `prepare` job
+    # already fetched and verified. Counting declarations against fetches
+    # would forbid the second and force each shard back to its own download —
+    # the repeated work build-once exists to remove. What must hold is that no
+    # job names the wheel without one of the two.
+    declarations = workflow.count(f"/.artifacts/{lock['wheel_filename']}")
+    prepared_installs = workflow.count("Install prepared AIOS SDK and DB artifacts")
+    assert declarations == sdk_fetches + prepared_installs
 
 
 def test_the_lock_matches_what_the_boundary_allows() -> None:

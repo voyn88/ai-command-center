@@ -1,0 +1,35 @@
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { beforeEach, afterEach, expect, test, vi } from 'vitest'
+import OwnerTaskActions from '../../components/OwnerTaskActions'
+
+beforeEach(() => { sessionStorage.clear() })
+afterEach(() => { vi.unstubAllGlobals() })
+test('network retry preserves the exact intent and does not silently claim success', async () => {
+  const fetcher = vi.fn()
+    .mockResolvedValueOnce({ ok: true, json: async () => ({ revision: 4, status: 'OPEN', body: '', can_launch: true, can_decide: false }) })
+    .mockRejectedValueOnce(new Error('connection dropped'))
+    .mockResolvedValueOnce({ ok: true, json: async () => ({ ok: true, reason: 'queued' }) })
+  vi.stubGlobal('fetch', fetcher)
+  const changed = vi.fn()
+  render(<OwnerTaskActions taskId="task" onChanged={changed} />)
+  fireEvent.click(await screen.findByRole('button', { name: 'Запустить агента по задаче' }))
+  await screen.findByText(/Нет подтверждения сервера/)
+  expect(changed).not.toHaveBeenCalled()
+  fireEvent.click(screen.getByRole('button', { name: 'Повторить отправку' }))
+  await waitFor(() => expect(changed).toHaveBeenCalledOnce())
+  expect(fetcher.mock.calls[1][1].body).toEqual(fetcher.mock.calls[2][1].body)
+})
+test('decision requires the owner answer and submits its selected meaning', async () => {
+  const fetcher = vi.fn()
+    .mockResolvedValueOnce({ ok: true, json: async () => ({ revision: 5, status: 'DEFER_TO_USER', body: 'Question', can_launch: false, can_decide: true }) })
+    .mockResolvedValueOnce({ ok: true, json: async () => ({ ok: true, reason: 'REJECTED' }) })
+  vi.stubGlobal('fetch', fetcher)
+  render(<OwnerTaskActions taskId="task" onChanged={() => undefined} />)
+  expect(await screen.findByRole('button', { name: 'Отправить решение' })).toBeDisabled()
+  fireEvent.change(screen.getByLabelText('Решение'), { target: { value: 'reject' } })
+  fireEvent.change(screen.getByLabelText('Ваш ответ'), { target: { value: 'Out of scope' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Отправить решение' }))
+  await screen.findByText('Решение сохранено. Задача отклонена.')
+  const body = JSON.parse(fetcher.mock.calls[1][1].body)
+  expect(body).toMatchObject({ decision: 'reject', note: 'Out of scope', expected_revision: 5 })
+})

@@ -1,0 +1,186 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="2588" viewBox="0 0 1120 2588" font-family="Helvetica, Arial, sans-serif">
+<defs><marker id="arrow-critical" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#C53030"/></marker><marker id="arrow-normal" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#A0AEC0"/></marker><marker id="arrow-mitigates" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#2F855A"/></marker></defs>
+<rect x="0" y="0" width="1120" height="2588" fill="#FFFFFF"/>
+<text x="40" y="60" font-size="20" font-weight="700" fill="#1A202C">Decision-Memory Graph — Path to Failure for Past Incidents</text>
+<text x="40" y="82" font-size="12" fill="#4A5568">VOYN-MIN-GRAPH-SQL — semantic graph of decisions, errors, dependencies and effects, mined from this repository's own incident history</text>
+<rect x="40" y="101" width="16" height="16" rx="3" fill="#EBF8FF" stroke="#2B6CB0" stroke-width="1.5"/><text x="62" y="113" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#2D3748">decision</text>
+<rect x="140" y="101" width="16" height="16" rx="3" fill="#FAF5FF" stroke="#6B46C1" stroke-width="1.5"/><text x="162" y="113" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#2D3748">dependency</text>
+<rect x="252" y="101" width="16" height="16" rx="3" fill="#FFFAF0" stroke="#C05621" stroke-width="1.5"/><text x="274" y="113" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#2D3748">error</text>
+<rect x="334" y="101" width="16" height="16" rx="3" fill="#F0FFF4" stroke="#2F855A" stroke-width="1.5"/><text x="356" y="113" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#2D3748">effect</text>
+<rect x="422" y="101" width="16" height="16" rx="3" fill="#FFF5F5" stroke="#C53030" stroke-width="1.5"/><text x="444" y="113" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#2D3748">effect (failure)</text>
+<line x1="570" y1="109" x2="604" y2="109" stroke="#C53030" stroke-width="3" marker-end="url(#arrow-critical)"/><text x="612" y="113" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#2D3748">path to failure</text>
+<line x1="728" y1="109" x2="762" y2="109" stroke="#2F855A" stroke-width="2" stroke-dasharray="6,4" marker-end="url(#arrow-mitigates)"/><text x="770" y="113" font-family="Helvetica, Arial, sans-serif" font-size="11" fill="#2D3748">mitigates</text>
+<text x="40" y="200" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="700" fill="#1A202C">VOYN-W0-AICC-DEFER-AUTO-RESUME-REM (migrations 0014, 0017)</text>
+<rect x="40" y="216" width="220" height="96" rx="10" fill="#EBF8FF" stroke="#2B6CB0" stroke-width="1.6"/>
+<text x="150.0" y="232" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="9" font-weight="700" letter-spacing="0.05em" fill="#2B6CB0">DECISION</text>
+<text x="150.0" y="254.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#1A365D">Bound auto-resume at 3</text>
+<text x="150.0" y="268.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#1A365D">GRANTED resumes, counted</text>
+<text x="150.0" y="282.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#1A365D">over a task's whole life</text>
+<rect x="300" y="216" width="220" height="96" rx="10" fill="#FAF5FF" stroke="#6B46C1" stroke-width="1.6"/>
+<text x="410.0" y="232" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="9" font-weight="700" letter-spacing="0.05em" fill="#6B46C1">DEPENDENCY</text>
+<text x="410.0" y="261.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#322659">Dead-codex-era outages</text>
+<text x="410.0" y="275.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#322659">spanning weeks</text>
+<rect x="560" y="216" width="220" height="96" rx="10" fill="#FFFAF0" stroke="#C05621" stroke-width="1.6"/>
+<text x="670.0" y="232" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="9" font-weight="700" letter-spacing="0.05em" fill="#C05621">ERROR</text>
+<text x="670.0" y="261.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#652B06">Lifetime count conflates a</text>
+<text x="670.0" y="275.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#652B06">burst with unlimited chances</text>
+<rect x="820" y="216" width="220" height="96" rx="10" fill="#FFF5F5" stroke="#C53030" stroke-width="3"/>
+<text x="930.0" y="232" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="9" font-weight="700" letter-spacing="0.05em" fill="#C53030">EFFECT • FAILURE</text>
+<text x="930.0" y="254.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#63171B">Tasks stuck DEFER_TO_USER</text>
+<text x="930.0" y="268.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#63171B">forever after the pipeline</text>
+<text x="930.0" y="282.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#63171B">was fixed</text>
+<rect x="820" y="372" width="220" height="96" rx="10" fill="#EBF8FF" stroke="#2B6CB0" stroke-width="1.6"/>
+<text x="930.0" y="388" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="9" font-weight="700" letter-spacing="0.05em" fill="#2B6CB0">DECISION</text>
+<text x="930.0" y="410.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#1A365D">Replace the lifetime budget</text>
+<text x="930.0" y="424.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#1A365D">with a 48-hour sliding</text>
+<text x="930.0" y="438.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#1A365D">window (migration 0017)</text>
+<line x1="260.0" y1="264.0" x2="300.0" y2="264.0" stroke="#C53030" stroke-width="3" stroke-dasharray="none" marker-end="url(#arrow-critical)"/>
+<line x1="520.0" y1="264.0" x2="560.0" y2="264.0" stroke="#C53030" stroke-width="3" stroke-dasharray="none" marker-end="url(#arrow-critical)"/>
+<line x1="780.0" y1="264.0" x2="820.0" y2="264.0" stroke="#C53030" stroke-width="3" stroke-dasharray="none" marker-end="url(#arrow-critical)"/>
+<line x1="930.0" y1="372.0" x2="930.0" y2="312.0" stroke="#2F855A" stroke-width="2" stroke-dasharray="6,4" marker-end="url(#arrow-mitigates)"/>
+<text x="40" y="598" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="700" fill="#1A202C">VOYN-W0-AICC-DISPATCH-PLAN-FABRICATED-SPEND-REM (#641 rejected, #706 fix)</text>
+<rect x="40" y="614" width="220" height="96" rx="10" fill="#EBF8FF" stroke="#2B6CB0" stroke-width="1.6"/>
+<text x="150.0" y="630" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="9" font-weight="700" letter-spacing="0.05em" fill="#2B6CB0">DECISION</text>
+<text x="150.0" y="652.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#1A365D">PR #641 redacts only the</text>
+<text x="150.0" y="666.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#1A365D">reported daily_spend_usd</text>
+<text x="150.0" y="680.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#1A365D">under the kill-switch path</text>
+<rect x="300" y="614" width="220" height="96" rx="10" fill="#FAF5FF" stroke="#6B46C1" stroke-width="1.6"/>
+<text x="410.0" y="630" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="9" font-weight="700" letter-spacing="0.05em" fill="#6B46C1">DEPENDENCY</text>
+<text x="410.0" y="652.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#322659">projected_spend_usd and</text>
+<text x="410.0" y="666.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#322659">budget_remaining_usd are</text>
+<text x="410.0" y="680.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#322659">derived from the same plan</text>
+<rect x="560" y="614" width="220" height="96" rx="10" fill="#FFFAF0" stroke="#C05621" stroke-width="1.6"/>
+<text x="670.0" y="630" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="9" font-weight="700" letter-spacing="0.05em" fill="#C05621">ERROR</text>
+<text x="670.0" y="652.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#652B06">The fabricated ceiling still</text>
+<text x="670.0" y="666.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#652B06">leaked into</text>
+<text x="670.0" y="680.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#652B06">projected/remaining</text>
+<rect x="820" y="614" width="220" height="96" rx="10" fill="#FFF5F5" stroke="#C53030" stroke-width="3"/>
+<text x="930.0" y="630" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="9" font-weight="700" letter-spacing="0.05em" fill="#C53030">EFFECT • FAILURE</text>
+<text x="930.0" y="652.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#63171B">A fabricated budget ceiling</text>
+<text x="930.0" y="666.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#63171B">ships as if it were a</text>
+<text x="930.0" y="680.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#63171B">measured value</text>
+<rect x="820" y="770" width="220" height="96" rx="10" fill="#EBF8FF" stroke="#2B6CB0" stroke-width="1.6"/>
+<text x="930.0" y="786" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="9" font-weight="700" letter-spacing="0.05em" fill="#2B6CB0">DECISION</text>
+<text x="930.0" y="808.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#1A365D">Add DispatchPlan.spend_measu</text>
+<text x="930.0" y="822.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#1A365D">rement (status/kind) as a</text>
+<text x="930.0" y="836.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#1A365D">required field</text>
+<line x1="260.0" y1="662.0" x2="300.0" y2="662.0" stroke="#C53030" stroke-width="3" stroke-dasharray="none" marker-end="url(#arrow-critical)"/>
+<line x1="520.0" y1="662.0" x2="560.0" y2="662.0" stroke="#C53030" stroke-width="3" stroke-dasharray="none" marker-end="url(#arrow-critical)"/>
+<line x1="780.0" y1="662.0" x2="820.0" y2="662.0" stroke="#C53030" stroke-width="3" stroke-dasharray="none" marker-end="url(#arrow-critical)"/>
+<line x1="930.0" y1="770.0" x2="930.0" y2="710.0" stroke="#2F855A" stroke-width="2" stroke-dasharray="6,4" marker-end="url(#arrow-mitigates)"/>
+<text x="40" y="996" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="700" fill="#1A202C">VOYN-W0-AICC-GITLEAKS-TEST-FIXTURE-FINGERPRINT (#766)</text>
+<rect x="40" y="1012" width="220" height="96" rx="10" fill="#EBF8FF" stroke="#2B6CB0" stroke-width="1.6"/>
+<text x="150.0" y="1028" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="9" font-weight="700" letter-spacing="0.05em" fill="#2B6CB0">DECISION</text>
+<text x="150.0" y="1057.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#1A365D">Run the secret scan gate</text>
+<text x="150.0" y="1071.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#1A365D">with fetch-depth: 0</text>
+<rect x="300" y="1012" width="220" height="96" rx="10" fill="#FAF5FF" stroke="#6B46C1" stroke-width="1.6"/>
+<text x="410.0" y="1028" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="9" font-weight="700" letter-spacing="0.05em" fill="#6B46C1">DEPENDENCY</text>
+<text x="410.0" y="1050.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#322659">A synthetic test password</text>
+<text x="410.0" y="1064.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#322659">fixture lives in tests/db/te</text>
+<text x="410.0" y="1078.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#322659">st_pool_rotation.py</text>
+<rect x="560" y="1012" width="220" height="96" rx="10" fill="#FFFAF0" stroke="#C05621" stroke-width="1.6"/>
+<text x="670.0" y="1028" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="9" font-weight="700" letter-spacing="0.05em" fill="#C05621">ERROR</text>
+<text x="670.0" y="1050.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#652B06">The scanner cannot</text>
+<text x="670.0" y="1064.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#652B06">distinguish a synthetic</text>
+<text x="670.0" y="1078.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#652B06">fixture from a real secret</text>
+<rect x="820" y="1012" width="220" height="96" rx="10" fill="#FFF5F5" stroke="#C53030" stroke-width="3"/>
+<text x="930.0" y="1028" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="9" font-weight="700" letter-spacing="0.05em" fill="#C53030">EFFECT • FAILURE</text>
+<text x="930.0" y="1057.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#63171B">The Secret scan gate fails</text>
+<text x="930.0" y="1071.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#63171B">on every open PR</text>
+<rect x="820" y="1168" width="220" height="96" rx="10" fill="#EBF8FF" stroke="#2B6CB0" stroke-width="1.6"/>
+<text x="930.0" y="1184" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="9" font-weight="700" letter-spacing="0.05em" fill="#2B6CB0">DECISION</text>
+<text x="930.0" y="1206.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#1A365D">Allowlist by exact</text>
+<text x="930.0" y="1220.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#1A365D">commit:file:rule:line</text>
+<text x="930.0" y="1234.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#1A365D">fingerprint</text>
+<line x1="260.0" y1="1060.0" x2="300.0" y2="1060.0" stroke="#C53030" stroke-width="3" stroke-dasharray="none" marker-end="url(#arrow-critical)"/>
+<line x1="520.0" y1="1060.0" x2="560.0" y2="1060.0" stroke="#C53030" stroke-width="3" stroke-dasharray="none" marker-end="url(#arrow-critical)"/>
+<line x1="780.0" y1="1060.0" x2="820.0" y2="1060.0" stroke="#C53030" stroke-width="3" stroke-dasharray="none" marker-end="url(#arrow-critical)"/>
+<line x1="930.0" y1="1168.0" x2="930.0" y2="1108.0" stroke="#2F855A" stroke-width="2" stroke-dasharray="6,4" marker-end="url(#arrow-mitigates)"/>
+<text x="40" y="1394" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="700" fill="#1A202C">VOYN-W0-AICC-MIGRATOR-PASSWORD-FLAKE</text>
+<rect x="40" y="1410" width="220" height="96" rx="10" fill="#EBF8FF" stroke="#2B6CB0" stroke-width="1.6"/>
+<text x="150.0" y="1426" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="9" font-weight="700" letter-spacing="0.05em" fill="#2B6CB0">DECISION</text>
+<text x="150.0" y="1441.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#1A365D">Give every product role a</text>
+<text x="150.0" y="1455.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#1A365D">session-scoped password</text>
+<text x="150.0" y="1469.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#1A365D">fixture, one per xdist</text>
+<text x="150.0" y="1483.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#1A365D">worker</text>
+<rect x="300" y="1410" width="220" height="96" rx="10" fill="#FAF5FF" stroke="#6B46C1" stroke-width="1.6"/>
+<text x="410.0" y="1426" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="9" font-weight="700" letter-spacing="0.05em" fill="#6B46C1">DEPENDENCY</text>
+<text x="410.0" y="1448.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#322659">Roles are cluster-level</text>
+<text x="410.0" y="1462.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#322659">objects shared by every</text>
+<text x="410.0" y="1476.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#322659">worker</text>
+<rect x="560" y="1410" width="220" height="96" rx="10" fill="#FFFAF0" stroke="#C05621" stroke-width="1.6"/>
+<text x="670.0" y="1426" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="9" font-weight="700" letter-spacing="0.05em" fill="#C05621">ERROR</text>
+<text x="670.0" y="1448.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#652B06">Check-then-create races</text>
+<text x="670.0" y="1462.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#652B06">across independent</text>
+<text x="670.0" y="1476.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#652B06">transactions</text>
+<rect x="820" y="1410" width="220" height="96" rx="10" fill="#FFF5F5" stroke="#C53030" stroke-width="3"/>
+<text x="930.0" y="1426" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="9" font-weight="700" letter-spacing="0.05em" fill="#C53030">EFFECT • FAILURE</text>
+<text x="930.0" y="1448.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#63171B">"password authentication</text>
+<text x="930.0" y="1462.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#63171B">failed for user</text>
+<text x="930.0" y="1476.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#63171B">aicc_migrator" in CI</text>
+<rect x="820" y="1566" width="220" height="96" rx="10" fill="#EBF8FF" stroke="#2B6CB0" stroke-width="1.6"/>
+<text x="930.0" y="1582" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="9" font-weight="700" letter-spacing="0.05em" fill="#2B6CB0">DECISION</text>
+<text x="930.0" y="1604.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#1A365D">pg_advisory_xact_lock inside</text>
+<text x="930.0" y="1618.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#1A365D">the same DO block as the</text>
+<text x="930.0" y="1632.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#1A365D">check and the create</text>
+<line x1="260.0" y1="1458.0" x2="300.0" y2="1458.0" stroke="#C53030" stroke-width="3" stroke-dasharray="none" marker-end="url(#arrow-critical)"/>
+<line x1="520.0" y1="1458.0" x2="560.0" y2="1458.0" stroke="#C53030" stroke-width="3" stroke-dasharray="none" marker-end="url(#arrow-critical)"/>
+<line x1="780.0" y1="1458.0" x2="820.0" y2="1458.0" stroke="#C53030" stroke-width="3" stroke-dasharray="none" marker-end="url(#arrow-critical)"/>
+<line x1="930.0" y1="1566.0" x2="930.0" y2="1506.0" stroke="#2F855A" stroke-width="2" stroke-dasharray="6,4" marker-end="url(#arrow-mitigates)"/>
+<text x="40" y="1792" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="700" fill="#1A202C">VOYN-W0-AICC-RUNS-READ-ZERO (#733)</text>
+<rect x="40" y="1808" width="220" height="96" rx="10" fill="#EBF8FF" stroke="#2B6CB0" stroke-width="1.6"/>
+<text x="150.0" y="1824" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="9" font-weight="700" letter-spacing="0.05em" fill="#2B6CB0">DECISION</text>
+<text x="150.0" y="1846.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#1A365D">build_projection() degrades</text>
+<text x="150.0" y="1860.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#1A365D">to empty lanes/events on any</text>
+<text x="150.0" y="1874.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#1A365D">read failure</text>
+<rect x="300" y="1808" width="220" height="96" rx="10" fill="#FAF5FF" stroke="#6B46C1" stroke-width="1.6"/>
+<text x="410.0" y="1824" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="9" font-weight="700" letter-spacing="0.05em" fill="#6B46C1">DEPENDENCY</text>
+<text x="410.0" y="1846.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#322659">Several unrelated conditions</text>
+<text x="410.0" y="1860.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#322659">can raise inside that one</text>
+<text x="410.0" y="1874.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#322659">read</text>
+<rect x="560" y="1808" width="220" height="96" rx="10" fill="#FFFAF0" stroke="#C05621" stroke-width="1.6"/>
+<text x="670.0" y="1824" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="9" font-weight="700" letter-spacing="0.05em" fill="#C05621">ERROR</text>
+<text x="670.0" y="1853.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#652B06">The caught exception was</text>
+<text x="670.0" y="1867.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#652B06">discarded, not logged</text>
+<rect x="820" y="1808" width="220" height="96" rx="10" fill="#FFF5F5" stroke="#C53030" stroke-width="3"/>
+<text x="930.0" y="1824" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="9" font-weight="700" letter-spacing="0.05em" fill="#C53030">EFFECT • FAILURE</text>
+<text x="930.0" y="1853.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#63171B">"Returns 0, no idea why" on</text>
+<text x="930.0" y="1867.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#63171B">the next live run</text>
+<rect x="820" y="1964" width="220" height="96" rx="10" fill="#EBF8FF" stroke="#2B6CB0" stroke-width="1.6"/>
+<text x="930.0" y="1980" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="9" font-weight="700" letter-spacing="0.05em" fill="#2B6CB0">DECISION</text>
+<text x="930.0" y="2009.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#1A365D">Log the traceback behind a</text>
+<text x="930.0" y="2023.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#1A365D">degraded run journal</text>
+<line x1="260.0" y1="1856.0" x2="300.0" y2="1856.0" stroke="#C53030" stroke-width="3" stroke-dasharray="none" marker-end="url(#arrow-critical)"/>
+<line x1="520.0" y1="1856.0" x2="560.0" y2="1856.0" stroke="#C53030" stroke-width="3" stroke-dasharray="none" marker-end="url(#arrow-critical)"/>
+<line x1="780.0" y1="1856.0" x2="820.0" y2="1856.0" stroke="#C53030" stroke-width="3" stroke-dasharray="none" marker-end="url(#arrow-critical)"/>
+<line x1="930.0" y1="1964.0" x2="930.0" y2="1904.0" stroke="#2F855A" stroke-width="2" stroke-dasharray="6,4" marker-end="url(#arrow-mitigates)"/>
+<text x="40" y="2190" font-family="Helvetica, Arial, sans-serif" font-size="14" font-weight="700" fill="#1A202C">VOYN-W0-AICC-TASK-IMPORT-CONCURRENCY-FLAKE (#507, #727)</text>
+<rect x="40" y="2206" width="220" height="96" rx="10" fill="#EBF8FF" stroke="#2B6CB0" stroke-width="1.6"/>
+<text x="150.0" y="2222" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="9" font-weight="700" letter-spacing="0.05em" fill="#2B6CB0">DECISION</text>
+<text x="150.0" y="2244.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#1A365D">load_tasks() seeds an empty</text>
+<text x="150.0" y="2258.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#1A365D">store when tasks.json is</text>
+<text x="150.0" y="2272.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#1A365D">missing</text>
+<rect x="300" y="2206" width="220" height="96" rx="10" fill="#FAF5FF" stroke="#6B46C1" stroke-width="1.6"/>
+<text x="410.0" y="2222" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="9" font-weight="700" letter-spacing="0.05em" fill="#6B46C1">DEPENDENCY</text>
+<text x="410.0" y="2251.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#322659">The seed-on-read runs</text>
+<text x="410.0" y="2265.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#322659">outside the store's flock</text>
+<rect x="560" y="2206" width="220" height="96" rx="10" fill="#FFFAF0" stroke="#C05621" stroke-width="1.6"/>
+<text x="670.0" y="2222" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="9" font-weight="700" letter-spacing="0.05em" fill="#C05621">ERROR</text>
+<text x="670.0" y="2251.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#652B06">Two importers both observe a</text>
+<text x="670.0" y="2265.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#652B06">missing tasks.json</text>
+<rect x="820" y="2206" width="220" height="96" rx="10" fill="#FFF5F5" stroke="#C53030" stroke-width="3"/>
+<text x="930.0" y="2222" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="9" font-weight="700" letter-spacing="0.05em" fill="#C53030">EFFECT • FAILURE</text>
+<text x="930.0" y="2244.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#63171B">The first task id of a bulk</text>
+<text x="930.0" y="2258.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#63171B">import package silently</text>
+<text x="930.0" y="2272.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#63171B">disappears</text>
+<rect x="820" y="2362" width="220" height="96" rx="10" fill="#EBF8FF" stroke="#2B6CB0" stroke-width="1.6"/>
+<text x="930.0" y="2378" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="9" font-weight="700" letter-spacing="0.05em" fill="#2B6CB0">DECISION</text>
+<text x="930.0" y="2393.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#1A365D">Make the seed an exclusive</text>
+<text x="930.0" y="2407.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#1A365D">create</text>
+<text x="930.0" y="2421.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#1A365D">(create_json_if_absent, via</text>
+<text x="930.0" y="2435.2" text-anchor="middle" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#1A365D">os.link)</text>
+<line x1="260.0" y1="2254.0" x2="300.0" y2="2254.0" stroke="#C53030" stroke-width="3" stroke-dasharray="none" marker-end="url(#arrow-critical)"/>
+<line x1="520.0" y1="2254.0" x2="560.0" y2="2254.0" stroke="#C53030" stroke-width="3" stroke-dasharray="none" marker-end="url(#arrow-critical)"/>
+<line x1="780.0" y1="2254.0" x2="820.0" y2="2254.0" stroke="#C53030" stroke-width="3" stroke-dasharray="none" marker-end="url(#arrow-critical)"/>
+<line x1="930.0" y1="2362.0" x2="930.0" y2="2302.0" stroke="#2F855A" stroke-width="2" stroke-dasharray="6,4" marker-end="url(#arrow-mitigates)"/>
+</svg>

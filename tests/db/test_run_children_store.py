@@ -58,6 +58,11 @@ def _launch(db_path: Path) -> dict:
 def test_the_journal_and_the_report_reconcile_after_every_write(
     pg_connection_factory, tmp_path, monkeypatch
 ) -> None:
+    """Two runs, not one. A hook that only mirrors the run it was written
+    against would still pass a single-run check — the second run's rows are
+    the only thing that can catch that, which is why every stage reconciles
+    both runs' children against the complete table rather than one run's
+    slice of it."""
     _patch(monkeypatch, pg_connection_factory)
     events = PostgresRunEventMirror(connection_factory=pg_connection_factory)
     reports = PostgresReportMirror(connection_factory=pg_connection_factory)
@@ -65,13 +70,20 @@ def test_the_journal_and_the_report_reconcile_after_every_write(
     db_path = tmp_path / "runtime.db"
     exec_db.db.migrate(db_path)
     run = _launch(db_path)
+    other_run = _launch(db_path)
+    exec_db.append_run_event(db_path, other_run["id"], "stdout", {"line": "the other run's own event"})
+    exec_db.create_report(db_path, other_run["id"], "/reports/AICC/other.md")
 
     def reconciled(stage: str) -> None:
-        assert run_event_divergence(exec_db.list_run_events_stored(db_path, run["id"]), events) == [], (
-            stage
+        stored_events = [
+            *exec_db.list_run_events_stored(db_path, run["id"]),
+            *exec_db.list_run_events_stored(db_path, other_run["id"]),
+        ]
+        assert run_event_divergence(stored_events, events) == [], stage
+        stored_reports = list(
+            exec_db.get_reports_for_runs(db_path, [run["id"], other_run["id"]]).values()
         )
-        stored_report = exec_db.get_report(db_path, run["id"])
-        assert report_divergence([stored_report] if stored_report else [], reports) == [], stage
+        assert report_divergence(stored_reports, reports) == [], stage
 
     exec_db.append_run_event(db_path, run["id"], "stdout", {"line": "hello"})
     reconciled("first event")

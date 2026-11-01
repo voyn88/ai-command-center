@@ -11,12 +11,13 @@ import {
   fetchBacklogTasks,
   reassignBacklogTask,
 } from '../../lib/backlogApi'
-import type { BacklogTask } from '../../lib/backlogApi'
+import type { BacklogStoreTask } from '../../lib/backlogApi'
 import {
   enqueueAudit,
   fetchQueueItems,
   getOwnerToken,
   QueueAuthError,
+  setOwnerToken,
 } from '../../lib/queueApi'
 import type { QueueItem } from '../../lib/queueApi'
 
@@ -30,6 +31,7 @@ vi.mock('../../lib/queueApi', async () => {
     fetchQueueItem: vi.fn(),
     enqueueAudit: vi.fn(),
     getOwnerToken: vi.fn(),
+    setOwnerToken: vi.fn(),
   }
 })
 
@@ -85,7 +87,7 @@ const oneItem: QueueItem[] = [
   },
 ]
 
-const backlogTask: BacklogTask = {
+const backlogTask: BacklogStoreTask = {
   task_id: 'VOYN-W0-EXAMPLE',
   wave: '0',
   priority: 'P0',
@@ -107,6 +109,7 @@ beforeEach(() => {
   vi.mocked(draftBacklogTask).mockReset()
   vi.mocked(confirmBacklogTask).mockReset()
   vi.mocked(reassignBacklogTask).mockReset()
+  vi.mocked(setOwnerToken).mockReset()
 })
 
 describe('Tasks — one-button audit', () => {
@@ -130,14 +133,52 @@ describe('Tasks — one-button audit', () => {
     expect(await screen.findByText('Audit queued — it will appear in the list below.')).toBeInTheDocument()
   })
 
-  test('shows the locked message when the owner token is rejected mid-submit', async () => {
-    vi.mocked(enqueueAudit).mockRejectedValue(new QueueAuthError())
+  test('a key rejected mid-submit opens the screen unlock gate, not a dead message', async () => {
+    vi.mocked(enqueueAudit).mockRejectedValueOnce(new QueueAuthError())
     render(<Tasks onNavigate={vi.fn()} />)
 
     await waitFor(() => expect(screen.getByText('Run audit')).toBeInTheDocument())
+    fireEvent.change(screen.getByLabelText('What to review'), {
+      target: { value: 'Проверь путь релиза' },
+    })
     fireEvent.click(screen.getByText('Run audit'))
 
-    expect(await screen.findByText(/Access key missing or rejected/)).toBeInTheDocument()
+    // The gate is the screen's ONLY unlock control: a message that merely
+    // says "unlock" while no unlock control exists is the bug this test
+    // guards. Assert the real input, and that the launcher stepped aside.
+    const keyInput = await screen.findByLabelText('Access key')
+    expect(screen.getByText(/the audit was NOT started/)).toBeInTheDocument()
+    expect(screen.queryByText('Run audit')).not.toBeInTheDocument()
+
+    // Unlocking replaces the rejected credential (so a retry no longer
+    // resends it) and reloads; the refused draft comes back with the
+    // launcher, so the retry costs one click and not a retype.
+    vi.mocked(enqueueAudit).mockResolvedValue({
+      work_item_id: 'wki_new',
+      idempotency_key: 'audit-abc',
+    })
+    fireEvent.change(keyInput, { target: { value: 'fresh-key' } })
+    fireEvent.click(screen.getByText('Unlock'))
+
+    await waitFor(() => expect(screen.getByText('Run audit')).toBeInTheDocument())
+    expect(setOwnerToken).toHaveBeenCalledWith('fresh-key')
+    expect(screen.getByLabelText('What to review')).toHaveValue('Проверь путь релиза')
+
+    fireEvent.click(screen.getByText('Run audit'))
+    await waitFor(() => expect(enqueueAudit).toHaveBeenCalledTimes(2))
+    expect(vi.mocked(enqueueAudit).mock.calls[1][0]).toEqual({
+      project_id: 'AICC',
+      prompt: 'Проверь путь релиза',
+    })
+    expect(await screen.findByText('Audit queued — it will appear in the list below.')).toBeInTheDocument()
+  })
+
+  test('a lock from the queue reads does not claim an audit was lost', async () => {
+    vi.mocked(fetchQueueItems).mockRejectedValueOnce(new QueueAuthError())
+    render(<Tasks onNavigate={vi.fn()} />)
+
+    await screen.findByLabelText('Access key')
+    expect(screen.queryByText(/the audit was NOT started/)).not.toBeInTheDocument()
   })
 
   test('does not render the audit launcher when there are no projects', async () => {
