@@ -5349,6 +5349,7 @@ WORKER_ONLY_TARGETS = frozenset(
         "/etc/systemd/system/voyn-aicc-source-clone-refresh.timer",
         "/etc/systemd/system/voyn-aicc-worker-release-deploy.service",
         "/etc/systemd/system/voyn-aicc-worker-release-deploy.timer",
+        "/etc/systemd/system/voyn-aicc-pgtunnel.service",
         "/etc/aicc/agent-workspace-roots",
         "/etc/aicc/worker-lanes",
         "/etc/aicc/gitconfig",
@@ -5411,10 +5412,20 @@ WORKER_ONLY_DIRECTORIES = (
 #: entry fixes: a rebuilt control host gets the tick from the transaction,
 #: atomically with the rest of the generation and rolled back with it.
 #:
+#: `voyn-aicc-self-deploy.{service,timer}` joined under
+#: VOYN-W0-AICC-UNMANAGED-LIVE-UNITS: live and enabled on control-01 but
+#: installed by hand, so a rebuilt control host lost migrations-deploy until
+#: an operator remembered the unit. Absence of an installer is not proof of
+#: deadness -- the 2026-08-30 recon found the timer active/enabled while
+#: Codex had classified it "dead: no installer".
+#:
 #: Nothing purges these on a worker host. The worker profile is not a
 #: conversion away from a control host (there is one control plane, and it
 #: owns the database), so unlike `WORKER_ONLY_TARGETS` there is no live host
 #: carrying these files that a worker install has to take them away from.
+#: Worker hosts explicitly retire self-deploy (replaced by
+#: `voyn-aicc-worker-release-deploy`) in the installer shell, which is the
+#: justified removal half of the same acceptance.
 CONTROL_ONLY_UNITS = (
     "voyn-aicc-review.service",
     "voyn-aicc-review.timer",
@@ -5426,6 +5437,8 @@ CONTROL_ONLY_UNITS = (
     "voyn-aicc-remediate.timer",
     "voyn-aicc-pr-window.service",
     "voyn-aicc-pr-window.timer",
+    "voyn-aicc-self-deploy.service",
+    "voyn-aicc-self-deploy.timer",
 )
 #: The timers of `CONTROL_ONLY_UNITS` the installer enables after commit, so
 #: installed units are *running* ticks and not just files on disk.
@@ -5435,8 +5448,19 @@ CONTROL_ONLY_TIMERS = (
     "voyn-aicc-remediate.timer",
     "voyn-aicc-credential-rescue.timer",
     "voyn-aicc-pr-window.timer",
+    "voyn-aicc-self-deploy.timer",
 )
 CONTROL_ONLY_TIMER = "voyn-aicc-pr-window.timer"
+
+#: Worker-host units that carry production traffic and must be installed by
+#: the worker profile (not left as hand-made `/etc/systemd/system` copies).
+#: `voyn-aicc-pgtunnel.service` is Required by every `voyn-aicc-worker@`
+#: lane; the 2026-08-30 recon found it active/enabled on worker-01 while the
+#: repo-owned installer never wrote or enabled it
+#: (VOYN-W0-AICC-UNMANAGED-LIVE-UNITS).
+WORKER_LIVE_UNITS = (
+    "voyn-aicc-pgtunnel.service",
+)
 
 
 def _runtime_target(target: str) -> bool:
@@ -5489,11 +5513,12 @@ def default_specs(
     not as a separate step that could commit while the other fails.
 
     The control-plane's own ticks become repo-owned under VOYN-W0-AICC-
-    CONTROL-PLANE-REPO-OWNED-UNITS, one at a time as each is needed.
-    `CONTROL_ONLY_UNITS` is the set that has arrived: the PR review-window
-    tick, which had never been installed on control-01 at all. The rest
-    (planner, review, merge, reaper, rotation) are still symlinks into the
-    operator's home and still follow.
+    CONTROL-PLANE-REPO-OWNED-UNITS (and VOYN-W0-AICC-UNMANAGED-LIVE-UNITS
+    for live hand-made survivors), one at a time as each is needed.
+    `CONTROL_ONLY_UNITS` is the set that has arrived: review/merge/
+    remediate/credential-rescue/pr-window plus the control self-deploy
+    tick. Planner/reaper and the legacy `aicc-backlog-*` spellings remain
+    outside this generation until their own authority PRs.
 
     What the transition does and does not remove, stated exactly, because
     "the agent principal is absent" is a claim this cannot make:
@@ -5650,6 +5675,17 @@ def default_specs(
         FileSpec(
             repo_root / "deploy/systemd/voyn-aicc-worker-release-deploy.timer",
             "/etc/systemd/system/voyn-aicc-worker-release-deploy.timer",
+            0o644,
+            root_uid,
+            root_gid,
+        ),
+        # PostgreSQL SSH tunnel every worker lane Requires=. Live on
+        # worker-01 while no installer owned it
+        # (VOYN-W0-AICC-UNMANAGED-LIVE-UNITS); host-local tunnel target stays
+        # in /etc/aicc/pgtunnel.env, which this transaction never writes.
+        FileSpec(
+            repo_root / "deploy/systemd/voyn-aicc-pgtunnel.service",
+            "/etc/systemd/system/voyn-aicc-pgtunnel.service",
             0o644,
             root_uid,
             root_gid,
