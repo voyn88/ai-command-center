@@ -201,4 +201,3 @@ class ExecutorAvailabilityStore:
                 cur.execute("SELECT executor_mark_available(%s)", (executor_id,))
         with _cache_lock:
             _cache.pop(executor_id, None)
-
