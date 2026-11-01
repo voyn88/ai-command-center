@@ -4,7 +4,7 @@ The one write ``backlog_intake_routes.confirm`` explicitly declined to be:
 that route only ever inserts a brand-new task and refuses outright if the id
 already exists (409), precisely so that changing an EXISTING task's fields
 stays on its own, narrower surface. This is that surface for two fields:
-``wave`` and ``priority``. It moves through :func:`backlog_reassign` (0031),
+``wave`` and ``priority``. It moves through :func:`backlog_reassign` (0035),
 the same optimistic-revision shape as :func:`backlog_transition` (0005) — the
 caller must supply the revision it read, and a stale one is refused rather
 than silently overwritten, whether the caller is a human editing the Tasks

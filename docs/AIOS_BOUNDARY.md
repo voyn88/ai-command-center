@@ -235,6 +235,21 @@ section below for why it exists at all):
   reconciliation. The model call itself reuses the frozen engine
   (`agent_runner.run_claude_code`, read-only `review` profile) rather than
   adding a second one.
+  `command_center/orchestrator/coordination.py`
+  (VOYN-W0-BACKLOG-ORCHESTRATOR, PR #1077) is a reviewed extension of this
+  same SRV composition exception: it requests a bounded advisory ordering of
+  already eligible backlog candidates through the existing queue and consumes
+  the existing worker result. It does not acquire work, run providers, spawn
+  processes, create a scheduler, or bypass the planner's dependency and lease
+  checks. Atomic snapshot deduplication, enqueue, and bounded pre-enqueue retry
+  decisions belong to PostgreSQL functions in migration 0032; queue claiming
+  and execution remain the accepted queue and worker's responsibility.
+  Python renders calls on a caller-owned connection, validates candidate IDs,
+  and applies only advisory order behind explicit enable/stop switches.
+  The orchestration classification comes from the package name; this single
+  baseline entry records its reviewed SRV placement, not permission for a new
+  general orchestration engine or a weakening of ADR-0008. The scanner remains
+  unchanged, and convergence follows the SRV exception below.
   `command_center/orchestrator/gh_access.py`
   (VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS) is a baseline addition
   of the same shape as `github_app_auth.py`: a transport adapter that chooses

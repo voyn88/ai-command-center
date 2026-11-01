@@ -1,0 +1,287 @@
+#!/usr/bin/python3
+"""Root-owned release publisher for per-host self-deploy.
+
+Installed as /usr/local/sbin/voyn-aicc-release-helper (root:root 0755). The
+sudoers policy grants `voynadmin` exactly this binary; the helper — not
+voynadmin — owns `/opt/aicc/releases` and `/opt/aicc/current`.
+
+Fleet outage 2026-09-11: `/opt/aicc` was hand-set to 2775 root:aicc-workspace
+so the unprivileged self-deploy tick could stage releases. The launcher's
+`_validate_binary` then refused every executor under `/opt/aicc/toolchains`
+("executor path component is not immutable root-owned: /opt/aicc"), parking
+the fleet. The hotfix restored 0755 and broke unprivileged staging. This
+helper reconciles both invariants: the release root stays root-owned and
+non-group-writable, and self-deploy still flips `current` without ever
+owning the tree.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+from pathlib import Path
+
+DEFAULT_RELEASE_ROOT = Path("/opt/aicc")
+SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+SELECTOR_RE = re.compile(r"^releases/[0-9a-f]{40}$")
+
+
+def _fail(message: str, code: int = 1) -> None:
+    print(f"AICC_RELEASE_HELPER_REFUSED: {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def _require_root() -> None:
+    if os.geteuid() != 0:
+        _fail("must run as root")
+
+
+def _immutable_root_dir(path: Path, *, create: bool = False) -> None:
+    """Root-owned 0755 — the launcher's ancestor rule.
+
+    As root we repair mode/owner rather than leave a group-writable ancestor
+    behind: that is exactly the 2775 hand-fix that took the fleet down. A
+    non-directory or an unfixable node still fails closed.
+    """
+    if create:
+        path.mkdir(parents=True, exist_ok=True)
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        _fail(f"release path is missing: {path}")
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        _fail(f"release path is not a directory: {path}")
+    # Repair first (umask 002 leaves freshly-created dirs group-writable).
+    if info.st_uid != 0 or info.st_gid != 0:
+        os.chown(path, 0, 0)
+    if stat.S_IMODE(info.st_mode) != 0o755:
+        os.chmod(path, 0o755)
+    info = path.stat()
+    if info.st_uid != 0 or stat.S_IMODE(info.st_mode) & 0o022:
+        _fail(
+            f"release path is not immutable root-owned: {path} "
+            f"uid={info.st_uid} mode={stat.S_IMODE(info.st_mode):04o}"
+        )
+
+
+def _prove_release_root(release_root: Path) -> None:
+    _immutable_root_dir(release_root, create=True)
+    _immutable_root_dir(release_root / "releases", create=True)
+
+
+def _selector_for_sha(sha: str) -> str:
+    if not SHA_RE.fullmatch(sha):
+        _fail("release sha is invalid")
+    return f"releases/{sha}"
+
+
+def _current_selector(current_link: Path) -> str:
+    try:
+        info = current_link.lstat()
+    except FileNotFoundError:
+        return "ABSENT"
+    if not stat.S_ISLNK(info.st_mode):
+        _fail("release selector is not a symlink")
+    selector = os.readlink(current_link)
+    if SELECTOR_RE.fullmatch(selector):
+        return selector
+    if os.path.isabs(selector):
+        return selector
+    _fail("release selector is invalid")
+
+
+def _point_current_at(current_link: Path, selector: str) -> None:
+    if (
+        selector != "ABSENT"
+        and not os.path.isabs(selector)
+        and not SELECTOR_RE.fullmatch(selector)
+    ):
+        _fail("release selector is invalid")
+    if selector != "ABSENT" and not os.path.isabs(selector):
+        target = current_link.parent / selector
+        if not target.is_dir():
+            _fail(f"release selector points at a missing release: {selector}")
+    tmp = current_link.with_name(f".{current_link.name}.next")
+    try:
+        tmp.unlink()
+    except FileNotFoundError:
+        pass
+    if selector == "ABSENT":
+        try:
+            current_link.unlink()
+        except FileNotFoundError:
+            pass
+        return
+    tmp.symlink_to(selector)
+    os.replace(tmp, current_link)
+
+
+def _tracked_files(repo_path: Path) -> list[str]:
+    listed = subprocess.run(
+        ["git", "-C", str(repo_path), "ls-files", "-z"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if listed.returncode != 0:
+        _fail(f"release file listing failed: {listed.stderr.strip()[:200]}")
+    return [name for name in listed.stdout.split("\0") if name]
+
+
+def _harden_tree(root: Path) -> None:
+    """Root-own and strip write bits so the tree matches the installer's
+    immutable release contract (voynadmin never owns a published release)."""
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        current = Path(dirpath)
+        os.chown(current, 0, 0, follow_symlinks=False)
+        mode = 0o555 if current == root else 0o555
+        os.chmod(current, mode, follow_symlinks=False)
+        for name in dirnames + filenames:
+            path = current / name
+            if path.is_symlink():
+                os.chown(path, 0, 0, follow_symlinks=False)
+                continue
+            os.chown(path, 0, 0, follow_symlinks=False)
+            info = path.lstat()
+            if stat.S_ISDIR(info.st_mode):
+                os.chmod(path, 0o555, follow_symlinks=False)
+            else:
+                # Preserve execute for scripts/binaries; drop every write bit.
+                executable = bool(info.st_mode & 0o111)
+                os.chmod(path, 0o555 if executable else 0o444, follow_symlinks=False)
+
+
+def cmd_current(args: argparse.Namespace) -> int:
+    _require_root()
+    release_root = Path(args.release_root)
+    _prove_release_root(release_root)
+    print(_current_selector(release_root / "current"))
+    return 0
+
+
+def cmd_stage(args: argparse.Namespace) -> int:
+    _require_root()
+    release_root = Path(args.release_root)
+    _prove_release_root(release_root)
+    sha = args.sha
+    selector = _selector_for_sha(sha)
+    release_dir = release_root / selector
+    if release_dir.exists():
+        print(f"AICC_RELEASE_ALREADY_STAGED {selector}")
+        return 0
+
+    repo_path = Path(args.repo)
+    if not (repo_path / ".git").exists() and not (repo_path / ".git").is_file():
+        # Bare worktree metadata still allows ls-files via git -C.
+        probed = subprocess.run(
+            ["git", "-C", str(repo_path), "rev-parse", "--is-inside-work-tree"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if probed.returncode != 0 or probed.stdout.strip() != "true":
+            _fail(f"repo path is not a git work tree: {repo_path}")
+
+    head = subprocess.run(
+        ["git", "-C", str(repo_path), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if head.returncode != 0 or head.stdout.strip() != sha:
+        _fail("repo HEAD does not match the requested release sha")
+
+    staging = release_root / "releases" / f".{sha}.staging-{os.getpid()}"
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging.mkdir(mode=0o755)
+    try:
+        for name in _tracked_files(repo_path):
+            source = repo_path / name
+            target = staging / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target, follow_symlinks=False)
+        if args.venv:
+            venv = Path(args.venv)
+            if not venv.exists():
+                _fail(f"release venv is missing: {venv}")
+            (staging / ".venv").symlink_to(venv)
+        (staging / ".aicc-release-sha").write_text(sha + "\n", encoding="ascii")
+        _harden_tree(staging)
+        os.rename(staging, release_dir)
+    except (OSError, shutil.Error) as exc:
+        shutil.rmtree(staging, ignore_errors=True)
+        _fail(f"release stage failed: {exc}")
+    print(f"AICC_RELEASE_STAGED {selector}")
+    return 0
+
+
+def cmd_select(args: argparse.Namespace) -> int:
+    _require_root()
+    release_root = Path(args.release_root)
+    _prove_release_root(release_root)
+    selector = _selector_for_sha(args.sha)
+    previous = _current_selector(release_root / "current")
+    _point_current_at(release_root / "current", selector)
+    print(f"AICC_RELEASE_SELECTED {selector} previous={previous}")
+    return 0
+
+
+def cmd_select_previous(args: argparse.Namespace) -> int:
+    """Restore a prior selector during self-deploy rollback."""
+    _require_root()
+    release_root = Path(args.release_root)
+    _prove_release_root(release_root)
+    selector = args.selector
+    if selector != "ABSENT" and not (
+        SELECTOR_RE.fullmatch(selector) or os.path.isabs(selector)
+    ):
+        _fail("rollback selector is invalid")
+    _point_current_at(release_root / "current", selector)
+    print(f"AICC_RELEASE_RESTORED {selector}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="voyn-aicc-release-helper")
+    parser.add_argument(
+        "--release-root",
+        default=str(DEFAULT_RELEASE_ROOT),
+        help="Immutable release root (default /opt/aicc)",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    current = sub.add_parser("current", help="Print the live release selector")
+    current.set_defaults(func=cmd_current)
+
+    stage = sub.add_parser("stage", help="Stage releases/<sha> as root-owned")
+    stage.add_argument("--repo", required=True, help="Source git work tree")
+    stage.add_argument("--sha", required=True, help="40-hex commit to stage")
+    stage.add_argument("--venv", default=None, help="Runtime venv to symlink")
+    stage.set_defaults(func=cmd_stage)
+
+    select = sub.add_parser("select", help="Atomically point current at releases/<sha>")
+    select.add_argument("--sha", required=True, help="40-hex commit to select")
+    select.set_defaults(func=cmd_select)
+
+    restore = sub.add_parser(
+        "select-previous", help="Restore a prior selector on rollback"
+    )
+    restore.add_argument("--selector", required=True, help="Prior selector or ABSENT")
+    restore.set_defaults(func=cmd_select_previous)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
