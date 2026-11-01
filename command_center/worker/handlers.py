@@ -164,10 +164,21 @@ def _review_pin_currency(
             ),
         )
     owner, repo = owned
-    proc = gh_access.run(
-        ["api", f"repos/{owner}/{repo}/pulls/{pr_number}"],
-        str(repository),
-    )
+    # ``gh_access.run`` uses ``subprocess.run(..., timeout=...)`` without a
+    # local catch; TimeoutExpired (a SubprocessError) and launch OSErrors
+    # (missing ``gh``, EPERM, …) must stay on the infra_wait path like a
+    # non-zero gh exit -- never reach the daemon's generic retryable handler
+    # without ``infra_wait``, and never spend a model call.
+    try:
+        proc = gh_access.run(
+            ["api", f"repos/{owner}/{repo}/pulls/{pr_number}"],
+            str(repository),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return (
+            "transient",
+            f"review_pin_transient: pull lookup failed: {exc}",
+        )
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "").strip()[-300:]
         return (

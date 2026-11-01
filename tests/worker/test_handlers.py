@@ -4,6 +4,7 @@ claude binary, no repository on disk unless a test builds one."""
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import socket
@@ -19,8 +20,12 @@ import pytest
 
 from command_center import agent_runner, workspace_provisioning
 from command_center.orchestrator.publish import PublishResult
+from command_center.worker import handlers as handlers_for_pin
 from command_center.worker.handlers import build_handlers
 from command_center.worker.payloads import PayloadError, parse_agent_run
+
+#: Captured before the ``handler`` fixture stubs currency as always-current.
+_REAL_REVIEW_PIN_CURRENCY = handlers_for_pin._review_pin_currency
 
 
 def _payload(**overrides):
@@ -2092,6 +2097,131 @@ def test_review_pin_currency_same_head_open_vs_changed_closed_transient(
         assert detail.startswith("review_pin_transient:")
         assert "state unproven" in detail
         assert "review_pin_stale" not in detail
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        subprocess.TimeoutExpired(cmd=["gh", "api"], timeout=30),
+        FileNotFoundError(errno.ENOENT, "No such file or directory", "gh"),
+        OSError(errno.EPERM, "Operation not permitted"),
+    ],
+)
+def test_review_pin_currency_gh_process_errors_are_transient_infra_wait(
+    handler, monkeypatch, tmp_path, exc
+) -> None:
+    """TimeoutExpired / launch OSError from gh must infra_wait without a model."""
+    from command_center.worker import handlers as handlers_module
+
+    run_agent, runs = handler
+    # Restore the real currency gate (fixture stubs it always-current).
+    monkeypatch.setattr(
+        handlers_module, "_review_pin_currency", _REAL_REVIEW_PIN_CURRENCY
+    )
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(tmp_path),
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/voyn88/ai-command-center.git",
+        ],
+        check=True,
+    )
+    head = "b" * 40
+
+    def raise_exc(argv, cwd, **kw):
+        raise exc
+
+    monkeypatch.setattr(handlers_module.gh_access, "run", raise_exc)
+    status, detail = handlers_module._review_pin_currency(tmp_path, "42", head)
+    assert status == "transient"
+    assert detail.startswith("review_pin_transient: pull lookup failed:")
+
+    outcome = run_agent(
+        _payload(
+            task_type="independent_review",
+            untrusted=True,
+            review_head={"pr_number": "42", "head_sha": head},
+        ),
+        _event(),
+    )
+    assert not outcome.ok
+    assert outcome.retryable is True
+    assert outcome.infra_wait is True
+    assert detail in outcome.reason
+    assert runs == []
+
+
+def test_review_pin_currency_process_error_path_preserves_stale_semantics(
+    monkeypatch, tmp_path
+) -> None:
+    """Closed / moved-head remain definitive stale beside the new catch."""
+    from command_center.worker import handlers as handlers_module
+
+    origin = tmp_path / "repo"
+    origin.mkdir()
+    subprocess.run(["git", "init", "-q", str(origin)], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(origin),
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/voyn88/ai-command-center.git",
+        ],
+        check=True,
+    )
+    head = "a" * 40
+
+    monkeypatch.setattr(
+        handlers_module.gh_access,
+        "run",
+        lambda argv, cwd, **kw: (_ for _ in ()).throw(
+            subprocess.TimeoutExpired(cmd=["gh"], timeout=1)
+        ),
+    )
+    status, detail = handlers_module._review_pin_currency(origin, "9", head)
+    assert status == "transient" and detail.startswith("review_pin_transient:")
+
+    monkeypatch.setattr(
+        handlers_module.gh_access,
+        "run",
+        lambda argv, cwd, **kw: subprocess.CompletedProcess(
+            argv,
+            0,
+            json.dumps(
+                {"state": "closed", "merged_at": None, "head": {"sha": head}}
+            ),
+            "",
+        ),
+    )
+    status, detail = handlers_module._review_pin_currency(origin, "9", head)
+    assert status == "stale" and "closed" in detail
+
+    monkeypatch.setattr(
+        handlers_module.gh_access,
+        "run",
+        lambda argv, cwd, **kw: subprocess.CompletedProcess(
+            argv,
+            0,
+            json.dumps(
+                {
+                    "state": "open",
+                    "merged_at": None,
+                    "head": {"sha": "b" * 40},
+                }
+            ),
+            "",
+        ),
+    )
+    status, detail = handlers_module._review_pin_currency(origin, "9", head)
+    assert status == "stale" and "queued pin was" in detail
 
 
 def test_review_head_checkout_failure_is_retryable(handler, monkeypatch) -> None:
