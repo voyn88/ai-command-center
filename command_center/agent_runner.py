@@ -151,8 +151,16 @@ PRINCIPAL_EXECUTOR_BINARIES: dict[str, str] = {
     # b311666). The retry-loop hazard that once motivated listing it is
     # closed in handlers instead: an unavailable executor falls through the
     # cascade to the next link rather than respinning forever.
+    # Trusted quality-band script (root-owned libexec), never a path inside
+    # the candidate worktree (VOYN-W0-AICC-SANDBOX-PREPUSH-TESTS).
+    "quality_band": "/usr/libexec/aicc-quality-band",
 }
 _PRINCIPAL_ISOLATION_FAILURE = "AICC_AGENT_LAUNCH_INFRA_FAILURE"
+QUALITY_BAND_EXECUTOR = "quality_band"
+QUALITY_BAND_PROFILE = "quality_band"
+# Impacted-test band budget: generous enough for a two-phase pytest run on a
+# typical agent diff, bounded well below MAX_TIMEOUT_SECONDS.
+QUALITY_BAND_TIMEOUT_SECONDS = 900
 
 # Codex 0.149.0 on worker-01 can exit zero after its vendor bwrap fails to
 # create loopback inside the network namespace. This exact, two-part signature
@@ -511,6 +519,141 @@ def build_principal_isolation_manifest(
         "model": model,
         "timeout_seconds": timeout_seconds,
     }
+
+
+def build_quality_band_manifest(
+    *,
+    repository_path: Path,
+    timeout_seconds: int = QUALITY_BAND_TIMEOUT_SECONDS,
+) -> dict[str, object]:
+    """Manifest for the allowlisted quality-band sandbox profile.
+
+    The launcher pairs ``executor=quality_band`` with ``profile=quality_band``
+    exclusively: fixed trusted argv, no model credentials, no network. The
+    prompt field is required by the closed manifest schema but never reaches
+    the sandboxed argv (``_provider_command`` returns the binary alone).
+    """
+    timeout = resolve_timeout(timeout_seconds)
+    return {
+        "version": 1,
+        "run_id": uuid.uuid4().hex,
+        "workspace": str(repository_path.resolve(strict=True)),
+        "executor": QUALITY_BAND_EXECUTOR,
+        "profile": QUALITY_BAND_PROFILE,
+        "prompt": "quality-band",
+        "model": None,
+        "timeout_seconds": timeout,
+    }
+
+
+def run_quality_band_gate(
+    repository_path: Path,
+    *,
+    timeout_seconds: int = QUALITY_BAND_TIMEOUT_SECONDS,
+) -> RunResult:
+    """Run impacted tests inside the principal-isolation quality-band sandbox.
+
+    Callers MUST distinguish a REFUSAL (candidate is red — fail closed) from
+    a DEFERRAL (feature absent / broker infra — fail open, proceed to CI)
+    using ``RunResult.is_principal_isolation_error``'s *exact* transport-
+    envelope check (status ``"failed"``, exit code ``125``, empty stdout, a
+    marker-prefixed stderr line). Never substring-search stdout/stderr for
+    the marker: the workspace under test is untrusted and can print anything.
+
+    Early "not enabled" / "executor not deployed" paths synthesise that same
+    envelope (including exit code 125) so publish treats them as deferrals —
+    the publish must proceed exactly as it already does when this feature is
+    absent on a worker (REM-REM review: exit_code=None broke the match and
+    incorrectly refused every non-provisioned host).
+    """
+    started_at = models.iso_now()
+    started_monotonic = time.monotonic()
+
+    def _infra(detail: str) -> RunResult:
+        now = models.iso_now()
+        return RunResult(
+            status="failed",
+            exit_code=125,
+            stdout="",
+            stderr=f"{_PRINCIPAL_ISOLATION_FAILURE}: {detail}",
+            duration_seconds=time.monotonic() - started_monotonic,
+            started_at=started_at,
+            completed_at=now,
+        )
+
+    if not principal_isolation_required():
+        return _infra("principal isolation is not enabled on this worker")
+    available, detail = principal_executor_preflight(QUALITY_BAND_EXECUTOR)
+    if not available:
+        return _infra(detail or "quality_band executor is not deployed")
+
+    try:
+        manifest = build_quality_band_manifest(
+            repository_path=repository_path,
+            timeout_seconds=timeout_seconds,
+        )
+    except (OSError, RunnerError) as exc:
+        return _infra(f"invalid quality_band manifest: {exc}")
+
+    command = [PRINCIPAL_ISOLATION_LAUNCHER, "--client"]
+    launcher_input = json.dumps(manifest, separators=(",", ":")) + "\n"
+    try:
+        proc = subprocess.Popen(
+            command,
+            cwd=Path("/"),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=_principal_launcher_environment(),
+            close_fds=True,
+            **_popen_new_process_group_kwargs(),
+        )
+    except OSError:
+        # Runtime absence of the launcher binary == not actually deployed,
+        # same deferral bucket as principal_executor_preflight reporting the
+        # profile missing (even if preflight earlier saw the script path).
+        return _infra("principal isolation launcher is unavailable")
+
+    try:
+        stdout, stderr = proc.communicate(
+            input=launcher_input, timeout=timeout_seconds
+        )
+    except subprocess.TimeoutExpired:
+        _terminate_process_group(
+            proc, grace_seconds=DEFAULT_TERMINATION_GRACE_SECONDS
+        )
+        stdout, stderr = "", ""
+        try:
+            out, err = proc.communicate(timeout=DEFAULT_TERMINATION_GRACE_SECONDS + 5.0)
+            stdout, stderr = out or "", err or ""
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        return RunResult(
+            status="timed_out",
+            exit_code=None,
+            stdout=stdout,
+            stderr=stderr,
+            duration_seconds=time.monotonic() - started_monotonic,
+            started_at=started_at,
+            completed_at=models.iso_now(),
+        )
+
+    exit_code = proc.returncode
+    status = (
+        "completed"
+        if exit_code == 0
+        else "failed"
+    )
+    return RunResult(
+        status=status,
+        exit_code=exit_code,
+        stdout=stdout or "",
+        stderr=stderr or "",
+        duration_seconds=time.monotonic() - started_monotonic,
+        started_at=started_at,
+        completed_at=models.iso_now(),
+    )
 
 
 def principal_isolation_required() -> bool:
