@@ -2217,7 +2217,7 @@ def test_principal_executor_preflight_refuses_a_group_writable_ancestor(monkeypa
     monkeypatch.setattr(
         PathType,
         "stat",
-        lambda self: _Info(0, 0o040775)
+        lambda self, *, follow_symlinks=True: _Info(0, 0o040775)
         if str(self) == "/opt/aicc"
         else _Info(0, 0o040755),
     )
