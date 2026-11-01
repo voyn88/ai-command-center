@@ -753,8 +753,10 @@ _PR_URL = re.compile(r"https://github\.com/([A-Za-z0-9][A-Za-z0-9-]*)/([A-Za-z0-
 # looser policy.
 _REVIEW_POLICY_VERSION = "v8"
 
+# Cursor Ask is not a zero-tool / model-only reviewer; Grok is the only
+# principal-isolation executor that actually supports model_only reviews.
 _MODEL_ONLY_REVIEW_EXECUTORS = frozenset(
-    {"copilot", "claude", "codex", "openai_http"}
+    {"copilot", "claude", "codex", "openai_http", "grok"}
 )
 
 

@@ -18,12 +18,10 @@ import urllib.request
 MAX_TURNS = 12
 MAX_TOTAL_TOKENS = 60000
 MAX_TOOLS_PER_TURN = 4
-# Soft ceiling before tools so one tools-disabled summary may still fit.
-SUMMARY_RESERVE_TOKENS = 4096
 MAX_IDENTICAL_TOOL_REPEATS = 3
 MAX_OUTPUT_TOKENS = 4096
-# Compact summary input must fit inside the reserve (prompt + checkpoint + output).
-SUMMARY_CHECKPOINT_CHARS = 2400
+# Official xAI default for grok-4.6 is reasoning high; pin low for economy/latency.
+GROK_46_REASONING_EFFORT = 'low'
 
 SHELL = {'type': 'function', 'name': 'shell',
          'description': 'Run a bounded shell command in the assigned repository. Read files, edit, test and commit here. Never push or change remotes.',
@@ -39,13 +37,22 @@ STOP_USAGE_UNKNOWN = 'usage_unknown'
 STOP_PROVIDER_INCOMPLETE = 'provider_incomplete'
 STOP_RUN_ERROR = 'run_error'
 
-# Summary/provider failures that must not erase a local partial after progress.
-_SUMMARY_TRANSPORT_ERRORS = (RuntimeError, OSError, TimeoutError, urllib.error.URLError)
+# Provider/network/shell failures that must not erase a local partial after progress.
+_TRANSPORT_ERRORS = (RuntimeError, OSError, TimeoutError, urllib.error.URLError)
 
 
 def completion(key: str, model: str, items: list, tools: bool = True) -> dict:
-    body = json.dumps({'model': model, 'input': items, 'tools': [SHELL] if tools else [],
-                       'max_output_tokens': MAX_OUTPUT_TOKENS, 'store': False}).encode()
+    payload = {
+        'model': model,
+        'input': items,
+        'tools': [SHELL] if tools else [],
+        'max_output_tokens': MAX_OUTPUT_TOKENS,
+        'store': False,
+    }
+    # grok-4.6 defaults to reasoning high; override only that model to low.
+    if model == 'grok-4.6':
+        payload['reasoning'] = {'effort': GROK_46_REASONING_EFFORT}
+    body = json.dumps(payload).encode()
     req = urllib.request.Request('https://api.x.ai/v1/responses', data=body,
         headers={'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json',
                  'User-Agent': 'aicc-grok-agent/1'})
@@ -161,8 +168,7 @@ def _emit_usage_and_stop(
         f'usage_unknown={"true" if usage_unknown else "false"} '
         f'identical_streak={identical_streak} '
         f'max_turns={MAX_TURNS} max_total_tokens={MAX_TOTAL_TOKENS} '
-        f'max_tools_per_turn={MAX_TOOLS_PER_TURN} '
-        f'summary_reserve_tokens={SUMMARY_RESERVE_TOKENS}'
+        f'max_tools_per_turn={MAX_TOOLS_PER_TURN}'
         f'{failure_part}',
         file=sys.stderr,
     )
@@ -211,72 +217,8 @@ def _local_partial_report(
     return '\n'.join(lines)
 
 
-def _try_final_summary(
-    key: str,
-    model: str,
-    *,
-    spent: int,
-    usage_unknown: bool,
-    reason: str,
-    checkpoint: str,
-) -> tuple[str | None, int, bool]:
-    """At most one tools-disabled compact summary when reserve remains.
-
-    Sends a bounded checkpoint-only prompt — never the full tool history — so
-    SUMMARY_RESERVE_TOKENS remains meaningful for input+output. Hard caps and
-    unknown usage skip the call entirely (deterministic local report is enough).
-
-    Returns (summary_text_or_None, spent, usage_unknown).
-    """
-    if usage_unknown or spent >= MAX_TOTAL_TOKENS:
-        return None, spent, usage_unknown
-    remaining = MAX_TOTAL_TOKENS - spent
-    if remaining <= 0:
-        return None, spent, usage_unknown
-    bounded = checkpoint if len(checkpoint) <= SUMMARY_CHECKPOINT_CHARS else (
-        checkpoint[:SUMMARY_CHECKPOINT_CHARS] + '\n…[checkpoint truncated]'
-    )
-    prompt = (
-        f'The driver is stopping with reason {reason}. '
-        'Below is the deterministic local checkpoint only. '
-        'Produce a brief truthful partial summary of that progress. '
-        'Do not claim the task completed successfully. Do not request tools.\n\n'
-        f'{bounded}'
-    )
-    summary_items = [
-        {
-            'role': 'system',
-            'content': (
-                'Summarize only the supplied checkpoint. Be brief. '
-                'Never claim success. Never request tools.'
-            ),
-        },
-        {'role': 'user', 'content': prompt},
-    ]
-    try:
-        response = completion(key, model, summary_items, tools=False)
-    except _SUMMARY_TRANSPORT_ERRORS:
-        return None, spent, usage_unknown
-    tokens = _parse_usage_tokens(response)
-    if tokens is None:
-        return None, spent, True
-    spent += tokens
-    if response.get('status') != 'completed':
-        return None, spent, usage_unknown
-    output = response.get('output', [])
-    if not isinstance(output, list) or not output:
-        return None, spent, usage_unknown
-    if any(item.get('type') == 'function_call' for item in output):
-        return None, spent, usage_unknown
-    text = _message_text(output).strip()
-    if not text:
-        return None, spent, usage_unknown
-    return text, spent, usage_unknown
-
-
 def _finish_partial(
     key: str,
-    model: str,
     *,
     reason: str,
     turns: int,
@@ -286,11 +228,11 @@ def _finish_partial(
     usage_unknown: bool,
     identical_streak: int,
     tool_trace: list[str],
-    attempt_summary: bool,
     failure_class: str = '',
 ) -> int:
-    # Build the durable local partial first so provider/summary/network failure
-    # cannot erase the report after tool progress.
+    # Deterministic durable partial only — no optional extra model summary call.
+    # (A prior reserve+summary path was not bounded by remaining budget once
+    # max_output_tokens plus prompt could exceed the leftover.)
     local = _local_partial_report(
         reason=reason,
         turns=turns,
@@ -301,35 +243,7 @@ def _finish_partial(
         tool_trace=tool_trace,
         failure_class=failure_class,
     )
-    summary = None
-    if attempt_summary:
-        summary, spent, usage_unknown = _try_final_summary(
-            key,
-            model,
-            spent=spent,
-            usage_unknown=usage_unknown,
-            reason=reason,
-            checkpoint=local,
-        )
-        # Refresh spent/usage lines after an optional summary attempt.
-        local = _local_partial_report(
-            reason=reason,
-            turns=turns,
-            tools_executed=tools_executed,
-            tools_refused=tools_refused,
-            spent=spent,
-            usage_unknown=usage_unknown,
-            tool_trace=tool_trace,
-            failure_class=failure_class,
-        )
-    if summary:
-        print(_redact(summary, key))
-        print()
-        print('---')
-        print('AICC_LOCAL_PARTIAL_CHECKPOINT (deterministic; run did not complete successfully)')
-        print(_redact(local, key))
-    else:
-        print(_redact(local, key))
+    print(_redact(local, key))
     _emit_usage_and_stop(
         reason=reason,
         turns=turns,
@@ -364,7 +278,6 @@ def run(prompt: str, model: str, tools: bool = True) -> int:
     identical_streak = 0
     last_signature: str | None = None
     turn = 0
-    tool_budget_ceiling = max(0, MAX_TOTAL_TOKENS - SUMMARY_RESERVE_TOKENS)
 
     try:
         for turn in range(1, MAX_TURNS + 1):
@@ -378,7 +291,7 @@ def run(prompt: str, model: str, tools: bool = True) -> int:
             if not isinstance(output, list) or not output:
                 if _has_progress(tools_executed, tool_trace, tools_refused):
                     return _finish_partial(
-                        key, model,
+                        key,
                         reason=STOP_PROVIDER_INCOMPLETE,
                         turns=turn,
                         tools_executed=tools_executed,
@@ -387,14 +300,13 @@ def run(prompt: str, model: str, tools: bool = True) -> int:
                         usage_unknown=usage_unknown,
                         identical_streak=identical_streak,
                         tool_trace=tool_trace,
-                        attempt_summary=False,
                         failure_class='empty_output',
                     )
                 raise RuntimeError('provider returned no output')
             if response.get('status') != 'completed':
                 if _has_progress(tools_executed, tool_trace, tools_refused):
                     return _finish_partial(
-                        key, model,
+                        key,
                         reason=STOP_PROVIDER_INCOMPLETE,
                         turns=turn,
                         tools_executed=tools_executed,
@@ -403,7 +315,6 @@ def run(prompt: str, model: str, tools: bool = True) -> int:
                         usage_unknown=usage_unknown,
                         identical_streak=identical_streak,
                         tool_trace=tool_trace,
-                        attempt_summary=False,
                         failure_class='incomplete_status',
                     )
                 raise RuntimeError('provider response incomplete')
@@ -416,7 +327,7 @@ def run(prompt: str, model: str, tools: bool = True) -> int:
                 if not text.strip():
                     if _has_progress(tools_executed, tool_trace, tools_refused):
                         return _finish_partial(
-                            key, model,
+                            key,
                             reason=STOP_PROVIDER_INCOMPLETE,
                             turns=turn,
                             tools_executed=tools_executed,
@@ -425,7 +336,6 @@ def run(prompt: str, model: str, tools: bool = True) -> int:
                             usage_unknown=usage_unknown,
                             identical_streak=identical_streak,
                             tool_trace=tool_trace,
-                            attempt_summary=False,
                             failure_class='empty_final_report',
                         )
                     raise RuntimeError('provider returned no final report')
@@ -449,7 +359,7 @@ def run(prompt: str, model: str, tools: bool = True) -> int:
                     limit=0,
                 )
                 return _finish_partial(
-                    key, model,
+                    key,
                     reason=STOP_USAGE_UNKNOWN,
                     turns=turn,
                     tools_executed=tools_executed,
@@ -458,7 +368,6 @@ def run(prompt: str, model: str, tools: bool = True) -> int:
                     usage_unknown=usage_unknown,
                     identical_streak=identical_streak,
                     tool_trace=tool_trace,
-                    attempt_summary=False,
                 )
             if spent >= MAX_TOTAL_TOKENS:
                 tools_refused += _append_call_refusals(
@@ -467,7 +376,7 @@ def run(prompt: str, model: str, tools: bool = True) -> int:
                     limit=MAX_TOTAL_TOKENS,
                 )
                 return _finish_partial(
-                    key, model,
+                    key,
                     reason=STOP_TOKEN_BUDGET,
                     turns=turn,
                     tools_executed=tools_executed,
@@ -476,26 +385,6 @@ def run(prompt: str, model: str, tools: bool = True) -> int:
                     usage_unknown=usage_unknown,
                     identical_streak=identical_streak,
                     tool_trace=tool_trace,
-                    attempt_summary=False,
-                )
-            if spent >= tool_budget_ceiling:
-                # Refuse all pending calls before any tools-disabled summary.
-                tools_refused += _append_call_refusals(
-                    items, calls, key,
-                    reason='token_budget',
-                    limit=tool_budget_ceiling,
-                )
-                return _finish_partial(
-                    key, model,
-                    reason=STOP_TOKEN_BUDGET,
-                    turns=turn,
-                    tools_executed=tools_executed,
-                    tools_refused=tools_refused,
-                    spent=spent,
-                    usage_unknown=usage_unknown,
-                    identical_streak=identical_streak,
-                    tool_trace=tool_trace,
-                    attempt_summary=True,
                 )
 
             for index, call in enumerate(calls):
@@ -536,7 +425,7 @@ def run(prompt: str, model: str, tools: bool = True) -> int:
                             ),
                         })
                     return _finish_partial(
-                        key, model,
+                        key,
                         reason=STOP_NO_PROGRESS,
                         turns=turn,
                         tools_executed=tools_executed,
@@ -545,7 +434,6 @@ def run(prompt: str, model: str, tools: bool = True) -> int:
                         usage_unknown=usage_unknown,
                         identical_streak=identical_streak,
                         tool_trace=tool_trace,
-                        attempt_summary=True,
                     )
 
                 preview = arguments if isinstance(arguments, str) else str(arguments)
@@ -560,7 +448,7 @@ def run(prompt: str, model: str, tools: bool = True) -> int:
                 tools_executed += 1
 
         return _finish_partial(
-            key, model,
+            key,
             reason=STOP_TURN_BUDGET,
             turns=MAX_TURNS,
             tools_executed=tools_executed,
@@ -569,14 +457,13 @@ def run(prompt: str, model: str, tools: bool = True) -> int:
             usage_unknown=usage_unknown,
             identical_streak=identical_streak,
             tool_trace=tool_trace,
-            attempt_summary=True,
         )
     except (KeyboardInterrupt, SystemExit):
         raise
-    except _SUMMARY_TRANSPORT_ERRORS as exc:
+    except _TRANSPORT_ERRORS as exc:
         if _has_progress(tools_executed, tool_trace, tools_refused):
             return _finish_partial(
-                key, model,
+                key,
                 reason=STOP_RUN_ERROR,
                 turns=turn,
                 tools_executed=tools_executed,
@@ -585,7 +472,6 @@ def run(prompt: str, model: str, tools: bool = True) -> int:
                 usage_unknown=usage_unknown,
                 identical_streak=identical_streak,
                 tool_trace=tool_trace,
-                attempt_summary=False,
                 failure_class=type(exc).__name__,
             )
         raise
@@ -594,7 +480,7 @@ def run(prompt: str, model: str, tools: bool = True) -> int:
         # Do not retry. KeyboardInterrupt/SystemExit are not caught here.
         if _has_progress(tools_executed, tool_trace, tools_refused):
             return _finish_partial(
-                key, model,
+                key,
                 reason=STOP_RUN_ERROR,
                 turns=turn,
                 tools_executed=tools_executed,
@@ -603,7 +489,6 @@ def run(prompt: str, model: str, tools: bool = True) -> int:
                 usage_unknown=usage_unknown,
                 identical_streak=identical_streak,
                 tool_trace=tool_trace,
-                attempt_summary=False,
                 failure_class=type(exc).__name__,
             )
         raise

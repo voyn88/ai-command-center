@@ -1,7 +1,6 @@
 import importlib.util
 import io
 import json
-import socket
 from pathlib import Path
 
 import pytest
@@ -35,9 +34,40 @@ def test_model_only_http_request_disables_tools(monkeypatch):
         assert body['tools'] == []
         assert 'tool_choice' not in body  # xAI rejects this field with an empty tools list.
         assert body['store'] is False
+        assert 'reasoning' not in body  # grok-4.3 keeps provider defaults
         return io.StringIO('{"status":"completed","output":[]}')
     monkeypatch.setattr(module.urllib.request, 'urlopen', open_request)
     module.completion('test-secret', 'grok-4.3', [], tools=False)
+
+
+def test_grok_4_6_request_sets_reasoning_effort_low(monkeypatch):
+    """Economy/latency default for grok-4.6 only; official docs default is high."""
+    module = driver()
+    seen = []
+
+    def open_request(request, timeout):
+        body = json.loads(request.data)
+        seen.append(body)
+        assert body['model'] == 'grok-4.6'
+        assert body['reasoning'] == {'effort': 'low'}
+        assert body['max_output_tokens'] == module.MAX_OUTPUT_TOKENS
+        assert body['store'] is False
+        return io.StringIO(
+            '{"status":"completed","usage":{"total_tokens":1},'
+            '"output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}]}'
+        )
+
+    monkeypatch.setattr(module.urllib.request, 'urlopen', open_request)
+    module.completion('test-secret', 'grok-4.6', [{'role': 'user', 'content': 'x'}], tools=False)
+    # Other models must not inherit the grok-4.6 override.
+    def open_other(request, timeout):
+        body = json.loads(request.data)
+        assert body['model'] == 'grok-4.3'
+        assert 'reasoning' not in body
+        return io.StringIO('{"status":"completed","output":[]}')
+    monkeypatch.setattr(module.urllib.request, 'urlopen', open_other)
+    module.completion('test-secret', 'grok-4.3', [], tools=True)
+    assert len(seen) == 1
 
 
 def test_driver_bounds_tool_loop(monkeypatch, capsys):
@@ -46,11 +76,6 @@ def test_driver_bounds_tool_loop(monkeypatch, capsys):
     count = []
     def completion(*args, **kwargs):
         count.append(1)
-        tools = True if len(args) < 4 else args[3]
-        if kwargs.get('tools') is False or tools is False:
-            return {'status': 'completed', 'usage': {'total_tokens': 10}, 'output': [
-                {'type': 'message', 'content': [{'type': 'output_text', 'text': 'summary attempt'}]}]}
-        # Distinct commands so turn-budget is exercised, not identical-call guard.
         return {'status': 'completed', 'usage': {'total_tokens': 100}, 'output': [
             {'type': 'function_call', 'name': 'shell', 'call_id': f'call-{len(count)}',
              'arguments': json.dumps({'command': f'echo turn-{len(count)}'})}]}
@@ -58,13 +83,15 @@ def test_driver_bounds_tool_loop(monkeypatch, capsys):
     monkeypatch.setattr(module, 'shell', lambda _: 'ok')
     code = module.run('task', 'grok-4.3')
     assert code == 1
-    # Tool loop is capped at MAX_TURNS; optional single summary may add one call.
-    assert module.MAX_TURNS <= len(count) <= module.MAX_TURNS + 1
+    # Tool loop is capped at MAX_TURNS; no optional extra summary call.
+    assert len(count) == module.MAX_TURNS
     captured = capsys.readouterr()
     assert 'AICC_PARTIAL_RESULT' in captured.out
     assert 'incomplete_budget_or_guard_stop' in captured.out
+    assert 'AICC_LOCAL_PARTIAL_CHECKPOINT' not in captured.out
     assert 'AICC_STOP: reason=turn_budget' in captured.err
     assert 'AICC_USAGE:' in captured.err
+    assert 'summary_reserve_tokens=' not in captured.err
 
 
 def test_driver_refuses_incomplete_result(monkeypatch):
@@ -124,42 +151,27 @@ def test_oversized_tool_batch_executes_allowance_and_refuses_rest(monkeypatch, c
 def test_token_budget_emits_partial_not_success(monkeypatch, capsys):
     module = driver()
     _isolate(module, monkeypatch)
-    # First response already consumes the soft tool ceiling; tools must not run.
-    soft = module.MAX_TOTAL_TOKENS - module.SUMMARY_RESERVE_TOKENS
     calls = {'n': 0}
-    summary_items = []
     def completion(key, model, items, tools=True):
         calls['n'] += 1
-        if tools:
-            return {'status': 'completed', 'usage': {'total_tokens': soft}, 'output': [
-                {'type': 'function_call', 'name': 'shell', 'call_id': 'c1',
-                 'arguments': '{"command":"echo should-not-run"}'},
-                {'type': 'function_call', 'name': 'shell', 'call_id': 'c2',
-                 'arguments': '{"command":"echo also-refused"}'}]}
-        # Soft-limit path must refuse pending calls before summary, and summary
-        # must be compact checkpoint-only (not the full accumulated history).
-        summary_items.append(items)
-        outputs = [item for item in items if item.get('type') == 'function_call_output']
-        assert outputs == []  # compact summary must not carry prior protocol history
-        text_blob = json.dumps(items)
-        assert 'echo should-not-run' not in text_blob
-        assert 'AICC_PARTIAL_RESULT' in text_blob
-        return {'status': 'completed', 'usage': {'total_tokens': 10}, 'output': [
-            {'type': 'message', 'content': [{'type': 'output_text',
-             'text': 'model partial: stopped on budget'}]}]}
+        return {'status': 'completed', 'usage': {'total_tokens': module.MAX_TOTAL_TOKENS}, 'output': [
+            {'type': 'function_call', 'name': 'shell', 'call_id': 'c1',
+             'arguments': '{"command":"echo should-not-run"}'},
+            {'type': 'function_call', 'name': 'shell', 'call_id': 'c2',
+             'arguments': '{"command":"echo also-refused"}'}]}
     monkeypatch.setattr(module, 'completion', completion)
     monkeypatch.setattr(module, 'shell', lambda _: pytest.fail('tools must not run after token ceiling'))
     code = module.run('task', 'grok-4.3')
     assert code == 1
-    assert calls['n'] == 2  # one tool-bearing turn + one reserved summary
-    assert len(summary_items) == 1
+    assert calls['n'] == 1  # hard cap: local partial only, no extra model summary
     captured = capsys.readouterr()
-    assert 'model partial: stopped on budget' in captured.out
-    assert 'AICC_LOCAL_PARTIAL_CHECKPOINT' in captured.out
     assert 'AICC_PARTIAL_RESULT' in captured.out
+    assert 'AICC_LOCAL_PARTIAL_CHECKPOINT' not in captured.out
     assert 'AICC_STOP: reason=token_budget' in captured.err
     assert 'tools_refused=2' in captured.err
     assert 'usage_unknown=false' in captured.err
+    assert 'ACCEPT' not in captured.out
+    assert code != 0
 
 
 def test_missing_usage_is_not_treated_as_zero(monkeypatch, capsys):
@@ -187,9 +199,6 @@ def test_repeated_identical_calls_stop_with_no_progress(monkeypatch, capsys):
     _isolate(module, monkeypatch)
     executed = []
     def completion(key, model, items, tools=True):
-        if tools is False:
-            return {'status': 'completed', 'usage': {'total_tokens': 5}, 'output': [
-                {'type': 'message', 'content': [{'type': 'output_text', 'text': 'no progress summary'}]}]}
         return {'status': 'completed', 'usage': {'total_tokens': 20}, 'output': [
             {'type': 'function_call', 'name': 'shell', 'call_id': f'c{len(executed)}',
              'arguments': '{"command":"echo same"}'}]}
@@ -201,9 +210,10 @@ def test_repeated_identical_calls_stop_with_no_progress(monkeypatch, capsys):
     captured = capsys.readouterr()
     assert 'AICC_STOP: reason=no_progress' in captured.err
     assert 'AICC_PARTIAL_RESULT' in captured.out
+    assert 'AICC_LOCAL_PARTIAL_CHECKPOINT' not in captured.out
 
 
-def test_hard_token_cap_skips_summary_and_keeps_local_partial(monkeypatch, capsys):
+def test_hard_token_cap_skips_tools_and_keeps_local_partial(monkeypatch, capsys):
     module = driver()
     _isolate(module, monkeypatch)
     def completion(key, model, items, tools=True):
@@ -219,21 +229,17 @@ def test_hard_token_cap_skips_summary_and_keeps_local_partial(monkeypatch, capsy
     assert 'AICC_STOP: reason=token_budget' in captured.err
     assert 'tools_refused=1' in captured.err
     assert 'AICC_PARTIAL_RESULT' in captured.out
-    assert 'AICC_LOCAL_PARTIAL_CHECKPOINT' not in captured.out  # no model summary
-    assert 'model partial' not in captured.out
+    assert 'AICC_LOCAL_PARTIAL_CHECKPOINT' not in captured.out
 
 
 def test_budget_stop_stderr_is_not_exact_provider_http_line(monkeypatch, capsys):
     """Worker only treats exact `provider HTTP NNN` stderr as grok provider failover."""
     module = driver()
     _isolate(module, monkeypatch)
-    soft = module.MAX_TOTAL_TOKENS - module.SUMMARY_RESERVE_TOKENS
     def completion(key, model, items, tools=True):
-        if tools:
-            return {'status': 'completed', 'usage': {'total_tokens': soft}, 'output': [
-                {'type': 'function_call', 'name': 'shell', 'call_id': 'c1',
-                 'arguments': '{"command":"true"}'}]}
-        raise RuntimeError('provider HTTP 500')  # summary failure must not become the process stderr
+        return {'status': 'completed', 'usage': {'total_tokens': module.MAX_TOTAL_TOKENS}, 'output': [
+            {'type': 'function_call', 'name': 'shell', 'call_id': 'c1',
+             'arguments': '{"command":"true"}'}]}
     monkeypatch.setattr(module, 'completion', completion)
     monkeypatch.setattr(module, 'shell', lambda _: pytest.fail('no tools'))
     code = module.run('task', 'grok-4.3')
@@ -246,27 +252,19 @@ def test_budget_stop_stderr_is_not_exact_provider_http_line(monkeypatch, capsys)
     assert err.splitlines()[0].startswith('AICC_STOP:')
 
 
-def test_soft_budget_refuses_pending_calls_before_summary(monkeypatch, capsys):
-    """Soft ceiling must append function_call_output refusals before tools-disabled summary."""
+def test_token_budget_refuses_pending_calls_before_partial(monkeypatch, capsys):
+    """Hard ceiling must append function_call_output refusals before durable partial."""
     module = driver()
     _isolate(module, monkeypatch)
-    soft = module.MAX_TOTAL_TOKENS - module.SUMMARY_RESERVE_TOKENS
     seen_refusals = []
     def completion(key, model, items, tools=True):
-        if tools:
-            return {'status': 'completed', 'usage': {'total_tokens': soft}, 'output': [
-                {'type': 'function_call', 'name': 'shell', 'call_id': 'pending-a',
-                 'arguments': '{"command":"echo a"}'},
-                {'type': 'function_call', 'name': 'shell', 'call_id': 'pending-b',
-                 'arguments': '{"command":"echo b"}'}]}
-        # Compact summary items are checkpoint-only; refusals live on the driver
-        # history that was closed before this call. Probe via tools_refused stderr.
-        return {'status': 'completed', 'usage': {'total_tokens': 8}, 'output': [
-            {'type': 'message', 'content': [{'type': 'output_text', 'text': 'compact ok'}]}]}
+        return {'status': 'completed', 'usage': {'total_tokens': module.MAX_TOTAL_TOKENS}, 'output': [
+            {'type': 'function_call', 'name': 'shell', 'call_id': 'pending-a',
+             'arguments': '{"command":"echo a"}'},
+            {'type': 'function_call', 'name': 'shell', 'call_id': 'pending-b',
+             'arguments': '{"command":"echo b"}'}]}
     monkeypatch.setattr(module, 'completion', completion)
-    monkeypatch.setattr(module, 'shell', lambda _: pytest.fail('soft budget must refuse, not run'))
-    # Capture refusals by wrapping _append_call_refusals side effect through items:
-    # re-run path asserts tools_refused on stderr; also check helper via spy.
+    monkeypatch.setattr(module, 'shell', lambda _: pytest.fail('budget must refuse, not run'))
     original = module._append_call_refusals
     def spy(items, calls, key, *, reason, limit):
         count = original(items, calls, key, reason=reason, limit=limit)
@@ -286,28 +284,6 @@ def test_soft_budget_refuses_pending_calls_before_summary(monkeypatch, capsys):
     assert 'tools_refused=2' in captured.err
     assert 'AICC_PARTIAL_RESULT' in captured.out
     assert code != 0
-
-
-def test_summary_timeout_preserves_local_partial(monkeypatch, capsys):
-    """OSError/TimeoutError during optional summary must not erase the local partial."""
-    module = driver()
-    _isolate(module, monkeypatch)
-    soft = module.MAX_TOTAL_TOKENS - module.SUMMARY_RESERVE_TOKENS
-    def completion(key, model, items, tools=True):
-        if tools:
-            return {'status': 'completed', 'usage': {'total_tokens': soft}, 'output': [
-                {'type': 'function_call', 'name': 'shell', 'call_id': 'c1',
-                 'arguments': '{"command":"true"}'}]}
-        raise TimeoutError('summary timed out')
-    monkeypatch.setattr(module, 'completion', completion)
-    monkeypatch.setattr(module, 'shell', lambda _: pytest.fail('no tools'))
-    code = module.run('task', 'grok-4.3')
-    assert code == 1
-    captured = capsys.readouterr()
-    assert 'AICC_PARTIAL_RESULT' in captured.out
-    assert 'AICC_STOP: reason=token_budget' in captured.err
-    assert 'TimeoutError' not in captured.err.splitlines()[0]
-    assert captured.err.strip() != 'TimeoutError'
 
 
 def test_provider_oserror_after_tools_emits_partial(monkeypatch, capsys):
@@ -389,20 +365,12 @@ def test_shell_timeout_after_progress_emits_partial(monkeypatch, capsys):
     assert 'echo one' in captured.out
 
 
-def test_urlerror_during_summary_preserves_partial(monkeypatch, capsys):
+def test_no_summary_reserve_constants():
     module = driver()
-    _isolate(module, monkeypatch)
-    soft = module.MAX_TOTAL_TOKENS - module.SUMMARY_RESERVE_TOKENS
-    def completion(key, model, items, tools=True):
-        if tools:
-            return {'status': 'completed', 'usage': {'total_tokens': soft}, 'output': [
-                {'type': 'function_call', 'name': 'shell', 'call_id': 'c1',
-                 'arguments': '{"command":"true"}'}]}
-        raise module.urllib.error.URLError(socket.gaierror('dns failed'))
-    monkeypatch.setattr(module, 'completion', completion)
-    monkeypatch.setattr(module, 'shell', lambda _: pytest.fail('no tools'))
-    code = module.run('task', 'grok-4.3')
-    assert code == 1
-    captured = capsys.readouterr()
-    assert 'AICC_PARTIAL_RESULT' in captured.out
-    assert 'AICC_STOP: reason=token_budget' in captured.err
+    assert not hasattr(module, 'SUMMARY_RESERVE_TOKENS')
+    assert not hasattr(module, 'SUMMARY_CHECKPOINT_CHARS')
+    assert not hasattr(module, '_try_final_summary')
+    assert module.MAX_TURNS == 12
+    assert module.MAX_TOTAL_TOKENS == 60000
+    assert module.MAX_TOOLS_PER_TURN == 4
+    assert module.MAX_OUTPUT_TOKENS == 4096
