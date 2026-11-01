@@ -133,3 +133,12 @@ def test_http_client_transport_failure_raises_timeout_error():
     client = sq.HTTPServerQueueClient(base_url="https://192.0.2.1", token="tok", timeout=0.01)
     with pytest.raises(sq.ServerQueueTimeoutError):
         client.list_items()
+
+def test_transport_refuses_non_http_schemes_before_sending_the_token() -> None:
+    """B310: the bearer token must never reach a file:/ftp: opener."""
+    import pytest
+    from command_center.application import server_queue
+
+    for url in ("file:///etc/passwd", "ftp://example.invalid/x"):
+        with pytest.raises(server_queue.ServerQueueTimeoutError, match="unsupported scheme"):
+            server_queue._http_get_json(url, "token", 1.0)
