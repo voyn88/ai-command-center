@@ -589,3 +589,15 @@ def test_the_mainstream_queue_verbs_are_covered():
     # and must not classify a module that is not named like a queue.
     for path in ("command_center/report_builder.py", "command_center/web_client.py"):
         assert "queue" not in boundary.classify_engine_categories(path, polling), path
+
+
+def test_coordination_srv_client_has_only_package_name_signature():
+    """The reviewed SRV composition must not acquire an engine signature."""
+    path = boundary.REPO_ROOT / "command_center/orchestrator/coordination.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    assert boundary.classify_engine_categories(
+        "command_center/application/advisory_order.py", tree
+    ) == set()
+    assert boundary.classify_engine_categories(
+        "command_center/orchestrator/coordination.py", tree
+    ) == {"orchestration"}

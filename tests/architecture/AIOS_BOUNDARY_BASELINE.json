@@ -132,6 +132,9 @@
     "command_center/orchestrator/__init__.py": [
       "orchestration"
     ],
+    "command_center/orchestrator/coordination.py": [
+      "orchestration"
+    ],
     "command_center/orchestrator/gh_access.py": [
       "orchestration"
     ],

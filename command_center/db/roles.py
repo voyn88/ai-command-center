@@ -66,27 +66,27 @@ from __future__ import annotations
 from types import MappingProxyType
 
 __all__ = [
-    "APP_ROLE",
-    "MIGRATOR_ROLE",
-    "OPERATOR_ROLE",
-    "WORKER_ROLE",
     "ALL_ROLES",
     "ALL_TABLES",
     "ALL_VIEWS",
+    "APP_ROLE",
     "COLUMN_PRIVILEGES",
     "FUNCTION_PRIVILEGES",
-    "merge_column_privileges",
-    "merge_privileges",
+    "IDENTITY_SEQUENCES",
+    "MIGRATOR_ROLE",
+    "OPERATOR_ROLE",
+    "PRIVILEGES",
     "VIEW_PRIVILEGES",
+    "WORKER_ROLE",
     "apply_bootstrap",
     "apply_table_grants",
-    "IDENTITY_SEQUENCES",
-    "PRIVILEGES",
+    "merge_column_privileges",
+    "merge_privileges",
     "render_bootstrap",
-    "render_worker_host_role",
     "render_grants",
-    "render_table_grants",
     "render_role_creation",
+    "render_table_grants",
+    "render_worker_host_role",
 ]
 
 MIGRATOR_ROLE = "aicc_migrator"
@@ -127,6 +127,7 @@ ALL_TABLES: tuple[str, ...] = (
     "backlog_task_remediation",
     "backlog_scan_cursor",
     "backlog_writer_lease",
+    "coordinator_state",
     "completion",
     "completion_event",
     "completion_validation",
@@ -308,6 +309,8 @@ _APP_BACKLOG_TABLES: dict[str, frozenset[str]] = {
     "backlog_writer_lease": _READ,
     "backlog_task_remediation": _READ,
     "backlog_scan_cursor": _READ,
+    # Coordination v2: reads only; every write is a SECURITY DEFINER CAS.
+    "coordinator_state": _READ,
 }
 
 _WORKER_BACKLOG_TABLES: dict[str, frozenset[str]] = {
@@ -318,6 +321,7 @@ _WORKER_BACKLOG_TABLES: dict[str, frozenset[str]] = {
     "backlog_writer_lease": _NONE,
     "backlog_task_remediation": _NONE,
     "backlog_scan_cursor": _NONE,
+    "coordinator_state": _NONE,
 }
 
 # The enrolment tables (0003), for the control plane. Read-only, and two of them
@@ -599,6 +603,12 @@ _APP_BACKLOG_FUNCTIONS = (
     "backlog_record_provenance(text, text, jsonb)",
     "backlog_owner_decision(text, bigint, text, text)",
     "backlog_owner_lock(text)",
+    # Coordination v2 (0031): durable snapshot/in-flight CAS; no DML path.
+    "coordinator_state_read(text)",
+    "coordinator_enqueue(text, text, text, text, text, jsonb)",
+    "coordinator_cas_begin(text, text, text, text, timestamptz)",
+    "coordinator_cas_finish(text, text, text, jsonb, text, jsonb, integer, timestamptz)",
+    "coordinator_cas_clear_inflight(text, text, text, timestamptz)",
 )
 
 # The enrolment surface (0003), split by who may do what.
@@ -988,14 +998,14 @@ def render_worker_host_role(role: str) -> list[str]:
     """
     _require_identifier(role)
     return [
-        "DO $$\n"
+        ("DO $$\n"
         "BEGIN\n"
         "    PERFORM pg_advisory_xact_lock(7823649102);\n"
         f"    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role}') THEN\n"
         f"        CREATE ROLE {role} LOGIN IN ROLE {WORKER_ROLE};\n"
         "    END IF;\n"
         "END\n"
-        "$$;"
+        "$$;")
     ]
 
 
@@ -1043,10 +1053,9 @@ def apply_table_grants(conn, schema: str = "public") -> int:
 
 
 def _execute(conn, statements: list[str]) -> int:
-    with conn.transaction():
-        with conn.cursor() as cur:
-            for statement in statements:
-                cur.execute(statement)
+    with conn.transaction(), conn.cursor() as cur:
+        for statement in statements:
+            cur.execute(statement)
     return len(statements)
 
 
