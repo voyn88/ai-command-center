@@ -2114,11 +2114,15 @@ def test_up_down_up_down_leaves_the_schema_byte_identical(
 def test_the_queue_mirror_is_untouched_by_this_migration(
     admin_conn, psycopg, test_dsn, role_passwords
 ):
-    """`queue_entry` sits outside the parity gate, so its shape may not change.
+    """Migration 0002 must not reshape `queue_entry`.
 
-    Altering it would be a data migration with no coverage. The claim protocol
-    therefore stands beside the mirror rather than reshaping it, and retiring
-    the mirror belongs to the JSON-queue contraction, not here.
+    The mirror is rebuilt wholesale from the JSON queue; a claim written
+    there is lost on the next sync. The claim protocol therefore stands
+    beside the mirror rather than reshaping it, and retiring the mirror
+    belongs to the JSON-queue contraction, not here. Shape correspondence
+    for `queue_entry` is still enforced by the SRV-07 parity gate
+    (`tests/db/test_schema_correspondence.py`) — that gate has no exclusion
+    for this table.
     """
     claim_migration = _claim_migration()
     statements = [
