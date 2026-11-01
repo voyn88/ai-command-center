@@ -9,7 +9,7 @@
 -- "cascade_exhausted: executor infrastructure failure%" at the start of
 -- the suffix). Widen the technical allowlist so these return to OPEN.
 -- Body otherwise matches 0030's backlog_return_to_pool (renumbered from
--- 0029 after main took 0029/0030; keeps 0030's malformed_pr_url rule).
+-- 0029, then 0031, after main took 0029-0032; keeps 0030's malformed_pr_url rule).
 CREATE OR REPLACE FUNCTION backlog_return_to_pool(p_task_id text, p_reason text)
     RETURNS backlog_verdict
     LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, public AS $$
