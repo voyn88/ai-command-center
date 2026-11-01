@@ -63,6 +63,25 @@ _LIVE_SELECT_FRAGMENT = (
     _LIVE_STATUS_SQL + ", " + _LIVE_REASON_SQL + ", " + _LIVE_UNTIL_SQL
 )
 
+# Fully literal statements (no runtime concatenation) so the SQL is static
+# and auditable; must stay in sync with the _LIVE_*_SQL fragments above.
+_GET_ONE_SQL = (
+    "SELECT CASE WHEN status = 'unavailable' AND unavailable_until > now()"
+    " THEN status ELSE 'available' END, "
+    "CASE WHEN status = 'unavailable' AND unavailable_until > now() THEN reason END, "
+    "CASE WHEN status = 'unavailable' AND unavailable_until > now()"
+    " THEN unavailable_until END"
+    " FROM executor_availability WHERE executor_id = %s"
+)
+_LIST_ALL_SQL = (
+    "SELECT executor_id, CASE WHEN status = 'unavailable' AND unavailable_until > now()"
+    " THEN status ELSE 'available' END, "
+    "CASE WHEN status = 'unavailable' AND unavailable_until > now() THEN reason END, "
+    "CASE WHEN status = 'unavailable' AND unavailable_until > now()"
+    " THEN unavailable_until END"
+    " FROM executor_availability ORDER BY executor_id"
+)
+
 
 def clear_cache() -> None:
     """Drop every memoized verdict. Tests that mark/clear an executor mid-run
@@ -125,8 +144,7 @@ class ExecutorAvailabilityStore:
         with self._connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT " + _LIVE_SELECT_FRAGMENT
-                    + " FROM executor_availability WHERE executor_id = %s",
+                    _GET_ONE_SQL,
                     (executor_id,),
                 )
                 row = cur.fetchone()
@@ -148,8 +166,7 @@ class ExecutorAvailabilityStore:
         with self._connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT executor_id, " + _LIVE_SELECT_FRAGMENT
-                    + " FROM executor_availability ORDER BY executor_id"
+                    _LIST_ALL_SQL
                 )
                 rows = cur.fetchall()
         return [
@@ -184,3 +201,4 @@ class ExecutorAvailabilityStore:
                 cur.execute("SELECT executor_mark_available(%s)", (executor_id,))
         with _cache_lock:
             _cache.pop(executor_id, None)
+
