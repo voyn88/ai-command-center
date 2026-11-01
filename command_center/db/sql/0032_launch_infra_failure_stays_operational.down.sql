@@ -1,20 +1,10 @@
--- AICC_AGENT_LAUNCH_INFRA_FAILURE and infra_wait exhaustion are substrate
--- failures, never owner decisions. Fleet outage 2026-09-11: group-writable
--- /opt/aicc made the launcher refuse every executor; attempts burned into
--- cascade_exhausted parks instead of infra_wait refunds. 0024 refunds the
--- attempt, but when a prior generation already dead-lettered with
--- infra_wait_exhausted / AICC_AGENT_LAUNCH_INFRA_FAILURE the ingest path
--- still wrapped it as cascade_exhausted: infra_wait_exhausted: ... which
--- did NOT match 0012/0021's technical patterns (those look for
--- "cascade_exhausted: executor infrastructure failure%" at the start of
--- the suffix). Widen the technical allowlist so these return to OPEN.
--- Body otherwise matches 0021's backlog_return_to_pool.
+-- Restore 0030's backlog_return_to_pool (without the launch-infra patterns).
 CREATE OR REPLACE FUNCTION backlog_return_to_pool(p_task_id text, p_reason text)
     RETURNS backlog_verdict
     LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, public AS $$
 DECLARE t backlog_task%ROWTYPE; v backlog_verdict; v_target text; v_prior integer;
         v_split_requested boolean := false;
-        v_technical boolean;
+        v_technical boolean; v_malformed boolean; v_bad_returns integer;
 BEGIN
     v.ok := false;
     SELECT * INTO t FROM backlog_task b WHERE b.task_id = p_task_id FOR UPDATE;
@@ -35,20 +25,22 @@ BEGIN
     v_technical := p_reason LIKE 'cascade_exhausted: no_pr_published%'
         OR p_reason LIKE 'cascade_exhausted: task_status_failed%'
         OR p_reason LIKE 'cascade_exhausted: executor infrastructure failure%'
-        OR p_reason LIKE 'cascade_exhausted: publish_%'
-        OR p_reason LIKE 'cascade_exhausted: infra_wait_exhausted%'
-        OR p_reason LIKE 'cascade_exhausted: %AICC_AGENT_LAUNCH_INFRA_FAILURE%';
+        OR p_reason LIKE 'cascade_exhausted: publish_%';
+    v_malformed := p_reason LIKE 'cascade_exhausted: malformed_pr_url%';
+    SELECT count(*) INTO v_bad_returns FROM backlog_event e
+     WHERE e.task_id = p_task_id AND e.event = 'return_to_pool'
+       AND e.outcome = 'granted'
+       AND e.reason LIKE 'cascade_exhausted: malformed_pr_url%';
     v_target := CASE
+        WHEN v_malformed AND v_bad_returns >= 1 THEN 'DEFER_TO_USER'
+        WHEN v_malformed THEN 'OPEN'
         WHEN v_technical THEN 'OPEN'
-        -- Pipeline class: the second non-technical return asks for a split
-        -- (planner dispatches decomposition), the fourth parks. Functional
-        -- tasks keep the original rule (second return parks).
         WHEN t.task_class = 'pipeline' AND v_prior >= 3 THEN 'DEFER_TO_USER'
         WHEN t.task_class = 'pipeline' AND v_prior >= 1 THEN 'OPEN'
         WHEN v_prior >= 1 THEN 'DEFER_TO_USER'
         ELSE 'OPEN'
     END;
-    v_split_requested := (NOT v_technical) AND t.task_class = 'pipeline'
+    v_split_requested := (NOT v_technical) AND (NOT v_malformed) AND t.task_class = 'pipeline'
                          AND v_prior >= 1 AND v_target = 'OPEN';
 
     UPDATE backlog_task b
