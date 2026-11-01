@@ -23,6 +23,23 @@ EnvironmentFile=/home/voynadmin/aicc-preprod/.env
 # remote. The finding reaches the planner through this unit's
 # --record-findings source, exactly like every other failure class.
 Environment=AICC_PR_WINDOW_REPO=.
+# The other half of the same question, asked directly: are the repo-owned
+# control ticks actually SCHEDULED on this host? The probe above measures the
+# reconciler by its EFFECT, so it can only speak once unlabelled fleet PRs
+# exist and only after their grace period -- on a quiet fleet a timer that was
+# never installed stays invisible right up to the moment PRs appear.
+# control-01 ran no PR-window timer at all for over a day while 67 open PRs
+# (752-822) went unlabelled and operators labelled them by hand
+# (VOYN-W0-AICC-PR-WINDOW-TIMER-NOT-DEPLOYED-ON-CONTROL); the host-wide unit
+# probe could not see it, because it asks systemd only for `--type=service`
+# and a timer that was never installed is not a failed service -- it is
+# nothing at all. This is the control probe and not the worker one for the
+# same reason as the line above: a worker host runs none of these timers and
+# their absence there is correct. Turned on by the environment rather than a
+# flag for the same reason as AICC_PR_WINDOW_REPO: the ExecStart below names
+# an absolute home path, which a public repository cannot restate in a new
+# line (scripts/ci/prepush/leak_guard.sh).
+Environment=AICC_CONTROL_TIMERS=1
 ExecStart=/home/voynadmin/aicc-preprod/repo/.venv/bin/python -m command_center.ops.infra_monitor --skip-workers --minimum-active-workers 0 --max-stalled-seconds 900 --max-recent-dead 0 --prometheus-url http://100.114.209.119:9090/-/ready
 NoNewPrivileges=true
 PrivateTmp=true
