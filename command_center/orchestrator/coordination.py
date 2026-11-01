@@ -26,9 +26,10 @@ import hashlib
 import json
 import os
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Any, Callable
+from datetime import UTC, datetime
+from typing import Any
 
 from command_center.worker.payloads import AGENT_RUN_SCHEMA_VERSION
 
@@ -235,12 +236,11 @@ def _render_prompt(compact_rows: list[dict[str, Any]]) -> str:
 
 
 def _rows(factory: Any, sql: str, params: tuple[Any, ...] = ()) -> list[tuple]:
-    with factory() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, params)
-            if cur.description is None:
-                return []
-            return list(cur.fetchall())
+    with factory() as conn, conn.cursor() as cur:
+        cur.execute(sql, params)
+        if cur.description is None:
+            return []
+        return list(cur.fetchall())
 
 
 def _row(factory: Any, sql: str, params: tuple[Any, ...] = ()) -> tuple | None:
@@ -414,8 +414,7 @@ def _resolve_inflight(
 
 def coordinate_once(
     factory: Any,
-    enqueue: Callable[[str, str, dict[str, Any], str | None, int], str],
-    limits: CoordinationLimits = CoordinationLimits(),
+    limits: CoordinationLimits | None = None,
     *,
     environ: dict[str, str] | None = None,
     load_candidates: Callable[[], list[dict[str, Any]]] | None = None,
@@ -425,6 +424,7 @@ def coordinate_once(
     Never blocks on a provider call. Safe to run after ``plan_once`` without
     holding ``planner:global``.
     """
+    limits = limits or CoordinationLimits()
     report = CoordinationReport()
     if coordination_stopped(environ):
         report.stopped = True
@@ -472,15 +472,18 @@ def coordinate_once(
 
     cooldown_until = state.get("cooldown_until")
     if cooldown_until is not None:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         aware = cooldown_until
         if getattr(aware, "tzinfo", None) is None:
-            aware = aware.replace(tzinfo=timezone.utc)
+            aware = aware.replace(tzinfo=UTC)
         if aware > now:
             report.skipped = "cooldown"
             return report
 
-    if state.get("snapshot_hash") == snapshot_hash:
+    if (
+        state.get("snapshot_hash") == snapshot_hash
+        and state.get("last_status") != "enqueue_failed"
+    ):
         report.skipped = "unchanged_snapshot"
         return report
     if (
@@ -496,15 +499,6 @@ def coordinate_once(
         return report
 
     key = f"coord:v2:{snapshot_hash}"
-    began = _row(
-        factory,
-        "SELECT coordinator_cas_begin(%s, %s, %s, %s)",
-        (limits.name, snapshot_hash, blocker_hash, key),
-    )
-    if not began or not began[0]:
-        report.skipped = "cas_begin_refused"
-        return report
-
     cascade = _coordination_cascade()
     payload = {
         "kind": "agent_run",
@@ -518,22 +512,19 @@ def coordinate_once(
         "cascade": cascade,
         "mode": "coordination_v2",
     }
-    try:
-        # Queue task_id is a synthetic audit label only; it is NOT a backlog
-        # row and is absent from the agent_run payload so publish/lease paths
-        # never treat coordination as implementation work.
-        work_item_id = enqueue(
-            limits.queue, key, payload, _COORD_TASK_ID, len(cascade)
-        )
-    except Exception as exc:  # noqa: BLE001 — fail closed, clear claim
-        _row(
-            factory,
-            "SELECT coordinator_cas_clear_inflight(%s, %s, %s)",
-            (limits.name, key, f"enqueue_failed:{type(exc).__name__}"),
-        )
-        report.rejected = f"enqueue_failed:{type(exc).__name__}"
-        return report
-    report.enqueued = work_item_id
+    # SQL owns both the claim and queue write in one transaction. Do not
+    # split these operations into callbacks using unrelated connections.
+    queued = _row(
+        factory,
+        "SELECT * FROM coordinator_enqueue(%s, %s, %s, %s, %s, %s::jsonb)",
+        (limits.name, snapshot_hash, blocker_hash, key, limits.queue, json.dumps(payload)),
+    )
+    if queued and queued[0]:
+        report.enqueued = str(queued[0])
+    elif queued and str(queued[1]).startswith("enqueue_failed:"):
+        report.rejected = str(queued[1])
+    else:
+        report.skipped = str(queued[1]) if queued else "cas_begin_refused"
     return report
 
 

@@ -66,27 +66,27 @@ from __future__ import annotations
 from types import MappingProxyType
 
 __all__ = [
-    "APP_ROLE",
-    "MIGRATOR_ROLE",
-    "OPERATOR_ROLE",
-    "WORKER_ROLE",
     "ALL_ROLES",
     "ALL_TABLES",
     "ALL_VIEWS",
+    "APP_ROLE",
     "COLUMN_PRIVILEGES",
     "FUNCTION_PRIVILEGES",
-    "merge_column_privileges",
-    "merge_privileges",
+    "IDENTITY_SEQUENCES",
+    "MIGRATOR_ROLE",
+    "OPERATOR_ROLE",
+    "PRIVILEGES",
     "VIEW_PRIVILEGES",
+    "WORKER_ROLE",
     "apply_bootstrap",
     "apply_table_grants",
-    "IDENTITY_SEQUENCES",
-    "PRIVILEGES",
+    "merge_column_privileges",
+    "merge_privileges",
     "render_bootstrap",
-    "render_worker_host_role",
     "render_grants",
-    "render_table_grants",
     "render_role_creation",
+    "render_table_grants",
+    "render_worker_host_role",
 ]
 
 MIGRATOR_ROLE = "aicc_migrator"
@@ -605,6 +605,7 @@ _APP_BACKLOG_FUNCTIONS = (
     "backlog_owner_lock(text)",
     # Coordination v2 (0031): durable snapshot/in-flight CAS; no DML path.
     "coordinator_state_read(text)",
+    "coordinator_enqueue(text, text, text, text, text, jsonb)",
     "coordinator_cas_begin(text, text, text, text, timestamptz)",
     "coordinator_cas_finish(text, text, text, jsonb, text, jsonb, integer, timestamptz)",
     "coordinator_cas_clear_inflight(text, text, text, timestamptz)",
@@ -997,14 +998,14 @@ def render_worker_host_role(role: str) -> list[str]:
     """
     _require_identifier(role)
     return [
-        "DO $$\n"
+        ("DO $$\n"
         "BEGIN\n"
         "    PERFORM pg_advisory_xact_lock(7823649102);\n"
         f"    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role}') THEN\n"
         f"        CREATE ROLE {role} LOGIN IN ROLE {WORKER_ROLE};\n"
         "    END IF;\n"
         "END\n"
-        "$$;"
+        "$$;")
     ]
 
 
@@ -1052,10 +1053,9 @@ def apply_table_grants(conn, schema: str = "public") -> int:
 
 
 def _execute(conn, statements: list[str]) -> int:
-    with conn.transaction():
-        with conn.cursor() as cur:
-            for statement in statements:
-                cur.execute(statement)
+    with conn.transaction(), conn.cursor() as cur:
+        for statement in statements:
+            cur.execute(statement)
     return len(statements)
 
 

@@ -597,12 +597,9 @@ def main(argv: list[str] | None = None) -> int:
                 # Coordination v2 runs AFTER the planner lease is released so a
                 # model call never blocks planner:global. Opt-in / stop switches
                 # live in coordination.coordinate_once; default is no-op.
-                from command_center.db.work_queue_store import WorkQueueStore
                 from command_center.orchestrator.coordination import coordinate_once
 
-                coord = coordinate_once(
-                    lambda: _nc(conn), _review_enqueue(WorkQueueStore(lambda: _nc(conn)))
-                )
+                coord = coordinate_once(lambda: _nc(conn))
                 if coord.stopped:
                     print(f"COORD     stopped ({coord.skipped})")
                 elif coord.enqueued:

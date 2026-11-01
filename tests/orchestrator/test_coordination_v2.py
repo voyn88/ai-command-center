@@ -4,19 +4,24 @@ from __future__ import annotations
 
 import json
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
 
-from command_center.orchestrator import coordination as coord
 from command_center.orchestrator.coordination import (
-    CoordinationLimits,
     apply_advisory_order,
     build_candidate_snapshot,
-    coordinate_once,
     parse_coordination_result,
 )
+from command_center.orchestrator.coordination import (
+    coordinate_once as _coordinate_once,
+)
+
+
+def coordinate_once(factory, enqueue, *args, **kwargs):
+    factory.__self__.enqueue_callback = enqueue
+    return _coordinate_once(factory, *args, **kwargs)
 
 
 def test_unchanged_snapshot_skips_model_call():
@@ -30,7 +35,7 @@ def test_unchanged_snapshot_skips_model_call():
             "title": "a",
         }
     ]
-    snap, compact, blocker = build_candidate_snapshot(rows)
+    snap, _compact, _blocker = build_candidate_snapshot(rows)
     store = _FakeCoordinatorStore(
         snapshot_hash=snap, blocker_hash="other", last_status="applied"
     )
@@ -314,21 +319,21 @@ def test_prompt_excludes_bodies_and_uses_grok_46_model_only():
     assert "backlog_task_id" not in payload
 
 
-def test_migration_0031_is_paired_and_registers_table():
+def test_migration_0032_is_paired_and_registers_table():
     from pathlib import Path
 
     from command_center.db import migrations, roles
 
     sql_dir = Path(migrations.SQL_DIR)
-    assert (sql_dir / "0031_coordinator_v2.up.sql").is_file()
-    assert (sql_dir / "0031_coordinator_v2.down.sql").is_file()
+    assert (sql_dir / "0032_coordinator_v2.up.sql").is_file()
+    assert (sql_dir / "0032_coordinator_v2.down.sql").is_file()
     assert "coordinator_state" in roles.ALL_TABLES
-    up = (sql_dir / "0031_coordinator_v2.up.sql").read_text(encoding="utf-8")
+    up = (sql_dir / "0032_coordinator_v2.up.sql").read_text(encoding="utf-8")
     assert "coordinator_cas_begin" in up
     assert "CREATE TABLE coordinator_state" in up
     found = migrations.discover()
     assert found[-1].slug == "coordinator_v2"
-    assert found[-1].version == 31
+    assert found[-1].version == 32
 
 
 # ---------------------------------------------------------------------------
@@ -352,7 +357,7 @@ class _FakeCoordinatorStore:
             "blocker_hash": blocker_hash,
             "advisory_order": list(advisory_order or []),
             "in_flight_key": in_flight_key,
-            "in_flight_at": datetime.now(timezone.utc) if in_flight_key else None,
+            "in_flight_at": datetime.now(UTC) if in_flight_key else None,
             "last_result_hash": "",
             "last_status": last_status,
             "cooldown_until": cooldown_until,
@@ -383,6 +388,22 @@ class _FakeCoordinatorStore:
         self._result: list[tuple] = []
         self.description = ("ok",)
 
+        if "coordinator_enqueue" in self._sql:
+            name, snap, blocker, key, queue, payload = params
+            self.execute("SELECT coordinator_cas_begin", (name, snap, blocker, key))
+            if not self._result[0][0]:
+                self._result = [(None, "cas_begin_refused")]
+                return
+            try:
+                item = self.enqueue_callback(queue, key, json.loads(payload), "VOYN-AICC-COORD-V2", 1)
+            except RuntimeError:
+                self.work_items.pop(key, None)
+                self.state.update(in_flight_key=None, last_status="enqueue_failed",
+                                  cooldown_until=datetime.now(UTC) + timedelta(seconds=300))
+                self._result = [(None, "enqueue_failed:RuntimeError")]
+            else:
+                self._result = [(item, None)]
+            return
         if "coordinator_state_read" in self._sql:
             s = self.state
             self._result = [
@@ -404,13 +425,7 @@ class _FakeCoordinatorStore:
             self.begin_calls.append(params)
             s = self.state
             ok = True
-            if s["in_flight_key"] is not None:
-                ok = False
-            elif s["cooldown_until"] and s["cooldown_until"] > datetime.now(timezone.utc):
-                ok = False
-            elif s["snapshot_hash"] == snap:
-                ok = False
-            elif (
+            if s["in_flight_key"] is not None or s["cooldown_until"] and s["cooldown_until"] > datetime.now(UTC) or s["snapshot_hash"] == snap or (
                 blocker
                 and s["blocker_hash"] == blocker
                 and s["last_status"] in ("rejected", "cooldown")
@@ -422,7 +437,7 @@ class _FakeCoordinatorStore:
                         "snapshot_hash": snap,
                         "blocker_hash": blocker or "",
                         "in_flight_key": key,
-                        "in_flight_at": datetime.now(timezone.utc),
+                        "in_flight_at": datetime.now(UTC),
                         "last_status": "queued",
                     }
                 )
@@ -449,7 +464,7 @@ class _FakeCoordinatorStore:
                 cooldown_seconds = int(params[5] or 0) if len(params) > 5 else 0
             cooldown = None
             if cooldown_seconds > 0:
-                cooldown = datetime.now(timezone.utc) + timedelta(seconds=cooldown_seconds)
+                cooldown = datetime.now(UTC) + timedelta(seconds=cooldown_seconds)
             s.update(
                 {
                     "in_flight_key": None,

@@ -14,13 +14,13 @@ Smallest durable coordinator integrated into the existing planner tick path:
 | Cursor | Implementation via existing `owner-alternatives` cascade (unchanged; PR #1071) |
 | Planner | Remains sole dispatch authority (`backlog_dispatch`); advisory order only reorders candidates |
 | Queue | Async `agent_run` work item — **never** holds `planner:global` across a model call |
-| State | Versioned table `coordinator_state` + CAS helpers (migration **0031**) |
+| State | Versioned table `coordinator_state` + CAS helpers (migration **0032**) |
 
 No new systemd unit. `python -m command_center.db backlog-plan` runs `coordinate_once` **after** `plan_once` returns (lease already released).
 
 ## Files
 
-- `command_center/db/sql/0031_coordinator_v2.up.sql` / `.down.sql` — durable state + CAS
+- `command_center/db/sql/0032_coordinator_v2.up.sql` / `.down.sql` — durable state + CAS
 - `command_center/orchestrator/coordination.py` — snapshot, parse/fail-closed, enqueue/apply
 - `command_center/orchestrator/planner.py` — advisory reorder of eligible candidates
 - `command_center/db/cli.py` — post-plan `coordinate_once` hook
@@ -52,7 +52,7 @@ Writes only via:
 
 Activation (owner-operated, after migrate + deploy of this SHA):
 
-1. Apply migration 0031 (`python -m command_center.db upgrade` as migrator).
+1. Apply migration 0032 (`python -m command_center.db upgrade` as migrator).
 2. Re-assert grants (`upgrade` already does).
 3. Set on the control-plane host env (e.g. `/etc/aicc/app.env`):
    - `AICC_COORDINATOR_V2=1`
@@ -62,7 +62,7 @@ Activation (owner-operated, after migrate + deploy of this SHA):
 Rollback / stop:
 
 - Immediate stop: `AICC_COORDINATOR_V2_STOP=1` (or unset `AICC_COORDINATOR_V2`).
-- Schema rollback: migration 0031 down (drops `coordinator_state` + CAS functions).
+- Schema rollback: migration 0032 down (drops `coordinator_state` + CAS functions).
 - Planner without advisory order: empty/missing state → original eligible order.
 
 ## Tests actually run
@@ -88,7 +88,7 @@ Covered behaviors:
 - enqueue failure clears CAS claim
 - stop switch / disabled default
 - prompt excludes bodies/secrets; cascade is Grok 4.6 model-only
-- migration 0031 paired + `coordinator_state` in `ALL_TABLES`
+- migration 0032 paired + `coordinator_state` in `ALL_TABLES`
 
 No live provider calls, no production DB, no package installs.
 
@@ -106,3 +106,22 @@ No live provider calls, no production DB, no package installs.
 ## Prioritization policy baked into the prompt
 
 Reconcile evidence-bearing / shipped work before new work; prefer tasks that reduce downstream model calls, retries, CI, and errors; UNKNOWN costs remain unknown; prefer ordering existing eligible ids over inventing work.
+
+
+## Corrective follow-up after main PR1037
+
+Migration moved to 0032; main's 0031 insert-sequence migration is preserved.
+`coordinator_enqueue` now commits the state claim and existing queue_enqueue
+in one SQL transaction. No planner tick can observe a committed half-enqueue.
+Pre-queue insertion failure records an SQLSTATE (not secret error text), retains
+the snapshot/key, and permits at most three attempts for that snapshot with a
+five-minute cooldown. Provider/model failure is not retried by this mechanism.
+A clear operation refuses any key that already has a queue item. Missing-item
+recovery uses the same bounded pre-queue budget; a changed snapshot gets its own
+budget. Read-only worker payload parsing and app-role enqueue were exercised
+against disposable PostgreSQL with normal conftest, not a production cluster.
+
+The original hardcoded repository_path remains a deployment prerequisite;
+these regressions validate payload syntax and DB authority, not live broker
+workspace access. Production coordination remains disabled. No provider call,
+service change, publication or deployment was performed by this follow-up.

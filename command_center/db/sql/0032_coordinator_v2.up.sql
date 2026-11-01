@@ -24,7 +24,7 @@ CREATE TABLE coordinator_state (
     CONSTRAINT coordinator_state_name_present CHECK (length(name) > 0),
     CONSTRAINT coordinator_state_status_vocab CHECK (
         last_status IN (
-            'idle', 'queued', 'applied', 'rejected', 'cooldown', 'stopped'
+            'idle', 'queued', 'applied', 'rejected', 'cooldown', 'stopped', 'enqueue_failed'
         )
     ),
     CONSTRAINT coordinator_state_order_is_array CHECK (
@@ -67,6 +67,7 @@ CREATE FUNCTION coordinator_cas_begin(
 ) RETURNS boolean
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, public AS $$
 DECLARE s coordinator_state%ROWTYPE;
+        attempts integer;
 BEGIN
     IF p_name IS NULL OR length(p_name) = 0
        OR p_snapshot_hash IS NULL OR length(p_snapshot_hash) = 0
@@ -82,7 +83,12 @@ BEGIN
     IF s.cooldown_until IS NOT NULL AND s.cooldown_until > p_now THEN
         RETURN false;
     END IF;
-    IF s.snapshot_hash = p_snapshot_hash THEN
+    IF s.snapshot_hash = p_snapshot_hash AND s.last_status <> 'enqueue_failed' THEN
+        RETURN false;
+    END IF;
+    attempts := CASE WHEN s.snapshot_hash = p_snapshot_hash
+        THEN coalesce((s.detail->>'enqueue_attempts')::integer, 0) ELSE 0 END;
+    IF attempts >= 3 THEN
         RETURN false;
     END IF;
     IF p_blocker_hash IS NOT NULL
@@ -97,7 +103,7 @@ BEGIN
            in_flight_key = p_key,
            in_flight_at = p_now,
            last_status = 'queued',
-           detail = jsonb_build_object('begin_key', p_key),
+           detail = jsonb_build_object('begin_key', p_key, 'enqueue_attempts', attempts + 1),
            updated_at = p_now
      WHERE name = p_name;
     RETURN true;
@@ -168,11 +174,15 @@ BEGIN
     IF NOT FOUND OR s.in_flight_key IS DISTINCT FROM p_key THEN
         RETURN false;
     END IF;
+    IF EXISTS (SELECT 1 FROM work_item WHERE idempotency_key = p_key) THEN
+        RETURN false;
+    END IF;
     UPDATE coordinator_state
        SET in_flight_key = NULL,
            in_flight_at = NULL,
-           last_status = 'idle',
-           detail = jsonb_build_object('cleared', p_reason),
+           last_status = 'enqueue_failed',
+           cooldown_until = p_now + interval '5 minutes',
+           detail = s.detail || jsonb_build_object('cleared', p_reason),
            updated_at = p_now
      WHERE name = p_name;
     RETURN true;
@@ -184,3 +194,36 @@ REVOKE ALL ON FUNCTION coordinator_state_read(text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION coordinator_cas_begin(text, text, text, text, timestamptz) FROM PUBLIC;
 REVOKE ALL ON FUNCTION coordinator_cas_finish(text, text, text, jsonb, text, jsonb, integer, timestamptz) FROM PUBLIC;
 REVOKE ALL ON FUNCTION coordinator_cas_clear_inflight(text, text, text, timestamptz) FROM PUBLIC;
+
+
+-- Claim and queue insertion are one transaction: a crash cannot commit half
+-- an enqueue. Only pre-queue failures retry, up to three attempts per snapshot
+-- with five-minute cooldown. A model failure is never retried by this helper.
+CREATE FUNCTION coordinator_enqueue(
+    p_name text, p_snapshot_hash text, p_blocker_hash text, p_key text,
+    p_queue text, p_payload jsonb
+) RETURNS TABLE (work_item_id text, failure text)
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+DECLARE v_id text;
+BEGIN
+    IF NOT coordinator_cas_begin(p_name, p_snapshot_hash, p_blocker_hash, p_key) THEN
+        RETURN QUERY SELECT NULL::text, 'cas_begin_refused'::text;
+        RETURN;
+    END IF;
+    BEGIN
+        v_id := queue_enqueue(p_queue, p_key, p_payload,
+            'VOYN-AICC-COORD-V2', NULL, 1, 100, 0, 2);
+    EXCEPTION WHEN OTHERS THEN
+        UPDATE coordinator_state SET in_flight_key = NULL, in_flight_at = NULL,
+            last_status = 'enqueue_failed',
+            cooldown_until = clock_timestamp() + interval '5 minutes',
+            detail = detail || jsonb_build_object('enqueue_sqlstate', SQLSTATE),
+            updated_at = clock_timestamp()
+        WHERE name = p_name AND in_flight_key = p_key;
+        RETURN QUERY SELECT NULL::text, ('enqueue_failed:' || SQLSTATE)::text;
+        RETURN;
+    END;
+    RETURN QUERY SELECT v_id, NULL::text;
+END
+$$;
+REVOKE ALL ON FUNCTION coordinator_enqueue(text, text, text, text, text, jsonb) FROM PUBLIC;
