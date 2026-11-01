@@ -315,6 +315,12 @@ def test_the_control_plane_cannot_claim() -> None:
         # 0029: bounded row lock and audited owner decision, no table UPDATE.
         "backlog_owner_lock",
         "backlog_owner_decision",
+        # 0032: durable Grok↔Cursor coordination CAS surface.
+        "coordinator_state_read",
+        "coordinator_enqueue",
+        "coordinator_cas_begin",
+        "coordinator_cas_finish",
+        "coordinator_cas_clear_inflight",
     }
 
 
