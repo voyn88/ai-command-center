@@ -86,7 +86,7 @@ def test_the_gate_catches_the_regression_it_exists_for(tmp_path) -> None:
     assert not refusal_audit.offenders(tmp_path)
     _write(
         tmp_path,
-        "0040_regression.up.sql",
+        "9000_regression.up.sql",
         """
 CREATE OR REPLACE FUNCTION backlog_set_task_class(p_task_id text, p_class text)
     RETURNS boolean LANGUAGE plpgsql AS $$
