@@ -1099,12 +1099,13 @@ def _run_agent(
                     and task_type not in agent_runner.MUTATING_TASK_TYPES
                     and run.status != "completed"
                 )
-                # A provider/auth/quota refusal happens before useful model work.
+                # A provider/auth refusal happens before useful model work.
                 # For read-only work the execution policy already prevents writes;
                 # for mutating work prove the isolated workspace is untouched before
                 # allowing another provider to inherit it.  This keeps failover
                 # inside the current queue lease, so an exhausted account neither
                 # consumes an attempt nor creates a red work_attempt row.
+                # (Capacity vs host is decided later, once no link can serve.)
                 safe_to_fail_over = task_type not in agent_runner.MUTATING_TASK_TYPES
                 if (
                     provider_failure
