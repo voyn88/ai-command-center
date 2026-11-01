@@ -23,10 +23,17 @@ persistent scheduling or the telemetry work remaining in PR #1002.
 Grok has at most 12 response turns, 4 tools per response, 4096 output tokens per
 response and 45 seconds per shell invocation. Its cumulative 60000-token guard
 is checked before executing more tools after a response; it is not a hard
-provider billing cap. The enclosing broker owns run timeout and descendant
-cleanup. Model-only requests send an empty tool list and reject tool calls.
-Provider HTTP diagnostics omit response bodies. Successful reports and quoted
-stdout quota messages do not open a cooldown.
+provider billing cap. Soft tool ceiling keeps a 4096-token reserve for at most
+one tools-disabled compact checkpoint summary; hard ceiling or unknown usage
+skips that call. Oversized batches execute the first 4 shell calls and append
+protocol-valid refusals for the rest. Budget, no-progress, incomplete-provider,
+and post-progress transport failures emit a deterministic `AICC_PARTIAL_RESULT`
+on stdout with a distinct `AICC_STOP` reason on stderr and exit 1 — never a
+successful completion. Pending function calls are refused before any optional
+summary so the protocol stays valid. The enclosing broker owns run timeout and
+descendant cleanup. Model-only requests send an empty tool list and reject tool
+calls. Provider HTTP diagnostics omit response bodies. Successful reports and
+quoted stdout quota messages do not open a cooldown.
 
 ## Rollout verification
 

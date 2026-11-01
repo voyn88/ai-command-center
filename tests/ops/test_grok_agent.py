@@ -1,6 +1,7 @@
 import importlib.util
 import io
 import json
+import socket
 from pathlib import Path
 
 import pytest
@@ -126,12 +127,23 @@ def test_token_budget_emits_partial_not_success(monkeypatch, capsys):
     # First response already consumes the soft tool ceiling; tools must not run.
     soft = module.MAX_TOTAL_TOKENS - module.SUMMARY_RESERVE_TOKENS
     calls = {'n': 0}
+    summary_items = []
     def completion(key, model, items, tools=True):
         calls['n'] += 1
         if tools:
             return {'status': 'completed', 'usage': {'total_tokens': soft}, 'output': [
                 {'type': 'function_call', 'name': 'shell', 'call_id': 'c1',
-                 'arguments': '{"command":"echo should-not-run"}'}]}
+                 'arguments': '{"command":"echo should-not-run"}'},
+                {'type': 'function_call', 'name': 'shell', 'call_id': 'c2',
+                 'arguments': '{"command":"echo also-refused"}'}]}
+        # Soft-limit path must refuse pending calls before summary, and summary
+        # must be compact checkpoint-only (not the full accumulated history).
+        summary_items.append(items)
+        outputs = [item for item in items if item.get('type') == 'function_call_output']
+        assert outputs == []  # compact summary must not carry prior protocol history
+        text_blob = json.dumps(items)
+        assert 'echo should-not-run' not in text_blob
+        assert 'AICC_PARTIAL_RESULT' in text_blob
         return {'status': 'completed', 'usage': {'total_tokens': 10}, 'output': [
             {'type': 'message', 'content': [{'type': 'output_text',
              'text': 'model partial: stopped on budget'}]}]}
@@ -140,11 +152,13 @@ def test_token_budget_emits_partial_not_success(monkeypatch, capsys):
     code = module.run('task', 'grok-4.3')
     assert code == 1
     assert calls['n'] == 2  # one tool-bearing turn + one reserved summary
+    assert len(summary_items) == 1
     captured = capsys.readouterr()
     assert 'model partial: stopped on budget' in captured.out
     assert 'AICC_LOCAL_PARTIAL_CHECKPOINT' in captured.out
     assert 'AICC_PARTIAL_RESULT' in captured.out
     assert 'AICC_STOP: reason=token_budget' in captured.err
+    assert 'tools_refused=2' in captured.err
     assert 'usage_unknown=false' in captured.err
 
 
@@ -163,6 +177,7 @@ def test_missing_usage_is_not_treated_as_zero(monkeypatch, capsys):
     assert 'AICC_STOP: reason=usage_unknown' in captured.err
     assert 'usage_tokens=unknown' in captured.err
     assert 'usage_unknown=true' in captured.err
+    assert 'tools_refused=1' in captured.err
     assert 'AICC_PARTIAL_RESULT' in captured.out
     assert code != 0
 
@@ -202,6 +217,7 @@ def test_hard_token_cap_skips_summary_and_keeps_local_partial(monkeypatch, capsy
     assert code == 1
     captured = capsys.readouterr()
     assert 'AICC_STOP: reason=token_budget' in captured.err
+    assert 'tools_refused=1' in captured.err
     assert 'AICC_PARTIAL_RESULT' in captured.out
     assert 'AICC_LOCAL_PARTIAL_CHECKPOINT' not in captured.out  # no model summary
     assert 'model partial' not in captured.out
@@ -228,3 +244,165 @@ def test_budget_stop_stderr_is_not_exact_provider_http_line(monkeypatch, capsys)
     assert 'AICC_STOP: reason=token_budget' in err
     # Unchanged exhausted tasks must not look like provider quota for automatic retry/failover.
     assert err.splitlines()[0].startswith('AICC_STOP:')
+
+
+def test_soft_budget_refuses_pending_calls_before_summary(monkeypatch, capsys):
+    """Soft ceiling must append function_call_output refusals before tools-disabled summary."""
+    module = driver()
+    _isolate(module, monkeypatch)
+    soft = module.MAX_TOTAL_TOKENS - module.SUMMARY_RESERVE_TOKENS
+    seen_refusals = []
+    def completion(key, model, items, tools=True):
+        if tools:
+            return {'status': 'completed', 'usage': {'total_tokens': soft}, 'output': [
+                {'type': 'function_call', 'name': 'shell', 'call_id': 'pending-a',
+                 'arguments': '{"command":"echo a"}'},
+                {'type': 'function_call', 'name': 'shell', 'call_id': 'pending-b',
+                 'arguments': '{"command":"echo b"}'}]}
+        # Compact summary items are checkpoint-only; refusals live on the driver
+        # history that was closed before this call. Probe via tools_refused stderr.
+        return {'status': 'completed', 'usage': {'total_tokens': 8}, 'output': [
+            {'type': 'message', 'content': [{'type': 'output_text', 'text': 'compact ok'}]}]}
+    monkeypatch.setattr(module, 'completion', completion)
+    monkeypatch.setattr(module, 'shell', lambda _: pytest.fail('soft budget must refuse, not run'))
+    # Capture refusals by wrapping _append_call_refusals side effect through items:
+    # re-run path asserts tools_refused on stderr; also check helper via spy.
+    original = module._append_call_refusals
+    def spy(items, calls, key, *, reason, limit):
+        count = original(items, calls, key, reason=reason, limit=limit)
+        seen_refusals.extend(
+            json.loads(item['output'])
+            for item in items
+            if item.get('type') == 'function_call_output'
+        )
+        return count
+    monkeypatch.setattr(module, '_append_call_refusals', spy)
+    code = module.run('task', 'grok-4.3')
+    assert code == 1
+    assert len(seen_refusals) == 2
+    assert all(entry.get('error') == 'tool_budget_refused' for entry in seen_refusals)
+    assert all(entry.get('reason') == 'token_budget' for entry in seen_refusals)
+    captured = capsys.readouterr()
+    assert 'tools_refused=2' in captured.err
+    assert 'AICC_PARTIAL_RESULT' in captured.out
+    assert code != 0
+
+
+def test_summary_timeout_preserves_local_partial(monkeypatch, capsys):
+    """OSError/TimeoutError during optional summary must not erase the local partial."""
+    module = driver()
+    _isolate(module, monkeypatch)
+    soft = module.MAX_TOTAL_TOKENS - module.SUMMARY_RESERVE_TOKENS
+    def completion(key, model, items, tools=True):
+        if tools:
+            return {'status': 'completed', 'usage': {'total_tokens': soft}, 'output': [
+                {'type': 'function_call', 'name': 'shell', 'call_id': 'c1',
+                 'arguments': '{"command":"true"}'}]}
+        raise TimeoutError('summary timed out')
+    monkeypatch.setattr(module, 'completion', completion)
+    monkeypatch.setattr(module, 'shell', lambda _: pytest.fail('no tools'))
+    code = module.run('task', 'grok-4.3')
+    assert code == 1
+    captured = capsys.readouterr()
+    assert 'AICC_PARTIAL_RESULT' in captured.out
+    assert 'AICC_STOP: reason=token_budget' in captured.err
+    assert 'TimeoutError' not in captured.err.splitlines()[0]
+    assert captured.err.strip() != 'TimeoutError'
+
+
+def test_provider_oserror_after_tools_emits_partial(monkeypatch, capsys):
+    """Network OSError after tool progress must emit honest partial, exit 1, no retry."""
+    module = driver()
+    _isolate(module, monkeypatch)
+    calls = {'n': 0}
+    def completion(key, model, items, tools=True):
+        calls['n'] += 1
+        if calls['n'] == 1:
+            return {'status': 'completed', 'usage': {'total_tokens': 40}, 'output': [
+                {'type': 'function_call', 'name': 'shell', 'call_id': 'c1',
+                 'arguments': '{"command":"echo progressed"}'}]}
+        raise OSError('network down')
+    monkeypatch.setattr(module, 'completion', completion)
+    monkeypatch.setattr(module, 'shell', lambda _: '{"exit_code":0,"output":"ok"}')
+    code = module.run('task', 'grok-4.3')
+    assert code == 1
+    assert calls['n'] == 2  # no unbounded retry
+    captured = capsys.readouterr()
+    assert 'AICC_PARTIAL_RESULT' in captured.out
+    assert 'AICC_STOP: reason=run_error' in captured.err
+    assert 'failure_class=OSError' in captured.err
+    assert 'tools_executed=1' in captured.err
+    assert 'echo progressed' in captured.out
+    assert code != 0
+
+
+def test_incomplete_after_progress_emits_partial_not_success(monkeypatch, capsys):
+    """Incomplete provider response with prior tool progress → honest partial, never success."""
+    module = driver()
+    _isolate(module, monkeypatch)
+    calls = {'n': 0}
+    def completion(key, model, items, tools=True):
+        calls['n'] += 1
+        if calls['n'] == 1:
+            return {'status': 'completed', 'usage': {'total_tokens': 30}, 'output': [
+                {'type': 'function_call', 'name': 'shell', 'call_id': 'c1',
+                 'arguments': '{"command":"echo prior"}'}]}
+        return {'status': 'incomplete', 'usage': {'total_tokens': 5},
+                'output': [{'type': 'message', 'content': [{'type': 'output_text', 'text': 'x'}]}]}
+    monkeypatch.setattr(module, 'completion', completion)
+    monkeypatch.setattr(module, 'shell', lambda _: '{"exit_code":0,"output":"ok"}')
+    code = module.run('task', 'grok-4.3')
+    assert code == 1
+    captured = capsys.readouterr()
+    assert 'AICC_PARTIAL_RESULT' in captured.out
+    assert 'AICC_STOP: reason=provider_incomplete' in captured.err
+    assert 'failure_class=incomplete_status' in captured.err
+    assert 'ACCEPT' not in captured.out
+    assert 'AICC_STOP: reason=completed' not in captured.err
+
+
+def test_shell_timeout_after_progress_emits_partial(monkeypatch, capsys):
+    """Shell timeout mid-batch after earlier progress preserves local partial."""
+    module = driver()
+    _isolate(module, monkeypatch)
+    def completion(key, model, items, tools=True):
+        return {'status': 'completed', 'usage': {'total_tokens': 25}, 'output': [
+            {'type': 'function_call', 'name': 'shell', 'call_id': 'c1',
+             'arguments': '{"command":"echo one"}'},
+            {'type': 'function_call', 'name': 'shell', 'call_id': 'c2',
+             'arguments': '{"command":"echo two"}'}]}
+    executed = []
+    def shell(arguments):
+        executed.append(arguments)
+        if len(executed) == 1:
+            return '{"exit_code":0,"output":"one"}'
+        raise RuntimeError('shell timed out; stop this run')
+    monkeypatch.setattr(module, 'completion', completion)
+    monkeypatch.setattr(module, 'shell', shell)
+    code = module.run('task', 'grok-4.3')
+    assert code == 1
+    assert len(executed) == 2
+    captured = capsys.readouterr()
+    assert 'AICC_PARTIAL_RESULT' in captured.out
+    assert 'AICC_STOP: reason=run_error' in captured.err
+    assert 'failure_class=RuntimeError' in captured.err
+    assert 'echo one' in captured.out
+
+
+def test_urlerror_during_summary_preserves_partial(monkeypatch, capsys):
+    module = driver()
+    _isolate(module, monkeypatch)
+    soft = module.MAX_TOTAL_TOKENS - module.SUMMARY_RESERVE_TOKENS
+    def completion(key, model, items, tools=True):
+        if tools:
+            return {'status': 'completed', 'usage': {'total_tokens': soft}, 'output': [
+                {'type': 'function_call', 'name': 'shell', 'call_id': 'c1',
+                 'arguments': '{"command":"true"}'}]}
+        raise module.urllib.error.URLError(socket.gaierror('dns failed'))
+    monkeypatch.setattr(module, 'completion', completion)
+    monkeypatch.setattr(module, 'shell', lambda _: pytest.fail('no tools'))
+    code = module.run('task', 'grok-4.3')
+    assert code == 1
+    captured = capsys.readouterr()
+    assert 'AICC_PARTIAL_RESULT' in captured.out
+    assert 'AICC_STOP: reason=token_budget' in captured.err

@@ -22,6 +22,8 @@ MAX_TOOLS_PER_TURN = 4
 SUMMARY_RESERVE_TOKENS = 4096
 MAX_IDENTICAL_TOOL_REPEATS = 3
 MAX_OUTPUT_TOKENS = 4096
+# Compact summary input must fit inside the reserve (prompt + checkpoint + output).
+SUMMARY_CHECKPOINT_CHARS = 2400
 
 SHELL = {'type': 'function', 'name': 'shell',
          'description': 'Run a bounded shell command in the assigned repository. Read files, edit, test and commit here. Never push or change remotes.',
@@ -34,6 +36,11 @@ STOP_TOKEN_BUDGET = 'token_budget'
 STOP_TURN_BUDGET = 'turn_budget'
 STOP_NO_PROGRESS = 'no_progress'
 STOP_USAGE_UNKNOWN = 'usage_unknown'
+STOP_PROVIDER_INCOMPLETE = 'provider_incomplete'
+STOP_RUN_ERROR = 'run_error'
+
+# Summary/provider failures that must not erase a local partial after progress.
+_SUMMARY_TRANSPORT_ERRORS = (RuntimeError, OSError, TimeoutError, urllib.error.URLError)
 
 
 def completion(key: str, model: str, items: list, tools: bool = True) -> dict:
@@ -108,6 +115,29 @@ def _tool_refusal_output(reason: str, limit: int) -> str:
     }, sort_keys=True)
 
 
+def _append_call_refusals(
+    items: list,
+    calls: list,
+    key: str,
+    *,
+    reason: str,
+    limit: int,
+) -> int:
+    """Append protocol-valid outputs for every pending function_call. Returns count."""
+    refused = 0
+    for call in calls:
+        call_id = call.get('call_id')
+        if not isinstance(call_id, str) or not call_id:
+            raise RuntimeError('function_call missing call_id')
+        items.append({
+            'type': 'function_call_output',
+            'call_id': call_id,
+            'output': _redact(_tool_refusal_output(reason, limit), key),
+        })
+        refused += 1
+    return refused
+
+
 def _redact(text: str, key: str) -> str:
     return text.replace(key, '[REDACTED]') if key else text
 
@@ -121,8 +151,10 @@ def _emit_usage_and_stop(
     spent: int,
     usage_unknown: bool,
     identical_streak: int,
+    failure_class: str = '',
 ) -> None:
     # Diagnostics only — never secrets, never provider bodies.
+    failure_part = f' failure_class={failure_class}' if failure_class else ''
     print(
         f'AICC_STOP: reason={reason} turns={turns} tools_executed={tools_executed} '
         f'tools_refused={tools_refused} usage_tokens={spent if not usage_unknown else "unknown"} '
@@ -130,7 +162,8 @@ def _emit_usage_and_stop(
         f'identical_streak={identical_streak} '
         f'max_turns={MAX_TURNS} max_total_tokens={MAX_TOTAL_TOKENS} '
         f'max_tools_per_turn={MAX_TOOLS_PER_TURN} '
-        f'summary_reserve_tokens={SUMMARY_RESERVE_TOKENS}',
+        f'summary_reserve_tokens={SUMMARY_RESERVE_TOKENS}'
+        f'{failure_part}',
         file=sys.stderr,
     )
     print(
@@ -150,6 +183,7 @@ def _local_partial_report(
     spent: int,
     usage_unknown: bool,
     tool_trace: list[str],
+    failure_class: str = '',
 ) -> str:
     lines = [
         'AICC_PARTIAL_RESULT',
@@ -160,12 +194,16 @@ def _local_partial_report(
         f'tools_refused: {tools_refused}',
         f'usage_tokens: {"unknown" if usage_unknown else spent}',
         f'usage_unknown: {"true" if usage_unknown else "false"}',
-        'note: Driver stopped before a completed final model report. '
-        'Executed tool side effects (if any) remain in the workspace. '
-        'This is not a successful completion.',
+        (
+            'note: Driver stopped before a completed final model report. '
+            'Executed tool side effects (if any) remain in the workspace. '
+            'This is not a successful completion.'
+        ),
         '',
         '## Tool trace (arguments truncated, secrets redacted)',
     ]
+    if failure_class:
+        lines.insert(3, f'failure_class: {failure_class}')
     if tool_trace:
         lines.extend(f'{index}. {entry}' for index, entry in enumerate(tool_trace, start=1))
     else:
@@ -176,13 +214,17 @@ def _local_partial_report(
 def _try_final_summary(
     key: str,
     model: str,
-    items: list,
     *,
     spent: int,
     usage_unknown: bool,
     reason: str,
+    checkpoint: str,
 ) -> tuple[str | None, int, bool]:
-    """At most one tools-disabled summary attempt when reserve remains.
+    """At most one tools-disabled compact summary when reserve remains.
+
+    Sends a bounded checkpoint-only prompt — never the full tool history — so
+    SUMMARY_RESERVE_TOKENS remains meaningful for input+output. Hard caps and
+    unknown usage skip the call entirely (deterministic local report is enough).
 
     Returns (summary_text_or_None, spent, usage_unknown).
     """
@@ -191,16 +233,29 @@ def _try_final_summary(
     remaining = MAX_TOTAL_TOKENS - spent
     if remaining <= 0:
         return None, spent, usage_unknown
-    prompt = (
-        'The driver is stopping with reason '
-        f'{reason}. Produce a brief truthful partial summary of progress so far. '
-        'Do not claim the task completed successfully. Do not request tools.'
+    bounded = checkpoint if len(checkpoint) <= SUMMARY_CHECKPOINT_CHARS else (
+        checkpoint[:SUMMARY_CHECKPOINT_CHARS] + '\n…[checkpoint truncated]'
     )
-    summary_items = list(items)
-    summary_items.append({'role': 'user', 'content': prompt})
+    prompt = (
+        f'The driver is stopping with reason {reason}. '
+        'Below is the deterministic local checkpoint only. '
+        'Produce a brief truthful partial summary of that progress. '
+        'Do not claim the task completed successfully. Do not request tools.\n\n'
+        f'{bounded}'
+    )
+    summary_items = [
+        {
+            'role': 'system',
+            'content': (
+                'Summarize only the supplied checkpoint. Be brief. '
+                'Never claim success. Never request tools.'
+            ),
+        },
+        {'role': 'user', 'content': prompt},
+    ]
     try:
         response = completion(key, model, summary_items, tools=False)
-    except RuntimeError:
+    except _SUMMARY_TRANSPORT_ERRORS:
         return None, spent, usage_unknown
     tokens = _parse_usage_tokens(response)
     if tokens is None:
@@ -222,7 +277,6 @@ def _try_final_summary(
 def _finish_partial(
     key: str,
     model: str,
-    items: list,
     *,
     reason: str,
     turns: int,
@@ -233,12 +287,10 @@ def _finish_partial(
     identical_streak: int,
     tool_trace: list[str],
     attempt_summary: bool,
+    failure_class: str = '',
 ) -> int:
-    summary = None
-    if attempt_summary:
-        summary, spent, usage_unknown = _try_final_summary(
-            key, model, items, spent=spent, usage_unknown=usage_unknown, reason=reason,
-        )
+    # Build the durable local partial first so provider/summary/network failure
+    # cannot erase the report after tool progress.
     local = _local_partial_report(
         reason=reason,
         turns=turns,
@@ -247,10 +299,32 @@ def _finish_partial(
         spent=spent,
         usage_unknown=usage_unknown,
         tool_trace=tool_trace,
+        failure_class=failure_class,
     )
+    summary = None
+    if attempt_summary:
+        summary, spent, usage_unknown = _try_final_summary(
+            key,
+            model,
+            spent=spent,
+            usage_unknown=usage_unknown,
+            reason=reason,
+            checkpoint=local,
+        )
+        # Refresh spent/usage lines after an optional summary attempt.
+        local = _local_partial_report(
+            reason=reason,
+            turns=turns,
+            tools_executed=tools_executed,
+            tools_refused=tools_refused,
+            spent=spent,
+            usage_unknown=usage_unknown,
+            tool_trace=tool_trace,
+            failure_class=failure_class,
+        )
     if summary:
         print(_redact(summary, key))
-        print('')
+        print()
         print('---')
         print('AICC_LOCAL_PARTIAL_CHECKPOINT (deterministic; run did not complete successfully)')
         print(_redact(local, key))
@@ -264,9 +338,14 @@ def _finish_partial(
         spent=spent,
         usage_unknown=usage_unknown,
         identical_streak=identical_streak,
+        failure_class=failure_class,
     )
     # Non-zero: partial/budget/guard stops are never successful completion.
     return 1
+
+
+def _has_progress(tools_executed: int, tool_trace: list[str], tools_refused: int) -> bool:
+    return tools_executed > 0 or bool(tool_trace) or tools_refused > 0
 
 
 def run(prompt: str, model: str, tools: bool = True) -> int:
@@ -284,122 +363,131 @@ def run(prompt: str, model: str, tools: bool = True) -> int:
     tool_trace: list[str] = []
     identical_streak = 0
     last_signature: str | None = None
+    turn = 0
     tool_budget_ceiling = max(0, MAX_TOTAL_TOKENS - SUMMARY_RESERVE_TOKENS)
 
-    for turn in range(1, MAX_TURNS + 1):
-        response = completion(key, model, items, tools)
-        tokens = _parse_usage_tokens(response)
-        if tokens is None:
-            usage_unknown = True
-        else:
-            spent += tokens
-        output = response.get('output', [])
-        if not isinstance(output, list) or not output:
-            raise RuntimeError('provider returned no output')
-        if response.get('status') != 'completed':
-            raise RuntimeError('provider response incomplete')
-        items.extend(output)
-        calls = [item for item in output if item.get('type') == 'function_call']
-        if calls and not tools:
-            raise RuntimeError('tools are disabled for this review')
-        if not calls:
-            text = _message_text(output)
-            if not text.strip():
-                raise RuntimeError('provider returned no final report')
-            print(_redact(text, key))
-            _emit_usage_and_stop(
-                reason=STOP_COMPLETED,
-                turns=turn,
-                tools_executed=tools_executed,
-                tools_refused=tools_refused,
-                spent=spent,
-                usage_unknown=usage_unknown,
-                identical_streak=identical_streak,
-            )
-            return 0
-
-        # After a tool-bearing response: decide whether more tools may run.
-        if usage_unknown:
-            return _finish_partial(
-                key, model, items,
-                reason=STOP_USAGE_UNKNOWN,
-                turns=turn,
-                tools_executed=tools_executed,
-                tools_refused=tools_refused,
-                spent=spent,
-                usage_unknown=usage_unknown,
-                identical_streak=identical_streak,
-                tool_trace=tool_trace,
-                attempt_summary=False,
-            )
-        if spent >= MAX_TOTAL_TOKENS:
-            return _finish_partial(
-                key, model, items,
-                reason=STOP_TOKEN_BUDGET,
-                turns=turn,
-                tools_executed=tools_executed,
-                tools_refused=tools_refused,
-                spent=spent,
-                usage_unknown=usage_unknown,
-                identical_streak=identical_streak,
-                tool_trace=tool_trace,
-                attempt_summary=False,
-            )
-        if spent >= tool_budget_ceiling:
-            # Preserve progress; one reserved summary attempt only.
-            return _finish_partial(
-                key, model, items,
-                reason=STOP_TOKEN_BUDGET,
-                turns=turn,
-                tools_executed=tools_executed,
-                tools_refused=tools_refused,
-                spent=spent,
-                usage_unknown=usage_unknown,
-                identical_streak=identical_streak,
-                tool_trace=tool_trace,
-                attempt_summary=True,
-            )
-
-        for index, call in enumerate(calls):
-            name = call.get('name')
-            if name != 'shell':
-                raise RuntimeError('unsupported tool')
-            call_id = call['call_id']
-            arguments = call.get('arguments', '')
-            signature = _call_signature(call)
-            if index >= MAX_TOOLS_PER_TURN:
-                # Do not discard the whole batch: refuse excess with valid protocol outputs.
-                tools_refused += 1
-                items.append({
-                    'type': 'function_call_output',
-                    'call_id': call_id,
-                    'output': _redact(
-                        _tool_refusal_output('max_tools_per_turn', MAX_TOOLS_PER_TURN),
-                        key,
-                    ),
-                })
-                continue
-
-            if last_signature is not None and signature == last_signature:
-                identical_streak += 1
+    try:
+        for turn in range(1, MAX_TURNS + 1):
+            response = completion(key, model, items, tools)
+            tokens = _parse_usage_tokens(response)
+            if tokens is None:
+                usage_unknown = True
             else:
-                identical_streak = 1
-                last_signature = signature
-            if identical_streak > MAX_IDENTICAL_TOOL_REPEATS:
-                # Keep protocol valid for this and any remaining calls in the batch.
-                for pending in calls[index:]:
-                    tools_refused += 1
-                    items.append({
-                        'type': 'function_call_output',
-                        'call_id': pending['call_id'],
-                        'output': _redact(
-                            _tool_refusal_output('no_progress', MAX_IDENTICAL_TOOL_REPEATS),
-                            key,
-                        ),
-                    })
+                spent += tokens
+            output = response.get('output', [])
+            if not isinstance(output, list) or not output:
+                if _has_progress(tools_executed, tool_trace, tools_refused):
+                    return _finish_partial(
+                        key, model,
+                        reason=STOP_PROVIDER_INCOMPLETE,
+                        turns=turn,
+                        tools_executed=tools_executed,
+                        tools_refused=tools_refused,
+                        spent=spent,
+                        usage_unknown=usage_unknown,
+                        identical_streak=identical_streak,
+                        tool_trace=tool_trace,
+                        attempt_summary=False,
+                        failure_class='empty_output',
+                    )
+                raise RuntimeError('provider returned no output')
+            if response.get('status') != 'completed':
+                if _has_progress(tools_executed, tool_trace, tools_refused):
+                    return _finish_partial(
+                        key, model,
+                        reason=STOP_PROVIDER_INCOMPLETE,
+                        turns=turn,
+                        tools_executed=tools_executed,
+                        tools_refused=tools_refused,
+                        spent=spent,
+                        usage_unknown=usage_unknown,
+                        identical_streak=identical_streak,
+                        tool_trace=tool_trace,
+                        attempt_summary=False,
+                        failure_class='incomplete_status',
+                    )
+                raise RuntimeError('provider response incomplete')
+            items.extend(output)
+            calls = [item for item in output if item.get('type') == 'function_call']
+            if calls and not tools:
+                raise RuntimeError('tools are disabled for this review')
+            if not calls:
+                text = _message_text(output)
+                if not text.strip():
+                    if _has_progress(tools_executed, tool_trace, tools_refused):
+                        return _finish_partial(
+                            key, model,
+                            reason=STOP_PROVIDER_INCOMPLETE,
+                            turns=turn,
+                            tools_executed=tools_executed,
+                            tools_refused=tools_refused,
+                            spent=spent,
+                            usage_unknown=usage_unknown,
+                            identical_streak=identical_streak,
+                            tool_trace=tool_trace,
+                            attempt_summary=False,
+                            failure_class='empty_final_report',
+                        )
+                    raise RuntimeError('provider returned no final report')
+                print(_redact(text, key))
+                _emit_usage_and_stop(
+                    reason=STOP_COMPLETED,
+                    turns=turn,
+                    tools_executed=tools_executed,
+                    tools_refused=tools_refused,
+                    spent=spent,
+                    usage_unknown=usage_unknown,
+                    identical_streak=identical_streak,
+                )
+                return 0
+
+            # After a tool-bearing response: decide whether more tools may run.
+            if usage_unknown:
+                tools_refused += _append_call_refusals(
+                    items, calls, key,
+                    reason='usage_unknown',
+                    limit=0,
+                )
                 return _finish_partial(
-                    key, model, items,
-                    reason=STOP_NO_PROGRESS,
+                    key, model,
+                    reason=STOP_USAGE_UNKNOWN,
+                    turns=turn,
+                    tools_executed=tools_executed,
+                    tools_refused=tools_refused,
+                    spent=spent,
+                    usage_unknown=usage_unknown,
+                    identical_streak=identical_streak,
+                    tool_trace=tool_trace,
+                    attempt_summary=False,
+                )
+            if spent >= MAX_TOTAL_TOKENS:
+                tools_refused += _append_call_refusals(
+                    items, calls, key,
+                    reason='token_budget',
+                    limit=MAX_TOTAL_TOKENS,
+                )
+                return _finish_partial(
+                    key, model,
+                    reason=STOP_TOKEN_BUDGET,
+                    turns=turn,
+                    tools_executed=tools_executed,
+                    tools_refused=tools_refused,
+                    spent=spent,
+                    usage_unknown=usage_unknown,
+                    identical_streak=identical_streak,
+                    tool_trace=tool_trace,
+                    attempt_summary=False,
+                )
+            if spent >= tool_budget_ceiling:
+                # Refuse all pending calls before any tools-disabled summary.
+                tools_refused += _append_call_refusals(
+                    items, calls, key,
+                    reason='token_budget',
+                    limit=tool_budget_ceiling,
+                )
+                return _finish_partial(
+                    key, model,
+                    reason=STOP_TOKEN_BUDGET,
                     turns=turn,
                     tools_executed=tools_executed,
                     tools_refused=tools_refused,
@@ -410,29 +498,115 @@ def run(prompt: str, model: str, tools: bool = True) -> int:
                     attempt_summary=True,
                 )
 
-            preview = arguments if isinstance(arguments, str) else str(arguments)
-            if len(preview) > 200:
-                preview = preview[:200] + '…'
-            tool_trace.append(_redact(f'shell {preview}', key))
-            items.append({
-                'type': 'function_call_output',
-                'call_id': call_id,
-                'output': _redact(shell(arguments), key),
-            })
-            tools_executed += 1
+            for index, call in enumerate(calls):
+                name = call.get('name')
+                if name != 'shell':
+                    raise RuntimeError('unsupported tool')
+                call_id = call['call_id']
+                arguments = call.get('arguments', '')
+                signature = _call_signature(call)
+                if index >= MAX_TOOLS_PER_TURN:
+                    # Do not discard the whole batch: refuse excess with valid protocol outputs.
+                    tools_refused += 1
+                    items.append({
+                        'type': 'function_call_output',
+                        'call_id': call_id,
+                        'output': _redact(
+                            _tool_refusal_output('max_tools_per_turn', MAX_TOOLS_PER_TURN),
+                            key,
+                        ),
+                    })
+                    continue
 
-    return _finish_partial(
-        key, model, items,
-        reason=STOP_TURN_BUDGET,
-        turns=MAX_TURNS,
-        tools_executed=tools_executed,
-        tools_refused=tools_refused,
-        spent=spent,
-        usage_unknown=usage_unknown,
-        identical_streak=identical_streak,
-        tool_trace=tool_trace,
-        attempt_summary=True,
-    )
+                if last_signature is not None and signature == last_signature:
+                    identical_streak += 1
+                else:
+                    identical_streak = 1
+                    last_signature = signature
+                if identical_streak > MAX_IDENTICAL_TOOL_REPEATS:
+                    # Keep protocol valid for this and any remaining calls in the batch.
+                    for pending in calls[index:]:
+                        tools_refused += 1
+                        items.append({
+                            'type': 'function_call_output',
+                            'call_id': pending['call_id'],
+                            'output': _redact(
+                                _tool_refusal_output('no_progress', MAX_IDENTICAL_TOOL_REPEATS),
+                                key,
+                            ),
+                        })
+                    return _finish_partial(
+                        key, model,
+                        reason=STOP_NO_PROGRESS,
+                        turns=turn,
+                        tools_executed=tools_executed,
+                        tools_refused=tools_refused,
+                        spent=spent,
+                        usage_unknown=usage_unknown,
+                        identical_streak=identical_streak,
+                        tool_trace=tool_trace,
+                        attempt_summary=True,
+                    )
+
+                preview = arguments if isinstance(arguments, str) else str(arguments)
+                if len(preview) > 200:
+                    preview = preview[:200] + '…'
+                tool_trace.append(_redact(f'shell {preview}', key))
+                items.append({
+                    'type': 'function_call_output',
+                    'call_id': call_id,
+                    'output': _redact(shell(arguments), key),
+                })
+                tools_executed += 1
+
+        return _finish_partial(
+            key, model,
+            reason=STOP_TURN_BUDGET,
+            turns=MAX_TURNS,
+            tools_executed=tools_executed,
+            tools_refused=tools_refused,
+            spent=spent,
+            usage_unknown=usage_unknown,
+            identical_streak=identical_streak,
+            tool_trace=tool_trace,
+            attempt_summary=True,
+        )
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except _SUMMARY_TRANSPORT_ERRORS as exc:
+        if _has_progress(tools_executed, tool_trace, tools_refused):
+            return _finish_partial(
+                key, model,
+                reason=STOP_RUN_ERROR,
+                turns=turn,
+                tools_executed=tools_executed,
+                tools_refused=tools_refused,
+                spent=spent,
+                usage_unknown=usage_unknown,
+                identical_streak=identical_streak,
+                tool_trace=tool_trace,
+                attempt_summary=False,
+                failure_class=type(exc).__name__,
+            )
+        raise
+    except Exception as exc:
+        # Unexpected driver/shell errors after progress: honest partial, never success.
+        # Do not retry. KeyboardInterrupt/SystemExit are not caught here.
+        if _has_progress(tools_executed, tool_trace, tools_refused):
+            return _finish_partial(
+                key, model,
+                reason=STOP_RUN_ERROR,
+                turns=turn,
+                tools_executed=tools_executed,
+                tools_refused=tools_refused,
+                spent=spent,
+                usage_unknown=usage_unknown,
+                identical_streak=identical_streak,
+                tool_trace=tool_trace,
+                attempt_summary=False,
+                failure_class=type(exc).__name__,
+            )
+        raise
 
 
 def main() -> int:
@@ -443,6 +617,8 @@ def main() -> int:
     args = parser.parse_args()
     try:
         return run(args.prompt, args.model, tools=not args.no_tools)
+    except (KeyboardInterrupt, SystemExit):
+        raise
     except Exception as exc:  # noqa: BLE001 -- CLI boundary must redact unexpected errors
         # Error type/detail only for our own safe exceptions, never raw payloads.
         print(str(exc) if isinstance(exc, RuntimeError) else type(exc).__name__, file=sys.stderr)
