@@ -328,6 +328,22 @@ done < "$secret_manifest"
 python3 "$repo_root/ops/aicc_staged_worker_rollout.py" verify \
   --lanes "$lane_registry" || fail "worker lane readiness or UID isolation failed"
 
+# Lane-input probe (VOYN-W0-AICC-OPT-AICC-GROUP-WRITABLE-BREAKS-LAUNCHER):
+# /opt/aicc itself is an executor path component. A group-writable release
+# root (the 2775 hand-fix of 2026-09-11) makes the launcher refuse every
+# toolchain binary before any task runs. Measure the same invariant the
+# launcher enforces, as a rollout input, not after lanes are already dead.
+[ -d /opt/aicc ] || fail "/opt/aicc is missing"
+[ "$(stat -c %u /opt/aicc)" -eq 0 ] || fail "/opt/aicc is not root-owned"
+if find /opt/aicc -maxdepth 0 -perm /022 -print -quit | grep -q .; then
+  fail "/opt/aicc is group/other-writable (launcher would refuse every executor)"
+fi
+# Exact mode: the 2775 hand-fix carried setgid+group-write. Anything other
+# than plain 0755 is a lane-input failure even if the write bits are clear.
+opt_aicc_mode=$(stat -c %a /opt/aicc)
+[ "$opt_aicc_mode" = 755 ] || \
+  fail "/opt/aicc mode is not 0755 (got $opt_aicc_mode); launcher immutability requires root-owned 0755"
+
 toolchain_bin=/opt/aicc/toolchains/current/bin
 for tool in "$toolchain_bin/claude" "$toolchain_bin/codex" "$toolchain_bin/copilot"; do
   resolved=$(readlink -f -- "$tool")
@@ -336,6 +352,20 @@ for tool in "$toolchain_bin/claude" "$toolchain_bin/codex" "$toolchain_bin/copil
   if find "$resolved" -maxdepth 0 -perm /022 -print -quit | grep -q .; then
     fail "executor is group/world-writable: $tool"
   fi
+  # Walk every ancestor of both the link and its target the same way
+  # `_validate_binary` does: any group/other-writable component is a lane
+  # input failure, not a per-task cascade exhaustion.
+  for chain_start in "$tool" "$resolved"; do
+    component=$chain_start
+    while [ "$component" != / ]; do
+      component=$(dirname -- "$component")
+      [ "$(stat -c %u "$component")" -eq 0 ] || \
+        fail "executor path component is not root-owned: $component"
+      if find "$component" -maxdepth 0 -perm /022 -print -quit | grep -q .; then
+        fail "executor path component is group/other-writable: $component"
+      fi
+    done
+  done
 done
 
 echo "AICC_AGENT_PRINCIPAL_BOUNDARY_OK"

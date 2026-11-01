@@ -149,17 +149,33 @@ class WorkQueueStore:
         return bool(row["ok"])
 
     def fail_infra_wait(
-        self, work: ClaimedWork, *, reason: str, max_infra_waits: int = 20
+        self,
+        work: ClaimedWork,
+        *,
+        reason: str,
+        max_infra_waits: int = 20,
+        detail: dict[str, Any] | None = None,
     ) -> bool:
         """Report a host/launcher/provider infrastructure failure.
 
         Like ``fail_lease_wait``, this refunds the attempt spent by
         ``queue_claim`` and uses a separate bounded wait counter so broken
         infrastructure retries without consuming the task's own attempts.
+
+        ``detail`` is merged into the ``work_event`` audit row the refund
+        writes (0025): the wait counters alone say an attempt was refunded,
+        not WHICH executor was out of quota or how long this worker will
+        withhold it, and a refusal writes no result row to carry that.
         """
         row = self._call(
-            "SELECT * FROM queue_fail_infra_wait(%s, %s, %s, %s)",
-            (work.attempt_id, work.claim_token, reason, max_infra_waits),
+            "SELECT * FROM queue_fail_infra_wait(%s, %s, %s, %s, %s::jsonb)",
+            (
+                work.attempt_id,
+                work.claim_token,
+                reason,
+                max_infra_waits,
+                json.dumps(detail) if detail else None,
+            ),
         )
         return bool(row["ok"])
 

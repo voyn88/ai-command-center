@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from command_center import project_config
+from command_center.application.server_queue import (
+    ServerQueueClient,
+    create_server_queue_client,
+)
+from command_center.platform.preferences import DataSourceMode
 from command_center.runtime import db as runtime_db
 from command_center.runtime import scheduler
 from command_center.runtime.api import ExecutionCenterAPI
@@ -18,11 +25,18 @@ class OperationsAdapter:
         *,
         execution_center_api: ExecutionCenterAPI | None = None,
         workspace_home_adapter: WorkspaceHomeAdapter | None = None,
+        data_source_mode: Callable[[], DataSourceMode] | None = None,
+        server_queue_client: ServerQueueClient | None = None,
     ) -> None:
         self._workspace = workspace_home_adapter or WorkspaceHomeAdapter(
             execution_center_api=execution_center_api
         )
         self._api = self._workspace.execution_center_api
+        # Resolved lazily (a callable, not a captured value) so a Settings
+        # toggle flipped mid-session takes effect on the very next read
+        # without reconstructing this adapter (VOYN-W0-APP-CONTROL-S2).
+        self._data_source_mode = data_source_mode or (lambda: DataSourceMode.LOCAL)
+        self._server_queue_client = server_queue_client or create_server_queue_client()
 
     def sessions(self) -> list[dict]:
         runs = self._api.list_runs(limit=500)
@@ -46,6 +60,8 @@ class OperationsAdapter:
         return rows
 
     def execution(self) -> list[dict]:
+        if self._data_source_mode() is DataSourceMode.SERVER:
+            return self._server_execution_rows()
         snapshot = self._workspace.snapshot(
             active_runs_limit=100,
             recent_runs_limit=100,
@@ -54,6 +70,33 @@ class OperationsAdapter:
             reports_limit=0,
         )
         return [*snapshot.get("active_runs", []), *snapshot.get("recent_runs", [])]
+
+    def _server_execution_rows(self) -> list[dict]:
+        """The "server" toggle's read (VOYN-W0-APP-CONTROL-S2): the same
+        five-column shape the local branch returns (``project``, ``state``,
+        ``task_type``, ``run_id``, ``created_at`` — see
+        ``main_window.py``'s ``operational_columns["execution"]``), populated
+        from the preprod work queue instead of the local runtime. A queue
+        item carries no ``project``/``task_type`` of its own (those live in
+        the work item's payload, not the list view), so the queue name
+        stands in for ``task_type`` and the repository id (falling back to
+        the task id) stands in for ``project`` — an honest, if coarser,
+        identification of "what this row is about" rather than a fabricated
+        field. Raises :class:`ServerQueueError` on failure/misconfiguration;
+        the caller (``OperationalPage``) already renders that as its generic
+        load-error state, same as any other operational read failing.
+        """
+        items = self._server_queue_client.list_items(limit=200)
+        return [
+            {
+                "project": item.repository_id or item.task_id,
+                "state": item.state,
+                "task_type": item.queue,
+                "run_id": item.work_item_id,
+                "created_at": item.created_at,
+            }
+            for item in items
+        ]
 
     def git(self) -> list[dict]:
         snapshot = self._workspace.snapshot(

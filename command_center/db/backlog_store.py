@@ -39,8 +39,8 @@ class ProvenanceNotRecorded(RuntimeError):
     criterion is a property of every migrated row, and an import run that
     returns a cheerful ``inserted`` count covering a row with no audit trail
     is exactly the silent no-op this class exists to make impossible. The SQL
-    side (0037) refuses to commit such a row at all, so reaching this means
-    the store is talking to something that is not the 0037 function."""
+    side (0047) refuses to commit such a row at all, so reaching this means
+    the store is talking to something that is not the 0047 function."""
 
     def __init__(self, task_id: str) -> None:
         super().__init__(
@@ -107,6 +107,19 @@ class BacklogStore:
         ok, reason, revision = self._row(
             "SELECT * FROM backlog_transition(%s, %s, %s)",
             (task_id, to_status, expected_revision),
+        )
+        return bool(ok), str(reason or ""), revision
+
+    def reassign(
+        self,
+        task_id: str,
+        wave: str,
+        priority: str | None,
+        expected_revision: int,
+    ) -> tuple[bool, str, int | None]:
+        ok, reason, revision = self._row(
+            "SELECT * FROM backlog_reassign(%s, %s, %s, %s)",
+            (task_id, wave, priority, expected_revision),
         )
         return bool(ok), str(reason or ""), revision
 
@@ -380,7 +393,7 @@ class BacklogStore:
         migration gate's "existing records migrated with provenance"
         acceptance criterion): the Markdown line it was read from, recorded
         once, at the moment the row is created, in the SAME transaction as
-        the insert (0037). A later re-import of the same task updates the row
+        the insert (0047). A later re-import of the same task updates the row
         through this same path but never restamps it — the row was migrated
         once, not once per import run.
 
@@ -411,7 +424,7 @@ class BacklogStore:
         """Stamp rows this Markdown names that carry no provenance event yet,
         returning the ids actually stamped (sorted).
 
-        The reconciliation half of the guarantee, for rows 0037 cannot reach
+        The reconciliation half of the guarantee, for rows 0047 cannot reach
         retroactively: those inserted before the stamp existed at all, and
         those inserted during the window when it was a second, separate round
         trip that a crash between the two could lose. Idempotent — a second

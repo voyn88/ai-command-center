@@ -676,7 +676,19 @@ def _same_mutability_class(current_task_type: str, candidate_task_type: str) -> 
 def _local_executor_preflight(executor: str, task_type: str) -> tuple[bool, str, str]:
     exhausted_until = agent_runner.executor_exhausted_until(executor)
     if exhausted_until is not None:
-        return False, f"quota exhausted until {exhausted_until.isoformat()}", f"{executor} quota exhausted"
+        # The ACCOUNT is out of quota on this host, not the CLI missing from
+        # it (VOYN-W0-AICC-EXECUTOR-QUOTA-AWARE-ROUTING). Reported in the
+        # same shape as any other unavailability so the caller's existing
+        # search for a healthy cascade link skips this one INSIDE the
+        # delivery it already holds -- no attempt spent proving again what
+        # the last refusal already established, and if no link is healthy the
+        # refusal routes to the infra-wait refund below rather than to the
+        # task's own attempt budget.
+        return (
+            False,
+            f"quota exhausted until {exhausted_until.isoformat()}",
+            f"{executor} quota exhausted",
+        )
     if executor == "cursor" and task_type in agent_runner.MODEL_ONLY_TASK_TYPES:
         return False, "Cursor cannot guarantee zero tools", "model-only executor unavailable"
     if executor == "openai_http":
@@ -718,7 +730,7 @@ _PROVIDER_ID_FOR_EXECUTOR: dict[str, str] = {
 
 #: How long a fleet-wide mark keeps an executor out of routing (VOYN-W0-AICC-
 #: EXECUTOR-QUOTA-VISIBILITY). A COOLDOWN, not the provider's true reset time
-#: — see `0033_executor_availability.up.sql`'s own docstring: nothing on this
+#: — see `0043_executor_availability.up.sql`'s own docstring: nothing on this
 #: side of the CLI knows a monthly quota's actual reset instant. Quota gets
 #: the longest window (an hour) because the incident this closes was a
 #: monthly cap; the others are shorter guesses at how long a transient
@@ -809,6 +821,47 @@ def _classify_and_record_provider_failure(executor: str, run: agent_runner.RunRe
         except Exception:
             pass
     return reason
+def _quota_skip(executor: str, cascade_step: int | None) -> dict[str, Any] | None:
+    """The telemetry row for a cascade link skipped by an open quota circuit,
+    or `None` when this link's unavailability is not the circuit's doing.
+
+    Read back from `agent_runner` rather than threaded out of
+    `_executor_preflight`: the circuit is the authority on its own deadline,
+    and a link that is unavailable for some other reason (missing CLI, dead
+    sandbox) must not be reported as a quota skip.
+    """
+    exhausted_until = agent_runner.executor_exhausted_until(executor)
+    if exhausted_until is None:
+        return None
+    return {
+        "cascade_step": cascade_step,
+        "executor": executor,
+        "exhausted_until": exhausted_until.isoformat(),
+    }
+
+
+def _quota_detail(
+    exhausted: list[dict[str, Any]], skipped: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """The `work_event` detail for a refusal a quota circuit had a hand in.
+
+    Empty when neither list has anything to say, so an ordinary
+    infrastructure failure keeps writing exactly the audit row it wrote
+    before this task existed.
+    """
+    quota: dict[str, Any] = {}
+    if exhausted:
+        quota["exhausted"] = exhausted
+    if skipped:
+        quota["skipped"] = skipped
+    return {"executor_quota": quota} if quota else {}
+
+
+#: WorkspaceVerificationError steps that mean the fleet failed to build the
+#: isolated workspace (substrate), as opposed to a fact about repository state.
+_PROVISIONING_STEPS = frozenset(
+    {"provision_worktree", "provision_standalone_clone", "task_clone_root_exists"}
+)
 
 
 def _run_agent(
@@ -835,7 +888,7 @@ def _run_agent(
     # burned attempts, `cascade_exhausted: task_status_failed`. The reason
     # string is machine-classified (`authority_unavailable:`), so the
     # backlog parks it for the owner instead of re-opening it into the same
-    # loop (0036_backlog_required_authority), and it is counted
+    # loop (0046_backlog_required_authority), and it is counted
     # separately from the `task_status_failed` population it used to hide
     # inside.
     #
@@ -899,12 +952,25 @@ def _run_agent(
         )
     except agent_runner.RunnerError as exc:
         # A repository this host cannot see may exist on another: the row is
-        # host-local state, so let redelivery try elsewhere -- bounded by the
-        # item's own max_attempts.
-        return HandlerOutcome(ok=False, reason=str(exc), retryable=True)
+        # host-local state, so let redelivery try elsewhere. It is evidence
+        # about this HOST's checkout, never about the work item, so it is
+        # refunded through the bounded infra-wait budget instead of spending
+        # the item's cascade-sized `max_attempts`
+        # (VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH).
+        return HandlerOutcome(
+            ok=False, reason=str(exc), retryable=True, infra_wait=True
+        )
 
     available, detail, unavailable_reason = _executor_preflight(executor, task_type)
     unknown_executors: list[str] = []
+    # Links this delivery declined to run because their account is out of
+    # quota. Telemetry only -- the skipping itself is `_executor_preflight`'s
+    # refusal above -- but it is the evidence that an attempt was NOT spent
+    # on an exhausted executor, so it travels to `work_event`.
+    quota_skips: list[dict[str, Any]] = []
+    first_skip = _quota_skip(executor, cascade_step) if not available else None
+    if first_skip is not None:
+        quota_skips.append(first_skip)
     if not available and link is not None:
         # An open Codex circuit is a routing fact, not a consumed model
         # attempt. Select the next healthy cascade link inside this already
@@ -943,6 +1009,9 @@ def _run_agent(
             )
             if not candidate_available:
                 detail, unavailable_reason = candidate_detail, candidate_reason
+                candidate_skip = _quota_skip(candidate_executor, candidate_step)
+                if candidate_skip is not None:
+                    quota_skips.append(candidate_skip)
                 continue
             link = candidate
             cascade_step = candidate_step
@@ -977,12 +1046,18 @@ def _run_agent(
                     f"executor(s) {sorted(set(unknown_executors))!r}"
                 ),
                 retryable=True,
+                detail=_quota_detail([], quota_skips),
             )
+        # AICC_AGENT_LAUNCH_INFRA_FAILURE (group-writable /opt/aicc, dead
+        # launcher socket, ...) is substrate failure: refund via infra_wait,
+        # never burn the cascade into cascade_exhausted parking
+        # (VOYN-W0-AICC-OPT-AICC-GROUP-WRITABLE-BREAKS-LAUNCHER).
         return HandlerOutcome(
             ok=False,
             reason=f"{unavailable_reason}: {detail}",
             retryable=True,
             infra_wait=True,
+            detail=_quota_detail([], quota_skips),
         )
 
     if lease_lost.is_set():
@@ -1156,6 +1231,9 @@ def _run_agent(
                     ok=False,
                     reason=f"isolated workspace root unavailable: {exc}",
                     retryable=True,
+                    # Host deployment state, not the work item: refund via
+                    # infra_wait (VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH).
+                    infra_wait=True,
                 )
 
             # Single-writer gate at the dispatch boundary (part B of
@@ -1368,6 +1446,12 @@ def _run_agent(
                     ok=False,
                     reason=f"workspace isolation failed at {exc.failed_step}: {exc.detail}",
                     retryable=True,
+                    # Only the provisioning steps themselves -- the fleet
+                    # could not BUILD the workspace it owes the run -- are
+                    # substrate and refund via infra_wait
+                    # (VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH). Repository
+                    # state facts above stay on the ordinary path.
+                    infra_wait=exc.failed_step in _PROVISIONING_STEPS,
                 )
             run_repository = Path(evidence.workspace_path)
 
@@ -1381,15 +1465,22 @@ def _run_agent(
         # return until the process group is either its own natural exit or
         # confirmed terminated (SIGTERM -> bounded grace -> SIGKILL, see
         # `agent_runner._terminate_process_group`) — so by the time this call
-        # returns, `daemon._execute`'s `lease_lost.is_set()` check (which
-        # discards the outcome without writing it back) is looking at an
-        # attempt whose subprocess is provably no longer running, not one
-        # still mutating state the daemon can no longer account for. This
-        # does not by itself change *when* the queue considers the attempt
-        # free for redelivery — that remains the lease's own
-        # visibility-window expiry / supersession in `work_queue_store`,
-        # unaffected by this change — it closes the narrower, previously-open
-        # gap that the OS process kept running regardless of that decision.
+        # returns, `daemon._execute`'s decision is being made about an attempt
+        # whose subprocess is provably no longer running, not one still
+        # mutating state the daemon can no longer account for.
+        #
+        # WHICH DECISION DEPENDS ON WHICH LEASE WENT, and this comment used to
+        # name only one of them ("the `lease_lost.is_set()` check, which
+        # discards the outcome without writing it back ... that remains the
+        # lease's own visibility-window expiry / supersession"). That is the
+        # QUEUE lease's answer. When the event was set by
+        # `writer_lease._renew_loop` instead, the queue lease is live and
+        # `_execute` now REPORTS this function's outcome, so the item returns
+        # to the queue immediately rather than sitting `claimed` for a whole
+        # visibility window under a lease nothing renews
+        # (VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED, monitor_finding #14016).
+        # What this event means to THIS function is unchanged either way:
+        # stop, and publish nothing.
         route_failovers: list[dict[str, Any]] = []
         # Set inside the loop whenever `provider_failure` is True; stays
         # `None` for a run that never hit that branch at all (e.g. the loop's
@@ -1397,6 +1488,11 @@ def _run_agent(
         # failure class) so the post-loop generic-message fallback below has
         # a defined value to read either way.
         provider_failure_reason: str | None = None
+        # Executors this delivery observed refusing for quota, in order. Each
+        # entry is also a circuit this worker opened, so the NEXT delivery --
+        # of this task or any other on this host -- skips the link at
+        # preflight instead of spending an attempt to rediscover it.
+        quota_exhaustions: list[dict[str, Any]] = []
         while True:
             run = agent_runner.run_claude_code(
                 repository_path=run_repository,
@@ -1416,8 +1512,27 @@ def _run_agent(
                 result_text = agent_runner.extract_result_text(run.stdout)
                 quota_signature = run.executor_quota_signature(executor)
                 if quota_signature is not None:
-                    agent_runner.record_executor_exhausted(
-                        executor, cooldown_seconds=60 if executor == "grok" else 1800,
+                    # Recorded BEFORE the failover search below, so the
+                    # candidate preflight sees the circuit this very run
+                    # opened and cannot route back into the account that just
+                    # refused.
+                    exhausted_until = agent_runner.record_executor_exhausted(
+                        executor, cooldown_seconds=60 if executor == "grok" else None
+                    )
+                    quota_exhaustions.append(
+                        {
+                            "cascade_step": cascade_step,
+                            "executor": executor,
+                            "signature": quota_signature,
+                            "exhausted_until": exhausted_until.isoformat(),
+                        }
+                    )
+                    log.warning(
+                        "executor %s is out of quota (%r); withheld on this "
+                        "worker until %s",
+                        executor,
+                        quota_signature,
+                        exhausted_until.isoformat(),
                     )
                 provider_failure = quota_signature is not None or run.is_executor_provider_error(executor) or (
                     executor == "copilot"
@@ -1478,6 +1593,11 @@ def _run_agent(
                             candidate_executor, candidate_task_type
                         )
                         if not candidate_available:
+                            candidate_skip = _quota_skip(
+                                candidate_executor, candidate_step
+                            )
+                            if candidate_skip is not None:
+                                quota_skips.append(candidate_skip)
                             continue
                         route_failovers.append(
                             {
@@ -1524,6 +1644,9 @@ def _run_agent(
                     candidate_executor, candidate_task_type
                 )
                 if not candidate_available:
+                    candidate_skip = _quota_skip(candidate_executor, candidate_step)
+                    if candidate_skip is not None:
+                        quota_skips.append(candidate_skip)
                     continue
                 route_failovers.append(
                     {
@@ -1561,12 +1684,18 @@ def _run_agent(
             # worktree itself is deliberately left in place (matching every
             # other "do not delete on an ambiguous outcome" branch below) so
             # a later attempt can inspect or reuse it.
-            # `daemon._execute` discards whatever `HandlerOutcome` is
-            # returned here (its own `lease_lost.is_set()` check, checked
-            # again after this handler returns) -- this early return is for
-            # this function's own legibility and to keep `publish_run` from
-            # ever running against a killed-mid-flight worktree, not to
-            # change what the daemon does with the result.
+            # THE RETURNED OUTCOME IS NOT ALWAYS DISCARDED, and this comment
+            # used to say it always was ("`daemon._execute` discards whatever
+            # `HandlerOutcome` is returned here ... not to change what the
+            # daemon does with the result"). It is discarded when the QUEUE
+            # lease went -- the write would be refused -- and REPORTED when
+            # this event came from `writer_lease._renew_loop`, because then
+            # the queue lease is live and `queue_fail` is accepted
+            # (VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED, monitor_finding
+            # #14016). So the `reason` and `retryable=True` below are load-
+            # bearing on that path rather than decoration, and the early
+            # return is still what keeps `publish_run` from ever running
+            # against a killed-mid-flight worktree.
             return HandlerOutcome(
                 ok=False,
                 reason="lease lost mid-execution; agent process group was forcibly terminated",
@@ -1578,6 +1707,8 @@ def _run_agent(
             "cascade_step": cascade_step,
             "executor": (link or {}).get("executor", "claude"),
             "route_failovers": route_failovers,
+            "executor_quota_exhaustions": quota_exhaustions,
+            "executor_quota_skips": quota_skips,
             **_machine_outcome(result_text),
             "status": run.status,
             "exit_code": run.exit_code,
@@ -1724,16 +1855,27 @@ def _run_agent(
             # VISIBILITY) — surfaced here too so the dead-letter reason this
             # attempt may land in names the SPECIFIC cause (quota, auth, a
             # network blip, ...) rather than the generic bucket every
-            # provider/auth/quota refusal used to share.
+            # provider/auth/quota refusal used to share. The generic bucket
+            # stays as the prefix so existing readers of the reason keep
+            # matching; the specific class follows it.
+            quota_note = (
+                f" [{quota_exhaustions[-1]['executor']} quota exhausted until "
+                f"{quota_exhaustions[-1]['exhausted_until']}]"
+                if quota_exhaustions
+                else ""
+            )
             return HandlerOutcome(
                 ok=False,
                 reason=(
                     "executor infrastructure failure "
-                    f"({provider_failure_reason or 'provider/auth/quota'}): "
+                    "(provider/auth/quota"
+                    f"{': ' + provider_failure_reason if provider_failure_reason else ''}): "
                     f"{_tail(result_text or run.stderr)}"
+                    f"{quota_note}"
                 ),
                 retryable=True,
                 infra_wait=True,
+                detail=_quota_detail(quota_exhaustions, quota_skips),
             )
         if run.is_executor_sandbox_error:
             # bwrap failed before Codex could enter the sandbox or run tools.

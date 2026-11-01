@@ -9,7 +9,7 @@ functional application milestones of `app.py`.
 ## [Unreleased]
 
 ### Added — Fleet-wide executor quota visibility (`VOYN-W0-AICC-EXECUTOR-QUOTA-VISIBILITY`)
-- `command_center/db/sql/0033_executor_availability.up.sql`: `executor_availability`
+- `command_center/db/sql/0043_executor_availability.up.sql`: `executor_availability`
   (current verdict, one row per executor) and `executor_availability_event`
   (durable audit trail), mutated only through `executor_mark_unavailable` /
   `executor_mark_available` — the same queue-claim idiom `work_item` already
@@ -38,6 +38,392 @@ functional application milestones of `app.py`.
   "You have exceeded your monthly quota" mid-review, burning a queue attempt
   and process-launch time for zero model work because nothing outlived that
   one attempt to keep the next claim off the same account.
+### Changed ? queue-stalled fix rebased onto main's queue migrations (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
+- Merged #982 (and through it main via #1002 ? #1032 ? #914). Main already
+  shipped this branch's 0025 (claim numbering ? main 0026) and 0026 (redrive
+  clears the lease-wait budget ? main 0027), so those two are dropped.
+- Renumbered the rest onto the stack: 0024 ? 0038 (monitor partial clear),
+  0027 ? 0039 (enqueue audit lock), 0028 ? 0040 (reap liveness), 0029 ? 0041
+  (reap relock deadline). References in code, tests and SQL follow.
+- 0040/0041 are REBUILT over main's 0037 reap body (lapse refunds its attempt,
+  spends the lease-wait budget, gated on a serving fleet) instead of 0002's,
+  which would have reverted 0036/0037 on every reaper tick. Pinned by
+  `test_the_bounded_reap_keeps_mains_lapse_accounting`.
+- The claim loop keeps both the raising-claim guard and main's
+  `_attempt_active` drain accounting; the queue monitor keeps both
+  `claim_overdue` and main's quota-aware `dead_letter_growth`.
+
+### Changed — queue dead-letter fix rebased onto main's wait classes (`VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH`)
+- Merged main (via the #1002 → #1032 → #914 stack). Main already shipped this
+  branch's 0024 (redrive clears waits → main 0027), 0025 (claim numbering →
+  main 0026) and 0026 (lease-wait exhaustion refund → main 0028), so those are
+  dropped. What main lacked is kept and renumbered: `0036_queue_reap_lease_lapse_refunds`
+  (a lapsed lease refunds the attempt and spends the bounded lease-wait budget)
+  and `0037_queue_wait_budget_needs_a_serving_fleet` (`_queue_fleet_is_serving`
+  gate on wait-budget exhaustion and on the reaper; `queue_fail` resets
+  `lease_wait_count`). `released.lock.json` regenerated for 0001–0037.
+- `no_fault` is no longer a routing flag: it is a read-only
+  `HandlerOutcome.no_fault` = `lease_wait or infra_wait`. Repository-not-visible,
+  isolated-root-unavailable (mutating) and workspace-isolation failures now
+  route through `infra_wait`; a wait outcome with `retryable=False` takes the
+  ordinary `fail` path. Read-only "permanent" clone failures keep main's
+  immediate dead letter.
+
+### Tests — the monitor's own measurement is now taken from a real database (`VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH`)
+- `tests/db/test_monitor_queue_measurement.py` (new) drives the real queue
+  functions and then reads the real `infra_monitor.read_queue_snapshot()`.
+  Everything that pinned the `dead_letter_growth` verdict built
+  `QueueSnapshot` by hand (`tests/ops/test_infra_monitor.py` has no database),
+  so the one query that actually touches the schema this branch changed — and
+  that decides whether finding #3396 clears — was pinned by nothing.
+- Three properties, each stated where the acceptance is stated: 25 no-fault
+  refusals during a total outage measure `recent_dead == 0` and surface as
+  `throughput_stalled` rather than as silence; the same refusal after one
+  served sibling reaches the monitor as `dead_letter_growth:1>0` plus
+  `executor_quota_exhausted` (so the measurement is live, not vacuously zero,
+  and the quota regex still matches through the `lease_wait_exhausted: `
+  prefix the SQL composes); and `recent_dead` is a one-hour WINDOW, which is
+  why the finding clears when dead-lettering stops and no operator has to
+  redrive what the old classification already produced.
+- Verified by mutation, not by assertion: making `_queue_fleet_is_serving()`
+  return true turns the first test red at the monitor's count, counting `dead`
+  outright instead of within the hour turns the third red, and narrowing the
+  quota regex turns the second red.
+
+### Fixed — the migration-lock guard was itself failing the AIOS boundary gate (`VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH`)
+- `scripts/migration_lock.py` (new) takes over `--write`;
+  `python -m command_center.db migration-lock` is now the check only. The
+  guard that stops an edited migration from blocking a deploy had put a
+  `Path.write_text` inside `command_center/db/cli.py`, and a durable
+  filesystem write in a package named `db` is exactly the signature
+  `tests/architecture/aios_boundary.py` reads as a persistence engine
+  ("a JSON store is a persistence engine even with no driver anywhere in
+  it"). `test_engine_inventory_matches_frozen_baseline` went red with
+  `NEW ENGINE MODULE: command_center/db/cli.py matches frozen categories
+  ['memory']` — a required CI gate, so the whole queue fix was unmergeable.
+- Why moved rather than baselined. Adding the entry would have recorded the
+  control plane's operational database CLI as a frozen persistence engine
+  and frozen it against growth, on the strength of a developer maintenance
+  command. docs/AIOS_BOUNDARY.md's procedure for a detector false positive
+  says to prefer moving the module over adding a baseline entry, and
+  regenerating a checked-in artifact is developer maintenance — the same
+  shape as `python -m tests.architecture.aios_boundary --write-baseline`.
+  `AIOS_BOUNDARY_BASELINE.json` is unchanged, and the check stays where a
+  deploy can reach it, persisting nothing.
+- The lock's `note` (rendered from `migrations._LOCK_NOTE`, so it cannot
+  drift from the code) now names both commands. Only that line of
+  `released.lock.json` changed; no recorded checksum moved.
+- Tests: `tests/db/test_cli_queue.py` states the property directly rather
+  than leaving it to the baseline gate's generic drift line —
+  `test_the_database_cli_is_not_a_persistence_engine` asserts the scanner's
+  own `_persists_data` is false for `db/cli.py`, and
+  `test_the_database_cli_does_not_offer_to_rewrite_the_lock` pins that
+  argparse *refuses* `--write` so the old invocation cannot be copied back
+  out of a commit message. `tests/db/test_migration_set.py` covers the
+  script's write and check paths and that the note names a command that
+  exists. Reintroducing the write turns all three red plus the boundary gate.
+
+### Fixed — a capacity outage no longer converts the whole backlog into dead letters (`VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH`)
+- `command_center/db/sql/0028_queue_wait_budget_needs_a_serving_fleet.up.sql`:
+  the no-fault wait budget (`lease_wait_count`, 20 waits) is spent only while
+  the fleet is demonstrably serving OTHER items, and `queue_fail`'s requeue
+  clears it. **The horizon that budget actually buys is 68.5 minutes** —
+  `_queue_backoff(2, n)` (2 is the backoff every dispatch enqueues with) runs
+  2, 4, 8 … 256 and then sits at its 300s cap, so
+  `SELECT sum(extract(epoch FROM _queue_backoff(2, n)))/60 FROM
+  generate_series(1,20) n` is `68.5`. **The fleet's dominant outage is four
+  times that.** `orchestrator.routing` records the measurement: the Claude
+  credential is a Max *subscription* with a five-hour rolling cap, and 142 of
+  167 parked tasks on 2026-08-23 were literally "You've hit your session
+  limit" — a response `worker.handlers` routes to `no_fault`, i.e. straight
+  to this budget. So every item in flight when that window closed was refused
+  for five hours, spent its whole budget in the first sixty-nine minutes, and
+  dead-lettered under `lease_wait_exhausted` with `attempt_count = 0`:
+  provably never delivered to a model, and permanently parked, because
+  `queue_redrive` is operator-only. `control-01:queue` counted the arrivals
+  as `dead_letter_growth`, in the class `infra_monitor` calls
+  `executor_quota_exhausted`.
+- Why the gate rather than a bigger number: the budget's own migrations say
+  what it is for — 0022 bounds "permanent, PATHOLOGICAL contention", 0027 the
+  item "that somehow kills its worker every time it is delivered". Both are
+  statements about one item being SINGLED OUT, and neither describes a window
+  that refuses every lane equally. A count of polls is not a duration either:
+  the same outage kills an item or not depending on how often it happened to
+  be offered. `_queue_fleet_is_serving()` asks the question that actually
+  separates the two, and it is the question `infra_monitor` already asks as
+  `recent_succeeded` — has any OTHER item of this queue had a delivery reach
+  the work in the last hour (`complete`/`granted`, or `fail`/`granted` with
+  `requeued`/`dead_lettered`)? Refusals are deliberately not evidence, so a
+  queue where nothing but refusals is happening reads as a fleet that is not
+  serving, which is what it is.
+- During an outage the wait count still climbs (the backoff is computed from
+  it, so an outage cannot become a 2-second poll loop) and every refusal is
+  still audited, now with `fleet_is_serving` beside the two counters. What
+  changes is only that exhausting the budget does not dead-letter an item the
+  fleet was refusing along with everything else: the backlog stays `ready` at
+  the 300s cap — one claim per item per five minutes — and the outage
+  surfaces through `infra_monitor`'s `queue_stalled` and
+  `throughput_stalled:0_succeeded_in_1h`, the classes that name a fleet that
+  has stopped serving. A stall keeps the work and names the fleet; a dead
+  letter destroys the work and blames the item. Stated trade: a queue holding
+  ONE item that poisons every worker it touches has no sibling to be compared
+  against, so it now cycles at the 300s cap instead of dying after 20
+  deliveries — deliberate, because nothing there distinguishes "this item is
+  poison" from "the fleet is down", and dead-lettering would not have
+  repaired the host either way.
+- Second half, same rule: `lease_wait_count` was cumulative over an item's
+  whole life and reset by nothing but `queue_redrive` (0024), so an item that
+  waited out one long outage carried that number forever and an ordinary
+  lease race weeks later was its 21st wait. `queue_fail`'s requeue — the one
+  non-terminal exit meaning a delivery got past the fleet and reported on the
+  work itself — now clears it, so 20 means 20 *consecutive* refusals. This
+  cannot become an unbounded retry: reaching the reset costs a real
+  `attempt_count`, which nothing refunds, so `max_attempts` (the cascade
+  length) caps how many times the budget can be cleared. The cleared number
+  travels into the audit exactly as the redrive's does.
+- Tests: `tests/db/test_queue_claim.py` proves all of it against a real
+  server —
+  `test_an_outage_that_refuses_everything_does_not_empty_the_queue_into_the_dlq`
+  drives 25 refusals with nothing being served (item still `ready`, both
+  model attempts intact) and then dead-letters the same item with the
+  identical refusal once one sibling is served, and reads the 68.5 minutes
+  back out of `_queue_backoff` rather than asserting it from a comment;
+  `test_a_delivery_that_reached_the_work_clears_the_wait_budget` and
+  `test_lapses_while_nothing_is_being_served_are_an_outage_not_a_verdict`
+  cover the other two sites. The tests that pin the DLQ still working now say
+  what makes it work — `_a_served_fleet()`, the siblings the item was singled
+  out from. `tests/worker/test_daemon.py`'s `QueueModel` gained the same two
+  rules, so the accounting is pinned in the suite that runs without a
+  database as well.
+
+### Fixed — a comment-only edit to migration 0022 was blocking every queue fix from reaching control-01 (`VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH`)
+- `command_center/db/sql/0022_queue_fail_lease_wait.up.sql`: restored
+  byte-for-byte to what shipped. The file's header cites itself as `0020` —
+  a real typo, and one that must stay. `schema_migration` records the
+  SHA-256 of each up-file as it was applied, and
+  `MigrationRunner.upgrade` verifies **every** recorded checksum before it
+  applies **any** pending migration, so correcting that character does not
+  correct 0022: on every database that already applied it — control-01's
+  among them — `python -m command_center.db upgrade` raises
+  `MigrationChecksumMismatch` and applies nothing, which means migrations
+  0024–0027 (the rest of this very fix) never land, and `self-deploy
+  --migrate` then rolls the checkout back, so the branch's Python-side
+  changes do not take effect either. Verified here by computing both
+  digests: recorded `633f0e94…`, file `509bdb47…`. The branch's own test
+  suite was green throughout — the authority that refuses lives in a
+  migrated database, and nothing in CI has one.
+- `command_center/db/sql/released.lock.json` (new) +
+  `migrations.verify_released_checksums()` / `released_lock()` /
+  `render_released_lock()`: the same verdict, reachable without a database.
+  `up` is literally `Migration.checksum` — the value the ledger holds — so
+  this is not a second authority, it is the ledger's authority moved to
+  where the edit is made. A new migration must be recorded before it ships
+  (otherwise the guard would only ever cover what it was created with), and
+  a recorded one cannot be deleted, because a database that applied it still
+  names it. It cannot stop someone who edits a file and re-locks it in the
+  same commit, and is not meant to: the failure mode was tidying a comment
+  without knowing the ledger existed, and a diff reading
+  `-"633f0e94…" +"509bdb47…"` cannot be misread that way. Digests are written
+  `sha256:<hex>`: the prefix names the algorithm, and it also keeps
+  detect-secrets from reading 54 bare hex runs as credentials — unprefixed,
+  every future migration would fail the security gate's "baseline changed"
+  check until someone re-ran the scanner.
+- `python -m command_center.db migration-lock`: the check. Handled before
+  `load_config()`
+  — it needs no DSN, so it answers on a laptop rather than only on the host
+  that is already broken. A missing or malformed lock is itself reported as a
+  `MigrationError`, so the command whose purpose is to replace a traceback
+  with a verdict has no path of its own that prints one — and since deleting
+  the file that is refusing is the obvious wrong move, that message says why
+  `--write` is not the repair (it would re-record the very edit that is
+  blocking the deploy).
+- `command_center/db/cli.py`: `upgrade` reports a `MigrationError` as
+  `migration refused: <verdict>` and exits 2, instead of letting it raise.
+  `command_center/deployment/self_deploy.py`: the failed-migration step
+  reports the **last** non-empty line of the subprocess output
+  (`_verdict_line`), not the first 130 characters. Together these are why
+  this stayed undiagnosed across every deploy tick: the report contained
+  `Traceback (most recent call last): File "/usr/lib/python3.12/runpy.py"…`,
+  and an edited-since migration is precisely the failure that never clears
+  by itself, so every tick re-reported the same unreadable header.
+- Tests: `tests/db/test_migration_set.py` pins the whole set against the lock
+  (reintroducing the exact 0022 edit turns it red with both checksums in the
+  diff), plus the edited / unrecorded / deleted / regeneration-is-a-no-op
+  cases; `tests/db/test_cli_queue.py` pins the two CLI exits;
+  `tests/orchestrator/test_self_deploy.py` pins a real traceback reduced to
+  its verdict in the deploy report.
+
+### Fixed — an incomplete isolation deployment no longer dead-letters every read-only run on its first delivery (`VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH`)
+- `command_center/worker/handlers.py`: `_read_only_isolated_checkout` used to
+  classify a subset of its failures as *permanent* — a missing/not-root-owned
+  principal workspace root, git refusing the source clone's ownership, a bound
+  clone that is not there — and the caller turned that into
+  `retryable=False`, which is not a budget but an immediate dead letter on the
+  item's first delivery. Every failure the helper can return is in fact a fact
+  about THIS HOST, and the mutating dispatch path already refunded the
+  identical `principal_workspace_root()` failure as `no_fault` twenty lines
+  away. So a worker halfway through its isolation rollout dead-lettered every
+  read-only item it claimed, having run nothing — the reviews are the
+  continuously-dispatched half of the fleet's work — and `control-01:queue`
+  measured the arrivals as `dead_letter_growth`. The helper now returns
+  `(path, reason)` with no permanence flag (it had no consequence left to
+  carry: "permanent" meant permanent on that host, and the queue is
+  fleet-wide), both dispatch paths refuse with `retryable=True,
+  no_fault=True`, and the pinned checkout's refusal is now the same single
+  call site as the non-isolated one it already shared everything else with.
+  A genuinely fleet-wide breakage still terminates in the DLQ, bounded by the
+  same `lease_wait_count` budget (20 waits, ~1h of capped backoff) as every
+  other capacity outage, instead of instantly.
+- `tests/worker/test_handlers.py`:
+  `test_an_incomplete_isolation_deployment_is_no_fault_for_read_only_and_mutating_alike`
+  pins the broken symmetry itself — one raise from the real
+  `principal_workspace_root()`, the real helper, and the read-only and
+  mutating paths made to agree on the verdict. The test that asserted the old
+  behaviour ("a permanent cause must not spin the cascade") now asserts the
+  exit that actually honours that intent: `no_fault` does not spend the
+  cascade budget at all, while `retryable=False` skipped it by killing the
+  item.
+- Same change, second defect: the isolated branch registered its own
+  `rmtree` cleanup and then fell through to the shared one, so a pinned
+  verification review's throwaway clone — not a worktree of anything — also
+  got `force_remove_worktree(repository, clone)`: a `git worktree
+  remove`/`prune` against the read-only bound clone, whose `rmtree` fallback
+  then deleted the tree under the other remover's feet and left it logging
+  "was not fully removed". One refusal site for both branches is also one
+  cleanup registration;
+  `test_review_head_pin_under_isolation_runs_in_a_clone_detached_at_the_pin`
+  now pins that.
+- `tests/worker/test_daemon.py`:
+  `test_a_host_that_cannot_provide_an_isolated_clone_no_longer_kills_the_item`
+  drives both classifications of the same host fact through the queue model
+  and pins the consequence the monitor counts — dead on delivery one under
+  `non_retryable:`, versus still `ready` with both model attempts intact.
+
+### Fixed — a lost worker no longer dead-letters the work it was holding (`VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH`)
+- `command_center/db/sql/0027_queue_reap_lease_lapse_refunds.up.sql`:
+  `queue_reap()` refunds the attempt the lapsed delivery spent and counts the
+  lapse against the item's bounded `lease_wait_count` budget instead of its
+  `max_attempts`. A visibility lease can only lapse when the worker PROCESS
+  stopped heartbeating — an OOM kill, a watchdog restart, a host loss, a
+  database outage — because the heartbeat runs beside the handler, so a
+  handler that merely hangs keeps its lease and never reaches the reaper.
+  `max_attempts` is the executor cascade's length (two links), so two such
+  restarts used to dead-letter a task that had never reached a model, which
+  the `control-01:queue` monitor measured as `dead_letter_growth`. Permanent
+  lapses still terminate in the DLQ, now under
+  `lease_wait_exhausted: visibility_timeout`, and `queue_redrive()` resets
+  that budget as it has since 0024.
+### Added — desktop points at the server (`VOYN-W0-APP-CONTROL-S2`)
+
+- `command_center/application/server_queue.py`: a read-only HTTP port over the
+  preprod server's work queue (`GET /api/v1/queue/items`,
+  `webapi/queue_routes.py`), built the same way
+  `command_center/application/aios_status.py` builds the AIOS SDK adapter —
+  a factory that only constructs the real client from a complete, HTTPS,
+  allowlisted-host configuration (`AICC_SERVER_QUEUE_URL`,
+  `AICC_SERVER_QUEUE_TOKEN`, `AICC_SERVER_QUEUE_ALLOWED_HOSTS`) and otherwise
+  returns an honest `DisabledServerQueueClient`. Transport is the same
+  authenticated `urllib` GET `http_auth.identity` already uses for `whoami` —
+  no new production dependency.
+- `command_center/platform/preferences.py`: `DataSourceMode` (`LOCAL` /
+  `SERVER`), the persisted "server" toggle, alongside the existing theme and
+  density preferences.
+- Settings screen: a new "Источник данных раздела «Выполнение»" group with
+  the Local/Server radio toggle (`command_center/desktop/pages/settings_page.py`).
+- `command_center/application/operations_adapter.py`: `OperationsAdapter.execution()`
+  now reads the mode via an injected callable (so a toggle flipped mid-session
+  takes effect on the very next read, no adapter reconstruction) and switches
+  from the local runtime snapshot to `server_queue`'s port, mapped into the
+  same five-column shape the "Выполнение" table already renders (queue name
+  stands in for `task_type`, repository id — falling back to task id — stands
+  in for `project`, since a queue-list row carries neither field directly).
+  Desktop still never imports `command_center.runtime`/`webapi` directly
+  (`tests/architecture/test_desktop_engine_fitness.py` continues to pass
+  unchanged) — only through this application-layer port, exactly like AIOS
+  status.
+
+### Added — voice intake for the backlog (`VOYN-W0-APP-CONTROL-S6b`)
+
+- Decision (the task left the transcription engine open): transcription runs
+  **on the device** through the Web Speech API (`web/src/lib/voiceInput.ts`),
+  not through a server-side Whisper. The owner's iPhone and Mac already have
+  the recognizer, so a tailnet-only preprod gains voice with no model weights,
+  no audio upload and no new server dependency, and the PWA (S3) gets it
+  without a native shell. The decision is reversible: a Whisper route would
+  post to the same endpoint with the same `source` flag, and the part that is
+  actually hard is already server-side.
+- `command_center/db/voice_transcript.py`: the deterministic repair of
+  dictated domain terms — the trap the task record names. A recognizer has
+  never heard of this vocabulary, so it writes the namespace token as a
+  Russian word (`воин`/`война`/`вояж`), the priority as words (`пи ноль`) or
+  as the Cyrillic homoglyph `р0` that renders like `P0` and is refused by the
+  ASCII-only parser field, and the wave as `волна ноль`. A closed table fixes
+  those exactly; anything outside the table is left as dictated rather than
+  guessed at, and every substitution is reported as a `Correction`. Pure
+  module — no I/O, no model — so it is equally the normalizer for a later
+  server-side transcription path.
+- `POST /api/v1/backlog/intake/draft` accepts `source: "chat" | "voice"`
+  (default `chat`). A voice draft is repaired before the model sees it, is
+  given one extra prompt paragraph (a recognizer splits an id into separate
+  words — join them, never invent a new id), and returns a `transcript`
+  block: what was heard, what was written, and every correction. Typed text
+  is never repaired — a repair table must not edit words the owner actually
+  typed. No new route and no new credential: it is the same `http_auth`
+  boundary and the same `backlog:intake:draft` operation as S6a.
+- Tasks screen: a microphone button beside «Предложить», rendered only where
+  the browser has a recognizer (Firefox and locked-down WebViews keep the
+  typed path, no dead control). Dictated words land in the same text box the
+  owner would have typed into and stay editable; the corrections the server
+  made are shown above the proposed line; the same draft → confirm gate still
+  applies, because a transcript is a suggestion, not an instruction. Refused
+  microphone, silence and offline recognition each get their own message
+  (`web/src/lib/i18n.ts`, both languages).
+
+### Added — chat-text backlog intake (`VOYN-W0-APP-CONTROL-S6a`)
+
+- `command_center/db/backlog_intake.py`: turns a free-text owner request into
+  one canonical backlog-Markdown line via a model prompt, then runs that line
+  back through the existing deterministic grammar
+  (`command_center.db.backlog_parser.parse_backlog`) — the model only
+  proposes text, the closed-vocabulary parser is the sole authority on
+  whether it is a task. Status is always forced to `UNTRIAGED`, the same
+  raw-finding discipline `backlog_triage` (0008) already enforces for the
+  Markdown importer.
+- `command_center/api/backlog_intake_routes.py`: `POST /api/v1/backlog/intake/draft`
+  (model call + parse, never writes) and `POST /api/v1/backlog/intake/confirm`
+  (re-parses the possibly hand-edited line from scratch, then inserts through
+  `BacklogStore.upsert_task`). `confirm` refuses with 409 when the task id
+  already names an existing record — `backlog_upsert_task` can also overwrite
+  an existing row directly (the Markdown-reconciliation path), and chat
+  intake must never reach into that shortcut. Both routes are on the
+  `http_auth` boundary (`backlog:intake:draft`/`backlog:intake:confirm`,
+  `EXPECTED_MUTATING_ROUTES` now 32).
+### Added — Quota-aware executor routing (`VOYN-W0-AICC-EXECUTOR-QUOTA-AWARE-ROUTING`)
+- `command_center/agent_runner.py`: `RunResult.executor_quota_signature`
+  recognises an executor's own "this account is out of quota" refusal
+  (Claude's session cap, Codex's usage limit, Copilot's monthly quota /
+  credit pool) and `record_executor_exhausted` opens a bounded, self-clearing
+  worker-local circuit against that executor (30 minutes by default,
+  `AICC_EXECUTOR_QUOTA_COOLDOWN_SECONDS`). The detector is deliberately
+  narrower than the attempt-level `is_executor_provider_error` in both
+  vocabulary and read scope -- Claude's structured refusal field, the tail of
+  stderr for the free-text CLIs -- because it licenses a cross-task action: a
+  transcript that merely quotes a quota message must never withhold a healthy
+  account from every later task on the host.
+- `command_center/worker/handlers.py`: `_executor_preflight` reports an open
+  circuit as unavailability, so the cascade skips the exhausted link INSIDE
+  the delivery the worker already holds. No attempt is spent rediscovering an
+  exhaustion the last refusal established; when no link can run, the refusal
+  routes to the infra-wait refund (0024) rather than to the task's own
+  attempt budget. The Codex workspace-write probe records a quota refusal the
+  same way, instead of re-probing the exhausted account on every mutating
+  dispatch.
+- `0033_infra_wait_quota_detail`: `queue_fail_infra_wait` takes an optional
+  `jsonb` detail, merged into the `work_event` audit row under the counters
+  it cannot overwrite. A refusal writes no result row, so this is how
+  "executor X is out of quota until T" and "these links were skipped without
+  spending an attempt" reach the audit trail. The argument defaults to NULL,
+  so a pre-0025 caller writes exactly the row it wrote before.
 
 ### Added — the one-button audit, wired into the web UI (`VOYN-W0-APP-CONTROL-S4`)
 
@@ -96,6 +482,1504 @@ functional application milestones of `app.py`.
   GitHub refuses the whole token otherwise, which would leave the fleet with
   no credential at all.
 
+### Fixed — the lease clock started when the server answered, so the lane outran the lease by the reply's own delay (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
+- `control-01:queue` carried `queue_stalled` as `monitor_finding` #41949. The
+  three fixes below (#41136, #41237, #41318) replaced the beat count with a
+  clock, gave that clock a reader the database cannot park, and separated "this
+  lane cannot prove the lease" from "the server refused it". All three left
+  the same half untouched: **which instant** the window is measured from.
+  `queue_claim` / `queue_heartbeat` grant `visible_until` from the server's
+  own `now()`, somewhere inside a call the lane is still waiting on, so with
+  the send at `S`, the grant at `G` and the answer at `A` the lane knows only
+  `S <= G <= A`:
+
+      dated from A:   lane deadline = A + V  >=  G + V = the server's
+      dated from S:   lane deadline = S + V  <=  G + V = the server's
+
+  The daemon dated from `A`, and the comment that chose it argued — correctly
+  — that this makes `remaining <= 0` prove a lapse. But the test the handler
+  actually runs under is `remaining > 0`, and from `A` that proves nothing:
+  the lane keeps executing for `A - G` past a lease the server has already
+  let go. `A - G` is the reply's own delay, nothing on this side bounds it,
+  and it is largest in exactly the fault this machinery exists for — a
+  `voyn-aicc-pgtunnel.service` restart whose request path still works and
+  whose reply path does not (`lease_client.run_lease` already allows a hung
+  subprocess 120s against the fleet's 300s window).
+
+  **WHAT THE OVERRUN COSTS IS THE PROBE'S OCCUPANCY**, the same lie from the
+  same direction as #41136 / #41237: every second of that overrun is a lane
+  executing an item `aicc-queue-reaper.timer` has handed back, so the fleet
+  holds TWO lanes' worth of work while `work_item` records ONE claim,
+  `spare_capacity` goes true against a fleet with no free lane, the due-ready
+  clock runs in full, and `control-01:queue` opens a `queue_stalled` no fleet
+  action reaches.
+
+  Dating from `S` costs at most one round trip of lease per beat, against a
+  cadence sized with a whole beat interval of margin on purpose
+  (`beat_interval_seconds`), and it is affordable only because of #41318: a
+  lapse no longer discards the outcome, it offers it, and `_queue_owns`
+  decides. Before that split this direction would have thrown away writable
+  runs on a slow reply — 0029's cost — which is why the order these findings
+  were fixed in is the order they had to be fixed in.
+
+  `_LeaseDeadline` now takes the request instant as a required argument
+  (`requested_at` / `sent_at` / `claim_sent_at`); a default would silently
+  restore the skew at whichever call site forgot to pass it. `run_forever`
+  captures the instant before `store.claim`, and `_heartbeat_loop` captures
+  it before `store.heartbeat`.
+- **Tests.** `test_a_beat_whose_reply_is_held_is_dated_from_when_it_was_sent`
+  and `test_the_lease_clock_starts_when_the_claim_was_asked_for` pin both
+  instants without a server; `test_the_lease_clock_cannot_be_dated_from_the_
+  instant_it_is_read` pins the signatures. The real-server
+  `test_a_beat_whose_reply_is_held_gives_the_lease_up_at_or_before_the_
+  servers` measures the same two instants against the real
+  `queue_claim` / `queue_heartbeat` and asserts the lane gives up at or before
+  the server's own `visible_until`.
+
+### Fixed — the lease deadline was read only by the thread the fault parks, so it was not a deadline (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
+- `control-01:queue` carried `queue_stalled` as `monitor_finding` #41237. The
+  previous fix (#41136, below) replaced a count of failed beats with a clock,
+  and the clock is right. What it could not do is be **read at the deadline**:
+  `_heartbeat_loop` evaluates it at the top of its loop, and the step before
+  that top is `store.heartbeat`. The failure the whole tolerance exists for is
+  a beat that never comes back — the credential rotation restarts
+  `voyn-aicc-pgtunnel.service` on its own timer, a severed forwarded socket
+  BLACK-HOLES the call, `connect_timeout` (10s) bounds only connecting and
+  `statement_timeout` is enforced by a server that is no longer reachable — so
+  the one event the deadline was for was also the one event that postponed the
+  verdict on itself. That residual was stated by the fix that created it
+  ("one window plus the one call it was parked in") and deferred to a
+  transport change.
+
+  **It is not a transport problem.** The lapse is a statement about a CLOCK,
+  and a clock can be read somewhere the socket cannot reach. The rule now has
+  one definition (`_LeaseDeadline` — the window from the last beat the server
+  ACCEPTED, dated from when that beat was SENT, by a monotonic clock; see
+  #41949 above for why the send and not the answer) and two
+  readers: `_heartbeat_loop`, which can be parked, and `_lease_deadline_loop`,
+  which touches no store, holds no connection, and whose only operations are a
+  subtraction and `Event.wait`. `_execute` owns the deadline, because `_execute`
+  owns the attempt, and starts both threads over it.
+
+  **MEASURED at the deployed ratio**, which is where the overrun lives:
+  `lease_client.run_lease` already allows a hung subprocess 120s against the
+  fleet's 300s window, and `beat_interval_seconds` is `V / 4`. With the
+  deadline read only at the top of the beat loop:
+
+      t=75   beat sent, parks           t=195  returns, 105s of lease left
+      t=270  beat sent, parks           t=390  returns, the lapse admitted
+
+  Ninety seconds of a lane executing an item `aicc-queue-reaper.timer` handed
+  back at t=300, and the overrun grows with the block rather than with
+  anything about the lease. Scaled onto the 8s window the real-server test
+  uses (block 3.2s), the same walk gives 10.4s against an 8s lease — 2.4s, the
+  same 30% — and it is 0.0s with the deadline watch running.
+
+  **WHAT THE OVERRUN COSTS IS THE PROBE'S OCCUPANCY**, the one thing a
+  fail-closed monitor cannot survive being lied to about, and it is the same
+  lie #41136 catalogued: the lane keeps executing an item it no longer owns,
+  the reaper hands that item back within the minute, and the fleet holds TWO
+  lanes' worth of work while `work_item` records ONE claim. `claimed` is what
+  `--claim-capacity` is weighed against (#13366), so `spare_capacity` goes
+  true against a fleet with no free lane, the due-ready clock runs in full,
+  and `fleet_idle_seconds` cannot bound it because the surviving claim is an
+  hour old. No fleet action reaches it — the lapsed-claim class is empty, a
+  lane restart only arranges for the next tunnel blip to do it again, and
+  `queue_redrive` reaches only items already dead. Meanwhile the lane that
+  claims the handed-back item re-runs the handler's side effects (`git push`
+  and PR creation included) against a workspace the first lane is still
+  writing to.
+- **The deadline watch does not feed the systemd watchdog, deliberately.** It
+  is alive for the whole of a run and does no work; pinging from it would
+  answer "is this process still useful" with "yes" for a process that has
+  wedged, and retire the detector `aicc-worker.service` sizes `WatchdogSec`
+  to be. Pings stay where they prove something — the claim loop between
+  claims, the beat thread around a call that actually reached the server —
+  and `test_the_deadline_watch_does_not_feed_the_watchdog` pins it.
+- **One ordering detail is load-bearing and changed with it.** A beat the
+  server REFUSES (`alive` is false) is an answer, but it is the answer "this
+  attempt is not yours"; the loop re-dated the lease on it before returning,
+  which was invisible while one thread owned the clock and would now push the
+  watch's deadline out past a lapse the server had just confirmed. Only an
+  accepted beat renews, and it renews to the instant the answer ARRIVED,
+  captured before the loop does anything else.
+- **WHAT REMAINS, bounded and stated.** The parked beat thread still cannot
+  return until its call does, so a lapsed attempt leaves one thread (and the
+  pool connection it checked out) outstanding until the socket gives up. It
+  costs nothing the probe can see: the attempt is already cancelled, the item
+  already recovered, and the lane already back in `run_forever`. Bounding the
+  call itself is still the transport's job (libpq `tcp_user_timeout` and
+  friends) and is still a fleet-wide connection change with no measurement
+  here — it is simply no longer what the lapse depends on.
+
+### Verified — the measurement behind the deadline-watch fix (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
+- A local PostgreSQL 16 cluster was available this session, so the real-server
+  half was RUN rather than reported: `tests/db/test_infra_monitor_queue_
+  snapshot.py` is 23 passed, and `test_queue_claim.py`, `test_reap_bound.py`,
+  `test_monitor_finding_clear.py` and `test_work_queue_admin.py` are 82 passed
+  together with it. `tests/worker/` and `tests/ops/test_infra_monitor.py` are
+  283 passed.
+- Re-verified by MUTATION, not by its own green. Making `_lease_deadline_loop`
+  return immediately — the pre-fix world, where only the beat loop reads the
+  clock — takes `test_the_beat_loop_admits_the_lapse_inside_the_window_it_was_
+  granted` red at exactly the predicted number ("the lane ran 2.4s past an 8s
+  lease while a beat sat in a 3.2s black hole", the deployed 30%), and both
+  server-free regressions red as a handler that is never stopped at all
+  (their black hole does not answer inside the test, so a bound that depends
+  on it cannot be met at any tolerance). Adding a `WATCHDOG=1` ping to the
+  watch takes `test_the_deadline_watch_does_not_feed_the_watchdog` red at 6
+  pings for 1 beat.
+- The real-server test now drives the attempt's threads EXACTLY as `_execute`
+  starts them — both loops over one shared `_LeaseDeadline` — because the
+  bound is a property of the pair. Driving the beat loop alone, which is what
+  it did when it only had to prove the clock had replaced the beat count, can
+  measure nothing better than "one window plus the parked call". Its block is
+  scaled from the deployed 120s-against-300s rather than left at one beat
+  interval: at a whole interval the two clocks happen to coincide and the old
+  code overruns by zero, so the previous shape could not have caught this.
+- `test_a_blip_of_the_tolerated_length_does_not_stop_the_work` is the
+  no-false-cancellation side and runs through `run_forever`/`_execute`, so it
+  exercises the new thread against a store that keeps the lease the way the
+  server keeps it: an accepted beat moves the shared deadline and the watch
+  does not fire.
+- The whole of `tests/db` against that cluster is 4 failed / 1006 passed / 44
+  skipped, and none of the four is this change: two enrolment tests assert a
+  password refusal the sandbox cluster cannot produce (it was `initdb
+  --auth=trust`), the backup drill wants a password in the DSN for the same
+  reason (`KeyError: 'password'`), and the readyz test has no `fastapi`
+  installed here. `tests/ops` is 41 failed, and the failing set is IDENTICAL
+  — compared name by name — on a pristine `git worktree` of HEAD, so it is
+  the sandbox's static gates and `/proc` restrictions, not this change.
+- `ruff check` passes on every file touched. The venv's `ruff` binary is not
+  executable in this sandbox; it was copied to a writable path and run from
+  there, as the previous session did.
+
+
+### Fixed — the lease tolerance was a COUNT OF BEATS, so a lane kept running an item the reaper had already handed back (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
+- `control-01:queue` carried `queue_stalled` as `monitor_finding` #41136.
+  `WorkerDaemon._heartbeat_loop` decided that the queue lease was gone when
+
+      consecutive_errors * interval >= visibility_seconds
+
+  which is elapsed time **only if a heartbeat that cannot reach the server
+  fails fast**. The failure this tolerance exists for does the opposite. The
+  beat crosses `voyn-aicc-pgtunnel.service` — the tunnel the credential
+  rotation restarts on its own 25-minute timer — and a severed forwarded
+  socket BLACK-HOLES the call: `connect_timeout` (10s) bounds connecting, and
+  `statement_timeout` is enforced by a server that is no longer reachable, so
+  nothing client-side bounds the read. Each failed cycle therefore cost
+  `interval + block` while the counter still demanded `TOLERATED_FAILED_BEATS
+  + 2` of them, and the loop gave the attempt up at `(F + 2) * (interval +
+  block)` instead of at `visibility_seconds`. MEASURED through the real loop:
+
+      window  block   old (count)   new (clock)
+        6s     1.5s        12.0s          6.0s
+      300s      10s       340.0s        310.0s
+      300s     120s       780.0s        390.0s
+      300s     900s      3900.0s        975.0s
+
+  The 120s row is not hypothetical: it is the timeout `lease_client.run_lease`
+  already allows a hung subprocess, and the same tunnel is what both reach
+  their authority over.
+
+  **WHAT THE OVERRUN COSTS IS THE PROBE'S OCCUPANCY**, which is the one thing
+  a fail-closed monitor cannot survive being lied to about. The lane keeps
+  executing an item it no longer owns; `aicc-queue-reaper.timer` does exactly
+  its job and hands that item back; and now the fleet is holding TWO lanes'
+  worth of work while `work_item` records ONE claim.
+
+  It is the third direction the same lie arrives from, and the first one the
+  probe cannot see at all. #13366 was occupancy counting ATTENDANCE (a lane
+  whose lease slipped is still holding its lane); #14016 was a lane that had
+  STOPPED working still filling it. Both are a claim the probe counts and
+  should not. This is the inverse — a lane working with no claim to show for
+  it — so every clock the measurement owns is consistent with the rows it was
+  given and all of them are wrong about the fleet. MEASURED against a real
+  PostgreSQL 16 server through `queue_claim`, the real `WorkQueueAdmin.reap`
+  and the production snapshot statement — two lanes 70 minutes into
+  legitimate attempts, the two surplus dispatched items due behind them
+  (`PlanLimits.wip_limit` is 4 against these 2 lanes), lane A's lease lapsed
+  and reaped while lane A runs on:
+
+      both leases live  claimed=2 attended=2 lapsed=0 fleet_idle=4200 -> ok
+      lane A runs on    claimed=1 attended=1 lapsed=0 fleet_idle=1200
+                                                      -> queue_stalled
+
+  Nothing about the work changed between those two lines. `claimed` is what
+  `--claim-capacity` is weighed against (#13366), so `spare_capacity` goes
+  true against a fleet with no free lane at all, the due-ready clock runs in
+  full, and `fleet_idle_seconds` cannot bound it because the surviving claim
+  is seventy minutes old. **And no fleet action reaches it**, which is why the
+  finding kept returning after every measurement fix: the lapsed-claim class
+  is empty (the reaper has already recovered the item, so no reaper fix
+  applies), restarting the lane only arranges for the next tunnel blip to do
+  it again, and `queue_redrive` reaches only items that are already dead.
+
+  The rest of the cost is 0029's catalogue, for the same reason — an attempt
+  taken away mid-run: the item is `ready` again and any lane may take it while
+  the first is still working, so the side effects run twice, and
+  `queue_claim` has already charged `attempt_count` for the delivery that was
+  taken away.
+
+  **The fix: a deadline, not a count.** `_heartbeat_loop` now holds
+  `granted_at` — one window from the last beat the SERVER accepted, by a
+  MONOTONIC clock, since the quantity is an elapsed duration and a wall clock
+  stepped by NTP would move the lease with it — and that single test at the
+  top of the loop is the only place the lapse is decided. An error is no
+  longer a verdict, just a beat that did not land. Two details are
+  load-bearing:
+  - **Dated from when a beat ANSWERED, not from when it was sent.** The server
+    grants the renewal somewhere inside the round trip, so the instant the
+    answer arrives is at or after the grant — which makes the test PROVE the
+    lapse rather than estimate it. Timing it from the send would give the
+    lease up to a round trip early, and an attempt taken away with time left
+    on its lease costs the whole run (0029).
+  - **The wait never sleeps past the deadline** (`min(interval, remaining)`).
+    Otherwise the loop parks a whole interval beyond the moment the attempt
+    stopped being ours, which is a sleep's worth of the same overrun.
+  What remains is bounded and stated: the thread cannot act while it is inside
+  `store.heartbeat`, so the handler stops within one window plus the one call
+  it was parked in. Bounding THAT needs a deadline on the transport (libpq
+  `tcp_user_timeout` and friends) rather than on this loop, and it is a
+  fleet-wide connection change this finding has no measurement for.
+- `TOLERATED_FAILED_BEATS` and `beat_interval_seconds` are unchanged and still
+  mean what they say: the cadence is what keeps a lease alive through a blip.
+  What changed is that the number of survivable failures is now a CONSEQUENCE
+  of that cadence rather than the thing that decides the attempt is gone.
+  `aicc-worker.service`'s 240s `WatchdogSec` and ADR-0011 are unaffected, and
+  the ADR's heartbeat section records the distinction — the same discipline
+  the cadence fix applied to its own restatements.
+
+### Fixed — a writer-lease renewal still in flight when the hold exited cancelled the run it had already protected (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
+- `writer_lease._renew_loop` tests `_stop` only at the top of its wait. A
+  renewal already inside `lease_client.run_lease` when the hold exits
+  outlives it: `_Handle.__exit__` sets `_stop`, joins the thread for TEN
+  seconds, then releases the lease and returns — while `run_lease` is
+  `subprocess.run(..., timeout=120)`. So the in-flight renewal comes back
+  late and fails, in the ordinary case BECAUSE `__exit__` released the row it
+  was renewing, and set `lease_lost` on a run that had already finished.
+- That event is `worker.handlers`' cancellation event, and `daemon._execute`
+  now REPORTS a run this lease cancelled instead of discarding it (the
+  #14016 fix, immediately above in this file). So a late renewal failure no
+  longer merely loses an outcome — it turns a completed, PUBLISHED attempt
+  into `queue_fail(retryable => true)`: the item is requeued, the next
+  delivery re-runs the whole handler (`git push` and PR creation included),
+  and `queue_claim` charges another attempt for it, three of which
+  dead-letter healthy work as `max_attempts_exhausted`.
+- Same lesson as `_release` in the entry below, which may not decide the
+  outcome of the work it was protecting: a lease whose lifecycle has ended has
+  no verdict left to give. Found by writing the deadline test above, not by
+  inspection.
+- `_RENEW_FRACTION`'s open question — whether this loop should absorb a
+  transient authority blip the way the beat loop does — is still open and
+  still unmeasured. One constraint on answering it is now written down beside
+  it: a tolerance expressed as "N renewals may fail" would mean anything
+  between N intervals and N * (interval + 120s) of real time here, and only
+  the second is what the lease has left. That is the defect the beat loop just
+  stopped making.
+
+### Verified — the measurements behind both fixes (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
+- A local PostgreSQL 16 cluster was available this session, so the real-server
+  halves were RUN rather than reported: `tests/db/test_infra_monitor_queue_
+  snapshot.py` is 23 passed (21 before this change), and
+  `test_queue_claim.py`, `test_reap_bound.py`, `test_monitor_finding_clear.py`
+  and `test_work_queue_admin.py` are 80 passed together.
+- Each fix was re-verified by MUTATION, not by its own green: restoring the
+  beat COUNT rule takes `test_the_lease_is_given_up_within_its_window_however_
+  slowly_a_beat_fails`, `test_counting_beats_is_not_measuring_the_window` and
+  the real-server `test_the_beat_loop_admits_the_lapse_inside_the_window_it_
+  was_granted` red (the last one measuring a 16.0s cancellation on an 8s
+  lease, a 100% overrun), and removing the `_stop` re-check takes
+  `test_a_renewal_in_flight_when_the_hold_exits_cannot_cancel_the_finished_
+  run` red through the REAL `subprocess.TimeoutExpired`.
+- `test_a_lane_running_past_its_lease_hides_the_fleets_real_occupancy` is
+  deliberately a CHARACTERISATION of the measurement rather than a test that
+  the fix turns green: the probe reports the truth about the rows it is given,
+  and the rows were a lie. It pins the whole chain — healthy `ok`, the reap,
+  the `queue_stalled` it produces, and the exit the deadline restores, which
+  is the lane returning to `run_forever` so the item it gave back is claimed
+  and the fleet clock moves.
+- The full suite in this sandbox is 376 failed / 4747 passed / 180 errors, and
+  NONE of it is this change: no failing test imports either module touched
+  here, and the same selection is identical (44 failed, 59 passed) on a
+  pristine `git worktree` of HEAD. Two environmental causes account for it --
+  `command_center.runtime.supervisor` cannot establish a process identity
+  under this sandbox's `/proc` restrictions (the `runtime_*`, `codex_*`,
+  `launch_*`, `portfolio_*` and `task_pipeline*` families), and the venv's
+  `ruff` binary is not executable here (the publish/manifest static gates).
+  `ruff check .` was run from a writable copy instead and passes, as do the
+  whitespace, byte-compile and leak-guard preflight steps.
+- A soak harness (two real `WorkerDaemon` lanes, the real `WorkQueueAdmin.reap`
+  on its timer, a real enqueuer and the production snapshot statement sampled
+  at the deployed ratios — `V`, `3V` stall window, `V/5` reaper, `0.4V`
+  probe — under injected lane restarts) was used to search for the shape
+  before it was found by reading, and reports no `queue_stalled`. It was
+  exploratory and is not committed; what it establishes is the same thing the
+  previous session's did, that the measurement does not produce this finding
+  on its own.
+
+### Fixed — one event carried two different lease losses, and the daemon read both as "do not report" (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
+- `control-01:queue` carried `queue_stalled` as `monitor_finding` #14016. TWO
+  LEASES COVER ONE ATTEMPT: the queue's visibility lease, renewed by
+  `WorkerDaemon._heartbeat_loop`, and the repository writer lease that
+  `worker.handlers` holds through provisioning, the agent run and
+  `publish_run`. Either going must stop the handler, so the writer lease was
+  deliberately given the daemon's own cancellation event — "a renewal failure
+  sets the SAME `lease_lost` event this function already wires into
+  `run_claude_code` as `cancel_event`", by that call site's own comment.
+
+  Sharing the CANCELLATION channel was right. Sharing it with the daemon's
+  **do not report** decision was not, and `writer_lease.py`'s module docstring
+  stated the conflation as though it were a design: "`daemon._execute` already
+  discards any outcome once `lease_lost` is set, so a lease lost to this cause
+  is handled exactly like one lost to the other." The two losses have opposite
+  consequences for the queue:
+
+      QUEUE lease lapsed   `_queue_owns` refuses the write, and must
+                           (`claim_expired`/`attempt_superseded`). The item is
+                           already the reaper's to recover.
+      WRITER lease lost    the queue lease is LIVE and renewing. `queue_fail`
+                           would be ACCEPTED. Discarding the outcome leaves the
+                           item `claimed` under a lease nothing renews.
+
+  **And that second state is the fail-OPEN reading a fail-closed monitor must
+  never have** — the direction #2766 named explicitly. While the abandoned
+  lease is still in the future the probe classifies the row as an ATTENDED
+  claim: `work_item.state = 'claimed'` with `work_attempt.state = 'active'`
+  and `visible_until > now()` is the measurement's own definition of "a lane
+  doing its job", and `_execute` has already returned to claiming. MEASURED
+  against a real PostgreSQL 16 server through `queue_claim`/`queue_heartbeat`
+  and the production snapshot statement — two lanes, the surplus dispatched
+  item due for forty minutes behind them, lane two's writer lease gone:
+
+      claimed=2  attended=2  lapsed=0  lapse_age=None
+      ready_due=1  due_age=2400  fleet_idle=2400   -> ok
+
+  Every clock the probe owns is blind to it at once. `lapsed_claim_age_seconds`
+  — the one weighed unconditionally and unbounded by the fleet clock — is
+  `None`, because the lease has not lapsed yet. The due-ready clock is excused
+  by the phantom occupancy, because `queue.claimed` is what `--claim-capacity`
+  is weighed against (#13366) and a lane that stopped working still fills it.
+  And `fleet_idle_seconds` is frozen too, because it moves only when an
+  attempt is created or leaves `active` and the abandoned attempt did neither.
+  Two such abandonments pin a two-lane fleet "full" while both lanes are free.
+
+  The rest of the cost is 0029's catalogue for a lease taken away at the finish
+  line, for the same reason: the run is lost although its outcome was DECIDED
+  and writable, the handler's side effects re-run under the next delivery, and
+  `queue_claim` has already charged `attempt_count` — so on the default
+  `max_attempts` of 3 the third blip dead-letters healthy work as
+  `visibility_timeout_exhausted`.
+
+  **It is a blip the fleet meets on a schedule it runs itself**, the same one
+  `TOLERATED_FAILED_BEATS` exists for: `voyn-lease` reaches its authority over
+  `/etc/aicc/lease.env`'s DSN and the credential rotation restarts that tunnel
+  on its own timer. The beat loop survives two of them; `_renew_loop` gives up
+  on the first, and the whole attempt used to pay for it.
+
+  **The fix: separate the two decisions, not the two cancellations.**
+  `_execute` now owns `queue_lease_lost` — set only by the beat loop, through
+  `_lose_queue_lease`, which sets it BEFORE the handler's `cancel` so the
+  handler can never be released before the daemon can tell which lease went —
+  and discards an outcome on that event alone. A run the writer lease cancelled
+  is REPORTED, which is what returns the item to the queue at once instead of
+  after a whole visibility window of occupancy that is not real. One `queue_fail`
+  makes both of the things the probe was lied to about true together: occupancy
+  becomes honest, and the fleet clock moves because the fleet really did give
+  an item back.
+
+  One place fails closed over the handler's own verdict, and only one: a
+  cancelled run reporting `ok` is reported as a retryable FAILURE instead.
+  `worker.handlers` already returns a retryable failure on that path, but
+  `queue_complete` is terminal and carries a result, and a cancelled agent's
+  workspace is whatever a forcibly terminated process left behind — a daemon
+  must not take a handler's word for that write.
+
+### Fixed — the lease tool is a subprocess, and three sites read only its exit code (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
+- `lease_client.run_lease` is `subprocess.run(..., timeout=120)` and does not
+  catch its own `TimeoutExpired`, so a `voyn-lease` that HANGS — the ordinary
+  shape of an unreachable authority, since it is reached over the DSN whose
+  tunnel the credential rotation restarts — raised straight through code
+  written as if the tool had always answered. A missing or unexecutable binary
+  (`OSError`) takes the same path.
+
+  **`writer_lease._renew_loop` is a thread target**, so the exception ended the
+  thread and nothing anywhere observed it: `lease_lost` was never set, so the
+  agent kept running; nothing renewed the lease again, so the row expired
+  server-side at `ttl` with this process still holding it — and `lease_argv`'s
+  own comment records what that costs the next claimant ("every later acquire
+  for that repository refused forever with `VOYN_LEASE_REFUSED expired requires
+  dead-process confirmation`", which `--auto-takeover` cannot clear while the
+  holder is alive); and the module's whole promise — a lease held "through
+  provisioning, the agent run ... and `publish_run`" — quietly stopped being
+  true for the rest of a run that may last `request.timeout_seconds`, with no
+  log line. It now fails closed as the failed renewal it is. Whether this loop
+  should absorb a transient blip the way the beat loop does is still the open
+  question stated above `_RENEW_FRACTION`; failing closed needs no new
+  measurement, and costs an attempt far less now that `_execute` reports a run
+  this lease cancelled instead of discarding it.
+
+  **`writer_lease._release` is documented best-effort** — "a release that fails
+  (authority unreachable, lease already expired server-side) leaves nothing
+  worse than the lease's own TTL expiry" — and ignoring the `CompletedProcess`
+  made it best-effort against a REFUSAL only. The first failure that comment
+  names does not arrive that way. `_release` runs from `_Handle.__exit__`, which
+  is the `ExitStack` `worker.handlers` closes in its own `finally`, so the
+  raise escaped INTO the handler's exit path and replaced whatever it had
+  already decided — **including a run that had finished and PUBLISHED**.
+  `_dispatch` catches it and returns a retryable failure, so `queue_fail`
+  requeues finished work, the next delivery re-runs the whole attempt (`git
+  push` and PR creation included) and `queue_claim` charges another attempt for
+  it. A release is cleanup of a lease whose lifecycle has already ended; it
+  cannot be allowed to decide the outcome of the work it was protecting. Found
+  by the renewal test above, not by inspection.
+
+### Verified — the branch's real-server proofs, actually run (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
+- Every previous session on this branch recorded that `tests/db` SKIPS without
+  PostgreSQL credentials, so the real-server halves of this branch stood on a
+  checkpoint's reported measurement. A local PostgreSQL 16 cluster was
+  available this session, so they were run: `tests/db` is **1001 passed, 44
+  skipped**, with 6 failures that are this sandbox and not this branch (no
+  `fastapi`, and the enrolment/`pg_hba` and `pg_dump` round-trip drills).
+  `tests/db/test_infra_monitor_queue_snapshot.py` — including the two tests
+  #14016's checkpoint added and could not run — is 21 passed.
+- Two of those tests drove `_heartbeat_loop` directly and so had to follow the
+  event split above; `_beat_through` now passes both events and asserts that a
+  cancellation from the beat loop always carries the narrow fact, so the helper
+  cannot stop measuring what it says it measures.
+- The probe itself was additionally exercised end to end against that server —
+  two real `WorkerDaemon` lanes, the real `WorkQueueAdmin.reap`, the real
+  snapshot statement, at the deployed ratios (`V`, `3V` stall window, `V/5`
+  reaper, `0.4V` probe) and under injected lane restarts, killed reaper ticks,
+  heartbeat bursts and duplicate enqueues of in-flight keys. 108 probe samples
+  across two runs, no `queue_stalled`, and the queue drained in both. That
+  harness was exploratory and is not committed; what it established is that the
+  measurement does not produce this finding on its own, which is why the fix
+  above is in the fleet and not in `evaluate`.
+- Stale restatements corrected where this change falsified them, which is the
+  same discipline the beat-cadence fix applied to its own: `writer_lease.py`'s
+  module docstring ("handled exactly like one lost to the other"), and two in
+  `worker/handlers.py` that told the reader the daemon discards whatever this
+  path returns.
+
+
+### Fixed — the lease had no renewal margin, so the fleet manufactured its own lapses (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
+- `control-01:queue` reported `queue_stalled` again (`monitor_finding` #13420).
+  The three commits before this one taught the MEASUREMENT to read a fleet
+  whose leases slip — #13366 stopped a slipped lease freeing the lane that is
+  still holding the item, 0029 stopped the reaper expiring a lease that had
+  been renewed. Both rest on the same premise, written into both of their
+  headers as if it were weather:
+
+      The beat runs at `visibility_seconds / 3` (100s against a 300s window),
+      so ANY TWO CONSECUTIVE FAILED BEATS lapse the lease.
+
+  It was not a fact about the fleet. It was an off-by-one beat in
+  `WorkerDaemon._heartbeat_loop`, sitting under a comment that promised the
+  opposite — "A third of the window: two consecutive beats may fail (a
+  restarting PostgreSQL, a network blip) **before the lease actually lapses**"
+  — with nothing anywhere measuring which of the two was true.
+
+  **The arithmetic.** A successful beat at `T` renews the lease to `T + V`
+  (`queue_heartbeat` renews by the attempt's own `visibility_seconds`, read
+  from the row). The beats that follow fall at `T + I`, `T + 2I`, …, so the
+  first beat that MUST succeed is number `F + 1`. At `I = V/3` and `F = 2`
+  that is `3 × (V/3)` — `V` EXACTLY. The beat lands ON the deadline, and
+  `_queue_owns` refuses it: `visible_until <= now()` is `claim_expired`, a
+  `<=` and not a `<`. The delivered tolerance was ONE failed beat.
+
+  **MEASURED against a real PostgreSQL 16 server**, through the real
+  `queue_claim`/`queue_heartbeat` and the real `_heartbeat_loop`, at
+  `visibility_seconds=12`:
+
+      0 consecutive failed beats   lease held   beats=[ok, ok, ok, ok]
+      1 consecutive failed beat    lease held   beats=[raised, ok, ok, ok]
+      2 consecutive failed beats   LEASE LOST   beats=[raised, raised, REFUSED]
+
+  and after the fix, on the same server and the same harness:
+
+      2 consecutive failed beats   lease held   beats=[raised, raised, ok, ok]
+      3 consecutive failed beats   LEASE LOST   beats=[raised, raised, raised, REFUSED]
+
+  **The fleet meets this on a schedule it runs itself.**
+  `voyn-aicc-worker@.service` declares `Requires=voyn-aicc-pgtunnel.service`,
+  and the credential rotation restarts that tunnel on its own timer. One
+  restart that costs two beats — ~200s at the deployed 300s window — takes
+  every in-flight attempt in the fleet at once.
+
+  **What each one costs, and none of it was the blip's to take.** The lane is
+  still executing. Its next beat resolves to `claim_expired` and
+  `daemon._execute` discards the outcome, so up to a whole
+  `TimeoutStopSec=3660s` run is thrown away at the finish line; the reaper
+  hands the item to another lane, so the side effects run again; and
+  `queue_claim` had already charged `attempt_count` for the delivery that was
+  taken away, so on the default `max_attempts` of 3 the third such blip
+  dead-letters a perfectly healthy item as `visibility_timeout_exhausted`,
+  reachable after that only by an operator's `queue_redrive`.
+
+  **Why it is this finding and not a neighbouring one.** Every lapse enters
+  the one starvation class `infra_monitor.evaluate` neither excuses by
+  capacity nor bounds by the fleet clock — "no lane is holding it, so no lane
+  being free is irrelevant to it … only the reaper does" — and then, once the
+  reaper has done its job, leaves the item back on the due-ready pile the same
+  probe weighs, with its clock running. The branch has spent three commits
+  making the probe read that state correctly. This is the fleet no longer
+  producing it.
+
+  **The fix: derive the cadence from the tolerance.** `TOLERATED_FAILED_BEATS`
+  is now a named constant with the arithmetic beside it, and
+  `beat_interval_seconds` returns `V / (F + 2)` — one interval for the
+  renewal, `F` for the failures, and one whole interval of MARGIN. The margin
+  is a beat rather than an epsilon because every term drifts the same way:
+  `beat_stop.wait(interval)` restarts from when the previous call RETURNED, so
+  each cycle costs `I` plus a round trip plus whatever the scheduler adds, and
+  the error accumulates. At the deployed window the beat moves from 100s to
+  75s — four renewals per window instead of three, per lane.
+
+  Nothing else moves. The error path's own ceiling is
+  `consecutive_errors * interval >= visibility_seconds`, which is "a full
+  window with no successful beat" at ANY interval, so it stays exact. The
+  watchdog cap still only ever SHORTENS the wait, now pinned as a property.
+  `WatchdogSec=240s` is deliberately left alone: against 75s beats it is a
+  little over three missed pings rather than two, which is more slack for a
+  wedge detector, and tightening a watchdog is a restart risk this finding has
+  no reason to take — the unit comment that stated the old arithmetic as fact
+  now states the new one.
+
+- **Nothing pinned the tolerance, which is why the comment could be wrong for
+  as long as it was.** `test_persistent_heartbeat_errors_stop_the_work` pins
+  the error ceiling, and the watchdog test pins the cap; the interval itself
+  was pinned by no test at all, and a fake store cannot catch it — it has no
+  deadline to be late for, so it answers every beat the same whenever it
+  arrives. Seven tests now, and they name the tolerance rather than the
+  divisor, so retuning either number has to keep the promise or go red:
+
+    * Five need no server (`tests/worker/test_daemon.py`) and so run in every
+      gate on every machine — the lesson `tests/db/test_reap_bound.py` was
+      written for. One states the survival property over every window the
+      clamps do not reach, one states it concretely at the deployed number,
+      one pins that the watchdog cap can only ever shorten the beat, and one
+      drives the REAL loop against a store that keeps the lease the way the
+      server keeps it (renew to `now() + V`; refuse at `visible_until <=
+      now()`), so the recovery beat is judged by a clock rather than by the
+      fake's goodwill. The fifth pins the arithmetic's own PREMISE: the
+      window the beat is sized to is the one the caller ASKS FOR, and the
+      lease is the one the server GRANTS. `queue_claim` clamps the request to
+      `[1, 3600]`, so a configured window above that ceiling would size the
+      beat to a lease that does not exist — 7200s asked for, 3600s kept,
+      beats at 1800s, and the tolerance gone again with no line of this fix
+      changed. Nothing reaches it today (`command_center.worker.__main__`
+      builds the daemon with the default config and exposes no knob), which
+      is exactly why it wanted pinning rather than leaving to the next
+      operator flag.
+    * Two run against a real server
+      (`tests/db/test_infra_monitor_queue_snapshot.py`), because the claim is
+      about the whole chain and not about one number: a lane 40 minutes into
+      an attempt loses the tolerated beats, and afterwards the lease is live,
+      the real `WorkQueueAdmin.reap()` finds nothing to recover, and the probe
+      reads an ATTENDED claim with `lapsed_claims == 0`. Its sibling proves
+      the direction — one beat past the tolerance and the lease is gone
+      exactly as before, the daemon stops the work and the reaper takes the
+      item back — so this is a margin and not a weakening of the protocol.
+
+  Three of the seven fail on the mutation back to `visibility_seconds / 3`
+  (including the real-server one); the other four are the fail-closed guards
+  and hold either way. Re-run on the branch head: the mutation reproduces the
+  finding's own failure in the loop test — beats `[raised, raised, refused]`,
+  `lease lost mid-execution; outcome discarded` — and reverting it takes all
+  three back to green.
+
+- **Housekeeping from the same work.** A checkpoint commit on this branch had
+  swept `coverage`'s own `.coverage` data file into the tree — a per-run,
+  per-checkout binary that no gate reads. It is untracked again and now
+  ignored (`.coverage`, `.coverage.*`), beside `.testmondata` and for the same
+  reason.
+
+### Fixed — a lane whose lease slipped is still holding its lane (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
+- `control-01:queue` reported `queue_stalled` again (`monitor_finding` #13366),
+  against a fleet at full stretch. `evaluate`'s capacity test asks "was a lane
+  free to take this?" and answered it with `attended_claims < claim_capacity`
+  — how many lanes hold a LIVE LEASE. That is a different question, and the
+  gap between the two is the ordinary appearance of a healthy long run.
+
+  **A lapsed lease does not free a lane.** The item stays `claimed` until the
+  reaper takes it back, and `queue_claim` will not hand that lane a second
+  one meanwhile — it is still inside `_execute`, running the handler. But the
+  measurement counted it as spare capacity, and spare capacity is what
+  unlocks the due-ready clock: `PlanLimits.wip_limit` is 4 against 2 lanes,
+  so the surplus dispatched item is *designed* to sit ready and due for a
+  whole attempt, and its clock had been running for an hour.
+
+  **MEASURED against a real PostgreSQL 16 server.** Two lanes 40 minutes into
+  legitimate attempts (`voyn-aicc-worker@.service` allows one 3660s), the
+  surplus item due behind them the whole time, and then lane two's lease 30
+  seconds past its deadline while lane two is still running:
+
+      both leases live   attended=2 claimed=2 due_age=2400  ->  ok
+      lease slipped 30s  attended=1 claimed=2 due_age=2400  ->  queue_stalled
+
+  Nothing about the fleet changed between those two lines. No lane is free,
+  no lane stopped, the lapse itself is 30s — nowhere near the 900s window —
+  and `aicc-queue-reaper.timer` clears it on its next minute. The entire
+  verdict is the 2400s due-ready clock, compared against the stall window on
+  the strength of a free lane that does not exist.
+
+  **How often the fleet is in that state.** The beat runs at
+  `visibility_seconds / 3` — 100s against a 300s window — so ANY TWO
+  CONSECUTIVE FAILED BEATS lapse the lease. 0029 names the occasion this
+  fleet meets it on: "a database blip or a `voyn-aicc-pgtunnel.service`
+  restart that cost two beats", which the credential rotation cycles on its
+  own schedule. The reaper clears it within a minute and the probe samples
+  every two, so this is not a race that might happen — it is a red tick
+  whenever the sample lands in the window.
+
+  **Why the fleet clock could not catch it**, having been added (#2471) for
+  exactly this family of false positive. `fleet_idle_seconds` is an hour here
+  *precisely because* both lanes have been busy for an hour: no attempt
+  changed state, which is what two healthy long runs look like. That bound
+  excuses the instant a lane frees. It has nothing to say about a fleet that
+  never freed one, and `min(3600, 3600)` is still 3600.
+
+  The fix weighs capacity by OCCUPANCY — `queue.claimed`, how many items the
+  fleet is holding — instead of by attendance. `attended_claims` keeps its
+  narrower job: it is what `live_claim_age_seconds` ages, under
+  `--max-claim-seconds`.
+
+- **What it gives up, and why that is already covered twice.** A lapsed claim
+  can also mean the LANE IS GONE, in which case a lane really is free and
+  this excuses due work for as long as the claim sits unreaped. Nothing is
+  lost, because that case was never reached through capacity:
+  `lapsed_claim_age_seconds` is weighed UNCONDITIONALLY — not gated by
+  capacity, not bounded by the fleet clock — and fires at this same window.
+  And the excuse cannot outlast the reaper: `queue_reap` moves the item out
+  of `claimed`, so occupancy drops on its own, capacity reopens and the
+  due-ready clock runs again. A reaper that stops is what the unconditional
+  clock is for, and it is what the previous entry on this branch measured.
+
+- **The change can only excuse, never accuse, and that is pinned as a
+  property.** `claimed` is `attended_claims + lapsed_claims` by construction
+  — the two filters are disjoint and together cover `state = 'claimed'` — so
+  `claimed < capacity` implies `attended_claims < capacity` and never the
+  reverse. Spare capacity can only go from true to false, the starved set can
+  only shrink, and no tick that was green can be turned red by this rule.
+  Checked exhaustively over the snapshot shapes the two definitions can
+  disagree on (0 cases where the new rule frees a lane the old one did not),
+  and pinned by
+  `test_counting_a_lapsed_claim_as_occupancy_can_only_excuse_never_accuse`.
+  It matters because a red tick on this probe mints a task: a change to the
+  capacity test earns its way in by removing false accusations, and must not
+  be able to add one.
+
+  One reclassification falls out of that, and it is a rename rather than a
+  new accusation: a lapse older than `CLAIM_POLL_CEILING_SECONDS` on a fleet
+  with no successes in the trailing hour used to read `queue_stalled` and now
+  reads `throughput_stalled`, which is its own failure code and its own
+  finding. `aicc-queue-reaper.timer` runs every minute, so a lapse the probe
+  still sees past that floor means a reap tick did not clear it. Whether that
+  floor — derived from the CLAIMER's poll ceiling — is the right one for a
+  clock only the REAPER can stop is a separate question from this one, and it
+  belongs to `throughput_stalled` rather than to the finding fixed here.
+
+- **Seven tests. Five fail on the mutation back to `attended_claims`; the
+  other two are the fail-closed guards and hold either way, which is what
+  makes them guards.** Three run the production statement against a real
+  server (`test_a_lane_whose_lease_slipped_is_still_holding_its_lane` builds
+  the shape through `queue_claim`/`queue_heartbeat` and lapses one lease;
+  `test_a_lapse_the_reaper_never_clears_is_still_a_stall` holds the same
+  snapshot past the window; `test_the_reaper_hands_the_lane_back_and_the_due_
+  clock_resumes` runs the real `WorkQueueAdmin.reap` as `aicc_app` and shows
+  the verdict return). Four need no server and so run in every gate on every
+  machine — the lesson `test_reap_bound.py` was written for — including
+  `test_occupancy_is_what_capacity_weighs_and_the_two_can_differ`, which
+  states the distinction directly so a future reader cannot restore the old
+  test by reading `attended_claims` as "the busy lanes", and the property
+  test above.
+
+
+### Fixed — the reaper's batch bound had stopped being a bound (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
+- `control-01:queue` reported `queue_stalled` again (`monitor_finding` #13145).
+  The only change on this branch since the last healthy measurement is one
+  line: `WorkQueueAdmin.REAP_BATCH` went from `100` to `10**9`, with no test,
+  no changelog and no argument, directly contradicting the comment two lines
+  above it ("Small enough that an interrupted tick loses a batch rather than a
+  backlog") and the whole of 0028. `10**9` is a legal `integer`, so nothing
+  refused it — `queue_reap(1000000000)` is simply the unbounded reap under a
+  bounded arity's name. Reverted to `100`.
+
+  **MEASURED against a real PostgreSQL 16 server.** 1000 lapsed leases, the
+  tick cancelled 100ms in — which is how `aicc-queue-reaper.service`'s
+  `TimeoutStartSec=60s` kill arrives, and how the restart of the tunnel the
+  credential rotation cycles arrives:
+
+      REAP_BATCH = 100    tick killed after 104.8 ms -> recovered 600 of 1000
+      REAP_BATCH = 10**9  tick killed after 105.5 ms -> recovered   0 of 1000
+
+  Same server, same backlog, same interruption, the same ~100ms of work done
+  in both: the bounded tick had banked six durable batches, the unbounded one
+  rolled back every expiration it had performed. That is 0028's defect
+  verbatim — "the older unbounded form recovered nothing at all when it was
+  interrupted, not everything up to where it stopped" — and the tick is
+  interruptible by design.
+
+  **Why this is the finding and not merely a regression.** `evaluate` weighs
+  two starvation clocks and only one of them is unconditional: due ready work
+  is excused by a full fleet and bounded by the fleet clock, while
+  `lapsed_claim_age_seconds` is neither. No lane is holding a lapsed claim, so
+  no lane being free says anything about it; only the reaper clears it, and no
+  lane restart and no `queue_redrive` — which reaches only items already
+  `dead` — is an exit. A reaper that commits nothing is therefore not a slow
+  reaper: it is that age climbing without limit, and `queue_stalled` with
+  nothing the fleet can do about it.
+
+  The normal case hides it, which is why it could ship. A handful of lapses
+  comes back short of any bound and is committed by the first call, so a quiet
+  queue reaps identically at `100` and at `10**9`. The two diverge only once
+  there is a backlog — after a worker host is lost, after a rotation window,
+  after a database blip — at exactly the moment recovery is the thing being
+  measured.
+
+- **The suite could not see it, and that is the part worth fixing.** Every
+  existing batching test sizes its backlog as `WorkQueueAdmin.REAP_BATCH + 3`.
+  They are proofs about the LOOP and they read the constant, so they follow it
+  wherever it goes: at `10**9` they do not go red, they stop being runnable —
+  a backlog of a billion claims is a gate that hangs, not a test that fails.
+  0028's fix is the loop AND a bound small enough to make the loop mean
+  something; only the loop was pinned.
+
+  `tests/db/test_reap_bound.py` pins the other half, from outside the
+  constant. It needs no server — deliberately, since the regression reached
+  HEAD past a suite whose only witnesses to it could not be collected without
+  one — and it names both edges:
+
+    * **Ceiling.** One batch is what an interruption throws away, so it must
+      be a small fraction of the tick: at a measured 0.206 ms per expiration
+      and its audit row (rounded to 1 ms, because production crosses
+      `voyn-aicc-pgtunnel.service` to a loaded server), a batch may spend at
+      most a tenth of the kill budget. `TimeoutStartSec` is parsed from
+      `deploy/systemd/aicc-queue-reaper.service` rather than restated, so the
+      ceiling follows the unit if the tick is ever retuned.
+    * **Floor.** `REAP_BATCH <= 0` is the same stall in a worse shape, found
+      while deriving the first edge: `queue_reap` clamps its own argument
+      (`greatest(p_max_items, 1)`) while `reap()` tests termination against
+      the bound it ASKED for, so the two never agree — the server reaps one
+      and answers `1`, `1 < 0` is false; the queue empties and answers `0`,
+      `0 < 0` is false. Reproduced in-process: still looping after 51 calls
+      against an empty queue. The tick would spin until systemd killed it,
+      recover nothing, and do it again the next minute.
+
+  Each edge fails on exactly one mutation and neither fails on the other.
+
+### Fixed — the reaper expired leases that were still live (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
+- **`queue_reap`'s re-test under the item's row lock dropped half the predicate
+  it was re-testing.** Migration 0029. The scan selects on two conditions,
+  `state = 'active' AND visible_until <= now()`; the re-test carried only the
+  first, under 0002's comment "a completion may have landed since the scan". A
+  completion is not the only thing that can land in that window, and
+  `queue_heartbeat` is the other one: a beat moves `visible_until` and never
+  touches `state`, so a renewal that committed between the scan and the lock
+  passed the re-test and had its lease expired anyway.
+
+  The window is structural. The scan is one statement, read at the
+  transaction's snapshot; the re-test is a later statement in the same READ
+  COMMITTED transaction and sees everything committed since. Between them sits
+  the rest of the loop — up to `WorkQueueAdmin.REAP_BATCH` items, each a row
+  lock, two UPDATEs and an audit INSERT. 0028's `SKIP LOCKED` narrowed it and
+  could not close it: while a beat's transaction is open it holds the item
+  `FOR UPDATE` (`_queue_owns`), so a reap arriving *then* defers the item,
+  which is correct. What remained is the beat that has already COMMITTED and
+  released — the reap finds the row free, finds the attempt `active`, and
+  expires a lease with time left on it.
+
+  **MEASURED against a real PostgreSQL 16 server**, with the beat's
+  transaction pinned open across the expiry instant and the reap blocked
+  mid-loop on another attempt's row:
+
+      queue_heartbeat -> (ok = true)     lease renewed, an hour of it left
+      queue_reap      -> 2
+      beating attempt: state = expired, visible_until > now()
+      beating item:    state = ready,   current_attempt_id = NULL
+
+  An attempt marked `expired` while its lease is still in the future, and an
+  item handed back to the queue out from under the lane running it.
+
+  **What it costs, none of which is the reap's to give away.** The lane is
+  still executing: its next beat and its `queue_complete` both resolve to
+  `attempt_superseded`, so `worker.daemon._execute` discards an outcome worth
+  up to one whole `TimeoutStopSec=3660s` attempt. The item is `ready` again and
+  any lane may take it, so the work is done twice — the one-owner promise holds
+  on paper (the fence refuses the loser's *write*) while the side effects have
+  already re-run. And `queue_claim` charged `attempt_count` for the delivery
+  that was taken away; `queue_fail_lease_wait` is the only refund and nothing
+  on this path calls it, so enough repeats dead-letter a healthy item
+  (`dead_letter_growth`), reachable after that only by an operator's
+  `queue_redrive`.
+
+  **Why it is filed under the stall.** 0028 gave the reaper liveness because
+  `lapsed_claim_age_seconds` is the one starvation class
+  `infra_monitor.evaluate` neither excuses by capacity nor bounds by the fleet
+  clock — "only the reaper" clears it. A reaper that also expires LIVE claims
+  is not merely failing to recover; it mints that class one attended claim at a
+  time, and every occurrence pushes an item back onto the due-ready pile the
+  same probe weighs. It fires when a beat straddles its own deadline — begun
+  live, committed lapsed — which is the fleet coming *back* from a database
+  blip or a `voyn-aicc-pgtunnel.service` restart that cost it two beats. That
+  is exactly the moment the lane is recoverable and the reap is most likely to
+  be running.
+
+  The re-test now carries both halves, against the tick's own `now()` (the
+  value the scan compared against), so a lease renewed past this tick is left
+  alone and an attempt that lapses *during* a reap is next tick's work — the
+  same answer 0028 gives a contended row, for the same reason: recovery a
+  minute late costs a minute, recovery that is wrong costs an attempt.
+  `CREATE OR REPLACE` on the bounded arity only; `queue_reap()` is one line
+  over that body (0028) and inherits the fix without being re-declared.
+- **Both halves of that re-test are now pinned, including the one 0002 wrote.**
+  Deleting `state = 'active'` from it left the entire suite green — the same
+  shape of unproven guard this branch has been closing everywhere else, and a
+  regression that only pinned the new half would have repeated the original
+  mistake. `test_a_lease_renewed_mid_reap_is_not_expired_anyway` and
+  `test_a_completion_landed_mid_reap_is_not_expired_over` stage the two
+  interleavings against a real server with nothing simulated: a real
+  `queue_heartbeat` / `queue_complete` from a transaction that opened while the
+  lease was live (`transaction_timestamp()` freezes there, which is what makes
+  it a call that raced its own deadline), committing while a real `queue_reap`
+  is blocked mid-loop on another attempt's row. The block is what makes the
+  interleaving deterministic rather than a race the suite would only sometimes
+  lose, and it is waited for in `pg_stat_activity` rather than slept at. Each
+  mutation fails exactly one of them.
+
+### Tested — the reaper's own entrypoint, not just the method behind it (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
+- **`aicc-queue-reaper.service` execs a line nothing in this repository ran.**
+  The entries below prove `WorkQueueAdmin.reap` against a real PostgreSQL
+  server as `aicc_app`. What systemd starts every minute is
+
+      ExecStart=/opt/aicc/.venv/bin/python -m command_center.db queue-reap
+
+  and `tests/db/test_cli_queue.py` reached that subcommand at the argparse
+  layer and stopped there. Between the two sat a seam nothing exercised —
+  and it is not incidental plumbing, because the properties this branch's
+  recovery fix rests on live in it rather than in the method:
+
+  * **The connection is autocommit.** Batching is only a fix because each
+    `queue_reap(REAP_BATCH)` is durable before the next starts, so "an
+    interruption costs one batch". That is a fact about `pool.connection()`
+    (`autocommit=True`), not about the loop — handed a transactional
+    connection, `reap` returns the same count while an interrupted tick
+    throws away the whole backlog again, which is the exact defect 0028
+    removed.
+  * **The identity is `aicc_app`.** Recovery is deliberately not a worker
+    privilege and 0028's `GRANT EXECUTE … queue_reap(integer)` names that
+    role; the CLI derives it from `AICC_PG_*`, not from a DSN a test built.
+  * **And it is the only exit from the one starvation class the probe weighs
+    unconditionally.** `evaluate` excuses due ready work behind a full fleet
+    and bounds it by the fleet clock; `lapsed_claim_age_seconds` is neither
+    excused nor bounded, and no lane restart and no `queue_redrive` reaches
+    a lapsed claim.
+
+  So a regression anywhere in that seam is `queue_stalled` on
+  `control-01:queue` with no exit reachable by fleet action, while every
+  existing test stays green. `test_the_reaper_timers_own_entrypoint_recovers_a_lapsed_claim`
+  now drives the unit's actual command end to end against a real server —
+  claim, lapse the lease, `cli.main(["queue-reap"])`, item claimable again
+  with its attempt numbering continuing — and pins the ExecStart's module and
+  subcommand to the command it proves. Verified to have teeth by mutation: a
+  non-autocommit pool, a CLI that stops calling `reap`, and an ExecStart that
+  drifts to another subcommand each fail it.
+
+  Same reason `test_readyz_is_200_against_a_real_database` exists on the
+  serving side: the unit tests there monkeypatched `pool.connection` and so
+  stayed green while the served process never opened the pool at all.
+
+### Fixed — a recovery fault must surface, not be answered with the bug it replaced (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
+- **`WorkQueueAdmin.reap`'s fallback caught every first-batch failure, and the
+  two it caught by mistake are the two 0028 exists for.** Found auditing the
+  batching this branch had just added, and it is on the one path the probe
+  measures with no escape clause: `evaluate` excuses due ready work behind a
+  full fleet and bounds it by the fleet clock, but `lapsed_claim_age_seconds`
+  is weighed unconditionally, and `queue_reap` is the only thing that clears a
+  lapsed claim. Restarting a lane does not reap, and `queue_redrive` only
+  reaches items already `dead`.
+
+  The fallback exists so a control host newer than its database still reaps:
+  `queue_reap(integer)` is absent before 0028, so the call is retried against
+  the unbounded arity. It was written as a bare `except Exception` on the
+  first batch. Measured against PostgreSQL 16 as `aicc_app`, three different
+  faults reach that handler:
+
+      statement timeout            QueryCanceled          57014
+      GRANT missed the new arity   InsufficientPrivilege  42501
+      database still at 0027       UndefinedFunction      42883
+
+  Only the last one may be answered by re-running the unbounded form.
+
+  **57014 is the worse miss.** The tick is interruptible by design —
+  `aicc-queue-reaper.service` is a `Type=oneshot` with `TimeoutStartSec=60s`,
+  and the connection crosses the tunnel the credential rotation restarts — and
+  an interruption arrives as a cancellation. Answering it with the unbounded
+  arity re-runs the whole-table scan whose all-or-nothing rollback is the
+  exact defect 0028 removed, over strictly MORE rows than the batch that just
+  failed, at the one moment the server has already shown it cannot finish that
+  much work. The fallback reintroduced the bug precisely when it mattered.
+
+  **42501 it swallowed silently.** A role re-provision that misses 0028's
+  `GRANT EXECUTE ... queue_reap(integer)` leaves the no-argument arity working
+  (it carries 0002's grant) and the bounded one refused. Measured: `reap()`
+  returned a count and reported success while a real deploy fault went
+  unrecorded — on the path whose absence becomes a `queue_stalled` finding
+  with no exit reachable by fleet action.
+
+  Now keyed on SQLSTATE `42883` alone. Keyed on the code rather than an
+  exception class because this module never imports psycopg — it is handed a
+  connection — and a driver that reports no SQLSTATE gets the raise, which is
+  the fail-closed answer. Two regression tests against a real server pin both
+  halves; both fail against the previous code, one on each mis-caught fault.
+
+### Fixed — recovery must make progress, not merely avoid corruption (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
+- `control-01:queue` reported `queue_stalled` again (`monitor_finding` #3321).
+  Every fix on this branch has closed one way for the fleet to end up UP AND
+  CLAIMING NOTHING. This one closes the other half of the finding: not the
+  lanes, but the RECOVERY PATH those lanes depend on — the only exit from the
+  one starvation class no lane restart and no redrive can reach.
+
+  **Why the reaper is what `queue_stalled` is measuring.** `evaluate` weighs
+  two clocks, and only one of them is unconditional:
+
+      starved_ages = [queue.lapsed_claim_age_seconds]
+      if spare_capacity: starved_ages.append(ready_due_starved)
+
+  Due ready work is excused by a full fleet and bounded by the fleet clock. A
+  lapsed claim is neither — "no lane is holding it, so no lane being free is
+  irrelevant to it … only the reaper does, and the lapse age is what measures
+  whether `aicc-queue-reaper.timer` (every minute) is still recovering." So
+  for that half of the finding the probe is measuring the reaper directly,
+  and a reaper that stops recovering is a `queue_stalled` with no exit
+  reachable by fleet action: restarting a lane does not reap, and
+  `queue_redrive` only reaches items that are already `dead`.
+
+  **0002 shipped the safety property and stopped there.** Its header states
+  the row lock as the reason a reap "cannot race a concurrent `complete()`",
+  and `WorkQueueAdmin.reap`'s docstring repeated it as the reason "a missed
+  tick delays recovery and never corrupts it". Both are true about
+  CORRECTNESS. Neither is a statement about PROGRESS — and `queue_claim`'s own
+  comment, two hundred lines above in the same file, draws exactly that
+  distinction for the claim path:
+
+      `SKIP LOCKED` BUYS THROUGHPUT, NOT CORRECTNESS … one slow claim
+      transaction stalls every other claimer.
+      `test_a_claimer_is_never_blocked_by_another_transactions_row_lock` pins
+      that property, and pins it as liveness rather than dressing it up as
+      exclusivity.
+
+  The claim path has that liveness property and a test pinning it. The
+  recovery path had neither, and it is the path where being stuck is
+  unbounded rather than merely slow.
+
+  **MEASURED against a real PostgreSQL 16 server.** Three items claimed,
+  three leases lapsed, one of the three items' rows held by another
+  transaction — any `_queue_owns` caller, a duplicate `queue_enqueue` since
+  0027, a `queue_redrive`, a migration's `ALTER`, an operator at a psql
+  prompt:
+
+      reap interrupted: canceling statement due to statement timeout
+      CONTEXT: while locking tuple (0,4)
+      recovered by the interrupted reap: 0 of 3
+
+  Both halves of that are the defect, and the second is the worse one. It
+  WAITED on the held row rather than stepping past it, so one contended item
+  stopped the recovery of every item behind it. And it is ALL OR NOTHING: the
+  first item had already been expired and requeued before the block, and the
+  interrupted transaction took that back with it. An interrupted tick
+  recovers nothing — not "everything up to where it stopped" — so its work is
+  not delayed, it is discarded, and the next tick starts from the same place.
+
+  **And the tick is interruptible by design.**
+  `aicc-queue-reaper.service` is a `Type=oneshot` with
+  `TimeoutStartSec=60s`, so systemd kills a tick that runs long; the
+  connection crosses `voyn-aicc-pgtunnel.service`, which the credential
+  rotation restarts; and the scan is over every expired attempt in the table
+  with no bound at all. Each of those turns a reap into a rollback, and every
+  rollback returns the fleet to the state that produced it.
+
+  **Migration 0028, in the two pieces that make recovery monotonic.**
+  `FOR UPDATE SKIP LOCKED` on the item, exactly as `queue_claim` takes it, so
+  a contended item is DEFERRED to the next tick (60 seconds) instead of
+  stopping this one — and the deferral is AUDITED rather than silent, with a
+  NULL `work_item_id` and the id in `detail`, because `_queue_audit` requires
+  the caller to hold the item's row lock (0027) and not holding it is the
+  whole reason the branch exists. Then a BOUNDED BATCH: `queue_reap(p_max_items)`
+  stops at a number the caller chose rather than at the size of the table, and
+  `WorkQueueAdmin.reap` loops batches on its autocommit connection so each is
+  durable before the next begins. An interruption now costs one batch.
+
+  Correctness is untouched. The re-test under the lock already handled
+  "somebody else finished this attempt", and whoever holds the row is by
+  definition one of the parties that resolves it — a completion, a claim, a
+  redrive. Skipping is how the reaper waits for them without making every
+  other item wait too.
+
+  **WHY AN OVERLOAD, which is 0024's lesson applied.** `CREATE OR REPLACE`
+  cannot add a parameter, so `p_max_items integer DEFAULT NULL` would define a
+  SECOND function and make the no-argument call AMBIGUOUS — `function
+  queue_reap() is not unique`, measured, and it breaks every existing caller.
+  `queue_reap()` therefore keeps its exact signature and 0002's `EXECUTE`
+  grant and delegates to the bounded form, so the reaper timer running from an
+  older checkout keeps working AND inherits the liveness fix, because the fix
+  is in the body both arities share. `WorkQueueAdmin.reap` falls back to the
+  unbounded arity against a database still at 0027 for the same
+  deploy-independence reason.
+
+  **WHAT THIS DOES NOT CLAIM.** It is not the cause of any one `queue_stalled`
+  reading. A reaper that is never interrupted and never contended behaves
+  exactly as before, and this branch's earlier commits removed the causes that
+  were producing the finding. It is why the lapsed-claim half of that finding
+  had no reliable exit: the recovery path could lose a tick's work to a fault
+  that had nothing to do with the items it was recovering, and nothing on the
+  host would ever have said so.
+
+- **The probe's poll floor was half the daemon's real poll ceiling.** Found
+  while auditing the same route from "work enqueued" to "work attended", and
+  NOT a cause of `queue_stalled` — it produces the sibling failure
+  `throughput_stalled`, which 0024 made independently clearable.
+
+  `CLAIM_POLL_CEILING_SECONDS` is "the longest a free lane can take to notice
+  due work", and `throughput_stalled` — the one check that fires INSIDE the
+  stall window — will not call anything younger than that starved. It was
+  `30.0`, pinned by a test asserting only
+  `>= WorkerConfig().idle_max_seconds`, which `30.0` satisfies. But
+  `idle_max_seconds` caps THE BACKOFF, not the sleep:
+
+      self._sleep(min(idle + random.uniform(0, idle), cap))
+      idle = min(idle * 2, self._config.idle_max_seconds)
+
+  Once the backoff saturates at 30s, every gap between polls is uniform on
+  [30s, 60s), and `cap` (the watchdog half-interval, 120s for the unit's
+  `WatchdogSec=240s`) never clamps it. So half of that range sat above the
+  floor: an item enqueued onto a queue that had been quiet all night could sit
+  30–60s unoffered and be read at the probe's next two-minute sample as
+  `throughput_stalled` — precisely the reading the floor exists to prevent
+  ("a queue that had been empty all night would otherwise go red the second
+  the first task was enqueued"). Not a corner: reachable on every poll cycle.
+
+  The floor is now `60.0`, and the test DERIVES the bound by running the
+  daemon's own backoff to saturation instead of restating one of its
+  constants, so a future change to either the cap or the jitter fails the test
+  rather than the fleet. The shared `_queue()` fixture's starved age is
+  derived from the constant for the same reason — it was a literal `60.0`
+  chosen against the old ceiling, and raising the ceiling would otherwise have
+  looked like a broken test instead of a moved band.
+
+### Fixed — a drained lane must find its own way back (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
+- `control-01:queue` reported `queue_stalled` again (`monitor_finding` #3078).
+  Every fix on this branch so far has closed one way for the fleet to end up
+  UP AND CLAIMING NOTHING — a raising claim killing the lane, a poisoned
+  head-of-line row nothing could claim past, a recovery path that reported
+  success and did nothing. This is the last one of that shape still open, and
+  the only one where the lane was never in trouble at all: it was told to stop
+  claiming, and then nothing ever told it to start.
+
+  **The reload that failed once and was never tried again.** `SIGUSR1` closes
+  the claim gate (`_drain`), and the ONLY thing that reopens it is
+  `_credential_reload_loop` clearing the flags after `reload_credentials()`
+  returns. The request is cleared BEFORE the attempt — deliberately, so a
+  `SIGHUP` arriving mid-reload is coalesced rather than dropped (review finding
+  on `c4001c4`) — so a reload that RAISED had consumed the request and left
+  nothing behind to retry it. The lane stayed drained for the life of the
+  process.
+
+  Nothing on the host notices, and that is what makes it an outage rather than
+  an incident. The lane holds a working pool (`replace_pool` builds and
+  authenticates the replacement BEFORE detaching the old one, so a failed
+  rebuild leaves the previous pool intact), and `run_forever`'s draining branch
+  feeds the systemd watchdog on every pass — so the unit is `active (running)`,
+  its watchdog is fed, its database connection is fine, and it will never claim
+  again. `Restart=` never fires because nothing ever fails.
+
+  It is also the likeliest reload to fail: the rebuild runs against a
+  credential the rotator has just changed, over a tunnel
+  (`voyn-aicc-pgtunnel.service`) that the same rotation restarts, and
+  `worker/__main__.py`'s `reload_credentials` raises on any of a missing
+  `AICC_WORKER_ENV_FILE`, an unreadable or half-published env file, a config
+  the loader refuses, or a replacement pool that cannot connect.
+
+  That state is exactly what the probe reports, and reports correctly: lanes
+  that are up but claiming nothing stop the fleet clock
+  (`fleet_idle_seconds`), due ready work is attended by nobody, and
+  `queue_stalled` opens with no exit reachable by fleet action — restarting is
+  not something anything on the host will do for a unit that looks healthy.
+
+  The reload now degrades the way the claim and report paths already do: log
+  it, back off `idle_max_seconds` (the interval every other "cannot proceed
+  yet" answer uses, because none of them is cured by asking again faster), and
+  keep trying. The backoff waits on `_reload_stop`, so a shutdown during it is
+  still prompt.
+
+  **The gate is deliberately NOT reopened on failure.** The drain is the
+  rotator's instruction to stop claiming while the credential it issued is
+  retired, so a lane that resumed because its reload kept failing would claim
+  under exactly the credential being invalidated. It stays shut until a reload
+  actually succeeds — which now happens on its own, with no operator and no
+  second `SIGHUP`, the moment whatever broke the rebuild is over. Both halves
+  are pinned by their own regression.
+
+- **Migration 0027 — the one audited path that held no lock.** Found while
+  auditing the same route from "work enqueued" to "work attended", proven
+  against a real server, and NOT a cause of the stall above. `_queue_audit`
+  numbers `work_event.seq` as `max(seq) + 1` and states the precondition that
+  makes it collision-free without a retry loop: "every caller passing a
+  non-null work_item_id already holds that item's row lock". Every caller did
+  — `queue_claim`, `queue_reap`, `queue_redrive` and everything reached
+  through `_queue_owns` take the item `FOR UPDATE`, and `queue_enqueue`'s
+  granted path inserts the item itself — except `queue_enqueue`'s DUPLICATE
+  path, which resolved the existing item with a bare `SELECT`.
+
+  The FK's `FOR KEY SHARE` is not that lock and is why the bug survived
+  review: it does not conflict with itself, and it is taken by the audit's
+  INSERT *after* the `max(seq)` subquery in the same statement has already
+  been evaluated. So a duplicate enqueue settles its `seq` on one snapshot,
+  waits behind whoever holds the item, and commits a number that party has
+  since used:
+
+      duplicate key value violates unique constraint "idx_work_event_item_seq"
+      DETAIL:  Key (work_item_id, seq)=(wki_..., 3) already exists.
+
+  The unlocked caller is always the loser, which is why this showed up as
+  dispatch failing rather than as the queue protocol failing. And the race is
+  routine, not exotic: the duplicate path is what an idempotency key is FOR
+  ("the dispatcher may retry an enqueue after a timeout without knowing
+  whether the first landed", 0002), `aicc-backlog-review.timer`,
+  `aicc-backlog-merge.timer` and the planner all re-enqueue keys for work
+  still in flight, and the counterparty needs no coincidence — the worker
+  holding that item beats every ~100s (`visibility_seconds / 3`), and every
+  beat is an audited, row-locked write to the same item. The exception aborts
+  the caller's transaction, taking down whatever else that tick had batched
+  with it, and loses the very refusal record the audit exists to keep —
+  the lesson `queue_redrive`'s unknown-item branch already carries in its own
+  comment.
+
+  0027 resolves the existing item `FOR UPDATE`, so the one caller outside the
+  precondition is inside it. The granted path and enqueues of different keys
+  are untouched.
+
+### Fixed — a claim that raises must not take the lane with it (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
+- `control-01:queue` reported `queue_stalled` again (`monitor_finding` #2873).
+  It is the same measurement as #2840 in the entry below, whose root cause —
+  a refunded lease wait leaving `attempt_no` taken, so `queue_claim` raised a
+  unique violation on the oldest due row — migration 0025 removed; that fix is
+  on this branch and not yet deployed, so the probe kept recording against the
+  fleet still running the old function. What follows are the two defects found
+  while VERIFYING that fix, both proven and both still open: the amplifier that
+  made one raising claim a fleet-wide outage rather than one stuck item, and a
+  recovery path that had gone quietly dead.
+- Neither of these is the cause of the stall — 0025 is. This one is why the
+  cause was not survivable.
+- `self._store.claim(...)` was the one protocol call `run_forever` makes on
+  EVERY iteration and the only one with no guard around it. Its three siblings
+  had each been closed after the same failure: a raising report write
+  (`_execute`, "it would propagate out of `run_forever`'s loop and kill the
+  whole daemon over the one attempt it was reporting"), a raising handler
+  (`_dispatch`), and a non-object payload. The claim was the worst place to
+  leave open, because it fires BEFORE any item is in hand — so the cost is not
+  one attempt but every attempt. The exception leaves the loop, the lane
+  exits, systemd restarts it, and the next claim raises on the same row.
+  `queue_claim` takes the OLDEST DUE ROW, so every lane selects it and dies:
+  the lane crash-loops and claims nothing.
+- That is the state the probe reads as a stall, and reads correctly. Lanes
+  that are up but claiming nothing stop the fleet clock
+  (`fleet_idle_seconds`), due ready work is attended by nobody, and
+  `queue_stalled` opens with no exit reachable by fleet action — restarting a
+  crash-looping lane only restarts the crash. Migration 0025 removed one
+  cause; any next one does it again, and a dropped connection or a PostgreSQL
+  restart is enough.
+- The claim path now degrades the way the report path already does: log it,
+  back off `idle_max_seconds` — the same interval every other unclaimable
+  answer uses, because none of them is cured by asking again faster — and keep
+  claiming. The backoff sits OUTSIDE `_claim_gate_lock` on purpose: the drain
+  coordinator takes that lock to emit the `aicc-drained` ACK the credential
+  rotator waits on, so sleeping under it would trade a dead lane for a wedged
+  one. A transient fault now costs one poll; a permanent one leaves a lane
+  that is up and visibly claiming nothing, which the queue probe still catches
+  on the fleet-idle clock. Neither ends with the lane dead.
+- Two regressions, both mutation-checked (both fail at the previous commit,
+  where the exception propagates straight out of `run_forever`): a claim that
+  raises the real unique-violation text, after which the lane must claim and
+  complete the item behind it; and the gate lock proved free from inside the
+  backoff itself.
+- MEASURED, including what it does NOT buy. Driven against a real PostgreSQL
+  16 server as the deployed fleet (2 lanes, 40-minute attempts, a 4-deep
+  backlog, writer-lease contention, retries, lane deaths, the reaper on its
+  1-minute timer, sampled every 2 minutes as the timer samples): 24 simulated
+  hours in which every claim raises from hour 6 gives 530 `queue_stalled`
+  samples, the first 22 minutes after the fault — the #2873 signature, and the
+  mechanism by which a claim fault becomes this finding at all. Against an
+  INTERMITTENT fault (30% of claims for 12 hours) the guarded and the
+  crash-looping fleet both stay green, because two lanes on 40-minute attempts
+  absorb a restart cycle; the guard is worth a poll instead of `RestartSec=10s`
+  plus a cold start there, not a change of verdict. And a deterministically
+  poisoned row stalls the queue either way — that is the cause, and removing it
+  is 0025's job, not this one's.
+
+### Fixed — the dead-letter queue had no exit for the class 0022 created (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
+- `queue_redrive` is "the DLQ's exit", written when a `work_item` had ONE
+  budget: it widens `max_attempts` explicitly so each widening is a recorded
+  act rather than a silent reset. 0022 gave the item a SECOND budget and a
+  second way to die — `lease_wait_count` against the caller's
+  `p_max_lease_waits`, dead-lettering as `lease_wait_exhausted` — and did not
+  tell the redrive. The same omission 0025 fixed in `queue_claim`, in the same
+  family, from the same migration.
+- So for the items it most needed to recover, the exit REPORTED SUCCESS AND
+  DID NOTHING. Measured against a real PostgreSQL 16 server (cap 2 for
+  brevity): three lease refusals dead-letter the item with
+  `lease_wait_count = 2`; `queue_redrive(item, 3)` returns true, audits
+  `granted`, moves it to `ready` and widens `max_attempts` 3 → 6; one further
+  refusal dead-letters it again. The count was still at the cap, so the very
+  next writer-lease refusal — the exact condition that dead-lettered it, and
+  the one most likely to still be true moments later — killed it, and the
+  widened attempt budget was never touched because the item never died of it.
+- The work stranded that way is FINISHED work: `lease_unavailable` names no
+  fault in it, only that a sibling lane held the repository's writer lease,
+  which is why 0022 exists at all. `backlog_dispatch` bounds concurrency by
+  per-repository writer leases across three repositories with two lanes, so
+  sustained contention is a state this fleet produces by design.
+- Migration 0026 restores BOTH budgets on redrive, unconditionally: an item
+  dead-lettered on `max_attempts` can carry a nearly spent `lease_wait_count`
+  from earlier contention, and redriving it into a handful of refusals before
+  the widened attempts are ever tried is the same defect wearing a different
+  `dead_reason`. It does not weaken the rule it sits under — `lease_wait_count`
+  counts contention against one delivery, not a property of the work; every
+  redrive is audited, and the previous count now travels in that audit beside
+  the previous `dead_reason`, so a redrive loop stays as visible as the
+  `max_attempts` widening beside it. The attempt HISTORY is still not reset:
+  `work_attempt` is untouched and 0025 still numbers the next delivery from it.
+- The regression asserts the SECOND refusal after a redrive, not the first —
+  with the budget unrestored the first already dead-letters, so a test that
+  stopped at one would pass against the broken function. It also proves the
+  bound still terminates: restoring a budget is not removing it.
+
+
+### Fixed — one writer-lease refusal stopped the whole queue (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
+- `control-01:queue` reported `queue_stalled` again (`monitor_finding` #2840),
+  and this time the probe was right: the queue really had stopped. Every
+  earlier entry below made the MEASUREMENT honest; this is the thing it was
+  honestly measuring.
+- `queue_claim` derived the new `work_attempt.attempt_no` from
+  `work_item.attempt_count`. That was free while the two moved together, and
+  migration 0022 separated them: `queue_fail_lease_wait` exists so a lost
+  writer-lease race does not spend the work's budget, so it requeues with
+  `attempt_count = greatest(attempt_count - 1, 0)` while deliberately KEEPING
+  the refunded `work_attempt` row — it is the audit trail 0002 promises, and
+  `work_event` references it. The item then carries `attempt_count = N-1`
+  beside an attempt that still holds `attempt_no = N`, the next claim
+  recomputes `N`, and `UNIQUE (work_item_id, attempt_no)` refuses it:
+  `duplicate key value violates unique constraint "idx_work_attempt_item_no"`.
+- The cost is the whole fleet, not the one item. The exception aborts
+  `queue_claim`, so the item is not merely un-retried but UNCLAIMABLE — and
+  `queue_claim` takes the oldest due row (`ORDER BY priority DESC,
+  available_at, created_at`), so it is head-of-line: every lane's next claim
+  selects it and raises, and healthy work behind it is never reached.
+  `worker.daemon.run_forever` has no handler for it either — it handles
+  `QueueRefusal`, which an exception is not — so the lane crash-loops under
+  systemd. One refusal of a kind the fleet is built to produce
+  (`backlog_dispatch` bounds concurrency by per-repository writer leases across
+  three repositories with two lanes; 0022's header records the live contention
+  that motivated the refund) stops every queue consumer.
+- That is why the finding kept reopening and could never be cleared by fleet
+  action: the monitor measures due ready work that no lane is holding while the
+  fleet clock stands still, which is exactly this state, and no amount of
+  correct measuring or restarting can claim an item whose next `attempt_no` is
+  already taken.
+- Migration 0025 numbers the delivery from the history that constrains it —
+  `attempt_no` is `max(attempt_no) + 1` over the item's own attempts, computed
+  under the row lock the claim already holds, so the unique index stays the
+  backstop its comment says it is rather than the thing that decides.
+  `attempt_count` stays the budget. It is also the recovery: an item already
+  poisoned carries `attempt_count = N-1` and a stuck `attempt_no = N`, and its
+  next claim takes `N+1` and succeeds — no data fix-up, no redrive, no
+  operator. Routing is unaffected: `worker.handlers._cascade_step` reads
+  `attempt_no` modulo the cascade length and already tolerates a number that
+  climbs independently of the budget (`queue_redrive` does the same), so a
+  lease-wait retry advances a cascade link exactly as it did before 0022, when
+  it was a plain `queue_fail(retryable => true)`.
+- Nothing had exercised the round trip, which is how this landed: the daemon's
+  routing to `fail_lease_wait`, the grant, and 0022's refund arithmetic were
+  all covered, but no test CLAIMED THE ITEM AGAIN afterwards — the only place
+  the collision can appear. Four regressions now do, each mutation-checked
+  against the migration: the refunded attempt taking the next number, the
+  head-of-line item that must not wedge the queue behind it, the lease-wait
+  bound still terminating in the DLQ with every delivery numbered afresh, and
+  — in the monitor's own suite — the stalled shape draining to a green probe.
+  Re-driven as a simulation of the deployed fleet against a real PostgreSQL 16
+  server (2 lanes, 40-minute attempts, a 4-deep backlog, retries, the reaper on
+  its 1-minute timer, sampled every 2 minutes as the timer samples): 24
+  simulated hours with writer-lease contention in the mix, zero red samples,
+  where the same run without the migration dies at the first refusal.
+
+### Fixed — the queue monitor called a working fleet stalled (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
+- The measurement spanned EVERY queue while the verdict knew exactly one fleet
+  (`monitor_finding` #2766). `work_item.queue` is a real dimension —
+  `queue_enqueue` writes it, `UNIQUE (queue, idempotency_key)` keys on it, and
+  `queue_claim(p_queue, ...)` serves exactly the one queue it is given, which
+  the lanes pass as `WorkerConfig.queue`. `_QUEUE_SNAPSHOT_SQL` filtered on
+  none of it, so every class it reports — "claimable by a free lane", "no lane
+  is holding it", "lanes doing their job" — was computed over rows belonging to
+  fleets that do not exist, and then judged against `--claim-capacity`. Both
+  directions were wrong, and the second is the one a fail-closed monitor must
+  never get wrong:
+  - A due `ready` row on any other queue counted as work this fleet was
+    ignoring. No lane can ever claim it, so no amount of healthy fleet
+    behaviour could retire the finding — an `open` `queue_stalled`, and the
+    task the planner mints from it, with no reachable exit. "The monitor clears
+    the finding when it measures healthy" was not a promise the measurement
+    could keep.
+  - FAIL-OPEN: claims on another queue counted toward this queue's capacity.
+    Two attended claims anywhere in the table made `attended_claims == 2`,
+    `spare_capacity` false, and a genuine hours-old unclaimed item on
+    `execution` was excused as backpressure behind a fleet that was not serving
+    it at all — the probe silent through exactly the stall it exists to catch.
+  The statement now binds the queue name twice: once to the pending work, and
+  once to the `fleet_idle_seconds` subquery added for #2471 — an attempt on
+  another queue's item is another fleet's lane, and letting it wind this clock
+  forward would excuse a stall of any age here through `min(due_age,
+  fleet_idle)`, reintroducing the fail-open through the fix for the one before
+  it. `--queue` defaults to the lanes' own queue, pinned to `WorkerConfig` by
+  `test_the_probes_queue_default_matches_the_daemons_own` the way capacity is
+  pinned to `deploy/aicc/worker-lanes`; the deployed `voyn-queue-monitor
+  .service` therefore needs no new flag. A fleet running a second queue gets a
+  second probe with its own capacity and finding source, because every
+  threshold on that ExecStart line is already a fact about one queue's fleet.
+  Regressions in both layers, all mutation-checked: at `evaluate`/`main` the
+  default, the flag's path into the statement's parameters, and that the name
+  is bound to BOTH questions; and against a real PostgreSQL server the foreign
+  ready row, the foreign claims that must not excuse a stall, and the foreign
+  attempt that must not wind the fleet clock.
+- The capacity test gated the COMPARISON and left the CLOCK running
+  (`monitor_finding` #2471). A due `ready` item's age is time since it became
+  due, and the queue is designed to hold work no lane can attend yet, so that
+  age climbs for hours while the fleet is legitimately full and invisible
+  behind `attended_claims == claim_capacity`. The moment occupancy drops the
+  same hours-old number is measured against 900s — and occupancy drops at
+  every attempt boundary (`queue_complete` commits before the daemon's next
+  claim), at every lane restart the 5-minute self-deploy tick issues, and at
+  every drain. With the probe sampling every two minutes, `control-01:queue`
+  goes red against lanes doing exactly their job, mints a task, and clears on
+  the next tick — a monitor that cannot stay green for 24h on a healthy fleet.
+  The stall clock is now bounded by how long the FLEET has been standing
+  still: an item is only being ignored while there is somebody to ignore it.
+  `_QUEUE_SNAPSHOT_SQL` reports `fleet_idle_seconds` — time since any lane took
+  an item (`work_attempt.created_at`) or handed one back (an attempt leaving
+  `active`) — and `evaluate` takes the lesser of that and the due age.
+  Heartbeats are deliberately excluded: `queue_heartbeat` writes
+  `updated_at = now()` on a row that stays `active`, and a clock a stalled
+  fleet could wind forward by beating would excuse every stall there is. A
+  lapsed claim is not bounded by it either — a neighbouring lane claiming away
+  beside a zombie says nothing about the zombie — and `None` (no attempt has
+  ever been made) bounds nothing, so a fleet that never started still fails
+  closed. Regressions in both layers: the attempt boundary, the fleet that has
+  not moved all window, the unmeasurable clock and the lapsed claim at
+  `evaluate`; and against a real server, the boundary driven through
+  `queue_complete`, a heartbeat that must not wind the clock, and an empty
+  `work_attempt`.
+- `tests/db/test_postgres_integration.py`: `test_execute_grants_match_the
+  _declared_protocol_steps` resolved declared signatures to catalog functions
+  by name prefix, so 0024's `monitor_clear_finding(text, text[])` — this
+  schema's first overload — made it call both declared forms ambiguous and
+  both granted overloads surplus on an exactly compliant database. It failed
+  on a correct schema rather than catching an incorrect one, which would have
+  held the whole branch out of CI. It now keys on name and arity via
+  `roles._function_key` against `pg_proc.pronargs`, the same way
+  `render_table_grants` and `test_grant_compliance` were taught to in the same
+  migration.
+- `command_center/ops/infra_monitor.py`: the stall clock was
+  `now() - min(work_item.updated_at)` over every ready or claimed row. For a
+  claimed row that timestamp is the moment it was CLAIMED — `queue_heartbeat`
+  renews `work_attempt.visible_until` and never touches the item — so any
+  attempt outrunning `--max-stalled-seconds` (900s) read as a stall, and the
+  deployment expects that to be ordinary: `voyn-aicc-worker@.service` gives one
+  attempt `TimeoutStopSec=3660s`, plus a 600s worktree clone before the agent
+  starts. `control-01:queue` therefore went red with `queue_stalled` on healthy
+  work, opened a `monitor_finding` (#481) and had the planner mint a task for
+  it — a fail-closed monitor that could not be green while the fleet worked.
+  The clock now measures only UNATTENDED pending work: ready and *due* (an item
+  inside its retry backoff is waiting by design), or claimed with no live
+  lease — the zombie the check was written for, which is still caught. A claim
+  under a live lease is reported separately as `live_claim_age_seconds` and
+  bounded by the new `--max-claim-seconds` (default 5400s), so a handler wedged
+  behind a still-beating heartbeat thread is caught at a ceiling above one
+  legitimate attempt instead of below it. `throughput_stalled` is gated on the
+  same unattended set, so the fix does not merely rename the false positive.
+- Excluding attended claims was half of it. The queue is *designed* to hold
+  more dispatched work than the fleet can claim — `PlanLimits.wip_limit` is 4
+  against the 2 lanes of `deploy/aicc/worker-lanes`, and `backlog_dispatch`
+  bounds concurrency by per-repository writer leases across three fleet
+  repositories — so the surplus item sits `ready` and *due* until a lane frees,
+  which takes a whole attempt and tripped the same clock on its own. A due
+  ready item is now a stall only when a lane was FREE to take it: the snapshot
+  reports three disjoint classes (`ready_due`, `lapsed_claims`,
+  `attended_claims`, each with its own age) and `evaluate` weighs the attended
+  claims against the new `--claim-capacity` (default 2, the lane registry). A
+  lapsed claim stays starved at any capacity — no lane is holding it, so a busy
+  fleet is no explanation for it. Scaling past two lanes means passing
+  `--claim-capacity`; until it is passed the probe under-reports rather than
+  crying wolf, which is the direction a red tick that mints a task should err.
+- `throughput_stalled` also gained a floor: it is the only check that fires
+  inside the stall window, and an hour with no successes is ordinary here (one
+  attempt may run longer), so a queue that had been empty all night went red
+  the second the planner dispatched the first task. It now needs the starved
+  work to be older than `CLAIM_POLL_CEILING_SECONDS` — the daemon's idle poll
+  backs off to `WorkerConfig.idle_max_seconds` (30s) and no further, so below
+  that nothing has been offered to a claimer yet.
+- `tests/db/test_infra_monitor_queue_snapshot.py`: the measurement proved
+  against a real server, as `aicc_app` — claims taken through `queue_claim`,
+  leases expired the way the protocol expires them, and the lease read through
+  `work_attempt_public` (`work_attempt` itself is granted to nobody).
+- `tests/ops/test_infra_monitor.py`: `test_new_pending_work_does_not_turn_an_idle_queue_red`
+  now sets the count alongside the age. Gating the stall check on the
+  unattended count made that snapshot unreachable (the count is 0 exactly when
+  the age is `None`), so the test passed through the gate without ever reaching
+  the `10s < 900s` comparison it exists to pin — it no longer failed when the
+  threshold was mutated away. The redundant count gates are gone with the
+  restructure; the ages alone drive the verdicts. Two defaults are pinned to
+  their sources rather than restated: `--claim-capacity` against
+  `deploy/aicc/worker-lanes`, and the throughput floor against
+  `WorkerConfig.idle_max_seconds`.
+- A healthy `queue_stalled` measurement could still leave its finding open:
+  the monitor recorded findings independently but cleared them only when every
+  check sharing the source was green. On `control-01:queue`, an unrelated
+  `dead_letter_growth` failure therefore held finding #481 open after the stall
+  fix. Migration 0024 adds a compatible two-argument clear function that closes
+  only findings absent from the current measurement; every monitor tick now
+  reconciles that set. Unit and PostgreSQL integration regressions cover red-tick
+  partial clears, stable finding/task identity, empty/NULL clears, source scope,
+  and grants for both control- and worker-host probes.
+- `deploy/systemd/voyn-queue-monitor.service`: the probe's finding source
+  (`control-01:queue`) is set as `Environment=AICC_MONITOR_FINDING_SOURCE`,
+  which `--record-findings` now defaults to, rather than appended to
+  `ExecStart`. That line spells the control host's absolute install path, and
+  `scripts/ci/prepush/leak_guard.sh` refuses any ADDED line carrying one in
+  this public repository — a rule the guarded publisher enforces too
+  (`_leak_guard_gate` fails the publish, it does not warn), so re-typing the
+  line to append a flag would have made the fix unpublishable. The line
+  already in history is untouched context. An explicit `--record-findings`
+  still wins over the environment, and the worker-host probe
+  (`voyn-infra-monitor.service`) sets neither, so it keeps recording nothing.
+
+- `monitor_clear_finding` is this schema's first OVERLOADED function, and two
+  places assumed a function name identified exactly one signature.
+  `roles.render_table_grants`' existence filter — the one that lets grants be
+  re-asserted against a database at an intermediate migration version — matched
+  on the bare name, so between 0021 and 0024 it would have emitted a GRANT for
+  the two-argument form while only the one-argument form existed; the whole
+  matrix applies in one transaction, so that is not one skipped privilege but
+  every grant in the run aborting. `tests/db/test_grant_compliance.py` resolved
+  declared signatures by name prefix the same way and would have called both
+  forms `AMBIGUOUS` and both granted overloads `EXTRA` on a schema that is
+  exactly compliant. Both now key on name AND arity (`roles._function_key`,
+  read from `pg_proc.pronargs`) — arity because it is what PostgreSQL resolves
+  this pair by and it is an integer, so no type-name spelling has to agree
+  between the declared matrix and the catalog; matching rendered types would
+  put `timestamptz` against `timestamp with time zone` and skip a grant
+  SILENTLY, and a missing grant is an outage the next deploy inherits while a
+  surplus statement is a loud error. A same-name/same-arity clash is still
+  reported as ambiguous.
 
 ### Added — Home screen widget snippets (`VOYN-MIN-WIDGET-SNIP`)
 - `AICCNativeCore.WidgetIntentSnippet` / `WidgetFlow` / `WidgetDestination`

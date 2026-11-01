@@ -69,6 +69,20 @@ def build_parser() -> argparse.ArgumentParser:
         "upgrade",
         help="Apply pending migrations and re-assert table grants (as the migrator).",
     )
+    # No database, so it is the one migration command a developer can run on a
+    # laptop -- which is where the edit that needs catching is made.
+    #
+    # Check only. Regeneration is `python scripts/migration_lock.py --write`:
+    # a durable write inside a package named `db` is what
+    # tests/architecture/aios_boundary.py reads as a persistence engine
+    # (docs/AIOS_BOUNDARY.md), and the control plane's database CLI is not
+    # one. Verifying persists nothing, so it belongs here, reachable from a
+    # deploy.
+    sub.add_parser(
+        "migration-lock",
+        help="Check the recorded checksum of every migration file "
+        "(regenerate with scripts/migration_lock.py --write).",
+    )
 
     # The queue's recovery surface (SRV-06). These run as `aicc_app` — the
     # role the SQL protocol granted queue_reap/queue_redrive/work_dlq to —
@@ -349,6 +363,17 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = build_parser().parse_args(argv)
 
+    if args.command == "migration-lock":
+        # No database and no configuration: the lock is a property of the
+        # files, and this must answer on a laptop with no DSN at all.
+        try:
+            migrations.verify_released_checksums()
+        except migrations.MigrationError as exc:
+            print(f"migration lock: {exc}", file=sys.stderr)
+            return 2
+        print(f"migration lock: {len(migrations.discover())} migrations unchanged")
+        return 0
+
     if args.command == "self-deploy":
         # Deliberately BEFORE any database configuration or pool: a deploy
         # must work when the database is down or this host has no DB role
@@ -437,7 +462,19 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
 
             if args.command == "upgrade":
-                applied = migrations.upgrade(conn)
+                try:
+                    applied = migrations.upgrade(conn)
+                except migrations.MigrationError as exc:
+                    # A refusal, not a crash. `self-deploy --migrate` runs this
+                    # as a subprocess and puts the head of its stderr into the
+                    # deploy report, so an uncaught raise reported
+                    # "Traceback (most recent call last):\n  File ..." and the
+                    # actual verdict -- "migration 0022 was modified after it
+                    # was applied" -- never reached the operator, and the
+                    # queue fixes behind it stayed unapplied
+                    # (VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH).
+                    print(f"migration refused: {exc}", file=sys.stderr)
+                    return 2
                 print(f"applied: {list(applied)}" if applied else "already up to date")
                 # Unconditionally, not only when something was applied: a table
                 # created by a migration starts with no grants, and re-asserting
