@@ -305,9 +305,22 @@ def test_backlog_plan_propagates_repository_path_to_coordinator(monkeypatch, exp
     from contextlib import nullcontext
 
     from command_center.db import cli
-    from command_center.orchestrator import coordination, planner
+    from command_center.orchestrator import (
+        control_plane_reconciler,
+        coordination,
+        planner,
+    )
 
     monkeypatch.setenv("AICC_FLEET_REPO", "/srv/configured-repo")
+    # The planner tick also heartbeats (control-plane reconciler); this test
+    # pins only the coordinator's repository path, so the heartbeat is
+    # recorded in-memory instead of on the stub connection.
+    heartbeats = []
+    monkeypatch.setattr(
+        control_plane_reconciler,
+        "record_heartbeat",
+        lambda _factory, tick, detail="": heartbeats.append(tick),
+    )
     monkeypatch.setattr(cli, "load_config", lambda: object())
     monkeypatch.setattr(cli.pool, "open_pool", lambda _config: None)
     monkeypatch.setattr(cli.pool, "close_pool", lambda: None)
@@ -318,3 +331,4 @@ def test_backlog_plan_propagates_repository_path_to_coordinator(monkeypatch, exp
     argv = ["backlog-plan"] + (["--repo-path", "/srv/explicit-repo"] if explicit else [])
     assert cli.main(argv) == 0
     assert captured == ["/srv/explicit-repo" if explicit else "/srv/configured-repo"]
+    assert heartbeats == ["backlog-plan"]
