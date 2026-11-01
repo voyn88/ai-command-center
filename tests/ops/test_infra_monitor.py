@@ -477,7 +477,92 @@ def test_findings_are_recorded_and_cleared_through_the_definer_functions(
     )
     calls.clear()
     infra_monitor.record_findings("worker-01:infra", (), {})
-    assert any("monitor_clear_finding" in c[0] for c in calls)
+    cleared = [c for c in calls if "monitor_clear_findings_except" in c[0]]
+    # A tick with no failures keeps an empty keep-list, which clears the
+    # whole source exactly as 0021's monitor_clear_finding(source) did.
+    assert cleared and cleared[0][1] == ("worker-01:infra", [])
+
+
+def test_a_class_that_is_green_again_clears_while_another_probe_is_red(
+    monkeypatch,
+) -> None:
+    """VOYN-MON-WORKER-01-INFRA-DEPLOY-LAG-PROBE-FAILED-44FE01A0F9.
+
+    0021 cleared a source's findings only on a tick with NO failures, so
+    every probe on a host shared one clearing gate. worker-01:infra runs
+    five, and `--unit-health` is red there as a standing fact -- it exists
+    because that host carries units with six-figure NRestarts -- so a
+    `deploy_lag_probe_failed` that had recovered stayed an OPEN finding, and
+    therefore a live P1 task, until something unrelated went green. Clearing
+    is per class: the keep-list is exactly what this tick measured RED.
+    """
+    from command_center.ops import infra_monitor
+
+    calls: list[tuple] = []
+
+    class _Cur:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql, params=None):
+            calls.append((sql.strip(), params))
+
+    class _Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def cursor(self):
+            return _Cur()
+
+        def commit(self):
+            calls.append(("commit", None))
+
+    class _Pool:
+        @staticmethod
+        def open_pool(cfg):
+            calls.append(("open", None))
+
+        @staticmethod
+        def connection():
+            return _Conn()
+
+        @staticmethod
+        def close_pool():
+            calls.append(("close", None))
+
+    import sys
+    import types
+
+    fake_db = types.ModuleType("command_center.db")
+    fake_db.pool = _Pool
+    fake_cfg = types.ModuleType("command_center.db.config")
+    fake_cfg.load_config = lambda: {}
+    monkeypatch.setitem(sys.modules, "command_center.db", fake_db)
+    monkeypatch.setitem(sys.modules, "command_center.db.pool", _Pool)
+    monkeypatch.setitem(sys.modules, "command_center.db.config", fake_cfg)
+    infra_monitor.record_findings(
+        "worker-01:infra",
+        ("crash_loop:1:ollama.service=315891", "failed_units:2:a.service,b.service"),
+        {"x": 1},
+    )
+    recorded = [c[1][1] for c in calls if "monitor_record_finding" in c[0]]
+    assert recorded == ["crash_loop", "failed_units"]
+    cleared = [c for c in calls if "monitor_clear_findings_except" in c[0]]
+    assert len(cleared) == 1
+    assert cleared[0][1] == ("worker-01:infra", ["crash_loop", "failed_units"])
+    # The recording comes FIRST and the clearing names what is still red, so
+    # a standing finding keeps its row -- its id, its opened_at and the task
+    # the planner linked to it. Clearing first would close and re-open every
+    # standing finding every two minutes.
+    assert [c[0] for c in calls].index(
+        next(c[0] for c in calls if "monitor_record_finding" in c[0])
+    ) < [c[0] for c in calls].index(cleared[0][0])
 
 
 def test_main_exits_non_zero_when_findings_cannot_be_recorded_even_if_healthy(

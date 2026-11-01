@@ -103,6 +103,14 @@ def test_orphan_down_migration_is_rejected(tmp_path) -> None:
         migrations.discover(tmp_path)
 
 
+def test_monitor_clear_by_class_does_not_collide_with_fleet_migrations() -> None:
+    """0029 is the per-class finding clear for
+    VOYN-MON-WORKER-01-INFRA-DEPLOY-LAG-PROBE-FAILED-44FE01A0F9."""
+    found = migrations.discover()
+    assert found[28].slug == "monitor_clear_findings_by_class"
+    assert "monitor_clear_findings_except" in found[28].up_sql
+
+
 def test_expected_schema_version_tracks_the_migration_set() -> None:
     """A hand-maintained constant here would eventually go un-bumped.
 

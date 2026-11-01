@@ -1327,3 +1327,51 @@ def test_open_monitor_findings_become_pipeline_tasks_once(rig) -> None:
         with conn.cursor() as cur:
             cur.execute("SELECT monitor_clear_finding(%s)", ("worker-01:infra",))
             assert cur.fetchone()[0] == 1
+
+
+def test_a_recovered_class_clears_its_own_finding_under_the_worker_grant(rig) -> None:
+    """0029, from the worker host's own role.
+
+    0021 cleared a source's findings only on a tick with no failures at all,
+    so one standing red probe (`crash_loop` on worker-01, where units carry
+    six-figure NRestarts) held every recovered class open with it -- including
+    `deploy_lag_probe_failed` (monitor_finding #12184).
+    """
+    app_factory, _store, worker = rig
+    # The worker role holds EXECUTE on the finding functions and no grant at
+    # all on the table (0021's policy, deliberately): every read below goes
+    # through the control plane's role instead.
+    with worker._factory() as conn:  # noqa: SLF001 — the worker role's own connection
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT monitor_record_finding(%s, %s, %s::jsonb)",
+                ("worker-01:infra", "crash_loop", "{}"),
+            )
+            standing = cur.fetchone()[0]
+            cur.execute(
+                "SELECT monitor_record_finding(%s, %s, %s::jsonb)",
+                ("worker-01:infra", "deploy_lag_probe_failed", "{}"),
+            )
+            # The next tick: deploy_lag_probe_failed green, crash_loop still red.
+            cur.execute(
+                "SELECT monitor_clear_findings_except(%s, %s)",
+                ("worker-01:infra", ["crash_loop"]),
+            )
+            assert cur.fetchone()[0] == 1
+            cur.execute(
+                "SELECT monitor_record_finding(%s, %s, %s::jsonb)",
+                ("worker-01:infra", "crash_loop", "{}"),
+            )
+            # Recorded before the clear each tick, so the standing finding
+            # keeps its id -- and with it its opened_at and its linked task.
+            assert cur.fetchone()[0] == standing
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT failure, state FROM monitor_finding "
+                "WHERE source = 'worker-01:infra' ORDER BY failure"
+            )
+            assert cur.fetchall() == [
+                ("crash_loop", "open"),
+                ("deploy_lag_probe_failed", "cleared"),
+            ]

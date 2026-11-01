@@ -244,6 +244,10 @@ def test_the_worker_reaches_the_queue_only_through_the_six_protocol_steps() -> N
         # -- turns a finding into a task.
         "monitor_record_finding",
         "monitor_clear_finding",
+        # 0029: and clears the classes it measured GREEN this tick, so a
+        # recovered class stops being an open finding without waiting for
+        # every other probe on the same host.
+        "monitor_clear_findings_except",
     }
     assert roles.VIEW_PRIVILEGES[roles.WORKER_ROLE] == {}
 
@@ -306,6 +310,7 @@ def test_the_control_plane_cannot_claim() -> None:
         "backlog_set_task_class",
         "monitor_record_finding",
         "monitor_clear_finding",
+        "monitor_clear_findings_except",
         "monitor_link_task",
         # VOYN-W0-AICC-BACKLOG-PG-CANONICAL-GATE (0020): the importer's stamp
         # of where a migrated row came from.
@@ -339,11 +344,33 @@ def test_function_grants_are_revoked_before_they_are_reapplied() -> None:
 
 
 @pytest.mark.parametrize(
-    "bad", ["queue_claim(text; DROP TABLE task)", "queue_claim(text"]
+    "bad",
+    [
+        "queue_claim(text; DROP TABLE task)",
+        "queue_claim(text",
+        # An array suffix is allowed, but only as a suffix and only on an
+        # otherwise plain identifier.
+        "monitor_clear_findings_except(text, te xt[])",
+        "monitor_clear_findings_except(text, []text)",
+    ],
 )
 def test_function_signature_guard_rejects_injection(bad: str) -> None:
     with pytest.raises(ValueError):
         roles._require_function_signature(bad)
+
+
+def test_function_signature_guard_accepts_an_array_argument() -> None:
+    """0029 takes the keep-list of still-red failure classes as `text[]`,
+    which is not a bare identifier and must not be rejected as one."""
+    roles._require_function_signature("monitor_clear_findings_except(text, text[])")
+    assert (
+        "monitor_clear_findings_except(text, text[])"
+        in roles.FUNCTION_PRIVILEGES[roles.WORKER_ROLE]
+    )
+    assert (
+        "GRANT EXECUTE ON FUNCTION public.monitor_clear_findings_except(text, text[]) "
+        "TO aicc_worker;" in roles.render_table_grants()
+    )
 
 
 def test_a_worker_host_role_is_a_login_member_of_the_worker_group() -> None:
