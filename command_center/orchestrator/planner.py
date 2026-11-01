@@ -560,6 +560,7 @@ def _payload_for(
             "untrusted": False,
             "cascade": cascade,
             "backlog_task_id": task["task_id"],
+            "required_authorities": list(task.get("required_authorities") or ()),
             "mode": "split",
         }
         return payload, len(cascade)
