@@ -47,6 +47,7 @@ from command_center.ui import (
     execution_center_form,
     execution_center_monitor,
     execution_strip,
+    fleet_panel,
     git_readers,
     home_dashboard,
     integration_center,
@@ -210,6 +211,7 @@ NAV: dict[str, tuple[str, str]] = {
     "waves": ("Волны", ":material/waves:"),
     "agents": ("AI-агенты", ":material/smart_toy:"),
     "execution_center": ("Live Execution Center", ":material/bolt:"),
+    "fleet": ("Fleet", ":material/dns:"),
     "daily_audit": ("Ежедневный аудит", ":material/fact_check:"),
     "runs": ("Журнал запусков", ":material/history:"),
     "timeline": ("Таймлайн", ":material/timeline:"),
@@ -682,10 +684,17 @@ def _open_command_palette() -> None:
     st.session_state.show_command_palette = True
 
 
+def _active_nav() -> dict[str, tuple[str, str]]:
+    """NAV filtered for this process: Fleet only when AICC_PG_* is configured."""
+    from command_center.db.fleet_read import filter_nav_for_postgres
+
+    return filter_nav_for_postgres(NAV)
+
+
 def build_commands() -> list[dict]:
     commands = [
         {"label": f"Перейти: {label}", "icon": icon, "action": ("nav", key)}
-        for key, (label, icon) in NAV.items()
+        for key, (label, icon) in _active_nav().items()
         if key not in sidebar.HIDDEN_FROM_SIDEBAR
     ]
     commands.extend(
@@ -708,7 +717,7 @@ page_key = shell.render_shell(
     sidebar_collapsed=st.session_state.get("nav_page") == "focus",
     title="🧭 AI Command Center",
     caption="Единый центр управления проектами, задачами и AI-процессами",
-    nav=NAV,
+    nav=_active_nav(),
     project_count=len(models.PROJECT_IDS),
     on_open_palette=_open_command_palette,
     tasks_by_id=tasks_by_id,
@@ -2316,6 +2325,14 @@ elif page_key == "execution_center":
     )
 
     render_live_execution_center(get_execution_center_api(), tasks)
+
+
+# --------------------------------------------------------------------------
+# Fleet — read-only PostgreSQL autonomous contour (VOYN-W0-AICC-UI-FLEET-…)
+# --------------------------------------------------------------------------
+
+elif page_key == "fleet":
+    fleet_panel.render()
 
 
 # --------------------------------------------------------------------------
