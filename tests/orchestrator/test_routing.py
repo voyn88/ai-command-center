@@ -29,8 +29,26 @@ def test_owner_profile_avoids_exhausted_subscription_and_preserves_class(monkeyp
     for task_class, task_type in [('implementation', 'implementation'), ('review', 'review')]:
         links = cascade_for(task_class)
         assert [link['executor'] for link in links] == ['cursor', 'grok']
+        assert [link.get('model') for link in links] == ['auto', 'grok-4.6']
         assert all(link['task_type'] == task_type for link in links)
         assert all(link['executor'] in agent_runner.PRINCIPAL_EXECUTOR_BINARIES for link in links)
+
+
+def test_owner_alternatives_selects_grok_4_6_and_keeps_cursor_auto(monkeypatch):
+    """Permanent owner-alternatives roster pin: Grok 4.6, Cursor auto unchanged."""
+    monkeypatch.setenv('AICC_EXECUTOR_PROFILE', 'owner-alternatives')
+    impl = cascade_for('implementation')
+    review = cascade_for('review')
+    assert impl[0] == {"executor": "cursor", "task_type": "implementation", "model": "auto"}
+    assert impl[1] == {"executor": "grok", "task_type": "implementation", "model": "grok-4.6"}
+    assert review[0]["model"] == "auto" and review[0]["executor"] == "cursor"
+    assert review[1]["model"] == "grok-4.6" and review[1]["executor"] == "grok"
+    # Default matrix must stay on the subscription cascade (not globally replaced).
+    monkeypatch.delenv('AICC_EXECUTOR_PROFILE', raising=False)
+    assert [link["executor"] for link in cascade_for("implementation")] == [
+        "claude",
+        "codex",
+    ]
 
 
 def test_the_implementation_escalation_link_is_a_different_account():
