@@ -27,6 +27,14 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def isolated_executor_quota_circuits():
+    from command_center import agent_runner
+    agent_runner.clear_executor_exhaustion()
+    yield
+    agent_runner.clear_executor_exhaustion()
+
+
+@pytest.fixture(autouse=True)
 def restore_main_module_after_streamlit_apptest():
     """Keep AppTest's temporary ``__main__`` from poisoning spawn workers.
 

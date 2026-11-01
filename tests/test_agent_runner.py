@@ -1061,11 +1061,14 @@ def test_codex_runs_exec_the_non_interactive_subcommand():
     assert command[1] == "exec", command
 
 
-def test_command_builders_table_covers_every_wired_executor():
+def test_command_builders_table_covers_every_wired_executor(monkeypatch):
     """The worker gates on this table (`handlers._run_agent`), and the routing
     matrix's own test derives its allowed set from it, so an entry here is the
     single act that makes an executor real."""
+    monkeypatch.setenv(agent_runner.PRINCIPAL_ISOLATION_REQUIRED_ENV, "required")
     assert set(agent_runner.COMMAND_BUILDERS) == {
+        "grok",
+        "cursor",
         "claude",
         "codex",
         "copilot",
@@ -1083,6 +1086,30 @@ def test_command_builders_table_covers_every_wired_executor():
             command = builder("x", task_type="review")
         assert isinstance(command, list) and command, name
         assert all(isinstance(part, str) for part in command), name
+
+
+@pytest.mark.parametrize("executor", ["grok", "cursor"])
+def test_alternative_executors_refuse_unisolated_launch(monkeypatch, executor):
+    monkeypatch.delenv(agent_runner.PRINCIPAL_ISOLATION_REQUIRED_ENV, raising=False)
+    with pytest.raises(agent_runner.RunnerError, match="isolation"):
+        agent_runner._command_builder(executor)("task", task_type="implementation")
+
+
+def test_alternative_model_only_review_capability(monkeypatch, tmp_path):
+    monkeypatch.setenv(agent_runner.PRINCIPAL_ISOLATION_REQUIRED_ENV, "required")
+    manifest = agent_runner.build_principal_isolation_manifest(
+        repository_path=tmp_path, prompt="review", task_type="independent_review",
+        timeout_seconds=60, executor="grok", model=None,
+    )
+    assert manifest["profile"] == "model_only"
+    assert "--no-tools" in agent_runner.build_grok_command("review", task_type="independent_review")
+    with pytest.raises(agent_runner.RunnerError, match="model-only"):
+        agent_runner.build_cursor_command("review", task_type="independent_review")
+    with pytest.raises(agent_runner.RunnerError, match="model-only"):
+        agent_runner.build_principal_isolation_manifest(
+            repository_path=tmp_path, prompt="review", task_type="independent_review",
+            timeout_seconds=60, executor="cursor", model=None,
+        )
 
 
 @pytest.mark.parametrize("task_type", sorted(agent_runner.READ_ONLY_TASK_TYPES))
@@ -1228,6 +1255,47 @@ def _provider_error_run(status="failed", exit_code=1, stdout="", stderr=""):
         started_at="t0",
         completed_at="t1",
     )
+
+
+@pytest.mark.parametrize("code", [401, 403, 429, 500, 502, 503, 504])
+def test_grok_provider_refusal_allows_bounded_fallback(code):
+    run = _provider_error_run(stderr=f"provider HTTP {code}\n")
+    assert run.is_executor_provider_error("grok")
+
+
+def test_quota_circuit_expires_and_never_shortens_an_existing_window():
+    from datetime import UTC, datetime, timedelta
+    now = datetime(2026, 10, 31, tzinfo=UTC)
+    until = agent_runner.record_executor_exhausted("cursor", now=now)
+    assert agent_runner.executor_exhausted_until("cursor", now=now) == until
+    assert agent_runner.record_executor_exhausted("cursor", now=now, cooldown_seconds=1) == until
+    assert agent_runner.executor_exhausted_until("cursor", now=until) is None
+    capped = agent_runner.record_executor_exhausted("grok", now=now, cooldown_seconds=1000000)
+    assert capped == now + timedelta(hours=1)
+
+
+@pytest.mark.parametrize("seconds", [float("inf"), float("nan"), 0, -1])
+def test_quota_circuit_refuses_invalid_deadlines(seconds):
+    with pytest.raises(ValueError, match="finite and positive"):
+        agent_runner.record_executor_exhausted("cursor", cooldown_seconds=seconds)
+
+
+def test_quota_signature_ignores_success_and_quoted_stdout():
+    assert _provider_error_run(stderr="provider HTTP 429").executor_quota_signature("grok")
+    assert _provider_error_run(stderr="provider HTTP 401").executor_quota_signature("grok") is None
+    assert _provider_error_run(stdout="usage limit reached", stderr="tests failed").executor_quota_signature("cursor") is None
+    assert _provider_error_run(status="completed", exit_code=0, stderr="usage limit reached").executor_quota_signature("cursor") is None
+
+
+@pytest.mark.parametrize("status,exit_code,stdout,stderr", [
+    ("completed", 0, "provider HTTP 429", ""),
+    ("failed", 1, "provider HTTP 429", "tests failed"),
+    ("failed", 1, "", "provider HTTP 422"),
+    ("failed", 1, "", "agent budget exhausted"),
+])
+def test_grok_task_failures_and_reports_do_not_trigger_fallback(status, exit_code, stdout, stderr):
+    run = _provider_error_run(status, exit_code, stdout, stderr)
+    assert not run.is_executor_provider_error("grok")
 
 
 def test_codex_usage_limit_is_a_provider_error_not_a_result():

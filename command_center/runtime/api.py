@@ -26,7 +26,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Iterable
 
-from command_center import project_config, provider_route, workspace_provisioning
+from command_center import pipeline_settings, project_config, provider_route, workspace_provisioning
 from command_center import run_lineage as provenance
 from command_center.runtime import autonomy, autonomy_service, context_service, db, scheduler, supervisor
 
@@ -98,6 +98,14 @@ class ExecutionCenterAPI:
         `timeout_seconds` defaults to 900s; pass `None` explicitly to disable
         the automatic timeout for this run.
         """
+        # Every public launch shares the persisted host admission limit.
+        # Callers may tighten it, but cannot bypass it with None or a larger cap.
+        configured_limit = pipeline_settings.load_settings(project_config.ROOT).max_global_concurrency
+        if max_global_concurrency is not None:
+            if type(max_global_concurrency) is not int or max_global_concurrency < 1:
+                raise ValueError("max_global_concurrency must be a positive integer")
+            configured_limit = min(configured_limit, max_global_concurrency)
+        max_global_concurrency = configured_limit
         allowed_providers = tuple(project_config.allowed_execution_providers(project))
         project_config.require_execution_provider_allowed(project, executor_id)
         for candidate in provider_route_ids or ():

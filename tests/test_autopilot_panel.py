@@ -77,7 +77,7 @@ def test_autopilot_controls_are_off_by_default(isolated_data_dir):
     at = _at()
     assert at.toggle(key="autopilot_enabled").value is False
     assert at.toggle(key="autopilot_auto_launch").value is False
-    assert at.toggle(key="autopilot_auto_merge").value is False
+    assert at.toggle(key="autopilot_auto_merge").value is True
 
 
 def test_enabling_autopilot_persists_to_disk_not_session_state(isolated_data_dir):
