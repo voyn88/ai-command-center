@@ -118,7 +118,9 @@ def run_completion(model: str, prompt: str) -> str:
         },
     )
     try:
-        with urllib.request.urlopen(request, timeout=_TIMEOUT_SECONDS) as response:
+        with urllib.request.urlopen(  # nosec B310 - base_url is from the closed, hardcoded https PROVIDERS table
+            request, timeout=_TIMEOUT_SECONDS
+        ) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read()[:500].decode("utf-8", "replace")

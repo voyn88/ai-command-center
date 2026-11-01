@@ -114,7 +114,7 @@ def installation_token(creds: GitHubAppCredentials) -> str:
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=15) as resp:  # nosec B310 - _TOKEN_URL is a hardcoded https literal
             data = json.loads(resp.read())
     except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError) as exc:
         raise AppAuthError(f"installation token exchange failed: {exc}") from exc

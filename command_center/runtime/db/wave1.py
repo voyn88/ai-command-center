@@ -143,7 +143,7 @@ def create_advisor_proposal(
     with db.connect(db_path) as conn:
         with db.transaction(conn):
             conn.execute(
-                f"INSERT INTO advisor_proposal ({columns}) VALUES ({placeholders})",
+                f"INSERT INTO advisor_proposal ({columns}) VALUES ({placeholders})",  # nosec B608 - columns/placeholders built from the hardcoded _ADVISOR_PROPOSAL_COLUMNS tuple; row values are bound via the `record` params dict
                 record,
             )
     _mirror_advisor_proposal(record)
@@ -218,7 +218,7 @@ def list_advisor_proposals(
     params.extend([limit, offset])
     with db.connect(db_path) as conn:
         rows = conn.execute(
-            f"SELECT * FROM advisor_proposal{where} "
+            f"SELECT * FROM advisor_proposal{where} "  # nosec B608 - `where` is assembled only from hardcoded clause literals ("project_ref = ?", "kind = ?", a status IN (...) template with only "?" placeholders, the fixed exclude-projects template) with all values bound as `?` params
             "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
             params,
         ).fetchall()
@@ -265,7 +265,7 @@ def _advisor_proposal_transition(
     params["proposal_id"] = proposal_id
     params["expected_version"] = expected_version
     cur = conn.execute(
-        f"UPDATE advisor_proposal SET {set_clause}, version = version + 1 "
+        f"UPDATE advisor_proposal SET {set_clause}, version = version + 1 "  # nosec B608 - set_clause keys come from `fields`, which is `extra_fields` (only ever a hardcoded literal, e.g. {"promoted_task_id": ...}, or None) plus the hardcoded "status"/"updated_at" keys; values are bound via named params
         "WHERE id = :proposal_id AND version = :expected_version",
         params,
     )
@@ -373,7 +373,7 @@ def create_owner_item(
     with db.connect(db_path) as conn:
         with db.transaction(conn):
             conn.execute(
-                f"INSERT INTO owner_item ({columns}) VALUES ({placeholders})",
+                f"INSERT INTO owner_item ({columns}) VALUES ({placeholders})",  # nosec B608 - columns/placeholders built from the hardcoded _OWNER_ITEM_COLUMNS tuple; row values are bound via the `record` params dict
                 record,
             )
     _mirror_owner_item(record)
@@ -441,7 +441,7 @@ def list_owner_items(
     params.extend([limit, offset])
     with db.connect(db_path) as conn:
         rows = conn.execute(
-            f"SELECT * FROM owner_item{where} "
+            f"SELECT * FROM owner_item{where} "  # nosec B608 - `where` is assembled only from hardcoded clause literals ("done = ?", the fixed exclude-projects template) with all values bound as `?` params
             "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
             params,
         ).fetchall()
@@ -542,7 +542,7 @@ def create_digest_item(
     with db.connect(db_path) as conn:
         with db.transaction(conn):
             conn.execute(
-                f"INSERT INTO digest_item ({columns}) VALUES ({placeholders})",
+                f"INSERT INTO digest_item ({columns}) VALUES ({placeholders})",  # nosec B608 - columns/placeholders built from the hardcoded _DIGEST_ITEM_COLUMNS tuple; row values are bound via the `record` params dict
                 record,
             )
     # `record`, not the return value. `_decode_digest_row` pops `refs_json` and
@@ -624,7 +624,7 @@ def list_digest_items_for_day(
         params.extend(exclude_params)
     with db.connect(db_path) as conn:
         rows = conn.execute(
-            f"SELECT * FROM digest_item WHERE {' AND '.join(clauses)} "
+            f"SELECT * FROM digest_item WHERE {' AND '.join(clauses)} "  # nosec B608 - `clauses` is assembled only from the hardcoded "day = ?" literal and the fixed exclude-projects template, with all values bound as `?` params
             "ORDER BY position ASC, created_at ASC, id ASC",
             params,
         ).fetchall()
@@ -670,7 +670,7 @@ def list_digest_items(
     params.extend([limit, offset])
     with db.connect(db_path) as conn:
         rows = conn.execute(
-            f"SELECT * FROM digest_item{where} "
+            f"SELECT * FROM digest_item{where} "  # nosec B608 - `where` is assembled only from hardcoded clause literals ("category = ?", the fixed exclude-projects template) with all values bound as `?` params
             "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
             params,
         ).fetchall()

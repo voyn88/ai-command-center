@@ -90,7 +90,7 @@ def fetch_artifact(lock: dict[str, object], platform: str) -> bytes:
         url, headers={"Accept": "application/octet-stream"}
     )
     try:
-        with urllib.request.urlopen(request, timeout=600) as response:
+        with urllib.request.urlopen(request, timeout=600) as response:  # nosec B310 - ASSET_URL is a hardcoded https literal
             payload = response.read(MAX_ARTIFACT_BYTES + 1)
     except OSError as exc:
         raise ToolchainRefused(

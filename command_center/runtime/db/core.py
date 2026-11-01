@@ -544,7 +544,7 @@ def _read_timestamp_zone(conn: sqlite3.Connection) -> str | None:
     written before this column existed, where the `SELECT` itself fails."""
     try:
         row = conn.execute(
-            f"SELECT {db.LEDGER_TIMESTAMP_TZ_COLUMN} AS zone FROM schema_version"
+            f"SELECT {db.LEDGER_TIMESTAMP_TZ_COLUMN} AS zone FROM schema_version"  # nosec B608 - LEDGER_TIMESTAMP_TZ_COLUMN is a hardcoded module constant ("timestamp_tz"), not caller-influenced
             f" WHERE {db.LEDGER_TIMESTAMP_TZ_COLUMN} IS NOT NULL"
             " ORDER BY version DESC LIMIT 1"
         ).fetchone()
@@ -583,13 +583,13 @@ def _stamp_timestamp_zone(conn: sqlite3.Connection) -> None:
                     f" ADD COLUMN {db.LEDGER_TIMESTAMP_TZ_COLUMN} TEXT"
                 )
             already = conn.execute(
-                f"SELECT 1 FROM schema_version"
+                f"SELECT 1 FROM schema_version"  # nosec B608 - LEDGER_TIMESTAMP_TZ_COLUMN is a hardcoded module constant ("timestamp_tz"), not caller-influenced
                 f" WHERE {db.LEDGER_TIMESTAMP_TZ_COLUMN} IS NOT NULL LIMIT 1"
             ).fetchone()
             if already:
                 return
             conn.execute(
-                f"UPDATE schema_version SET {db.LEDGER_TIMESTAMP_TZ_COLUMN} = ?"
+                f"UPDATE schema_version SET {db.LEDGER_TIMESTAMP_TZ_COLUMN} = ?"  # nosec B608 - LEDGER_TIMESTAMP_TZ_COLUMN is a hardcoded module constant ("timestamp_tz"); the value (`zone`) is bound via `?`
                 " WHERE version = (SELECT MAX(version) FROM schema_version)",
                 (zone,),
             )
@@ -698,7 +698,7 @@ def apply_runtime_retention(db_path: Path, *, retention_days: int) -> int:
                        AND completed_at IS NOT NULL
                        AND completed_at < ?
                  )
-                """,
+                """,  # nosec B608 - `placeholders` is just N "?" markers sized off the hardcoded TERMINAL_STATES frozenset, not an identifier/fragment from input; all values (states, cutoff) are bound via the params tuple
                 (*db.TERMINAL_STATES, cutoff),
             )
             removed = cur.rowcount

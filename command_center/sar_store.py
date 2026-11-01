@@ -254,7 +254,7 @@ def _transition(
 
     set_clause = ", ".join(f"{k}=?" for k in updates)
     conn.execute(
-        f"UPDATE sars SET {set_clause} WHERE id=?",
+        f"UPDATE sars SET {set_clause} WHERE id=?",  # nosec B608 - set_clause keys come only from "state"/"updated_at" plus hardcoded extra_fields keys passed by module-private callers; values are bound via params
         (*updates.values(), sar_id),
     )
     _audit(conn, sar_id, actor=actor,
@@ -337,7 +337,7 @@ def list_sars(
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     with _db(db_path) as conn:
         rows = conn.execute(
-            f"SELECT * FROM sars {where} ORDER BY created_at DESC", params
+            f"SELECT * FROM sars {where} ORDER BY created_at DESC", params  # nosec B608 - clauses is built only from hardcoded literal fragments ("state = ?", "sar_type = ?", "case_id = ?"); actual values passed via params list
         ).fetchall()
     return [dict(r) for r in rows]
 
