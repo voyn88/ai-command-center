@@ -88,6 +88,7 @@ Security model:
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import signal
@@ -139,6 +140,8 @@ PRINCIPAL_WORKSPACE_ROOTS_FILE = Path("/etc/aicc/agent-workspace-roots")
 # executor" is exactly the drift that hid it; keep this in step with the
 # launcher's TOOLCHAIN_BIN.
 PRINCIPAL_EXECUTOR_BINARIES: dict[str, str] = {
+    "grok": "/usr/libexec/aicc-grok-agent",
+    "cursor": "/opt/aicc/providers/cursor/agent",
     "claude": "/opt/aicc/toolchains/current/bin/claude",
     "codex": "/opt/aicc/toolchains/current/bin/codex",
     # Copilot is DELIBERATELY absent: ADR-0010 keeps it disabled under
@@ -216,7 +219,7 @@ _EXECUTOR_QUOTA_SIGNATURES: dict[str, tuple[str, ...]] = {
     # Claude reports the Max subscription's 5-hour rolling window through its
     # own structured result payload: "You've hit your session limit · resets
     # 4:10pm (UTC)" (live capture, 2026-08-21 16:09 UTC).
-    "claude": ("hit your session limit", "usage limit reached"),
+    "claude": ("hit your session limit", "hit your usage limit", "usage limit reached"),
     # Codex, live 2026-09-02 / 2026-09-11: "ERROR: You've hit your usage
     # limit. Visit .../usage to purchase more credits or try again at Sep
     # 15th, 2026 1:24 AM."
@@ -225,6 +228,8 @@ _EXECUTOR_QUOTA_SIGNATURES: dict[str, tuple[str, ...]] = {
     # two refusals its CLI prints when the account -- not the request -- is
     # over its limit.
     "copilot": ("exceeded your monthly quota", "ai credit usage limit"),
+    # Cursor (from main #1022): the account-level usage refusals.
+    "cursor": ("hit your usage limit", "usage limit reached", "quota exceeded"),
 }
 
 #: How much of the refusal channel `executor_quota_signature` reads. A CLI
@@ -244,7 +249,6 @@ _CODEX_PREFLIGHT_PROMPT = (
 )
 _codex_workspace_write_preflight_lock = threading.Lock()
 _codex_workspace_write_preflight_result: tuple[bool, str] | None = None
-
 
 def disable_codex_workspace_write(detail: str = "") -> None:
     """Open the worker-local Codex circuit after a runtime bwrap failure."""
@@ -310,10 +314,15 @@ def record_executor_exhausted(
     in the window pull the reopening forward.
     """
     moment = now if now is not None else datetime.now(UTC)
+    if cooldown_seconds is not None and (
+        not math.isfinite(cooldown_seconds) or cooldown_seconds <= 0
+    ):
+        raise ValueError("executor cooldown must be finite and positive")
     window = (
         cooldown_seconds if cooldown_seconds is not None else _quota_cooldown_seconds()
     )
-    until = moment + timedelta(seconds=max(window, 0.0))
+    # Bounded at one hour (main #1022): a circuit must self-clear.
+    until = moment + timedelta(seconds=min(max(window, 0.0), 3600.0))
     with _executor_exhaustion_lock:
         current = _executor_exhausted_until.get(executor)
         if current is not None and current > until:
@@ -597,12 +606,17 @@ def build_principal_isolation_manifest(
     """
     if executor not in COMMAND_BUILDERS:
         raise RunnerError(f"unknown executor {executor!r}")
+    if executor == "cursor" and task_type in MODEL_ONLY_TASK_TYPES:
+        raise RunnerError("Cursor model-only execution is not supported")
     return {
         "version": 1,
         "run_id": uuid.uuid4().hex,
         "workspace": str(repository_path.resolve(strict=True)),
         "executor": executor,
-        "profile": profile_for_task_type(task_type),
+        "profile": (
+            "model_only" if executor == "grok" and task_type in MODEL_ONLY_TASK_TYPES
+            else profile_for_task_type(task_type)
+        ),
         "prompt": prompt,
         "model": model,
         "timeout_seconds": timeout_seconds,
@@ -1181,11 +1195,34 @@ def build_copilot_command(
 #: real CLI. Caught by exactly those tests when this was first written the
 #: other way.
 COMMAND_BUILDERS: dict[str, str] = {
+    "grok": "build_grok_command",
+    "cursor": "build_cursor_command",
     "claude": "build_command",
     "codex": "build_codex_command",
     "copilot": "build_copilot_command",
     "openai_http": "build_openai_http_command",
 }
+
+
+def build_grok_command(prompt: str, *, task_type: str, model: str | None = None) -> list[str]:
+    if not principal_isolation_required():
+        raise RunnerError("Grok tools require principal isolation")
+    command = [PRINCIPAL_EXECUTOR_BINARIES["grok"], "--model", model or "grok-4.3"]
+    if task_type in MODEL_ONLY_TASK_TYPES:
+        command += ["--no-tools"]
+    return command + ["--", prompt]
+
+
+def build_cursor_command(prompt: str, *, task_type: str, model: str | None = None) -> list[str]:
+    if not principal_isolation_required():
+        raise RunnerError("Cursor requires principal isolation")
+    if task_type in MODEL_ONLY_TASK_TYPES:
+        raise RunnerError("Cursor model-only execution is not supported")
+    command = [PRINCIPAL_EXECUTOR_BINARIES["cursor"], "--print", "--output-format", "text", "--trust"]
+    command += ["--mode", "ask"] if profile_for_task_type(task_type) == PROFILE_READ_ONLY else ["--force"]
+    if model:
+        command += ["--model", model]
+    return command + ["--", prompt]
 
 
 def build_openai_http_command(
@@ -1384,7 +1421,15 @@ class RunResult:
             return True
         if self.status != "failed" or not self.exit_code:
             return False
+        if executor == "grok":
+            # Our driver emits one fixed diagnostic, never a provider body.
+            # A report discussing HTTP errors must not trigger another run.
+            return self.stderr.strip() in {
+                f"provider HTTP {code}"
+                for code in (401, 403, 429, 500, 502, 503, 504)
+            }
         signatures = {
+            "cursor": _CODEX_RETRYABLE_FAILURE_SIGNATURES + _COPILOT_RETRYABLE_FAILURE_SIGNATURES,
             "copilot": _COPILOT_RETRYABLE_FAILURE_SIGNATURES,
             "codex": _CODEX_RETRYABLE_FAILURE_SIGNATURES,
         }.get(executor)
@@ -1426,6 +1471,8 @@ class RunResult:
         """
         if self.status != "failed" or not self.exit_code:
             return None
+        if executor == "grok":
+            return "HTTP 429" if (self.stderr or "").strip() == "provider HTTP 429" else None
         signatures = _EXECUTOR_QUOTA_SIGNATURES.get(executor)
         if not signatures:
             return None

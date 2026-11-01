@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import json
+import subprocess
 from contextlib import contextmanager
+
+import pytest
 
 from command_center.orchestrator import review_merge
 
@@ -93,6 +97,47 @@ def test_accepted_red_checks_remediate_after_bounded_rerun_is_exhausted(monkeypa
     assert not report.rerun
 
 
+@pytest.mark.parametrize("conclusion", [None, ""])
+def test_accepted_pending_checks_wait_without_rerun_or_remediation(monkeypatch, conclusion):
+    """VOYN-W0-AICC-MERGE-TICK-REJECTS-ON-PENDING-CHECKS: checks still running
+    on an accepted head are a timing fact. No flake rerun (nothing failed),
+    no remediation task (nothing to fix), no transition -- the tick reports
+    `checks_pending` and looks again next tick."""
+    _install_common(monkeypatch, accepted=True, window_reason="checks_stale")
+    # Exercise the actual gh JSON path, not a mocked pending classification.
+    def fake_gh(argv, _repo):
+        assert argv[:2] == ["pr", "view"]
+        body = {
+            "state": "OPEN", "headRefOid": HEAD,
+            "author": {"login": "writer"},
+            "reviews": [{"body": f"ACCEPTANCE: ACCEPT {HEAD}",
+                         "author": {"login": "reviewer"}}],
+            "statusCheckRollup": [{"name": "Linux quality shard 1 of 4",
+                                   "status": "IN_PROGRESS",
+                                   "conclusion": conclusion}],
+        }
+        return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    reruns, remediations = [], []
+    monkeypatch.setattr(
+        review_merge, "_rerun_failed_ci_once", lambda *_args: reruns.append(_args) or ""
+    )
+    monkeypatch.setattr(
+        review_merge,
+        "_remediate_merge_blocker",
+        lambda *_args: remediations.append(_args) or "TASK-REM",
+    )
+
+    report = review_merge.autonomy_remediate_once(
+        object(), object(), "/repo", task_id="TASK"
+    )
+
+    assert report.remediated == []
+    assert reruns == [] and remediations == []
+    assert ("TASK", "checks_pending: ['Linux quality shard 1 of 4']") in report.skipped
+
+
 def test_accepted_red_checks_get_one_bounded_rerun_before_remediation(monkeypatch):
     _install_common(monkeypatch, accepted=True, window_reason="checks_stale")
     monkeypatch.setattr(
@@ -119,3 +164,25 @@ def test_accepted_red_checks_get_one_bounded_rerun_before_remediation(monkeypatc
     assert report.rerun == [("TASK", "flaky_rerun_dispatched:1")]
     assert not report.remediated
     assert not remediated
+
+
+@pytest.mark.parametrize("status", ["QUEUED", "IN_PROGRESS", "WAITING"])
+def test_empty_graphql_conclusion_keeps_window_active_but_not_mergeable(status):
+    check = {"name": "CursorApproval", "status": status, "conclusion": ""}
+    assert review_merge._check_is_pending(check)
+    assert not review_merge._check_is_red_for_window(check)
+    assert not review_merge._check_is_green(check)
+
+
+@pytest.mark.parametrize("conclusion", ["AMBIGUOUS", "FAILURE", "CANCELLED"])
+def test_nonempty_negative_verdict_is_not_reclassified_as_pending(conclusion):
+    check = {"status": "IN_PROGRESS", "conclusion": conclusion}
+    assert not review_merge._check_is_pending(check)
+    assert review_merge._check_is_red_for_window(check)
+    assert not review_merge._check_is_green(check)
+
+
+def test_completed_empty_conclusion_is_not_green_or_pending():
+    check = {"status": "COMPLETED", "conclusion": ""}
+    assert not review_merge._check_is_pending(check)
+    assert not review_merge._check_is_green(check)

@@ -1,3 +1,6 @@
+-- 0031 (renumbered from PR #1002's 0025 after main took 0025-0030; rebuilt on
+-- 0028's atomic-refund body so neither change is lost).
+--
 -- The infra-wait audit row carries the caller's own evidence.
 --
 -- 0024 made a provider/launcher/sandbox outage refund its attempt instead of
@@ -20,7 +23,7 @@
 -- not replacing it -- the counters stay exactly where readers already look,
 -- and `p_detail` cannot overwrite them because the server-decided keys are
 -- applied last. The parameter defaults to NULL, so a worker still running
--- the pre-0025 four-argument call resolves to this same function and writes
+-- the pre-0031 four-argument call resolves to this same function and writes
 -- the same row it wrote before: the rolling deploy needs no ordering beyond
 -- the usual migrate-then-ship.
 DROP FUNCTION IF EXISTS queue_fail_infra_wait(text, text, text, integer);
@@ -31,7 +34,7 @@ CREATE FUNCTION queue_fail_infra_wait(
 ) RETURNS queue_verdict
     LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, public AS $$
 DECLARE o record; v queue_verdict; i work_item%ROWTYPE;
-        v_waits integer; v_cap integer; v_detail jsonb;
+        v_waits integer; v_cap integer; v_refunded integer; v_detail jsonb;
 BEGIN
     v.ok := false;
     o := _queue_owns(p_attempt_id, p_claim_token);
@@ -48,37 +51,40 @@ BEGIN
 
     v_cap := greatest(p_max_infra_waits, 1);
     v_waits := i.infra_wait_count + 1;
-    -- A caller detail that is not an object (a bare number, a string, an
-    -- array) has no keys to merge and is dropped rather than allowed to
-    -- replace the counters with a scalar.
+    -- A caller detail that is not an object has no keys to merge and is
+    -- dropped rather than allowed to replace the counters with a scalar.
     v_detail := CASE WHEN jsonb_typeof(p_detail) = 'object'
                      THEN p_detail ELSE '{}'::jsonb END;
 
     IF v_waits > v_cap THEN
         UPDATE work_item
            SET state = 'dead', current_attempt_id = NULL,
+               attempt_count = greatest(work_item.attempt_count - 1, 0),
+               infra_wait_count = v_waits,
                dead_reason = 'infra_wait_exhausted: ' || coalesce(p_reason, 'unspecified'),
                dead_at = now(), updated_at = now()
-         WHERE work_item_id = o.work_item_id;
+         WHERE work_item_id = o.work_item_id
+         RETURNING attempt_count INTO v_refunded;
         PERFORM _queue_audit(o.work_item_id, p_attempt_id, 'fail', 'granted',
                              'infra_wait_dead_lettered',
                              v_detail || jsonb_build_object('infra_wait_count', v_waits,
-                                                            'max_infra_waits', v_cap));
+                                                'max_infra_waits', v_cap,
+                                                'attempt_count', v_refunded));
         v.reason := 'infra_wait_dead_lettered';
     ELSE
         UPDATE work_item
            SET state = 'ready', current_attempt_id = NULL,
-               attempt_count = greatest(i.attempt_count - 1, 0),
+               attempt_count = greatest(work_item.attempt_count - 1, 0),
                infra_wait_count = v_waits,
                available_at = now() + _queue_backoff(i.retry_backoff_seconds, v_waits),
                updated_at = now()
-         WHERE work_item_id = o.work_item_id;
+         WHERE work_item_id = o.work_item_id
+         RETURNING attempt_count INTO v_refunded;
         PERFORM _queue_audit(o.work_item_id, p_attempt_id, 'fail', 'granted',
                              'infra_wait_requeued',
                              v_detail || jsonb_build_object('infra_wait_count', v_waits,
-                                                            'max_infra_waits', v_cap,
-                                                            'attempt_count',
-                                                            greatest(i.attempt_count - 1, 0)));
+                                                'max_infra_waits', v_cap,
+                                                'attempt_count', v_refunded));
         v.reason := 'infra_wait_requeued';
     END IF;
 

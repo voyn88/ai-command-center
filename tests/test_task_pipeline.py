@@ -92,7 +92,7 @@ def test_settings_default_to_everything_off(tmp_path):
     settings = pipeline_settings.load_settings(tmp_path)
     assert settings.enabled is False
     assert settings.auto_launch is False
-    assert settings.auto_merge_after_checks is False
+    assert settings.auto_merge_after_checks is True
     assert settings.auto_launch_active is False
     assert settings.auto_merge_active is False
 

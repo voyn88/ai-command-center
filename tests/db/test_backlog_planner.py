@@ -1327,3 +1327,79 @@ def test_open_monitor_findings_become_pipeline_tasks_once(rig) -> None:
         with conn.cursor() as cur:
             cur.execute("SELECT monitor_clear_finding(%s)", ("worker-01:infra",))
             assert cur.fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("bad_url", [
+    "not-a-pr",
+    "https://github.com/owner?x/repo/pull/1",
+    "https://github.com/owner/repo name/pull/1",
+    "https://github.com/owner/repo/pull/0",
+])
+def test_malformed_pr_ingest_is_bounded_and_records_no_evidence(rig, bad_url):
+    app_factory, store, worker = rig
+    task_id = "VOYN-W0-HYGIENE"
+    assert store.upsert_task(_task(task_id, repo="repo-in"))[0]
+    for expected in ("OPEN", "DEFER_TO_USER"):
+        assert _dispatch(app_factory, task_id)[0]
+        _complete_latest(app_factory, worker, task_id, {
+            "status": "completed", "pr_url": bad_url, "head_sha": "a" * 40,
+        })
+        with app_factory() as conn, conn.cursor() as cur:
+            cur.execute("SELECT * FROM backlog_ingest_results('planner-t')")
+            assert len(cur.fetchall()) == 1
+            cur.execute(
+                "SELECT count(*) FROM backlog_evidence WHERE task_id = %s",
+                (task_id,),
+            )
+            assert cur.fetchone()[0] == 0
+        assert store.get_task(task_id)["status"] == expected
+    with app_factory() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT detail->>'split_requested' FROM backlog_event "
+            "WHERE task_id = %s AND event = 'return_to_pool' "
+            "AND outcome = 'granted' ORDER BY event_id",
+            (task_id,),
+        )
+        assert cur.fetchall() == [("false",), ("false",)]
+
+
+def test_clear_last_pr_is_idempotent_and_bounds_redispatch(rig):
+    app_factory, store, worker = rig
+    task_id = "VOYN-W0-CLEAR"
+    assert store.upsert_task(_task(task_id, repo="repo-in"))[0]
+    for expected in ("OPEN", "DEFER_TO_USER"):
+        assert _dispatch(app_factory, task_id)[0]
+        _complete_latest(app_factory, worker, task_id, {
+            "status": "completed", "pr_url": "https://github.com/o/r/pull/7",
+        })
+        with app_factory() as conn, conn.cursor() as cur:
+            cur.execute("SELECT * FROM backlog_ingest_results('planner-t')")
+        assert store.record_evidence(task_id, "pr", "broken-pr")[0]
+        with app_factory() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT reason FROM backlog_clear_evidence(%s, 'pr', %s, %s)",
+                (task_id, "broken-pr", "malformed_pr_url"),
+            )
+            assert cur.fetchone()[0] == "cleared"
+        assert store.get_task(task_id)["status"] == "READY_TO_REVIEW"
+        with app_factory() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT reason FROM backlog_clear_evidence(%s, 'pr', %s, %s)",
+                (task_id, "https://github.com/o/r/pull/7", "test_invalidated"),
+            )
+            assert cur.fetchone()[0] == "cleared_and_" + expected.lower()
+            cur.execute(
+                "SELECT reason FROM backlog_clear_evidence(%s, 'pr', %s, %s)",
+                (task_id, "https://github.com/o/r/pull/7", "test_invalidated"),
+            )
+            assert cur.fetchone()[0] == "already_absent"
+        assert store.get_task(task_id)["status"] == expected
+
+
+def test_worker_cannot_clear_evidence_or_park_tasks(rig, psycopg):
+    _app_factory, _store, worker = rig
+    with worker._connection() as conn, conn.cursor() as cur:
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            cur.execute(
+                "SELECT * FROM backlog_clear_evidence('none', 'pr', 'x', 'x')"
+            )

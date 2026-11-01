@@ -35,6 +35,7 @@ second edit to undo; the circuit reopens on its own.
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 __all__ = ["ROUTING_MATRIX", "cascade_for"]
@@ -91,6 +92,10 @@ ROUTING_MATRIX: dict[str, list[dict[str, Any]]] = {
 def cascade_for(task_class: str) -> list[dict[str, Any]]:
     """The cascade for a task class; unknown classes get the implementation
     route rather than a refusal — routing chooses HOW, never WHETHER."""
+    if os.environ.get("AICC_EXECUTOR_PROFILE") == "owner-alternatives":
+        task_type = "review" if task_class == "review" else "implementation"
+        return [{"executor": "cursor", "task_type": task_type, "model": "auto"},
+                {"executor": "grok", "task_type": task_type, "model": "grok-4.6"}]
     return [
         dict(link)
         for link in ROUTING_MATRIX.get(task_class, ROUTING_MATRIX["implementation"])
