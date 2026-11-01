@@ -1484,7 +1484,11 @@ def test_the_beat_loop_admits_the_lapse_inside_the_window_it_was_granted(
     for thread in threads:
         thread.start()
     cancelled = cancel.wait(BLIP_WINDOW * 4)
-    lost_at = time.monotonic() - started
+    now = time.monotonic()
+    lost_at = now - started
+    # The lane's deadline is dated from `claim_sent_at` (at or before the
+    # server's grant), so "not ahead of its deadline" is measured from there.
+    lost_since_claim_sent = now - claim_sent_at
     beat_stop.set()
     for thread in threads:
         thread.join(timeout=5)
@@ -1516,8 +1520,8 @@ def test_the_beat_loop_admits_the_lapse_inside_the_window_it_was_granted(
         f"lease while a beat sat in a {block:.1f}s black hole; beats "
         f"attempted at {attempts}"
     )
-    assert lost_at >= BLIP_WINDOW, (
-        f"the lease was given up at {lost_at:.1f}s, ahead of its "
+    assert lost_since_claim_sent >= BLIP_WINDOW, (
+        f"the lease was given up at {lost_since_claim_sent:.3f}s, ahead of its "
         f"{BLIP_WINDOW}s deadline -- an attempt taken away with time left on "
         "its lease costs the whole run (0041)"
     )
@@ -1771,7 +1775,7 @@ def test_a_beat_whose_reply_is_held_gives_the_lease_up_at_or_before_the_servers(
     REACHES the server and COMMITS, whose reply is then held on the way back,
     must stop the lane at or before the server's own `visible_until`.
 
-    The hold is three seconds -- long enough that dating from the answer would
+    The hold is three quarters of a beat interval -- long enough that dating from the answer would
     overrun by a measurable amount, short enough to fit inside a beat interval
     of this window, and the shape `lease_client.run_lease` already allows a
     hung subprocess 120s against the fleet's 300s window. The server's grant
@@ -1791,8 +1795,11 @@ def test_a_beat_whose_reply_is_held_gives_the_lease_up_at_or_before_the_servers(
 
     measure, app, worker, _age = monitor
     window = BLIP_WINDOW
-    hold = 3.0
     interval = beat_interval_seconds(window)
+    # Three quarters of a beat interval (1.5s at the deployed V/4 ratio):
+    # longer than the 1.0s slack below, so dating from the answer is caught,
+    # and still inside one interval, which the assertion below pins.
+    hold = interval * 0.75
     assert hold < interval, (
         f"a held reply of {hold}s would span a beat interval of {interval}s "
         "and change what is being measured"

@@ -1217,7 +1217,18 @@ class WorkerDaemon:
             # beyond the moment the attempt stopped being ours. Capping the
             # wait is what makes the bound above one window rather than one
             # window plus a sleep.
-            if beat_stop.wait(min(interval, remaining)):
+            if remaining <= interval:
+                # Less than one beat interval of PROVEN lease is left. A beat
+                # sent now lands inside the drift margin
+                # `beat_interval_seconds` keeps, and an acceptance there would
+                # quietly stretch the tolerance by a beat (a blip past
+                # `TOLERATED_FAILED_BEATS` would keep the lease). Wait out the
+                # rest of the window -- still one window, not one plus a sleep
+                # -- and let the check at the top declare the lapse.
+                if beat_stop.wait(remaining):
+                    return
+                continue
+            if beat_stop.wait(interval):
                 return
             # Fed even when the database is unreachable: the watchdog answers
             # "is the process alive", not "is PostgreSQL up" — restarting the

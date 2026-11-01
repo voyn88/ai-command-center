@@ -495,6 +495,36 @@ def test_unexplained_deaths_beyond_the_quota_class_still_raise_growth() -> None:
     assert "dead_letter_growth:1>0" in report.failures
 
 
+def test_a_fleet_that_only_refuses_is_a_throughput_stall_even_with_both_clocks_fresh() -> None:
+    """Lanes spinning on no-fault refusals, as the database really leaves
+    them: the refused item is in its wait backoff (not due), every refusal
+    freshened the fleet clock, and no lane holds anything. Neither
+    starvation clock can see it; the refused-ready count must."""
+    from command_center.ops.infra_monitor import QueueSnapshot, evaluate
+
+    def snap(**kw):
+        base = dict(
+            ready=1, claimed=0, succeeded=0, dead=0, success_age_seconds=None,
+            recent_succeeded=0, ready_due=0, ready_due_age_seconds=None,
+            attended_claims=0, fleet_idle_seconds=1.0, refused_ready=1,
+        )
+        base.update(kw)
+        return QueueSnapshot(**base)
+
+    lanes = {"voyn-aicc-worker@1.service": "active"}
+    kw = dict(minimum_active_workers=1, max_stalled_seconds=900, prometheus_ready=True)
+    assert evaluate(lanes, snap(), **kw).failures == ("throughput_stalled:0_succeeded_in_1h",)
+    # Backpressure, not an outage: a lane is attending a long run (the writer
+    # lease the refusals waited on is ITS lease).
+    assert evaluate(
+        lanes, snap(claimed=1, attended_claims=1, live_claim_age_seconds=4200.0), **kw
+    ).ok
+    # Something succeeded in the hour: the fleet is serving.
+    assert evaluate(lanes, snap(recent_succeeded=1), **kw).ok
+    # No refusal on record: an idle, quiet queue is not a stall.
+    assert evaluate(lanes, snap(refused_ready=0), **kw).ok
+
+
 def test_spinning_lanes_with_no_success_in_an_hour_are_a_throughput_stall() -> None:
     from command_center.ops.infra_monitor import evaluate
 
@@ -1442,7 +1472,7 @@ def test_the_statement_binds_the_queue_to_both_of_its_questions(monkeypatch) -> 
         def __exit__(self, *a): return False
         def execute(self, statement, params=None): bound.append((statement, params))
         def fetchone(self):
-            return (0, 0, 0, 0, None, 0, 0, 0, 0, None, 0, None, 0, None, None)
+            return (0, 0, 0, 0, None, 0, 0, 0, 0, None, 0, None, 0, None, None, 0)
 
     class _Conn:
         def __enter__(self): return self

@@ -154,6 +154,14 @@ class QueueSnapshot:
     #: said to have been ignored. ``None`` when the queue has no attempts at
     #: all: no evidence either way, so it bounds nothing.
     fleet_idle_seconds: float | None = None
+    #: Ready items the fleet has already handed back at least once with a
+    #: NO-FAULT wait (``lease_wait_count`` / ``infra_wait_count`` > 0) -- work
+    #: a lane reached and could not serve for a reason outside the work. A
+    #: refused item sits in its wait backoff, so it is neither due nor
+    #: starved, and the fleet clock stays fresh because every refusal is an
+    #: attempt leaving ``active``: neither starvation clock can see lanes
+    #: spinning on refusals. This count is what lets ``evaluate`` see them.
+    refused_ready: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -419,6 +427,8 @@ _QUEUE_SNAPSHOT_SQL = """
             w.state,
             w.updated_at,
             w.dead_reason,
+            (w.state = 'ready'
+             AND w.lease_wait_count + w.infra_wait_count > 0) AS refused_ready,
             (w.state = 'claimed'
              AND coalesce(a.state = 'active' AND a.visible_until > now(), false))
                 AS attended,
@@ -501,7 +511,8 @@ _QUEUE_SNAPSHOT_SQL = """
                          ELSE a.updated_at END)))
            FROM work_attempt_public a
            JOIN work_item wq ON wq.work_item_id = a.work_item_id
-          WHERE wq.queue = %s)
+          WHERE wq.queue = %s),
+        count(*) FILTER (WHERE refused_ready)
     FROM classified
 """
 
@@ -530,6 +541,7 @@ def snapshot_from_row(row: tuple[Any, ...]) -> QueueSnapshot:
         attended_claims,
         live_claim_age,
         fleet_idle,
+        refused_ready,
     ) = row
 
     def seconds(value: Any) -> float | None:
@@ -551,6 +563,7 @@ def snapshot_from_row(row: tuple[Any, ...]) -> QueueSnapshot:
         attended_claims=int(attended_claims),
         live_claim_age_seconds=seconds(live_claim_age),
         fleet_idle_seconds=seconds(fleet_idle),
+        refused_ready=int(refused_ready),
     )
 
 
@@ -1435,18 +1448,41 @@ def evaluate(
         # untouched: lanes spinning on refusals fail fast, `queue_fail`
         # requeues, occupancy drops between spins and the requeued items come
         # back as due-ready work no lane took -- the unoffered clock exactly.
+        #
+        # THE SECOND CORROBORATION: A FLEET THAT ONLY REFUSES. Lanes spinning
+        # on no-fault refusals (a subscription cap, a dead executor) leave
+        # nothing on either starvation clock: each refusal requeues the item
+        # into its wait BACKOFF (`available_at` in the future, so not due) and
+        # is itself an attempt leaving `active` (so the fleet clock is fresh).
+        # Measured end to end in `tests/db/test_monitor_queue_measurement.py`:
+        # twenty-five refusals and no success read as `ok` without this. What
+        # corroborates instead is ready work the fleet has already handed back
+        # with a no-fault wait while it is attending NOTHING -- no lane is
+        # holding a claim it could be legitimately busy with, so the refusals
+        # are not backpressure behind a long run (a writer lease held by a
+        # sibling's 70-minute attempt keeps `attended_claims` > 0 and stays
+        # excused, as above).
         unoffered_age = ready_due_starved if spare_capacity else None
+        only_refusing = queue.refused_ready > 0 and queue.attended_claims == 0
         if (
             queue.recent_succeeded is not None
             and queue.recent_succeeded == 0
-            and unoffered_age is not None
-            and CLAIM_POLL_CEILING_SECONDS < unoffered_age
+            and (
+                only_refusing
+                or (
+                    unoffered_age is not None
+                    and CLAIM_POLL_CEILING_SECONDS < unoffered_age
+                )
+            )
             # Still mutually exclusive with `queue_stalled`, and still keyed on
             # the WHOLE starved age rather than on the unoffered one: a lapse
             # past the window has already minted that failure, and one
             # condition must not mint two findings and two planner tasks.
-            and starved_age is not None
-            and starved_age <= max_stalled_seconds
+            and (
+                starved_age <= max_stalled_seconds
+                if starved_age is not None
+                else only_refusing
+            )
         ):
             failures.append("throughput_stalled:0_succeeded_in_1h")
 
