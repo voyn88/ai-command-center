@@ -25,6 +25,23 @@ import { ExecutionIcon, HomeIcon, TasksIcon } from '../components/NavIcons'
 import { fetchHome } from '../lib/api'
 import type { Project } from '../lib/api'
 import {
+  confirmBacklogTask,
+  draftBacklogTask,
+  fetchBacklogStatus,
+  fetchBacklogTaskDetail,
+  fetchBacklogTasks,
+  reassignBacklogTask,
+} from '../lib/backlogApi'
+import type {
+  BacklogStatusCounts,
+  BacklogStoreTask,
+  BacklogTaskDetail,
+  DraftResult,
+  Transcript,
+} from '../lib/backlogApi'
+import { dictationSupported, startDictation } from '../lib/voiceInput'
+import type { DictationError, DictationHandle } from '../lib/voiceInput'
+import {
   enqueueAudit,
   fetchQueueItem,
   fetchQueueItems,
@@ -239,6 +256,409 @@ function AuditLauncher({
   )
 }
 
+const BACKLOG_STATUSES = [
+  'OPEN',
+  'IN_PROGRESS',
+  'READY_TO_REVIEW',
+  'DONE',
+  'UNTRIAGED',
+  'DEFER_TO_USER',
+  'SPLIT',
+  'NEEDS_REFINEMENT',
+  'DECIDED',
+] as const
+
+function backlogStatusLabel(status: string, t: (key: string) => string): string {
+  const key = `backlogStatus${status}`
+  const label = t(key)
+  return label === key ? status : label
+}
+
+function backlogStatusTone(status: string): string {
+  if (status === 'DONE') return 'var(--ok)'
+  if (status === 'DEFER_TO_USER' || status === 'NEEDS_REFINEMENT') return 'var(--bad)'
+  if (status === 'IN_PROGRESS' || status === 'READY_TO_REVIEW') return 'var(--accent-2)'
+  return 'var(--tx3)'
+}
+
+/** History for one backlog task (S6c drill-down): the transition trail that
+ * makes up its "decomposition" — this record IS one piece of the larger
+ * central task, and its events are the progress record for that piece. */
+function BacklogHistory({ taskId }: { taskId: string }) {
+  const { t } = useTranslation()
+  const [detail, setDetail] = useState<BacklogTaskDetail | null>(null)
+  const [failed, setFailed] = useState(false)
+
+  useEffect(() => {
+    setDetail(null)
+    setFailed(false)
+    fetchBacklogTaskDetail(taskId).then(setDetail).catch(() => setFailed(true))
+  }, [taskId])
+
+  if (failed) return <p className="task-details" style={{ color: 'var(--bad)' }}>{t('errorLoading')}</p>
+  if (!detail) return <p className="task-details">{t('loading')}</p>
+  return (
+    <div className="task-details">
+      {detail.events.length === 0 ? (
+        <p>{t('backlogHistoryEmpty')}</p>
+      ) : (
+        detail.events.map((event, index) => (
+          <p key={`${event.created_at}-${index}`}>
+            {event.event} — {event.outcome}
+            {event.reason ? ` (${event.reason})` : ''}
+          </p>
+        ))
+      )}
+    </div>
+  )
+}
+
+/** Inline priority/wave reprioritization for one backlog task (S6d): the
+ * optimistic-revision form the same operation the chat/voice parser drives
+ * (S6a/S6b) when it re-issues a task line with a changed token. */
+function BacklogReassignForm({
+  item,
+  onSaved,
+}: {
+  item: BacklogStoreTask
+  onSaved: (next: { wave: string; priority: string | null; revision: number }) => void
+}) {
+  const { t } = useTranslation()
+  const [wave, setWave] = useState(item.wave)
+  const [priority, setPriority] = useState(item.priority ?? '')
+  const [status, setStatus] = useState<'idle' | 'saving' | 'error' | 'conflict'>('idle')
+
+  const dirty = wave.trim() !== item.wave || priority.trim() !== (item.priority ?? '')
+
+  const submit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    if (!dirty || !wave.trim() || status === 'saving') return
+    setStatus('saving')
+    try {
+      const result = await reassignBacklogTask(item.task_id, {
+        wave: wave.trim(),
+        priority: priority.trim() || null,
+        expected_revision: item.revision,
+      })
+      setStatus('idle')
+      onSaved({ wave: wave.trim(), priority: priority.trim() || null, revision: result.revision })
+    } catch (error) {
+      // `reassign`'s 409 body is `{reason, revision}` — not a string `detail`,
+      // so `authedPost` falls back to the bare status code as the reason.
+      setStatus(error instanceof Error && error.message.endsWith('-> 409') ? 'conflict' : 'error')
+    }
+  }
+
+  return (
+    <form onSubmit={submit} style={{ display: 'flex', gap: '.5rem', flexWrap: 'wrap', alignItems: 'center' }}>
+      <label style={{ display: 'flex', gap: '.35rem', alignItems: 'center', fontSize: '.72rem', color: 'var(--tx3)' }}>
+        {t('backlogWave')}
+        <input
+          className="task-token-input"
+          style={{ minWidth: '5rem', padding: '.3rem .5rem' }}
+          value={wave}
+          onChange={(event) => setWave(event.target.value)}
+        />
+      </label>
+      <label style={{ display: 'flex', gap: '.35rem', alignItems: 'center', fontSize: '.72rem', color: 'var(--tx3)' }}>
+        {t('backlogPriority')}
+        <input
+          className="task-token-input"
+          style={{ minWidth: '4rem', padding: '.3rem .5rem' }}
+          value={priority}
+          onChange={(event) => setPriority(event.target.value)}
+        />
+      </label>
+      <button type="submit" className="task-toggle" disabled={!dirty || status === 'saving'}>
+        {status === 'saving' ? t('backlogReassignSaving') : t('backlogReassignSave')}
+      </button>
+      {status === 'conflict' && <span style={{ color: 'var(--bad)', fontSize: '.7rem' }}>{t('backlogReassignConflict')}</span>}
+      {status === 'error' && <span style={{ color: 'var(--bad)', fontSize: '.7rem' }}>{t('backlogReassignError')}</span>}
+    </form>
+  )
+}
+
+function BacklogTaskRow({ item, onReassigned }: { item: BacklogStoreTask; onReassigned: (id: string, next: { wave: string; priority: string | null; revision: number }) => void }) {
+  const { t } = useTranslation()
+  const [open, setOpen] = useState(false)
+
+  return (
+    <article className="task-row">
+      <div style={{ display: 'flex', alignItems: 'center', gap: '.8rem', flexWrap: 'wrap' }}>
+        <span className="task-status" style={{ color: backlogStatusTone(item.status) }}>
+          {backlogStatusLabel(item.status, t)}
+        </span>
+        <strong style={{ color: 'var(--tx)', fontSize: '.84rem', flex: 1, minWidth: '8rem' }}>{item.title}</strong>
+        <span className="task-date">
+          {t('backlogWave')} {item.wave} · {t('backlogPriority')} {item.priority ?? t('backlogNoPriority')}
+        </span>
+        <button type="button" className="task-toggle" onClick={() => setOpen((v) => !v)}>
+          {open ? t('taskHide') : t('taskDetails')}
+        </button>
+      </div>
+      {open && (
+        <>
+          <BacklogReassignForm item={item} onSaved={(next) => onReassigned(item.task_id, next)} />
+          <div>
+            <p className="task-details-label" style={{ margin: '0 0 .3rem' }}>{t('backlogHistory')}</p>
+            <BacklogHistory taskId={item.task_id} />
+          </div>
+        </>
+      )}
+    </article>
+  )
+}
+
+/** What the server repaired in a dictated transcript (S6b) — shown above the
+ * proposed line so a misheard term is visible and correctable, never a silent
+ * rewrite of what the owner said. */
+function TranscriptRepairs({ transcript }: { transcript: Transcript }) {
+  const { t } = useTranslation()
+  if (transcript.corrections.length === 0) return null
+  return (
+    <p style={{ margin: 0, color: 'var(--tx3)', fontSize: '.85rem' }}>
+      {t('voiceCorrections')}{' '}
+      {transcript.corrections
+        .map((correction) => `«${correction.heard}» → ${correction.written}`)
+        .join(', ')}
+    </p>
+  )
+}
+
+/** Chat and voice intake (S6a/S6b): draft a proposed backlog line from free
+ * text — typed, or dictated into the same box through the device's own
+ * recognizer — let the owner read (and edit) it, then confirm. Dictation only
+ * fills the text box; every word still goes through the same draft → confirm
+ * gate, because a transcript is a suggestion, not an instruction. */
+function BacklogIntake({ onCreated }: { onCreated: () => void }) {
+  const { t, i18n } = useTranslation()
+  const [text, setText] = useState('')
+  const [line, setLine] = useState<string | null>(null)
+  const [parseFailed, setParseFailed] = useState(false)
+  const [phase, setPhase] = useState<'idle' | 'drafting' | 'previewing' | 'confirming' | 'locked' | 'draftError' | 'confirmError' | 'duplicate' | 'success'>('idle')
+  const [dictation, setDictation] = useState<DictationHandle | null>(null)
+  const [voiceError, setVoiceError] = useState<DictationError | null>(null)
+  // Sticky for the whole entry: text that arrived by microphone stays flagged
+  // as a transcript even after the owner edits a word by hand, so the server
+  // still repairs the terms it did not touch.
+  const [dictated, setDictated] = useState(false)
+  const [transcript, setTranscript] = useState<Transcript | null>(null)
+  const canDictate = dictationSupported()
+
+  const listen = () => {
+    if (dictation) {
+      dictation.stop()
+      return
+    }
+    setVoiceError(null)
+    // Whatever is already in the box is kept: dictation appends to the
+    // owner's own words instead of overwriting them.
+    const typed = text.trim()
+    const handle = startDictation({
+      lang: i18n.language.startsWith('ru') ? 'ru-RU' : 'en-US',
+      onText: (heard) => {
+        setDictated(true)
+        setText(typed ? `${typed} ${heard}` : heard)
+      },
+      onError: setVoiceError,
+      onEnd: () => setDictation(null),
+    })
+    setDictation(handle)
+  }
+
+  const draft = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    if (!text.trim() || phase === 'drafting') return
+    dictation?.stop()
+    setPhase('drafting')
+    try {
+      const result: DraftResult = await draftBacklogTask(text.trim(), dictated ? 'voice' : 'chat')
+      setParseFailed(!result.ok)
+      setLine(result.ok ? result.line : result.raw_output)
+      setTranscript(result.transcript ?? null)
+      setPhase('previewing')
+    } catch (error) {
+      setPhase(error instanceof QueueAuthError ? 'locked' : 'draftError')
+    }
+  }
+
+  const confirm = async () => {
+    if (!line || !line.trim() || phase === 'confirming') return
+    setPhase('confirming')
+    try {
+      await confirmBacklogTask(line.trim())
+      setPhase('success')
+      setText('')
+      setLine(null)
+      setTranscript(null)
+      setDictated(false)
+      onCreated()
+    } catch (error) {
+      if (error instanceof QueueAuthError) setPhase('locked')
+      // `confirm`'s 409 body is a string `detail` ("... already exists ..."),
+      // which `authedPost` surfaces verbatim as the reason.
+      else if (error instanceof Error && error.message.includes('already exists')) setPhase('duplicate')
+      else setPhase('confirmError')
+    }
+  }
+
+  const cancel = () => {
+    setLine(null)
+    setTranscript(null)
+    setPhase('idle')
+  }
+
+  return (
+    <GlassPanel title={t('intakeTitle')}>
+      {line === null ? (
+        <form onSubmit={draft} style={{ display: 'flex', gap: '.6rem', flexWrap: 'wrap' }}>
+          <textarea
+            className="task-token-input"
+            value={text}
+            onChange={(event) => setText(event.target.value)}
+            aria-label={t('intakeTitle')}
+            placeholder={t('intakePlaceholder')}
+            rows={2}
+            style={{ width: '100%', resize: 'vertical', fontFamily: 'inherit' }}
+          />
+          <div style={{ display: 'flex', gap: '.6rem', flexWrap: 'wrap', alignItems: 'center' }}>
+            <button type="submit" className="execution-back" disabled={!text.trim() || phase === 'drafting'}>
+              {phase === 'drafting' ? t('intakeDrafting') : t('intakeDraft')}
+            </button>
+            {canDictate && (
+              <button
+                type="button"
+                className="task-toggle"
+                onClick={listen}
+                aria-pressed={dictation !== null}
+                title={t('voiceHint')}
+              >
+                {dictation ? t('voiceStop') : t('voiceStart')}
+              </button>
+            )}
+            {dictation && <span style={{ color: 'var(--accent-2)' }}>{t('voiceListening')}</span>}
+          </div>
+        </form>
+      ) : (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '.6rem' }}>
+          {transcript && <TranscriptRepairs transcript={transcript} />}
+          <p style={{ margin: 0, color: parseFailed ? 'var(--bad)' : 'var(--tx3)' }}>
+            {parseFailed ? t('intakeParseFailed') : t('intakePreview')}
+          </p>
+          <textarea
+            className="task-token-input"
+            value={line}
+            onChange={(event) => setLine(event.target.value)}
+            aria-label={t('intakePreview')}
+            rows={2}
+            style={{ width: '100%', resize: 'vertical', fontFamily: 'var(--font-mono)' }}
+          />
+          <div style={{ display: 'flex', gap: '.6rem' }}>
+            <button type="button" className="execution-back" onClick={confirm} disabled={!line.trim() || phase === 'confirming'}>
+              {phase === 'confirming' ? t('intakeConfirming') : t('intakeConfirm')}
+            </button>
+            <button type="button" className="task-toggle" onClick={cancel}>{t('intakeCancel')}</button>
+          </div>
+        </div>
+      )}
+      {voiceError && (
+        <p style={{ color: 'var(--bad)', margin: 0 }}>
+          {t(
+            voiceError === 'denied'
+              ? 'voiceDenied'
+              : voiceError === 'no-speech'
+                ? 'voiceNoSpeech'
+                : voiceError === 'network'
+                  ? 'voiceNetwork'
+                  : 'voiceError',
+          )}
+        </p>
+      )}
+      {phase === 'locked' && <p style={{ color: 'var(--bad)', margin: 0 }}>{t('intakeLocked')}</p>}
+      {phase === 'draftError' && <p style={{ color: 'var(--bad)', margin: 0 }}>{t('intakeDraftError')}</p>}
+      {phase === 'confirmError' && <p style={{ color: 'var(--bad)', margin: 0 }}>{t('intakeError')}</p>}
+      {phase === 'duplicate' && <p style={{ color: 'var(--bad)', margin: 0 }}>{t('intakeDuplicate')}</p>}
+      {phase === 'success' && <p style={{ color: 'var(--ok)', margin: 0 }}>{t('intakeSuccess')}</p>}
+    </GlassPanel>
+  )
+}
+
+/** The central backlog's status and decomposition (S6c): an overall
+ * done/total progress bar, per-status counts, and the task list itself —
+ * each row IS one piece of the decomposition, with its own history and
+ * reprioritization control. */
+function BacklogSection() {
+  const { t } = useTranslation()
+  const [status, setStatus] = useState<BacklogStatusCounts | null>(null)
+  const [tasks, setTasks] = useState<BacklogStoreTask[] | null>(null)
+  const [error, setError] = useState(false)
+
+  const load = useCallback(() => {
+    setError(false)
+    Promise.all([fetchBacklogStatus(), fetchBacklogTasks()])
+      .then(([statusResult, tasksResult]) => {
+        setStatus(statusResult)
+        setTasks(tasksResult.tasks)
+      })
+      .catch(() => setError(true))
+  }, [])
+  useEffect(load, [load])
+
+  const reassign = (taskId: string, next: { wave: string; priority: string | null; revision: number }) => {
+    setTasks((current) =>
+      current
+        ? current.map((task) => (task.task_id === taskId ? { ...task, ...next } : task))
+        : current,
+    )
+  }
+
+  if (error) {
+    return (
+      <GlassPanel title={t('backlogTitle')}>
+        <p style={{ color: 'var(--bad)' }}>{t('backlogErrorLoading')}</p>
+        <button className="execution-back" onClick={load}>{t('retry')}</button>
+      </GlassPanel>
+    )
+  }
+  if (!status || !tasks) {
+    return <GlassPanel title={t('backlogTitle')}>{t('loading')}</GlassPanel>
+  }
+
+  const done = status.counts['DONE'] ?? 0
+  const percent = status.total === 0 ? 0 : Math.round((done / status.total) * 100)
+
+  return (
+    <>
+      <BacklogIntake onCreated={load} />
+      <GlassPanel title={t('backlogTitle')}>
+        <p style={{ color: 'var(--tx3)', marginTop: 0 }}>{t('backlogSubtitle')}</p>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '.6rem', marginBottom: '.9rem' }}>
+          <div style={{ flex: 1, height: '.5rem', borderRadius: '999px', background: 'rgba(255,255,255,.08)', overflow: 'hidden' }}>
+            <div style={{ width: `${percent}%`, height: '100%', background: 'var(--ok)' }} />
+          </div>
+          <span style={{ fontSize: '.72rem', color: 'var(--tx3)', whiteSpace: 'nowrap' }}>
+            {percent}% {t('backlogProgress')} ({done}/{status.total})
+          </span>
+        </div>
+        <div className="execution-filters" aria-label={t('allStates')}>
+          {BACKLOG_STATUSES.map((state) => (
+            <span key={state} style={{ color: 'var(--tx3)', fontSize: '.68rem' }}>
+              {backlogStatusLabel(state, t)}: {status.counts[state] ?? 0}
+            </span>
+          ))}
+        </div>
+        <div className="execution-list">
+          {tasks.length === 0 ? (
+            <p style={{ color: 'var(--tx3)' }}>{t('backlogEmpty')}</p>
+          ) : (
+            tasks.map((item) => <BacklogTaskRow key={item.task_id} item={item} onReassigned={reassign} />)
+          )}
+        </div>
+      </GlassPanel>
+    </>
+  )
+}
+
 function TokenGate({ notice, onUnlocked }: { notice?: string | null; onUnlocked: () => void }) {
   const { t } = useTranslation()
   const [value, setValue] = useState('')
@@ -289,6 +709,13 @@ export default function Tasks({ onNavigate }: { onNavigate: (screen: 'home' | 'e
       })
   }, [filter])
   useEffect(load, [load])
+  // The audit launcher's project picker: GET /api/home is unauthenticated
+  // (same source Home.tsx uses), independent of the owner-token gate above.
+  useEffect(() => {
+    fetchHome()
+      .then((data) => setProjects(data.projects))
+      .catch(() => setProjects([]))
+  }, [])
 
   // A 401 from the audit POST is the same condition as a 401 from the reads,
   // so it takes the same route: lock the screen, which renders the one
@@ -350,6 +777,7 @@ export default function Tasks({ onNavigate }: { onNavigate: (screen: 'home' | 'e
               onAuthRequired={requireUnlock}
             />
           )}
+          {!locked && items && <BacklogSection />}
           {!locked && items && (
             <GlassPanel title={t('tasks')}>
               <div className="execution-filters" aria-label={t('allStates')}>

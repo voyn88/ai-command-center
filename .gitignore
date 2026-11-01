@@ -81,6 +81,14 @@ data/integration_registry.lock
 # (`make test-impacted`). Per-checkout, never shared — CI does not use it.
 .testmondata
 
+# `coverage`'s own data file, written by any local `pytest --cov` run and by
+# `make test-impacted-seed`. Per-checkout and per-run; CI publishes coverage
+# from its own artefacts. One checkpoint commit swept it into this branch's
+# history (VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED), which is what this line
+# is for.
+.coverage
+.coverage.*
+
 # Agent-instruction files are per-machine context with absolute local paths
 # and internal programme names — never repository content in a PUBLIC repo.
 # One `git add -A` swept CLAUDE.md into pushed history twice (#259, and the

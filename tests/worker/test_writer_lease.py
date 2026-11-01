@@ -9,6 +9,8 @@ stubbed out."""
 
 from __future__ import annotations
 
+import subprocess
+import time
 import threading
 
 import pytest
@@ -221,3 +223,185 @@ def test_renewal_is_scheduled_with_margin_before_the_granted_ttl_expires():
         assert renew_after <= ttl / 2, (
             f"renew_after={renew_after} for ttl={ttl} leaves too little margin"
         )
+
+
+# ---------------------------------------------------------------------------
+# VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED: the lease tool is a SUBPROCESS, and
+# every site below read only its RETURN CODE.
+#
+# `lease_client.run_lease` is `subprocess.run(..., timeout=120)` and does not
+# catch its own `TimeoutExpired`, so a lease tool that HANGS -- the ordinary
+# shape of an unreachable authority, since `voyn-lease` reaches its own over
+# `/etc/aicc/lease.env`'s DSN and the credential rotation restarts that tunnel
+# on its own timer -- raises straight through code that was written as if the
+# tool had always answered.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def impatient_lease_tool(monkeypatch):
+    """`run_lease` with a one-second timeout, so a tool that sleeps produces
+    the REAL `subprocess.TimeoutExpired` instead of a hand-rolled stand-in --
+    without waiting out the module's own 120s default."""
+    from command_center.worker import lease_client
+
+    real_run_lease = lease_client.run_lease
+
+    def impatient(argv, cwd, timeout=120):
+        return real_run_lease(argv, cwd, timeout=1)
+
+    monkeypatch.setattr(lease_client, "run_lease", impatient)
+    return real_run_lease
+
+
+def test_a_renewal_that_hangs_fails_closed_instead_of_killing_the_thread(
+    tmp_path, impatient_lease_tool
+):
+    """THE REGRESSION: a renewal that RAISES used to end the renewal thread
+    silently, and with it the fence.
+
+    `_renew_loop` read a return code, so every branch assumed `voyn-lease` ran
+    and answered. The loop is a thread target, so an exception ended the
+    thread and nothing anywhere observed it:
+
+      * `lease_lost` was never set, so the agent kept running;
+      * nothing renewed the lease again, so the row expired server-side at
+        `ttl` with this process still holding it -- and `lease_argv`'s own
+        comment records what that costs the next claimant ("every later
+        acquire for that repository refused forever with
+        `VOYN_LEASE_REFUSED expired requires dead-process confirmation`",
+        which `--auto-takeover` cannot clear while the holder is alive);
+      * and this module's whole promise -- a lease held "through
+        provisioning, the agent run ... and `publish_run`" -- stopped being
+        true for the rest of a run that may last `request.timeout_seconds`,
+        with no log line anywhere.
+    """
+    calls = tmp_path / "calls.log"
+    tool = _install_lease_tool(
+        tmp_path,
+        f'echo "$*" >> {calls}\n'
+        f"n=$(grep -c . {calls} 2>/dev/null || echo 0)\n"
+        # The initial acquire answers; every call after it hangs past the
+        # fixture's one-second timeout.
+        'if [ "$n" -le 1 ]; then exit 0; fi\nsleep 30\n',
+    )
+    lease_lost = threading.Event()
+
+    with hold(tmp_path, _cfg(str(tool), ttl=3), lease_lost):
+        assert lease_lost.wait(timeout=20), (
+            "a renewal that raised killed the renewal thread silently: the "
+            "agent keeps running and nothing renews the lease again"
+        )
+
+    # The reproduction went through `subprocess`'s own timeout rather than a
+    # hand-rolled failure, which is what makes it the deployed shape.
+    with pytest.raises(subprocess.TimeoutExpired):
+        impatient_lease_tool([str(tool), "--repo", str(tmp_path), "list"], tmp_path,
+                             timeout=1)
+
+
+def test_a_release_that_hangs_cannot_overturn_the_work_it_protected(
+    tmp_path, impatient_lease_tool
+):
+    """THE SECOND REGRESSION, and the more expensive one: `_release` is
+    documented best-effort -- "a release that fails (authority unreachable,
+    lease already expired server-side) leaves nothing worse than the lease's
+    own TTL expiry" -- and it was best-effort only against a REFUSAL.
+
+    Ignoring the `CompletedProcess` covers a non-zero exit. The first failure
+    that comment names does not arrive that way: an unreachable authority
+    HANGS, and `run_lease` raises. `_release` runs from `_Handle.__exit__`,
+    which is the `ExitStack` `worker.handlers` closes in its own `finally`, so
+    the exception escaped INTO the handler's exit path and replaced whatever
+    it had already decided -- including a run that had finished and PUBLISHED.
+    `_dispatch` catches it and returns a retryable failure, so `queue_fail`
+    requeues finished work, the next delivery re-runs the whole attempt (`git
+    push` and PR creation included) and `queue_claim` charges another attempt
+    for it.
+    """
+    calls = tmp_path / "calls.log"
+    # Acquire and every renewal answer; only `release` hangs. The lease is
+    # therefore healthy for the whole run -- nothing here is about losing it.
+    tool = _install_lease_tool(
+        tmp_path,
+        f'echo "$*" >> {calls}\n'
+        'case " $* " in *" release "*) sleep 30 ;; *) exit 0 ;; esac\n',
+    )
+    lease_lost = threading.Event()
+
+    with hold(tmp_path, _cfg(str(tool), ttl=600), lease_lost):
+        published = "the work this lease was protecting finished"
+
+    # No exception escaped the context manager, so the caller's own outcome
+    # survives its cleanup.
+    assert published
+    assert not lease_lost.is_set()
+    assert " release " in calls.read_text(), "the release was never attempted"
+
+
+def test_a_renewal_in_flight_when_the_hold_exits_cannot_cancel_the_finished_run(
+    tmp_path, impatient_lease_tool
+):
+    """A lease whose lifecycle has ENDED has no verdict left to give -- the
+    same lesson `_release` carries, applied to the renewal that outlived it
+    (VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED).
+
+    `_renew_loop` tests `_stop` only at the TOP of its wait. A renewal already
+    inside `lease_client.run_lease` when the hold exits outlives it:
+    `__exit__` sets `_stop`, joins this thread for ten seconds, then releases
+    the lease and returns. So the in-flight renewal comes back LATE and fails
+    -- in the ordinary case BECAUSE `__exit__` released the row it was
+    renewing -- and set `lease_lost` on a run that had already finished.
+
+    That event is `worker.handlers`' cancellation event, and
+    `daemon._execute` now REPORTS a run this lease cancelled rather than
+    discarding it, so a late failure turns a completed, PUBLISHED attempt into
+    `queue_fail(retryable => true)`: the item is requeued, the next delivery
+    re-runs the whole handler -- `git push` and PR creation included -- and
+    `queue_claim` charges another attempt for it, three of which dead-letter
+    healthy work.
+    """
+    calls = tmp_path / "calls.log"
+    # The initial acquire answers. The first RENEWAL hangs past the fixture's
+    # one-second `run_lease` timeout, so it is still in flight when the hold
+    # exits -- and `release`, which runs after the join gives up, answers at
+    # once so nothing else delays the exit.
+    tool = _install_lease_tool(
+        tmp_path,
+        f'echo "$*" >> {calls}\n'
+        'case " $* " in\n'
+        f'  *" release "*) exit 0 ;;\n'
+        "esac\n"
+        f"n=$(grep -c ' acquire ' {calls} 2>/dev/null || echo 0)\n"
+        'if [ "$n" -le 1 ]; then exit 0; fi\nsleep 30\n',
+    )
+    lease_lost = threading.Event()
+
+    handle = hold(tmp_path, _cfg(str(tool), ttl=3), lease_lost)
+    with handle:
+        # ttl=3 -> the renew interval is the module's 1s floor. Wait until the
+        # renewal that will fail is actually in flight, so the exit below
+        # really does race it rather than happening before it starts.
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if calls.read_text().count(" acquire ") >= 2:
+                break
+            time.sleep(0.05)
+        else:  # pragma: no cover - the fixture's tool did not renew
+            pytest.fail(f"no renewal was attempted: {calls.read_text()!r}")
+        published = "the work this lease was protecting finished and published"
+
+    # The hold has exited: the lease is released and the run is over. The
+    # renewal that was in flight is still running -- `__exit__` joined it for
+    # ten seconds and gave up -- so wait for it to come back and give it every
+    # chance to cancel something.
+    handle._thread.join(timeout=40)
+    assert not handle._thread.is_alive(), "the late renewal never came back"
+
+    assert published
+    assert not lease_lost.is_set(), (
+        "a renewal that failed after the hold was released cancelled a run "
+        "that had already finished; `daemon._execute` reports that as a "
+        "retryable failure and requeues published work"
+    )
+    assert " release " in calls.read_text(), "the release was never attempted"

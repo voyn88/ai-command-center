@@ -1,3 +1,48 @@
+# The control-plane queue probe. It connects as `aicc_app` (the .env below):
+# the measurement reads `work_item` and joins the lease through
+# `work_attempt_public`, neither of which a worker role may read.
+#
+# AICC_MONITOR_FINDING_SOURCE is --record-findings by another name (the flag
+# wins when both are given): it makes a red probe a task the fleet fixes
+# rather than a permanently failed unit. `control-01:queue` is the source the
+# live probe already records under (monitor_finding #481), so the name is not
+# free to change -- a different string opens a second, unlinked finding for
+# the same measurement.
+#
+# It is set HERE, beside the EnvironmentFile, and deliberately not appended to
+# ExecStart below. That line carries this host's absolute install path, and
+# this is a public repository: `scripts/ci/prepush/leak_guard.sh` refuses any
+# ADDED line containing one, and the guarded publisher runs it (a refusal is
+# `leak_guard_failed`, not a warning). The line already in history is
+# untouched context; re-typing it to append a flag would have made it a new
+# one. Deployment identity belongs beside the environment anyway -- everything
+# on ExecStart is a policy threshold, and this is which host is measuring.
+#
+# --max-stalled-seconds times work NOBODY IS ATTENDING and nobody is merely
+# too busy for: a lapsed claim, or a due ready item left unclaimed WHILE A LANE
+# WAS FREE. It is deliberately not a bound on how long one attempt may run
+# (`voyn-aicc-worker@.service` gives a single attempt TimeoutStopSec=3660s),
+# and it is deliberately not a bound on how long work may queue: the planner's
+# WIP limit is 4 against 2 lanes, so a dispatched item waiting for a lane is
+# the design working. Those two are bounded instead by --max-claim-seconds and
+# --claim-capacity, both left at their defaults here -- the capacity default is
+# the lane registry `deploy/aicc/worker-lanes`, so SCALING THE FLEET PAST TWO
+# LANES MEANS PASSING --claim-capacity HERE. Until it is passed the probe
+# under-reports (it excuses a due item while 2 lanes are busy, even if a third
+# was free); --max-claim-seconds and the lapsed-claim clock still fire, and
+# that direction is deliberate: a red tick mints a task, so this probe must not
+# cry wolf at a healthy fleet.
+#
+# --queue is not passed and does not need to be: it defaults to the queue the
+# worker lanes claim from, which is the only queue this host's fleet serves.
+# It exists because the measurement is now scoped to ONE queue (monitor_finding
+# #2766). `queue_claim` takes the queue as an argument and will not look
+# outside it, so spanning queues was wrong in both directions -- a ready row on
+# a queue no lane claims from was an unclearable `queue_stalled`, and claims on
+# such a queue filled THIS queue's --claim-capacity and excused a real stall.
+# Every threshold on the ExecStart line below is a fact about one queue's
+# fleet, so a second queue gets a SECOND unit with its own --queue,
+# --claim-capacity and AICC_MONITOR_FINDING_SOURCE -- never this one widened.
 [Unit]
 Description=VOYN durable queue fail-closed monitor
 After=network-online.target tailscaled.service postgresql.service prometheus.service
@@ -8,6 +53,7 @@ Type=oneshot
 User=voynadmin
 WorkingDirectory=/home/voynadmin/aicc-preprod/repo
 EnvironmentFile=/home/voynadmin/aicc-preprod/.env
+Environment=AICC_MONITOR_FINDING_SOURCE=control-01:queue
 # --pr-window-repo runs one `gh pr list` per tick and turns "an open fleet PR
 # has carried no review-window label for over 15 minutes" into a monitor
 # finding. It belongs to this probe and not the worker one: it needs the

@@ -47,6 +47,8 @@ COMMENT ON COLUMN backlog_task.required_authorities IS
 -- restore in this same migration -- 0019 recreated this view without one and
 -- every planner tick died for 18 minutes with "permission denied for view
 -- backlog_eligible" (0020, and the policy test that now enforces it).
+-- Keeps main's 0031 `insert_seq` tiebreaker as the LAST sort key, so
+-- same-timestamp rows still dispatch in insertion order.
 DROP VIEW IF EXISTS backlog_eligible;
 CREATE VIEW backlog_eligible AS
     SELECT t.task_id, t.wave, t.priority, t.status, t.title, t.body, t.repo,
@@ -67,7 +69,8 @@ CREATE VIEW backlog_eligible AS
                    THEN t.wave::numeric ELSE NULL END ASC,
               (t.task_class = 'pipeline') DESC,
               coalesce(t.priority, 'P9') ASC,
-              t.created_at ASC;
+              t.created_at ASC,
+              t.insert_seq ASC;
 
 DO $$
 BEGIN
@@ -152,7 +155,10 @@ BEGIN
            p_reason LIKE 'cascade_exhausted: no_pr_published%'
         OR p_reason LIKE 'cascade_exhausted: task_status_failed%'
         OR p_reason LIKE 'cascade_exhausted: executor infrastructure failure%'
-        OR p_reason LIKE 'cascade_exhausted: publish_%');
+        OR p_reason LIKE 'cascade_exhausted: publish_%'
+        -- 0034 (launch infra failure stays operational): substrate waits.
+        OR p_reason LIKE 'cascade_exhausted: infra_wait_exhausted%'
+        OR p_reason LIKE 'cascade_exhausted: %AICC_AGENT_LAUNCH_INFRA_FAILURE%');
     v_malformed := p_reason LIKE 'cascade_exhausted: malformed_pr_url%';
     SELECT count(*) INTO v_bad_returns FROM backlog_event e
      WHERE e.task_id = p_task_id AND e.event = 'return_to_pool'
