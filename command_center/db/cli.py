@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from contextlib import nullcontext
 from typing import Any
@@ -133,11 +134,10 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--wip-limit", type=int, default=4)
     plan.add_argument(
         "--repo-path",
-        default=".",
-        help="This host's own checkout. The pre-dispatch reuse gate reads its "
-        "default branch to see whether a remediation task's parent is already "
-        "merged (VOYN-W0-AICC-DISPATCH-REUSE-GATE); an empty value turns the "
-        "gate off and dispatches every candidate.",
+        default=None,
+        help="This host's own checkout. Unset: the pre-dispatch reuse gate reads "
+        "'.' (VOYN-W0-AICC-DISPATCH-REUSE-GATE) and opt-in coordination uses "
+        "AICC_FLEET_REPO; an explicit empty value turns the reuse gate off.",
     )
     plan.add_argument(
         "--dry-run",
@@ -654,7 +654,9 @@ def main(argv: list[str] | None = None) -> int:
                 report = plan_once(
                     lambda: _nc(conn),
                     PlanLimits(wip_limit=args.wip_limit),
-                    source_path=args.repo_path or None,
+                    source_path=(
+                        "." if args.repo_path is None else (args.repo_path or None)
+                    ),
                 )
                 if report.planner_busy:
                     print("planner lease held elsewhere; nothing done")
@@ -708,19 +710,44 @@ def main(argv: list[str] | None = None) -> int:
                     detail=f"dispatched={len(report.dispatched)} "
                     f"ingested={len(report.ingested)}",
                 )
+                # Coordination v2 runs AFTER the planner lease is released so a
+                # model call never blocks planner:global. Opt-in / stop switches
+                # live in coordination.coordinate_once; default is no-op.
+                from command_center.orchestrator.coordination import (
+                    CoordinationLimits,
+                    coordinate_once,
+                )
+
+                coord = coordinate_once(
+                    lambda: _nc(conn), CoordinationLimits(
+                        repository_path=(
+                            os.environ.get("AICC_FLEET_REPO", "")
+                            if args.repo_path is None
+                            else args.repo_path
+                        )
+                    )
+                )
+                if coord.stopped:
+                    print(f"COORD     stopped ({coord.skipped})")
+                elif coord.enqueued:
+                    print(f"COORD     enqueued {coord.enqueued}")
+                elif coord.applied:
+                    print(f"COORD     applied order n={len(coord.applied)}")
+                elif coord.rejected:
+                    print(f"COORD     rejected: {coord.rejected}")
+                elif coord.skipped and coord.skipped != "disabled":
+                    print(f"COORD     skipped: {coord.skipped}")
                 return 0
 
             if args.command == "backlog-review":
                 from contextlib import nullcontext as _nc
 
                 from command_center.db.work_queue_store import WorkQueueStore
+                from command_center.orchestrator import gh_access
+                from command_center.orchestrator import watchdog as _watchdog
                 from command_center.orchestrator.control_plane_reconciler import (
                     record_heartbeat,
                 )
-
-                from command_center.orchestrator import watchdog as _watchdog
-
-                from command_center.orchestrator import gh_access
                 from command_center.orchestrator.review_merge import (
                     publish_review_verdicts,
                     reconcile_pr_evidence,
@@ -828,11 +855,10 @@ def main(argv: list[str] | None = None) -> int:
             if args.command == "backlog-merge":
                 from contextlib import nullcontext as _nc
 
+                from command_center.orchestrator import watchdog as _watchdog
                 from command_center.orchestrator.control_plane_reconciler import (
                     record_heartbeat,
                 )
-
-                from command_center.orchestrator import watchdog as _watchdog
                 from command_center.orchestrator.review_merge import merge_once
 
                 report = merge_once(lambda: _nc(conn), args.repo_path)

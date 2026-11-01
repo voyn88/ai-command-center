@@ -23,9 +23,9 @@ from command_center.evolution.scorer import (
     COST,
     DEFAULT_WEIGHTS,
     DURATION,
-    FitnessWeights,
     GENE_DIMENSION,
     SUCCESS,
+    FitnessWeights,
     dimension_value,
     fitness,
 )

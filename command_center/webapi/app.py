@@ -40,8 +40,8 @@ from fastapi.staticfiles import StaticFiles
 
 from command_center.dispatch.api import create_dispatch_router
 from command_center.http_auth.routing import enforce, validate_routing
-from command_center.webapi.queue_routes import create_queue_router
 from command_center.runtime.api import ExecutionCenterAPI
+from command_center.webapi.queue_routes import create_queue_router
 from command_center.webapi.serializers import serialize_execution, serialize_home
 from command_center.workspace_home import build_workspace_home_snapshot
 

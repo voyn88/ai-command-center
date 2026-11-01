@@ -13,7 +13,6 @@ engine — so it does not read as new persistence-engine growth.
 from __future__ import annotations
 
 import contextlib
-
 from pathlib import Path
 from typing import TYPE_CHECKING
 

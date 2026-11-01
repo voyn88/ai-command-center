@@ -21,10 +21,10 @@ anyone deciding so.
 from __future__ import annotations
 
 from aios_db import (
+    DB_CONTRACT,
     AdvisoryLockError,
     AdvisoryLockTimeout,
     AiosDbError,
-    DB_CONTRACT,
     Migration,
     MigrationChecksumMismatch,
     MigrationError,

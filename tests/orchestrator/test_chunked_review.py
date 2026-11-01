@@ -448,6 +448,26 @@ def test_empty_reject_never_adjudicates_or_accepts_and_retry_is_bounded(monkeypa
         assert review_merge._next_retry_key(None, TASK, key, HEAD) == expected
 
 
+def test_stale_verification_dead_letter_does_not_remediate(monkeypatch):
+    snapshot = snap("diff --git a/a b/a\n+x\n")
+    findings = "a.py:1: missing authorization check\nVERDICT: REJECT\nHEAD_SHA: " + HEAD
+    monkeypatch.setattr(review_merge, "_latest_review_result", lambda *a: None)
+    monkeypatch.setattr(
+        review_merge,
+        "_rows",
+        lambda *_a, **_k: [("dead", "review_pin_stale: pull 380 head moved")],
+    )
+    assert review_merge._verified_rejection_outcome(
+        None,
+        lambda *a: pytest.fail("no model enqueue"),
+        TASK,
+        PR,
+        snapshot,
+        findings,
+        review_merge.ReviewConfig(),
+    ) == ("WAIT", "review_pin_stale")
+
+
 def test_empty_reject_chunk_cannot_create_remediation(monkeypatch):
     snapshot = snap("diff --git a/a b/a\n" + "x\n" * 40_000)
     review_rows = rows(snapshot)

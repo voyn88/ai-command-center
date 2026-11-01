@@ -31,8 +31,8 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 
 from command_center.http_auth import authz
 from command_center.http_auth.identity import (
-    Principal,
     PlatformUnavailable,
+    Principal,
     bearer_token,
 )
 from command_center.http_auth.identity import _whoami as whoami

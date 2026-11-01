@@ -39,7 +39,6 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import command_center.runtime.db as db  # facade (late-bound; see docstring)
-
 from command_center.runtime.db.wave1 import _exclude_projects_clause
 
 _LOG = logging.getLogger(__name__)

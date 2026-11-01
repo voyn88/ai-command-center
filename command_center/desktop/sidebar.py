@@ -12,11 +12,11 @@ from __future__ import annotations
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import QButtonGroup, QLabel, QVBoxLayout, QWidget
 
-from . import tokens
-from . import i18n
+from command_center.platform import DensityMode
+
+from . import i18n, tokens
 from .navigation_item import NavigationItem
 from .sections import SECTIONS, Section
-from command_center.platform import DensityMode
 
 
 class Sidebar(QWidget):

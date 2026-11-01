@@ -43,7 +43,11 @@ used to smuggle an actual audit engine past the gate.
 from __future__ import annotations
 
 from command_center.db.mirror_support import MIRROR_UNAVAILABLE, ColumnCodec
-from command_center.db.table_mirror import MirroredTable, PostgresTableMirror, divergence_against
+from command_center.db.table_mirror import (
+    MirroredTable,
+    PostgresTableMirror,
+    divergence_against,
+)
 
 __all__ = [
     "AUDIT_FINDING_COLUMNS",

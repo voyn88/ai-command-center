@@ -25,9 +25,9 @@ incidents open conflicts without any startup edit. Tests construct their own
 from __future__ import annotations
 
 from command_center.conflicts.intake import (
+    DEFAULT_INTAKE_CONFIG,
     ConflictIntake,
     ConflictIntakeConfig,
-    DEFAULT_INTAKE_CONFIG,
     install_default_intake,
 )
 

@@ -64,11 +64,11 @@ No new task store, no new queue, no second completion state machine.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import logging
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
-import dataclasses
 from pathlib import Path
 
 from command_center import (
@@ -77,19 +77,17 @@ from command_center import (
     git_info,
     launch_service,
     models,
-    report_parser,
     pipeline_settings,
     project_config,
+    report_parser,
     storage,
     tasks_repository,
     workspace_provisioning,
 )
 from command_center.pipeline_settings import PipelineSettings
 from command_center.runtime import completion as completion_domain
-from command_center.runtime import completion_service
+from command_center.runtime import completion_service, reports, scheduler, task_sync
 from command_center.runtime import db as runtime_db
-from command_center.runtime import reports
-from command_center.runtime import scheduler, task_sync
 from command_center.runtime.completion import CompletionPolicy
 
 _LOG = logging.getLogger(__name__)
@@ -2434,7 +2432,8 @@ def daily_spend_usd(db_path: Path, *, now: str | None = None) -> float:
     catching a phantom `TypeError` that the SQLite row set can never produce.
     """
     import json as _json
-    from datetime import datetime as _dt, timedelta as _td
+    from datetime import datetime as _dt
+    from datetime import timedelta as _td
 
     anchor = _dt.fromisoformat(now) if now else _dt.now()
     cutoff = (anchor - _td(hours=24)).isoformat(timespec="seconds")

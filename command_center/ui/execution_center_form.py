@@ -17,7 +17,13 @@ from pathlib import Path
 
 import streamlit as st
 
-from command_center import agent_runner, executors, launch_service, models, project_config
+from command_center import (
+    agent_runner,
+    executors,
+    launch_service,
+    models,
+    project_config,
+)
 from command_center.runtime import api as runtime_api
 from command_center.runtime import context_service as runtime_context_service
 from command_center.runtime import supervisor as runtime_supervisor

@@ -17,9 +17,8 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Iterable
 
-from command_center.runtime import autonomy as autonomy_domain
-
 import command_center.runtime.db as db  # facade (late-bound; see docstring)
+from command_center.runtime import autonomy as autonomy_domain
 
 _LOG = logging.getLogger(__name__)
 

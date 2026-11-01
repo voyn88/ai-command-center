@@ -24,9 +24,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from command_center import executors as executors_module
-from command_center import pipeline_settings, project_config, tasks_repository
-from command_center import task_pipeline
-from command_center.project_config import is_sensitive
+from command_center import (
+    pipeline_settings,
+    project_config,
+    task_pipeline,
+    tasks_repository,
+)
 from command_center.dispatch import policy_config
 from command_center.dispatch.models import (
     DispatchPlan,
@@ -35,6 +38,7 @@ from command_center.dispatch.models import (
     QueuedTask,
 )
 from command_center.dispatch.policy import plan_dispatch
+from command_center.project_config import is_sensitive
 from command_center.runtime import db as runtime_db
 
 if TYPE_CHECKING:  # a type-only import: the service layer stays free of FastAPI

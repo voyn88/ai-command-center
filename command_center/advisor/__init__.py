@@ -31,7 +31,7 @@ from command_center.advisor.collectors import (
     TrendCollector,
     UxCollector,
 )
-from command_center.advisor.config import AdvisorConfig, AutoRule, DEFAULT_CONFIG
+from command_center.advisor.config import DEFAULT_CONFIG, AdvisorConfig, AutoRule
 from command_center.advisor.registry import CollectorRegistry, default_registry
 from command_center.advisor.scorer import ProposalScorer, Score
 from command_center.advisor.service import (

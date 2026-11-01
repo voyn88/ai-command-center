@@ -15,7 +15,6 @@ from pathlib import Path
 
 from command_center import git_info, models, project_config
 
-
 DEFAULT_TASK_PRIORITY = "Medium"
 
 

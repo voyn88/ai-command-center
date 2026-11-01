@@ -28,8 +28,8 @@ from .pages.home import HomePage
 from .pages.operational import OperationalPage
 from .pages.projects import ProjectsPage
 from .pages.settings_page import SettingsPage
-from .settings import SettingsStore
 from .sections import ACTIVE_SECTION_KEYS, DEFAULT_SECTION_KEY
+from .settings import SettingsStore
 from .sidebar import Sidebar
 from .theme import ThemeController, ThemeMode
 from .top_bar import TopBar

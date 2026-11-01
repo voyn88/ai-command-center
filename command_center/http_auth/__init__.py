@@ -19,7 +19,7 @@ than a decorator repeated 29 times.
 from __future__ import annotations
 
 from command_center.http_auth.authz import UnknownOperationError, is_permitted
-from command_center.http_auth.identity import Principal, PlatformUnavailable
+from command_center.http_auth.identity import PlatformUnavailable, Principal
 from command_center.http_auth.routing import (
     RouteInventoryError,
     enforce,

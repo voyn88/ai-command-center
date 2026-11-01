@@ -14,7 +14,6 @@ import sqlite3
 from pathlib import Path
 from typing import Callable
 
-
 import command_center.runtime.db as db  # facade (late-bound; see docstring)
 
 # --------------------------------------------------------------------------

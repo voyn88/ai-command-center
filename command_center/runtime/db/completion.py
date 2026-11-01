@@ -16,7 +16,6 @@ import logging
 from pathlib import Path
 from typing import Any, Iterable
 
-
 import command_center.runtime.db as db  # facade (late-bound; see docstring)
 
 _LOG = logging.getLogger(__name__)

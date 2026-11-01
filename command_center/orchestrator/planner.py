@@ -26,6 +26,12 @@ from pathlib import Path
 from typing import Any
 
 from command_center import git_info
+from command_center.orchestrator.coordination import (
+    apply_advisory_order,
+    coordination_enabled,
+    coordination_stopped,
+    load_advisory_order,
+)
 from command_center.orchestrator.routing import cascade_for
 from command_center.worker.payloads import AGENT_RUN_SCHEMA_VERSION
 
@@ -511,7 +517,7 @@ def _monitor_task_id(source: str, failure: str) -> str:
     id (review of fc167cf7) -- the second upsert would have collided and
     that finding would have stayed unlinked forever."""
     slug = re.sub(r"[^A-Z0-9]+", "-", f"{source}-{failure}".upper()).strip("-")[:70]
-    digest = hashlib.sha256(f"{source}\x00{failure}".encode("utf-8")).hexdigest()[:10].upper()
+    digest = hashlib.sha256(f"{source}\x00{failure}".encode()).hexdigest()[:10].upper()
     return f"VOYN-MON-{slug}-{digest}"
 
 
@@ -607,6 +613,9 @@ def _payload_for(
     return payload, len(cascade)
 
 
+_DEFAULT_PLAN_LIMITS = PlanLimits()
+
+
 class Planner:
     """Owns nothing but the composition; every decision is the database's."""
 
@@ -621,18 +630,16 @@ class Planner:
         self._source_path = source_path
 
     def _rows(self, sql: str, params: tuple[Any, ...] = ()) -> list[tuple]:
-        with self._factory() as conn:
-            with conn.cursor() as cur:
-                cur.execute(sql, params)
-                return cur.fetchall()
+        with self._factory() as conn, conn.cursor() as cur:
+            cur.execute(sql, params)
+            return cur.fetchall()
 
     def _row(self, sql: str, params: tuple[Any, ...]) -> tuple:
         return self._rows(sql, params)[0]
 
     def _exec(self, sql: str, params: tuple[Any, ...] = ()) -> None:
-        with self._factory() as conn:
-            with conn.cursor() as cur:
-                cur.execute(sql, params)
+        with self._factory() as conn, conn.cursor() as cur:
+            cur.execute(sql, params)
 
     def _reuse_gate(self, candidates: list[tuple]) -> _ReuseGate | None:
         """This tick's reuse-gate context, or None when the gate cannot run.
@@ -716,7 +723,7 @@ class Planner:
             return True, authority.summary
         return False, reason or "refused"
 
-    def plan_once(self, limits: PlanLimits = PlanLimits()) -> PlanReport:
+    def plan_once(self, limits: PlanLimits = _DEFAULT_PLAN_LIMITS) -> PlanReport:
         report = PlanReport()
         ok, reason, *_ = self._row(
             "SELECT * FROM backlog_lease_acquire(%s, %s, %s)",
@@ -812,11 +819,11 @@ class Planner:
                         (
                             task_id_for_finding, "0", "P1", "OPEN", "task",
                             f"monitor finding: {failure} on {source}",
-                            f"Recorded by the fail-closed monitor '{source}' (monitor_finding "
+                            (f"Recorded by the fail-closed monitor '{source}' (monitor_finding "
                             f"#{finding_id}): failure '{failure}'. Find the root cause and fix "
                             "it so the measurement is healthy again; the monitor clears the "
                             "finding when it measures healthy. Acceptance: the monitor reports "
-                            "ok for 24h and the root-cause fix is merged with a regression test.",
+                            "ok for 24h and the root-cause fix is merged with a regression test."),
                             "ai-command-center",
                         ),
                     )
@@ -873,6 +880,16 @@ class Planner:
                 "       task_class, required_authorities "
                 "FROM backlog_eligible"
             )
+            # Advisory reorder from coordination v2 (Grok). Stale/unknown ids
+            # are ignored; backlog_dispatch still re-checks eligibility under
+            # the row lock. Missing/unreadable state → original order.
+            if coordination_enabled() and not coordination_stopped():
+                try:
+                    advisory = load_advisory_order(self._factory)
+                except Exception:  # noqa: BLE001 — coordination must never abort planning
+                    advisory = []
+                if advisory:
+                    candidates = apply_advisory_order(candidates, advisory, id_index=0)
             gate = self._reuse_gate(candidates)
             for row in candidates:
                 if len(row) >= 9:
@@ -982,7 +999,7 @@ class Planner:
 
 def plan_once(
     connection_factory: Any,
-    limits: PlanLimits = PlanLimits(),
+    limits: PlanLimits = _DEFAULT_PLAN_LIMITS,
     *,
     source_path: str | None = None,
 ) -> PlanReport:

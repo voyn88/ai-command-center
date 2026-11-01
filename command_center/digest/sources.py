@@ -23,11 +23,11 @@ from pathlib import Path
 
 from command_center import read_model
 from command_center.project_config import is_sensitive
+from command_center.runtime import db
 from command_center.runtime.db.core import resolve_db_path
 from command_center.runtime.runs_read import list_unified_runs
 from command_center.tasks_repository import load_tasks
 from command_center.ui.git_readers import get_git_log
-from command_center.runtime import db
 
 # Repo root is three levels up: <root>/command_center/digest/sources.py
 ROOT = Path(__file__).resolve().parents[2]

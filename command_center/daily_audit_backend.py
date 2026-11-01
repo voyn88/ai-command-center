@@ -14,8 +14,8 @@ import hashlib
 import json
 import logging
 import os
-import signal
 import shlex
+import signal
 import subprocess
 import time
 from dataclasses import dataclass
@@ -23,13 +23,15 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
 from command_center import models, report_parser
-from command_center.daily_audit import CampaignBackendError, CampaignRequest, CampaignResult
+from command_center.daily_audit import (
+    CampaignBackendError,
+    CampaignRequest,
+    CampaignResult,
+)
 from command_center.runtime import db as runtime_db
-from command_center.runtime import providers
-from command_center.runtime import reports
+from command_center.runtime import providers, reports
 from command_center.runtime.api import ExecutionCenterAPI
 from command_center.runtime.completion_service import CompletionOrchestrator
-
 
 logger = logging.getLogger(__name__)
 

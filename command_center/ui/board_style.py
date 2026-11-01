@@ -28,6 +28,7 @@ import streamlit as st
 from command_center.design import Theme, color
 from command_center.ui import live_board, theme
 
+
 # Board palette, derived from the platform-canonical
 # `command_center/design/tokens.json` (the same source `.streamlit/config.toml`'s
 # `[theme.light]`/`[theme.dark]` mirror). Each bucket tone carries a *line* colour

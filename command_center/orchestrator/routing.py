@@ -84,7 +84,7 @@ def cascade_for(task_class: str) -> list[dict[str, Any]]:
     if os.environ.get("AICC_EXECUTOR_PROFILE") == "owner-alternatives":
         task_type = "review" if task_class == "review" else "implementation"
         return [{"executor": "cursor", "task_type": task_type, "model": "auto"},
-                {"executor": "grok", "task_type": task_type, "model": "grok-4.3"}]
+                {"executor": "grok", "task_type": task_type, "model": "grok-4.6"}]
     return [
         dict(link)
         for link in ROUTING_MATRIX.get(task_class, ROUTING_MATRIX["implementation"])

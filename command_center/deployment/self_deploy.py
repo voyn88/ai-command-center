@@ -297,8 +297,9 @@ def self_deploy_once(
             _record_provenance(cfg, report)
         if outcome in {"rolled_back", "failed"} and report.target_sha:
             try:
-                from command_center.lane_budget import pause_for_red_smoke
                 from pathlib import Path as _Path
+
+                from command_center.lane_budget import pause_for_red_smoke
                 pause_for_red_smoke(_Path(repo_path), sha=report.target_sha)
             except Exception:
                 pass
