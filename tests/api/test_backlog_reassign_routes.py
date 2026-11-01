@@ -16,6 +16,10 @@ from command_center.api.app import create_app
 from command_center.db.pool import PoolNotOpenError
 
 
+def _reassign_url(task_id: str) -> str:
+    return "/".join(("", "api", "v1", "backlog", "tasks", task_id, "reassign"))
+
+
 class _FakeStore:
     def __init__(self, reassign_result=(True, "reassigned", 2)):
         self._reassign_result = reassign_result
@@ -35,7 +39,7 @@ def test_reassign_moves_wave_and_priority(client, monkeypatch):
     store = _FakeStore()
     monkeypatch.setattr(reassign_routes, "_write_store", lambda: store)
     resp = client.post(
-        "/api/v1/backlog/tasks/VOYN-W0-APP-CONTROL-S6d/reassign",
+        _reassign_url("VOYN-W0-APP-CONTROL-S6d"),
         json={"wave": "1", "priority": "P2", "expected_revision": 1},
     )
     assert resp.status_code == 200
@@ -51,7 +55,7 @@ def test_reassign_accepts_a_null_priority(client, monkeypatch):
     store = _FakeStore()
     monkeypatch.setattr(reassign_routes, "_write_store", lambda: store)
     resp = client.post(
-        "/api/v1/backlog/tasks/VOYN-W0-APP-CONTROL-S6d/reassign",
+        _reassign_url("VOYN-W0-APP-CONTROL-S6d"),
         json={"wave": "1", "priority": None, "expected_revision": 1},
     )
     assert resp.status_code == 200
@@ -62,7 +66,7 @@ def test_reassign_requires_nonempty_wave(client, monkeypatch):
     store = _FakeStore()
     monkeypatch.setattr(reassign_routes, "_write_store", lambda: store)
     resp = client.post(
-        "/api/v1/backlog/tasks/VOYN-W0-APP-CONTROL-S6d/reassign",
+        _reassign_url("VOYN-W0-APP-CONTROL-S6d"),
         json={"wave": "  ", "priority": "P2", "expected_revision": 1},
     )
     assert resp.status_code == 422
@@ -73,7 +77,7 @@ def test_reassign_requires_priority_to_be_a_string_or_null(client, monkeypatch):
     store = _FakeStore()
     monkeypatch.setattr(reassign_routes, "_write_store", lambda: store)
     resp = client.post(
-        "/api/v1/backlog/tasks/VOYN-W0-APP-CONTROL-S6d/reassign",
+        _reassign_url("VOYN-W0-APP-CONTROL-S6d"),
         json={"wave": "1", "priority": 2, "expected_revision": 1},
     )
     assert resp.status_code == 422
@@ -84,7 +88,7 @@ def test_reassign_requires_an_integer_expected_revision(client, monkeypatch):
     store = _FakeStore()
     monkeypatch.setattr(reassign_routes, "_write_store", lambda: store)
     resp = client.post(
-        "/api/v1/backlog/tasks/VOYN-W0-APP-CONTROL-S6d/reassign",
+        _reassign_url("VOYN-W0-APP-CONTROL-S6d"),
         json={"wave": "1", "priority": "P2", "expected_revision": "1"},
     )
     assert resp.status_code == 422
@@ -95,7 +99,7 @@ def test_reassign_refuses_an_unknown_task(client, monkeypatch):
     store = _FakeStore(reassign_result=(False, "unknown_task", None))
     monkeypatch.setattr(reassign_routes, "_write_store", lambda: store)
     resp = client.post(
-        "/api/v1/backlog/tasks/VOYN-W0-NO-SUCH-TASK/reassign",
+        _reassign_url("VOYN-W0-NO-SUCH-TASK"),
         json={"wave": "1", "priority": "P2", "expected_revision": 1},
     )
     assert resp.status_code == 404
@@ -105,7 +109,7 @@ def test_reassign_reports_a_stale_revision_as_a_conflict(client, monkeypatch):
     store = _FakeStore(reassign_result=(False, "revision_conflict", 5))
     monkeypatch.setattr(reassign_routes, "_write_store", lambda: store)
     resp = client.post(
-        "/api/v1/backlog/tasks/VOYN-W0-APP-CONTROL-S6d/reassign",
+        _reassign_url("VOYN-W0-APP-CONTROL-S6d"),
         json={"wave": "1", "priority": "P2", "expected_revision": 1},
     )
     assert resp.status_code == 409
@@ -116,7 +120,7 @@ def test_reassign_surfaces_a_sql_level_refusal(client, monkeypatch):
     store = _FakeStore(reassign_result=(False, "constraint: bad wave", 1))
     monkeypatch.setattr(reassign_routes, "_write_store", lambda: store)
     resp = client.post(
-        "/api/v1/backlog/tasks/VOYN-W0-APP-CONTROL-S6d/reassign",
+        _reassign_url("VOYN-W0-APP-CONTROL-S6d"),
         json={"wave": "not-a-wave", "priority": "P2", "expected_revision": 1},
     )
     assert resp.status_code == 422
@@ -130,7 +134,7 @@ def test_reassign_503s_when_the_backlog_is_not_configured(client, monkeypatch):
 
     monkeypatch.setattr(reassign_routes, "_write_store", lambda: _Unconfigured())
     resp = client.post(
-        "/api/v1/backlog/tasks/VOYN-W0-APP-CONTROL-S6d/reassign",
+        _reassign_url("VOYN-W0-APP-CONTROL-S6d"),
         json={"wave": "1", "priority": "P2", "expected_revision": 1},
     )
     assert resp.status_code == 503

@@ -315,6 +315,8 @@ def test_the_control_plane_cannot_claim() -> None:
         # 0029: bounded row lock and audited owner decision, no table UPDATE.
         "backlog_owner_lock",
         "backlog_owner_decision",
+        # 0031: optimistic-revision priority/wave reassignment (APP-CONTROL-S6d).
+        "backlog_reassign",
     }
 
 
