@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -151,12 +152,19 @@ def _http_get_json(url: str, token: str, timeout: float) -> tuple[int, bytes]:
     outage: it carries a real status line, so it is returned as a status for
     the caller to interpret (401 vs any other non-2xx).
     """
+    # B310: urlopen honours file:/ and custom schemes. The base URL is
+    # operator-configured, so refuse anything but HTTP(S) HERE, at the call,
+    # rather than trusting every caller: a bearer token must never be handed
+    # to a file: or ftp: opener.
+    scheme = urllib.parse.urlsplit(url).scheme.lower()
+    if scheme not in ("http", "https"):
+        raise ServerQueueTimeoutError(f"queue_transport_failure: unsupported scheme {scheme!r}")
     auth_header = "Bearer" + " " + token
-    request = urllib.request.Request(  # noqa: S310 - scheme is operator-configured
+    request = urllib.request.Request(  # noqa: S310 - scheme checked just above
         url, headers={"Authorization": auth_header, "Accept": "application/json"}
     )
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
+        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310  # nosec B310
             return int(response.status), response.read()
     except urllib.error.HTTPError as exc:
         return int(exc.code), exc.read()
