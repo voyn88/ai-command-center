@@ -61,7 +61,7 @@ AUDIT_TABLE_SUFFIX = "_event"
 NON_ABORTING_RAISE_LEVELS = frozenset({"debug", "log", "info", "notice", "warning"})
 
 #: Signatures the static gate cannot treat as safe but that are deliberate.
-#: `backlog_import_task` (0037) must abort the insert when provenance stamp
+#: `backlog_import_task` (0047) must abort the insert when provenance stamp
 #: fails — atomic import, not a refusal-as-data path. `executor_mark_*`
 #: validates arguments with `RAISE` before any `executor_availability_event`
 #: row is written; the gate over-approximates because it cannot prove order.

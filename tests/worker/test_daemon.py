@@ -22,6 +22,7 @@ from command_center.worker.daemon import (
     HandlerOutcome,
     WorkerConfig,
     WorkerDaemon,
+    _LeaseDeadline,
 )
 
 
@@ -66,8 +67,8 @@ class ScriptedStore:
         self.calls.append(("fail_lease_wait", work.attempt_id, reason))
         return True
 
-    def fail_infra_wait(self, work, *, reason):
-        self.calls.append(("fail_infra_wait", work.attempt_id, reason))
+    def fail_infra_wait(self, work, *, reason, detail=None):
+        self.calls.append(("fail_infra_wait", work.attempt_id, reason, detail))
         return True
 
 
@@ -108,7 +109,7 @@ def test_a_failing_handler_reports_fail_not_complete() -> None:
     assert not any(c[0] == "complete" for c in store.calls)
 
 
-def test_a_lease_wait_failure_routes_to_the_lease_wait_store_method() -> None:
+def test_a_no_fault_failure_routes_to_the_refund_store_method() -> None:
     """VOYN-W0-AICC-PUBLISH-LEASE-CONTENTION-BURNS-ATTEMPT: a publish that
     lost the writer-lease race to a sibling lane names no fault in this
     item's own work. Reporting it through the ordinary `fail(retryable=True)`
@@ -149,8 +150,44 @@ def test_an_infra_wait_failure_routes_to_the_infra_wait_store_method() -> None:
         "fail_infra_wait",
         "wat-1",
         "executor infrastructure failure (agent principal isolation): socket inactive",
+        None,
     ) in store.calls
     assert not any(c[0] == "fail" for c in store.calls)
+
+
+def test_an_infra_wait_carries_the_handlers_detail_to_the_audit_row() -> None:
+    """VOYN-W0-AICC-EXECUTOR-QUOTA-AWARE-ROUTING: the refund itself only
+    records that an attempt was given back. Which executor is out of quota,
+    and until when this worker will withhold it, is the handler's fact, and a
+    refusal writes no result row to carry it -- so it travels with the
+    failure report into `work_event.detail`."""
+    store = ScriptedStore([_work({"kind": "infra"})])
+    quota = {
+        "executor_quota": {
+            "exhausted": [
+                {
+                    "cascade_step": 1,
+                    "executor": "codex",
+                    "signature": "hit your usage limit",
+                    "exhausted_until": "2026-09-22T12:30:00+00:00",
+                }
+            ]
+        }
+    }
+
+    def infra(payload, lease_lost, attempt_no=1):
+        return HandlerOutcome(
+            ok=False,
+            reason="executor infrastructure failure (provider/auth/quota): out of quota",
+            infra_wait=True,
+            detail=quota,
+        )
+
+    daemon = WorkerDaemon(store, {"infra": infra}, WorkerConfig(visibility_seconds=3))
+    _run_until_idle(daemon, store)
+
+    reported = [call for call in store.calls if call[0] == "fail_infra_wait"]
+    assert reported and reported[0][3] == quota
 
 
 def test_a_raising_handler_is_a_retryable_failure() -> None:
@@ -212,8 +249,8 @@ def test_sigterm_finishes_the_item_in_hand_and_claims_no_more() -> None:
 
     original_execute = daemon._execute
 
-    def execute_then_stop(work):
-        original_execute(work)
+    def execute_then_stop(work, sent_at):
+        original_execute(work, sent_at)
         daemon.request_stop()  # the signal arrives while item 1 is in hand
 
     daemon._execute = execute_then_stop  # type: ignore[method-assign]
@@ -697,11 +734,12 @@ def test_the_watchdog_budget_caps_the_refusal_sleep(monkeypatch) -> None:
 def test_the_watchdog_cap_keeps_the_beat_alive_under_a_long_visibility(
     monkeypatch,
 ) -> None:
-    """Mutant E: with visibility_seconds=3600 the beat interval is 1200s, and
-    the watchdog cap on that interval is the ONLY thing that keeps a healthy
+    """Mutant E: with visibility_seconds=3600 the beat interval is 900s
+    (`beat_interval_seconds`, which the cadence fix moved from 1200s), and the
+    watchdog cap on that interval is the ONLY thing that keeps a healthy
     long-lease worker pinging inside its budget. Without the cap the first
-    beat (and first in-run ping) would arrive 20 minutes late — here, never
-    within the 10s bound."""
+    beat (and first in-run ping) would arrive a quarter-hour late — here,
+    never within the 10s bound."""
     import os
     import threading
 
@@ -720,7 +758,7 @@ def test_the_watchdog_cap_keeps_the_beat_alive_under_a_long_visibility(
     def slow(payload, lease_lost, attempt_no=1):
         assert beat_seen.wait(timeout=10), (
             "no heartbeat within the watchdog budget: the uncapped interval "
-            "would have parked the beat thread for visibility/3 seconds"
+            "would have parked the beat thread for a quarter of the window"
         )
         return HandlerOutcome(ok=True, result={})
 
@@ -773,6 +811,1806 @@ def test_the_daemon_speaks_real_sd_notify_datagrams(monkeypatch) -> None:
     )
 
 
+def test_a_raising_claim_does_not_kill_the_lane(caplog) -> None:
+    """THE AMPLIFIER (VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED).
+
+    `claim()` is the one protocol call the loop makes on EVERY iteration, and
+    it was the only one with no guard around it -- while a raising report
+    write, a raising handler and a non-object payload had each been closed
+    after the same failure. It is the worst place to lack one: the exception
+    fires before any item is in hand, so it does not cost one attempt, it
+    costs every attempt. It leaves `run_forever`, the lane exits, systemd
+    restarts it, and the next claim raises on the same row.
+
+    That is how monitor_finding #2840 became a fleet-wide outage rather than
+    one stuck item: a refunded lease wait left `attempt_no` taken, so
+    `queue_claim` raised a unique violation -- on the OLDEST DUE ROW, which
+    every lane selects first. Migration 0026 removed that cause; this removes
+    the amplifier, which is the half the monitor actually measures. Lanes that
+    are up but claiming nothing stop the fleet clock, and `control-01:queue`
+    reports `queue_stalled` with no exit reachable by fleet action, because
+    restarting a crash-looping lane only restarts the crash.
+
+    The second claim is the assertion: it can only happen if the first one's
+    exception did not leave the loop.
+    """
+    import logging
+
+    store = ScriptedStore([_work({"kind": "echo"}, attempt_id="wat-2")])
+    raised: list[str] = []
+    real_claim = store.claim
+
+    def raising_claim(queue, *, visibility_seconds):
+        if not raised:
+            raised.append(queue)
+            # What a head-of-line poisoned row actually raised.
+            raise RuntimeError(
+                'duplicate key value violates unique constraint '
+                '"idx_work_attempt_item_no"'
+            )
+        return real_claim(queue, visibility_seconds=visibility_seconds)
+
+    store.claim = raising_claim  # type: ignore[method-assign]
+    daemon = WorkerDaemon(
+        store,
+        {"echo": lambda p, e, a=1: HandlerOutcome(ok=True, result={})},
+        WorkerConfig(visibility_seconds=3),
+    )
+
+    # `_run_until_idle` stops on the FIRST sleep, and the backoff after a
+    # raising claim is a sleep -- so it would end the run before proving
+    # anything. Stop on the second instead: one for the backoff, and the
+    # daemon must reach a claim in between.
+    sleeps: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        if len(sleeps) >= 2:
+            daemon.request_stop()
+
+    daemon._sleep = sleep  # type: ignore[method-assign]
+    with caplog.at_level(logging.ERROR):
+        daemon.run_forever()  # must return normally, not raise
+
+    # The lane survived and went back to claiming: the item behind the
+    # poisoned row was served, which is the whole point.
+    assert raised == ["execution"]
+    assert ("complete", "wat-2", {}) in store.calls
+    assert any("claim raised" in r.message for r in caplog.records)
+    # Backed off rather than spun: the same interval every other unclaimable
+    # answer uses, because none of them is cured by asking again faster.
+    assert sleeps[0] == WorkerConfig().idle_max_seconds
+
+
+def test_a_raising_claim_does_not_hold_the_drain_gate_through_its_backoff() -> None:
+    """The backoff must sit OUTSIDE `_claim_gate_lock`. The drain coordinator
+    takes that same lock to emit the `aicc-drained` ACK the credential rotator
+    waits on, so sleeping under it would stall a rotation behind a database
+    fault that has nothing to do with it -- trading a dead lane for a wedged
+    one.
+
+    Measured by taking the lock from the sleep itself: if the loop still held
+    it, this could not acquire it.
+    """
+    store = ScriptedStore([])
+
+    def always_raising_claim(queue, *, visibility_seconds):
+        raise ConnectionError("server closed the connection unexpectedly")
+
+    store.claim = always_raising_claim  # type: ignore[method-assign]
+    daemon = WorkerDaemon(store, {}, WorkerConfig(visibility_seconds=3))
+
+    gate_was_free: list[bool] = []
+
+    def sleep(_seconds: float) -> None:
+        acquired = daemon._claim_gate_lock.acquire(blocking=False)
+        gate_was_free.append(acquired)
+        if acquired:
+            daemon._claim_gate_lock.release()
+        daemon.request_stop()
+
+    daemon._sleep = sleep  # type: ignore[method-assign]
+    daemon.run_forever()
+
+    assert gate_was_free == [True], "the claim gate stayed locked through the backoff"
+
+
+def test_a_failed_credential_reload_does_not_strand_the_drained_lane() -> None:
+    """A drained lane's ONLY route back to claiming is a successful reload.
+
+    `request_drain()` (SIGUSR1) closes the claim gate and nothing reopens it
+    except `_credential_reload_loop` clearing the flags after
+    `reload_credentials()` returns. The request is cleared BEFORE the attempt
+    -- deliberately, so a SIGHUP arriving mid-reload is coalesced rather than
+    dropped -- so a reload that RAISES consumed the request and left nothing
+    to retry it. The lane then stays drained for the life of the process:
+    up, feeding the systemd watchdog from the draining branch (so no restart
+    is ever triggered), holding a working pool, and claiming nothing.
+
+    That is a `queue_stalled` with no exit reachable by fleet action, which
+    is the failure class every fix on this branch has been closing -- the
+    fleet clock stops, due ready work is attended by nobody, and restarting
+    is not something anything on the host will do for a unit that looks
+    healthy. The reload must degrade the way the claim and report paths
+    already do: log it, back off, keep trying.
+    """
+    import threading
+
+    attempts = []
+    notices: list[str] = []
+    fail_until = 2
+
+    def reload_credentials() -> None:
+        attempts.append(len(attempts) + 1)
+        if len(attempts) <= fail_until:
+            raise RuntimeError("pool rebuild refused: connection reset")
+
+    store = ScriptedStore([])
+    daemon = WorkerDaemon(
+        store,
+        {},
+        # `idle_max_seconds` doubles as the reload retry interval, exactly as
+        # it does for the claim and refusal paths.
+        WorkerConfig(visibility_seconds=3, idle_min_seconds=0.01, idle_max_seconds=0.01),
+        notify=notices.append,
+        reload_credentials=reload_credentials,
+    )
+    worker = threading.Thread(target=daemon.run_forever)
+    worker.start()
+    try:
+        daemon.request_drain()
+        deadline = time.monotonic() + 5
+        while "STATUS=aicc-drained-idle" not in notices and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert "STATUS=aicc-drained-idle" in notices
+
+        claims_while_drained = sum(call[0] == "claim" for call in store.calls)
+        daemon.request_reload()
+
+        # The lane comes back on its own: the failed reloads are retried, and
+        # the first one that succeeds reopens the gate.
+        deadline = time.monotonic() + 5
+        while "STATUS=aicc-ready" not in notices[-3:] and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(attempts) > fail_until, (
+            f"a failed reload was never retried: {attempts}"
+        )
+        assert "STATUS=aicc-reload-failed" in notices
+
+        deadline = time.monotonic() + 5
+        while (
+            sum(call[0] == "claim" for call in store.calls) <= claims_while_drained
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        assert sum(call[0] == "claim" for call in store.calls) > claims_while_drained, (
+            "the lane never resumed claiming after the reload finally succeeded"
+        )
+    finally:
+        daemon.request_stop()
+        worker.join(timeout=5)
+    assert not worker.is_alive()
+
+
+def test_a_failing_credential_reload_keeps_the_claim_gate_shut() -> None:
+    """Retrying must not become failing open.
+
+    The drain is the rotator's instruction to stop claiming while the
+    credential it issued is retired; a lane that reopened the gate because
+    its reload kept failing would claim under exactly the credential the
+    rotation is invalidating. So the retry loop reopens the gate only on a
+    reload that actually SUCCEEDED -- while the reload keeps failing the lane
+    stays drained and claims nothing, which is the safe half of this
+    behaviour and the half a naive "clear the flags in a finally" would lose.
+    """
+    import threading
+
+    notices: list[str] = []
+    attempts = []
+
+    def reload_credentials() -> None:
+        attempts.append(1)
+        raise RuntimeError("credential file unreadable")
+
+    store = ScriptedStore([])
+    daemon = WorkerDaemon(
+        store,
+        {},
+        WorkerConfig(visibility_seconds=3, idle_min_seconds=0.01, idle_max_seconds=0.01),
+        notify=notices.append,
+        reload_credentials=reload_credentials,
+    )
+    worker = threading.Thread(target=daemon.run_forever)
+    worker.start()
+    try:
+        daemon.request_drain()
+        deadline = time.monotonic() + 5
+        while "STATUS=aicc-drained-idle" not in notices and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert "STATUS=aicc-drained-idle" in notices
+        claims_at_drain = sum(call[0] == "claim" for call in store.calls)
+
+        daemon.request_reload()
+        deadline = time.monotonic() + 3
+        while len(attempts) < 3 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(attempts) >= 3, f"the reload was not retried: {attempts}"
+
+        assert sum(call[0] == "claim" for call in store.calls) == claims_at_drain, (
+            "a lane whose reload keeps failing must not claim again"
+        )
+        assert "READY=1" not in notices[1:], "a failed reload must not re-arm READY"
+    finally:
+        daemon.request_stop()
+        worker.join(timeout=5)
+    assert not worker.is_alive()
+
+
+# ---------------------------------------------------------------------------
+# VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED (monitor_finding #13420): the lease
+# had no renewal margin at all.
+#
+# `_heartbeat_loop` waited `visibility_seconds / 3` between beats under a
+# comment promising that "two consecutive beats may fail (a restarting
+# PostgreSQL, a network blip) before the lease actually lapses". Three beats
+# at a third of the window land at V/3, 2V/3 and V EXACTLY -- so after two
+# failures the beat that has to succeed arrives ON the deadline, and
+# `_queue_owns` refuses it (`claim_expired`, a `<=` test). The delivered
+# tolerance was ONE.
+#
+# These pin the tolerance itself rather than the divisor, so a future change
+# to either number has to keep the promise or go red.
+# `tests/db/test_infra_monitor_queue_snapshot.py` proves the same property end
+# to end against a real server -- the real `queue_heartbeat` keeping the real
+# lease, then the probe reading the lane it leaves behind; these need no
+# server and so run in every gate on every machine -- the lesson
+# `tests/db/test_reap_bound.py` was written for.
+
+
+def test_the_lease_survives_the_beats_the_daemon_says_may_fail() -> None:
+    """THE REGRESSION, as arithmetic over the window the deployment runs and
+    every other window the clamps do not reach.
+
+    A successful beat at T renews the lease to T + V. The beat that must
+    succeed is the one after the tolerated failures, at T + (F + 1) * I, and
+    it has to land while the lease is still LIVE -- `visible_until <= now()`
+    is refused, so landing exactly on the deadline is landing late.
+    """
+    from command_center.worker.daemon import (
+        TOLERATED_FAILED_BEATS as tolerated,
+    )
+    from command_center.worker.daemon import (
+        beat_interval_seconds,
+    )
+
+    for window in (8, 12, 60, WorkerConfig().visibility_seconds, 600, 3600):
+        interval = beat_interval_seconds(window)
+        first_required_beat = (tolerated + 1) * interval
+        assert first_required_beat < window, (
+            f"visibility_seconds={window}: the beat after {tolerated} failures "
+            f"lands at {first_required_beat}s against a {window}s lease"
+        )
+        # ... and with a whole beat to spare, because every term drifts the
+        # same way: `beat_stop.wait(interval)` restarts after the PREVIOUS
+        # call returned, so each cycle costs the round trip too.
+        assert first_required_beat + interval <= window, (
+            f"visibility_seconds={window}: no margin left after "
+            f"{tolerated} failed beats"
+        )
+
+
+def test_the_configured_window_is_one_the_server_will_actually_grant() -> None:
+    """The arithmetic above is about the window the CALLER ASKS FOR; the lease
+    is the one the SERVER GRANTS. `queue_claim` clamps the request to
+    ``[1, 3600]`` (`least(greatest(coalesce(p_visibility_seconds, 60), 1),
+    3600)`), so a configured window above the ceiling would size the beat to a
+    lease that does not exist -- 7200s asked for, 3600s kept, beats at 1800s,
+    and the tolerance this module just bought back is gone again without a
+    line of it changing.
+
+    Nothing can reach that today: `command_center.worker.__main__` builds the
+    daemon with the default config and exposes no knob. This pins the reason
+    it is safe, so a knob added later lands here instead of in the fleet."""
+    assert 1 <= WorkerConfig().visibility_seconds <= 3600
+
+
+def test_the_deployed_window_beats_often_enough_to_survive_a_tunnel_restart() -> None:
+    """The same property at the number the fleet actually runs, stated
+    concretely so the regression reads as a fleet fact and not as algebra.
+
+    `voyn-aicc-worker@.service` declares `Requires=voyn-aicc-pgtunnel.service`
+    and the credential rotation restarts that tunnel on its own timer, so a
+    blip costing two beats is a scheduled event, not a coincidence.
+    """
+    from command_center.worker.daemon import beat_interval_seconds
+
+    window = WorkerConfig().visibility_seconds
+    interval = beat_interval_seconds(window)
+    beats_before_expiry = [n * interval for n in (1, 2, 3)]
+
+    assert max(beats_before_expiry) < window, (
+        f"beats at {beats_before_expiry} against a {window}s lease"
+    )
+
+
+def test_the_watchdog_cap_can_only_shorten_the_beat() -> None:
+    """The cap exists so a long window cannot park the beat thread past the
+    systemd watchdog deadline. It must never LENGTHEN the interval, which
+    would silently spend the tolerance this module just bought back."""
+    from command_center.worker.daemon import beat_interval_seconds
+
+    window = 3600
+    uncapped = beat_interval_seconds(window)
+
+    assert beat_interval_seconds(window, 1.0) == 1.0
+    assert beat_interval_seconds(window, uncapped * 10) == uncapped
+    # The floor is the same clamp `queue_claim` puts on the window itself.
+    assert beat_interval_seconds(1, 0.0) == 1.0
+    assert beat_interval_seconds(0.5) == 1.0
+
+
+def test_a_blip_of_the_tolerated_length_does_not_stop_the_work() -> None:
+    """The loop itself, against a store that keeps the lease the way the
+    server keeps it.
+
+    `queue_heartbeat` renews `visible_until` to `now() + visibility_seconds`
+    and `_queue_owns` refuses a beat that arrives when `visible_until <=
+    now()` -- landing ON the deadline is landing late. This fake enforces
+    exactly those two rules and nothing else, so the beat that recovers from
+    the blip is judged by the clock rather than by the fake's goodwill. Under
+    `visibility_seconds / 3` the third beat lands at the deadline, the store
+    refuses it, and the handler's run is thrown away.
+
+    A blip of `TOLERATED_FAILED_BEATS` beats is what a
+    `voyn-aicc-pgtunnel.service` restart does to a lane, and the credential
+    rotation restarts that tunnel on its own timer.
+    """
+    import threading
+
+    from command_center.worker.daemon import TOLERATED_FAILED_BEATS
+
+    window = 8.0
+    store = ScriptedStore([_work({"kind": "slow"})])
+    beats: list[str] = []
+    recovered = threading.Event()
+    claimed_at = time.monotonic()
+    visible_until = [claimed_at + window]
+
+    def leased_heartbeat(work):
+        if len(beats) < TOLERATED_FAILED_BEATS:
+            beats.append("raised")
+            raise ConnectionError("tunnel restarting")
+        now = time.monotonic()
+        if visible_until[0] <= now:
+            # `_queue_owns`: 'claim_expired'. The attempt is forfeit even
+            # though nobody has taken it yet.
+            beats.append("refused")
+            recovered.set()
+            return False
+        visible_until[0] = now + window
+        beats.append("ok")
+        recovered.set()
+        return True
+
+    store.heartbeat = leased_heartbeat  # type: ignore[method-assign]
+
+    def slow(payload, lease_lost, attempt_no=1):
+        assert recovered.wait(timeout=window * 3), f"no beat recovered: {beats}"
+        assert not lease_lost.is_set(), (
+            f"{TOLERATED_FAILED_BEATS} failed beats gave the lease up: {beats}"
+        )
+        return HandlerOutcome(ok=True, result={"ok": True})
+
+    daemon = WorkerDaemon(store, {"slow": slow}, WorkerConfig(visibility_seconds=window))
+    _run_until_idle(daemon, store)
+
+    assert beats[:TOLERATED_FAILED_BEATS] == ["raised"] * TOLERATED_FAILED_BEATS
+    assert "refused" not in beats, f"the recovery beat arrived too late: {beats}"
+    assert any(call[0] == "complete" for call in store.calls), (
+        "the attempt was thrown away by a blip it was sized to survive"
+    )
+
+
+# ---------------------------------------------------------------------------
+# VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED (monitor_finding #14016).
+#
+# TWO LEASES COVER ONE ATTEMPT and only one of them forbids the report. The
+# queue's visibility lease is this daemon's; the repository WRITER lease is
+# held by `worker.handlers` through `writer_lease.hold(repository, lease_cfg,
+# lease_lost)` -- handed THIS loop's event on purpose, so that one cancellation
+# path serves both ("a renewal failure sets the SAME `lease_lost` event this
+# function already wires into `run_claude_code` as `cancel_event`").
+#
+# Sharing the cancellation channel is right. Sharing it with "do not report"
+# was not: `_execute` read any set event as "the database already gave this
+# attempt to someone else", which is true of exactly one of the two senders.
+# ---------------------------------------------------------------------------
+
+
+def test_a_run_cancelled_by_the_writer_lease_is_reported_not_discarded() -> None:
+    """THE REGRESSION. The writer lease goes; the queue lease is live and
+    renewing. `queue_fail` would be ACCEPTED, so it must be sent.
+
+    Discarding it instead left the item `claimed` under a lease nothing renews
+    any more -- and `visible_until` is still in the FUTURE, so for the rest of
+    that window `control-01:queue` reads the row as an ATTENDED claim (the
+    measurement's own words for "a lane doing its job") while `_execute` has
+    returned and the loop has gone back to claiming. That inflates
+    `queue.claimed`, which is what `--claim-capacity` is weighed against
+    (monitor_finding #13366), so `evaluate` excuses due ready work as
+    backpressure behind occupancy that does not exist -- the fail-OPEN
+    direction a fail-closed monitor must never have.
+
+    The blip is one the fleet runs itself: `voyn-lease` reaches its authority
+    over `/etc/aicc/lease.env`'s DSN, the credential rotation restarts that
+    tunnel on its own timer, and `writer_lease._renew_loop` gives up on the
+    FIRST failed renewal where the beat loop survives
+    `TOLERATED_FAILED_BEATS`.
+    """
+    store = ScriptedStore([_work({"kind": "slow"})])
+    store.heartbeat_alive = True  # the QUEUE lease is healthy throughout
+
+    def slow(payload, lease_lost, attempt_no=1):
+        # What `writer_lease._renew_loop` does on a failed renewal: set the
+        # event the handler was handed, which cancels the agent.
+        lease_lost.set()
+        return HandlerOutcome(
+            ok=False, reason="writer lease renewal failed", retryable=True
+        )
+
+    daemon = WorkerDaemon(store, {"slow": slow}, WorkerConfig(visibility_seconds=3))
+    _run_until_idle(daemon, store)
+
+    failures = [call for call in store.calls if call[0] == "fail"]
+    assert failures == [("fail", "wat-1", "writer lease renewal failed", True)], (
+        "a decided, writable outcome was discarded; the item stays `claimed` "
+        f"for a whole visibility window: {store.calls}"
+    )
+    # And no heartbeat ever said the queue lease was gone, which is the whole
+    # point -- nothing about THIS lease changed.
+    assert store.heartbeat_alive is True
+
+
+def test_a_cancelled_run_is_never_completed_even_if_the_handler_says_so() -> None:
+    """Fail closed over the handler's own verdict, and only here.
+
+    Reporting a cancelled run is correct; reporting it as SUCCESS is not. A
+    cancelled agent's workspace is whatever a forcibly terminated process left
+    behind, and `queue_complete` is terminal and carries a result. The daemon
+    must not take a handler's word for that write -- `worker.handlers` already
+    returns a retryable failure on this path, and a handler that honours
+    `lease_lost` by returning anyway must not be able to ack the item.
+    """
+    store = ScriptedStore([_work({"kind": "slow"})])
+
+    def slow(payload, lease_lost, attempt_no=1):
+        lease_lost.set()
+        return HandlerOutcome(ok=True, result={"published": "maybe"})
+
+    daemon = WorkerDaemon(store, {"slow": slow}, WorkerConfig(visibility_seconds=3))
+    _run_until_idle(daemon, store)
+
+    assert not any(call[0] == "complete" for call in store.calls), store.calls
+    failures = [call for call in store.calls if call[0] == "fail"]
+    assert len(failures) == 1, store.calls
+    assert failures[0][3] is True, "a cancelled run must come back for retry"
+    assert "after the handler reported success" in failures[0][2]
+
+
+def test_the_narrow_fact_is_recorded_before_the_handler_is_released() -> None:
+    """The ordering the distinction rests on, pinned where it lives.
+
+    `_execute` tells the senders apart by reading a SECOND event beside
+    `cancel`. `cancel` is what the handler waits on, so the moment it is set
+    the handler may return and `_execute` may read that second event -- which
+    must therefore already be true, or a lost QUEUE lease would be mistaken
+    for a lost writer lease and reported anyway, which is the lost update the
+    protocol exists to prevent.
+
+    `WorkerDaemon._stop_the_handler` is that ordering and nothing else, so
+    this asserts it directly rather than racing two threads for it -- and it
+    asserts it for BOTH narrow facts, because there are two of them now
+    (monitor_finding #41318) and only one of them used to exist.
+    """
+    import threading
+
+    for name in ("queue_lease_lost", "lease_unproven"):
+        order: list[str] = []
+        fact = threading.Event()
+
+        class RecordingCancel(threading.Event):
+            def set(self) -> None:
+                # What the handler would see at the instant it is released.
+                order.append(name if fact.is_set() else "cancel")
+                super().set()
+
+        WorkerDaemon._stop_the_handler(fact, RecordingCancel())
+
+        assert order == [name], (
+            f"the handler can be released before the daemon knows that {name} "
+            "is the reason it stopped"
+        )
+        assert fact.is_set()
+
+
+def test_a_lost_queue_lease_still_discards_the_outcome() -> None:
+    """The half that must not change, restated against the new split: when the
+    BEAT LOOP is the one that gives up, the attempt is already somebody else's
+    (or the reaper's) and `_queue_owns` would refuse the write. Nothing is
+    reported -- not even the retryable failure a writer-lease cancellation now
+    gets."""
+    store = ScriptedStore([_work({"kind": "slow"})])
+    store.heartbeat_alive = False  # the first beat discovers the lease is gone
+
+    def slow(payload, lease_lost, attempt_no=1):
+        assert lease_lost.wait(timeout=10), "heartbeat never signalled loss"
+        return HandlerOutcome(
+            ok=False, reason="stopped on a lost lease", retryable=True
+        )
+
+    daemon = WorkerDaemon(store, {"slow": slow}, WorkerConfig(visibility_seconds=3))
+    _run_until_idle(daemon, store)
+
+    assert not any(call[0] == "complete" for call in store.calls), store.calls
+    assert not any(call[0] == "fail" for call in store.calls), store.calls
+    assert not any(call[0] == "fail_lease_wait" for call in store.calls), store.calls
+
+
+# ---------------------------------------------------------------------------
+# VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED: the beat loop's tolerance was a
+# COUNT OF BEATS wearing a clock's clothes.
+#
+# `_heartbeat_loop` gave up on the queue lease when
+# `consecutive_errors * interval >= visibility_seconds`. That product is
+# elapsed time only if a heartbeat that cannot reach the server fails in
+# roughly nothing -- and the failure the tolerance exists for does the
+# opposite. The beat crosses `voyn-aicc-pgtunnel.service`, which the credential
+# rotation restarts on its own timer; a severed forwarded socket BLACK-HOLES
+# the call, and nothing client-side bounds the read (`connect_timeout` bounds
+# connecting, `statement_timeout` is enforced by the server that is no longer
+# reachable). Each failed cycle therefore cost `interval + block` while the
+# counter still demanded `F + 2` of them.
+#
+# The cost of overrunning is the lane executing an item it no longer owns,
+# which is the probe's occupancy lied to from a third direction (after
+# monitor_finding #13366 and #14016): `aicc-queue-reaper.timer` hands the item
+# back, the fleet holds two lanes' worth of work, `work_item` records one
+# claim, `spare_capacity` goes true and `queue_stalled` opens against a fleet
+# with no free lane. `tests/db/test_infra_monitor_queue_snapshot.py` measures
+# that half against a real server; these need none and so run in every gate.
+#
+# They drive the loop through the INJECTED clock rather than waiting the
+# window out, because the property is about the deployed 300s window and a
+# test that has to sleep through it would have to pick a different one.
+# ---------------------------------------------------------------------------
+
+
+class _FakeClock:
+    """A monotonic clock a test advances, and a `beat_stop.wait` that advances
+    it by the beat interval -- so the loop's own pacing moves time exactly as
+    it does in production, and only the blocked call has to be scripted."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def _beat_until_lost(
+    window: int, block: float, beats: int = 40
+) -> tuple[float, list[float]]:
+    """Run the real `_heartbeat_loop` against a heartbeat that hangs for
+    `block` seconds of clock time and then fails, for ever.
+
+    Returns ``(when the queue lease was declared lost, when each beat was
+    attempted)`` on the injected clock. `beats` bounds the run so a loop that
+    never gives up fails as a timeout-free assertion instead of hanging.
+    """
+    import threading
+
+    clock = _FakeClock()
+    attempts: list[float] = []
+    lost_at: list[float] = []
+    lease_unproven = threading.Event()
+    queue_lease_lost = threading.Event()
+    cancel = threading.Event()
+    beat_stop = threading.Event()
+
+    class HangingStore:
+        def heartbeat(self, work):
+            attempts.append(clock.now)
+            if len(attempts) >= beats:
+                beat_stop.set()
+            # The call does not answer; it parks on a dead socket and then
+            # reports the failure it has been sitting on all along.
+            clock.advance(block)
+            raise ConnectionError("tunnel black-holed")
+
+    class _WaitForTheBeat:
+        """`beat_stop.wait(interval)`: real pacing on the fake clock."""
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def wait(self, seconds: float) -> bool:
+            if beat_stop.is_set():
+                return True
+            clock.advance(seconds)
+            return False
+
+        def is_set(self) -> bool:
+            return beat_stop.is_set()
+
+    daemon = WorkerDaemon(
+        HangingStore(),
+        {},
+        WorkerConfig(visibility_seconds=window),
+        monotonic=clock,
+    )
+    original_set = cancel.set
+
+    def record_and_set() -> None:
+        lost_at.append(clock.now)
+        original_set()
+
+    cancel.set = record_and_set  # type: ignore[method-assign]
+    # The deadline the attempt was granted, on the same injected clock. It is
+    # `_execute`'s to own in production (both the beat thread and the deadline
+    # watch read it); here the beat loop is driven on its own, so the test
+    # constructs it and the loop is the only reader.
+    deadline = _LeaseDeadline(window, clock, clock())
+    daemon._heartbeat_loop(
+        _work({"kind": "slow"}),
+        deadline,
+        lease_unproven,
+        queue_lease_lost,
+        cancel,
+        _WaitForTheBeat(),
+    )
+    assert lease_unproven.is_set(), (
+        f"the loop never gave the lease up in {len(attempts)} beats "
+        f"across {clock.now}s of a {window}s lease: {attempts}"
+    )
+    # AND IT IS THE INFERRED FACT, NOT THE SERVER'S (monitor_finding #41318).
+    # Every beat here failed to ANSWER; none of them was refused, so nothing
+    # has established that the attempt is no longer ours and the outcome must
+    # still be offered to the database rather than discarded.
+    assert not queue_lease_lost.is_set(), (
+        "a clock the lane reads on its own was recorded as the server having "
+        "refused this attempt"
+    )
+    assert lost_at, "the handler was never cancelled"
+    return lost_at[0], attempts
+
+
+def test_the_lease_is_given_up_within_its_window_however_slowly_a_beat_fails() -> None:
+    """THE REGRESSION. The loop must stop the handler within one visibility
+    window of the last beat the server accepted -- no matter how long each
+    failing beat takes to admit it.
+
+    A fast failure was always handled: four cycles of `interval` are exactly
+    one window at `beat_interval_seconds`. The black-holed call was not, and
+    it is the one the tolerance is for.
+
+    THIS IS THE BEAT LOOP ON ITS OWN, and so is the weaker of the two bounds
+    the attempt actually has. `_execute` runs `_lease_deadline_loop` beside
+    it over the same `_LeaseDeadline`, which removes the `+ block` below
+    entirely (monitor_finding #41237); that is measured at the bottom of this
+    file, by the tests that run the pair. What is pinned here is the property
+    of this function alone -- that it fires on the CLOCK rather than on a
+    count of beats -- so a future change to either thread still has the
+    other's statement to fail against.
+    """
+    window = WorkerConfig().visibility_seconds
+
+    for block in (0.0, 1.0, 10.0, 120.0, 900.0):
+        lost_at, attempts = _beat_until_lost(window, block)
+        # ONE WINDOW PLUS AT MOST THE ONE CALL THE LOOP WAS PARKED IN, which
+        # is the whole of what THIS THREAD can promise: while it is inside
+        # `store.heartbeat` it cannot act. The attempt's own bound is one
+        # window flat, and it is held by the thread that holds no connection;
+        # see `test_a_beat_parked_on_a_dead_socket_cannot_outlive_the_lease`.
+        # The point here is that the bound is the WINDOW plus one call instead
+        # of `TOLERATED_FAILED_BEATS + 2` of them.
+        assert lost_at <= window + block, (
+            f"a beat that hangs {block}s let the handler run "
+            f"{lost_at - window:.0f}s past a {window}s lease, more than the "
+            f"one call it was parked in (beats attempted at {attempts})"
+        )
+        # Not early either: an attempt taken away with time left on its lease
+        # costs the whole run (migration 0041), so the loop may only give up
+        # once the lapse is PROVEN -- which is at the window, not before it.
+        assert lost_at >= window, (
+            f"a beat that hangs {block}s gave the lease up at {lost_at}s, "
+            f"ahead of its {window}s deadline"
+        )
+
+
+def test_counting_beats_is_not_measuring_the_window() -> None:
+    """The defect stated as the arithmetic it was, so the fix cannot quietly
+    revert to it.
+
+    `consecutive_errors * interval >= visibility_seconds` needs
+    `TOLERATED_FAILED_BEATS + 2` failures at the derived cadence. Each costs
+    `interval` PLUS however long the call sat there, so the old test fired at
+    `(F + 2) * (interval + block)` -- four times the window at the 120s block
+    `lease_client`'s own subprocess timeout allows, and the overrun grows
+    without bound as the block does.
+    """
+    from command_center.worker.daemon import (
+        TOLERATED_FAILED_BEATS,
+        beat_interval_seconds,
+    )
+
+    window = WorkerConfig().visibility_seconds
+    interval = beat_interval_seconds(window)
+    required_failures = TOLERATED_FAILED_BEATS + 2
+
+    for block in (10.0, 120.0):
+        counted = required_failures * (interval + block)
+        assert counted > window, (
+            "this test no longer describes the old defect: counting "
+            f"{required_failures} failures at a {block}s block gives "
+            f"{counted}s, which is inside the {window}s window"
+        )
+        measured, _attempts = _beat_until_lost(window, block)
+        assert measured < counted, (
+            f"the loop still fires on the beat COUNT ({counted}s) rather than "
+            f"on the window ({window}s): it gave up at {measured}s"
+        )
+
+
+def test_a_beat_the_server_accepted_moves_the_deadline() -> None:
+    """The other half: the window is measured from the last beat the SERVER
+    accepted, so a fleet whose database comes back keeps its attempt.
+
+    One failure, one success, then silence -- the successful beat has to
+    re-date the deadline, or the next failure would be judged against a window
+    that started before it and the lease would be given up with most of it
+    left.
+    """
+    import threading
+
+    from command_center.worker.daemon import beat_interval_seconds
+
+    window = 300
+    clock = _FakeClock()
+    interval = beat_interval_seconds(window)
+    answers = [None, True]  # None raises; True is `queue_heartbeat` ok
+    lost_at: list[float] = []
+
+    class FlakyStore:
+        def heartbeat(self, work):
+            if answers:
+                answer = answers.pop(0)
+                if answer is None:
+                    raise ConnectionError("one blip")
+                return answer
+            raise ConnectionError("gone for good")
+
+    class _WaitForTheBeat:
+        def wait(self, seconds: float) -> bool:
+            clock.advance(seconds)
+            return False
+
+        def is_set(self) -> bool:
+            return False
+
+    cancel = threading.Event()
+    original_set = cancel.set
+
+    def record_and_set() -> None:
+        lost_at.append(clock.now)
+        original_set()
+
+    cancel.set = record_and_set  # type: ignore[method-assign]
+    daemon = WorkerDaemon(
+        FlakyStore(), {}, WorkerConfig(visibility_seconds=window), monotonic=clock
+    )
+    daemon._heartbeat_loop(
+        _work({"kind": "slow"}),
+        _LeaseDeadline(window, clock, clock()),
+        threading.Event(),
+        threading.Event(),
+        cancel,
+        _WaitForTheBeat(),
+    )
+
+    # The successful beat landed at 2 * interval and renewed the lease there,
+    # so the lapse is proven only a whole window after THAT -- not a window
+    # after the claim.
+    accepted_at = 2 * interval
+    assert lost_at and lost_at[0] >= accepted_at + window, (
+        f"the lease was given up at {lost_at}s; the beat the server accepted "
+        f"at {accepted_at}s renews it to {accepted_at + window}s"
+    )
+
+
+# ---------------------------------------------------------------------------
+# VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED (monitor_finding #41237).
+#
+# A DEADLINE IS ONLY AS GOOD AS THE THREAD THAT EVALUATES IT. #41136 replaced
+# the beat COUNT with a clock, and the clock is right; what it could not do is
+# be READ at the deadline, because the step before the top of the beat loop is
+# `store.heartbeat`. The failure the whole tolerance exists for is a beat that
+# never comes back -- the credential rotation restarts
+# `voyn-aicc-pgtunnel.service` on its own timer, a severed forwarded socket
+# BLACK-HOLES the call, `connect_timeout` bounds only connecting and
+# `statement_timeout` is enforced by a server that is no longer reachable --
+# so the one event the deadline is for was also the one event that postponed
+# it. The lapse arrived at `window + block`, with `block` unbounded, and the
+# previous fix stated that residual as its own ("one window plus the one call
+# it was parked in") and deferred it to a transport change.
+#
+# It is not a transport problem. The lapse is a statement about a CLOCK, and a
+# clock can be read somewhere the socket cannot reach: `_lease_deadline_loop`
+# runs beside the beat, shares its `_LeaseDeadline`, and touches no store.
+#
+# Every second of the overrun is a lane executing an item
+# `aicc-queue-reaper.timer` has already handed back: the fleet holds two
+# lanes' worth of work while `work_item` records one claim, `spare_capacity`
+# goes true against a fleet with no free lane, and `control-01:queue` opens
+# `queue_stalled` with no exit any fleet action reaches.
+# `tests/db/test_infra_monitor_queue_snapshot.py` measures that half against a
+# real server; these need none and so run in every gate.
+# ---------------------------------------------------------------------------
+
+
+def _execute_against_a_black_hole(
+    window: int, *, notifications: list[str] | None = None
+) -> tuple:
+    """Run the real `_execute` over one claim whose heartbeat parks on a dead
+    socket and stays there.
+
+    Returns ``(when the handler was released, when each beat was sent, the
+    event that finally lets the parked call answer, the store, the thread
+    `_execute` is running on)``. The caller must set the event and join the
+    thread.
+    """
+    import threading
+
+    started = time.monotonic()
+    released = threading.Event()
+    beats: list[float] = []
+    stopped_at: list[float] = []
+    handler_done = threading.Event()
+
+    class BlackHoledStore:
+        def __init__(self) -> None:
+            self.calls: list[tuple] = []
+
+        def heartbeat(self, work):
+            beats.append(time.monotonic() - started)
+            # Nothing client-side bounds this read, so the call is still
+            # outstanding long after the lease it was renewing has died.
+            released.wait(30)
+            raise ConnectionError("tunnel black-holed")
+
+        def complete(self, work, result):
+            self.calls.append(("complete", work.attempt_id, result))
+            return True
+
+        def fail(self, work, *, reason, retryable=True):
+            self.calls.append(("fail", work.attempt_id, reason, retryable))
+            return True
+
+        def fail_lease_wait(self, work, *, reason, max_lease_waits=20):
+            self.calls.append(("fail_lease_wait", work.attempt_id, reason))
+            return True
+
+    def slow(payload, lease_lost, attempt_no=1):
+        lease_lost.wait(window * 10)
+        stopped_at.append(time.monotonic() - started)
+        handler_done.set()
+        return HandlerOutcome(ok=True, result={"ok": True})
+
+    store = BlackHoledStore()
+    daemon = WorkerDaemon(
+        store, {"slow": slow}, WorkerConfig(visibility_seconds=window)
+    )
+    if notifications is not None:
+        daemon._notify = notifications.append  # type: ignore[method-assign]
+    run = threading.Thread(
+        target=daemon._execute,
+        args=(_work({"kind": "slow"}), time.monotonic()),
+        daemon=True,
+    )
+    run.start()
+    assert handler_done.wait(window * 6), (
+        f"the handler was never stopped at all; beats sent at {beats}"
+    )
+    return stopped_at[0], beats, released, store, run
+
+
+def test_a_beat_parked_on_a_dead_socket_cannot_outlive_the_lease() -> None:
+    """THE REGRESSION. The handler stops within the window the server
+    granted, measured while the beat thread is STILL inside the call that
+    stopped reaching the server.
+
+    Under the previous rule this run cancels when the parked call finally
+    answers -- a bound set by the fault rather than by the lease. Here the
+    call never answers at all inside the test, so any dependence on it shows
+    up as a timeout rather than as a tolerable overrun.
+    """
+    window = 2
+    stopped_at, beats, released, store, run = _execute_against_a_black_hole(window)
+    try:
+        # THE BEAT IS STILL PARKED. `released` is what lets that call return
+        # and the test has not set it, so whatever declared the lapse, it was
+        # not the beat loop coming back from `store.heartbeat`.
+        assert beats, "no beat was ever sent, so nothing was parked"
+        assert not released.is_set()
+        assert stopped_at <= window + 1.0, (
+            f"the lane ran {stopped_at - window:.1f}s past a {window}s lease "
+            f"while a beat sat in a black hole that has not answered yet "
+            f"(beats sent at {beats})"
+        )
+        # Not early either: an attempt taken away with time left on its lease
+        # costs the whole run (migration 0041).
+        assert stopped_at >= window - 0.05, (
+            f"the lease was given up at {stopped_at:.2f}s, ahead of its "
+            f"{window}s deadline"
+        )
+    finally:
+        released.set()
+        run.join(timeout=15)
+    # AND THE OUTCOME IS OFFERED TO THE SERVER, NOT DISCARDED
+    # (monitor_finding #41318). This assertion used to be `store.calls == []`,
+    # which is the defect: nothing here established that the attempt had been
+    # taken away. Every beat failed to ANSWER, and an unanswered beat is not a
+    # refused beat -- `store.heartbeat` is one autocommit statement, so a
+    # black-holed call may have reached the server, run and COMMITTED with
+    # only the reply lost, which leaves the server's lease up to one beat
+    # interval beyond this deadline. `queue_fail` is ACCEPTED inside that gap,
+    # and `_queue_owns` is the only thing that can refuse it.
+    #
+    # Never `queue_complete`, though the handler returned `ok=True`: a
+    # cancelled run's workspace is whatever a terminated agent left behind.
+    assert not any(call[0] == "complete" for call in store.calls), store.calls
+    failures = [call for call in store.calls if call[0] == "fail"]
+    assert len(failures) == 1, (
+        "a decided, writable outcome was discarded on a deadline the server "
+        f"never confirmed; the item stays `claimed`: {store.calls}"
+    )
+    assert failures[0][3] is True, "a cancelled run must come back for retry"
+    assert "could not prove was live" in failures[0][2], failures
+
+
+def test_the_lapse_is_bounded_by_the_lease_and_not_by_the_block() -> None:
+    """The defect stated as the arithmetic it was, so the fix cannot quietly
+    revert to it.
+
+    The old bound was `window + block`: the deadline was read at the top of
+    the beat loop, and the step before it was the blocked call. `block` has no
+    client-side bound -- `lease_client.run_lease` already allows a hung
+    subprocess 120s against the fleet's 300s window, and a black-holed socket
+    read is not bounded at all -- so the overrun grew with the fault rather
+    than with anything about the lease.
+
+    So the BLOCK is held fixed here, far longer than either lease, and the
+    WINDOW is varied. Under the old bound both runs end when the same parked
+    call answers, which is the same instant for both and tracks neither
+    window; under this one each ends at its own lease.
+    """
+    windows = (2, 3)
+    measured = []
+    for window in windows:
+        stopped_at, beats, released, _store, run = _execute_against_a_black_hole(
+            window
+        )
+        released.set()
+        run.join(timeout=15)
+        measured.append(stopped_at)
+        assert beats, f"no beat was sent at a {window}s window"
+    for window, stopped_at in zip(windows, measured, strict=True):
+        assert abs(stopped_at - window) <= 1.0, (
+            f"a {window}s lease was given up at {stopped_at:.2f}s; the lapse "
+            f"tracks the WINDOW, not the blocked call (measured {measured} "
+            f"for windows {windows})"
+        )
+
+
+def test_the_deadline_watch_does_not_feed_the_watchdog() -> None:
+    """It watches a clock and nothing else, and a thread that pings while
+    doing nothing would retire the wedge detector it pings into.
+
+    `aicc-worker.service` sizes `WatchdogSec` so that a handler that hangs AND
+    takes the beat thread with it misses ping after ping and is restarted. The
+    deadline watch is alive for exactly that run, so if it fed the watchdog it
+    would answer "is this process still useful" with "yes" for a process that
+    has stopped being so. Pings stay where they prove something: the claim
+    loop between claims, and the beat thread around a call that actually
+    reached the server.
+    """
+    window = 2
+    notifications: list[str] = []
+    _stopped_at, beats, released, _store, run = _execute_against_a_black_hole(
+        window, notifications=notifications
+    )
+    released.set()
+    run.join(timeout=15)
+    pings = [note for note in notifications if "WATCHDOG=1" in note]
+    assert len(pings) == len(beats), (
+        f"{len(pings)} watchdog pings for {len(beats)} beats: something other "
+        "than the beat thread is feeding the watchdog during a run whose "
+        "database has stopped answering"
+    )
+
+
+# ---------------------------------------------------------------------------
+# VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED (monitor_finding #41318).
+#
+# AN UNANSWERED BEAT IS NOT A REFUSED BEAT, and the daemon treated it as one.
+#
+# `_LeaseDeadline` is dated from the last beat the LANE SAW accepted, which is
+# the only thing a client can honestly date it from. `_execute` then used it
+# as the answer to a different question -- "has the database taken this
+# attempt away" -- and discarded the outcome on it. But `store.heartbeat` is
+# one autocommit `SELECT queue_heartbeat(...)`, so a call black-holed on a
+# severed `voyn-aicc-pgtunnel.service` socket may well have REACHED the
+# server, RUN and COMMITTED, with only the reply lost: `connect_timeout`
+# bounds connecting and `statement_timeout` is enforced by a server that is no
+# longer reachable, so nothing says otherwise. The server's `visible_until` is
+# then up to one beat interval past this lane's deadline (75s against the
+# deployed 300s window, `beat_interval_seconds` = V/4), and inside that gap
+# the attempt IS still ours by the only authority that decides -- `_queue_owns`
+# -- so `queue_fail` is ACCEPTED.
+#
+# Discarding it instead is the phantom attended claim #14016 catalogued,
+# reached from the lane's own inference rather than from a shared cancellation
+# event: the item stays `claimed` with `visible_until` in the FUTURE, which is
+# the probe's own definition of a lane doing its job, while `_execute` has
+# returned and the loop has gone back to claiming. `queue.claimed` is what
+# `--claim-capacity` is weighed against (#13366), so `spare_capacity` goes
+# false and `evaluate` excuses due ready work as backpressure behind occupancy
+# that does not exist -- the fail-OPEN direction a fail-closed monitor must
+# never have. The rest is 0041's catalogue: the run is lost although its
+# outcome was decided and WRITABLE, the handler's side effects re-run under
+# the next delivery, and `queue_claim` has already charged `attempt_count`, so
+# on the default `max_attempts` of 3 the third tunnel restart dead-letters
+# healthy work as `visibility_timeout_exhausted`.
+#
+# So the clock stops the WORK (fail-closed, unchanged) and the SERVER decides
+# the WRITE. These tests pin the two halves against each other, because the
+# fix is the distinction and not either branch on its own.
+# ---------------------------------------------------------------------------
+
+
+def _execute_one(store, handler, window: int = 3) -> None:
+    """Run the real `_execute` over one claim, start to finish."""
+    daemon = WorkerDaemon(
+        store, {"slow": handler}, WorkerConfig(visibility_seconds=window)
+    )
+    daemon._execute(_work({"kind": "slow"}), time.monotonic())
+
+
+def test_an_unanswered_beat_is_not_a_refused_beat() -> None:
+    """THE REGRESSION, as the pair of cases the one event used to conflate.
+
+    Same window, same handler, same cancellation -- the only difference is
+    WHO said the attempt was over. A heartbeat that never answers says nothing
+    about ownership, so the outcome has to be offered to the database; a
+    heartbeat the server REFUSED is `_queue_owns` itself answering, so it must
+    not be.
+    """
+    reported: dict[str, list] = {}
+
+    def slow(payload, lease_lost, attempt_no=1):
+        assert lease_lost.wait(timeout=30), "the handler was never stopped"
+        return HandlerOutcome(ok=False, reason="stopped mid-run", retryable=True)
+
+    # (a) THE BEAT NEVER ANSWERS. It raises here rather than parking, so the
+    # case is the ORDINARY unanswered beat -- a lapse admitted on the clock
+    # with no refusal anywhere in it -- and the test needs no black hole to
+    # make the point.
+    silent = ScriptedStore([])
+
+    def raising_heartbeat(work):
+        silent.calls.append(("heartbeat", work.attempt_id))
+        raise ConnectionError("tunnel black-holed")
+
+    silent.heartbeat = raising_heartbeat  # type: ignore[method-assign]
+    _execute_one(silent, slow)
+    reported["unanswered"] = [c for c in silent.calls if c[0] != "heartbeat"]
+
+    # (b) THE SERVER REFUSED THE BEAT. `queue_heartbeat` returns ok=false only
+    # through `_queue_owns`, so this is `attempt_superseded`/`claim_expired`.
+    refused = ScriptedStore([])
+    refused.heartbeat_alive = False
+    _execute_one(refused, slow)
+    reported["refused"] = [c for c in refused.calls if c[0] != "heartbeat"]
+
+    assert reported["unanswered"] == [
+        ("fail", "wat-1", "stopped mid-run", True)
+    ], (
+        "a decided, writable outcome was discarded on a deadline no refusal "
+        f"supports: {reported['unanswered']}"
+    )
+    assert reported["refused"] == [], (
+        "the server said this attempt is not ours and the daemon wrote "
+        f"anyway: {reported['refused']}"
+    )
+
+
+def test_a_cancelled_run_is_never_terminal_however_the_handler_reported_it() -> None:
+    """Fail closed over BOTH terminal writes, not just `queue_complete`.
+
+    A cancelled run's workspace is whatever a terminated agent left behind, so
+    the daemon may take neither terminal verdict from it: not a completion,
+    and not a NON-RETRYABLE failure, which dead-letters the item on a verdict
+    about work that never finished. The second half matters now that the lapse
+    path reaches this branch (monitor_finding #41318) -- a handler deep in its
+    own refusal logic can return `retryable=False` for a reason that has
+    nothing to do with the lease that was just taken away.
+    """
+    for verdict in (
+        HandlerOutcome(ok=True, result={"published": "maybe"}),
+        HandlerOutcome(ok=False, reason="payload refused", retryable=False),
+    ):
+        store = ScriptedStore([])
+
+        def heartbeat_that_never_answers(work, _store=store):
+            _store.calls.append(("heartbeat", work.attempt_id))
+            raise ConnectionError("tunnel black-holed")
+
+        store.heartbeat = heartbeat_that_never_answers  # type: ignore[method-assign]
+
+        def slow(payload, lease_lost, attempt_no=1, _verdict=verdict):
+            assert lease_lost.wait(timeout=30), "the handler was never stopped"
+            return _verdict
+
+        _execute_one(store, slow)
+
+        assert not any(c[0] == "complete" for c in store.calls), store.calls
+        failures = [c for c in store.calls if c[0] == "fail"]
+        assert len(failures) == 1, store.calls
+        assert failures[0][3] is True, (
+            f"a run cancelled by a lapse was reported as terminal ({verdict}); "
+            "the item dead-letters on a verdict about work that never finished"
+        )
+        assert "could not prove was live" in failures[0][2], failures
+
+
+def test_the_deadline_watch_cannot_say_what_the_server_thinks() -> None:
+    """The signature is the guarantee, so it is asserted as one.
+
+    `_lease_deadline_loop` holds no connection: it cannot have heard from the
+    server, so it must not be able to record the server's verdict. Handing it
+    `queue_lease_lost` was how a clock came to discard a writable outcome.
+    """
+    import inspect
+
+    parameters = list(
+        inspect.signature(WorkerDaemon._lease_deadline_loop).parameters
+    )
+    assert "lease_unproven" in parameters, parameters
+    assert "queue_lease_lost" not in parameters, (
+        "the thread that holds no connection can once again record the "
+        f"server's verdict: {parameters}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED (monitor_finding #41949).
+#
+# THE CLOCK STARTS WHEN THE LANE ASKS, NOT WHEN THE SERVER ANSWERS.
+#
+# #41136 replaced the beat COUNT with a clock, #41237 gave that clock a reader
+# the database cannot park, and #41318 separated "this lane cannot prove the
+# lease" from "the server refused it". All three left the same half untouched:
+# WHICH INSTANT the window is measured from. `queue_claim`/`queue_heartbeat`
+# grant `visible_until` from the server's own `now()`, somewhere inside a call
+# the lane is still waiting on, so with the send at `S`, the grant at `G` and
+# the answer at `A` the lane knows only `S <= G <= A`:
+#
+#     dated from A:   lane deadline = A + V  >=  G + V = the server's
+#     dated from S:   lane deadline = S + V  <=  G + V = the server's
+#
+# The daemon dated from `A`, and the comment that chose it argued -- correctly
+# -- that this makes `remaining <= 0` PROVE a lapse. But the test the handler
+# RUNS UNDER is `remaining > 0`, and from `A` that proves nothing: the lane
+# keeps executing for `A - G` past a lease the server has already let go.
+# `A - G` is the reply's own delay, nothing on this side bounds it, and it is
+# largest in exactly the fault this machinery exists for -- a
+# `voyn-aicc-pgtunnel.service` restart whose request path still works and
+# whose reply path does not (`lease_client.run_lease` already allows a hung
+# subprocess 120s against the fleet's 300s window).
+#
+# Every second of that overrun is the overrun #41237 catalogues, reached by a
+# different route: `aicc-queue-reaper.timer` hands the item back inside it, so
+# the fleet holds two lanes' worth of work against one recorded claim,
+# `spare_capacity` goes true against a fleet with no free lane, and
+# `control-01:queue` opens a `queue_stalled` no fleet action reaches.
+#
+# Dating from `S` costs at most one round trip of lease per beat, against a
+# cadence sized with a whole beat interval of margin on purpose, and it is
+# affordable only because of #41318: a lapse no longer discards the outcome,
+# it offers it, and `_queue_owns` decides.
+#
+# These tests need no server and so run in every gate;
+# `tests/db/test_infra_monitor_queue_snapshot.py` measures the same two
+# instants against the real `queue_claim`/`queue_heartbeat`.
+# ---------------------------------------------------------------------------
+
+
+def test_a_beat_whose_reply_is_held_is_dated_from_when_it_was_sent() -> None:
+    """THE REGRESSION. One beat that REACHES the server and is ACCEPTED, whose
+    reply is then held on the way back, must renew the lane's deadline to the
+    instant it was SENT -- not to the instant the answer finally arrived.
+
+    The arithmetic is exact because the clock is injected: the beat is sent at
+    one interval, the server grants there, and the lane's deadline is one
+    window after that. Dating from the answer puts it a whole `hold` later,
+    which is the defect, so the two numbers cannot be confused for scheduling
+    noise.
+    """
+    import threading
+
+    from command_center.worker.daemon import beat_interval_seconds
+
+    window = 300
+    interval = beat_interval_seconds(window)
+    # The 120s `lease_client.run_lease` already allows a hung subprocess,
+    # which is this fleet's own measure of how long a reply can be held by a
+    # tunnel that is half gone.
+    hold = 120.0
+    clock = _FakeClock()
+    sent: list[float] = []
+    lost_at: list[float] = []
+
+    class HeldReplyStore:
+        def heartbeat(self, work):
+            sent.append(clock.now)
+            if len(sent) > 1:
+                # Nothing renews again: the first beat's answer is the last
+                # one this lane ever sees, which is what leaves the deadline
+                # under test as the one the lapse is measured against.
+                raise ConnectionError("the reply path is gone for good")
+            # `queue_heartbeat` runs and COMMITS here -- the grant is at or
+            # after the send -- and then the reply is held on the way back.
+            clock.advance(hold)
+            return True
+
+    class _WaitForTheBeat:
+        """`beat_stop.wait(interval)`: real pacing on the fake clock."""
+
+        def wait(self, seconds: float) -> bool:
+            clock.advance(seconds)
+            return False
+
+        def is_set(self) -> bool:
+            return False
+
+    cancel = threading.Event()
+    original_set = cancel.set
+
+    def record_and_set() -> None:
+        lost_at.append(clock.now)
+        original_set()
+
+    cancel.set = record_and_set  # type: ignore[method-assign]
+    daemon = WorkerDaemon(
+        HeldReplyStore(), {}, WorkerConfig(visibility_seconds=window), monotonic=clock
+    )
+    daemon._heartbeat_loop(
+        _work({"kind": "slow"}),
+        _LeaseDeadline(window, clock, clock()),
+        threading.Event(),
+        threading.Event(),
+        cancel,
+        _WaitForTheBeat(),
+    )
+
+    assert sent, "no beat was ever sent, so nothing was accepted or held"
+    assert sent[0] == interval, f"the accepted beat went out at {sent}"
+    assert lost_at, "the loop never gave the lease up"
+    # THE SERVER'S OWN DEADLINE, as close as the lane can know it: the grant
+    # is at or after this send, so a window from the send is at or before the
+    # window the server granted.
+    assert lost_at[0] == sent[0] + window, (
+        f"the lease was given up at {lost_at[0]}s; a beat sent at {sent[0]}s "
+        f"and accepted there is good until {sent[0] + window}s"
+    )
+    # The defect stated as the arithmetic it was, so the fix cannot quietly
+    # revert to it: dating from the answer adds the whole held reply, and the
+    # overrun grows with the fault rather than with anything about the lease.
+    assert lost_at[0] < sent[0] + hold + window, (
+        f"the deadline is still dated from the ANSWER: {lost_at[0]}s is the "
+        f"send ({sent[0]}s) plus the {hold}s held reply plus the {window}s "
+        "window, every second of which is a lane executing an item whose "
+        "lease the server has let go"
+    )
+
+
+def test_the_lease_clock_starts_when_the_claim_was_asked_for() -> None:
+    """The other instant, through the real `run_forever` -> `_execute` path:
+    the attempt's clock starts before `store.claim`, so a claim whose REPLY is
+    held does not hand the lane lease the server never granted.
+
+    The beat path above is the one that repeats; this one is the one that is
+    never renewed if the handler outlives its first interval, and it is the
+    plumbing half of the fix -- `run_forever` captures the instant, `_execute`
+    takes it as an argument, and nothing on the way may re-read the clock.
+    """
+    window = 2
+    # Held long enough that the two datings are further apart than any
+    # scheduling noise, and shorter than the window so the handler really
+    # starts before the lapse (the claim's own reply is unbounded in the
+    # fault, so this is the mild version of it).
+    hold = 1.5
+    sent: list[float] = []
+    stopped_at: list[float] = []
+
+    class HeldClaimStore(ScriptedStore):
+        def claim(self, queue, *, visibility_seconds):
+            # The lane's own capture is just BEFORE this line; the server's
+            # grant is inside the call. Both are at or before the answer.
+            sent.append(time.monotonic())
+            answer = super().claim(queue, visibility_seconds=visibility_seconds)
+            if isinstance(answer, ClaimedWork):
+                # `queue_claim` committed the claim and dated the window from
+                # its own `now()`; only the reply is held.
+                time.sleep(hold)
+            return answer
+
+        def heartbeat(self, work):
+            # The same half-severed tunnel: nothing renews, so the attempt
+            # lives exactly as long as the window it was granted.
+            raise ConnectionError("the reply path is gone")
+
+    store = HeldClaimStore([_work({"kind": "slow"})])
+
+    def slow(payload, lease_lost, attempt_no=1):
+        assert lease_lost.wait(window * 10), "the handler was never stopped"
+        stopped_at.append(time.monotonic())
+        return HandlerOutcome(ok=True, result={"ok": True})
+
+    daemon = WorkerDaemon(
+        store, {"slow": slow}, WorkerConfig(visibility_seconds=window)
+    )
+    _run_until_idle(daemon, store)
+
+    assert stopped_at, "the handler never ran"
+    ran_for = stopped_at[0] - sent[0]
+    assert ran_for <= window + 0.5, (
+        f"the lane ran {ran_for - window:.2f}s past a {window}s lease because "
+        f"its clock started when a claim held {hold}s ANSWERED instead of "
+        "when it was asked for"
+    )
+    # Not early either: dating from the send gives up at most one round trip
+    # of lease, and an attempt taken away with time left on it costs the whole
+    # run (migration 0041).
+    assert ran_for >= window - 0.25, (
+        f"the attempt was stopped {window - ran_for:.2f}s inside its own "
+        f"{window}s window"
+    )
+
+
+def test_the_lease_clock_cannot_be_dated_from_the_instant_it_is_read() -> None:
+    """The signature is the guarantee, so it is asserted as one.
+
+    `_LeaseDeadline` is constructed AFTER `queue_claim` has answered and
+    `renew` is called AFTER the beat has, so every instant available at either
+    call site is already past the grant. A default would not be a convenience:
+    it would silently restore the skew this finding is about, at whichever
+    call site forgot to pass the instant.
+    """
+    import inspect
+
+    empty = inspect.Parameter.empty
+    construct = inspect.signature(_LeaseDeadline.__init__).parameters
+    assert construct["requested_at"].default is empty, (
+        "the lease clock can once again default to the instant it is "
+        "constructed, which is already past the server's grant"
+    )
+    renew = inspect.signature(_LeaseDeadline.renew).parameters
+    assert renew["sent_at"].default is empty, (
+        "a renewal can once again default to the instant it is recorded, "
+        "which is the answer's and not the send's"
+    )
+    execute = inspect.signature(WorkerDaemon._execute).parameters
+    assert "claim_sent_at" in execute and execute["claim_sent_at"].default is empty, (
+        "`_execute` no longer requires the instant its caller asked for the "
+        f"claim: {list(execute)}"
+    )
+
+
+def test_a_no_fault_outcome_that_forbids_retry_takes_the_ordinary_path() -> None:
+    """`no_fault` implies `retryable` -- the refund path has no
+    non-retryable branch, so it cannot honour "never deliver this again".
+    A contradictory outcome must therefore fall back to `fail`, which can,
+    rather than being silently requeued by the refund path."""
+    store = ScriptedStore([_work({"kind": "contradiction"})])
+
+    def contradictory(payload, lease_lost, attempt_no=1):
+        return HandlerOutcome(
+            ok=False, reason="cannot happen", retryable=False, lease_wait=True
+        )
+
+    daemon = WorkerDaemon(
+        store, {"contradiction": contradictory}, WorkerConfig(visibility_seconds=3)
+    )
+    _run_until_idle(daemon, store)
+
+    assert ("fail", "wat-1", "cannot happen", False) in store.calls
+    assert not any(c[0] == "fail_lease_wait" for c in store.calls)
+
+
+def test_an_infra_wait_that_forbids_retry_takes_the_ordinary_path() -> None:
+    """The same guard on the substrate wait class (#982 merged onto main's
+    lease_wait / infra_wait split): `retryable=False` is a final verdict and
+    must reach `fail`, never the `fail_infra_wait` refund."""
+    store = ScriptedStore([_work({"kind": "contradiction"})])
+
+    def contradictory(payload, lease_lost, attempt_no=1):
+        return HandlerOutcome(
+            ok=False, reason="cannot happen", retryable=False, infra_wait=True
+        )
+
+    daemon = WorkerDaemon(
+        store, {"contradiction": contradictory}, WorkerConfig(visibility_seconds=3)
+    )
+    _run_until_idle(daemon, store)
+
+    assert ("fail", "wat-1", "cannot happen", False) in store.calls
+    assert not any(c[0] == "fail_infra_wait" for c in store.calls)
+
+
+def test_no_fault_is_the_union_of_the_two_wait_classes() -> None:
+    assert HandlerOutcome(ok=False, lease_wait=True).no_fault is True
+    assert HandlerOutcome(ok=False, infra_wait=True).no_fault is True
+    assert HandlerOutcome(ok=False).no_fault is False
+
+
+# -- VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH ----------------------------
+
+
+class QueueModel:
+    """A store that keeps the queue's ATTEMPT ACCOUNTING, not just a script.
+
+    Deliberately narrow: it mirrors only the arithmetic rules the dead-letter
+    growth turns on, each already proven against real PostgreSQL in
+    tests/db/test_queue_claim.py --
+
+    * ``queue_claim`` advances ``attempt_count`` when it hands the delivery
+      out (migration 0002);
+    * ``queue_fail`` dead-letters when the report is non-retryable *or*
+      ``attempt_count >= max_attempts`` (0002), and its requeue clears the
+      wait budget the item was carrying (0028);
+    * ``queue_fail_lease_wait`` refunds that one increment and counts the
+      refusal against its own bounded ``lease_wait_count`` instead (0022);
+    * exhausting THAT budget dead-letters only while the fleet is serving
+      other items -- ``fleet_is_serving`` here, `_queue_fleet_is_serving`
+      there (0028).
+
+    Everything else about the protocol -- locking, tokens, audit -- is out of
+    scope here; what this fake exists to show is which of those two exits the
+    daemon takes, and what the item's state is after N deliveries.
+    """
+
+    def __init__(
+        self,
+        payload: dict,
+        *,
+        max_attempts: int,
+        max_lease_waits: int = 20,
+        delivery_cap: int = 5,
+        fleet_is_serving: bool = True,
+    ):
+        self.payload = payload
+        self.max_attempts = max_attempts
+        self.max_lease_waits = max_lease_waits
+        # How many times the fleet is willing to redeliver before the test
+        # stops watching; the loop ends on `no_work` either way, so an item
+        # that dead-letters earlier simply never reaches this.
+        self.delivery_cap = delivery_cap
+        # Whether the queue can show a delivery to some OTHER item that got
+        # past the fleet recently. False is a fleet-wide outage: every lane
+        # is refusing everything, so no refusal is evidence about this item.
+        self.fleet_is_serving = fleet_is_serving
+        self.attempt_count = 0
+        self.lease_wait_count = 0
+        self.state = "ready"
+        self.dead_reason: str | None = None
+        self.deliveries = 0
+
+    def claim(self, queue, *, visibility_seconds):
+        if self.state != "ready" or self.deliveries >= self.delivery_cap:
+            return QueueRefusal(reason="no_work")
+        self.attempt_count += 1
+        self.deliveries += 1
+        self.state = "claimed"
+        return _work(self.payload, attempt_id=f"wat-{self.attempt_count}")
+
+    def heartbeat(self, work):
+        return True
+
+    def complete(self, work, result):
+        self.state = "succeeded"
+        return True
+
+    def fail(self, work, *, reason, retryable):
+        if not retryable or self.attempt_count >= self.max_attempts:
+            self.state = "dead"
+            self.dead_reason = (
+                f"non_retryable: {reason}"
+                if not retryable
+                else f"max_attempts_exhausted: {reason}"
+            )
+        else:
+            self.state = "ready"
+            # 0028: this delivery reached the work and came back with a
+            # verdict about it, so the waits the item collected getting here
+            # are spent history, not a running total against its next outage.
+            self.lease_wait_count = 0
+        return True
+
+    def fail_lease_wait(self, work, *, reason):
+        self.lease_wait_count += 1
+        # Both branches refund, including the one that gives up (0026) -- the
+        # refusal that exhausts the budget names no fault in the work either,
+        # so a DLQ row from it reads `attempt_count = 0`.
+        self.attempt_count = max(self.attempt_count - 1, 0)
+        if self.lease_wait_count > self.max_lease_waits and self.fleet_is_serving:
+            self.state = "dead"
+            self.dead_reason = f"lease_wait_exhausted: {reason}"
+        else:
+            self.state = "ready"
+        return True
+
+
+def _drain(store: QueueModel, handler) -> None:
+    """Let the loop redeliver the item until the queue stops offering it --
+    because it dead-lettered, or because the model's delivery cap is
+    reached. `_run_until_idle`'s convention: the first idle sleep ends the
+    run."""
+    daemon = WorkerDaemon(store, handler, WorkerConfig(visibility_seconds=3))
+    _run_until_idle(daemon, store)
+
+
+def test_fleet_refusals_no_longer_dead_letter_the_item_they_never_ran() -> None:
+    """The finding this task closes, at the accounting level.
+
+    The planner sets ``max_attempts`` to the cascade length, and that
+    cascade has been two links since copilot left the isolated fleet
+    (`orchestrator.routing`). So TWO refusals that name no fault in the work
+    item -- a lease a sibling lane holds, an account past its cap, a
+    workspace the host could not provision -- used to be enough to
+    dead-letter a task that had never spent a single model attempt. The
+    monitor 'control-01:queue' measured the resulting pile as
+    `dead_letter_growth` (monitor_finding #469).
+
+    Routed as `no_fault`, the same refusals refund the attempt they were
+    handed and spend the queue's separate bounded budget instead: the item
+    is still `ready` after five of them, with its two model attempts intact.
+    """
+    store = QueueModel({"kind": "agent_run"}, max_attempts=2)
+
+    def contended(payload, lease_lost, attempt_no=1):
+        return HandlerOutcome(
+            ok=False,
+            reason="writer lease unavailable: acquire_failed: held by a sibling lane",
+            retryable=True,
+            lease_wait=True,
+        )
+
+    _drain(store, {"agent_run": contended})
+
+    assert store.deliveries == 5
+    assert store.state == "ready", store.dead_reason
+    assert store.dead_reason is None
+    assert store.attempt_count == 0, "every refusal refunded the attempt it spent"
+    assert store.lease_wait_count == 5
+
+
+def test_a_genuine_failure_still_dead_letters_on_the_cascade_budget() -> None:
+    """The other half of the guarantee: the DLQ still works. A handler
+    failure that names the WORK spends `max_attempts` exactly as before, so
+    the fix cannot be mistaken for "nothing ever dead-letters again"."""
+    store = QueueModel({"kind": "agent_run"}, max_attempts=2, delivery_cap=5)
+
+    def broken(payload, lease_lost, attempt_no=1):
+        return HandlerOutcome(
+            ok=False, reason="guarded publish preparation failed", retryable=True
+        )
+
+    _drain(store, {"agent_run": broken})
+
+    assert store.deliveries == 2, "the item is dead after its budget, not re-delivered"
+    assert store.state == "dead"
+    assert store.dead_reason is not None
+    assert store.dead_reason.startswith("max_attempts_exhausted:")
+
+
+def test_contention_that_singles_out_one_item_still_terminates_in_the_dlq() -> None:
+    """The refund budget is bounded, not infinite: contention that never
+    clears *while the fleet serves everything else* still reaches the
+    dead-letter queue -- with a reason that tells an operator it was the
+    fleet, not the item -- so a pathological host cannot hide behind an item
+    that retries forever.
+
+    `fleet_is_serving=True` is the load-bearing half of that sentence since
+    0028, and it is the default here because it is the ordinary condition: a
+    queue with work moving through it. What it excludes is the case the test
+    below covers.
+    """
+    store = QueueModel(
+        {"kind": "agent_run"},
+        max_attempts=2,
+        max_lease_waits=3,
+        delivery_cap=10,
+        fleet_is_serving=True,
+    )
+
+    def contended(payload, lease_lost, attempt_no=1):
+        return HandlerOutcome(
+            ok=False,
+            reason="executor infrastructure failure (provider/auth/quota): capped",
+            retryable=True,
+            lease_wait=True,
+        )
+
+    _drain(store, {"agent_run": contended})
+
+    assert store.state == "dead"
+    assert store.dead_reason is not None
+    assert store.dead_reason.startswith("lease_wait_exhausted:")
+    # infra_monitor classifies the DLQ row by its reason: a capacity outage
+    # that outlasts the wait budget must still land in the quota class.
+    assert "quota" in store.dead_reason
+
+
+def test_an_outage_that_refuses_everything_no_longer_empties_the_queue_into_the_dlq() -> None:
+    """The finding this task closes, at the horizon the budget actually buys.
+
+    `_queue_backoff(2, n)` -- 2 being the backoff every dispatch enqueues
+    with -- runs 2, 4, 8 … 256 and then sits at its 300s cap, so the 20 waits
+    the budget allows are 68.5 minutes of waiting, after which the 21st
+    refusal dead-letters the item under `lease_wait_exhausted` with
+    `attempt_count = 0`: never delivered to a model, and nothing but an
+    operator's `queue-redrive` brings it back.
+
+    The fleet's dominant outage is four times longer than that.
+    `orchestrator.routing` records the measurement: the Claude credential is
+    a Max *subscription* with a five-hour rolling cap, and 142 of 167 parked
+    tasks on 2026-08-23 were "You've hit your session limit". Every item in
+    flight when that window closes is refused for five hours and spends its
+    whole budget in the first sixty-nine minutes, so the queue converted its
+    own backlog into dead letters -- the `dead_letter_growth` control-01
+    measures, arriving in the class `infra_monitor` calls
+    `executor_quota_exhausted`.
+
+    The budget was never meant to bound this. 0022 bounds "permanent,
+    PATHOLOGICAL contention" and 0027 the item "that somehow kills its worker
+    every time it is delivered": both are statements about one item being
+    singled out, and neither describes a window that refuses every lane
+    equally. So the budget now spends only against a serving fleet -- fifty
+    refusals with nothing else getting through leave the item `ready`, with
+    both its model attempts intact, for the fleet that comes back.
+    """
+    store = QueueModel(
+        {"kind": "agent_run"},
+        max_attempts=2,
+        max_lease_waits=20,
+        delivery_cap=50,
+        fleet_is_serving=False,
+    )
+
+    def capped(payload, lease_lost, attempt_no=1):
+        return HandlerOutcome(
+            ok=False,
+            reason=(
+                "executor infrastructure failure (provider/auth/quota): "
+                "You've hit your session limit"
+            ),
+            retryable=True,
+            lease_wait=True,
+        )
+
+    _drain(store, {"agent_run": capped})
+
+    assert store.deliveries == 50, "the item was offered for the whole outage"
+    assert store.state == "ready", store.dead_reason
+    assert store.dead_reason is None, "the outage is not a verdict on the work"
+    assert store.attempt_count == 0, "and it still has not reached a model"
+    assert store.lease_wait_count == 50, "every refusal is still counted, and backs off"
+
+
+def test_a_delivery_that_reaches_the_work_clears_the_wait_budget() -> None:
+    """The second half of the same rule (0028).
+
+    `lease_wait_count` was cumulative over the item's whole life and reset by
+    nothing but `queue_redrive`, so an item that waited out one long outage
+    carried that number forever: an ordinary lease race weeks later would be
+    its 21st wait and would dead-letter it. `queue_fail`'s requeue is the one
+    non-terminal exit meaning a delivery got past the fleet and reported on
+    the work itself, so it clears the budget -- 20 *consecutive* refusals,
+    not 20 across the months an item may live.
+
+    This cannot become an unbounded retry: reaching the reset costs a real
+    `attempt_count`, and nothing refunds those. `max_attempts` -- the cascade
+    length -- is the ceiling on how many times the budget can be cleared.
+    """
+    store = QueueModel(
+        {"kind": "agent_run"}, max_attempts=3, max_lease_waits=2, delivery_cap=4
+    )
+    # Two fleet refusals (the budget's last one), then a delivery that runs
+    # and fails on the work, then a third fleet refusal. Without the reset
+    # that third refusal is wait number three and the item is dead.
+    script = [True, True, False, True]
+
+    def mixed(payload, lease_lost, attempt_no=1):
+        if script and script.pop(0):
+            return HandlerOutcome(
+                ok=False,
+                reason="writer lease unavailable: held by a sibling lane",
+                retryable=True,
+                lease_wait=True,
+            )
+        return HandlerOutcome(
+            ok=False, reason="the agent produced no verdict", retryable=True
+        )
+
+    _drain(store, {"agent_run": mixed})
+
+    assert store.state != "dead", store.dead_reason
+    assert store.lease_wait_count == 1, "the real delivery reset the budget"
+    assert store.attempt_count == 1, "and that delivery is the one thing it spent"
+
+
+def test_a_host_that_cannot_provide_an_isolated_clone_no_longer_kills_the_item() -> None:
+    """The consequence the monitor actually counts, for the one refusal that
+    reached no budget at all.
+
+    Under principal isolation every read-only run gets a throwaway detached
+    clone (`handlers._read_only_isolated_checkout`). A subset of the ways a
+    host can fail to provide one -- the principal workspace-root config
+    absent or no longer immutable root-owned, git refusing the source clone's
+    ownership, the bound clone simply not there -- was classified *permanent*
+    and refused `retryable=False`. The two halves of this test are the same
+    host fact reported under the old classification and the new one, and the
+    difference is not how much budget it spends but whether the item survives
+    at all: `queue_fail` dead-letters a non-retryable report unconditionally,
+    so the item died on its FIRST delivery, having run nothing. Reviews are
+    dispatched continuously, so one host in that state filled the DLQ as fast
+    as it could claim -- the `dead_letter_growth` control-01:queue measured.
+    """
+    reason = (
+        "isolated workspace root is unavailable: principal workspace-root "
+        "config is not immutable root-owned"
+    )
+
+    old = QueueModel({"kind": "agent_run"}, max_attempts=2, delivery_cap=5)
+    _drain(
+        old,
+        {
+            "agent_run": lambda payload, lease_lost, attempt_no=1: HandlerOutcome(
+                ok=False, reason=reason, retryable=False
+            )
+        },
+    )
+    assert old.deliveries == 1, "one delivery was all it took"
+    assert old.state == "dead"
+    assert old.dead_reason == f"non_retryable: {reason}"
+    assert old.attempt_count == 1, "and the item was charged for it"
+
+    new = QueueModel({"kind": "agent_run"}, max_attempts=2, delivery_cap=5)
+    _drain(
+        new,
+        {
+            "agent_run": lambda payload, lease_lost, attempt_no=1: HandlerOutcome(
+                ok=False, reason=reason, retryable=True, lease_wait=True
+            )
+        },
+    )
+    assert new.state == "ready", new.dead_reason
+    assert new.dead_reason is None
+    assert new.attempt_count == 0, "both model attempts intact for a healthier lane"
+    assert new.lease_wait_count == new.deliveries == 5
 
 def test_drain_idle_waits_for_claim_handler_and_outcome_persistence():
     import threading
@@ -947,7 +2785,7 @@ def test_unhandled_execution_exception_does_not_advertise_idle():
     notices = []
     daemon = WorkerDaemon(store, {}, notify=notices.append)
 
-    def execute(work):
+    def execute(work, sent_at=None):
         daemon.request_drain()
         raise RuntimeError("unhandled execution failure")
 

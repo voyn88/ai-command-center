@@ -1496,7 +1496,7 @@ def test_a_reopened_finding_does_not_reset_the_task_carrying_its_fix(rig) -> Non
 
 
 def test_a_recovered_class_clears_its_own_finding_under_the_worker_grant(rig) -> None:
-    """0031, from the worker host's own role.
+    """0038 (partial clear), from the worker host's own role.
 
     0021 cleared a source's findings only on a tick with no failures at all,
     so one standing red probe (`crash_loop` on worker-01, where units carry
@@ -1519,7 +1519,7 @@ def test_a_recovered_class_clears_its_own_finding_under_the_worker_grant(rig) ->
             )
             # The next tick: deploy_lag green, crash_loop still red.
             cur.execute(
-                "SELECT monitor_clear_findings_except(%s, %s)",
+                "SELECT monitor_clear_finding(%s, %s)",
                 ("worker-01:infra", ["crash_loop"]),
             )
             assert cur.fetchone()[0] == 1
@@ -1617,7 +1617,7 @@ def test_worker_cannot_clear_evidence_or_park_tasks(rig, psycopg):
 # ---------------------------------------------------------------------------
 # VOYN-W0-AICC-AUDIT-ROLLBACK-CLASS вЂ” a refusal is data, not an exception
 # ---------------------------------------------------------------------------
-# Migration 0039 removed the `RAISE`s from `backlog_dispatch` and
+# Migration 0049 removed the `RAISE`s from `backlog_dispatch` and
 # `backlog_ingest_results`. Both were on paths their own comments called
 # unreachable, and both were reachable enough to erase a tick's audit: the
 # exception aborts the caller's transaction, and the refusal row goes with it.
@@ -1675,7 +1675,7 @@ def test_a_refused_dispatch_transition_is_recorded_instead_of_raised(
 ) -> None:
     """The measurement, on the dispatch path: 1 audit row, not 0.
 
-    Before 0039 this raised `dispatch transition refused`, which aborted the
+    Before 0049 this raised `dispatch transition refused`, which aborted the
     caller's transaction and took with it the lease-acquire audit, the refusal
     itself, and anything else the caller had written in the same transaction.
     """
@@ -1915,12 +1915,12 @@ def test_a_refused_dispatch_cannot_release_a_lease_a_concurrent_one_just_took(
     assert detail["lease_release_reason"] == "repo_has_in_flight_task"
 
 
-def test_migration_0039_is_reversible_without_residue(pg_connection_factory) -> None:
+def test_migration_0049_is_reversible_without_residue(pg_connection_factory) -> None:
     """Live up -> down -> up on the exact function bodies, the same pin this
     suite keeps on 0009/0011/0012: the down restores the raising definitions
     and drops the compensation helper, and the second up removes them again.
     A no-op down would leave a database that still erases its own refusal
-    audit while the ledger reported 0039 reverted."""
+    audit while the ledger reported 0049 reverted."""
     from command_center.db import migrations
 
     def prosrc(conn, name: str) -> str:
@@ -1944,7 +1944,7 @@ def test_migration_0039_is_reversible_without_residue(pg_connection_factory) -> 
         assert "transition_refused" in prosrc(conn, "backlog_dispatch")
         assert helpers(conn) == 1
 
-        migrations.downgrade(conn, target=38)
+        migrations.downgrade(conn, target=48)
         for name in ("backlog_dispatch", "backlog_ingest_results",
                      "backlog_split_task", "backlog_set_task_class"):
             assert "RAISE EXCEPTION" in prosrc(conn, name), name

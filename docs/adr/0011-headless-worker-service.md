@@ -55,11 +55,55 @@ This is a distinct mechanism from the queue's visibility lease, and the two must
 - `work_queue_store.claim`'s `visibility_seconds` (default 300, clamped server-side to `[1, 3600]`
   by `queue_claim`) is the width of a single lease window on the claimed `work_item` row.
 - That window is **renewed, not lengthened**, by a heartbeat thread that runs beside the handler for
-  the entire duration of a run (`WorkerDaemon._heartbeat_loop`, firing at a third of the visibility
-  window) — the daemon docstring's own words: "the heartbeat runs beside the handler, not inside
-  it... [it] renews at a third of the visibility window." A run many multiples of 300 seconds long
+  the entire duration of a run (`WorkerDaemon._heartbeat_loop`, firing at
+  `beat_interval_seconds` — often enough that `TOLERATED_FAILED_BEATS` consecutive failures still
+  leave a beat's margin before the deadline; 75s against the default 300s window). It fired at a
+  *third* of the window until VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED, which is one beat too slow:
+  the third beat lands on the deadline, so the two failed beats the design is sized around lost the
+  lease and the whole run with it. A run many multiples of 300 seconds long
   survives on live heartbeats exactly as well as a 60-second one; only a *lapsed* heartbeat (the
   process wedged, the database unreachable) ends the lease early.
+- The number of tolerated failures is a consequence of that cadence, and is deliberately **not** how
+  the lapse is decided: `_heartbeat_loop` holds a deadline — one window from the last beat the
+  server *accepted*, by a monotonic clock — and gives the attempt up when it passes. It counted
+  failed beats instead until VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED, which is elapsed time only if
+  an unreachable server fails the beat quickly; a severed `voyn-aicc-pgtunnel.service` socket
+  black-holes the call instead, so the lane kept executing an item the reaper had already handed
+  back and the queue probe read the fleet as having a free lane it did not have.
+- **And that deadline is evaluated where the database cannot delay it.** The rule above is correct
+  and was still mis-timed, because it was read at the top of the beat loop and the step before that
+  top is the heartbeat call: the one failure the tolerance exists for — a black-holed socket — was
+  also the one failure that postponed the verdict on itself, by however long the call sat there
+  (`lease_client.run_lease` already allows a hung subprocess 120s; a socket read nothing bounds can
+  sit longer). `_LeaseDeadline` now holds the rule and two threads read it: `_heartbeat_loop`, which
+  can be parked, and `_lease_deadline_loop`, which touches no store and therefore cannot be
+  (VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED, `monitor_finding` #41237). The deadline watch
+  deliberately does **not** feed the systemd watchdog: it is alive for the whole of a run and does
+  no work, so pinging from it would answer "is this process still useful" with "yes" for a wedged
+  one and retire the detector `WatchdogSec` exists to be.
+- **And the deadline stops the work without deciding the write, because an unanswered beat is not a
+  refused beat.** `_LeaseDeadline` can only be dated from the last beat the *lane saw* accepted, and
+  `store.heartbeat` is a single autocommit `SELECT queue_heartbeat(...)` — so a call black-holed on a
+  severed tunnel may have reached the server, run and *committed*, with only the reply lost. The
+  server's `visible_until` is then up to one beat interval (75s against the deployed 300s window)
+  beyond the deadline the lane can prove, and inside that gap the attempt is still the lane's by the
+  only authority that decides it: `_queue_owns`. So the deadline raises `lease_unproven` — stop the
+  handler, the fail-closed half — and `queue_heartbeat` answering `ok = false` raises
+  `queue_lease_lost`, which is the only fact that may discard an outcome. `_execute` discarded on the
+  clock until VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED (`monitor_finding` #41318), which threw away a
+  `queue_fail` the database would have accepted and left the item `claimed` under a lease nothing
+  renews — the phantom attended claim of #14016, reached from the lane's own inference. A run
+  cancelled this way is reported as a *retryable* failure whatever the handler said: neither terminal
+  write (`queue_complete`, or a non-retryable `queue_fail`) may be taken from a workspace a
+  terminated agent left behind.
+- **And that clock starts when the lane asks, not when the server answers.** The window is granted
+  from the server's own `now()`, somewhere inside a call the lane is still waiting on, so the
+  request instant is at or before the grant and the answer's is at or after it. Dating from the
+  answer made `remaining <= 0` prove a lapse and made `remaining > 0` — the test the handler actually
+  runs under — prove nothing, so the lane outran the server's lease by the reply's own delay, which
+  is unbounded in exactly the fault above. Dating from the request costs one round trip of a window
+  sized with a whole beat of margin, and is affordable only because the split above stopped a lapse
+  from discarding the outcome (VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED, `monitor_finding` #41949).
 - A payload's `timeout_seconds` therefore never "outlives" the queue's visibility lease in the sense
   of exceeding a fixed budget that lease enforces — a heartbeating worker can hold the row for as
   long as `agent_runner` lets the agent run, and no longer. The two ceilings coincide at 3600s
@@ -113,7 +157,7 @@ against it — exactly the race `blocking_lease`'s own docstring disclaims respo
 
 `deploy/systemd/aicc-worker.service` runs `Type=notify` with a watchdog fed from both the claim loop
 (between claims) and the heartbeat thread (during a run), so every healthy state pings within one
-heartbeat interval (`visibility_seconds / 3`, ~100s by default). `WatchdogSec=240s` is two missed
+heartbeat interval (`beat_interval_seconds`, 75s by default). `WatchdogSec=240s` is three missed
 intervals plus slack; a wedged process (a handler that hangs and takes the heartbeat thread with it)
 is restarted, and that restart is safe by the same construction as a SIGKILL — lease expiry plus the
 control-plane reaper resume the item elsewhere. `TimeoutStopSec=330s` outlives one visibility window
@@ -156,7 +200,7 @@ longer-running handler is abandoned at the timeout, which is safe but not free (
 - `command_center/agent_runner.py` — `MIN_TIMEOUT_SECONDS`, `MAX_TIMEOUT_SECONDS`, `resolve_timeout`,
   `timeout_for_task`
 - `command_center/db/work_queue_store.py` — `claim`/`heartbeat`, `visibility_seconds`
-- `command_center/worker/daemon.py` — `WorkerDaemon._heartbeat_loop`, the watchdog feed
+- `command_center/worker/daemon.py` — `WorkerDaemon._heartbeat_loop` and `_lease_deadline_loop` over one `_LeaseDeadline`, the `lease_unproven`/`queue_lease_lost` split in `_execute`, the watchdog feed
 - `command_center/worker/writer_lease.py` — `hold`, the full-lifecycle writer lease
   (`VOYN-W0-AICC-LEASE-FULL-LIFECYCLE-FENCE`)
 - `command_center/worker/worktree_lease.py` — `blocking_lease`

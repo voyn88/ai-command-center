@@ -1,4 +1,4 @@
-"""backlog_mark_duplicate (0038): the legal exit for an OPEN duplicate.
+"""backlog_mark_duplicate (0048): the legal exit for an OPEN duplicate.
 
 The dedup scan (`bge-m3` embeddings over the live tasks, pairwise cosine,
 threshold 0.75) confirmed real duplicates among tasks that were already OPEN,
@@ -492,7 +492,7 @@ def test_migration_0038_is_reversible_without_residue(pg_connection_factory):
     with pg_connection_factory() as conn:
         migrations.upgrade(conn)
         assert present(conn) == (1, "backlog_duplicate")
-        migrations.downgrade(conn, target=37)
+        migrations.downgrade(conn, target=47)
         assert present(conn) == (0, None)
         migrations.upgrade(conn)  # must not raise 'already exists'
         assert present(conn) == (1, "backlog_duplicate")

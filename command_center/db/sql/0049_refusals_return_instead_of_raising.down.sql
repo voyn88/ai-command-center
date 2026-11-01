@@ -1,4 +1,4 @@
--- Reverse of 0039: the pre-0039 bodies, in which a refusal raises.
+-- Reverse of 0049 (numbered 0039 before the 0033-0041 stack): the pre-0049 bodies, in which a refusal raises.
 --
 -- CREATE OR REPLACE rather than a no-op, so an up->down->up cycle actually
 -- restores the old definitions and the second up is measurable (the pin
