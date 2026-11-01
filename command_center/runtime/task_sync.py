@@ -16,15 +16,30 @@ see `launch.begin_launch`) stayed frozen at 5% forever, even after its run
 reached `launch_status="Completed"` — a direct violation of "Completed
 implies progress == 100" and the literal shape of the reported defect
 (`state=COMPLETED`, `progress` stuck at 5%).
+
+Nothing here projects a run's *terminal* facts until that run is finalized.
+A run's terminal state is published before its report, its `process_exited`
+event and the auto-commit of the agent's work are durable, and this module
+routinely runs in a different process from the one finalizing the run — so
+the gap is observable and, once projected, latched. `is_pending_finalization`
+is the single predicate every terminal-facing branch consults; read its
+docstring for why it keys on the persisted `run["state"]` rather than the
+display status, and for the bounded recovery rule that keeps historical rows
+(whose marker is never coming) from being stranded by it.
 """
 
 from __future__ import annotations
+
+import logging
+from datetime import datetime
 
 from command_center import models, project_config, report_parser
 from command_center.runtime import completion as completion_states
 from command_center.runtime import db, providers, reports, session_view
 from command_center.runtime.api import ExecutionCenterAPI
 from command_center.runtime.completion_service import CompletionOrchestrator
+
+logger = logging.getLogger(__name__)
 
 # Session-view display status -> Kanban `models.LAUNCH_STATUSES` value, for
 # every status *except* `STATUS_COMPLETED` — a genuinely-completed run does
@@ -86,6 +101,76 @@ _COMPLETION_REJECTION_STATES = frozenset(
 # Launch statuses that assert the delivered work landed. A rejected completion
 # must not be allowed to keep hiding behind one of these.
 _SUCCESS_LAUNCH_STATUSES = frozenset({"Completed", "Needs Review"})
+
+# --- Finalization race (VOYN-W0-AICC-FLAKE-03) -----------------------------
+#: How long after `completed_at` a terminal-but-unfinalized run is still
+#: presumed to be *inside* its finalization window rather than abandoned in it.
+#:
+#: The window itself is tiny — `_migration_24_add_finalized_at` measured a 6.1 ms
+#: median on a clean tree and 152 ms worst case on a dirty one — and the debug
+#: CLI already calls 60 s the point at which finalization is "wedged, never
+#: merely slow" (`execution_center_debug._finalization_timeout`). 15 minutes is
+#: an order of magnitude above that ceiling, so this never expires on a
+#: finalization that is genuinely running; it only bounds how long a run whose
+#: finalizer will *never* arrive can hold its task hostage.
+FINALIZATION_GRACE_SECONDS = 900.0
+
+
+def _age_seconds(timestamp: str | None) -> float | None:
+    """Seconds since a `models.iso_now()` timestamp, or `None` when there is no
+    usable one. Run timestamps are naive local time by project convention (see
+    `models.iso_now`); a timezone-aware value from an imported legacy row is
+    converted to local naive rather than rejected."""
+    if not timestamp:
+        return None
+    try:
+        written = datetime.fromisoformat(timestamp)
+    except (TypeError, ValueError):
+        return None
+    if written.tzinfo is not None:
+        written = written.astimezone().replace(tzinfo=None)
+    return (datetime.now() - written).total_seconds()
+
+
+def is_pending_finalization(run: dict) -> bool:
+    """Whether this run's terminal outcome is published but its *durability
+    writes are not* — the `process_exited` event, the auto-commit of the agent's
+    work, and the run report all land after the terminal state is committed, on
+    a daemon thread (`Supervisor._supervise`). A sync pass in another process
+    reads the terminal state during that gap and would project an empty
+    report/verdict, then latch it forever via `terminal_projection_run_id`.
+
+    Keyed on the **persisted** `run["state"]` against `db.TERMINAL_STATES`, not
+    on `session_view.derive_status`'s display vocabulary. `INTERRUPTED` and
+    `UNKNOWN` are terminal database states, but both derive to `Requires
+    Attention`, which is deliberately absent from
+    `session_view.TERMINAL_DISPLAY_STATUSES` — so a display-keyed gate leaves
+    exactly those two runs projecting mid-window, which is the shape this whole
+    fix exists to close (they are also the states that drive executor-failover
+    and relaunch, the most consequential writes here).
+
+    Bounded by `FINALIZATION_GRACE_SECONDS`, because the marker is nullable and
+    **never backfilled** (see `_migration_24_add_finalized_at`). Two kinds of
+    row carry `finalized_at IS NULL` permanently: every terminal row written
+    before migration 24 added the column, and every row whose finalizer died
+    inside the window with no fenced claim for a later Supervisor to recover
+    through — `_acquire_recovery_finalization_claim` returns False when the
+    claim row is absent, deliberately. Waiting on a marker nothing will ever
+    write would strand those tasks forever, which is a worse and much quieter
+    regression than the race. A run that went terminal longer ago than the
+    grace window is therefore treated as finalized-as-far-as-it-will-ever-be
+    and projected exactly as it was before this gate existed. A terminal row
+    with no parseable `completed_at` is historical by the same argument: every
+    live path that publishes a terminal state writes the timestamp with it.
+    """
+    if run.get("state") not in db.TERMINAL_STATES:
+        return False
+    if run.get("finalized_at"):
+        return False
+    age = _age_seconds(run.get("completed_at"))
+    if age is None:
+        return False
+    return age < FINALIZATION_GRACE_SECONDS
 
 
 def _resolve_target_launch_status(status: str, task: dict) -> str:
@@ -243,11 +328,20 @@ def sync_task_from_run(task: dict, run: dict, *, db_path) -> bool:
     # terminal facts once finalization actually completes. Waiting for the
     # marker means the resync *after* finalization is the one that projects
     # them.
-    pending_finalization = (
-        status in session_view.TERMINAL_DISPLAY_STATUSES
-        and not already_finalized_for_this_run
-        and not run.get("finalized_at")
-    )
+    #
+    # `is_pending_finalization` reads the persisted `run["state"]`, not the
+    # display `status`: `INTERRUPTED`/`UNKNOWN` are terminal database states
+    # that derive to `Requires Attention` — outside
+    # `TERMINAL_DISPLAY_STATUSES` — and a display-keyed gate would leave them
+    # driving executor-failover, relaunch and timeline writes mid-window.
+    pending_finalization = is_pending_finalization(run) and not already_finalized_for_this_run
+    if pending_finalization:
+        logger.debug(
+            "Holding task %s: run %s is %s but not finalized yet",
+            task.get("id"),
+            run["id"],
+            run.get("state"),
+        )
     if status in session_view.TERMINAL_DISPLAY_STATUSES and not already_finalized_for_this_run and not pending_finalization:
         # Must run *before* `target_launch_status` is resolved below: a
         # `Completed` run's launch status depends on `task["progress"]`
@@ -272,7 +366,17 @@ def sync_task_from_run(task: dict, run: dict, *, db_path) -> bool:
     # agent in the chain (see `execution_queue.select_available_executor`). The
     # task only stays stranded when *every* allowed executor has failed (the
     # launch layer then reports `LAUNCH_SKIP_NO_AVAILABLE_EXECUTOR`).
-    if not already_finalized_for_this_run:
+    #
+    # Skipped entirely while `pending_finalization`. `failure_reason`/`state`
+    # are durable at the write that made the state terminal, but the *decisions*
+    # taken here are not merely cosmetic: they blame a provider
+    # (`failed_executors`), ask the planner to relaunch (`relaunch_requested`)
+    # and append permanent timeline events. `INTERRUPTED` is the live example —
+    # the supervisor's own reconciliation is what turns a lost process into
+    # `INTERRUPTED` *and then finalizes it*, so acting on the state before its
+    # finalization lands means re-queueing a task whose predecessor run is
+    # still writing its report and auto-committing the agent's work.
+    if not already_finalized_for_this_run and not pending_finalization:
         reason = run.get("failure_reason")
         died_on_startup = (
             run.get("state") == "INTERRUPTED" and not run.get("first_output_at")
@@ -337,17 +441,24 @@ def sync_task_from_run(task: dict, run: dict, *, db_path) -> bool:
         task.pop("failed_executors", None)
         mutated = True
 
-    # `target_launch_status` may still be a genuinely terminal value here
-    # (e.g. `Failed`, `Needs Review`) for a `pending_finalization` run whose
-    # failure was never eligible for the executor-fallback rewrite above —
-    # that rewrite is the only thing allowed to move a terminal value while
-    # unfinalized, because it is based on `failure_reason`/`state`, which are
-    # durable at the same write that made the state terminal. Persisting any
-    # *other* terminal value here would latch it into `_TERMINAL_LAUNCH_
-    # STATUSES`, making `already_finalized_for_this_run` true on the next
-    # call and permanently skipping the terminal-field projection above once
-    # the run does finalize.
-    if pending_finalization and target_launch_status in _TERMINAL_LAUNCH_STATUSES:
+    # Hold every `launch_status` write while the run is unfinalized — not just
+    # the `_TERMINAL_LAUNCH_STATUSES` ones. Two reasons, and the narrower gate
+    # missed both:
+    #
+    # - Persisting a terminal value (`Failed`, `Needs Review`, …) would latch it
+    #   into `_TERMINAL_LAUNCH_STATUSES`, making `already_finalized_for_this_run`
+    #   true on the next call and permanently skipping the terminal-field
+    #   projection above once the run does finalize.
+    # - `Requires Attention` is *not* in that set, yet it is exactly what an
+    #   unfinalized `INTERRUPTED`/`UNKNOWN` run resolves to. Writing it strands
+    #   the task for a human on evidence — an empty report, uncommitted work —
+    #   that the finalizer was still in the middle of producing.
+    #
+    # Every value reachable while `pending_finalization` asserts something about
+    # this run's *outcome* (the one exception, the executor-fallback rewrite to
+    # "Ready", is itself skipped above), so there is nothing here worth writing
+    # early. The resync after finalization writes the truthful value.
+    if pending_finalization:
         pass
     elif task.get("launch_status") != target_launch_status:
         task["launch_status"] = target_launch_status
@@ -512,6 +623,17 @@ def _seed_and_project_completion(
     completion = db.get_completion(api.db_path, run["id"])
     if completion is None:
         if run.get("state") != "COMPLETED":
+            return False
+        if is_pending_finalization(run):
+            # Same race as the terminal projection in `sync_task_from_run`, with
+            # a longer tail: the completion row is the seed of the validate → PR
+            # → merge state machine, and the auto-commit of the agent's work
+            # happens *after* the COMPLETED state is published. Seeding here
+            # would start that machine against a working tree whose changes are
+            # not committed yet, and `begin_completion` records the run's head
+            # as it stands. An existing row is still projected — the completion
+            # pipeline owns its own state once it exists; only creating one is
+            # held back.
             return False
         cfg = project_config.get_project_config(run["project"])
         completion = CompletionOrchestrator(api.db_path).begin_completion(

@@ -14,7 +14,7 @@ import pytest
 # vendored `aios_db` wheel — present in CI, optional in a bare local checkout.
 pytest.importorskip("aios_db")
 
-from command_center.db.cli import _review_enqueue, build_parser  # noqa: E402
+from command_center.db.cli import _review_enqueue, build_parser
 
 
 def test_queue_reap_takes_no_arguments() -> None:
@@ -229,3 +229,67 @@ def test_the_database_cli_does_not_offer_to_rewrite_the_lock(capsys) -> None:
         main(["migration-lock", "--write"])
     assert exit_code.value.code == 2
     assert "unrecognized arguments: --write" in capsys.readouterr().err
+def test_backlog_pr_window_labels_without_opening_a_database(monkeypatch, capsys) -> None:
+    """VOYN-W0-AICC-PR-WINDOW-RECONCILER-NOT-DEPLOYED-ON-CONTROL: the tick
+    reads and writes GitHub only. Requiring a database credential to run it
+    bought nothing and cost it a host -- it is what tied the labeller to the
+    one unit layout that had one, on a host the control plane is not, so the
+    tick was never deployed and every fleet PR opened with no CI. This runs
+    before `load_config`, and the deploy-managed unit therefore needs no
+    EnvironmentFile at all."""
+    from command_center.db import cli
+    from command_center.orchestrator import review_merge
+
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("the PR-window tick must not reach the database")
+
+    monkeypatch.setattr(cli, "load_config", refuse)
+    monkeypatch.setattr(cli.pool, "open_pool", refuse)
+    monkeypatch.setattr(
+        review_merge,
+        "reconcile_pr_window",
+        lambda repo_path: review_merge.PrWindowReport(
+            active=[(907, "deadbeef")], blocked=[(906, "checks_missing")]
+        ),
+    )
+
+    assert cli.main(["backlog-pr-window", "--repo-path", "/opt/aicc/current"]) == 0
+    out = capsys.readouterr().out
+    assert "ACTIVE    #907 -> deadbeef" in out
+    assert "BLOCKED   #906: checks_missing" in out
+
+
+def test_backlog_pr_window_reports_a_failed_listing_as_a_failed_tick(monkeypatch) -> None:
+    """A listing that failed labelled nothing; systemd must see a failed tick
+    rather than an empty, successful-looking report (the 500,000-node GraphQL
+    refusal did exactly that for days)."""
+    from command_center.db import cli
+    from command_center.orchestrator import review_merge
+
+    monkeypatch.setattr(
+        review_merge,
+        "reconcile_pr_window",
+        lambda repo_path: review_merge.PrWindowReport(error="pr_list_failed: 403"),
+    )
+
+    assert cli.main(["backlog-pr-window"]) == 1
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_backlog_plan_propagates_repository_path_to_coordinator(monkeypatch, explicit):
+    from contextlib import nullcontext
+
+    from command_center.db import cli
+    from command_center.orchestrator import coordination, planner
+
+    monkeypatch.setenv("AICC_FLEET_REPO", "/srv/configured-repo")
+    monkeypatch.setattr(cli, "load_config", lambda: object())
+    monkeypatch.setattr(cli.pool, "open_pool", lambda _config: None)
+    monkeypatch.setattr(cli.pool, "close_pool", lambda: None)
+    monkeypatch.setattr(cli.pool, "connection", lambda: nullcontext(object()))
+    monkeypatch.setattr(planner, "plan_once", lambda *_args: planner.PlanReport())
+    captured = []
+    monkeypatch.setattr(coordination, "coordinate_once", lambda _factory, limits: captured.append(limits.repository_path) or coordination.CoordinationReport())
+    argv = ["backlog-plan"] + (["--repo-path", "/srv/explicit-repo"] if explicit else [])
+    assert cli.main(argv) == 0
+    assert captured == ["/srv/explicit-repo" if explicit else "/srv/configured-repo"]

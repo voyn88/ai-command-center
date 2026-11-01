@@ -135,34 +135,47 @@ class WorkQueueStore:
     def fail_lease_wait(
         self, work: ClaimedWork, *, reason: str, max_lease_waits: int = 20
     ) -> bool:
-        """Report a failure that names no fault in the work item itself --
-        a writer-lease race lost to a sibling lane
-        (VOYN-W0-AICC-PUBLISH-LEASE-CONTENTION-BURNS-ATTEMPT, the case this
-        was built for), and since
-        VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH every sibling refusal
-        of the same class: an executor this host cannot start, a provider
-        that refused on quota, a workspace the fleet could not provision.
-        See ``worker.daemon.HandlerOutcome.no_fault`` for the boundary.
-
-        Unlike ``fail``, this refunds the attempt ``queue_claim`` already
-        spent for this delivery and bounds retries against a separate,
-        smaller-than-forever budget (``lease_wait_count``, defaulting to 20
-        waits with the queue's own capped backoff) instead of
-        ``max_attempts``. The SQL keeps its migration-0022 name.
-
-        That budget is spent only while the fleet is serving OTHER items
-        (0028): 20 waits at the enqueued backoff is 68.5 minutes, and the
-        fleet's dominant outage — the Claude subscription's five-hour rolling
-        cap — is four times longer, so a count that ran during a total outage
-        dead-lettered every item in flight for a condition none of them
-        caused. Exhausting it is a verdict about an item that was singled
-        out; an outage surfaces through ``infra_monitor``'s ``queue_stalled``
-        instead, and ``fail``'s requeue (a delivery that reached the work)
-        clears the budget so it measures one outage rather than a lifetime.
+        """Report a failure that names no fault in the work itself -- a
+        writer-lease race lost to a sibling lane
+        (VOYN-W0-AICC-PUBLISH-LEASE-CONTENTION-BURNS-ATTEMPT). Unlike
+        ``fail``, this refunds the attempt ``queue_claim`` already spent for
+        this delivery and bounds retries against a separate lease-wait
+        budget instead of ``max_attempts``.
         """
         row = self._call(
             "SELECT * FROM queue_fail_lease_wait(%s, %s, %s, %s)",
             (work.attempt_id, work.claim_token, reason, max_lease_waits),
+        )
+        return bool(row["ok"])
+
+    def fail_infra_wait(
+        self,
+        work: ClaimedWork,
+        *,
+        reason: str,
+        max_infra_waits: int = 20,
+        detail: dict[str, Any] | None = None,
+    ) -> bool:
+        """Report a host/launcher/provider infrastructure failure.
+
+        Like ``fail_lease_wait``, this refunds the attempt spent by
+        ``queue_claim`` and uses a separate bounded wait counter so broken
+        infrastructure retries without consuming the task's own attempts.
+
+        ``detail`` is merged into the ``work_event`` audit row the refund
+        writes (0025): the wait counters alone say an attempt was refunded,
+        not WHICH executor was out of quota or how long this worker will
+        withhold it, and a refusal writes no result row to carry that.
+        """
+        row = self._call(
+            "SELECT * FROM queue_fail_infra_wait(%s, %s, %s, %s, %s::jsonb)",
+            (
+                work.attempt_id,
+                work.claim_token,
+                reason,
+                max_infra_waits,
+                json.dumps(detail) if detail else None,
+            ),
         )
         return bool(row["ok"])
 

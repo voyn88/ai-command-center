@@ -2,7 +2,7 @@
 
 Migration ``0002_queue_claim`` shipped recovery as PL/pgSQL — ``queue_reap()``
 requeues every lapsed lease (and dead-letters the item once the lapses
-outlast its lease-wait budget, 0027), ``work_dlq`` is the dead-letter queue's
+outlast its lease-wait budget, 0036), ``work_dlq`` is the dead-letter queue's
 interface, ``queue_redrive()`` is its audited exit — and granted all three to
 ``aicc_app`` and nothing to workers. Until this module, nothing in
 production called any of them: the reaper existed only for tests, which means
@@ -67,7 +67,7 @@ class WorkQueueAdmin:
     def reap(self) -> int:
         """Expire every lapsed lease: requeue it, dead-letter it once the
         item's lease-wait budget is exhausted *and the fleet is demonstrably
-        serving its other items* (0028 — with nothing getting through, lapsing
+        serving its other items* (0037 — with nothing getting through, lapsing
         leases are a fleet-wide outage, and an outage must not be spelled as a
         verdict on every item it caught). Returns the number of attempts
         expired.

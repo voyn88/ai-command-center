@@ -8,6 +8,21 @@ Type=oneshot
 User=voynadmin
 WorkingDirectory=/home/voynadmin/aicc-preprod/repo
 EnvironmentFile=/home/voynadmin/aicc-preprod/.env
+# --pr-window-repo runs one `gh pr list` per tick and turns "an open fleet PR
+# has carried no review-window label for over 15 minutes" into a monitor
+# finding. It belongs to this probe and not the worker one: it needs the
+# backlog database (the `pr` evidence) and the control host's gh identity.
+# Without it, a PR-window reconciler that is absent, disabled, failing or out
+# of GitHub quota is invisible -- which is how every fleet PR went without CI
+# until 2026-09-09 (VOYN-W0-AICC-PR-WINDOW-RECONCILER-NOT-DEPLOYED-ON-CONTROL).
+# It is enabled by AICC_PR_WINDOW_REPO below rather than by a flag: this
+# unit's ExecStart names an absolute home path, which a public repository
+# cannot restate in a new line (scripts/ci/prepush/leak_guard.sh), and an
+# environment default is the same knob either way. `.` is this unit's own
+# WorkingDirectory above -- a clone, so gh reads the repository from its
+# remote. The finding reaches the planner through this unit's
+# --record-findings source, exactly like every other failure class.
+Environment=AICC_PR_WINDOW_REPO=.
 ExecStart=/home/voynadmin/aicc-preprod/repo/.venv/bin/python -m command_center.ops.infra_monitor --skip-workers --minimum-active-workers 0 --max-stalled-seconds 900 --max-recent-dead 0 --prometheus-url http://100.114.209.119:9090/-/ready
 NoNewPrivileges=true
 PrivateTmp=true

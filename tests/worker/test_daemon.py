@@ -15,6 +15,8 @@ import signal
 import time
 from pathlib import Path
 
+import pytest
+
 from command_center.db.work_queue_store import ClaimedWork, QueueRefusal
 from command_center.worker.daemon import (
     HandlerOutcome,
@@ -64,6 +66,10 @@ class ScriptedStore:
         self.calls.append(("fail_lease_wait", work.attempt_id, reason))
         return True
 
+    def fail_infra_wait(self, work, *, reason, detail=None):
+        self.calls.append(("fail_infra_wait", work.attempt_id, reason, detail))
+        return True
+
 
 def _run_until_idle(daemon: WorkerDaemon, store: ScriptedStore) -> None:
     """Run the loop until the script is exhausted, then stop it via the
@@ -108,13 +114,13 @@ def test_a_no_fault_failure_routes_to_the_refund_store_method() -> None:
     item's own work. Reporting it through the ordinary `fail(retryable=True)`
     path would still count it against `max_attempts` (the queue already
     advanced `attempt_count` at claim), which is exactly what dead-lettered
-    finished work live on 2026-09-06. `no_fault=True` must route to the
+    finished work live on 2026-09-06. `lease_wait=True` must route to the
     store's separate refund-and-bound path instead."""
     store = ScriptedStore([_work({"kind": "publish"})])
 
     def contended(payload, lease_lost, attempt_no=1):
         return HandlerOutcome(
-            ok=False, reason="publish failed: lease_unavailable: held by x", no_fault=True
+            ok=False, reason="publish failed: lease_unavailable: held by x", lease_wait=True
         )
 
     daemon = WorkerDaemon(store, {"publish": contended}, WorkerConfig(visibility_seconds=3))
@@ -124,6 +130,63 @@ def test_a_no_fault_failure_routes_to_the_refund_store_method() -> None:
         store.calls
     )
     assert not any(c[0] == "fail" for c in store.calls)
+
+
+def test_an_infra_wait_failure_routes_to_the_infra_wait_store_method() -> None:
+    store = ScriptedStore([_work({"kind": "infra"})])
+
+    def infra(payload, lease_lost, attempt_no=1):
+        return HandlerOutcome(
+            ok=False,
+            reason="executor infrastructure failure (agent principal isolation): socket inactive",
+            infra_wait=True,
+        )
+
+    daemon = WorkerDaemon(store, {"infra": infra}, WorkerConfig(visibility_seconds=3))
+    _run_until_idle(daemon, store)
+
+    assert (
+        "fail_infra_wait",
+        "wat-1",
+        "executor infrastructure failure (agent principal isolation): socket inactive",
+        None,
+    ) in store.calls
+    assert not any(c[0] == "fail" for c in store.calls)
+
+
+def test_an_infra_wait_carries_the_handlers_detail_to_the_audit_row() -> None:
+    """VOYN-W0-AICC-EXECUTOR-QUOTA-AWARE-ROUTING: the refund itself only
+    records that an attempt was given back. Which executor is out of quota,
+    and until when this worker will withhold it, is the handler's fact, and a
+    refusal writes no result row to carry it -- so it travels with the
+    failure report into `work_event.detail`."""
+    store = ScriptedStore([_work({"kind": "infra"})])
+    quota = {
+        "executor_quota": {
+            "exhausted": [
+                {
+                    "cascade_step": 1,
+                    "executor": "codex",
+                    "signature": "hit your usage limit",
+                    "exhausted_until": "2026-09-22T12:30:00+00:00",
+                }
+            ]
+        }
+    }
+
+    def infra(payload, lease_lost, attempt_no=1):
+        return HandlerOutcome(
+            ok=False,
+            reason="executor infrastructure failure (provider/auth/quota): out of quota",
+            infra_wait=True,
+            detail=quota,
+        )
+
+    daemon = WorkerDaemon(store, {"infra": infra}, WorkerConfig(visibility_seconds=3))
+    _run_until_idle(daemon, store)
+
+    reported = [call for call in store.calls if call[0] == "fail_infra_wait"]
+    assert reported and reported[0][3] == quota
 
 
 def test_a_raising_handler_is_a_retryable_failure() -> None:
@@ -239,9 +302,9 @@ def test_credential_hot_reload_does_not_wait_for_or_signal_the_running_job() -> 
     assert handler_started.wait(timeout=5)
     daemon.request_drain()
     deadline = time.monotonic() + 5
-    while "STATUS=aicc-drained" not in pings and time.monotonic() < deadline:
+    while "STATUS=aicc-drained-busy" not in pings and time.monotonic() < deadline:
         time.sleep(0.01)
-    assert "STATUS=aicc-drained" in pings
+    assert "STATUS=aicc-drained-busy" in pings
     daemon.request_reload()
     assert reload_done.wait(timeout=5)
     handler_release.set()
@@ -250,7 +313,7 @@ def test_credential_hot_reload_does_not_wait_for_or_signal_the_running_job() -> 
     assert not worker.is_alive()
     assert events == ["handler", "reload", "handler-finished"]
     assert pings.count("READY=1") == 2
-    assert "STATUS=aicc-drained" in pings
+    assert "STATUS=aicc-drained-busy" in pings
     assert ("complete", "wat-1", {}) in store.calls
 
 
@@ -283,12 +346,12 @@ def test_drain_ack_is_after_atomic_claim_gate_close() -> None:
 
     daemon.request_drain()
     time.sleep(0.05)
-    assert "STATUS=aicc-drained" not in notices
+    assert "STATUS=aicc-drained-idle" not in notices
     release.set()
     deadline = time.monotonic() + 5
-    while "STATUS=aicc-drained" not in notices and time.monotonic() < deadline:
+    while "STATUS=aicc-drained-idle" not in notices and time.monotonic() < deadline:
         time.sleep(0.01)
-    assert "STATUS=aicc-drained" in notices
+    assert "STATUS=aicc-drained-idle" in notices
     time.sleep(0.05)
     assert calls[0] == 1, "no claim may begin after the drain ACK"
     daemon.request_stop()
@@ -369,7 +432,7 @@ def test_real_sigterm_boundary_then_bounded_sigkill_allows_lease_redelivery(
             )
             daemon.install_signal_handlers()
             daemon.run_forever()
-        except BaseException:
+        except BaseException:  # noqa: BLE001 - child test reports any failure to parent
             os._exit(1)
         os._exit(0)
 
@@ -755,7 +818,7 @@ def test_a_no_fault_outcome_that_forbids_retry_takes_the_ordinary_path() -> None
 
     def contradictory(payload, lease_lost, attempt_no=1):
         return HandlerOutcome(
-            ok=False, reason="cannot happen", retryable=False, no_fault=True
+            ok=False, reason="cannot happen", retryable=False, lease_wait=True
         )
 
     daemon = WorkerDaemon(
@@ -765,6 +828,32 @@ def test_a_no_fault_outcome_that_forbids_retry_takes_the_ordinary_path() -> None
 
     assert ("fail", "wat-1", "cannot happen", False) in store.calls
     assert not any(c[0] == "fail_lease_wait" for c in store.calls)
+
+
+def test_an_infra_wait_that_forbids_retry_takes_the_ordinary_path() -> None:
+    """The same guard on the substrate wait class (#982 merged onto main's
+    lease_wait / infra_wait split): `retryable=False` is a final verdict and
+    must reach `fail`, never the `fail_infra_wait` refund."""
+    store = ScriptedStore([_work({"kind": "contradiction"})])
+
+    def contradictory(payload, lease_lost, attempt_no=1):
+        return HandlerOutcome(
+            ok=False, reason="cannot happen", retryable=False, infra_wait=True
+        )
+
+    daemon = WorkerDaemon(
+        store, {"contradiction": contradictory}, WorkerConfig(visibility_seconds=3)
+    )
+    _run_until_idle(daemon, store)
+
+    assert ("fail", "wat-1", "cannot happen", False) in store.calls
+    assert not any(c[0] == "fail_infra_wait" for c in store.calls)
+
+
+def test_no_fault_is_the_union_of_the_two_wait_classes() -> None:
+    assert HandlerOutcome(ok=False, lease_wait=True).no_fault is True
+    assert HandlerOutcome(ok=False, infra_wait=True).no_fault is True
+    assert HandlerOutcome(ok=False).no_fault is False
 
 
 # -- VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH ----------------------------
@@ -896,7 +985,7 @@ def test_fleet_refusals_no_longer_dead_letter_the_item_they_never_ran() -> None:
             ok=False,
             reason="writer lease unavailable: acquire_failed: held by a sibling lane",
             retryable=True,
-            no_fault=True,
+            lease_wait=True,
         )
 
     _drain(store, {"agent_run": contended})
@@ -952,7 +1041,7 @@ def test_contention_that_singles_out_one_item_still_terminates_in_the_dlq() -> N
             ok=False,
             reason="executor infrastructure failure (provider/auth/quota): capped",
             retryable=True,
-            no_fault=True,
+            lease_wait=True,
         )
 
     _drain(store, {"agent_run": contended})
@@ -1009,7 +1098,7 @@ def test_an_outage_that_refuses_everything_no_longer_empties_the_queue_into_the_
                 "You've hit your session limit"
             ),
             retryable=True,
-            no_fault=True,
+            lease_wait=True,
         )
 
     _drain(store, {"agent_run": capped})
@@ -1050,7 +1139,7 @@ def test_a_delivery_that_reaches_the_work_clears_the_wait_budget() -> None:
                 ok=False,
                 reason="writer lease unavailable: held by a sibling lane",
                 retryable=True,
-                no_fault=True,
+                lease_wait=True,
             )
         return HandlerOutcome(
             ok=False, reason="the agent produced no verdict", retryable=True
@@ -1104,7 +1193,7 @@ def test_a_host_that_cannot_provide_an_isolated_clone_no_longer_kills_the_item()
         new,
         {
             "agent_run": lambda payload, lease_lost, attempt_no=1: HandlerOutcome(
-                ok=False, reason=reason, retryable=True, no_fault=True
+                ok=False, reason=reason, retryable=True, lease_wait=True
             )
         },
     )
@@ -1112,3 +1201,185 @@ def test_a_host_that_cannot_provide_an_isolated_clone_no_longer_kills_the_item()
     assert new.dead_reason is None
     assert new.attempt_count == 0, "both model attempts intact for a healthier lane"
     assert new.lease_wait_count == new.deliveries == 5
+
+def test_drain_idle_waits_for_claim_handler_and_outcome_persistence():
+    import threading
+
+    claim_entered = threading.Event()
+    claim_release = threading.Event()
+    handler_entered = threading.Event()
+    handler_release = threading.Event()
+    persist_entered = threading.Event()
+    persist_release = threading.Event()
+    busy_ack = threading.Event()
+    idle_ack = threading.Event()
+    notices = []
+
+    class Store(ScriptedStore):
+        def claim(self, queue, *, visibility_seconds):
+            claim_entered.set()
+            assert claim_release.wait(5)
+            return super().claim(queue, visibility_seconds=visibility_seconds)
+
+        def complete(self, work, result):
+            persist_entered.set()
+            assert persist_release.wait(5)
+            return super().complete(work, result)
+
+    store = Store([_work({"kind": "slow"})])
+
+    def handler(payload, lease_lost, attempt_no=1):
+        handler_entered.set()
+        assert handler_release.wait(5)
+        return HandlerOutcome(ok=True, result={})
+
+    def notify(message):
+        notices.append(message)
+        if "STATUS=aicc-drained-idle" in message:
+            idle_ack.set()
+        elif "STATUS=aicc-drained-busy" in message:
+            busy_ack.set()
+
+    daemon = WorkerDaemon(store, {"slow": handler},
+                          WorkerConfig(idle_min_seconds=0.01), notify=notify)
+    worker = threading.Thread(target=daemon.run_forever)
+    worker.start()
+    try:
+        assert claim_entered.wait(5)
+        daemon.request_drain()
+        assert not busy_ack.wait(0.05)
+        assert not idle_ack.is_set()
+        claim_release.set()
+        assert handler_entered.wait(5)
+        assert busy_ack.wait(5)
+        assert not idle_ack.is_set()
+        handler_release.set()
+        assert persist_entered.wait(5)
+        assert not idle_ack.is_set(), "handler completion is not durable completion"
+        persist_release.set()
+        assert idle_ack.wait(5)
+        assert [c[0] for c in store.calls].count("claim") == 1
+        assert ("complete", "wat-1", {}) in store.calls
+    finally:
+        claim_release.set()
+        handler_release.set()
+        persist_release.set()
+        daemon.request_stop()
+        worker.join(5)
+    assert not worker.is_alive()
+
+
+def test_completion_after_reload_cannot_overwrite_ready_with_stale_idle():
+    import threading
+
+    persisting = threading.Event()
+    finish = threading.Event()
+    busy = threading.Event()
+    reloaded = threading.Event()
+    notices = []
+
+    class Store(ScriptedStore):
+        def complete(self, work, result):
+            persisting.set()
+            assert finish.wait(5)
+            return super().complete(work, result)
+
+    store = Store([_work({"kind": "echo"})])
+
+    def notify(message):
+        notices.append(message)
+        if message == "STATUS=aicc-drained-busy":
+            busy.set()
+        if busy.is_set() and message == "STATUS=aicc-ready":
+            reloaded.set()
+
+    daemon = WorkerDaemon(
+        store, {"echo": lambda p, e, a=1: HandlerOutcome(ok=True)},
+        WorkerConfig(idle_min_seconds=0.01), notify=notify,
+    )
+    worker = threading.Thread(target=daemon.run_forever)
+    worker.start()
+    try:
+        assert persisting.wait(5)
+        daemon.request_drain()
+        assert busy.wait(5)
+        daemon.request_reload()
+        assert reloaded.wait(5)
+        ready_index = len(notices)
+        finish.set()
+        deadline = time.monotonic() + 5
+        while not any(c[0] == "complete" for c in store.calls) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert any(c[0] == "complete" for c in store.calls)
+        daemon.request_stop()
+        worker.join(5)
+        assert not any("STATUS=aicc-drained" in p for p in notices[ready_index:])
+    finally:
+        finish.set()
+        daemon.request_stop()
+        worker.join(5)
+    assert not worker.is_alive()
+
+
+@pytest.mark.parametrize("report_failure", ["exception", "refusal"])
+def test_handled_report_failure_does_not_permanently_block_idle_after_reload(report_failure):
+    import threading
+
+    attempted = threading.Event()
+    drained = threading.Event()
+    reloaded = threading.Event()
+    notices = []
+
+    class Store(ScriptedStore):
+        def complete(self, work, result):
+            attempted.set()
+            if report_failure == "exception":
+                raise RuntimeError("ambiguous database write")
+            return False
+
+    store = Store([_work({"kind": "echo"})])
+
+    def notify(message):
+        notices.append(message)
+        if "STATUS=aicc-drained-idle" in message:
+            drained.set()
+        if drained.is_set() and message == "STATUS=aicc-ready":
+            reloaded.set()
+
+    daemon = WorkerDaemon(
+        store, {"echo": lambda p, e, a=1: HandlerOutcome(ok=True)},
+        WorkerConfig(idle_min_seconds=0.01), notify=notify,
+    )
+    worker = threading.Thread(target=daemon.run_forever)
+    worker.start()
+    try:
+        assert attempted.wait(5)
+        daemon.request_drain()
+        assert drained.wait(5), "a handled failure is no longer in-flight work"
+        assert any("STATUS=aicc-drained-idle" in p for p in notices)
+        daemon.request_reload()
+        assert reloaded.wait(5)
+        drained.clear()
+        daemon.request_drain()
+        assert drained.wait(5), "a handled failure is no longer in-flight work"
+        assert any("STATUS=aicc-drained-idle" in p for p in notices)
+    finally:
+        daemon.request_stop()
+        worker.join(5)
+    assert not worker.is_alive()
+
+
+
+def test_unhandled_execution_exception_does_not_advertise_idle():
+    store = ScriptedStore([_work({"kind": "echo"})])
+    notices = []
+    daemon = WorkerDaemon(store, {}, notify=notices.append)
+
+    def execute(work):
+        daemon.request_drain()
+        raise RuntimeError("unhandled execution failure")
+
+    daemon._execute = execute
+    with pytest.raises(RuntimeError, match="unhandled execution failure"):
+        daemon.run_forever()
+    assert not any("STATUS=aicc-drained-idle" in p for p in notices)

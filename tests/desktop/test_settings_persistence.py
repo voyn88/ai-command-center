@@ -94,6 +94,32 @@ def test_density_preference_roundtrips(settings_store, settings_file):
     assert _reopen_store(settings_file).density_mode() is DensityMode.COMPACT
 
 
+def test_data_source_mode_defaults_local_and_roundtrips(settings_store, settings_file):
+    from command_center.platform import DataSourceMode
+
+    assert settings_store.data_source_mode() is DataSourceMode.LOCAL
+    settings_store.set_data_source_mode(DataSourceMode.SERVER)
+    settings_store.sync()
+    assert _reopen_store(settings_file).data_source_mode() is DataSourceMode.SERVER
+
+
+def test_data_source_mode_toggle_persists_across_restart(qtbot, qapp, settings_store, settings_file):
+    from command_center.platform import DataSourceMode
+
+    first, _ = build_shell(qapp, settings_store)
+    qtbot.addWidget(first)
+    first.navigate_to("settings")
+    first._settings_page.data_source_buttons()[DataSourceMode.SERVER].click()
+    first.shutdown()
+
+    reopened = _reopen_store(settings_file)
+    assert reopened.data_source_mode() is DataSourceMode.SERVER
+
+    second, _ = build_shell(qapp, reopened)
+    qtbot.addWidget(second)
+    assert second._settings.data_source_mode() is DataSourceMode.SERVER
+
+
 def test_reset_window_geometry_removes_geometry_and_state(
     settings_store, settings_file
 ):

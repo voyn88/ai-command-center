@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the worker release deploy tick periodically (VOYN-W0-AICC-WORKER-SELF-DEPLOY-MUST-STAGE-IMMUTABLE-RELEASE)
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

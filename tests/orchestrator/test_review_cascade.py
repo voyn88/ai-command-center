@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from command_center import agent_runner
 from command_center.orchestrator import review_merge
 
@@ -39,6 +41,10 @@ def test_review_payload_carries_the_two_step_cascade(monkeypatch):
     assert [link["executor"] for link in payload["cascade"]] == ["codex", "claude"]
     assert payload["untrusted"] is True
     assert payload["task_type"] == "independent_review"
+    assert payload["review_head"] == {
+        "pr_number": "7",
+        "head_sha": "a" * 40,
+    }
     assert all(
         link["task_type"] == "independent_review"
         and link["capability"] == "model_only"
@@ -97,6 +103,69 @@ def test_empty_review_route_fails_closed_without_enqueuing(monkeypatch):
     )
     assert calls == []
     assert report.skipped == [("VOYN-W0-X", "no_review_executor_route")]
+
+
+def test_owner_alternatives_review_filters_keep_grok_4_6_exclude_cursor(monkeypatch):
+    """owner-alternatives is cursor+grok; model_only/verification filters must
+    keep the supported Grok 4.6 reviewer and drop Cursor before enqueue, so the
+    route is not emptied into no_review_executor_route ahead of worker rewrite.
+    Independent identity/acceptance gates are unchanged by this allowlist.
+    """
+    monkeypatch.setenv("AICC_EXECUTOR_PROFILE", "owner-alternatives")
+    model_only = review_merge._model_only_review_cascade()
+    verification = review_merge._verification_review_cascade()
+
+    assert [link["executor"] for link in model_only] == ["grok"]
+    assert model_only[0]["model"] == "grok-4.6"
+    assert model_only[0]["task_type"] == "independent_review"
+    assert model_only[0]["capability"] == "model_only"
+
+    assert [link["executor"] for link in verification] == ["grok"]
+    assert verification[0]["model"] == "grok-4.6"
+    assert verification[0]["task_type"] == "verification_review"
+    assert verification[0]["capability"] == "read_only"
+
+    assert "cursor" not in review_merge._MODEL_ONLY_REVIEW_EXECUTORS
+    assert "grok" in review_merge._MODEL_ONLY_REVIEW_EXECUTORS
+
+    # Enqueue path must carry Grok 4.6 through the model_only filter (not empty).
+    monkeypatch.setattr(
+        review_merge,
+        "_rows",
+        lambda *args: [
+            ("VOYN-W0-X", "https://github.com/o/ai-command-center/pull/7")
+        ],
+    )
+    monkeypatch.setattr(
+        review_merge,
+        "_pr_diff_and_head",
+        lambda *args: review_merge._PRSnapshot.create(
+            "diff", "b" * 40, "a" * 40
+        ),
+    )
+    monkeypatch.setattr(
+        "command_center.orchestrator.planner.repo_route",
+        lambda repo: ("AICC", "/srv/aicc"),
+    )
+    calls = []
+    report = review_merge.review_once(
+        object(), lambda *args: calls.append(args), "/srv/aicc"
+    )
+    assert report.skipped == []
+    assert len(calls) == 1
+    _queue, _key, payload, task_id, max_attempts = calls[0]
+    assert task_id == "VOYN-W0-X"
+    assert [link["executor"] for link in payload["cascade"]] == ["grok"]
+    assert payload["cascade"][0]["model"] == "grok-4.6"
+    assert payload["cascade"][0]["capability"] == "model_only"
+    assert payload["task_type"] == "independent_review"
+    assert max_attempts == 1
+    # Cursor Ask remains excluded from model-only argv construction.
+    monkeypatch.setenv(agent_runner.PRINCIPAL_ISOLATION_REQUIRED_ENV, "required")
+    with pytest.raises(agent_runner.RunnerError, match="model-only"):
+        agent_runner.build_cursor_command(
+            payload["prompt"], task_type="independent_review"
+        )
 
 
 def test_review_tick_stops_when_global_review_wip_is_full(monkeypatch):

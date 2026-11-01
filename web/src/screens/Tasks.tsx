@@ -9,16 +9,40 @@
 //
 // The owner token is asked for once, inline, when the server answers 401 —
 // the SPA is served by the same origin as the API, so there is no separate
-// login route to build or protect.
+// login route to build or protect. That single gate covers every call the
+// screen makes: a 401 from the audit POST locks the screen exactly like a
+// 401 from the queue reads, because both mean the same thing — the stored
+// credential is missing or rejected.
 
 import { useCallback, useEffect, useState } from 'react'
+import type { FormEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 import BackgroundSwitcher from '../components/BackgroundSwitcher'
 import GlassPanel from '../components/GlassPanel'
 import LangToggle from '../components/LangToggle'
 import NavItem from '../components/NavItem'
 import { ExecutionIcon, HomeIcon, TasksIcon } from '../components/NavIcons'
+import { fetchHome } from '../lib/api'
+import type { Project } from '../lib/api'
 import {
+  confirmBacklogTask,
+  draftBacklogTask,
+  fetchBacklogStatus,
+  fetchBacklogTaskDetail,
+  fetchBacklogTasks,
+  reassignBacklogTask,
+} from '../lib/backlogApi'
+import type {
+  BacklogStatusCounts,
+  BacklogStoreTask,
+  BacklogTaskDetail,
+  DraftResult,
+  Transcript,
+} from '../lib/backlogApi'
+import { dictationSupported, startDictation } from '../lib/voiceInput'
+import type { DictationError, DictationHandle } from '../lib/voiceInput'
+import {
+  enqueueAudit,
   fetchQueueItem,
   fetchQueueItems,
   QueueAuthError,
@@ -128,11 +152,519 @@ function TaskRow({ item, language, fallback }: { item: QueueItem; language: stri
   )
 }
 
-function TokenGate({ onUnlocked }: { onUnlocked: () => void }) {
+/** What the owner was about to run — carried back to the screen when a
+ * submit is refused for credentials, so unlocking does not silently discard
+ * an edited prompt. */
+type AuditDraft = { projectId: string; prompt: string }
+
+/** The project the picker starts on: the draft's, while it still exists in
+ * the list, otherwise the first project. */
+function preferredProject(projects: Project[], draft: AuditDraft | null): string {
+  if (draft && projects.some((project) => project.id === draft.projectId)) return draft.projectId
+  return projects[0]?.id ?? ''
+}
+
+/** The one-button audit trigger (APP-CONTROL-S4): pick a project, confirm
+ * (or edit) the review prompt, and enqueue an `agent_run` — the server
+ * pins the safe profile (task_type=review, untrusted=false) and resolves
+ * `repository_path` from the project's own config, so the caller here only
+ * ever needs a project id.
+ *
+ * The panel owns no credential of its own: a 401 is handed up via
+ * `onAuthRequired` so the screen's one `TokenGate` does the repair. */
+function AuditLauncher({
+  projects,
+  draft,
+  onQueued,
+  onAuthRequired,
+}: {
+  projects: Project[]
+  draft: AuditDraft | null
+  onQueued: () => void
+  onAuthRequired: (draft: AuditDraft) => void
+}) {
+  const { t } = useTranslation()
+  const [projectId, setProjectId] = useState(() => preferredProject(projects, draft))
+  const [prompt, setPrompt] = useState(() => draft?.prompt ?? t('auditPromptDefault'))
+  const [status, setStatus] = useState<'idle' | 'sending' | 'error'>('idle')
+  const [lastQueued, setLastQueued] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (!projectId && projects.length > 0) setProjectId(preferredProject(projects, draft))
+  }, [projects, projectId, draft])
+
+  if (projects.length === 0) return null
+
+  const submit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    if (!projectId || !prompt.trim() || status === 'sending') return
+    setStatus('sending')
+    setLastQueued(null)
+    try {
+      const ack = await enqueueAudit({ project_id: projectId, prompt: prompt.trim() })
+      setStatus('idle')
+      setLastQueued(ack.work_item_id)
+      onQueued()
+    } catch (error) {
+      if (error instanceof QueueAuthError) {
+        // The stored credential is missing or rejected. Retrying here would
+        // just resend it, so hand the failure — and the draft — to the
+        // screen, which shows the unlock control and reloads once a new
+        // credential is stored.
+        setStatus('idle')
+        onAuthRequired({ projectId, prompt: prompt.trim() })
+      } else {
+        setStatus('error')
+      }
+    }
+  }
+
+  return (
+    <GlassPanel title={t('auditTitle')}>
+      <form onSubmit={submit} style={{ display: 'flex', flexDirection: 'column', gap: '.6rem' }}>
+        <div style={{ display: 'flex', gap: '.6rem', flexWrap: 'wrap' }}>
+          <select
+            className="task-token-input"
+            value={projectId}
+            onChange={(event) => setProjectId(event.target.value)}
+            aria-label={t('auditProjectLabel')}
+          >
+            {projects.map((project) => (
+              <option key={project.id} value={project.id}>
+                {project.name}
+              </option>
+            ))}
+          </select>
+          <button type="submit" className="execution-back" disabled={status === 'sending'}>
+            {status === 'sending' ? t('auditSubmitting') : t('auditSubmit')}
+          </button>
+        </div>
+        <textarea
+          className="task-token-input"
+          value={prompt}
+          onChange={(event) => setPrompt(event.target.value)}
+          aria-label={t('auditPromptLabel')}
+          rows={2}
+          style={{ width: '100%', resize: 'vertical', fontFamily: 'inherit' }}
+        />
+        {status === 'error' && <p style={{ color: 'var(--bad)', margin: 0 }}>{t('auditError')}</p>}
+        {lastQueued && status === 'idle' && (
+          <p style={{ color: 'var(--ok)', margin: 0 }}>{t('auditQueued')}</p>
+        )}
+      </form>
+    </GlassPanel>
+  )
+}
+
+const BACKLOG_STATUSES = [
+  'OPEN',
+  'IN_PROGRESS',
+  'READY_TO_REVIEW',
+  'DONE',
+  'UNTRIAGED',
+  'DEFER_TO_USER',
+  'SPLIT',
+  'NEEDS_REFINEMENT',
+  'DECIDED',
+] as const
+
+function backlogStatusLabel(status: string, t: (key: string) => string): string {
+  const key = `backlogStatus${status}`
+  const label = t(key)
+  return label === key ? status : label
+}
+
+function backlogStatusTone(status: string): string {
+  if (status === 'DONE') return 'var(--ok)'
+  if (status === 'DEFER_TO_USER' || status === 'NEEDS_REFINEMENT') return 'var(--bad)'
+  if (status === 'IN_PROGRESS' || status === 'READY_TO_REVIEW') return 'var(--accent-2)'
+  return 'var(--tx3)'
+}
+
+/** History for one backlog task (S6c drill-down): the transition trail that
+ * makes up its "decomposition" — this record IS one piece of the larger
+ * central task, and its events are the progress record for that piece. */
+function BacklogHistory({ taskId }: { taskId: string }) {
+  const { t } = useTranslation()
+  const [detail, setDetail] = useState<BacklogTaskDetail | null>(null)
+  const [failed, setFailed] = useState(false)
+
+  useEffect(() => {
+    setDetail(null)
+    setFailed(false)
+    fetchBacklogTaskDetail(taskId).then(setDetail).catch(() => setFailed(true))
+  }, [taskId])
+
+  if (failed) return <p className="task-details" style={{ color: 'var(--bad)' }}>{t('errorLoading')}</p>
+  if (!detail) return <p className="task-details">{t('loading')}</p>
+  return (
+    <div className="task-details">
+      {detail.events.length === 0 ? (
+        <p>{t('backlogHistoryEmpty')}</p>
+      ) : (
+        detail.events.map((event, index) => (
+          <p key={`${event.created_at}-${index}`}>
+            {event.event} — {event.outcome}
+            {event.reason ? ` (${event.reason})` : ''}
+          </p>
+        ))
+      )}
+    </div>
+  )
+}
+
+/** Inline priority/wave reprioritization for one backlog task (S6d): the
+ * optimistic-revision form the same operation the chat/voice parser drives
+ * (S6a/S6b) when it re-issues a task line with a changed token. */
+function BacklogReassignForm({
+  item,
+  onSaved,
+}: {
+  item: BacklogStoreTask
+  onSaved: (next: { wave: string; priority: string | null; revision: number }) => void
+}) {
+  const { t } = useTranslation()
+  const [wave, setWave] = useState(item.wave)
+  const [priority, setPriority] = useState(item.priority ?? '')
+  const [status, setStatus] = useState<'idle' | 'saving' | 'error' | 'conflict'>('idle')
+
+  const dirty = wave.trim() !== item.wave || priority.trim() !== (item.priority ?? '')
+
+  const submit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    if (!dirty || !wave.trim() || status === 'saving') return
+    setStatus('saving')
+    try {
+      const result = await reassignBacklogTask(item.task_id, {
+        wave: wave.trim(),
+        priority: priority.trim() || null,
+        expected_revision: item.revision,
+      })
+      setStatus('idle')
+      onSaved({ wave: wave.trim(), priority: priority.trim() || null, revision: result.revision })
+    } catch (error) {
+      // `reassign`'s 409 body is `{reason, revision}` — not a string `detail`,
+      // so `authedPost` falls back to the bare status code as the reason.
+      setStatus(error instanceof Error && error.message.endsWith('-> 409') ? 'conflict' : 'error')
+    }
+  }
+
+  return (
+    <form onSubmit={submit} style={{ display: 'flex', gap: '.5rem', flexWrap: 'wrap', alignItems: 'center' }}>
+      <label style={{ display: 'flex', gap: '.35rem', alignItems: 'center', fontSize: '.72rem', color: 'var(--tx3)' }}>
+        {t('backlogWave')}
+        <input
+          className="task-token-input"
+          style={{ minWidth: '5rem', padding: '.3rem .5rem' }}
+          value={wave}
+          onChange={(event) => setWave(event.target.value)}
+        />
+      </label>
+      <label style={{ display: 'flex', gap: '.35rem', alignItems: 'center', fontSize: '.72rem', color: 'var(--tx3)' }}>
+        {t('backlogPriority')}
+        <input
+          className="task-token-input"
+          style={{ minWidth: '4rem', padding: '.3rem .5rem' }}
+          value={priority}
+          onChange={(event) => setPriority(event.target.value)}
+        />
+      </label>
+      <button type="submit" className="task-toggle" disabled={!dirty || status === 'saving'}>
+        {status === 'saving' ? t('backlogReassignSaving') : t('backlogReassignSave')}
+      </button>
+      {status === 'conflict' && <span style={{ color: 'var(--bad)', fontSize: '.7rem' }}>{t('backlogReassignConflict')}</span>}
+      {status === 'error' && <span style={{ color: 'var(--bad)', fontSize: '.7rem' }}>{t('backlogReassignError')}</span>}
+    </form>
+  )
+}
+
+function BacklogTaskRow({ item, onReassigned }: { item: BacklogStoreTask; onReassigned: (id: string, next: { wave: string; priority: string | null; revision: number }) => void }) {
+  const { t } = useTranslation()
+  const [open, setOpen] = useState(false)
+
+  return (
+    <article className="task-row">
+      <div style={{ display: 'flex', alignItems: 'center', gap: '.8rem', flexWrap: 'wrap' }}>
+        <span className="task-status" style={{ color: backlogStatusTone(item.status) }}>
+          {backlogStatusLabel(item.status, t)}
+        </span>
+        <strong style={{ color: 'var(--tx)', fontSize: '.84rem', flex: 1, minWidth: '8rem' }}>{item.title}</strong>
+        <span className="task-date">
+          {t('backlogWave')} {item.wave} · {t('backlogPriority')} {item.priority ?? t('backlogNoPriority')}
+        </span>
+        <button type="button" className="task-toggle" onClick={() => setOpen((v) => !v)}>
+          {open ? t('taskHide') : t('taskDetails')}
+        </button>
+      </div>
+      {open && (
+        <>
+          <BacklogReassignForm item={item} onSaved={(next) => onReassigned(item.task_id, next)} />
+          <div>
+            <p className="task-details-label" style={{ margin: '0 0 .3rem' }}>{t('backlogHistory')}</p>
+            <BacklogHistory taskId={item.task_id} />
+          </div>
+        </>
+      )}
+    </article>
+  )
+}
+
+/** What the server repaired in a dictated transcript (S6b) — shown above the
+ * proposed line so a misheard term is visible and correctable, never a silent
+ * rewrite of what the owner said. */
+function TranscriptRepairs({ transcript }: { transcript: Transcript }) {
+  const { t } = useTranslation()
+  if (transcript.corrections.length === 0) return null
+  return (
+    <p style={{ margin: 0, color: 'var(--tx3)', fontSize: '.85rem' }}>
+      {t('voiceCorrections')}{' '}
+      {transcript.corrections
+        .map((correction) => `«${correction.heard}» → ${correction.written}`)
+        .join(', ')}
+    </p>
+  )
+}
+
+/** Chat and voice intake (S6a/S6b): draft a proposed backlog line from free
+ * text — typed, or dictated into the same box through the device's own
+ * recognizer — let the owner read (and edit) it, then confirm. Dictation only
+ * fills the text box; every word still goes through the same draft → confirm
+ * gate, because a transcript is a suggestion, not an instruction. */
+function BacklogIntake({ onCreated }: { onCreated: () => void }) {
+  const { t, i18n } = useTranslation()
+  const [text, setText] = useState('')
+  const [line, setLine] = useState<string | null>(null)
+  const [parseFailed, setParseFailed] = useState(false)
+  const [phase, setPhase] = useState<'idle' | 'drafting' | 'previewing' | 'confirming' | 'locked' | 'draftError' | 'confirmError' | 'duplicate' | 'success'>('idle')
+  const [dictation, setDictation] = useState<DictationHandle | null>(null)
+  const [voiceError, setVoiceError] = useState<DictationError | null>(null)
+  // Sticky for the whole entry: text that arrived by microphone stays flagged
+  // as a transcript even after the owner edits a word by hand, so the server
+  // still repairs the terms it did not touch.
+  const [dictated, setDictated] = useState(false)
+  const [transcript, setTranscript] = useState<Transcript | null>(null)
+  const canDictate = dictationSupported()
+
+  const listen = () => {
+    if (dictation) {
+      dictation.stop()
+      return
+    }
+    setVoiceError(null)
+    // Whatever is already in the box is kept: dictation appends to the
+    // owner's own words instead of overwriting them.
+    const typed = text.trim()
+    const handle = startDictation({
+      lang: i18n.language.startsWith('ru') ? 'ru-RU' : 'en-US',
+      onText: (heard) => {
+        setDictated(true)
+        setText(typed ? `${typed} ${heard}` : heard)
+      },
+      onError: setVoiceError,
+      onEnd: () => setDictation(null),
+    })
+    setDictation(handle)
+  }
+
+  const draft = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    if (!text.trim() || phase === 'drafting') return
+    dictation?.stop()
+    setPhase('drafting')
+    try {
+      const result: DraftResult = await draftBacklogTask(text.trim(), dictated ? 'voice' : 'chat')
+      setParseFailed(!result.ok)
+      setLine(result.ok ? result.line : result.raw_output)
+      setTranscript(result.transcript ?? null)
+      setPhase('previewing')
+    } catch (error) {
+      setPhase(error instanceof QueueAuthError ? 'locked' : 'draftError')
+    }
+  }
+
+  const confirm = async () => {
+    if (!line || !line.trim() || phase === 'confirming') return
+    setPhase('confirming')
+    try {
+      await confirmBacklogTask(line.trim())
+      setPhase('success')
+      setText('')
+      setLine(null)
+      setTranscript(null)
+      setDictated(false)
+      onCreated()
+    } catch (error) {
+      if (error instanceof QueueAuthError) setPhase('locked')
+      // `confirm`'s 409 body is a string `detail` ("... already exists ..."),
+      // which `authedPost` surfaces verbatim as the reason.
+      else if (error instanceof Error && error.message.includes('already exists')) setPhase('duplicate')
+      else setPhase('confirmError')
+    }
+  }
+
+  const cancel = () => {
+    setLine(null)
+    setTranscript(null)
+    setPhase('idle')
+  }
+
+  return (
+    <GlassPanel title={t('intakeTitle')}>
+      {line === null ? (
+        <form onSubmit={draft} style={{ display: 'flex', gap: '.6rem', flexWrap: 'wrap' }}>
+          <textarea
+            className="task-token-input"
+            value={text}
+            onChange={(event) => setText(event.target.value)}
+            aria-label={t('intakeTitle')}
+            placeholder={t('intakePlaceholder')}
+            rows={2}
+            style={{ width: '100%', resize: 'vertical', fontFamily: 'inherit' }}
+          />
+          <div style={{ display: 'flex', gap: '.6rem', flexWrap: 'wrap', alignItems: 'center' }}>
+            <button type="submit" className="execution-back" disabled={!text.trim() || phase === 'drafting'}>
+              {phase === 'drafting' ? t('intakeDrafting') : t('intakeDraft')}
+            </button>
+            {canDictate && (
+              <button
+                type="button"
+                className="task-toggle"
+                onClick={listen}
+                aria-pressed={dictation !== null}
+                title={t('voiceHint')}
+              >
+                {dictation ? t('voiceStop') : t('voiceStart')}
+              </button>
+            )}
+            {dictation && <span style={{ color: 'var(--accent-2)' }}>{t('voiceListening')}</span>}
+          </div>
+        </form>
+      ) : (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '.6rem' }}>
+          {transcript && <TranscriptRepairs transcript={transcript} />}
+          <p style={{ margin: 0, color: parseFailed ? 'var(--bad)' : 'var(--tx3)' }}>
+            {parseFailed ? t('intakeParseFailed') : t('intakePreview')}
+          </p>
+          <textarea
+            className="task-token-input"
+            value={line}
+            onChange={(event) => setLine(event.target.value)}
+            aria-label={t('intakePreview')}
+            rows={2}
+            style={{ width: '100%', resize: 'vertical', fontFamily: 'var(--font-mono)' }}
+          />
+          <div style={{ display: 'flex', gap: '.6rem' }}>
+            <button type="button" className="execution-back" onClick={confirm} disabled={!line.trim() || phase === 'confirming'}>
+              {phase === 'confirming' ? t('intakeConfirming') : t('intakeConfirm')}
+            </button>
+            <button type="button" className="task-toggle" onClick={cancel}>{t('intakeCancel')}</button>
+          </div>
+        </div>
+      )}
+      {voiceError && (
+        <p style={{ color: 'var(--bad)', margin: 0 }}>
+          {t(
+            voiceError === 'denied'
+              ? 'voiceDenied'
+              : voiceError === 'no-speech'
+                ? 'voiceNoSpeech'
+                : voiceError === 'network'
+                  ? 'voiceNetwork'
+                  : 'voiceError',
+          )}
+        </p>
+      )}
+      {phase === 'locked' && <p style={{ color: 'var(--bad)', margin: 0 }}>{t('intakeLocked')}</p>}
+      {phase === 'draftError' && <p style={{ color: 'var(--bad)', margin: 0 }}>{t('intakeDraftError')}</p>}
+      {phase === 'confirmError' && <p style={{ color: 'var(--bad)', margin: 0 }}>{t('intakeError')}</p>}
+      {phase === 'duplicate' && <p style={{ color: 'var(--bad)', margin: 0 }}>{t('intakeDuplicate')}</p>}
+      {phase === 'success' && <p style={{ color: 'var(--ok)', margin: 0 }}>{t('intakeSuccess')}</p>}
+    </GlassPanel>
+  )
+}
+
+/** The central backlog's status and decomposition (S6c): an overall
+ * done/total progress bar, per-status counts, and the task list itself —
+ * each row IS one piece of the decomposition, with its own history and
+ * reprioritization control. */
+function BacklogSection() {
+  const { t } = useTranslation()
+  const [status, setStatus] = useState<BacklogStatusCounts | null>(null)
+  const [tasks, setTasks] = useState<BacklogStoreTask[] | null>(null)
+  const [error, setError] = useState(false)
+
+  const load = useCallback(() => {
+    setError(false)
+    Promise.all([fetchBacklogStatus(), fetchBacklogTasks()])
+      .then(([statusResult, tasksResult]) => {
+        setStatus(statusResult)
+        setTasks(tasksResult.tasks)
+      })
+      .catch(() => setError(true))
+  }, [])
+  useEffect(load, [load])
+
+  const reassign = (taskId: string, next: { wave: string; priority: string | null; revision: number }) => {
+    setTasks((current) =>
+      current
+        ? current.map((task) => (task.task_id === taskId ? { ...task, ...next } : task))
+        : current,
+    )
+  }
+
+  if (error) {
+    return (
+      <GlassPanel title={t('backlogTitle')}>
+        <p style={{ color: 'var(--bad)' }}>{t('backlogErrorLoading')}</p>
+        <button className="execution-back" onClick={load}>{t('retry')}</button>
+      </GlassPanel>
+    )
+  }
+  if (!status || !tasks) {
+    return <GlassPanel title={t('backlogTitle')}>{t('loading')}</GlassPanel>
+  }
+
+  const done = status.counts['DONE'] ?? 0
+  const percent = status.total === 0 ? 0 : Math.round((done / status.total) * 100)
+
+  return (
+    <>
+      <BacklogIntake onCreated={load} />
+      <GlassPanel title={t('backlogTitle')}>
+        <p style={{ color: 'var(--tx3)', marginTop: 0 }}>{t('backlogSubtitle')}</p>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '.6rem', marginBottom: '.9rem' }}>
+          <div style={{ flex: 1, height: '.5rem', borderRadius: '999px', background: 'rgba(255,255,255,.08)', overflow: 'hidden' }}>
+            <div style={{ width: `${percent}%`, height: '100%', background: 'var(--ok)' }} />
+          </div>
+          <span style={{ fontSize: '.72rem', color: 'var(--tx3)', whiteSpace: 'nowrap' }}>
+            {percent}% {t('backlogProgress')} ({done}/{status.total})
+          </span>
+        </div>
+        <div className="execution-filters" aria-label={t('allStates')}>
+          {BACKLOG_STATUSES.map((state) => (
+            <span key={state} style={{ color: 'var(--tx3)', fontSize: '.68rem' }}>
+              {backlogStatusLabel(state, t)}: {status.counts[state] ?? 0}
+            </span>
+          ))}
+        </div>
+        <div className="execution-list">
+          {tasks.length === 0 ? (
+            <p style={{ color: 'var(--tx3)' }}>{t('backlogEmpty')}</p>
+          ) : (
+            tasks.map((item) => <BacklogTaskRow key={item.task_id} item={item} onReassigned={reassign} />)
+          )}
+        </div>
+      </GlassPanel>
+    </>
+  )
+}
+
+function TokenGate({ notice, onUnlocked }: { notice?: string | null; onUnlocked: () => void }) {
   const { t } = useTranslation()
   const [value, setValue] = useState('')
   return (
     <GlassPanel title={t('tokenPrompt')}>
+      {notice && <p style={{ color: 'var(--bad)', marginTop: 0 }}>{notice}</p>}
       <p style={{ color: 'var(--tx3)', marginTop: 0 }}>{t('tokenHint')}</p>
       <form
         style={{ display: 'flex', gap: '.6rem', flexWrap: 'wrap' }}
@@ -163,6 +695,8 @@ export default function Tasks({ onNavigate }: { onNavigate: (screen: 'home' | 'e
   const [locked, setLocked] = useState(false)
   const [error, setError] = useState(false)
   const [filter, setFilter] = useState<string>('ALL')
+  const [projects, setProjects] = useState<Project[]>([])
+  const [pendingAudit, setPendingAudit] = useState<AuditDraft | null>(null)
 
   const load = useCallback(() => {
     setError(false)
@@ -175,6 +709,36 @@ export default function Tasks({ onNavigate }: { onNavigate: (screen: 'home' | 'e
       })
   }, [filter])
   useEffect(load, [load])
+  // The audit launcher's project picker: GET /api/home is unauthenticated
+  // (same source Home.tsx uses), independent of the owner-token gate above.
+  useEffect(() => {
+    fetchHome()
+      .then((data) => setProjects(data.projects))
+      .catch(() => setProjects([]))
+  }, [])
+
+  // A 401 from the audit POST is the same condition as a 401 from the reads,
+  // so it takes the same route: lock the screen, which renders the one
+  // `TokenGate`. The refused draft is kept so the launcher comes back with
+  // it once a new credential unlocks the screen.
+  const requireUnlock = useCallback((draft: AuditDraft) => {
+    setPendingAudit(draft)
+    setLocked(true)
+  }, [])
+
+  // A queued audit retires its draft: a later lock (from the reads, say)
+  // must not claim an audit is still waiting to be started.
+  const handleQueued = useCallback(() => {
+    setPendingAudit(null)
+    load()
+  }, [load])
+  // The audit launcher's project picker: GET /api/home is unauthenticated
+  // (same source Home.tsx uses), independent of the owner-token gate above.
+  useEffect(() => {
+    fetchHome()
+      .then((data) => setProjects(data.projects))
+      .catch(() => setProjects([]))
+  }, [])
 
   const visible = items || []
 
@@ -195,7 +759,9 @@ export default function Tasks({ onNavigate }: { onNavigate: (screen: 'home' | 'e
           <NavItem label={t('tasks')} icon={<TasksIcon />} active onClick={() => onNavigate('tasks')} />
         </aside>
         <main className="execution-main">
-          {locked && <TokenGate onUnlocked={load} />}
+          {locked && (
+            <TokenGate notice={pendingAudit ? t('auditLocked') : null} onUnlocked={load} />
+          )}
           {!locked && !items && !error && <GlassPanel>{t('loading')}</GlassPanel>}
           {!locked && error && (
             <GlassPanel>
@@ -203,6 +769,15 @@ export default function Tasks({ onNavigate }: { onNavigate: (screen: 'home' | 'e
               <button className="execution-back" onClick={load}>{t('retry')}</button>
             </GlassPanel>
           )}
+          {!locked && items && (
+            <AuditLauncher
+              projects={projects}
+              draft={pendingAudit}
+              onQueued={handleQueued}
+              onAuthRequired={requireUnlock}
+            />
+          )}
+          {!locked && items && <BacklogSection />}
           {!locked && items && (
             <GlassPanel title={t('tasks')}>
               <div className="execution-filters" aria-label={t('allStates')}>

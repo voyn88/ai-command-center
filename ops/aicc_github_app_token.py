@@ -17,6 +17,14 @@ only the worker principal can read it:
   lane's ``GH_CONFIG_DIR`` (the AGENT's launcher points GH_CONFIG_DIR at a
   nonexistent path, so untrusted model code never sees the token).
 
+The same store is what gives the CONTROL ticks their own GitHub quota
+(``command_center/orchestrator/gh_access.py``): they run as ``aicc-worker``
+and so can read it, which is what stopped them dying with the operator's own
+exhausted GraphQL budget
+(VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS). Their extra read scopes
+are requested on top of the lane set and degrade to it if ungranted -- see
+``CONTROL_PERMISSIONS``.
+
 Standard library plus ``openssl dgst`` for the RS256 JWT: no new dependency on
 a host whose only job is to run the fleet. The private key stays root-only on
 the host; rejected alternatives: a long-lived PAT (human credential), a
@@ -32,6 +40,7 @@ import os
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -39,6 +48,20 @@ DEFAULT_PEM = Path("/etc/voyn/secrets/aicc-github-app.pem")
 DEFAULT_ROOT = Path("/var/lib/aicc/github")
 DEFAULT_REPOS = ("ai-command-center", "aios", "voyn-logistics-crm")
 DEFAULT_PERMISSIONS = {"contents": "write", "pull_requests": "write", "metadata": "read"}
+#: What the CONTROL ticks additionally need once they run under this token
+#: instead of a human's (VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS):
+#: the check rollup and commit statuses a PR's eligibility is decided from,
+#: and the workflow reruns the merge tick asks for on a cancelled or flaky
+#: required check. Requested on top of the base set, never instead of it --
+#: an installation that was granted only the base set still gets a token
+#: (see `mint`), because the worker lanes' git access must not depend on a
+#: permission the owner has not approved yet.
+CONTROL_PERMISSIONS = {
+    **DEFAULT_PERMISSIONS,
+    "checks": "read",
+    "statuses": "read",
+    "actions": "write",
+}
 API = "https://api.github.com"
 JWT_LIFETIME_SECONDS = 540
 
@@ -71,7 +94,36 @@ def _openssl_sign(pem: Path, payload: bytes) -> bytes:
     ).stdout
 
 
-def mint(app_id: str, installation_id: str, pem: Path, *, repositories, permissions, opener=None) -> dict:
+def mint(
+    app_id: str,
+    installation_id: str,
+    pem: Path,
+    *,
+    repositories,
+    permissions,
+    fallback_permissions=None,
+    opener=None,
+) -> dict:
+    """One installation token, narrowed to `repositories` and `permissions`.
+
+    GitHub refuses (422) a token that asks for a permission the owner never
+    granted the installation, and the refusal is all-or-nothing: one
+    ungranted extra would leave the fleet with NO token at all -- no git
+    fetch, no publish, no ticks. So an optional `fallback_permissions` set is
+    retried once on that refusal, which is what lets this ask for the control
+    ticks' extra read scopes without making the lanes' git access hostage to
+    an approval that has not happened yet."""
+    try:
+        return _access_token(app_id, installation_id, pem, repositories, permissions, opener)
+    except urllib.error.HTTPError as exc:
+        if fallback_permissions is None or exc.code not in (403, 422):
+            raise
+    return _access_token(
+        app_id, installation_id, pem, repositories, fallback_permissions, opener
+    )
+
+
+def _access_token(app_id, installation_id, pem, repositories, permissions, opener) -> dict:
     request = urllib.request.Request(
         f"{API}/app/installations/{installation_id}/access_tokens",
         data=json.dumps({"permissions": dict(permissions), "repositories": list(repositories)}).encode(),
@@ -145,7 +197,8 @@ def main(argv: list[str] | None = None) -> int:
         args.installation_id,
         args.pem,
         repositories=args.repository or DEFAULT_REPOS,
-        permissions=DEFAULT_PERMISSIONS,
+        permissions=CONTROL_PERMISSIONS,
+        fallback_permissions=DEFAULT_PERMISSIONS,
     )
     store(document, args.root)
     print(json.dumps({

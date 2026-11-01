@@ -20,10 +20,22 @@ redrive (``queue_redrive``) widens ``max_attempts`` without resetting
 within one pass through the cascade; the wrap is what makes a redrive's
 fresh attempts walk the cascade again instead of dead-ending on the last
 link every time (VOYN-W0-AICC-REDRIVE-CLAMP-RESETS-TO-LAST-LINK).
+
+This table stays STATIC in the other sense too: an executor whose account is
+out of quota is not withdrawn from it. Quota is a fact about a credential on
+one host at one moment, discovered by running the CLI there and cured by a
+rolling window nobody can observe from the control plane, so it is held where
+it is discovered -- `agent_runner.record_executor_exhausted`, consulted by
+`worker.handlers._executor_preflight`, which skips the exhausted link inside
+a delivery the worker already holds rather than spending an attempt on it
+(VOYN-W0-AICC-EXECUTOR-QUOTA-AWARE-ROUTING). Editing this table to route
+around an exhausted account would outlive the exhaustion and would need a
+second edit to undo; the circuit reopens on its own.
 """
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 __all__ = ["ROUTING_MATRIX", "cascade_for"]
@@ -80,6 +92,10 @@ ROUTING_MATRIX: dict[str, list[dict[str, Any]]] = {
 def cascade_for(task_class: str) -> list[dict[str, Any]]:
     """The cascade for a task class; unknown classes get the implementation
     route rather than a refusal — routing chooses HOW, never WHETHER."""
+    if os.environ.get("AICC_EXECUTOR_PROFILE") == "owner-alternatives":
+        task_type = "review" if task_class == "review" else "implementation"
+        return [{"executor": "cursor", "task_type": task_type, "model": "auto"},
+                {"executor": "grok", "task_type": task_type, "model": "grok-4.6"}]
     return [
         dict(link)
         for link in ROUTING_MATRIX.get(task_class, ROUTING_MATRIX["implementation"])

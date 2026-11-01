@@ -17,13 +17,16 @@ Design decisions, each traceable to the shipped substrate:
   signal — or the timeout's SIGKILL — abandons it, and the lease expiry plus
   the control plane's reaper make that abandonment safe by construction.
   Safe, and now also *free*: a lapse is charged to the queue's bounded
-  fleet budget rather than to the item's ``max_attempts`` (migration 0027),
-  because the heartbeat below runs beside the handler — so a lease can only
-  lapse when this PROCESS stopped beating, which is never evidence about the
-  payload it was holding. Every "the lease will lapse and a later delivery
-  retries" branch in this module depends on that; while the reaper spent
-  ``max_attempts``, two restarts dead-lettered a task that never ran
-  (VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH).
+  lease-wait budget rather than to the item's ``max_attempts`` (migration
+  0036), because the heartbeat below runs beside the handler -- so a lease
+  can only lapse when this PROCESS stopped beating, which is never evidence
+  about the payload it was holding (VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH).
+* **Drain ACK does not imply idle.** ``aicc-drained`` retains its legacy
+  meaning (claim gate closed, possibly busy). ``aicc-drained-busy`` explicitly
+  identifies unsettled local work. ``aicc-drained-idle`` additionally
+  proves that no claim/handler/report is in flight. A handled outcome-write
+  failure is left to the canonical lease expiry/reaper, as on the normal loop;
+  it is not permanent evidence of work still running inside this process.
 * **Auth failure means stop, not retry.** A refused connection may mean the
   credential was rotated out from under us (`enroll_rotate_self` is
   first-writer-wins); hammering the server with a dead secret is
@@ -68,31 +71,40 @@ class HandlerOutcome:
     result: dict[str, Any] = field(default_factory=dict)
     reason: str = ""
     retryable: bool = True
-    # True only for a refusal that names no fault in the WORK ITEM -- a
-    # writer-lease race lost to a sibling lane, an executor CLI this host
-    # cannot start, a provider that refused on quota, a workspace the fleet
-    # could not provision -- as opposed to a broken commit, a bad payload or
-    # an agent run that genuinely failed. Routes to `queue_fail_lease_wait`
+    # True only for a refusal that names no fault in the work itself -- a
+    # writer-lease race lost to a sibling lane (publish `lease_unavailable`
+    # or a held worktree / task lease at dispatch), not a broken commit or a
+    # bad payload (VOYN-W0-AICC-PUBLISH-LEASE-CONTENTION-BURNS-ATTEMPT: a
+    # publish that lost that race used to fail through the ordinary
+    # `retryable=True` path, which spends this item's `max_attempts` on
+    # contention it had no part in causing and can dead-letter already
+    # -finished work; REM also closes the same burn on the dispatch-time
+    # acquire / blocking_lease door). Routes to `queue_fail_lease_wait`
     # instead of `queue_fail`: it refunds the attempt `queue_claim` already
-    # spent for this delivery and counts the refusal against its own
-    # bounded budget instead. Meaningless when `ok` is True and implies
-    # `retryable` -- there is no such thing as a non-retryable no-fault
-    # refusal.
-    #
-    # Named for the fault, not for the one case that first needed it. It
-    # began as `lease_wait`, wired to exactly one call site (a publish that
-    # lost the writer-lease race,
-    # VOYN-W0-AICC-PUBLISH-LEASE-CONTENTION-BURNS-ATTEMPT), while every
-    # sibling refusal of the same class kept spending `max_attempts`. That
-    # budget IS the cascade length (`orchestrator.routing`: two links since
-    # copilot left the isolated fleet), so two refusals the work item had no
-    # part in causing dead-lettered it having never spent a single model
-    # attempt -- the dead-letter growth control-01:queue measures
-    # (VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH). The database side
-    # keeps its migration-0022 names (`queue_fail_lease_wait`,
-    # `lease_wait_count`, `lease_wait_exhausted`); renaming a shipped
-    # function and column would buy nothing a comment cannot say.
-    no_fault: bool = False
+    # spent for this delivery and counts the wait against its own bounded
+    # budget instead. Meaningless when `ok` is True and implies `retryable`
+    # -- there is no such thing as a non-retryable lease wait.
+    lease_wait: bool = False
+    # Same refund semantics for failures in the host/launcher/provider
+    # substrate. These are not task attempts: a missing systemd socket, a
+    # broken sandbox, or a provider outage says the work did not get a fair
+    # execution slot.
+    infra_wait: bool = False
+    # Structured evidence about the REFUSAL, for the audit row rather than
+    # for the result row (VOYN-W0-AICC-EXECUTOR-QUOTA-AWARE-ROUTING: which
+    # executor is out of quota, and until when this worker will withhold it).
+    # `result` is the item's outcome and is only written by `queue_complete`,
+    # so a refusal has no way to carry a fact forward otherwise; this travels
+    # into `work_event.detail` alongside the wait counters. Empty for every
+    # outcome that has nothing extra to say, which is almost all of them.
+    detail: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def no_fault(self) -> bool:
+        """True for a refusal that names no fault in the work item -- either
+        wait class. Read-only shorthand for tests and audit wording; routing
+        always goes through the specific flag."""
+        return self.lease_wait or self.infra_wait
 
 
 class Handler(Protocol):
@@ -146,6 +158,9 @@ class WorkerDaemon:
         # loop holds it from its final drain check through claim(), so a drain
         # ACK cannot race ahead of an already-starting database claim.
         self._claim_gate_lock = threading.Lock()
+        # Guarded by the claim gate: include claim I/O and final persistence,
+        # not only the handler. Clear only after _execute finishes its handling.
+        self._attempt_active = False
         self._reload_requested = threading.Event()
         self._reload_stop = threading.Event()
         # Injectable so tests drive time instead of waiting through it.
@@ -189,6 +204,12 @@ class WorkerDaemon:
         self._notify(f"RELOADING=1\nMONOTONIC_USEC={time.monotonic_ns() // 1_000}")
         self._reload_requested.set()
 
+    def _drained_status(self) -> str:
+        """Caller holds the gate lock, including while emitting this status."""
+        if self._attempt_active:
+            return "aicc-drained-busy"  # claims closed; an attempt is still unsettled
+        return "aicc-drained-idle"
+
     def _drain_coordinator_loop(self) -> None:
         while not self._drain_stop.is_set():
             if not self._drain_wakeup.wait(0.25):
@@ -199,11 +220,11 @@ class WorkerDaemon:
             with self._claim_gate_lock:
                 if self._drain.is_set() and not self._drain_closed.is_set():
                     self._drain_closed.set()
-                    # This is the protocol ACK consumed by the rotator.  At
+                    # Both statuses acknowledge the closed claim gate. At
                     # this point claim() is not running and cannot begin until
                     # the lock is released, after which the closed flag is
                     # checked again before any claim.
-                    self._notify("STATUS=aicc-drained")
+                    self._notify(f"STATUS={self._drained_status()}")
 
     def _credential_reload_loop(self) -> None:
         while not self._reload_stop.is_set():
@@ -262,7 +283,7 @@ class WorkerDaemon:
                     draining = self._drain.is_set()
                     if draining:
                         status = (
-                            "aicc-drained"
+                            self._drained_status()
                             if self._drain_closed.is_set()
                             else "aicc-drain-requested"
                         )
@@ -276,10 +297,13 @@ class WorkerDaemon:
                     # STATUS travels with every claim-path ping so a status
                     # written by a dying drain cycle can never stick.
                     self._notify("WATCHDOG=1\nSTATUS=aicc-ready")
+                    self._attempt_active = True
                     claimed = self._store.claim(
                         self._config.queue,
                         visibility_seconds=self._config.visibility_seconds,
                     )
+                    if isinstance(claimed, QueueRefusal):
+                        self._attempt_active = False
                 if isinstance(claimed, QueueRefusal):
                     if claimed.reason == "no_work":
                         self._sleep(min(idle + random.uniform(0, idle), cap))
@@ -292,6 +316,15 @@ class WorkerDaemon:
                     continue
                 idle = self._config.idle_min_seconds
                 self._execute(claimed)
+                # A handled report failure has no remaining local I/O or work;
+                # canonical visibility expiry/reaping handles its uncertain
+                # outcome. An escaping exception never reaches this idle ACK.
+                with self._claim_gate_lock:
+                    self._attempt_active = False
+                    if self._drain.is_set() and self._drain_closed.is_set():
+                        # Reload clears both flags and emits READY under
+                        # this same lock: no late idle ACK can overwrite it.
+                        self._notify(f"STATUS={self._drained_status()}")
         finally:
             self._reload_stop.set()
             self._reload_requested.set()
@@ -332,12 +365,16 @@ class WorkerDaemon:
         try:
             if outcome.ok:
                 accepted = self._store.complete(work, outcome.result)
-            elif outcome.no_fault and outcome.retryable:
-                # `retryable` is re-checked rather than assumed: the refund
-                # path has no non-retryable branch, so a (contradictory)
-                # outcome claiming both must take the ordinary path that can
-                # actually honour "do not deliver this again".
+            # A wait implies `retryable`: an outcome that also says
+            # retryable=False is a final verdict, and the refund path must not
+            # quietly turn it back into a redelivery (VOYN-MON-CONTROL-01-
+            # QUEUE-DEAD-LETTER-GROWTH).
+            elif outcome.lease_wait and outcome.retryable:
                 accepted = self._store.fail_lease_wait(work, reason=outcome.reason)
+            elif outcome.infra_wait and outcome.retryable:
+                accepted = self._store.fail_infra_wait(
+                    work, reason=outcome.reason, detail=outcome.detail or None
+                )
             else:
                 accepted = self._store.fail(
                     work, reason=outcome.reason, retryable=outcome.retryable
@@ -353,9 +390,7 @@ class WorkerDaemon:
             # payload crash this module already closed once. The lease is
             # left to lapse on its own (visibility expiry, then the reaper),
             # exactly like the stale-owner refusal below; a later delivery
-            # retries, and since migration 0027 the lapse costs the item no
-            # attempt -- the database outage that stopped us writing is the
-            # fleet's, not the payload's.
+            # retries.
             logger.exception(
                 "attempt %s: writing the outcome raised; the attempt's lease "
                 "will lapse and a later delivery will retry",

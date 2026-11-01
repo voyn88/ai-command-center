@@ -21,6 +21,13 @@ def _make_task(**overrides) -> dict:
     return task
 
 
+#: A terminal `completed_at` far enough in the past that no finalization could
+#: still be in flight for it — the shape of a row written before migration 24
+#: added `finalized_at` (never backfilled), or one whose finalizer died without
+#: a fenced claim for a later Supervisor to recover through.
+_HISTORICAL_COMPLETED_AT = "2020-01-01T00:00:00"
+
+
 def _make_run(
     db_path,
     *,
@@ -34,7 +41,13 @@ def _make_run(
     caller of `sync_task_from_run` relies on: a run whose finalization already
     completed by the time it is synced. Pass `finalized=False` to build the
     terminal-but-unfinalized row `run.finalized_at` exists to make visible —
-    e.g. from a sync pass racing a different process's finalization."""
+    e.g. from a sync pass racing a different process's finalization.
+
+    With `finalized=False`, `completed_at` decides *which* unfinalized row you
+    get, because `task_sync.is_pending_finalization` bounds the hold by
+    `FINALIZATION_GRACE_SECONDS`: a just-written timestamp (`db.iso_now()`) is a
+    finalization still in flight, while an old one is a historical row whose
+    marker nothing will ever write (see `_HISTORICAL_COMPLETED_AT`)."""
     task = db.create_task(db_path, project="AIOS", title="t", task_type="implementation", task_id=task_id)
     session = db.create_session(db_path, task_id=task["id"], project="AIOS", repository_path="/tmp/x")
     run = db.create_run(
@@ -516,11 +529,15 @@ def test_sync_task_from_run_does_not_project_a_terminal_run_before_it_is_finaliz
     enough to run `_apply_terminal_fields` and set
     `terminal_projection_run_id`, which would then make the idempotency
     check above skip this exact run forever — so the real report/verdict
-    would never be picked up once finalization actually completed."""
+    would never be picked up once finalization actually completed.
+
+    `completed_at` is *now*, deliberately: that is what makes this a
+    finalization in flight rather than a historical row the grace window in
+    `is_pending_finalization` releases (covered below)."""
     db_path = tmp_path / "runtime.db"
     db.migrate(db_path)
     run = _make_run(
-        db_path, state="COMPLETED", completed_at="2026-01-01T00:01:00", finalized=False
+        db_path, state="COMPLETED", completed_at=db.iso_now(), finalized=False
     )
     db.append_run_event(
         db_path, run["id"], "result",
@@ -553,6 +570,237 @@ def test_sync_task_from_run_does_not_project_a_terminal_run_before_it_is_finaliz
     assert task["latest_verdict"] == "APPROVED_FOR_COMMIT"
     assert task["pull_request_url"] == "https://example.invalid/pr/1"
     assert task["launch_status"] == "Needs Review"
+
+
+# --------------------------------------------------------------------------
+# The finalization window, for the states a *display*-keyed gate misses
+# (VOYN-W0-AICC-FLAKE-03). `INTERRUPTED`/`UNKNOWN` are terminal database
+# states that `session_view.derive_status` maps to `Requires Attention`, which
+# is deliberately absent from `TERMINAL_DISPLAY_STATUSES` — so gating on the
+# display vocabulary leaves exactly these two runs projecting mid-window, and
+# they drive the most consequential writes in this module: blaming a provider,
+# re-queueing the task, and permanent timeline events.
+# --------------------------------------------------------------------------
+
+
+def test_sync_holds_an_unfinalized_interrupted_run_from_failing_over(tmp_path):
+    """An `INTERRUPTED` run with no output normally records the dead executor
+    and flips the task back to "Ready" (AICC-DESKTOP-017). Until it is
+    finalized, none of that may happen: the supervisor's own reconciliation is
+    what classifies a lost process `INTERRUPTED` *and then* finalizes it, so
+    acting on the state first blames a provider and re-queues a task whose
+    predecessor run is still writing its report and auto-committing the agent's
+    work."""
+    db_path = tmp_path / "runtime-INTERRUPTED-unfinalized.db"
+    db.migrate(db_path)
+    run = _make_run(
+        db_path, state="INTERRUPTED", completed_at=db.iso_now(), finalized=False
+    )
+    task = _make_task(launch_status="Running", current_run_id=run["id"])
+
+    mutated = task_sync.sync_task_from_run(task, run, db_path=db_path)
+
+    assert mutated is False
+    assert task["launch_status"] == "Running"
+    assert not task.get("failed_executors")
+    assert "relaunch_requested" not in task
+    assert task["timeline"] == []
+
+    with db.connect(db_path) as conn:
+        conn.execute("UPDATE run SET finalized_at = ? WHERE id = ?", (db.iso_now(), run["id"]))
+        conn.commit()
+    run = db.get_run(db_path, run["id"])
+
+    assert task_sync.sync_task_from_run(task, run, db_path=db_path) is True
+    assert task["launch_status"] == "Ready"
+    assert task["failed_executors"] == ["claude_code"]
+    assert [event["type"] for event in task["timeline"]] == ["executor_failed"]
+
+
+def test_sync_holds_an_unfinalized_interrupted_run_from_requesting_relaunch(tmp_path):
+    """The mid-run-interruption branch (the agent *had* produced output) asks
+    the pipeline to re-enqueue via `relaunch_requested`. Requesting a relaunch
+    while the previous run is still auto-committing is how the same work gets
+    done twice — so it waits for the marker too."""
+    db_path = tmp_path / "runtime-INTERRUPTED-output-unfinalized.db"
+    db.migrate(db_path)
+    run = _make_run(
+        db_path, state="INTERRUPTED", completed_at=db.iso_now(), finalized=False
+    )
+    run = db.update_run_fields(
+        db_path,
+        run["id"],
+        expected_version=run["version"],
+        fields={"first_output_at": db.iso_now()},
+    )
+    task = _make_task(launch_status="Running", current_run_id=run["id"])
+
+    assert task_sync.sync_task_from_run(task, run, db_path=db_path) is False
+    assert task.get("relaunch_requested") is None
+    assert task["launch_status"] == "Running"
+    assert task["timeline"] == []
+
+    with db.connect(db_path) as conn:
+        conn.execute("UPDATE run SET finalized_at = ? WHERE id = ?", (db.iso_now(), run["id"]))
+        conn.commit()
+    run = db.get_run(db_path, run["id"])
+
+    assert task_sync.sync_task_from_run(task, run, db_path=db_path) is True
+    assert task["relaunch_requested"] is True
+    assert task["launch_status"] == "Ready"
+
+
+def test_sync_holds_an_unfinalized_unknown_run_from_requiring_attention(tmp_path):
+    """`UNKNOWN` resolves to the `Requires Attention` launch status, which is
+    *not* in `_TERMINAL_LAUNCH_STATUSES` — so a gate that only held terminal
+    launch statuses let it through. Writing it strands the task for a human on
+    evidence the finalizer was still in the middle of producing."""
+    db_path = tmp_path / "runtime-UNKNOWN-unfinalized.db"
+    db.migrate(db_path)
+    run = _make_run(
+        db_path, state="UNKNOWN", completed_at=db.iso_now(), finalized=False
+    )
+    task = _make_task(launch_status="Running", current_run_id=run["id"])
+
+    assert task_sync.sync_task_from_run(task, run, db_path=db_path) is False
+    assert task["launch_status"] == "Running"
+
+    with db.connect(db_path) as conn:
+        conn.execute("UPDATE run SET finalized_at = ? WHERE id = ?", (db.iso_now(), run["id"]))
+        conn.commit()
+    run = db.get_run(db_path, run["id"])
+
+    assert task_sync.sync_task_from_run(task, run, db_path=db_path) is True
+    assert task["launch_status"] == "Requires Attention"
+
+
+# --------------------------------------------------------------------------
+# Historical rows: `finalized_at` is nullable and never backfilled, so waiting
+# on a marker nothing will ever write is a permanent strand, not a race fix.
+# --------------------------------------------------------------------------
+
+
+def test_sync_projects_a_historical_unfinalized_completed_run(tmp_path):
+    """A terminal row written before migration 24 added `finalized_at` (or one
+    whose finalizer died with no fenced claim to recover through) carries
+    `finalized_at IS NULL` forever. Past `FINALIZATION_GRACE_SECONDS` it is
+    projected exactly as it was before the gate existed, rather than holding
+    its task hostage to a marker that is never coming."""
+    db_path = tmp_path / "runtime-historical.db"
+    db.migrate(db_path)
+    run = _make_run(
+        db_path,
+        state="COMPLETED",
+        completed_at=_HISTORICAL_COMPLETED_AT,
+        finalized=False,
+    )
+    db.append_run_event(
+        db_path, run["id"], "result",
+        {"result": "Verdict: APPROVED FOR COMMIT\nPR: https://example.invalid/pr/7"},
+    )
+    db.create_report(db_path, run["id"], f"reports/AIOS/{run['id'][:8]}.md")
+    task = _make_task()
+
+    assert task_sync.sync_task_from_run(task, run, db_path=db_path) is True
+
+    assert task["terminal_projection_run_id"] == run["id"]
+    assert task["latest_verdict"] == "APPROVED_FOR_COMMIT"
+    assert task["pull_request_url"] == "https://example.invalid/pr/7"
+    assert task["report_path"].endswith(".md")
+    assert task["launch_status"] == "Needs Review"
+
+
+def test_sync_projects_a_historical_unfinalized_interrupted_run(tmp_path):
+    """The same recovery rule for the states the display gate missed: a
+    historical `INTERRUPTED` row still fails over to the next executor instead
+    of leaving the task parked on a dead provider indefinitely."""
+    db_path = tmp_path / "runtime-historical-INTERRUPTED.db"
+    db.migrate(db_path)
+    run = _make_run(
+        db_path,
+        state="INTERRUPTED",
+        completed_at=_HISTORICAL_COMPLETED_AT,
+        finalized=False,
+    )
+    task = _make_task()
+
+    assert task_sync.sync_task_from_run(task, run, db_path=db_path) is True
+
+    assert task["launch_status"] == "Ready"
+    assert task["failed_executors"] == ["claude_code"]
+
+
+def test_is_pending_finalization_ignores_active_and_untimestamped_runs(tmp_path):
+    """The predicate's two "not a race" answers, pinned directly: a run that is
+    not in a terminal *database* state is not finalizing anything, and a
+    terminal row with no parseable `completed_at` is historical by the same
+    argument as an old one — nothing that writes the marker omits the
+    timestamp."""
+    db_path = tmp_path / "runtime-predicate.db"
+    db.migrate(db_path)
+
+    running = _make_run(db_path, state="RUNNING", task_id="task-running")
+    assert task_sync.is_pending_finalization(running) is False
+
+    undated = _make_run(
+        db_path, state="COMPLETED", task_id="task-undated", finalized=False
+    )
+    assert undated["completed_at"] is None
+    assert task_sync.is_pending_finalization(undated) is False
+
+    in_flight = _make_run(
+        db_path,
+        state="COMPLETED",
+        task_id="task-in-flight",
+        completed_at=db.iso_now(),
+        finalized=False,
+    )
+    assert task_sync.is_pending_finalization(in_flight) is True
+
+    finalized = _make_run(
+        db_path, state="COMPLETED", task_id="task-finalized", completed_at=db.iso_now()
+    )
+    assert task_sync.is_pending_finalization(finalized) is False
+
+
+def test_seeding_a_completion_waits_for_finalization_but_historical_rows_do_not(tmp_path):
+    """The completion row is the seed of the validate → PR → merge state
+    machine, and the auto-commit of the agent's work happens *after* the
+    COMPLETED state is published. Seeding mid-window starts that machine
+    against a working tree whose changes are not committed yet. A historical
+    row seeds immediately, for the same reason it projects: its marker is
+    never coming."""
+
+    class _StubApi:
+        def __init__(self, db_path):
+            self.db_path = db_path
+
+    db_path = tmp_path / "runtime-seed.db"
+    db.migrate(db_path)
+    api = _StubApi(db_path)
+
+    in_flight = _make_run(
+        db_path,
+        state="COMPLETED",
+        task_id="task-in-flight",
+        completed_at=db.iso_now(),
+        finalized=False,
+    )
+    task = _make_task()
+
+    assert task_sync._seed_and_project_completion(api, task, in_flight) is False
+    assert db.get_completion(db_path, in_flight["id"]) is None
+
+    historical = _make_run(
+        db_path,
+        state="COMPLETED",
+        task_id="task-historical",
+        completed_at=_HISTORICAL_COMPLETED_AT,
+        finalized=False,
+    )
+
+    assert task_sync._seed_and_project_completion(api, _make_task(), historical) is True
+    assert db.get_completion(db_path, historical["id"]) is not None
 
 
 def test_sync_task_from_run_running_with_output_advances_to_implementation(tmp_path):

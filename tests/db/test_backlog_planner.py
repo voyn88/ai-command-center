@@ -219,6 +219,77 @@ def test_wip_limit_is_enforced_in_the_database(rig) -> None:
     assert not ok and reason == "wip_exhausted"
 
 
+def test_backlog_eligible_orders_by_created_at_before_insert_seq(rig, admin_conn) -> None:
+    """VOYN-W0-AICC-INSERT-SEQ-RETRY-REM, adversarial review of PR #441:
+    `insert_seq` must be a tiebreaker APPENDED after `created_at`, never a
+    replacement for it. Insert three same-wave/priority tasks in REVERSE
+    timestamp order, so insertion order (and therefore insert_seq) actively
+    disagrees with created_at. If insert_seq ever outranked created_at, the
+    view would come back ORD1, ORD2, ORD3 -- the insertion order -- instead
+    of honoring the timestamps."""
+    app_factory, store, _worker = rig
+    assert store.upsert_task(_task("VOYN-W0-ORD1"))[0]
+    assert store.upsert_task(_task("VOYN-W0-ORD2"))[0]
+    assert store.upsert_task(_task("VOYN-W0-ORD3"))[0]
+
+    # created_at is admin-owned data (no app-role DML path exists for it);
+    # backdating it directly is how this test disentangles insertion order
+    # from timestamp order.
+    with admin_conn.cursor() as cur:
+        # ORD1 was inserted first (lowest insert_seq) but stamped with the
+        # LATEST created_at; ORD3 was inserted last (highest insert_seq)
+        # but stamped with the EARLIEST.
+        cur.execute(
+            "UPDATE backlog_task SET created_at = %s WHERE task_id = %s",
+            ("2026-01-03T00:00:00+00", "VOYN-W0-ORD1"),
+        )
+        cur.execute(
+            "UPDATE backlog_task SET created_at = %s WHERE task_id = %s",
+            ("2026-01-02T00:00:00+00", "VOYN-W0-ORD2"),
+        )
+        cur.execute(
+            "UPDATE backlog_task SET created_at = %s WHERE task_id = %s",
+            ("2026-01-01T00:00:00+00", "VOYN-W0-ORD3"),
+        )
+
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT task_id FROM backlog_eligible")
+            order = [
+                row[0]
+                for row in cur.fetchall()
+                if row[0] in ("VOYN-W0-ORD1", "VOYN-W0-ORD2", "VOYN-W0-ORD3")
+            ]
+            assert order == ["VOYN-W0-ORD3", "VOYN-W0-ORD2", "VOYN-W0-ORD1"]
+
+
+def test_backlog_eligible_insert_seq_breaks_equal_timestamp_ties(rig, admin_conn) -> None:
+    """With created_at tied (an importer batch landing inside one tick),
+    insert_seq must break the tie in true insertion order -- the whole point
+    of adding it as a tiebreaker."""
+    app_factory, store, _worker = rig
+    assert store.upsert_task(_task("VOYN-W0-TIE1"))[0]
+    assert store.upsert_task(_task("VOYN-W0-TIE2"))[0]
+    assert store.upsert_task(_task("VOYN-W0-TIE3"))[0]
+
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "UPDATE backlog_task SET created_at = %s "
+            "WHERE task_id IN ('VOYN-W0-TIE1', 'VOYN-W0-TIE2', 'VOYN-W0-TIE3')",
+            ("2026-01-01T00:00:00+00",),
+        )
+
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT task_id FROM backlog_eligible")
+            order = [
+                row[0]
+                for row in cur.fetchall()
+                if row[0] in ("VOYN-W0-TIE1", "VOYN-W0-TIE2", "VOYN-W0-TIE3")
+            ]
+            assert order == ["VOYN-W0-TIE1", "VOYN-W0-TIE2", "VOYN-W0-TIE3"]
+
+
 def test_the_wave_gate_yields_exactly_when_the_earlier_wave_is_spent(rig) -> None:
     """Approved decision 1, both directions: refused while the earliest
     numeric wave has a dispatchable candidate; admitted the moment it has
@@ -546,6 +617,37 @@ def test_migration_0009_is_reversible_without_residue(pg_connection_factory) -> 
             assert "v_task_status" in cur.fetchone()[0]
 
 
+def test_migration_0031_is_reversible_without_residue(pg_connection_factory) -> None:
+    """Live up->down->up pins insert_seq to migration 0031: downgrading to
+    0030 must drop the column and restore the created_at-only ordering, the
+    second upgrade must reapply both."""
+    from command_center.db import migrations
+
+    with pg_connection_factory() as conn:
+        migrations.upgrade(conn)
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_get_viewdef('backlog_eligible')")
+            assert "insert_seq" in cur.fetchone()[0]
+        migrations.downgrade(conn, target=30)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) FROM information_schema.columns "
+                "WHERE table_name = 'backlog_task' AND column_name = 'insert_seq'"
+            )
+            assert cur.fetchone()[0] == 0
+            cur.execute("SELECT pg_get_viewdef('backlog_eligible')")
+            assert "insert_seq" not in cur.fetchone()[0]
+        migrations.upgrade(conn)  # must not raise 'already exists'
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) FROM information_schema.columns "
+                "WHERE table_name = 'backlog_task' AND column_name = 'insert_seq'"
+            )
+            assert cur.fetchone()[0] == 1
+            cur.execute("SELECT pg_get_viewdef('backlog_eligible')")
+            assert "insert_seq" in cur.fetchone()[0]
+
+
 def test_second_cascade_exhaustion_parks_for_the_owner(rig) -> None:
     """First exhaustion: a finding — back to OPEN, fresh epoch. Second:
     DEFER_TO_USER — two full budgets failing is a human's decision point,
@@ -654,6 +756,9 @@ def test_repo_routes_translate_the_backlog_vocabulary(monkeypatch) -> None:
         "AICC", "/home/voynadmin/Projects/ai-command-center"
     )
     assert repo_route("aios")[0] == "AIOS"
+    assert repo_route("voyn-logistics-crm") == (
+        "CRM", "/home/voynadmin/Projects/voyn-logistics-crm"
+    )
     assert repo_route("nowhere/unknown") is None
     monkeypatch.setenv("AICC_PLANNER_REPO_ROUTES", '{"x": ["AIOS", "/p"]}')
     assert repo_route("x") == ("AIOS", "/p")
@@ -1324,3 +1429,79 @@ def test_open_monitor_findings_become_pipeline_tasks_once(rig) -> None:
         with conn.cursor() as cur:
             cur.execute("SELECT monitor_clear_finding(%s)", ("worker-01:infra",))
             assert cur.fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("bad_url", [
+    "not-a-pr",
+    "https://github.com/owner?x/repo/pull/1",
+    "https://github.com/owner/repo name/pull/1",
+    "https://github.com/owner/repo/pull/0",
+])
+def test_malformed_pr_ingest_is_bounded_and_records_no_evidence(rig, bad_url):
+    app_factory, store, worker = rig
+    task_id = "VOYN-W0-HYGIENE"
+    assert store.upsert_task(_task(task_id, repo="repo-in"))[0]
+    for expected in ("OPEN", "DEFER_TO_USER"):
+        assert _dispatch(app_factory, task_id)[0]
+        _complete_latest(app_factory, worker, task_id, {
+            "status": "completed", "pr_url": bad_url, "head_sha": "a" * 40,
+        })
+        with app_factory() as conn, conn.cursor() as cur:
+            cur.execute("SELECT * FROM backlog_ingest_results('planner-t')")
+            assert len(cur.fetchall()) == 1
+            cur.execute(
+                "SELECT count(*) FROM backlog_evidence WHERE task_id = %s",
+                (task_id,),
+            )
+            assert cur.fetchone()[0] == 0
+        assert store.get_task(task_id)["status"] == expected
+    with app_factory() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT detail->>'split_requested' FROM backlog_event "
+            "WHERE task_id = %s AND event = 'return_to_pool' "
+            "AND outcome = 'granted' ORDER BY event_id",
+            (task_id,),
+        )
+        assert cur.fetchall() == [("false",), ("false",)]
+
+
+def test_clear_last_pr_is_idempotent_and_bounds_redispatch(rig):
+    app_factory, store, worker = rig
+    task_id = "VOYN-W0-CLEAR"
+    assert store.upsert_task(_task(task_id, repo="repo-in"))[0]
+    for expected in ("OPEN", "DEFER_TO_USER"):
+        assert _dispatch(app_factory, task_id)[0]
+        _complete_latest(app_factory, worker, task_id, {
+            "status": "completed", "pr_url": "https://github.com/o/r/pull/7",
+        })
+        with app_factory() as conn, conn.cursor() as cur:
+            cur.execute("SELECT * FROM backlog_ingest_results('planner-t')")
+        assert store.record_evidence(task_id, "pr", "broken-pr")[0]
+        with app_factory() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT reason FROM backlog_clear_evidence(%s, 'pr', %s, %s)",
+                (task_id, "broken-pr", "malformed_pr_url"),
+            )
+            assert cur.fetchone()[0] == "cleared"
+        assert store.get_task(task_id)["status"] == "READY_TO_REVIEW"
+        with app_factory() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT reason FROM backlog_clear_evidence(%s, 'pr', %s, %s)",
+                (task_id, "https://github.com/o/r/pull/7", "test_invalidated"),
+            )
+            assert cur.fetchone()[0] == "cleared_and_" + expected.lower()
+            cur.execute(
+                "SELECT reason FROM backlog_clear_evidence(%s, 'pr', %s, %s)",
+                (task_id, "https://github.com/o/r/pull/7", "test_invalidated"),
+            )
+            assert cur.fetchone()[0] == "already_absent"
+        assert store.get_task(task_id)["status"] == expected
+
+
+def test_worker_cannot_clear_evidence_or_park_tasks(rig, psycopg):
+    _app_factory, _store, worker = rig
+    with worker._connection() as conn, conn.cursor() as cur:
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            cur.execute(
+                "SELECT * FROM backlog_clear_evidence('none', 'pr', 'x', 'x')"
+            )

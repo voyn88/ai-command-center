@@ -8,6 +8,22 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Changed — queue dead-letter fix rebased onto main's wait classes (`VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH`)
+- Merged main (via the #1002 → #1032 → #914 stack). Main already shipped this
+  branch's 0024 (redrive clears waits → main 0027), 0025 (claim numbering →
+  main 0026) and 0026 (lease-wait exhaustion refund → main 0028), so those are
+  dropped. What main lacked is kept and renumbered: `0036_queue_reap_lease_lapse_refunds`
+  (a lapsed lease refunds the attempt and spends the bounded lease-wait budget)
+  and `0037_queue_wait_budget_needs_a_serving_fleet` (`_queue_fleet_is_serving`
+  gate on wait-budget exhaustion and on the reaper; `queue_fail` resets
+  `lease_wait_count`). `released.lock.json` regenerated for 0001–0037.
+- `no_fault` is no longer a routing flag: it is a read-only
+  `HandlerOutcome.no_fault` = `lease_wait or infra_wait`. Repository-not-visible,
+  isolated-root-unavailable (mutating) and workspace-isolation failures now
+  route through `infra_wait`; a wait outcome with `retryable=False` takes the
+  ordinary `fail` path. Read-only "permanent" clone failures keep main's
+  immediate dead letter.
+
 ### Tests — the monitor's own measurement is now taken from a real database (`VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH`)
 - `tests/db/test_monitor_queue_measurement.py` (new) drives the real queue
   functions and then reads the real `infra_monitor.read_queue_snapshot()`.
@@ -252,6 +268,175 @@ functional application milestones of `app.py`.
   lapses still terminate in the DLQ, now under
   `lease_wait_exhausted: visibility_timeout`, and `queue_redrive()` resets
   that budget as it has since 0024.
+### Added — desktop points at the server (`VOYN-W0-APP-CONTROL-S2`)
+
+- `command_center/application/server_queue.py`: a read-only HTTP port over the
+  preprod server's work queue (`GET /api/v1/queue/items`,
+  `webapi/queue_routes.py`), built the same way
+  `command_center/application/aios_status.py` builds the AIOS SDK adapter —
+  a factory that only constructs the real client from a complete, HTTPS,
+  allowlisted-host configuration (`AICC_SERVER_QUEUE_URL`,
+  `AICC_SERVER_QUEUE_TOKEN`, `AICC_SERVER_QUEUE_ALLOWED_HOSTS`) and otherwise
+  returns an honest `DisabledServerQueueClient`. Transport is the same
+  authenticated `urllib` GET `http_auth.identity` already uses for `whoami` —
+  no new production dependency.
+- `command_center/platform/preferences.py`: `DataSourceMode` (`LOCAL` /
+  `SERVER`), the persisted "server" toggle, alongside the existing theme and
+  density preferences.
+- Settings screen: a new "Источник данных раздела «Выполнение»" group with
+  the Local/Server radio toggle (`command_center/desktop/pages/settings_page.py`).
+- `command_center/application/operations_adapter.py`: `OperationsAdapter.execution()`
+  now reads the mode via an injected callable (so a toggle flipped mid-session
+  takes effect on the very next read, no adapter reconstruction) and switches
+  from the local runtime snapshot to `server_queue`'s port, mapped into the
+  same five-column shape the "Выполнение" table already renders (queue name
+  stands in for `task_type`, repository id — falling back to task id — stands
+  in for `project`, since a queue-list row carries neither field directly).
+  Desktop still never imports `command_center.runtime`/`webapi` directly
+  (`tests/architecture/test_desktop_engine_fitness.py` continues to pass
+  unchanged) — only through this application-layer port, exactly like AIOS
+  status.
+
+### Added — voice intake for the backlog (`VOYN-W0-APP-CONTROL-S6b`)
+
+- Decision (the task left the transcription engine open): transcription runs
+  **on the device** through the Web Speech API (`web/src/lib/voiceInput.ts`),
+  not through a server-side Whisper. The owner's iPhone and Mac already have
+  the recognizer, so a tailnet-only preprod gains voice with no model weights,
+  no audio upload and no new server dependency, and the PWA (S3) gets it
+  without a native shell. The decision is reversible: a Whisper route would
+  post to the same endpoint with the same `source` flag, and the part that is
+  actually hard is already server-side.
+- `command_center/db/voice_transcript.py`: the deterministic repair of
+  dictated domain terms — the trap the task record names. A recognizer has
+  never heard of this vocabulary, so it writes the namespace token as a
+  Russian word (`воин`/`война`/`вояж`), the priority as words (`пи ноль`) or
+  as the Cyrillic homoglyph `р0` that renders like `P0` and is refused by the
+  ASCII-only parser field, and the wave as `волна ноль`. A closed table fixes
+  those exactly; anything outside the table is left as dictated rather than
+  guessed at, and every substitution is reported as a `Correction`. Pure
+  module — no I/O, no model — so it is equally the normalizer for a later
+  server-side transcription path.
+- `POST /api/v1/backlog/intake/draft` accepts `source: "chat" | "voice"`
+  (default `chat`). A voice draft is repaired before the model sees it, is
+  given one extra prompt paragraph (a recognizer splits an id into separate
+  words — join them, never invent a new id), and returns a `transcript`
+  block: what was heard, what was written, and every correction. Typed text
+  is never repaired — a repair table must not edit words the owner actually
+  typed. No new route and no new credential: it is the same `http_auth`
+  boundary and the same `backlog:intake:draft` operation as S6a.
+- Tasks screen: a microphone button beside «Предложить», rendered only where
+  the browser has a recognizer (Firefox and locked-down WebViews keep the
+  typed path, no dead control). Dictated words land in the same text box the
+  owner would have typed into and stay editable; the corrections the server
+  made are shown above the proposed line; the same draft → confirm gate still
+  applies, because a transcript is a suggestion, not an instruction. Refused
+  microphone, silence and offline recognition each get their own message
+  (`web/src/lib/i18n.ts`, both languages).
+
+### Added — chat-text backlog intake (`VOYN-W0-APP-CONTROL-S6a`)
+
+- `command_center/db/backlog_intake.py`: turns a free-text owner request into
+  one canonical backlog-Markdown line via a model prompt, then runs that line
+  back through the existing deterministic grammar
+  (`command_center.db.backlog_parser.parse_backlog`) — the model only
+  proposes text, the closed-vocabulary parser is the sole authority on
+  whether it is a task. Status is always forced to `UNTRIAGED`, the same
+  raw-finding discipline `backlog_triage` (0008) already enforces for the
+  Markdown importer.
+- `command_center/api/backlog_intake_routes.py`: `POST /api/v1/backlog/intake/draft`
+  (model call + parse, never writes) and `POST /api/v1/backlog/intake/confirm`
+  (re-parses the possibly hand-edited line from scratch, then inserts through
+  `BacklogStore.upsert_task`). `confirm` refuses with 409 when the task id
+  already names an existing record — `backlog_upsert_task` can also overwrite
+  an existing row directly (the Markdown-reconciliation path), and chat
+  intake must never reach into that shortcut. Both routes are on the
+  `http_auth` boundary (`backlog:intake:draft`/`backlog:intake:confirm`,
+  `EXPECTED_MUTATING_ROUTES` now 32).
+### Added — Quota-aware executor routing (`VOYN-W0-AICC-EXECUTOR-QUOTA-AWARE-ROUTING`)
+- `command_center/agent_runner.py`: `RunResult.executor_quota_signature`
+  recognises an executor's own "this account is out of quota" refusal
+  (Claude's session cap, Codex's usage limit, Copilot's monthly quota /
+  credit pool) and `record_executor_exhausted` opens a bounded, self-clearing
+  worker-local circuit against that executor (30 minutes by default,
+  `AICC_EXECUTOR_QUOTA_COOLDOWN_SECONDS`). The detector is deliberately
+  narrower than the attempt-level `is_executor_provider_error` in both
+  vocabulary and read scope -- Claude's structured refusal field, the tail of
+  stderr for the free-text CLIs -- because it licenses a cross-task action: a
+  transcript that merely quotes a quota message must never withhold a healthy
+  account from every later task on the host.
+- `command_center/worker/handlers.py`: `_executor_preflight` reports an open
+  circuit as unavailability, so the cascade skips the exhausted link INSIDE
+  the delivery the worker already holds. No attempt is spent rediscovering an
+  exhaustion the last refusal established; when no link can run, the refusal
+  routes to the infra-wait refund (0024) rather than to the task's own
+  attempt budget. The Codex workspace-write probe records a quota refusal the
+  same way, instead of re-probing the exhausted account on every mutating
+  dispatch.
+- `0033_infra_wait_quota_detail`: `queue_fail_infra_wait` takes an optional
+  `jsonb` detail, merged into the `work_event` audit row under the counters
+  it cannot overwrite. A refusal writes no result row, so this is how
+  "executor X is out of quota until T" and "these links were skipped without
+  spending an attempt" reach the audit trail. The argument defaults to NULL,
+  so a pre-0025 caller writes exactly the row it wrote before.
+
+### Added — the one-button audit, wired into the web UI (`VOYN-W0-APP-CONTROL-S4`)
+
+- `web/src/screens/Tasks.tsx`: an `AuditLauncher` panel above the task list —
+  pick a project, confirm (or edit) the review prompt, one button. A
+  successful enqueue reloads the task list so the new item appears
+  immediately.
+- The launcher owns no credential of its own: a 401 from the audit POST is
+  handed up to the screen (`onAuthRequired`), which locks and renders the
+  same single `TokenGate` a 401 from the queue reads does — so the owner
+  gets an actual unlock control, and a retry uses the replacement key
+  instead of resending the rejected one. The refused draft (project +
+  prompt) rides along and is restored when the screen unlocks, so the retry
+  is one click rather than a retype, and the gate says plainly that the
+  audit was NOT started. (Supersedes PR #421, rejected for exactly this
+  missing recovery path: the panel showed "unlock below" while no unlock
+  control existed.)
+- `web/src/lib/queueApi.ts`: `enqueueAudit`, the typed `POST /api/v1/queue/audit`
+  client (401 raises the same `QueueAuthError` the reads use).
+- `command_center/webapi/queue_routes.py`: `repository_path` is now optional
+  in the audit request — the one-button trigger only knows a `project_id`.
+  When omitted, it resolves from `project_config.get_project_config`, the
+  same source the worker already confirms the run against
+  (`agent_runner.validate_repository`), so the caller never needs to know
+  the server's filesystem layout. An explicit `repository_path` is still
+  honored verbatim.
+- The `execution`-queue enqueue → claim → `agent_run` (review profile) →
+  result → `GET /api/v1/queue/items/{id}` path was verified end-to-end at
+  the code level (SRV-05's worker already claims this queue and shape);
+  the remaining gap is operational — the systemd unit is not yet installed
+  on any host.
+
+### Fixed — Control ticks have their own GitHub quota (`VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS`)
+- `command_center/orchestrator/gh_access.py`: every `gh` call the review,
+  merge and PR-window ticks make now runs under the `voyn-aicc-fleet` App's
+  installation token (`/var/lib/aicc/github/gh`, minted by
+  `voyn-aicc-github-token.timer` and readable by the `aicc-worker` principal
+  the ticks run as) instead of whatever human credential is ambient on
+  control-01. On 2026-09-09 21:15-22:10 UTC that human's shared GraphQL quota
+  was exhausted (`API rate limit already exceeded for user ID 297853521`) and
+  all three ticks failed for an hour. A host without the store falls back to
+  the ambient credential and says so; a refusal from the App falls back per
+  call so a scope it was never granted cannot break a tick.
+- The PR-window tick -- the only loop that touches every open pull request --
+  moved from `gh pr list`/`gh pr view`/`gh pr edit` (GraphQL) to the REST
+  endpoints (`gh api repos/...`), with per-`(repo, PR, head sha)` caching of
+  the details, so an unchanged head costs no API call at all. Its timer went
+  from 5 to 15 minutes; labelling is advisory and no gate reads it.
+- Each tick reports a `QUOTA` line: identity, REST/GraphQL call counts, cache
+  hits, ambient fallbacks, rate-limited calls, and the identity's remaining
+  core/GraphQL budget (read with `gh api rate_limit`, which is exempt from
+  rate limiting).
+- `ops/aicc_github_app_token.py` requests the ticks' additional read scopes
+  (`checks`, `statuses`, `actions`) on top of the lanes' git set, and falls
+  back to the lane set alone if the installation was never granted them --
+  GitHub refuses the whole token otherwise, which would leave the fleet with
+  no credential at all.
+
 
 ### Added — Home screen widget snippets (`VOYN-MIN-WIDGET-SNIP`)
 - `AICCNativeCore.WidgetIntentSnippet` / `WidgetFlow` / `WidgetDestination`

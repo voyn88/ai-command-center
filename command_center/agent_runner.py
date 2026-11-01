@@ -88,6 +88,7 @@ Security model:
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import signal
@@ -97,7 +98,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from command_center import models, openai_exec, project_config, storage
@@ -139,6 +140,8 @@ PRINCIPAL_WORKSPACE_ROOTS_FILE = Path("/etc/aicc/agent-workspace-roots")
 # executor" is exactly the drift that hid it; keep this in step with the
 # launcher's TOOLCHAIN_BIN.
 PRINCIPAL_EXECUTOR_BINARIES: dict[str, str] = {
+    "grok": "/usr/libexec/aicc-grok-agent",
+    "cursor": "/opt/aicc/providers/cursor/agent",
     "claude": "/opt/aicc/toolchains/current/bin/claude",
     "codex": "/opt/aicc/toolchains/current/bin/codex",
     # Copilot is DELIBERATELY absent: ADR-0010 keeps it disabled under
@@ -176,6 +179,66 @@ _COPILOT_RETRYABLE_FAILURE_SIGNATURES = (
     "getaddrinfo",
     "econnreset",
 )
+#: Codex pre-task failures reported only as free text on a failed, non-zero
+#: process. Live incident 2026-09-02 / 2026-09-11: the CLI exited 1 with
+#: "ERROR: You've hit your usage limit ... try again at Sep 15th" and an
+#: empty result, the review work item completed "successfully" with that
+#: error as its whole payload, and every review stalled until the quota
+#: window -- the account failed, not the task, and nothing advanced the
+#: cascade to the next executor. Same containment rules as the Copilot list:
+#: consulted only for status == "failed" with a non-zero exit code, so a
+#: successful review that merely DISCUSSES a usage limit cannot match.
+_CODEX_RETRYABLE_FAILURE_SIGNATURES = (
+    "you've hit your usage limit",
+    "usage limit reached",
+    "not logged in",
+    "authentication failed",
+    "unauthorized",
+    "too many requests",
+    "stream disconnected",
+)
+#: Executor -> the phrases that mean THE ACCOUNT IS OUT OF QUOTA, as opposed
+#: to the broader "this attempt hit a provider problem" lists above
+#: (VOYN-W0-AICC-EXECUTOR-QUOTA-AWARE-ROUTING). Two tables rather than one
+#: because they license two different actions:
+#:
+#: * `_*_RETRYABLE_FAILURE_SIGNATURES` decides ONE attempt's failover -- the
+#:   next cascade link runs inside the same delivery, so a false positive
+#:   costs a redundant route switch and nothing else.
+#: * this table opens a WORKER-LOCAL CIRCUIT (`record_executor_exhausted`)
+#:   that withholds the executor from EVERY later task dispatched on this
+#:   host until the cooldown lapses. A false positive there starves a healthy
+#:   account with no operator-visible cause, so the phrases are the quota
+#:   refusals themselves -- not auth, not network, and not a bare "rate
+#:   limit", which is a per-minute throttle the next attempt clears rather
+#:   than an exhausted account.
+#:
+#: The scope the phrases are matched against is narrowed for the same reason;
+#: see `RunResult.executor_quota_signature`.
+_EXECUTOR_QUOTA_SIGNATURES: dict[str, tuple[str, ...]] = {
+    # Claude reports the Max subscription's 5-hour rolling window through its
+    # own structured result payload: "You've hit your session limit · resets
+    # 4:10pm (UTC)" (live capture, 2026-08-21 16:09 UTC).
+    "claude": ("hit your session limit", "hit your usage limit", "usage limit reached"),
+    # Codex, live 2026-09-02 / 2026-09-11: "ERROR: You've hit your usage
+    # limit. Visit .../usage to purchase more credits or try again at Sep
+    # 15th, 2026 1:24 AM."
+    "codex": ("hit your usage limit", "usage limit reached"),
+    # Copilot: the monthly premium-request allowance and the credit pool, the
+    # two refusals its CLI prints when the account -- not the request -- is
+    # over its limit.
+    "copilot": ("exceeded your monthly quota", "ai credit usage limit"),
+    # Cursor (from main #1022): the account-level usage refusals.
+    "cursor": ("hit your usage limit", "usage limit reached", "quota exceeded"),
+}
+
+#: How much of the refusal channel `executor_quota_signature` reads. A CLI
+#: prints its terminal refusal last, and an unbounded read is exactly how a
+#: long transcript that merely QUOTES a quota message (an agent printing
+#: `tests/fixtures/fake_codex.py`, a review of this very file) would reach
+#: the matcher.
+_QUOTA_SIGNATURE_TAIL_CHARS = 2000
+
 _CODEX_PREFLIGHT_PROMPT = (
     "This is a disposable sandbox capability probe. In the current repository, "
     "create a file named aicc-codex-commit-probe.txt containing exactly "
@@ -187,7 +250,6 @@ _CODEX_PREFLIGHT_PROMPT = (
 _codex_workspace_write_preflight_lock = threading.Lock()
 _codex_workspace_write_preflight_result: tuple[bool, str] | None = None
 
-
 def disable_codex_workspace_write(detail: str = "") -> None:
     """Open the worker-local Codex circuit after a runtime bwrap failure."""
     global _codex_workspace_write_preflight_result
@@ -196,6 +258,109 @@ def disable_codex_workspace_write(detail: str = "") -> None:
         reason = f"{reason}: {detail[-400:]}"
     with _codex_workspace_write_preflight_lock:
         _codex_workspace_write_preflight_result = (False, reason)
+
+
+#: The worker-local quota circuit (VOYN-W0-AICC-EXECUTOR-QUOTA-AWARE-ROUTING),
+#: the same shape as the Codex sandbox circuit above: process-local state, no
+#: new table, no background timer.
+#:
+#: Why worker-local and not a queue column: the fact being recorded is "this
+#: host's credential for this executor is out of quota". It is discovered by
+#: running the CLI here, it is cured by a rolling window that nobody can
+#: observe from the control plane, and every consumer of it (`handlers.
+#: _executor_preflight`) runs in this process. A shared table would need a
+#: writer, an owner and an invalidation rule for a fact that expires on its
+#: own within the half hour.
+#:
+#: Why a fixed cooldown rather than the reset time the refusal quotes: those
+#: strings are prose ("resets 4:10pm (UTC)", "try again at Sep 15th, 2026
+#: 1:24 AM") in at least three formats across executors and locales, and a
+#: misparse either parks a healthy executor for days or reopens the circuit
+#: into the same exhausted account. A bounded, self-clearing window costs at
+#: most one wasted attempt per window and cannot do either.
+EXECUTOR_QUOTA_COOLDOWN_SECONDS = 1800
+EXECUTOR_QUOTA_COOLDOWN_ENV = "AICC_EXECUTOR_QUOTA_COOLDOWN_SECONDS"
+_executor_exhaustion_lock = threading.Lock()
+#: executor -> the instant its circuit reopens. Guarded by the lock above:
+#: the daemon is single-threaded per attempt today, but handler threads are
+#: the plan of record and a dict mutated from two of them is exactly the
+#: defence-in-depth `_provision_lock` already applies.
+_executor_exhausted_until: dict[str, datetime] = {}
+
+
+def _quota_cooldown_seconds() -> float:
+    """The configured cooldown, falling back to the default for anything a
+    float() cannot read or that is not positive -- a typo'd env var must not
+    silently disable the circuit (0) or park an executor forever."""
+    configured = os.environ.get(EXECUTOR_QUOTA_COOLDOWN_ENV, "")
+    try:
+        seconds = float(configured)
+    except ValueError:
+        return float(EXECUTOR_QUOTA_COOLDOWN_SECONDS)
+    return seconds if seconds > 0 else float(EXECUTOR_QUOTA_COOLDOWN_SECONDS)
+
+
+def record_executor_exhausted(
+    executor: str,
+    *,
+    cooldown_seconds: float | None = None,
+    now: datetime | None = None,
+) -> datetime:
+    """Open `executor`'s quota circuit; returns the instant it reopens.
+
+    An already-open circuit is only ever EXTENDED, never shortened: a second
+    refusal inside an open window says the account is still exhausted, and
+    taking the smaller of the two deadlines would let a run that failed early
+    in the window pull the reopening forward.
+    """
+    moment = now if now is not None else datetime.now(UTC)
+    if cooldown_seconds is not None and (
+        not math.isfinite(cooldown_seconds) or cooldown_seconds <= 0
+    ):
+        raise ValueError("executor cooldown must be finite and positive")
+    window = (
+        cooldown_seconds if cooldown_seconds is not None else _quota_cooldown_seconds()
+    )
+    # Bounded at one hour (main #1022): a circuit must self-clear.
+    until = moment + timedelta(seconds=min(max(window, 0.0), 3600.0))
+    with _executor_exhaustion_lock:
+        current = _executor_exhausted_until.get(executor)
+        if current is not None and current > until:
+            return current
+        _executor_exhausted_until[executor] = until
+        return until
+
+
+def executor_exhausted_until(
+    executor: str, *, now: datetime | None = None
+) -> datetime | None:
+    """When `executor`'s quota circuit reopens, or `None` while it is closed.
+
+    Self-clearing on read: a lapsed window is dropped here, so the executor
+    returns to the cascade with no operator action and no timer thread.
+    """
+    moment = now if now is not None else datetime.now(UTC)
+    with _executor_exhaustion_lock:
+        until = _executor_exhausted_until.get(executor)
+        if until is None:
+            return None
+        if until <= moment:
+            del _executor_exhausted_until[executor]
+            return None
+        return until
+
+
+def clear_executor_exhaustion(executor: str | None = None) -> None:
+    """Close the circuit immediately -- one executor, or all of them.
+
+    For an operator who has topped the account up before the window lapses,
+    and for tests, which must not inherit a circuit an earlier test opened.
+    """
+    with _executor_exhaustion_lock:
+        if executor is None:
+            _executor_exhausted_until.clear()
+        else:
+            _executor_exhausted_until.pop(executor, None)
 
 
 # --------------------------------------------------------------------------
@@ -441,12 +606,17 @@ def build_principal_isolation_manifest(
     """
     if executor not in COMMAND_BUILDERS:
         raise RunnerError(f"unknown executor {executor!r}")
+    if executor == "cursor" and task_type in MODEL_ONLY_TASK_TYPES:
+        raise RunnerError("Cursor model-only execution is not supported")
     return {
         "version": 1,
         "run_id": uuid.uuid4().hex,
         "workspace": str(repository_path.resolve(strict=True)),
         "executor": executor,
-        "profile": profile_for_task_type(task_type),
+        "profile": (
+            "model_only" if executor == "grok" and task_type in MODEL_ONLY_TASK_TYPES
+            else profile_for_task_type(task_type)
+        ),
         "prompt": prompt,
         "model": model,
         "timeout_seconds": timeout_seconds,
@@ -480,15 +650,38 @@ def principal_workspace_root(
 def principal_executor_preflight(executor: str) -> tuple[bool, str]:
     """Cheap worker-side check for the fixed root-owned provider path.
 
-    The privileged broker repeats ownership/mode validation.  This check only
-    avoids spending a queue attempt when deployment is visibly incomplete.
+    Mirrors the launcher's `_validate_binary` ancestor rule closely enough to
+    refuse a group-writable `/opt/aicc` (fleet outage 2026-09-11) as
+    `AICC_AGENT_LAUNCH_INFRA_FAILURE` before a queue attempt is spent. The
+    privileged broker still re-validates at launch.
     """
     binary = PRINCIPAL_EXECUTOR_BINARIES.get(executor)
     if binary is None:
         return False, f"executor {executor!r} is not allowlisted"
-    if Path(binary).is_file() and os.access(binary, os.X_OK):
-        return True, ""
-    return False, f"isolated executor binary is unavailable: {binary}"
+    candidate = Path(binary)
+    try:
+        if not candidate.is_file() or not os.access(candidate, os.X_OK):
+            return False, f"isolated executor binary is unavailable: {binary}"
+        resolved = candidate.resolve(strict=True)
+    except OSError:
+        return False, f"isolated executor binary is unavailable: {binary}"
+    for chain in (candidate.parents, resolved.parents):
+        for parent in chain:
+            try:
+                info = parent.stat()
+            except OSError as exc:
+                return (
+                    False,
+                    f"{_PRINCIPAL_ISOLATION_FAILURE}: executor path component "
+                    f"unreadable: {parent}: {exc}",
+                )
+            if info.st_uid != 0 or info.st_mode & 0o022:
+                return (
+                    False,
+                    f"{_PRINCIPAL_ISOLATION_FAILURE}: executor path component "
+                    f"is not immutable root-owned: {parent}",
+                )
+    return True, ""
 
 
 def _principal_launcher_environment() -> dict[str, str]:
@@ -680,8 +873,29 @@ def codex_workspace_write_preflight() -> tuple[bool, str]:
                     False,
                     f"Codex workspace-write sandbox unavailable: {detail}",
                 )
+            elif run.is_principal_isolation_error:
+                # Preserve the launcher marker so the worker classifies this as
+                # infra_wait (no attempt burn, no cascade_exhausted park) —
+                # VOYN-W0-AICC-OPT-AICC-GROUP-WRITABLE-BREAKS-LAUNCHER.
+                detail = diagnostic[-400:] or _PRINCIPAL_ISOLATION_FAILURE
+                return (
+                    False,
+                    detail
+                    if detail.startswith(f"{_PRINCIPAL_ISOLATION_FAILURE}:")
+                    else f"{_PRINCIPAL_ISOLATION_FAILURE}: {detail}",
+                )
             elif run.status != "completed":
                 detail = diagnostic[-400:] or f"exit_code={run.exit_code!r}"
+                if run.executor_quota_signature("codex") is not None:
+                    # This probe is a real Codex invocation, so a quota
+                    # refusal here is the same fact a task run would have
+                    # discovered -- and without recording it, every later
+                    # mutating dispatch re-probes into the same exhausted
+                    # account (the probe result is deliberately not cached
+                    # for transient failures, see below). Recorded on the
+                    # BOUNDED quota circuit, never the permanent sandbox one:
+                    # an exhausted account is cured by its own window.
+                    record_executor_exhausted("codex")
                 # Provider/auth/network failures are transient. Do not pin a
                 # worker-wide negative forever; only the proven bwrap/capability
                 # failures above/below open the persistent local circuit.
@@ -885,9 +1099,11 @@ def build_codex_command(
       enforcement, exactly as `--tools` is for Claude: a read-only sandbox
       cannot write the tree no matter what the model decides to attempt.
     * `PROFILE_TRUSTED_DEVELOPMENT` -> `--sandbox workspace-write`, which
-      confines writes to the working root `--cd` names. `danger-full-
-      access` is never used: it removes the boundary this profile exists
-      to draw.
+      confines writes to the working root `--cd` names -- OUTSIDE principal
+      isolation. Under isolation (`principal_isolation_required()`) the
+      systemd unit is the boundary and Codex runs `danger-full-access`
+      inside it: its inner bubblewrap mounted .git read-only and no commit
+      could land (owner decision 2026-09-09).
 
     `--skip-git-repo-check` is NOT passed: every dispatch runs inside a
     real git worktree (`workspace_provisioning`), so the check is a free
@@ -900,7 +1116,19 @@ def build_codex_command(
     executor, so nothing downstream has to learn a second format.
     """
     profile = profile_for_task_type(task_type)
-    sandbox = "read-only" if profile == PROFILE_READ_ONLY else "workspace-write"
+    if profile == PROFILE_READ_ONLY:
+        sandbox = "read-only"
+    elif principal_isolation_required():
+        # Under principal isolation the systemd unit the broker builds is the
+        # boundary (dynamic uid, only /workspace writable, ProtectSystem=
+        # strict, no capabilities); Codex's own bubblewrap on top mounted
+        # .git read-only, so the commit the fleet contract requires could
+        # never land (worker-01 2026-09-09). Owner decision 2026-09-09: no
+        # inner sandbox INSIDE the unit. The launcher builds the same argv
+        # (a test pins both against each other).
+        sandbox = "danger-full-access"
+    else:
+        sandbox = "workspace-write"
     command = [
         CODEX_BINARY,
         "exec",
@@ -1001,11 +1229,34 @@ def build_copilot_command(
 #: real CLI. Caught by exactly those tests when this was first written the
 #: other way.
 COMMAND_BUILDERS: dict[str, str] = {
+    "grok": "build_grok_command",
+    "cursor": "build_cursor_command",
     "claude": "build_command",
     "codex": "build_codex_command",
     "copilot": "build_copilot_command",
     "openai_http": "build_openai_http_command",
 }
+
+
+def build_grok_command(prompt: str, *, task_type: str, model: str | None = None) -> list[str]:
+    if not principal_isolation_required():
+        raise RunnerError("Grok tools require principal isolation")
+    command = [PRINCIPAL_EXECUTOR_BINARIES["grok"], "--model", model or "grok-4.3"]
+    if task_type in MODEL_ONLY_TASK_TYPES:
+        command += ["--no-tools"]
+    return command + ["--", prompt]
+
+
+def build_cursor_command(prompt: str, *, task_type: str, model: str | None = None) -> list[str]:
+    if not principal_isolation_required():
+        raise RunnerError("Cursor requires principal isolation")
+    if task_type in MODEL_ONLY_TASK_TYPES:
+        raise RunnerError("Cursor model-only execution is not supported")
+    command = [PRINCIPAL_EXECUTOR_BINARIES["cursor"], "--print", "--output-format", "text", "--trust"]
+    command += ["--mode", "ask"] if profile_for_task_type(task_type) == PROFILE_READ_ONLY else ["--force"]
+    if model:
+        command += ["--model", model]
+    return command + ["--", prompt]
 
 
 def build_openai_http_command(
@@ -1142,6 +1393,17 @@ class RunResult:
         self.is_error: bool = bool(payload.get("is_error")) if payload else False
         self.api_error_status = payload.get("api_error_status") if payload else None
         self.terminal_reason = payload.get("terminal_reason") if payload else None
+        # The CLI's own message field, kept as a STRUCTURED field rather
+        # than re-derived from raw stdout by every caller. On an API error
+        # this is the provider's refusal text; `executor_quota_signature` is
+        # the only consumer and reads it only once the structured error
+        # fields have confirmed that shape. Coerced to "" for any payload
+        # whose `result` is absent or not a string -- a matcher must never
+        # see a non-str, and `None` would only push the guard outward.
+        result_message = payload.get("result") if payload else None
+        self.result_message: str = (
+            result_message if isinstance(result_message, str) else ""
+        )
 
     @property
     def result_status(self) -> str:
@@ -1184,20 +1446,80 @@ class RunResult:
     def is_executor_provider_error(self, executor: str) -> bool:
         """Whether the selected CLI positively reports a provider failure.
 
-        Claude exposes structured API fields; Copilot 1.0.x reports its
-        pre-task auth/quota/network failures on stderr. Copilot free-text is
+        Claude exposes structured API fields; Copilot 1.0.x and Codex report
+        pre-task auth/quota/network failures on stderr. Free text is
         considered only for a failed, non-zero process, so a successful
         review that merely discusses a rate limit cannot trigger a retry.
         """
         if self.is_executor_api_error:
             return True
-        if executor != "copilot" or self.status != "failed" or not self.exit_code:
+        if self.status != "failed" or not self.exit_code:
+            return False
+        if executor == "grok":
+            # Our driver emits one fixed diagnostic, never a provider body.
+            # A report discussing HTTP errors must not trigger another run.
+            return self.stderr.strip() in {
+                f"provider HTTP {code}"
+                for code in (401, 403, 429, 500, 502, 503, 504)
+            }
+        signatures = {
+            "cursor": _CODEX_RETRYABLE_FAILURE_SIGNATURES + _COPILOT_RETRYABLE_FAILURE_SIGNATURES,
+            "copilot": _COPILOT_RETRYABLE_FAILURE_SIGNATURES,
+            "codex": _CODEX_RETRYABLE_FAILURE_SIGNATURES,
+        }.get(executor)
+        if signatures is None:
             return False
         diagnostic = f"{self.stdout}\n{self.stderr}".lower()
-        return any(
-            signature in diagnostic
-            for signature in _COPILOT_RETRYABLE_FAILURE_SIGNATURES
-        )
+        return any(signature in diagnostic for signature in signatures)
+
+    def executor_quota_signature(self, executor: str) -> str | None:
+        """The quota-exhaustion phrase this run's REFUSAL CHANNEL reports, or
+        `None`.
+
+        Deliberately narrower than `is_executor_provider_error` in both what
+        it matches and WHERE it reads, because it licenses a larger action:
+        the caller opens a worker-local circuit that withholds this executor
+        from every later task on this host (`record_executor_exhausted`),
+        where a provider error only moves the current attempt to the next
+        cascade link. A control must not read wider than it acts
+        (independent review of #705), so:
+
+        * The gate is the one the free-text provider check already uses -- a
+          FAILED process with a NON-ZERO exit code -- so a completed run
+          whose report discusses quotas can never match.
+        * For `claude`, the only text read is the CLI's own structured
+          `result` field, and only once its structured error fields have
+          positively confirmed an API-level failure
+          (`is_executor_api_error`). Model transcript text never reaches the
+          matcher.
+        * For the free-text CLIs, the only text read is the TAIL of
+          `stderr`. Their agent output goes to stdout and stderr is the
+          diagnostic channel, so the account's refusal is the last thing
+          printed there. Including stdout -- as the attempt-level check
+          does, where the blast radius is one attempt -- would let any
+          transcript that merely quotes a quota message open the circuit.
+
+        Returns `None`, never a phrase, whenever the shape cannot be
+        positively confirmed: an executor with no quota vocabulary, a
+        payload that did not parse, an empty stderr.
+        """
+        if self.status != "failed" or not self.exit_code:
+            return None
+        if executor == "grok":
+            return "HTTP 429" if (self.stderr or "").strip() == "provider HTTP 429" else None
+        signatures = _EXECUTOR_QUOTA_SIGNATURES.get(executor)
+        if not signatures:
+            return None
+        if executor == "claude":
+            if not self.is_executor_api_error:
+                return None
+            diagnostic = self.result_message.lower()
+        else:
+            diagnostic = (self.stderr or "")[-_QUOTA_SIGNATURE_TAIL_CHARS:].lower()
+        for signature in signatures:
+            if signature in diagnostic:
+                return signature
+        return None
 
     @property
     def is_executor_sandbox_error(self) -> bool:

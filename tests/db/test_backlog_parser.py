@@ -104,6 +104,7 @@ def test_repo_is_inferred_from_the_task_family() -> None:
     assert _infer_repo("VOYN-W0-AICC-SRV-08") == "ai-command-center"
     assert _infer_repo("VOYN-W0-F2") == "aios"
     assert _infer_repo("VOYN-W0-F3") == "ai-command-center"
+    assert _infer_repo("VOYN-CRM-P0-DISPATCH") == "voyn-logistics-crm"
     assert _infer_repo("VOYN-OPS-CI-SPEED-01") is None
     assert _infer_repo("VOYN-W0-BE-ACC") == "ai-command-center"
 
