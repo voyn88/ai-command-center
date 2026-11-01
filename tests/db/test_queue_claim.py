@@ -1303,6 +1303,10 @@ def test_the_last_lease_wait_refunds_its_attempt_like_every_one_before(
         _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names),
         psycopg.connect(host_dsns[0], autocommit=True) as worker,
     ):
+        # 0037: the wait budget only dead-letters an item the serving fleet
+        # singled out, so the exhausting refusal needs a served sibling.
+        with psycopg.connect(app_dsn, autocommit=True) as app:
+            _a_served_fleet(app, worker)
         for delivery, expected in enumerate(
             ("lease_wait_requeued", "lease_wait_requeued", "lease_wait_dead_lettered"),
             start=1,
@@ -1408,7 +1412,10 @@ def test_redrive_clears_both_wait_budgets_it_widens_the_attempts_for(
                 "SELECT ok, reason FROM queue_fail_infra_wait(%s, %s, %s, 5)",
                 (verdict[3], token, "executor infrastructure failure: launcher"),
             ) == (True, "infra_wait_requeued")
-            # ... then two lease waits against a cap of one: the second exceeds it.
+            # ... then two lease waits against a cap of one: the second exceeds it
+            # (0037: only while the fleet is demonstrably serving a sibling).
+            with psycopg.connect(app_dsn, autocommit=True) as app:
+                _a_served_fleet(app, worker)
             for expected in ("lease_wait_requeued", "lease_wait_dead_lettered"):
                 token, token_hash = _token()
                 verdict = _claim(worker, token_hash)
