@@ -54,8 +54,7 @@ def _module():
     # instead of a fake; dedicated tests below override this seam again to
     # assert on the lock file's exact location and lifecycle.
     module.ROLLOUT_LOCK_PATH = (
-        Path(tempfile.mkdtemp(prefix="aicc-rollout-lock-"))
-        / "aicc-staged-rollout.lock"
+        Path(tempfile.mkdtemp(prefix="aicc-rollout-lock-")) / "aicc-staged-rollout.lock"
     )
     return module
 
@@ -136,14 +135,15 @@ class FakeSystemd:
                     "MainPID": "0",
                 },
             )
-        # The lane-mutating timers (rotate, self-deploy) are held/released
+        # The lane-mutating timers are held/released
         # around every rollout, live and disabled outside it -- a strict
         # fake must declare them like any other real rollout-visible unit
         # rather than silently no-opping their stop/start (review on
         # fd5de6b, same rationale as the legacy units above).
         for timer in (
             "voyn-aicc-credential-rotation.timer",
-            "voyn-aicc-self-deploy.timer",
+            "voyn-aicc-worker-release-deploy.timer",
+            "voyn-aicc-source-clone-refresh.timer",
         ):
             self.states.setdefault(
                 timer,
@@ -191,7 +191,14 @@ class FakeSystemd:
                 return "inactive"
             # Mutating a unit this fake never declared is a typo'd rollout
             # target, not a no-op (review on fd5de6b).
-            if action in {"start", "stop", "enable", "disable", "restart"}:
+            if action in {
+                "start",
+                "stop",
+                "enable",
+                "disable",
+                "restart",
+                "reset-failed",
+            }:
                 raise KeyError(unit)
             return ""
         state = self.states[unit]
@@ -211,6 +218,13 @@ class FakeSystemd:
             state["ActiveState"] = "active"
             state["SubState"] = "running"
             state["MainPID"] = "3000"
+        elif action == "reset-failed":
+            # systemd's `failed` is a latch; reset-failed is the ONLY thing
+            # that clears it without a successful run. On anything not
+            # latched it is a no-op that succeeds.
+            if state["ActiveState"] == "failed":
+                state["ActiveState"] = "inactive"
+                state["SubState"] = "dead"
         return ""
 
     def probe(self, *args: str) -> tuple[int, str, str]:
@@ -341,7 +355,9 @@ def test_registry_rejects_non_root_owner(tmp_path, monkeypatch):
         def __getattr__(self, name):
             return getattr(self._value, name)
 
-    monkeypatch.setattr(module, "_registry_fstat", lambda fd: NonRootStat(real_fstat(fd)))
+    monkeypatch.setattr(
+        module, "_registry_fstat", lambda fd: NonRootStat(real_fstat(fd))
+    )
     with pytest.raises(module.RolloutError, match="root:root regular"):
         module._configured_units(lanes)
 
@@ -374,9 +390,7 @@ def test_registry_replacement_during_read_fails_closed(tmp_path, monkeypatch):
         return real_stat(path, *args, **kwargs)
 
     monkeypatch.setattr(module.os, "stat", replace_before_named_stat)
-    monkeypatch.setattr(
-        module, "_registry_fstat", lambda fd: RootStat(real_fstat(fd))
-    )
+    monkeypatch.setattr(module, "_registry_fstat", lambda fd: RootStat(real_fstat(fd)))
     with pytest.raises(module.RolloutError, match="changed while being read"):
         module._configured_units(lanes)
 
@@ -556,7 +570,10 @@ def test_staged_rollout_drains_and_proves_each_lane_before_next(tmp_path, monkey
         privileged_users=("root", "voynadmin"),
         uid_for_user=_uid,
         process_uid=lambda pid: 1002,
-        process_environment=lambda pid: ("AICC_AGENT_PRINCIPAL_ISOLATION=required", "AICC_DATA_DIR=/var/lib/aicc/data"),
+        process_environment=lambda pid: (
+            "AICC_AGENT_PRINCIPAL_ISOLATION=required",
+            "AICC_DATA_DIR=/var/lib/aicc/data",
+        ),
     )
 
     mutations = [
@@ -578,13 +595,20 @@ def test_staged_rollout_drains_and_proves_each_lane_before_next(tmp_path, monkey
         ("stop", units[1]),
         ("start", units[1]),
     ]
-    # Both lane-mutating timers are held before the FIRST lane mutation (the
+    # All lane-mutating timers are held before the FIRST lane mutation (the
     # legacy retirement) and released only after the LAST -- staged rollout
-    # vs. rotate/self-deploy timers, live worker-01 (2026-09-08).
-    assert systemd.calls[0] == ("stop", "voyn-aicc-credential-rotation.timer")
-    assert systemd.calls[1] == ("stop", "voyn-aicc-self-deploy.timer")
-    assert systemd.calls[-2] == ("start", "voyn-aicc-credential-rotation.timer")
-    assert systemd.calls[-1] == ("start", "voyn-aicc-self-deploy.timer")
+    # vs. rotate/self-deploy/source-refresh timers.
+    stops = [call for call in systemd.calls if call[0] == "stop"]
+    assert stops[:3] == [
+        ("stop", "voyn-aicc-credential-rotation.timer"),
+        ("stop", "voyn-aicc-worker-release-deploy.timer"),
+        ("stop", "voyn-aicc-source-clone-refresh.timer"),
+    ]
+    assert systemd.calls[-3:] == [
+        ("start", "voyn-aicc-credential-rotation.timer"),
+        ("start", "voyn-aicc-worker-release-deploy.timer"),
+        ("start", "voyn-aicc-source-clone-refresh.timer"),
+    ]
     # The shared lock a tick honours even if it fires anyway is gone once the
     # rollout finishes -- a rollout must never exit leaving it in place.
     assert not lock_path.exists()
@@ -873,15 +897,17 @@ def test_rollout_restores_timers_and_lock_on_failure(tmp_path, monkeypatch):
     assert systemd.states["voyn-aicc-credential-rotation.timer"]["ActiveState"] == (
         "active"
     )
-    assert systemd.states["voyn-aicc-self-deploy.timer"]["ActiveState"] == "active"
+    assert systemd.states["voyn-aicc-worker-release-deploy.timer"]["ActiveState"] == "active"
     timer_calls = [
         call for call in systemd.calls if call[-1] in module.LANE_MUTATING_TIMERS
     ]
     assert timer_calls == [
         ("stop", "voyn-aicc-credential-rotation.timer"),
-        ("stop", "voyn-aicc-self-deploy.timer"),
+        ("stop", "voyn-aicc-worker-release-deploy.timer"),
+        ("stop", "voyn-aicc-source-clone-refresh.timer"),
         ("start", "voyn-aicc-credential-rotation.timer"),
-        ("start", "voyn-aicc-self-deploy.timer"),
+        ("start", "voyn-aicc-worker-release-deploy.timer"),
+        ("start", "voyn-aicc-source-clone-refresh.timer"),
     ]
 
 
@@ -926,6 +952,15 @@ def test_write_and_remove_rollout_lock_round_trip(tmp_path, monkeypatch):
     module.remove_rollout_lock()
 
 
+def test_remove_rollout_lock_preserves_foreign_owner(tmp_path, monkeypatch):
+    module = _module()
+    lock_path = tmp_path / "aicc-staged-rollout.lock"
+    monkeypatch.setattr(module, "ROLLOUT_LOCK_PATH", lock_path)
+    lock_path.write_text(f"{os.getpid() + 1}\n", encoding="utf-8")
+    module.remove_rollout_lock()
+    assert lock_path.read_text(encoding="utf-8") == f"{os.getpid() + 1}\n"
+
+
 def test_rollout_with_timers_already_held_does_not_touch_timers_or_lock(
     tmp_path, monkeypatch
 ):
@@ -949,7 +984,10 @@ def test_rollout_with_timers_already_held_does_not_touch_timers_or_lock(
         privileged_users=("root", "voynadmin"),
         uid_for_user=_uid,
         process_uid=lambda pid: 1002,
-        process_environment=lambda pid: ("AICC_AGENT_PRINCIPAL_ISOLATION=required", "AICC_DATA_DIR=/var/lib/aicc/data"),
+        process_environment=lambda pid: (
+            "AICC_AGENT_PRINCIPAL_ISOLATION=required",
+            "AICC_DATA_DIR=/var/lib/aicc/data",
+        ),
         timers_already_held=True,
     )
 
@@ -1112,7 +1150,9 @@ def test_a_release_whose_interpreter_is_a_symlink_is_accepted(tmp_path, monkeypa
     module.verify_immutable_release()
 
 
-def test_interpreter_target_outside_the_release_is_still_verified(tmp_path, monkeypatch):
+def test_interpreter_target_outside_the_release_is_still_verified(
+    tmp_path, monkeypatch
+):
     """The binary that actually runs lives in a system path. Verifying only
     what is inside the release proves nothing about it."""
     module = _module()
@@ -1122,7 +1162,9 @@ def test_interpreter_target_outside_the_release_is_still_verified(tmp_path, monk
         module.verify_immutable_release()
 
 
-def test_directory_holding_the_interpreter_symlink_must_not_be_writable(tmp_path, monkeypatch):
+def test_directory_holding_the_interpreter_symlink_must_not_be_writable(
+    tmp_path, monkeypatch
+):
     """A symlink's own mode is meaningless; its directory's is what protects
     it from being repointed."""
     module = _module()
@@ -1147,7 +1189,9 @@ def test_a_symlink_cycle_is_refused_rather_than_followed(tmp_path, monkeypatch):
         module.verify_immutable_release()
 
 
-def test_a_writable_directory_far_above_the_interpreter_is_refused(tmp_path, monkeypatch):
+def test_a_writable_directory_far_above_the_interpreter_is_refused(
+    tmp_path, monkeypatch
+):
     """Not just the immediate parent. Write permission on any directory above
     the interpreter is enough to rename the whole subtree out and drop a
     replacement -- so checking `/usr/bin` while ignoring `/usr` would leave the
@@ -1199,8 +1243,12 @@ def test_a_missing_required_environment_file_is_refused_before_any_mutation(tmp_
         )
     )
 
-    with pytest.raises(module.RolloutError, match="required environment files are absent"):
-        module.verify_required_environment_files(systemd, ("voyn-aicc-worker@1.service",))
+    with pytest.raises(
+        module.RolloutError, match="required environment files are absent"
+    ):
+        module.verify_required_environment_files(
+            systemd, ("voyn-aicc-worker@1.service",)
+        )
 
 
 def test_an_absent_optional_environment_file_is_not_a_refusal(tmp_path):
@@ -1220,11 +1268,15 @@ def test_every_required_file_is_named_at_once(tmp_path):
     module._environment_file_exists = os.path.exists
     first, second = tmp_path / "a.env", tmp_path / "b.env"
     systemd = _EnvSystemd(
-        "\n".join([_entry(str(first), optional=False), _entry(str(second), optional=False)])
+        "\n".join(
+            [_entry(str(first), optional=False), _entry(str(second), optional=False)]
+        )
     )
 
     with pytest.raises(module.RolloutError) as refusal:
-        module.verify_required_environment_files(systemd, ("voyn-aicc-worker@1.service",))
+        module.verify_required_environment_files(
+            systemd, ("voyn-aicc-worker@1.service",)
+        )
 
     assert str(first) in str(refusal.value)
     assert str(second) in str(refusal.value)
@@ -1251,7 +1303,10 @@ def test_rollout_checks_required_files_before_retiring_anything():
             privileged_users=("root", "voynadmin"),
             uid_for_user=_uid,
             process_uid=lambda pid: 1002,
-            process_environment=lambda pid: ("AICC_AGENT_PRINCIPAL_ISOLATION=required", "AICC_DATA_DIR=/var/lib/aicc/data"),
+            process_environment=lambda pid: (
+                "AICC_AGENT_PRINCIPAL_ISOLATION=required",
+                "AICC_DATA_DIR=/var/lib/aicc/data",
+            ),
         )
 
     # Nothing was retired, enabled, started or stopped: the refusal came first.
@@ -1295,9 +1350,7 @@ def test_broker_instances_are_discovered_for_the_snapshot_not_for_the_rollout(
         "aicc-agent-launcher@7.service"
     )
 
-    assert module.discover_launcher_units(systemd) == (
-        "aicc-agent-launcher@7.service",
-    )
+    assert module.discover_launcher_units(systemd) == ("aicc-agent-launcher@7.service",)
     assert module.discover_units(systemd, lanes) == ("voyn-aicc-worker@1.service",)
 
 
@@ -1527,9 +1580,7 @@ def test_snapshot_closure_tolerates_a_host_with_no_matching_templates():
     finding on 0e856b9a)."""
     module = _module()
 
-    module.verify_snapshot_closure(
-        _ZeroMatchSystemd(()), {"version": 3, "units": {}}
-    )
+    module.verify_snapshot_closure(_ZeroMatchSystemd(()), {"version": 3, "units": {}})
 
 
 def test_snapshot_closure_still_fails_closed_on_a_real_enumeration_failure():
@@ -1545,12 +1596,13 @@ def test_snapshot_closure_still_fails_closed_on_a_real_enumeration_failure():
             return super().probe(*args)
 
     with pytest.raises(module.RolloutError, match="Failed to connect"):
-        module.verify_snapshot_closure(
-            BrokenSystemd(()), {"version": 3, "units": {}}
-        )
+        module.verify_snapshot_closure(BrokenSystemd(()), {"version": 3, "units": {}})
 
 
-_ENV_OK = ("AICC_AGENT_PRINCIPAL_ISOLATION=required", "AICC_DATA_DIR=/var/lib/aicc/data")
+_ENV_OK = (
+    "AICC_AGENT_PRINCIPAL_ISOLATION=required",
+    "AICC_DATA_DIR=/var/lib/aicc/data",
+)
 
 
 def _verify_one(module, systemd, unit, **overrides):
@@ -1601,8 +1653,12 @@ def test_a_lane_whose_process_has_no_data_dir_is_refused():
         ("AICC_AGENT_PRINCIPAL_ISOLATION=required",),
         (*_ENV_OK, "AICC_DATA_DIR=relative"),
     ):
-        with pytest.raises(module.RolloutError, match="no single absolute AICC_DATA_DIR"):
-            _verify_one(module, systemd, unit, process_environment=lambda pid, env=env: env)
+        with pytest.raises(
+            module.RolloutError, match="no single absolute AICC_DATA_DIR"
+        ):
+            _verify_one(
+                module, systemd, unit, process_environment=lambda pid, env=env: env
+            )
 
 
 def test_a_lane_that_cannot_read_its_inputs_is_refused_with_the_path():
@@ -1617,7 +1673,9 @@ def test_a_lane_that_cannot_read_its_inputs_is_refused_with_the_path():
         seen.append((pid, uid, data_dir))
         return "/home/voynadmin/Projects/ai-command-center is not visible inside the lane namespace as uid 1002"
 
-    with pytest.raises(module.RolloutError, match="cannot read its task inputs: /home/voynadmin"):
+    with pytest.raises(
+        module.RolloutError, match="cannot read its task inputs: /home/voynadmin"
+    ):
         _verify_one(module, systemd, unit, lane_inputs_visible=blind)
     assert seen == [(int(systemd.states[unit]["MainPID"]), 1002, "/var/lib/aicc/data")]
 
@@ -1626,7 +1684,10 @@ def test_rollout_refuses_to_advance_past_a_blind_lane():
     module = _module()
     units = ("voyn-aicc-worker@1.service", "voyn-aicc-worker@2.service")
     systemd = FakeSystemd(units)
-    with pytest.raises(module.RolloutError, match="voyn-aicc-worker@1.service cannot read its task inputs"):
+    with pytest.raises(
+        module.RolloutError,
+        match="voyn-aicc-worker@1.service cannot read its task inputs",
+    ):
         module.rollout(
             systemd,
             units,
@@ -1642,7 +1703,9 @@ def test_rollout_refuses_to_advance_past_a_blind_lane():
     # Lanes only: the rollout also restores the lane-mutating timers it held
     # (ROLLOUT-VS-ROTATE), and those `start`s are not lanes.
     started = [
-        call[1] for call in systemd.calls if call[0] == "start" and call[1].endswith(".service")
+        call[1]
+        for call in systemd.calls
+        if call[0] == "start" and call[1].endswith(".service")
     ]
     assert started == ["voyn-aicc-worker@1.service"], "lane 2 never started"
 
@@ -1654,10 +1717,14 @@ def test_lane_inputs_probe_reads_the_config_on_the_host_and_tests_each_path_in_t
     data_dir = tmp_path / "data"
     data_dir.mkdir()
     (data_dir / "project_config.json").write_text(
-        json.dumps({
-            "AICC": {"repository_path": "/home/voynadmin/Projects/ai-command-center"},
-            "AIOS": {"repository_path": "/home/voynadmin/Projects/aios"},
-        }),
+        json.dumps(
+            {
+                "AICC": {
+                    "repository_path": "/home/voynadmin/Projects/ai-command-center"
+                },
+                "AIOS": {"repository_path": "/home/voynadmin/Projects/aios"},
+            }
+        ),
         encoding="utf-8",
     )
     monkeypatch.setattr(real, "_process_gid", lambda pid: 2002)
@@ -1666,25 +1733,52 @@ def test_lane_inputs_probe_reads_the_config_on_the_host_and_tests_each_path_in_t
     def fake_run(argv, **kwargs):
         ran.append(argv)
         failing = "/aios" in " ".join(argv)
-        return subprocess.CompletedProcess(argv, 1 if failing else 0, "", "fatal: detected dubious ownership" if failing else "")
+        return subprocess.CompletedProcess(
+            argv,
+            1 if failing else 0,
+            "",
+            "fatal: detected dubious ownership" if failing else "",
+        )
 
     monkeypatch.setattr(real.subprocess, "run", fake_run)
-    env = ("GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=safe.directory", "GIT_CONFIG_VALUE_0=/x")
+    env = (
+        "GIT_CONFIG_COUNT=1",
+        "GIT_CONFIG_KEY_0=safe.directory",
+        "GIT_CONFIG_VALUE_0=/x",
+    )
     failure = real._lane_inputs_visible(4242, 1002, str(data_dir), env)
     assert failure == (
         "/home/voynadmin/Projects/aios is not usable inside the lane namespace as uid 1002"
         ": fatal: detected dubious ownership"
     )
-    assert all(a[:9] == ["nsenter", "-t", "4242", "-m", "-S", "1002", "-G", "2002", "--"] for a in ran)
+    assert all(
+        a[:9] == ["nsenter", "-t", "4242", "-m", "-S", "1002", "-G", "2002", "--"]
+        for a in ran
+    )
     assert ran[0][9:] == ["test", "-r", str(data_dir / "project_config.json")]
     # git runs with the LANE's environment, not root's: env -i + its variables.
-    assert ran[1][9:] == ["env", "-i", *env, "git", "-C", "/home/voynadmin/Projects/ai-command-center", "rev-parse", "--show-toplevel"]
-    assert ran[2][-3:] == ["/home/voynadmin/Projects/aios", "rev-parse", "--show-toplevel"]
+    assert ran[1][9:] == [
+        "env",
+        "-i",
+        *env,
+        "git",
+        "-C",
+        "/home/voynadmin/Projects/ai-command-center",
+        "rev-parse",
+        "--show-toplevel",
+    ]
+    assert ran[2][-3:] == [
+        "/home/voynadmin/Projects/aios",
+        "rev-parse",
+        "--show-toplevel",
+    ]
 
 
 def test_lane_inputs_probe_refuses_a_config_without_any_repository_path(tmp_path):
     real = _real_probe(_module())
-    assert "is not readable on the host" in real._lane_inputs_visible(1, 1002, str(tmp_path / "missing"))
+    assert "is not readable on the host" in real._lane_inputs_visible(
+        1, 1002, str(tmp_path / "missing")
+    )
     (tmp_path / "project_config.json").write_text("{}", encoding="utf-8")
     assert real._lane_inputs_visible(1, 1002, str(tmp_path)) == (
         f"{tmp_path / 'project_config.json'} configures no project: every task would fail"
@@ -1692,7 +1786,12 @@ def test_lane_inputs_probe_refuses_a_config_without_any_repository_path(tmp_path
     # A mixed configuration is refused too: one valid project does not excuse
     # another whose tasks would fail (review of 39981fc9).
     (tmp_path / "project_config.json").write_text(
-        json.dumps({"AICC": {"repository_path": "/srv/x"}, "AIOS": {"allowed_agents": ["claude_code"]}}),
+        json.dumps(
+            {
+                "AICC": {"repository_path": "/srv/x"},
+                "AIOS": {"allowed_agents": ["claude_code"]},
+            }
+        ),
         encoding="utf-8",
     )
     failure = real._lane_inputs_visible(1, 1002, str(tmp_path))
@@ -1700,6 +1799,140 @@ def test_lane_inputs_probe_refuses_a_config_without_any_repository_path(tmp_path
     (tmp_path / "project_config.json").write_text(
         json.dumps({"AICC": {"repository_path": "relative/path"}}), encoding="utf-8"
     )
-    assert "project 'AICC' has no absolute repository_path" in real._lane_inputs_visible(1, 1002, str(tmp_path))
+    assert (
+        "project 'AICC' has no absolute repository_path"
+        in real._lane_inputs_visible(1, 1002, str(tmp_path))
+    )
     (tmp_path / "project_config.json").write_text("not json", encoding="utf-8")
     assert "is not valid JSON" in real._lane_inputs_visible(1, 1002, str(tmp_path))
+
+
+def test_hold_skips_timers_that_are_not_installed_on_the_host():
+    """Installer integration (systemd container) has no rotation/self-deploy
+    timers; `systemctl stop` on a not-found unit fails, so the hold must skip
+    absent timers instead of refusing the whole rollout (main red since #873)."""
+    module = _module()
+    systemd = FakeSystemd(("voyn-aicc-worker@1.service",))
+    systemd.states.pop("voyn-aicc-credential-rotation.timer", None)
+    systemd.states.pop("voyn-aicc-worker-release-deploy.timer", None)
+    systemd.states.pop("voyn-aicc-source-clone-refresh.timer", None)
+
+    module.hold_lane_mutating_timers(systemd)
+
+    assert [call for call in systemd.calls if call[0] == "stop"] == []
+
+
+def test_rollout_lock_does_not_overwrite_existing_owner(tmp_path, monkeypatch):
+    module = _module()
+    lock = tmp_path / "rollout.lock"
+    monkeypatch.setattr(module, "ROLLOUT_LOCK_PATH", lock)
+    lock.write_text("other-owner")
+    with pytest.raises(FileExistsError):
+        module.write_rollout_lock()
+    assert lock.read_text() == "other-owner"
+
+
+# ---------------------------------------------------------------------------
+# Retirement must not leave an unreapable corpse in PID 1's unit table.
+#
+# VOYN-MON-WORKER-01-INFRA-FAILED-UNITS. Retiring the pre-template workers
+# stops and *disables* them, and disabling removes the symlink that was their
+# fragment -- so they are deliberately gone from the host for good. A `stop`
+# that reaches its timeout (a worker daemon holding a task does) latches
+# `failed` on the way out, and a unit with no fragment can never run again, so
+# nothing will ever clear that latch: systemd keeps the unit loaded for no
+# other reason than to remember it. The host unit-health probe then counted
+# those corpses as broken infrastructure every two minutes on a host whose
+# retirement had succeeded -- a `failed_units` finding no repair could clear,
+# because the units it named no longer existed.
+# ---------------------------------------------------------------------------
+
+
+LEGACY = (
+    "voyn-aicc-worker.service",
+    "voyn-aicc-worker-2.service",
+    "aicc-worker.service",
+)
+
+
+class _TimedOutLegacyStop(FakeSystemd):
+    """A legacy `stop` that reaches TimeoutStopSec: systemd latches `failed`."""
+
+    def run(self, *args: str, check: bool = True) -> str:
+        if args[0] == "stop" and args[-1] in LEGACY:
+            self.calls.append(args)
+            state = self.states[args[-1]]
+            state["ActiveState"] = "failed"
+            state["SubState"] = "failed"
+            state["MainPID"] = "0"
+            return ""
+        return super().run(*args, check=check)
+
+
+def test_a_timed_out_legacy_stop_is_not_left_latched_failed():
+    """The defect, with the live exit shape: every retired unit ends
+    un-latched, and the clear is issued after the disable that removes its
+    fragment -- so what is cleared is final."""
+    module = _module()
+    systemd = _TimedOutLegacyStop(("voyn-aicc-worker@1.service",))
+
+    module.retire_legacy_units(systemd)
+
+    for unit in LEGACY:
+        assert systemd.states[unit]["ActiveState"] != "failed"
+        # Order is part of the contract: stop, disable, then clear.
+        assert systemd.calls.index(("reset-failed", unit)) > systemd.calls.index(
+            ("disable", unit)
+        )
+
+
+def test_retirement_refuses_a_unit_whose_latch_it_could_not_clear():
+    """Proving the latch is gone, not that a clear was issued: a reaping rule
+    that was merely WRITTEN did nothing on any host for a whole finding cycle
+    (7570626c). `reset-failed` here is a no-op, as it is for an unprivileged
+    caller, and the rollout must refuse rather than advance."""
+    module = _module()
+
+    class _ClearDoesNothing(_TimedOutLegacyStop):
+        def run(self, *args: str, check: bool = True) -> str:
+            if args[0] == "reset-failed":
+                self.calls.append(args)
+                return ""
+            return super().run(*args, check=check)
+
+    systemd = _ClearDoesNothing(("voyn-aicc-worker@1.service",))
+    with pytest.raises(module.RolloutError, match="still latched failed"):
+        module.retire_legacy_units(systemd)
+
+
+def test_an_abandoned_rollout_does_not_leave_a_legacy_corpse_behind():
+    """worker-01, 2026-08-31: four consecutive attempts failed, and each one
+    stopped and disabled the legacy units again on the way out. That path is
+    how the corpses were produced as much as the success path is."""
+    module = _module()
+    unit = "voyn-aicc-worker@1.service"
+
+    class _LaneWillNotVerify(_TimedOutLegacyStop):
+        def run(self, *args: str, check: bool = True) -> str:
+            value = super().run(*args, check=check)
+            if args == ("start", unit):
+                self.states[unit]["DropInPaths"] = ""
+            return value
+
+    systemd = _LaneWillNotVerify((unit,))
+    with pytest.raises(module.RolloutError):
+        module.rollout(
+            systemd,
+            (unit,),
+            agent_user="aicc-agent",
+            privileged_users=("root", "voynadmin"),
+            uid_for_user=_uid,
+            process_uid=lambda pid: 1002,
+            process_environment=lambda pid: (
+                "AICC_AGENT_PRINCIPAL_ISOLATION=required",
+                "AICC_DATA_DIR=/var/lib/aicc/data",
+            ),
+        )
+
+    for legacy in LEGACY:
+        assert systemd.states[legacy]["ActiveState"] != "failed"

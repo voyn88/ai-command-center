@@ -25,7 +25,7 @@ _ALLOWED_LATIN = {
     "CI", "PR", "SHA", "API", "URL", "JSON", "CPU", "macOS", "QR", "PDF",
     "ID", "HTTP", "HTTPS", "Git", "GitHub",
     # Canonical product acronyms shown unchanged as project names.
-    "AICC", "AIOS", "AICOS", "ESF", "AML",
+    "AICC", "AIOS", "AICOS", "ESF", "AML", "CRM", "VOYN",
     # Git domain terms kept in their conventional Latin form (like "Git"),
     # clearer to a developer operator than a literal translation.
     "worktree", "Worktree",

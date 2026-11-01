@@ -1,0 +1,11 @@
+[Unit]
+Description=Run AICC autonomy remediation tick
+
+[Timer]
+OnBootSec=7min
+OnUnitInactiveSec=5min
+AccuracySec=30s
+Unit=voyn-aicc-remediate.service
+
+[Install]
+WantedBy=timers.target

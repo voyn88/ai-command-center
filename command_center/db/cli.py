@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from contextlib import nullcontext
 from typing import Any
@@ -67,6 +68,20 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser(
         "upgrade",
         help="Apply pending migrations and re-assert table grants (as the migrator).",
+    )
+    # No database, so it is the one migration command a developer can run on a
+    # laptop -- which is where the edit that needs catching is made.
+    #
+    # Check only. Regeneration is `python scripts/migration_lock.py --write`:
+    # a durable write inside a package named `db` is what
+    # tests/architecture/aios_boundary.py reads as a persistence engine
+    # (docs/AIOS_BOUNDARY.md), and the control plane's database CLI is not
+    # one. Verifying persists nothing, so it belongs here, reachable from a
+    # deploy.
+    sub.add_parser(
+        "migration-lock",
+        help="Check the recorded checksum of every migration file "
+        "(regenerate with scripts/migration_lock.py --write).",
     )
 
     # The queue's recovery surface (SRV-06). These run as `aicc_app` — the
@@ -125,6 +140,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     plan.add_argument("--wip-limit", type=int, default=4)
     plan.add_argument(
+        "--repo-path", default=os.environ.get("AICC_FLEET_REPO", ""),
+        help="Configured repository path for opt-in coordination (AICC_FLEET_REPO).",
+    )
+    plan.add_argument(
         "--dry-run",
         action="store_true",
         help="Report the eligible set without dispatching.",
@@ -148,6 +167,19 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Review and publish a verdict only for this exact backlog task id.",
     )
+    remediate = sub.add_parser(
+        "backlog-remediate",
+        help="One autonomy remediation tick: drain blocked READY_TO_REVIEW PRs "
+        "by refreshing stale exact-head review, rerunning bounded stale/red "
+        "checks, or spawning capped follow-up remediation tasks. Never merges "
+        "or posts acceptance directly. Needs --repo-path.",
+    )
+    remediate.add_argument("--repo-path", default=".", help="Local clone for gh calls.")
+    remediate.add_argument(
+        "--task-id",
+        default=None,
+        help="Remediate only this exact backlog task id.",
+    )
     sub.add_parser(
         "backlog-merge",
         help="One merge tick (BO-S3b): merge every reviewed PR whose ACCEPT "
@@ -164,10 +196,16 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser(
         "backlog-pr-window",
         help="One PR-window tick: label every open PR active/waiting/"
-        "blocked in a bounded rotation (aicc-backlog-pr-window.timer). "
+        "blocked in a bounded rotation (voyn-aicc-pr-window.timer). "
         "Only ever relabels -- never merges, approves, or weakens a gate. "
-        "Needs --repo-path.",
-    ).add_argument("--repo-path", default=".", help="Local clone for gh calls.")
+        "GitHub only: opens no database connection, so it runs on any host "
+        "with a gh identity. Needs --repo-path.",
+    ).add_argument(
+        "--repo-path",
+        default=".",
+        help="Directory to run gh in. A clone, or any directory when GH_REPO "
+        "names the repository (the deploy-managed unit uses the release tree).",
+    )
 
     self_deploy = sub.add_parser(
         "self-deploy",
@@ -206,6 +244,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Marker file the staged worker rollout holds for its duration; "
         "a tick that finds it present refuses rather than racing the "
         "rollout's own lane mutations.",
+    )
+    self_deploy.add_argument(
+        "--release-root",
+        default=None,
+        help="Optional immutable release root. When set, stage tracked source "
+        "under RELEASE_ROOT/releases/<sha> and atomically update "
+        "RELEASE_ROOT/current.",
+    )
+    self_deploy.add_argument(
+        "--release-venv",
+        default=None,
+        help="Runtime venv to expose as .venv inside each immutable release "
+        "(defaults to REPO_PATH/.venv when --release-root is set).",
     )
 
     # The fleet's single-panel view over enrolled worker-host devices
@@ -263,6 +314,17 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = build_parser().parse_args(argv)
 
+    if args.command == "migration-lock":
+        # No database and no configuration: the lock is a property of the
+        # files, and this must answer on a laptop with no DSN at all.
+        try:
+            migrations.verify_released_checksums()
+        except migrations.MigrationError as exc:
+            print(f"migration lock: {exc}", file=sys.stderr)
+            return 2
+        print(f"migration lock: {len(migrations.discover())} migrations unchanged")
+        return 0
+
     if args.command == "self-deploy":
         # Deliberately BEFORE any database configuration or pool: a deploy
         # must work when the database is down or this host has no DB role
@@ -281,6 +343,8 @@ def main(argv: list[str] | None = None) -> int:
                 services=tuple(args.restart),
                 migrate=args.migrate,
                 rollout_lock_path=args.rollout_lock,
+                release_root=args.release_root,
+                release_venv=args.release_venv,
             ),
         )
         print(f"{deploy_report.outcome.upper():10} {deploy_report.detail}")
@@ -289,6 +353,44 @@ def main(argv: list[str] | None = None) -> int:
         # A refusal or rollback exits non-zero so systemd surfaces the
         # failed tick to the operator; noop/deployed is success.
         return 0 if deploy_report.outcome in ("noop", "deployed") else 1
+
+    if args.command == "backlog-pr-window":
+        # Deliberately BEFORE any database configuration or pool, like
+        # self-deploy above and for a sharper reason: the PR-window
+        # reconciler reads and writes GitHub and nothing else -- it takes no
+        # connection factory and touches no table -- so a database credential
+        # was a requirement that bought the tick nothing and cost it a host.
+        # It is what tied the tick to the one layout that had one
+        # (User=aicc-worker, /etc/ai-command-center.env), which the control
+        # plane does not have, which is why the labeller was never deployed
+        # there at all and every fleet PR opened without CI
+        # (VOYN-W0-AICC-PR-WINDOW-RECONCILER-NOT-DEPLOYED-ON-CONTROL). The
+        # deploy-managed unit needs no EnvironmentFile, and the tick keeps
+        # labelling while the database is down.
+        from command_center.orchestrator.review_merge import reconcile_pr_window
+
+        window = reconcile_pr_window(args.repo_path)
+        if window.error is not None:
+            print(f"pr-window tick failed: {window.error}", file=sys.stderr)
+            if window.quota is not None:
+                # The quota line is exactly what tells an operator whether a
+                # failed listing was a rate limit, and under whose identity
+                # -- print it on the way out, not only on the happy path.
+                print(window.quota.line())
+            return 1
+        for number, head in window.active:
+            print(f"ACTIVE    #{number} -> {head}")
+        for number, head in window.waiting:
+            print(f"WAITING   #{number} -> {head}")
+        for number, reason in window.blocked:
+            print(f"BLOCKED   #{number}: {reason}")
+        for number, head in window.age_fallback:
+            print(f"AGE-FALLBACK #{number} -> {head}: createdAt used")
+        for number, head in window.unreadable:
+            print(f"UNREADABLE #{number} -> {head}: detail lookup failed, label kept")
+        if window.quota is not None:
+            print(window.quota.line())
+        return 0
 
     try:
         config = load_config()
@@ -311,7 +413,19 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
 
             if args.command == "upgrade":
-                applied = migrations.upgrade(conn)
+                try:
+                    applied = migrations.upgrade(conn)
+                except migrations.MigrationError as exc:
+                    # A refusal, not a crash. `self-deploy --migrate` runs this
+                    # as a subprocess and puts the head of its stderr into the
+                    # deploy report, so an uncaught raise reported
+                    # "Traceback (most recent call last):\n  File ..." and the
+                    # actual verdict -- "migration 0022 was modified after it
+                    # was applied" -- never reached the operator, and the
+                    # queue fixes behind it stayed unapplied
+                    # (VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH).
+                    print(f"migration refused: {exc}", file=sys.stderr)
+                    return 2
                 print(f"applied: {list(applied)}" if applied else "already up to date")
                 # Unconditionally, not only when something was applied: a table
                 # created by a migration starts with no grants, and re-asserting
@@ -522,12 +636,34 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"REFUSED   {task_id}: {reason}")
                 for task_id, reason in report.undispatchable:
                     print(f"NO-REPO   {task_id}: {reason}")
+                # Coordination v2 runs AFTER the planner lease is released so a
+                # model call never blocks planner:global. Opt-in / stop switches
+                # live in coordination.coordinate_once; default is no-op.
+                from command_center.orchestrator.coordination import (
+                    CoordinationLimits,
+                    coordinate_once,
+                )
+
+                coord = coordinate_once(
+                    lambda: _nc(conn), CoordinationLimits(repository_path=args.repo_path)
+                )
+                if coord.stopped:
+                    print(f"COORD     stopped ({coord.skipped})")
+                elif coord.enqueued:
+                    print(f"COORD     enqueued {coord.enqueued}")
+                elif coord.applied:
+                    print(f"COORD     applied order n={len(coord.applied)}")
+                elif coord.rejected:
+                    print(f"COORD     rejected: {coord.rejected}")
+                elif coord.skipped and coord.skipped != "disabled":
+                    print(f"COORD     skipped: {coord.skipped}")
                 return 0
 
             if args.command == "backlog-review":
                 from contextlib import nullcontext as _nc
 
                 from command_center.db.work_queue_store import WorkQueueStore
+                from command_center.orchestrator import gh_access
                 from command_center.orchestrator.review_merge import (
                     publish_review_verdicts,
                     reconcile_pr_evidence,
@@ -537,50 +673,88 @@ def main(argv: list[str] | None = None) -> int:
 
                 store = WorkQueueStore(lambda: _nc(conn))
                 enqueue = _review_enqueue(store)
-                # Before selecting anything: a task whose PR exists but was
-                # never recorded is invisible to every gate downstream. This
-                # derives that evidence from the task's own branch, so a pull
-                # request opened outside `publish_run` still reaches review.
-                evidence = reconcile_pr_evidence(
-                    lambda: _nc(conn), args.repo_path, task_id=args.task_id
+                # One quota scope for the WHOLE tick: the four steps below
+                # all call `gh`, so counting them separately would tell an
+                # operator nothing about what the tick as a whole spent --
+                # and the identity is resolved once, here, rather than four
+                # times (VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS).
+                with gh_access.tick(args.repo_path) as quota:
+                    # Before selecting anything: a task whose PR exists but
+                    # was never recorded is invisible to every gate
+                    # downstream. This derives that evidence from the task's
+                    # own branch, so a pull request opened outside
+                    # `publish_run` still reaches review.
+                    evidence = reconcile_pr_evidence(
+                        lambda: _nc(conn), args.repo_path, task_id=args.task_id
+                    )
+                    for evidence_task_id, pr in evidence.recorded:
+                        print(f"PR-FOUND  {evidence_task_id} -> {pr}")
+                    for evidence_task_id, reason in evidence.skipped:
+                        print(f"PR-SKIP   {evidence_task_id}: {reason}")
+                    report = review_once(
+                        lambda: _nc(conn),
+                        enqueue,
+                        args.repo_path,
+                        task_id=args.task_id,
+                    )
+                    for task_id, pr in report.reviewed:
+                        print(f"REVIEW    {task_id} -> {pr}")
+                    for task_id, reason in report.skipped:
+                        print(f"SKIP      {task_id}: {reason}")
+                    retry_report = reconcile_review_once(
+                        lambda: _nc(conn),
+                        enqueue,
+                        args.repo_path,
+                        task_id=args.task_id,
+                    )
+                    for task_id, retry_key in retry_report.retried:
+                        print(f"RETRY     {task_id} -> {retry_key}")
+                    for task_id, reason in retry_report.skipped:
+                        print(f"RETRY-SKIP {task_id}: {reason}")
+                    marker_report = publish_review_verdicts(
+                        lambda: _nc(conn), args.repo_path, task_id=args.task_id,
+                        # The same queue writer review_once uses: a REJECT
+                        # enqueues one finding-verification run before it may
+                        # remediate (VOYN-W0-AICC-REVIEW-AUTO-ACCEPT).
+                        enqueue=enqueue,
+                    )
+                    for task_id, pr in marker_report.reviewed:
+                        print(f"MARKER    {task_id} -> {pr}")
+                    for task_id, new_task_id in marker_report.remediated:
+                        print(f"REMEDIATE {task_id} -> {new_task_id}")
+                    for task_id, reason in marker_report.skipped:
+                        print(f"SKIP      {task_id}: {reason}")
+                # Printed AFTER the scope closes: the remaining-budget half
+                # of the line is read on the way out (`gh api rate_limit`,
+                # which does not itself consume quota).
+                print(quota.line())
+                return 0
+
+            if args.command == "backlog-remediate":
+                from contextlib import nullcontext as _nc
+
+                from command_center.db.work_queue_store import WorkQueueStore
+                from command_center.orchestrator.review_merge import (
+                    autonomy_remediate_once,
                 )
-                for evidence_task_id, pr in evidence.recorded:
-                    print(f"PR-FOUND  {evidence_task_id} -> {pr}")
-                for evidence_task_id, reason in evidence.skipped:
-                    print(f"PR-SKIP   {evidence_task_id}: {reason}")
-                report = review_once(
+
+                store = WorkQueueStore(lambda: _nc(conn))
+                report = autonomy_remediate_once(
                     lambda: _nc(conn),
-                    enqueue,
+                    _review_enqueue(store),
                     args.repo_path,
                     task_id=args.task_id,
                 )
-                for task_id, pr in report.reviewed:
-                    print(f"REVIEW    {task_id} -> {pr}")
+                for task_id, pr in report.refreshed:
+                    print(f"REFRESH   {task_id} -> {pr}")
+                for task_id, reason in report.rerun:
+                    print(f"RERUN     {task_id}: {reason}")
+                for task_id, new_task_id in report.remediated:
+                    print(f"REMEDIATE {task_id} -> {new_task_id}")
                 for task_id, reason in report.skipped:
                     print(f"SKIP      {task_id}: {reason}")
-                retry_report = reconcile_review_once(
-                    lambda: _nc(conn),
-                    enqueue,
-                    args.repo_path,
-                    task_id=args.task_id,
-                )
-                for task_id, retry_key in retry_report.retried:
-                    print(f"RETRY     {task_id} -> {retry_key}")
-                for task_id, reason in retry_report.skipped:
-                    print(f"RETRY-SKIP {task_id}: {reason}")
-                marker_report = publish_review_verdicts(
-                    lambda: _nc(conn), args.repo_path, task_id=args.task_id,
-                    # The same queue writer review_once uses: a REJECT
-                    # enqueues one finding-verification run before it may
-                    # remediate (VOYN-W0-AICC-REVIEW-AUTO-ACCEPT).
-                    enqueue=enqueue,
-                )
-                for task_id, pr in marker_report.reviewed:
-                    print(f"MARKER    {task_id} -> {pr}")
-                for task_id, new_task_id in marker_report.remediated:
-                    print(f"REMEDIATE {task_id} -> {new_task_id}")
-                for task_id, reason in marker_report.skipped:
-                    print(f"SKIP      {task_id}: {reason}")
+                if report.quota is not None:
+                    print(report.quota.line())
                 return 0
 
             if args.command == "backlog-merge":
@@ -593,7 +767,18 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"MERGED    {task_id} -> {head}")
                 for task_id, reason in report.skipped:
                     print(f"SKIP      {task_id}: {reason}")
-                return 0
+                for task_id, reason in report.errors:
+                    print(f"ERROR     {task_id}: {reason}", file=sys.stderr)
+                if report.quota is not None:
+                    print(report.quota.line())
+                # `errors` means the gateway could not even evaluate a
+                # merge (its identity is unconfigured, GitHub was
+                # unreachable) -- distinct from an ordinary `skipped` PR
+                # that simply isn't ready, and reported with a non-zero
+                # exit so a caller (timer, runbook) fails loudly instead of
+                # retrying forever unaware (VOYN-W0-AICC-MERGE-GATEWAY-
+                # REM-REM-REM).
+                return 1 if report.errors else 0
 
             if args.command == "backlog-merge-reconcile":
                 from contextlib import nullcontext as _nc
@@ -615,27 +800,6 @@ def main(argv: list[str] | None = None) -> int:
                 # Non-zero exit surfaces a real finding to a human/CI without
                 # ever touching the database -- report-only stays report-only.
                 return 1 if report.suspect else 0
-
-            if args.command == "backlog-pr-window":
-                from command_center.orchestrator.review_merge import (
-                    reconcile_pr_window,
-                )
-
-                report = reconcile_pr_window(args.repo_path)
-                if report.error is not None:
-                    print(f"pr-window tick failed: {report.error}", file=sys.stderr)
-                    return 1
-                for number, head in report.active:
-                    print(f"ACTIVE    #{number} -> {head}")
-                for number, head in report.waiting:
-                    print(f"WAITING   #{number} -> {head}")
-                for number, reason in report.blocked:
-                    print(f"BLOCKED   #{number}: {reason}")
-                for number, head in report.age_fallback:
-                    print(f"AGE-FALLBACK #{number} -> {head}: createdAt used")
-                for number, head in report.unreadable:
-                    print(f"UNREADABLE #{number} -> {head}: detail lookup failed, label kept")
-                return 0
 
             if args.command == "downgrade":
                 if not args.confirmed:

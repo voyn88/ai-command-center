@@ -57,6 +57,28 @@ def test_incident_intake_dedups_by_source_ref(bus) -> None:
     assert len(opened) == 1
 
 
+def test_incident_intake_does_not_resurrect_a_resolved_conflict(bus) -> None:
+    """Dedup is by ``source_ref`` alone (:func:`db.get_conflict_by_source_ref`
+    carries no status filter), so a redelivery against a ``source_ref`` whose
+    only row is already ``resolved`` still matches that row and is dropped —
+    it does **not** open a second conflict. Pinned here because ADR-0012 cites
+    this test for that claim; without it, "a fresh incident opens a new
+    conflict" would be exactly the kind of unverified assertion the ADR
+    itself argues against."""
+    ConflictIntake().register(bus)
+    bus.publish(IncidentOpened(incident_id="closed", severity="sev1"))
+    (row,) = [r for r in _conflicts() if r["source_ref"] == "incident:closed"]
+    db.set_conflict_status(
+        resolve_db_path(ROOT), row["id"], expected_version=row["version"], status="resolved"
+    )
+
+    bus.publish(IncidentOpened(incident_id="closed", severity="sev1"))  # redelivery
+
+    matching = [r for r in _conflicts() if r["source_ref"] == "incident:closed"]
+    assert len(matching) == 1
+    assert matching[0]["status"] == "resolved"
+
+
 def test_sensitive_incident_opens_no_conflict(bus) -> None:
     ConflictIntake().register(bus)
     bus.publish(IncidentOpened(incident_id="secret", severity="sev1", project_ref="BANK"))

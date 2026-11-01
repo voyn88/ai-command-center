@@ -66,27 +66,27 @@ from __future__ import annotations
 from types import MappingProxyType
 
 __all__ = [
-    "APP_ROLE",
-    "MIGRATOR_ROLE",
-    "OPERATOR_ROLE",
-    "WORKER_ROLE",
     "ALL_ROLES",
     "ALL_TABLES",
     "ALL_VIEWS",
+    "APP_ROLE",
     "COLUMN_PRIVILEGES",
     "FUNCTION_PRIVILEGES",
-    "merge_column_privileges",
-    "merge_privileges",
+    "IDENTITY_SEQUENCES",
+    "MIGRATOR_ROLE",
+    "OPERATOR_ROLE",
+    "PRIVILEGES",
     "VIEW_PRIVILEGES",
+    "WORKER_ROLE",
     "apply_bootstrap",
     "apply_table_grants",
-    "IDENTITY_SEQUENCES",
-    "PRIVILEGES",
+    "merge_column_privileges",
+    "merge_privileges",
     "render_bootstrap",
-    "render_worker_host_role",
     "render_grants",
-    "render_table_grants",
     "render_role_creation",
+    "render_table_grants",
+    "render_worker_host_role",
 ]
 
 MIGRATOR_ROLE = "aicc_migrator"
@@ -127,6 +127,7 @@ ALL_TABLES: tuple[str, ...] = (
     "backlog_task_remediation",
     "backlog_scan_cursor",
     "backlog_writer_lease",
+    "coordinator_state",
     "completion",
     "completion_event",
     "completion_validation",
@@ -308,6 +309,8 @@ _APP_BACKLOG_TABLES: dict[str, frozenset[str]] = {
     "backlog_writer_lease": _READ,
     "backlog_task_remediation": _READ,
     "backlog_scan_cursor": _READ,
+    # Coordination v2: reads only; every write is a SECURITY DEFINER CAS.
+    "coordinator_state": _READ,
 }
 
 _WORKER_BACKLOG_TABLES: dict[str, frozenset[str]] = {
@@ -318,6 +321,7 @@ _WORKER_BACKLOG_TABLES: dict[str, frozenset[str]] = {
     "backlog_writer_lease": _NONE,
     "backlog_task_remediation": _NONE,
     "backlog_scan_cursor": _NONE,
+    "coordinator_state": _NONE,
 }
 
 # The enrolment tables (0003), for the control plane. Read-only, and two of them
@@ -535,7 +539,7 @@ _WORKER_FUNCTIONS = (
     "queue_complete(text, text, jsonb)",
     "queue_fail(text, text, text, boolean)",
     # 0021: the worker-host fail-closed probe records what it measured.
-    # 0024 adds the two-argument overload: clear this source's findings EXCEPT
+    # 0038 adds the two-argument overload: clear this source's findings EXCEPT
     # the ones this tick still measures, so a resolved failure stops waiting
     # for its unrelated siblings to go green too.
     "monitor_record_finding(text, text, jsonb)",
@@ -545,6 +549,12 @@ _WORKER_FUNCTIONS = (
     # work itself (VOYN-W0-AICC-PUBLISH-LEASE-CONTENTION-BURNS-ATTEMPT) --
     # see 0022_queue_fail_lease_wait.
     "queue_fail_lease_wait(text, text, text, integer)",
+    # A sibling refund path for host/launcher/provider infrastructure
+    # failures. These are not task attempts, but must still be bounded under
+    # their own wait budget. The trailing jsonb (0025) is the caller's own
+    # evidence for the audit row -- which executor is out of quota and until
+    # when this worker withholds it -- and defaults to NULL.
+    "queue_fail_infra_wait(text, text, text, integer, jsonb)",
 )
 
 # Deliberately not `queue_claim`: only a role that PostgreSQL authenticated as a
@@ -552,7 +562,7 @@ _WORKER_FUNCTIONS = (
 _APP_FUNCTIONS = (
     "queue_enqueue(text, text, jsonb, text, text, integer, integer, integer, integer)",
     "queue_reap()",
-    # 0028 adds the bounded arity: one call is one transaction, and an
+    # 0040 adds the bounded arity: one call is one transaction, and an
     # interrupted transaction recovers nothing at all, so `WorkQueueAdmin.reap`
     # commits batches instead of betting a whole backlog on a tick that
     # `aicc-queue-reaper.service` gives 60 seconds. Both arities are listed
@@ -590,10 +600,14 @@ _APP_BACKLOG_FUNCTIONS = (
     "backlog_scan_claim(text, text, text)",
     # Triage of raw findings (0008): UNTRIAGED -> OPEN/NEEDS_REFINEMENT/DONE/DECIDED.
     "backlog_triage(text, text, text)",
+    # Priority/wave reassignment (0035, VOYN-W0-APP-CONTROL-S6d).
+    "backlog_reassign(text, text, text, bigint)",
+    # Evidence hygiene (0030): remove proven malformed PR evidence.
+    "backlog_clear_evidence(text, text, text, text)",
     # 0021: read-only deploy preflight with dispatch's privileges; the task
     # class setter the planner uses for split children and monitor tasks; the
     # monitor-finding record/clear pair (shared with worker hosts, see
-    # _WORKER_FUNCTIONS, including 0024's partial-clear overload) and the
+    # _WORKER_FUNCTIONS, including 0038's partial-clear overload) and the
     # control-plane-only task link.
     "backlog_dispatch_smoke()",
     "backlog_set_task_class(text, text)",
@@ -604,6 +618,14 @@ _APP_BACKLOG_FUNCTIONS = (
     # Audit trail for where a record came from (0020); the importer's stamp
     # that a row was migrated rather than authored directly in the store.
     "backlog_record_provenance(text, text, jsonb)",
+    "backlog_owner_decision(text, bigint, text, text)",
+    "backlog_owner_lock(text)",
+    # Coordination v2 (0031): durable snapshot/in-flight CAS; no DML path.
+    "coordinator_state_read(text)",
+    "coordinator_enqueue(text, text, text, text, text, jsonb)",
+    "coordinator_cas_begin(text, text, text, text, timestamptz)",
+    "coordinator_cas_finish(text, text, text, jsonb, text, jsonb, integer, timestamptz)",
+    "coordinator_cas_clear_inflight(text, text, text, timestamptz)",
 )
 
 # The enrolment surface (0003), split by who may do what.
@@ -991,14 +1013,14 @@ def render_worker_host_role(role: str) -> list[str]:
     """
     _require_identifier(role)
     return [
-        "DO $$\n"
+        ("DO $$\n"
         "BEGIN\n"
         "    PERFORM pg_advisory_xact_lock(7823649102);\n"
         f"    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role}') THEN\n"
         f"        CREATE ROLE {role} LOGIN IN ROLE {WORKER_ROLE};\n"
         "    END IF;\n"
         "END\n"
-        "$$;"
+        "$$;")
     ]
 
 
@@ -1032,7 +1054,7 @@ def apply_table_grants(conn, schema: str = "public") -> int:
         )
         relations = {row[0] for row in cur.fetchall()}
         # Name AND arity: `monitor_clear_finding` exists under two signatures
-        # from 0024 on, and only one of them exists before it (see
+        # from 0038 on, and only one of them exists before it (see
         # `_function_key`).
         cur.execute(
             "SELECT p.proname, p.pronargs FROM pg_proc p JOIN pg_namespace n "
@@ -1049,10 +1071,9 @@ def apply_table_grants(conn, schema: str = "public") -> int:
 
 
 def _execute(conn, statements: list[str]) -> int:
-    with conn.transaction():
-        with conn.cursor() as cur:
-            for statement in statements:
-                cur.execute(statement)
+    with conn.transaction(), conn.cursor() as cur:
+        for statement in statements:
+            cur.execute(statement)
     return len(statements)
 
 
@@ -1060,9 +1081,9 @@ def _function_key(signature: str) -> str:
     """`name(type, ...)` -> `name/arity`, the key the existence filter matches.
 
     The bare NAME used to be enough, because every function in this schema had
-    exactly one signature. 0024's `monitor_clear_finding(text, text[])` is the
+    exactly one signature. 0038's `monitor_clear_finding(text, text[])` is the
     first overload, and it made name-matching wrong in the one direction that
-    raises: at any version between 0021 and 0024 the name is present (0021's
+    raises: at any version between 0021 and 0038 the name is present (0021's
     one-argument form) while the two-argument form is not, so
     `apply_table_grants` would emit a GRANT for a function that does not exist
     and abort the whole matrix -- exactly the intermediate-version case the
@@ -1101,7 +1122,7 @@ def _require_function_signature(signature: str) -> None:
     for argument in (a.strip() for a in rest[:-1].split(",")):
         if not argument:
             continue
-        # An argument may be an array type (0024's `monitor_clear_finding(text,
+        # An argument may be an array type (0038's `monitor_clear_finding(text,
         # text[])`). The brackets are the only punctuation admitted, and only
         # as a suffix: `text[]` is guarded as `text` plus a shape PostgreSQL
         # spells exactly this way, while `text[]evil` or `text]` still fail.

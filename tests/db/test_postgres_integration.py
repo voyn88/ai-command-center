@@ -410,7 +410,7 @@ def test_execute_grants_match_the_declared_protocol_steps(
 
     Declared signatures resolve to catalog functions by NAME AND ARITY
     (`roles._function_key` against `pg_proc.pronargs`), never by name alone.
-    0024's `monitor_clear_finding(text, text[])` is this schema's first
+    0038's `monitor_clear_finding(text, text[])` is this schema's first
     overload, and a name-prefix match calls both declared forms ambiguous and
     both granted overloads surplus on a schema that is exactly compliant --
     this test failed on a correct database rather than catching an incorrect

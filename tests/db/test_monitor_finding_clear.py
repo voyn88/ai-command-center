@@ -14,7 +14,7 @@ trailing hour keeps `dead_letter_growth` red, so on a fleet that dead-letters
 at all the all-green tick never comes -- and `queue_stalled`, healthy again
 since the stall clock was fixed, stays `open` behind it with its task, forever.
 
-0024 adds the set difference: clear this source's open findings EXCEPT the
+0038 adds the set difference: clear this source's open findings EXCEPT the
 ones still being measured. Why a real server rather than a stub cursor:
 
 * The behaviour under test is the `failure <> ALL (...)` predicate and the

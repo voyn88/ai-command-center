@@ -14,7 +14,7 @@ import pytest
 # vendored `aios_db` wheel — present in CI, optional in a bare local checkout.
 pytest.importorskip("aios_db")
 
-from command_center.db.cli import _review_enqueue, build_parser  # noqa: E402
+from command_center.db.cli import _review_enqueue, build_parser
 
 
 def test_queue_reap_takes_no_arguments() -> None:
@@ -118,3 +118,178 @@ def test_backlog_review_enqueues_ahead_of_implementation_dispatch() -> None:
         "priority": 100,
     }]
     assert calls[0]["priority"] > 0
+
+
+def test_migration_lock_checks_without_a_database(capsys) -> None:
+    """The one migration command that runs where the edit is made. It is
+    deliberately handled before `load_config()`: a laptop with no DSN must
+    still get the verdict, or the guard is only reachable from the host that
+    is already broken (VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH)."""
+    from command_center.db import migrations
+    from command_center.db.cli import main
+
+    assert main(["migration-lock"]) == 0
+    assert f"{len(migrations.discover())} migrations unchanged" in capsys.readouterr().out
+
+
+def test_migration_lock_reports_an_edited_file_as_a_refusal(
+    capsys, monkeypatch, tmp_path
+) -> None:
+    """Exit 2 and a message, never a traceback: this command exists to be
+    read."""
+    from command_center.db import migrations
+    from command_center.db.cli import main
+
+    def refuse(sql_dir=None):
+        raise migrations.MigrationError("0022_queue_fail_lease_wait.up.sql changed")
+
+    monkeypatch.setattr(migrations, "verify_released_checksums", refuse)
+    assert main(["migration-lock"]) == 2
+    assert "migration lock: 0022_queue_fail_lease_wait.up.sql changed" in (
+        capsys.readouterr().err
+    )
+
+
+def test_upgrade_reports_a_refusing_ledger_as_a_message(capsys, monkeypatch) -> None:
+    """`self-deploy --migrate` runs this as a subprocess and puts a bounded
+    slice of its stderr in the deploy report. An uncaught `MigrationError`
+    made that slice a traceback header, so the one failure that never clears
+    by itself -- an already-applied file edited since -- was also the one the
+    operator could not read (VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH)."""
+    from contextlib import nullcontext
+
+    from command_center.db import cli, migrations
+
+    monkeypatch.setattr(cli, "load_config", lambda: _StubConfig())
+    monkeypatch.setattr(cli.pool, "open_pool", lambda config: None)
+    monkeypatch.setattr(cli.pool, "close_pool", lambda: None)
+    monkeypatch.setattr(cli.pool, "connection", lambda: nullcontext(object()))
+
+    def refuse(conn, **kwargs):
+        raise migrations.MigrationError(
+            "migration 0022_queue_fail_lease_wait was modified after it was applied"
+        )
+
+    monkeypatch.setattr(cli.migrations, "upgrade", refuse)
+
+    assert cli.main(["upgrade"]) == 2
+    captured = capsys.readouterr()
+    assert captured.err.splitlines() == [
+        "migration refused: migration 0022_queue_fail_lease_wait was modified "
+        "after it was applied"
+    ]
+    # The grant re-assertion must not run behind a refused migration.
+    assert "table grants" not in captured.out
+
+
+class _StubConfig:
+    def redacted(self) -> str:
+        return "postgresql://stub"
+
+
+def test_the_database_cli_is_not_a_persistence_engine() -> None:
+    """`command_center/db/cli.py` must persist nothing.
+
+    The AIOS boundary gate (docs/AIOS_BOUNDARY.md, ADR-0008/ADR-0015) reads a
+    durable filesystem write inside a package named `db` as a persistence
+    engine -- "a JSON store is a persistence engine even with no driver
+    anywhere in it" -- and freezes the file against growth by recording it in
+    `AIOS_BOUNDARY_BASELINE.json`. Adding `migration-lock --write` to this CLI
+    did exactly that and turned
+    `test_engine_inventory_matches_frozen_baseline` red
+    (VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH).
+
+    Regenerating the lock is developer maintenance, so it moved to
+    `scripts/migration_lock.py --write` -- the boundary doc's own preferred
+    remedy, moving the module rather than growing the frozen inventory. This
+    test states the property directly, because the baseline gate reports it as
+    generic drift and the next person to reach for a convenient `write_text`
+    here would read that as an unrelated failure.
+    """
+    import ast
+
+    from tests.architecture import aios_boundary as boundary
+
+    source = (boundary.REPO_ROOT / "command_center/db/cli.py").read_text(
+        encoding="utf-8"
+    )
+    assert not boundary._persists_data(ast.parse(source))
+    assert boundary.classify_engine_categories(
+        "command_center/db/cli.py", ast.parse(source)
+    ) == set()
+
+
+def test_the_database_cli_does_not_offer_to_rewrite_the_lock(capsys) -> None:
+    """`--write` is gone from this command, not merely unused: argparse has to
+    refuse it, or the write comes back the first time someone copies the old
+    invocation out of a commit message."""
+    from command_center.db.cli import main
+
+    with pytest.raises(SystemExit) as exit_code:
+        main(["migration-lock", "--write"])
+    assert exit_code.value.code == 2
+    assert "unrecognized arguments: --write" in capsys.readouterr().err
+def test_backlog_pr_window_labels_without_opening_a_database(monkeypatch, capsys) -> None:
+    """VOYN-W0-AICC-PR-WINDOW-RECONCILER-NOT-DEPLOYED-ON-CONTROL: the tick
+    reads and writes GitHub only. Requiring a database credential to run it
+    bought nothing and cost it a host -- it is what tied the labeller to the
+    one unit layout that had one, on a host the control plane is not, so the
+    tick was never deployed and every fleet PR opened with no CI. This runs
+    before `load_config`, and the deploy-managed unit therefore needs no
+    EnvironmentFile at all."""
+    from command_center.db import cli
+    from command_center.orchestrator import review_merge
+
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("the PR-window tick must not reach the database")
+
+    monkeypatch.setattr(cli, "load_config", refuse)
+    monkeypatch.setattr(cli.pool, "open_pool", refuse)
+    monkeypatch.setattr(
+        review_merge,
+        "reconcile_pr_window",
+        lambda repo_path: review_merge.PrWindowReport(
+            active=[(907, "deadbeef")], blocked=[(906, "checks_missing")]
+        ),
+    )
+
+    assert cli.main(["backlog-pr-window", "--repo-path", "/opt/aicc/current"]) == 0
+    out = capsys.readouterr().out
+    assert "ACTIVE    #907 -> deadbeef" in out
+    assert "BLOCKED   #906: checks_missing" in out
+
+
+def test_backlog_pr_window_reports_a_failed_listing_as_a_failed_tick(monkeypatch) -> None:
+    """A listing that failed labelled nothing; systemd must see a failed tick
+    rather than an empty, successful-looking report (the 500,000-node GraphQL
+    refusal did exactly that for days)."""
+    from command_center.db import cli
+    from command_center.orchestrator import review_merge
+
+    monkeypatch.setattr(
+        review_merge,
+        "reconcile_pr_window",
+        lambda repo_path: review_merge.PrWindowReport(error="pr_list_failed: 403"),
+    )
+
+    assert cli.main(["backlog-pr-window"]) == 1
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_backlog_plan_propagates_repository_path_to_coordinator(monkeypatch, explicit):
+    from contextlib import nullcontext
+
+    from command_center.db import cli
+    from command_center.orchestrator import coordination, planner
+
+    monkeypatch.setenv("AICC_FLEET_REPO", "/srv/configured-repo")
+    monkeypatch.setattr(cli, "load_config", lambda: object())
+    monkeypatch.setattr(cli.pool, "open_pool", lambda _config: None)
+    monkeypatch.setattr(cli.pool, "close_pool", lambda: None)
+    monkeypatch.setattr(cli.pool, "connection", lambda: nullcontext(object()))
+    monkeypatch.setattr(planner, "plan_once", lambda *_args: planner.PlanReport())
+    captured = []
+    monkeypatch.setattr(coordination, "coordinate_once", lambda _factory, limits: captured.append(limits.repository_path) or coordination.CoordinationReport())
+    argv = ["backlog-plan"] + (["--repo-path", "/srv/explicit-repo"] if explicit else [])
+    assert cli.main(argv) == 0
+    assert captured == ["/srv/explicit-repo" if explicit else "/srv/configured-repo"]

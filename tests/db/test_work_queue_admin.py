@@ -181,7 +181,7 @@ def test_redrive_refusals_are_data_not_exceptions(queue_actors) -> None:
 
 # ---------------------------------------------------------------------------
 # The recovery path must make PROGRESS, not merely avoid corrupting anything
-# (VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED, migration 0028).
+# (VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED, migration 0040).
 #
 # `queue_reap` is the only thing that clears a lapsed claim, and a lapsed
 # claim is the one starvation class `infra_monitor.evaluate` neither gates on
@@ -206,7 +206,7 @@ def test_one_contended_item_cannot_stop_every_other_recovery(
     queue_actors, admin_conn, test_dsn
 ) -> None:
     """THE REGRESSION. Three zombie claims, one of whose rows another
-    transaction is holding. Before 0028 the reap WAITED on that row -- so a
+    transaction is holding. Before 0040 the reap WAITED on that row -- so a
     single contended item stopped the recovery of every item behind it, and
     the tick died on `aicc-queue-reaper.service`'s `TimeoutStartSec=60s`
     having recovered nothing at all.
@@ -226,7 +226,7 @@ def test_one_contended_item_cannot_stop_every_other_recovery(
     held = claims[1]
 
     # Any of the parties that legitimately hold an item's row: a heartbeat or
-    # a report through `_queue_owns`, a duplicate `queue_enqueue` since 0027,
+    # a report through `_queue_owns`, a duplicate `queue_enqueue` since 0039,
     # a `queue_redrive`, a migration's ALTER, an operator at a psql prompt.
     with psycopg.connect(test_dsn, autocommit=False) as holder:
         with holder.cursor() as cur:
@@ -303,7 +303,7 @@ def test_a_deferred_item_is_audited_rather_than_silently_skipped(
     assert reason == "item_locked"
     assert attempt_id == claimed.attempt_id
     # NULL item id with the id in `detail`: `_queue_audit`'s seq is only
-    # collision-free for a caller holding the item's row lock (0027), and not
+    # collision-free for a caller holding the item's row lock (0039), and not
     # holding it is exactly why this branch ran.
     assert item_id is None
     assert detail["deferred_work_item_id"] == claimed.work_item_id
@@ -312,7 +312,7 @@ def test_a_deferred_item_is_audited_rather_than_silently_skipped(
 def test_an_interrupted_reap_keeps_the_batches_it_already_committed(
     queue_actors, admin_conn, test_dsn
 ) -> None:
-    """The second half of 0028. One `queue_reap` call is one transaction, so
+    """The second half of 0040. One `queue_reap` call is one transaction, so
     an interrupted call recovers NOTHING -- not everything up to where it
     stopped. `WorkQueueAdmin.reap` therefore commits bounded batches, and an
     interruption costs one batch instead of the whole backlog."""
@@ -363,7 +363,7 @@ def test_the_unbounded_arity_survives_for_a_host_that_has_not_redeployed(
     """`queue_reap()` keeps its exact signature -- and with it 0002's EXECUTE
     grant -- so the reaper timer running from an older checkout keeps working
     AND inherits the liveness fix, because the fix is in the body both
-    arities share. 0024's lesson: a `DEFAULT` on the new parameter would have
+    arities share. 0038's lesson: a `DEFAULT` on the new parameter would have
     made this call ambiguous instead."""
     store, _admin, psycopg, app_dsn = queue_actors
     _enqueue(psycopg, app_dsn, "old-caller-1", {"kind": "echo"})
@@ -381,7 +381,7 @@ def test_reap_falls_back_when_the_schema_has_not_reached_0028(
 ) -> None:
     """The control host and the worker host deploy independently, so this
     module can be newer than the database it is talking to. A reaper that
-    refused to run at all against a 0027 schema would be the one outcome
+    refused to run at all against a 0039 schema would be the one outcome
     worse than an unbatched one -- recovery is the thing whose absence the
     monitor reports as a stall."""
     store, admin, psycopg, app_dsn = queue_actors
@@ -389,12 +389,12 @@ def test_reap_falls_back_when_the_schema_has_not_reached_0028(
     assert isinstance(store.claim(QUEUE, visibility_seconds=60), ClaimedWork)
     _lapse_every_lease(psycopg, test_dsn)
 
-    # The database as it genuinely was before 0028 -- 0002's blocking,
+    # The database as it genuinely was before 0040 -- 0002's blocking,
     # unbounded body and no second arity -- reached the way a rolled-back
     # control host reaches it, not by hand-dropping half of the pair.
     from command_center.db import migrations
 
-    migrations.downgrade(admin_conn, target=27)
+    migrations.downgrade(admin_conn, target=39)
     with admin_conn.cursor() as cur:
         cur.execute(
             "SELECT count(*) FROM pg_proc WHERE proname = 'queue_reap' "
@@ -463,7 +463,7 @@ def test_a_grant_that_missed_the_new_arity_is_raised_not_papered_over(
     `except Exception` on the first batch, so ANY first-call failure re-ran
     the UNBOUNDED arity -- and the fallback is only correct for one of them.
 
-    A role re-provision that missed 0028's `GRANT EXECUTE ... queue_reap(integer)`
+    A role re-provision that missed 0040's `GRANT EXECUTE ... queue_reap(integer)`
     leaves the no-argument arity working (it carries 0002's grant) and the
     bounded one refused: `InsufficientPrivilege`, SQLSTATE 42501, measured.
     The old code answered that with the unbounded whole-table scan and
@@ -509,7 +509,7 @@ def test_an_interrupted_batch_is_never_retried_unbounded(
     `TimeoutStartSec=60s`, and the connection crosses the tunnel the
     credential rotation restarts -- arrives as `QueryCanceled`, SQLSTATE
     57014. Answering THAT by re-running the unbounded arity re-runs the
-    whole-table scan whose all-or-nothing rollback is the defect 0028 removed,
+    whole-table scan whose all-or-nothing rollback is the defect 0040 removed,
     over strictly more rows than the batch that just failed, at the one moment
     the server has already shown it cannot finish that much work.
 
@@ -568,7 +568,7 @@ def test_the_reaper_timers_own_entrypoint_recovers_a_lapsed_claim(
     and between that line and the method under test sits a seam nothing
     exercised -- `tests/db/test_cli_queue.py` reaches `queue-reap` at the
     argparse layer and stops there. The seam is not incidental plumbing;
-    every property 0028's fix rests on lives in it:
+    every property 0040's fix rests on lives in it:
 
       * THE CONNECTION IS AUTOCOMMIT. `reap`'s batching is only a fix
         because each `queue_reap(REAP_BATCH)` is durable before the next one
@@ -576,9 +576,9 @@ def test_the_reaper_timers_own_entrypoint_recovers_a_lapsed_claim(
         `pool.connection()` (`autocommit=True`), not about the loop, and the
         loop cannot tell the difference. Handed a transactional connection it
         would still return the same count while an interrupted tick threw
-        away the whole backlog again, which is the exact defect 0028 removed.
+        away the whole backlog again, which is the exact defect 0040 removed.
       * THE IDENTITY IS `aicc_app`. Recovery is deliberately not a worker
-        privilege, and 0028's `GRANT EXECUTE ... queue_reap(integer)` names
+        privilege, and 0040's `GRANT EXECUTE ... queue_reap(integer)` names
         that role; the CLI gets it from `AICC_PG_*`, not from a DSN a test
         constructed.
       * AND IT IS THE ONLY EXIT FROM THE ONE STARVATION CLASS THE PROBE
@@ -639,7 +639,7 @@ def test_the_reaper_timers_own_entrypoint_recovers_a_lapsed_claim(
             assert conn.autocommit, (
                 "the reaper's connection must be autocommit: without it a "
                 "batched reap is one transaction again, and an interrupted "
-                "tick recovers nothing (0028)"
+                "tick recovers nothing (0040)"
             )
     finally:
         pool.close_pool()

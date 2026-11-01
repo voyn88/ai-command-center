@@ -3,6 +3,7 @@ import Home from './screens/Home'
 import Execution from './screens/Execution'
 import Tasks from './screens/Tasks'
 import BackgroundLayer from './components/BackgroundLayer'
+import ServerWorkspace from './screens/ServerWorkspace'
 
 type Screen = 'home' | 'execution' | 'tasks'
 
@@ -21,9 +22,11 @@ function App() {
   return (
     <>
       <BackgroundLayer />
-      {screen === 'home' && <Home onNavigate={navigate} />}
-      {screen === 'execution' && <Execution onNavigate={navigate} />}
-      {screen === 'tasks' && <Tasks onNavigate={navigate} />}
+      {import.meta.env.VITE_AICC_DATA_SOURCE === 'server' ? <ServerWorkspace /> : <>
+        {screen === 'home' && <Home onNavigate={navigate} />}
+        {screen === 'execution' && <Execution onNavigate={navigate} />}
+        {screen === 'tasks' && <Tasks onNavigate={navigate} />}
+      </>}
     </>
   )
 }

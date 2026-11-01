@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -63,6 +64,7 @@ def calls(monkeypatch, tmp_path):
         return subprocess.CompletedProcess([], 0, "", "")
 
     def fake_smoke(repo_path, timeout):
+        recorded["smoke_cwd"] = repo_path
         return subprocess.CompletedProcess([], recorded["smoke_rc"], "", "import boom")
 
     def fake_dispatch_smoke(repo_path, timeout):
@@ -124,7 +126,7 @@ def test_refuses_while_a_staged_rollout_holds_the_lock(pair, calls, tmp_path):
 
 
 def test_deploys_normally_once_the_rollout_lock_is_absent(pair, calls, tmp_path):
-    origin, clone, first = pair
+    origin, clone, _first = pair
     new = _commit(origin, "advance")
     cfg = _cfg(
         tmp_path,
@@ -158,6 +160,203 @@ def test_fast_forward_deploys_migrates_restarts_and_records(pair, calls, tmp_pat
         for line in (tmp_path / "provenance.jsonl").read_text().splitlines()
     ]
     assert rows[-1]["outcome"] == "deployed" and rows[-1]["target_sha"] == new
+
+
+def test_immutable_release_is_staged_and_selected(pair, calls, tmp_path):
+    origin, clone, _first = pair
+    new = _commit(origin, "advance")
+    release_root = tmp_path / "opt-aicc"
+    runtime_venv = tmp_path / "runtime-venv"
+    runtime_venv.mkdir()
+
+    report = self_deploy_once(
+        str(clone),
+        _cfg(
+            tmp_path,
+            migrate=True,
+            release_root=str(release_root),
+            release_venv=str(runtime_venv),
+        ),
+    )
+
+    release = release_root / "releases" / new
+    assert (report.outcome, report.detail) == ("deployed", new)
+    assert release.is_dir()
+    assert (release / "tracked.txt").read_text() == "advance"
+    assert (release / ".aicc-release-sha").read_text() == new + "\n"
+    assert (release / ".venv").is_symlink()
+    assert (release / ".venv").readlink() == runtime_venv
+    assert (release_root / "current").readlink() == Path(f"releases/{new}")
+    assert calls["smoke_cwd"] == str(release)
+    assert calls["migrate_cwd"] == str(release)
+    assert "release_selected:" + new in report.steps
+
+
+def test_already_current_checkout_still_selects_missing_immutable_release(
+    pair, calls, tmp_path
+):
+    _origin, clone, current = pair
+    release_root = tmp_path / "opt-aicc"
+    release_root.mkdir()
+    (release_root / "current").symlink_to(clone)
+    runtime_venv = tmp_path / "runtime-venv"
+    runtime_venv.mkdir()
+
+    report = self_deploy_once(
+        str(clone),
+        _cfg(
+            tmp_path,
+            migrate=True,
+            release_root=str(release_root),
+            release_venv=str(runtime_venv),
+        ),
+    )
+
+    release = release_root / "releases" / current
+    assert (report.outcome, report.detail) == ("deployed", current)
+    assert release.is_dir()
+    assert (release_root / "current").readlink() == Path(f"releases/{current}")
+    assert calls["smoke_cwd"] == str(release)
+    assert calls["migrate_cwd"] == str(release)
+    assert "checkout_already_current:" + current in report.steps
+    assert "release_selected:" + current in report.steps
+
+
+def test_noop_when_checkout_and_immutable_release_are_current(pair, calls, tmp_path):
+    _origin, clone, current = pair
+    release_root = tmp_path / "opt-aicc"
+    release = release_root / "releases" / current
+    release.mkdir(parents=True)
+    (release_root / "current").symlink_to(f"releases/{current}")
+
+    report = self_deploy_once(
+        str(clone),
+        _cfg(tmp_path, migrate=True, release_root=str(release_root)),
+    )
+
+    assert (report.outcome, report.detail) == ("noop", current)
+    assert calls["migrate"] == 0
+    assert "smoke_cwd" not in calls
+
+
+def test_failed_restart_restores_previous_release_selector(pair, calls, tmp_path):
+    origin, clone, first = pair
+    release_root = tmp_path / "opt-aicc"
+    old_release = release_root / "releases" / first
+    old_release.mkdir(parents=True)
+    (release_root / "current").symlink_to(f"releases/{first}")
+    _commit(origin, "advance")
+    calls["systemctl_rc"][("restart",)] = 1
+
+    report = self_deploy_once(
+        str(clone),
+        _cfg(
+            tmp_path,
+            services=("voyn-aicc-worker.service",),
+            release_root=str(release_root),
+            release_venv=str(tmp_path / "missing-venv"),
+        ),
+    )
+
+    assert report.outcome == "failed"
+    assert "rollback_incomplete_services" in report.detail
+    assert _git(clone, "rev-parse", "HEAD") == first
+    assert (release_root / "current").readlink() == Path(f"releases/{first}")
+
+
+def test_committed_control_unit_deploys_an_immutable_release():
+    root = Path(__file__).parents[2]
+    service = (root / "deploy/systemd/voyn-aicc-self-deploy.service").read_text()
+
+    assert "WorkingDirectory=/opt/aicc/current" in service
+    assert "--release-root /opt/aicc" in service
+    assert "--release-venv ${AICC_RUNTIME_VENV}" in service
+    assert "--repo-path ${AICC_SOURCE_REPO}" in service  # pragma: allowlist secret
+    assert "Environment=AICC_PREPROD_ROOT=/home/voynadmin/aicc-preprod" in service  # pragma: allowlist secret
+    assert "Environment=AICC_SOURCE_REPO=/home/voynadmin/aicc-preprod/repo" in service  # pragma: allowlist secret
+    assert (
+        "Environment=AICC_RUNTIME_VENV=/home/voynadmin/aicc-preprod/repo/.venv"
+        in service
+    )
+    assert "exec /opt/aicc/current/.venv/bin/python" in service
+    # voynadmin never writes /opt/aicc directly; the sudoers grant is the
+    # only publish surface (VOYN-W0-AICC-OPT-AICC-GROUP-WRITABLE-BREAKS-LAUNCHER).
+    sudoers = (root / "deploy/sudoers.d/voyn-aicc-self-deploy").read_text()
+    assert "voyn-aicc-release-helper" in sudoers
+    assert "NOPASSWD: VOYN_AICC_SELF_DEPLOY_RELEASE" in sudoers
+    assert "User=voynadmin" in service
+
+
+def test_production_release_root_goes_through_the_privileged_helper(
+    pair, calls, tmp_path, monkeypatch
+):
+    """/opt/aicc staging must not run as voynadmin against a group-writable
+    tree. The tick calls the root-owned helper instead."""
+    origin, clone, _first = pair
+    new = _commit(origin, "advance")
+    helper_calls: list[list[str]] = []
+
+    def fake_helper(args, timeout):
+        helper_calls.append(list(args))
+        if args[:1] == ["current"]:
+            return subprocess.CompletedProcess(args, 0, "ABSENT\n", "")
+        if args[:1] == ["stage"]:
+            return subprocess.CompletedProcess(
+                args, 0, f"AICC_RELEASE_STAGED releases/{new}\n", ""
+            )
+        if args[:1] == ["select"]:
+            return subprocess.CompletedProcess(
+                args, 0, f"AICC_RELEASE_SELECTED releases/{new} previous=ABSENT\n", ""
+            )
+        return subprocess.CompletedProcess(args, 1, "", "unexpected")
+
+    monkeypatch.setattr(self_deploy, "_release_helper", fake_helper)
+    monkeypatch.setattr(
+        self_deploy,
+        "_privileged_release_root",
+        lambda path: True,
+    )
+
+    report = self_deploy_once(
+        str(clone),
+        _cfg(
+            tmp_path,
+            migrate=True,
+            release_root="/opt/aicc",
+            release_venv=str(tmp_path / "runtime-venv"),
+        ),
+    )
+
+    assert (report.outcome, report.detail) == ("deployed", new)
+    assert helper_calls[0] == ["current"]
+    assert helper_calls[1][0] == "stage"
+    assert "--sha" in helper_calls[1] and new in helper_calls[1]
+    assert helper_calls[2] == ["select", "--sha", new]
+    assert "release_selected:" + new in report.steps
+    assert calls["smoke_cwd"] == str(self_deploy.PRODUCTION_RELEASE_ROOT / f"releases/{new}")
+
+
+def test_worker_release_deploy_unit_replaces_voynadmin_self_deploy():
+    """Worker hosts stage root-owned immutable releases; the old voynadmin
+    self-deploy-worker unit is retired (VOYN-W0-AICC-WORKER-SELF-DEPLOY-
+    MUST-STAGE-IMMUTABLE-RELEASE)."""
+    root = Path(__file__).parents[2]
+    service = (
+        root / "deploy/systemd/voyn-aicc-worker-release-deploy.service"
+    ).read_text()
+    timer = (
+        root / "deploy/systemd/voyn-aicc-worker-release-deploy.timer"
+    ).read_text()
+
+    assert not (root / "deploy/systemd/voyn-aicc-self-deploy-worker.service").exists()
+    assert "User=root" in service
+    assert "ExecStart=/usr/libexec/aicc-worker-release-deploy" in service
+    assert "ProtectSystem=strict" in service
+    assert "ReadWritePaths=/opt/aicc/releases" in service
+    assert "OnUnitActiveSec=5min" in timer
+    # Control-host self-deploy remains for migrations.
+    control = (root / "deploy/systemd/voyn-aicc-self-deploy.service").read_text()
+    assert "--migrate" in control
 
 
 def test_noop_looking_migration_still_records_unrolled_back_write(
@@ -414,3 +613,40 @@ def test_failed_dispatch_smoke_after_migration_rolls_back_before_restart(pair, c
     assert _git(clone, "rev-parse", "HEAD") == first
     assert "database_upgrade_ran_not_rolled_back" in report.steps
     assert "dispatch_smoke_passed" not in report.steps
+
+
+def test_a_failed_migration_reports_its_verdict_not_the_traceback_header(
+    pair, calls, tmp_path, monkeypatch
+):
+    """VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH: the report field is
+    bounded, so it has to choose an end of the output to keep -- and it kept
+    the head, which for a Python subprocess is `Traceback (most recent call
+    last):` and an interpreter path. The one migration failure that can
+    persist across every tick (an edited already-applied file: the ledger
+    refuses forever, not transiently) is therefore the one the operator could
+    not read, and four queue migrations sat unapplied behind it while
+    control-01 went on measuring dead_letter_growth."""
+    origin, clone, first = pair
+    _commit(origin, "advance with migration")
+    verdict = (
+        "aios_db.errors.MigrationChecksumMismatch: migration "
+        "0022_queue_fail_lease_wait was modified after it was applied"
+    )
+    monkeypatch.setattr(
+        self_deploy, "_run_migrations",
+        lambda repo_path, timeout: subprocess.CompletedProcess(
+            [], 1, "",
+            "Traceback (most recent call last):\n"
+            '  File "/usr/lib/python3.12/runpy.py", line 198, in '
+            "_run_module_as_main\n"
+            "    return _run_code(code, main_globals, None,\n"
+            f"{verdict}\n",
+        ),
+    )
+    cfg = _cfg(tmp_path, services=("voyn-aicc-worker.service",), migrate=True)
+    report = self_deploy_once(str(clone), cfg)
+
+    assert report.outcome == "rolled_back"
+    assert "was modified after it was applied" in report.detail
+    assert "Traceback" not in report.detail
+    assert _git(clone, "rev-parse", "HEAD") == first

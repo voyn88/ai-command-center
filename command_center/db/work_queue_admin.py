@@ -1,9 +1,10 @@
 """The control-plane surface over the queue's recovery protocol (SRV-06).
 
 Migration ``0002_queue_claim`` shipped recovery as PL/pgSQL — ``queue_reap()``
-requeues or dead-letters every lapsed lease, ``work_dlq`` is the dead-letter
-queue's interface, ``queue_redrive()`` is its audited exit — and granted all
-three to ``aicc_app`` and nothing to workers. Until this module, nothing in
+requeues every lapsed lease (and dead-letters the item once the lapses
+outlast its lease-wait budget, 0036), ``work_dlq`` is the dead-letter queue's
+interface, ``queue_redrive()`` is its audited exit — and granted all three to
+``aicc_app`` and nothing to workers. Until this module, nothing in
 production called any of them: the reaper existed only for tests, which means
 a worker host that lost power held its items hostage for exactly as long as
 no human ran ``SELECT queue_reap()`` by hand.
@@ -16,7 +17,7 @@ seam — a callable the CLI and the reaper timer can reach.
 
 With ONE exception, and it is here because it cannot be anywhere else: a SQL
 function runs inside its caller's transaction and so cannot commit, and one
-transaction is exactly what an interrupted reap throws away (0028). Batching
+transaction is exactly what an interrupted reap throws away (0040). Batching
 the reap is therefore the caller's job, and this is the caller. See ``reap``.
 
 Identity: these are ``aicc_app`` privileges by design. A worker may not reap
@@ -77,7 +78,7 @@ class WorkQueueAdmin:
     #: else: every batching test in ``test_work_queue_admin.py`` sizes its
     #: backlog as ``REAP_BATCH + 3``, so they follow this number wherever it
     #: goes and cannot see it stop being a bound. Raised past the tick it
-    #: restores the all-or-nothing reap 0028 removed (measured: a killed tick
+    #: restores the all-or-nothing reap 0040 removed (measured: a killed tick
     #: recovered 0 of 1000 at ``10**9``, 600 at ``100``); dropped to zero or
     #: below it never satisfies ``reap``'s own termination test, because the
     #: function clamps with ``greatest(p_max_items, 1)`` and the loop compares
@@ -85,19 +86,32 @@ class WorkQueueAdmin:
     REAP_BATCH = 100
 
     #: SQLSTATE ``undefined_function``. The ONE error that means "this
-    #: database has not reached 0028", and so the only one ``reap``'s
+    #: database has not reached 0040", and so the only one ``reap``'s
     #: unbounded fallback may answer. See there for the two it must not.
     UNDEFINED_FUNCTION = "42883"
 
     def reap(self) -> int:
-        """Expire every lapsed lease: requeue items with budget left, dead-
-        letter the exhausted. Returns the number of attempts expired.
+        """Expire every lapsed lease: requeue it, dead-letter it once the
+        item's lease-wait budget is exhausted *and the fleet is demonstrably
+        serving its other items* (0037 — with nothing getting through, lapsing
+        leases are a fleet-wide outage, and an outage must not be spelled as a
+        verdict on every item it caught). Returns the number of attempts
+        expired.
+
+        A lapse never spends ``max_attempts`` (0027). The heartbeat runs
+        beside the handler, so a lease can only lapse when the worker PROCESS
+        stopped beating — a kill, a restart, a host loss, a database outage —
+        and none of that is evidence about the work item. It is counted
+        against ``lease_wait_count`` instead, the same bounded fleet budget a
+        no-fault handler refusal spends (see
+        ``work_queue_store.fail_lease_wait``), and the attempt ``queue_claim``
+        spent for the lapsed delivery is refunded.
 
         Safe to run at any moment and from any number of schedulers —
         ``queue_reap()`` takes each item's row lock, so it cannot race a
         concurrent completion, and a reap that finds nothing is a no-op.
 
-        BATCHED, BECAUSE ONE CALL IS ONE TRANSACTION (0028). The older
+        BATCHED, BECAUSE ONE CALL IS ONE TRANSACTION (0040). The older
         unbounded form recovered nothing at all when it was interrupted —
         not "everything up to where it stopped" — and the tick is
         interruptible by design: ``aicc-queue-reaper.service`` is a
@@ -132,24 +146,24 @@ class WorkQueueAdmin:
                         #
                         # THE BARE `except Exception` THIS REPLACES CAUGHT
                         # EVERY FIRST-BATCH FAILURE, and the two it caught by
-                        # mistake are the two 0028 EXISTS FOR. Measured against
+                        # mistake are the two 0040 EXISTS FOR. Measured against
                         # PostgreSQL 16 as `aicc_app`:
                         #
                         #     statement timeout       QueryCanceled         57014
                         #     GRANT missed the arity  InsufficientPrivilege 42501
-                        #     database still at 0027  UndefinedFunction     42883
+                        #     database still at 0039  UndefinedFunction     42883
                         #
                         # A `TimeoutStartSec=60s` kill or a pgtunnel restart
                         # mid-reap arrives as 57014, and answering it with the
                         # UNBOUNDED form re-runs the whole-table scan whose
-                        # all-or-nothing rollback is the defect 0028 removed --
+                        # all-or-nothing rollback is the defect 0040 removed --
                         # over strictly MORE rows than the batch that just
                         # failed, at the one moment the server has already
                         # shown it cannot finish that much work. The fallback
                         # was reintroducing the bug exactly when it mattered.
                         #
                         # And 42501 it swallowed SILENTLY: a role re-provision
-                        # that missed 0028's GRANT is a real deploy fault, and
+                        # that missed 0040's GRANT is a real deploy fault, and
                         # the fallback turned it into a successful-looking reap
                         # that returned a count and left nothing for anyone to
                         # see. Recovery is the one path whose absence

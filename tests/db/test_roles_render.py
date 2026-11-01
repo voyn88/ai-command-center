@@ -202,10 +202,10 @@ def test_no_role_holds_a_table_privilege_on_the_claim_protocol() -> None:
         assert roles.PRIVILEGES[role]["work_attempt"] == frozenset()
 
 
-def test_the_worker_reaches_the_queue_only_through_the_five_protocol_steps() -> None:
+def test_the_worker_reaches_the_queue_only_through_the_six_protocol_steps() -> None:
     """Two assertions rather than one, because the role now carries two layers.
 
-    The queue half must stay exactly five steps, and the whole set must stay
+    The queue half must stay exactly six steps, and the whole set must stay
     exactly what both tasks declared. A single equality would have to be edited
     by every later task that adds a function, and editing it is indistinguishable
     from widening it.
@@ -223,6 +223,7 @@ def test_the_worker_reaches_the_queue_only_through_the_five_protocol_steps() -> 
         "queue_complete",
         "queue_fail",
         "queue_fail_lease_wait",
+        "queue_fail_infra_wait",
     }
     # And the enrolment layer: prove its own identity, read only the
     # server-authoritative expiry of that proved credential, rotate its own
@@ -233,6 +234,7 @@ def test_the_worker_reaches_the_queue_only_through_the_five_protocol_steps() -> 
         "queue_complete",
         "queue_fail",
         "queue_fail_lease_wait",
+        "queue_fail_infra_wait",
         "identity_assert",
         "identity_current_credential",
         "enroll_rotate_self",
@@ -297,6 +299,8 @@ def test_the_control_plane_cannot_claim() -> None:
         # scan cursor for the tick windows.
         "backlog_scan_claim",
         "backlog_triage",
+        # 0030: clear proven malformed evidence through the audited function.
+        "backlog_clear_evidence",
         # 0021: read-only deploy preflight with dispatch's privileges; the
         # task-class setter (split children, monitor tasks); and the
         # monitor-finding pair the control-host probe uses.
@@ -308,6 +312,17 @@ def test_the_control_plane_cannot_claim() -> None:
         # VOYN-W0-AICC-BACKLOG-PG-CANONICAL-GATE (0020): the importer's stamp
         # of where a migrated row came from.
         "backlog_record_provenance",
+        # 0029: bounded row lock and audited owner decision, no table UPDATE.
+        "backlog_owner_lock",
+        "backlog_owner_decision",
+        # 0035: optimistic-revision priority/wave reassignment (APP-CONTROL-S6d).
+        "backlog_reassign",
+        # 0032: durable Grok↔Cursor coordination CAS surface.
+        "coordinator_state_read",
+        "coordinator_enqueue",
+        "coordinator_cas_begin",
+        "coordinator_cas_finish",
+        "coordinator_cas_clear_inflight",
     }
 
 
@@ -404,12 +419,12 @@ def test_identifier_guard_rejects_injection(bad: str) -> None:
 
 
 def test_an_overloaded_function_is_filtered_by_arity_not_by_name() -> None:
-    """A database between 0021 and 0024 has `monitor_clear_finding(text)` and
+    """A database between 0021 and 0038 has `monitor_clear_finding(text)` and
     not `monitor_clear_finding(text, text[])`.
 
     `apply_table_grants` runs the whole matrix in ONE transaction, so emitting
     a GRANT for the absent overload does not skip one privilege -- it aborts
-    every grant in the run. Before 0024 no name in this schema had two
+    every grant in the run. Before 0038 no name in this schema had two
     signatures, which is what made matching on the bare name look sufficient.
     """
     one_arg = "GRANT EXECUTE ON FUNCTION public.monitor_clear_finding(text) TO"
@@ -430,7 +445,7 @@ def test_an_overloaded_function_is_filtered_by_arity_not_by_name() -> None:
         for signature in privileges
     }
     assert _emitted(every_function) == (True, True)
-    # The pre-0024 catalog: same name, one arity.
+    # The pre-0038 catalog: same name, one arity.
     assert _emitted(every_function - {"monitor_clear_finding/2"}) == (True, False)
     # And the filter is not merely dropping both: the arity it keeps is the
     # arity it was told about.

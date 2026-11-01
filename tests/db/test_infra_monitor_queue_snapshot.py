@@ -664,7 +664,7 @@ def test_a_lane_whose_lease_slipped_is_still_holding_its_lane(monitor) -> None:
     item ready and due behind them the whole time -- `PlanLimits.wip_limit` 4
     against 2 lanes, the shape the queue is DESIGNED to hold. Then lane two's
     lease lapses by 30 seconds -- an outage past what the beat cadence
-    absorbs, which 0029 names the occasion for: a database blip, or the
+    absorbs, which 0041 names the occasion for: a database blip, or the
     `voyn-aicc-pgtunnel.service` restart the credential rotation cycles.
     (Two failed beats used to be enough, because the beat ran at
     `visibility_seconds / 3` and the third landed on the deadline; see
@@ -921,7 +921,7 @@ def test_the_reaper_hands_the_lane_back_and_the_due_clock_resumes(monitor) -> No
 #
 # Everything above this line taught the MEASUREMENT to read a fleet whose
 # leases slip -- #13366 stopped a slipped lease freeing the lane that still
-# holds the item, 0029 stopped the reaper expiring a lease that had been
+# holds the item, 0041 stopped the reaper expiring a lease that had been
 # renewed. Both rest on the same premise, stated in both of their headers:
 # "the beat runs at `visibility_seconds / 3` ... so ANY TWO CONSECUTIVE FAILED
 # BEATS lapse the lease", treated as an unavoidable fact of the fleet.
@@ -1519,7 +1519,7 @@ def test_the_beat_loop_admits_the_lapse_inside_the_window_it_was_granted(
     assert lost_at >= BLIP_WINDOW, (
         f"the lease was given up at {lost_at:.1f}s, ahead of its "
         f"{BLIP_WINDOW}s deadline -- an attempt taken away with time left on "
-        "its lease costs the whole run (0029)"
+        "its lease costs the whole run (0041)"
     )
     # The beat thread really was still inside the black-holed call when the
     # lapse was declared, which is what makes the bound above a measurement

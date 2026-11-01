@@ -1,3 +1,12 @@
+# The /srv layout of the PR-window tick, kept for the hosts that have it.
+#
+# NOT the control plane's: this names User=aicc-worker, /usr/bin/python and an
+# /srv/ai-command-center clone, none of which control-01 has ever had, so this
+# unit could not be installed there and never was -- the labeller simply did
+# not run and every fleet PR opened without CI
+# (VOYN-W0-AICC-PR-WINDOW-RECONCILER-NOT-DEPLOYED-ON-CONTROL). The control
+# host installs deploy/systemd/voyn-aicc-pr-window.{service,timer} instead,
+# through the control profile of ops/aicc_install_transaction.py.
 [Unit]
 Description=AICC backlog PR-window tick
 After=postgresql.service
@@ -6,4 +15,9 @@ After=postgresql.service
 Type=oneshot
 User=aicc-worker
 EnvironmentFile=-/etc/ai-command-center.env
+# The (repo, PR, head) detail cache `gh_access` writes: systemd creates
+# /var/cache/aicc-gh owned by this unit's User and exports $CACHE_DIRECTORY,
+# which is the only well-known writable location a tick running as
+# aicc-worker has (VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS).
+CacheDirectory=aicc-gh
 ExecStart=/usr/bin/python -m command_center.db backlog-pr-window --repo-path /srv/ai-command-center

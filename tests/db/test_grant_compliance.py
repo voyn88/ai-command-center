@@ -268,7 +268,7 @@ def _check_compliance(admin_conn) -> list[str]:
 
     # ---- function grants ---------------------------------------------------
     with admin_conn.cursor() as cur:
-        # Keyed by name AND arity, not name alone: from 0024 on,
+        # Keyed by name AND arity, not name alone: from 0038 on,
         # `monitor_clear_finding` is TWO functions (`(text)` and
         # `(text, text[])`), and a name-only match would call both declared
         # signatures ambiguous and then report both granted overloads as EXTRA

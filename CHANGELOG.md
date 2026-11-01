@@ -8,6 +8,450 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Changed ? queue-stalled fix rebased onto main's queue migrations (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
+- Merged #982 (and through it main via #1002 ? #1032 ? #914). Main already
+  shipped this branch's 0025 (claim numbering ? main 0026) and 0026 (redrive
+  clears the lease-wait budget ? main 0027), so those two are dropped.
+- Renumbered the rest onto the stack: 0024 ? 0038 (monitor partial clear),
+  0027 ? 0039 (enqueue audit lock), 0028 ? 0040 (reap liveness), 0029 ? 0041
+  (reap relock deadline). References in code, tests and SQL follow.
+- 0040/0041 are REBUILT over main's 0037 reap body (lapse refunds its attempt,
+  spends the lease-wait budget, gated on a serving fleet) instead of 0002's,
+  which would have reverted 0036/0037 on every reaper tick. Pinned by
+  `test_the_bounded_reap_keeps_mains_lapse_accounting`.
+- The claim loop keeps both the raising-claim guard and main's
+  `_attempt_active` drain accounting; the queue monitor keeps both
+  `claim_overdue` and main's quota-aware `dead_letter_growth`.
+
+### Changed — queue dead-letter fix rebased onto main's wait classes (`VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH`)
+- Merged main (via the #1002 → #1032 → #914 stack). Main already shipped this
+  branch's 0024 (redrive clears waits → main 0027), 0025 (claim numbering →
+  main 0026) and 0026 (lease-wait exhaustion refund → main 0028), so those are
+  dropped. What main lacked is kept and renumbered: `0036_queue_reap_lease_lapse_refunds`
+  (a lapsed lease refunds the attempt and spends the bounded lease-wait budget)
+  and `0037_queue_wait_budget_needs_a_serving_fleet` (`_queue_fleet_is_serving`
+  gate on wait-budget exhaustion and on the reaper; `queue_fail` resets
+  `lease_wait_count`). `released.lock.json` regenerated for 0001–0037.
+- `no_fault` is no longer a routing flag: it is a read-only
+  `HandlerOutcome.no_fault` = `lease_wait or infra_wait`. Repository-not-visible,
+  isolated-root-unavailable (mutating) and workspace-isolation failures now
+  route through `infra_wait`; a wait outcome with `retryable=False` takes the
+  ordinary `fail` path. Read-only "permanent" clone failures keep main's
+  immediate dead letter.
+
+### Tests — the monitor's own measurement is now taken from a real database (`VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH`)
+- `tests/db/test_monitor_queue_measurement.py` (new) drives the real queue
+  functions and then reads the real `infra_monitor.read_queue_snapshot()`.
+  Everything that pinned the `dead_letter_growth` verdict built
+  `QueueSnapshot` by hand (`tests/ops/test_infra_monitor.py` has no database),
+  so the one query that actually touches the schema this branch changed — and
+  that decides whether finding #3396 clears — was pinned by nothing.
+- Three properties, each stated where the acceptance is stated: 25 no-fault
+  refusals during a total outage measure `recent_dead == 0` and surface as
+  `throughput_stalled` rather than as silence; the same refusal after one
+  served sibling reaches the monitor as `dead_letter_growth:1>0` plus
+  `executor_quota_exhausted` (so the measurement is live, not vacuously zero,
+  and the quota regex still matches through the `lease_wait_exhausted: `
+  prefix the SQL composes); and `recent_dead` is a one-hour WINDOW, which is
+  why the finding clears when dead-lettering stops and no operator has to
+  redrive what the old classification already produced.
+- Verified by mutation, not by assertion: making `_queue_fleet_is_serving()`
+  return true turns the first test red at the monitor's count, counting `dead`
+  outright instead of within the hour turns the third red, and narrowing the
+  quota regex turns the second red.
+
+### Fixed — the migration-lock guard was itself failing the AIOS boundary gate (`VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH`)
+- `scripts/migration_lock.py` (new) takes over `--write`;
+  `python -m command_center.db migration-lock` is now the check only. The
+  guard that stops an edited migration from blocking a deploy had put a
+  `Path.write_text` inside `command_center/db/cli.py`, and a durable
+  filesystem write in a package named `db` is exactly the signature
+  `tests/architecture/aios_boundary.py` reads as a persistence engine
+  ("a JSON store is a persistence engine even with no driver anywhere in
+  it"). `test_engine_inventory_matches_frozen_baseline` went red with
+  `NEW ENGINE MODULE: command_center/db/cli.py matches frozen categories
+  ['memory']` — a required CI gate, so the whole queue fix was unmergeable.
+- Why moved rather than baselined. Adding the entry would have recorded the
+  control plane's operational database CLI as a frozen persistence engine
+  and frozen it against growth, on the strength of a developer maintenance
+  command. docs/AIOS_BOUNDARY.md's procedure for a detector false positive
+  says to prefer moving the module over adding a baseline entry, and
+  regenerating a checked-in artifact is developer maintenance — the same
+  shape as `python -m tests.architecture.aios_boundary --write-baseline`.
+  `AIOS_BOUNDARY_BASELINE.json` is unchanged, and the check stays where a
+  deploy can reach it, persisting nothing.
+- The lock's `note` (rendered from `migrations._LOCK_NOTE`, so it cannot
+  drift from the code) now names both commands. Only that line of
+  `released.lock.json` changed; no recorded checksum moved.
+- Tests: `tests/db/test_cli_queue.py` states the property directly rather
+  than leaving it to the baseline gate's generic drift line —
+  `test_the_database_cli_is_not_a_persistence_engine` asserts the scanner's
+  own `_persists_data` is false for `db/cli.py`, and
+  `test_the_database_cli_does_not_offer_to_rewrite_the_lock` pins that
+  argparse *refuses* `--write` so the old invocation cannot be copied back
+  out of a commit message. `tests/db/test_migration_set.py` covers the
+  script's write and check paths and that the note names a command that
+  exists. Reintroducing the write turns all three red plus the boundary gate.
+
+### Fixed — a capacity outage no longer converts the whole backlog into dead letters (`VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH`)
+- `command_center/db/sql/0028_queue_wait_budget_needs_a_serving_fleet.up.sql`:
+  the no-fault wait budget (`lease_wait_count`, 20 waits) is spent only while
+  the fleet is demonstrably serving OTHER items, and `queue_fail`'s requeue
+  clears it. **The horizon that budget actually buys is 68.5 minutes** —
+  `_queue_backoff(2, n)` (2 is the backoff every dispatch enqueues with) runs
+  2, 4, 8 … 256 and then sits at its 300s cap, so
+  `SELECT sum(extract(epoch FROM _queue_backoff(2, n)))/60 FROM
+  generate_series(1,20) n` is `68.5`. **The fleet's dominant outage is four
+  times that.** `orchestrator.routing` records the measurement: the Claude
+  credential is a Max *subscription* with a five-hour rolling cap, and 142 of
+  167 parked tasks on 2026-08-23 were literally "You've hit your session
+  limit" — a response `worker.handlers` routes to `no_fault`, i.e. straight
+  to this budget. So every item in flight when that window closed was refused
+  for five hours, spent its whole budget in the first sixty-nine minutes, and
+  dead-lettered under `lease_wait_exhausted` with `attempt_count = 0`:
+  provably never delivered to a model, and permanently parked, because
+  `queue_redrive` is operator-only. `control-01:queue` counted the arrivals
+  as `dead_letter_growth`, in the class `infra_monitor` calls
+  `executor_quota_exhausted`.
+- Why the gate rather than a bigger number: the budget's own migrations say
+  what it is for — 0022 bounds "permanent, PATHOLOGICAL contention", 0027 the
+  item "that somehow kills its worker every time it is delivered". Both are
+  statements about one item being SINGLED OUT, and neither describes a window
+  that refuses every lane equally. A count of polls is not a duration either:
+  the same outage kills an item or not depending on how often it happened to
+  be offered. `_queue_fleet_is_serving()` asks the question that actually
+  separates the two, and it is the question `infra_monitor` already asks as
+  `recent_succeeded` — has any OTHER item of this queue had a delivery reach
+  the work in the last hour (`complete`/`granted`, or `fail`/`granted` with
+  `requeued`/`dead_lettered`)? Refusals are deliberately not evidence, so a
+  queue where nothing but refusals is happening reads as a fleet that is not
+  serving, which is what it is.
+- During an outage the wait count still climbs (the backoff is computed from
+  it, so an outage cannot become a 2-second poll loop) and every refusal is
+  still audited, now with `fleet_is_serving` beside the two counters. What
+  changes is only that exhausting the budget does not dead-letter an item the
+  fleet was refusing along with everything else: the backlog stays `ready` at
+  the 300s cap — one claim per item per five minutes — and the outage
+  surfaces through `infra_monitor`'s `queue_stalled` and
+  `throughput_stalled:0_succeeded_in_1h`, the classes that name a fleet that
+  has stopped serving. A stall keeps the work and names the fleet; a dead
+  letter destroys the work and blames the item. Stated trade: a queue holding
+  ONE item that poisons every worker it touches has no sibling to be compared
+  against, so it now cycles at the 300s cap instead of dying after 20
+  deliveries — deliberate, because nothing there distinguishes "this item is
+  poison" from "the fleet is down", and dead-lettering would not have
+  repaired the host either way.
+- Second half, same rule: `lease_wait_count` was cumulative over an item's
+  whole life and reset by nothing but `queue_redrive` (0024), so an item that
+  waited out one long outage carried that number forever and an ordinary
+  lease race weeks later was its 21st wait. `queue_fail`'s requeue — the one
+  non-terminal exit meaning a delivery got past the fleet and reported on the
+  work itself — now clears it, so 20 means 20 *consecutive* refusals. This
+  cannot become an unbounded retry: reaching the reset costs a real
+  `attempt_count`, which nothing refunds, so `max_attempts` (the cascade
+  length) caps how many times the budget can be cleared. The cleared number
+  travels into the audit exactly as the redrive's does.
+- Tests: `tests/db/test_queue_claim.py` proves all of it against a real
+  server —
+  `test_an_outage_that_refuses_everything_does_not_empty_the_queue_into_the_dlq`
+  drives 25 refusals with nothing being served (item still `ready`, both
+  model attempts intact) and then dead-letters the same item with the
+  identical refusal once one sibling is served, and reads the 68.5 minutes
+  back out of `_queue_backoff` rather than asserting it from a comment;
+  `test_a_delivery_that_reached_the_work_clears_the_wait_budget` and
+  `test_lapses_while_nothing_is_being_served_are_an_outage_not_a_verdict`
+  cover the other two sites. The tests that pin the DLQ still working now say
+  what makes it work — `_a_served_fleet()`, the siblings the item was singled
+  out from. `tests/worker/test_daemon.py`'s `QueueModel` gained the same two
+  rules, so the accounting is pinned in the suite that runs without a
+  database as well.
+
+### Fixed — a comment-only edit to migration 0022 was blocking every queue fix from reaching control-01 (`VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH`)
+- `command_center/db/sql/0022_queue_fail_lease_wait.up.sql`: restored
+  byte-for-byte to what shipped. The file's header cites itself as `0020` —
+  a real typo, and one that must stay. `schema_migration` records the
+  SHA-256 of each up-file as it was applied, and
+  `MigrationRunner.upgrade` verifies **every** recorded checksum before it
+  applies **any** pending migration, so correcting that character does not
+  correct 0022: on every database that already applied it — control-01's
+  among them — `python -m command_center.db upgrade` raises
+  `MigrationChecksumMismatch` and applies nothing, which means migrations
+  0024–0027 (the rest of this very fix) never land, and `self-deploy
+  --migrate` then rolls the checkout back, so the branch's Python-side
+  changes do not take effect either. Verified here by computing both
+  digests: recorded `633f0e94…`, file `509bdb47…`. The branch's own test
+  suite was green throughout — the authority that refuses lives in a
+  migrated database, and nothing in CI has one.
+- `command_center/db/sql/released.lock.json` (new) +
+  `migrations.verify_released_checksums()` / `released_lock()` /
+  `render_released_lock()`: the same verdict, reachable without a database.
+  `up` is literally `Migration.checksum` — the value the ledger holds — so
+  this is not a second authority, it is the ledger's authority moved to
+  where the edit is made. A new migration must be recorded before it ships
+  (otherwise the guard would only ever cover what it was created with), and
+  a recorded one cannot be deleted, because a database that applied it still
+  names it. It cannot stop someone who edits a file and re-locks it in the
+  same commit, and is not meant to: the failure mode was tidying a comment
+  without knowing the ledger existed, and a diff reading
+  `-"633f0e94…" +"509bdb47…"` cannot be misread that way. Digests are written
+  `sha256:<hex>`: the prefix names the algorithm, and it also keeps
+  detect-secrets from reading 54 bare hex runs as credentials — unprefixed,
+  every future migration would fail the security gate's "baseline changed"
+  check until someone re-ran the scanner.
+- `python -m command_center.db migration-lock`: the check. Handled before
+  `load_config()`
+  — it needs no DSN, so it answers on a laptop rather than only on the host
+  that is already broken. A missing or malformed lock is itself reported as a
+  `MigrationError`, so the command whose purpose is to replace a traceback
+  with a verdict has no path of its own that prints one — and since deleting
+  the file that is refusing is the obvious wrong move, that message says why
+  `--write` is not the repair (it would re-record the very edit that is
+  blocking the deploy).
+- `command_center/db/cli.py`: `upgrade` reports a `MigrationError` as
+  `migration refused: <verdict>` and exits 2, instead of letting it raise.
+  `command_center/deployment/self_deploy.py`: the failed-migration step
+  reports the **last** non-empty line of the subprocess output
+  (`_verdict_line`), not the first 130 characters. Together these are why
+  this stayed undiagnosed across every deploy tick: the report contained
+  `Traceback (most recent call last): File "/usr/lib/python3.12/runpy.py"…`,
+  and an edited-since migration is precisely the failure that never clears
+  by itself, so every tick re-reported the same unreadable header.
+- Tests: `tests/db/test_migration_set.py` pins the whole set against the lock
+  (reintroducing the exact 0022 edit turns it red with both checksums in the
+  diff), plus the edited / unrecorded / deleted / regeneration-is-a-no-op
+  cases; `tests/db/test_cli_queue.py` pins the two CLI exits;
+  `tests/orchestrator/test_self_deploy.py` pins a real traceback reduced to
+  its verdict in the deploy report.
+
+### Fixed — an incomplete isolation deployment no longer dead-letters every read-only run on its first delivery (`VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH`)
+- `command_center/worker/handlers.py`: `_read_only_isolated_checkout` used to
+  classify a subset of its failures as *permanent* — a missing/not-root-owned
+  principal workspace root, git refusing the source clone's ownership, a bound
+  clone that is not there — and the caller turned that into
+  `retryable=False`, which is not a budget but an immediate dead letter on the
+  item's first delivery. Every failure the helper can return is in fact a fact
+  about THIS HOST, and the mutating dispatch path already refunded the
+  identical `principal_workspace_root()` failure as `no_fault` twenty lines
+  away. So a worker halfway through its isolation rollout dead-lettered every
+  read-only item it claimed, having run nothing — the reviews are the
+  continuously-dispatched half of the fleet's work — and `control-01:queue`
+  measured the arrivals as `dead_letter_growth`. The helper now returns
+  `(path, reason)` with no permanence flag (it had no consequence left to
+  carry: "permanent" meant permanent on that host, and the queue is
+  fleet-wide), both dispatch paths refuse with `retryable=True,
+  no_fault=True`, and the pinned checkout's refusal is now the same single
+  call site as the non-isolated one it already shared everything else with.
+  A genuinely fleet-wide breakage still terminates in the DLQ, bounded by the
+  same `lease_wait_count` budget (20 waits, ~1h of capped backoff) as every
+  other capacity outage, instead of instantly.
+- `tests/worker/test_handlers.py`:
+  `test_an_incomplete_isolation_deployment_is_no_fault_for_read_only_and_mutating_alike`
+  pins the broken symmetry itself — one raise from the real
+  `principal_workspace_root()`, the real helper, and the read-only and
+  mutating paths made to agree on the verdict. The test that asserted the old
+  behaviour ("a permanent cause must not spin the cascade") now asserts the
+  exit that actually honours that intent: `no_fault` does not spend the
+  cascade budget at all, while `retryable=False` skipped it by killing the
+  item.
+- Same change, second defect: the isolated branch registered its own
+  `rmtree` cleanup and then fell through to the shared one, so a pinned
+  verification review's throwaway clone — not a worktree of anything — also
+  got `force_remove_worktree(repository, clone)`: a `git worktree
+  remove`/`prune` against the read-only bound clone, whose `rmtree` fallback
+  then deleted the tree under the other remover's feet and left it logging
+  "was not fully removed". One refusal site for both branches is also one
+  cleanup registration;
+  `test_review_head_pin_under_isolation_runs_in_a_clone_detached_at_the_pin`
+  now pins that.
+- `tests/worker/test_daemon.py`:
+  `test_a_host_that_cannot_provide_an_isolated_clone_no_longer_kills_the_item`
+  drives both classifications of the same host fact through the queue model
+  and pins the consequence the monitor counts — dead on delivery one under
+  `non_retryable:`, versus still `ready` with both model attempts intact.
+
+### Fixed — a lost worker no longer dead-letters the work it was holding (`VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH`)
+- `command_center/db/sql/0027_queue_reap_lease_lapse_refunds.up.sql`:
+  `queue_reap()` refunds the attempt the lapsed delivery spent and counts the
+  lapse against the item's bounded `lease_wait_count` budget instead of its
+  `max_attempts`. A visibility lease can only lapse when the worker PROCESS
+  stopped heartbeating — an OOM kill, a watchdog restart, a host loss, a
+  database outage — because the heartbeat runs beside the handler, so a
+  handler that merely hangs keeps its lease and never reaches the reaper.
+  `max_attempts` is the executor cascade's length (two links), so two such
+  restarts used to dead-letter a task that had never reached a model, which
+  the `control-01:queue` monitor measured as `dead_letter_growth`. Permanent
+  lapses still terminate in the DLQ, now under
+  `lease_wait_exhausted: visibility_timeout`, and `queue_redrive()` resets
+  that budget as it has since 0024.
+### Added — desktop points at the server (`VOYN-W0-APP-CONTROL-S2`)
+
+- `command_center/application/server_queue.py`: a read-only HTTP port over the
+  preprod server's work queue (`GET /api/v1/queue/items`,
+  `webapi/queue_routes.py`), built the same way
+  `command_center/application/aios_status.py` builds the AIOS SDK adapter —
+  a factory that only constructs the real client from a complete, HTTPS,
+  allowlisted-host configuration (`AICC_SERVER_QUEUE_URL`,
+  `AICC_SERVER_QUEUE_TOKEN`, `AICC_SERVER_QUEUE_ALLOWED_HOSTS`) and otherwise
+  returns an honest `DisabledServerQueueClient`. Transport is the same
+  authenticated `urllib` GET `http_auth.identity` already uses for `whoami` —
+  no new production dependency.
+- `command_center/platform/preferences.py`: `DataSourceMode` (`LOCAL` /
+  `SERVER`), the persisted "server" toggle, alongside the existing theme and
+  density preferences.
+- Settings screen: a new "Источник данных раздела «Выполнение»" group with
+  the Local/Server radio toggle (`command_center/desktop/pages/settings_page.py`).
+- `command_center/application/operations_adapter.py`: `OperationsAdapter.execution()`
+  now reads the mode via an injected callable (so a toggle flipped mid-session
+  takes effect on the very next read, no adapter reconstruction) and switches
+  from the local runtime snapshot to `server_queue`'s port, mapped into the
+  same five-column shape the "Выполнение" table already renders (queue name
+  stands in for `task_type`, repository id — falling back to task id — stands
+  in for `project`, since a queue-list row carries neither field directly).
+  Desktop still never imports `command_center.runtime`/`webapi` directly
+  (`tests/architecture/test_desktop_engine_fitness.py` continues to pass
+  unchanged) — only through this application-layer port, exactly like AIOS
+  status.
+
+### Added — voice intake for the backlog (`VOYN-W0-APP-CONTROL-S6b`)
+
+- Decision (the task left the transcription engine open): transcription runs
+  **on the device** through the Web Speech API (`web/src/lib/voiceInput.ts`),
+  not through a server-side Whisper. The owner's iPhone and Mac already have
+  the recognizer, so a tailnet-only preprod gains voice with no model weights,
+  no audio upload and no new server dependency, and the PWA (S3) gets it
+  without a native shell. The decision is reversible: a Whisper route would
+  post to the same endpoint with the same `source` flag, and the part that is
+  actually hard is already server-side.
+- `command_center/db/voice_transcript.py`: the deterministic repair of
+  dictated domain terms — the trap the task record names. A recognizer has
+  never heard of this vocabulary, so it writes the namespace token as a
+  Russian word (`воин`/`война`/`вояж`), the priority as words (`пи ноль`) or
+  as the Cyrillic homoglyph `р0` that renders like `P0` and is refused by the
+  ASCII-only parser field, and the wave as `волна ноль`. A closed table fixes
+  those exactly; anything outside the table is left as dictated rather than
+  guessed at, and every substitution is reported as a `Correction`. Pure
+  module — no I/O, no model — so it is equally the normalizer for a later
+  server-side transcription path.
+- `POST /api/v1/backlog/intake/draft` accepts `source: "chat" | "voice"`
+  (default `chat`). A voice draft is repaired before the model sees it, is
+  given one extra prompt paragraph (a recognizer splits an id into separate
+  words — join them, never invent a new id), and returns a `transcript`
+  block: what was heard, what was written, and every correction. Typed text
+  is never repaired — a repair table must not edit words the owner actually
+  typed. No new route and no new credential: it is the same `http_auth`
+  boundary and the same `backlog:intake:draft` operation as S6a.
+- Tasks screen: a microphone button beside «Предложить», rendered only where
+  the browser has a recognizer (Firefox and locked-down WebViews keep the
+  typed path, no dead control). Dictated words land in the same text box the
+  owner would have typed into and stay editable; the corrections the server
+  made are shown above the proposed line; the same draft → confirm gate still
+  applies, because a transcript is a suggestion, not an instruction. Refused
+  microphone, silence and offline recognition each get their own message
+  (`web/src/lib/i18n.ts`, both languages).
+
+### Added — chat-text backlog intake (`VOYN-W0-APP-CONTROL-S6a`)
+
+- `command_center/db/backlog_intake.py`: turns a free-text owner request into
+  one canonical backlog-Markdown line via a model prompt, then runs that line
+  back through the existing deterministic grammar
+  (`command_center.db.backlog_parser.parse_backlog`) — the model only
+  proposes text, the closed-vocabulary parser is the sole authority on
+  whether it is a task. Status is always forced to `UNTRIAGED`, the same
+  raw-finding discipline `backlog_triage` (0008) already enforces for the
+  Markdown importer.
+- `command_center/api/backlog_intake_routes.py`: `POST /api/v1/backlog/intake/draft`
+  (model call + parse, never writes) and `POST /api/v1/backlog/intake/confirm`
+  (re-parses the possibly hand-edited line from scratch, then inserts through
+  `BacklogStore.upsert_task`). `confirm` refuses with 409 when the task id
+  already names an existing record — `backlog_upsert_task` can also overwrite
+  an existing row directly (the Markdown-reconciliation path), and chat
+  intake must never reach into that shortcut. Both routes are on the
+  `http_auth` boundary (`backlog:intake:draft`/`backlog:intake:confirm`,
+  `EXPECTED_MUTATING_ROUTES` now 32).
+### Added — Quota-aware executor routing (`VOYN-W0-AICC-EXECUTOR-QUOTA-AWARE-ROUTING`)
+- `command_center/agent_runner.py`: `RunResult.executor_quota_signature`
+  recognises an executor's own "this account is out of quota" refusal
+  (Claude's session cap, Codex's usage limit, Copilot's monthly quota /
+  credit pool) and `record_executor_exhausted` opens a bounded, self-clearing
+  worker-local circuit against that executor (30 minutes by default,
+  `AICC_EXECUTOR_QUOTA_COOLDOWN_SECONDS`). The detector is deliberately
+  narrower than the attempt-level `is_executor_provider_error` in both
+  vocabulary and read scope -- Claude's structured refusal field, the tail of
+  stderr for the free-text CLIs -- because it licenses a cross-task action: a
+  transcript that merely quotes a quota message must never withhold a healthy
+  account from every later task on the host.
+- `command_center/worker/handlers.py`: `_executor_preflight` reports an open
+  circuit as unavailability, so the cascade skips the exhausted link INSIDE
+  the delivery the worker already holds. No attempt is spent rediscovering an
+  exhaustion the last refusal established; when no link can run, the refusal
+  routes to the infra-wait refund (0024) rather than to the task's own
+  attempt budget. The Codex workspace-write probe records a quota refusal the
+  same way, instead of re-probing the exhausted account on every mutating
+  dispatch.
+- `0033_infra_wait_quota_detail`: `queue_fail_infra_wait` takes an optional
+  `jsonb` detail, merged into the `work_event` audit row under the counters
+  it cannot overwrite. A refusal writes no result row, so this is how
+  "executor X is out of quota until T" and "these links were skipped without
+  spending an attempt" reach the audit trail. The argument defaults to NULL,
+  so a pre-0025 caller writes exactly the row it wrote before.
+
+### Added — the one-button audit, wired into the web UI (`VOYN-W0-APP-CONTROL-S4`)
+
+- `web/src/screens/Tasks.tsx`: an `AuditLauncher` panel above the task list —
+  pick a project, confirm (or edit) the review prompt, one button. A
+  successful enqueue reloads the task list so the new item appears
+  immediately.
+- The launcher owns no credential of its own: a 401 from the audit POST is
+  handed up to the screen (`onAuthRequired`), which locks and renders the
+  same single `TokenGate` a 401 from the queue reads does — so the owner
+  gets an actual unlock control, and a retry uses the replacement key
+  instead of resending the rejected one. The refused draft (project +
+  prompt) rides along and is restored when the screen unlocks, so the retry
+  is one click rather than a retype, and the gate says plainly that the
+  audit was NOT started. (Supersedes PR #421, rejected for exactly this
+  missing recovery path: the panel showed "unlock below" while no unlock
+  control existed.)
+- `web/src/lib/queueApi.ts`: `enqueueAudit`, the typed `POST /api/v1/queue/audit`
+  client (401 raises the same `QueueAuthError` the reads use).
+- `command_center/webapi/queue_routes.py`: `repository_path` is now optional
+  in the audit request — the one-button trigger only knows a `project_id`.
+  When omitted, it resolves from `project_config.get_project_config`, the
+  same source the worker already confirms the run against
+  (`agent_runner.validate_repository`), so the caller never needs to know
+  the server's filesystem layout. An explicit `repository_path` is still
+  honored verbatim.
+- The `execution`-queue enqueue → claim → `agent_run` (review profile) →
+  result → `GET /api/v1/queue/items/{id}` path was verified end-to-end at
+  the code level (SRV-05's worker already claims this queue and shape);
+  the remaining gap is operational — the systemd unit is not yet installed
+  on any host.
+
+### Fixed — Control ticks have their own GitHub quota (`VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS`)
+- `command_center/orchestrator/gh_access.py`: every `gh` call the review,
+  merge and PR-window ticks make now runs under the `voyn-aicc-fleet` App's
+  installation token (`/var/lib/aicc/github/gh`, minted by
+  `voyn-aicc-github-token.timer` and readable by the `aicc-worker` principal
+  the ticks run as) instead of whatever human credential is ambient on
+  control-01. On 2026-09-09 21:15-22:10 UTC that human's shared GraphQL quota
+  was exhausted (`API rate limit already exceeded for user ID 297853521`) and
+  all three ticks failed for an hour. A host without the store falls back to
+  the ambient credential and says so; a refusal from the App falls back per
+  call so a scope it was never granted cannot break a tick.
+- The PR-window tick -- the only loop that touches every open pull request --
+  moved from `gh pr list`/`gh pr view`/`gh pr edit` (GraphQL) to the REST
+  endpoints (`gh api repos/...`), with per-`(repo, PR, head sha)` caching of
+  the details, so an unchanged head costs no API call at all. Its timer went
+  from 5 to 15 minutes; labelling is advisory and no gate reads it.
+- Each tick reports a `QUOTA` line: identity, REST/GraphQL call counts, cache
+  hits, ambient fallbacks, rate-limited calls, and the identity's remaining
+  core/GraphQL budget (read with `gh api rate_limit`, which is exempt from
+  rate limiting).
+- `ops/aicc_github_app_token.py` requests the ticks' additional read scopes
+  (`checks`, `statuses`, `actions`) on top of the lanes' git set, and falls
+  back to the lane set alone if the installation was never granted them --
+  GitHub refuses the whole token otherwise, which would leave the fleet with
+  no credential at all.
+
 ### Fixed — the lease clock started when the server answered, so the lane outran the lease by the reply's own delay (`VOYN-MON-CONTROL-01-QUEUE-QUEUE-STALLED`)
 - `control-01:queue` carried `queue_stalled` as `monitor_finding` #41949. The
   three fixes below (#41136, #41237, #41318) replaced the beat count with a

@@ -3,7 +3,12 @@ Description=Run the backlog PR-window tick periodically
 
 [Timer]
 OnBootSec=4min
-OnUnitActiveSec=5min
+# Every 15 minutes, not every 5: this tick touches EVERY open pull
+# request, and labelling is advisory -- no gate reads these labels. The
+# detail cache holds for 30 minutes, so a PR whose head has not moved
+# costs no API call on every other tick
+# (VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS).
+OnUnitActiveSec=15min
 
 [Install]
 WantedBy=timers.target
