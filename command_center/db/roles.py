@@ -127,6 +127,7 @@ ALL_TABLES: tuple[str, ...] = (
     "backlog_task_remediation",
     "backlog_scan_cursor",
     "backlog_writer_lease",
+    "coordinator_state",
     "completion",
     "completion_event",
     "completion_validation",
@@ -308,6 +309,8 @@ _APP_BACKLOG_TABLES: dict[str, frozenset[str]] = {
     "backlog_writer_lease": _READ,
     "backlog_task_remediation": _READ,
     "backlog_scan_cursor": _READ,
+    # Coordination v2: reads only; every write is a SECURITY DEFINER CAS.
+    "coordinator_state": _READ,
 }
 
 _WORKER_BACKLOG_TABLES: dict[str, frozenset[str]] = {
@@ -318,6 +321,7 @@ _WORKER_BACKLOG_TABLES: dict[str, frozenset[str]] = {
     "backlog_writer_lease": _NONE,
     "backlog_task_remediation": _NONE,
     "backlog_scan_cursor": _NONE,
+    "coordinator_state": _NONE,
 }
 
 # The enrolment tables (0003), for the control plane. Read-only, and two of them
@@ -599,6 +603,11 @@ _APP_BACKLOG_FUNCTIONS = (
     "backlog_record_provenance(text, text, jsonb)",
     "backlog_owner_decision(text, bigint, text, text)",
     "backlog_owner_lock(text)",
+    # Coordination v2 (0031): durable snapshot/in-flight CAS; no DML path.
+    "coordinator_state_read(text)",
+    "coordinator_cas_begin(text, text, text, text, timestamptz)",
+    "coordinator_cas_finish(text, text, text, jsonb, text, jsonb, integer, timestamptz)",
+    "coordinator_cas_clear_inflight(text, text, text, timestamptz)",
 )
 
 # The enrolment surface (0003), split by who may do what.

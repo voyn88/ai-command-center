@@ -24,6 +24,10 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from command_center.orchestrator.coordination import (
+    apply_advisory_order,
+    load_advisory_order,
+)
 from command_center.orchestrator.routing import cascade_for
 from command_center.worker.payloads import AGENT_RUN_SCHEMA_VERSION
 
@@ -444,6 +448,15 @@ class Planner:
                 "       task_class "
                 "FROM backlog_eligible"
             )
+            # Advisory reorder from coordination v2 (Grok). Stale/unknown ids
+            # are ignored; backlog_dispatch still re-checks eligibility under
+            # the row lock. Missing/unreadable state → original order.
+            try:
+                advisory = load_advisory_order(self._factory)
+            except Exception:  # noqa: BLE001 — coordination must never abort planning
+                advisory = []
+            if advisory:
+                candidates = apply_advisory_order(candidates, advisory, id_index=0)
             for (
                 task_id, wave, priority, title, body, repo, dispatchable, task_class,
             ) in candidates:

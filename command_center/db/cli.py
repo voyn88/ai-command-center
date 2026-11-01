@@ -594,6 +594,25 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"REFUSED   {task_id}: {reason}")
                 for task_id, reason in report.undispatchable:
                     print(f"NO-REPO   {task_id}: {reason}")
+                # Coordination v2 runs AFTER the planner lease is released so a
+                # model call never blocks planner:global. Opt-in / stop switches
+                # live in coordination.coordinate_once; default is no-op.
+                from command_center.db.work_queue_store import WorkQueueStore
+                from command_center.orchestrator.coordination import coordinate_once
+
+                coord = coordinate_once(
+                    lambda: _nc(conn), _review_enqueue(WorkQueueStore(lambda: _nc(conn)))
+                )
+                if coord.stopped:
+                    print(f"COORD     stopped ({coord.skipped})")
+                elif coord.enqueued:
+                    print(f"COORD     enqueued {coord.enqueued}")
+                elif coord.applied:
+                    print(f"COORD     applied order n={len(coord.applied)}")
+                elif coord.rejected:
+                    print(f"COORD     rejected: {coord.rejected}")
+                elif coord.skipped and coord.skipped != "disabled":
+                    print(f"COORD     skipped: {coord.skipped}")
                 return 0
 
             if args.command == "backlog-review":
