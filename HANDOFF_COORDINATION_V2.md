@@ -128,3 +128,21 @@ path before DB access. Both disabled and STOP mode also bypass advisory reads
 and preserve the original planner ordering. Live broker workspace access still
 requires activation verification. Production coordination remains disabled. No provider call,
 service change, publication or deployment was performed by this follow-up.
+
+
+## Persistence and mirror scope
+
+`coordinator_state` is PostgreSQL-native durable authority, not an ephemeral
+cache. The SQLite-to-PostgreSQL mirror coverage ledger signs it out because no
+SQLite source exists, just as for native queue and backlog scheduler tables.
+The owning backlog scope is `VOYN-W0-BACKLOG-ORCHESTRATOR`.
+
+This exclusion does not exclude the table from PostgreSQL backup or restore.
+Restore coordinator state and `work_item`/`work_result` from the same consistent
+recovery point. Normal process restarts retain the snapshot, retry budget and
+in-flight key. Do not clear the table to rebuild advisory ordering: that loses
+deduplication and may spend on previously evaluated snapshots again. If queue
+and coordinator state were restored inconsistently, keep coordination stopped
+until reconciled; the missing-item repair path is not a disaster-recovery or
+exactly-once guarantee across inconsistent backups. A future SQLite authority
+requires a new mirror/cutover decision, pinned by the dedicated coverage test.
