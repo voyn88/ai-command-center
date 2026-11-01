@@ -2,7 +2,7 @@
 
 **Status:** implemented locally, **not activated**. Owner must opt in after migrate/deploy.
 
-**Commit SHA:** _(filled at commit time; see `git rev-parse HEAD` on this branch)_
+**Commit SHA:** `0c56d6894050730484882324a32739a5544d96e8`
 
 ## What shipped
 
