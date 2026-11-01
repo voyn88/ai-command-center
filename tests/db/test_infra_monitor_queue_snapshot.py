@@ -1668,7 +1668,10 @@ def test_a_beat_that_commits_without_answering_leaves_the_write_acceptable(
 
     # THE DEADLINE WAS THE LANE'S OWN, and it fired on the clock: the handler
     # stopped one window after the CLAIM, because no beat ever answered.
-    lapsed_at = time.monotonic() - started
+    # Measured from `claim_sent_at`, the instant `_LeaseDeadline` is dated
+    # from: `started` is taken later, so timing from it under-reads the lapse
+    # by the setup in between and fails a deadline that fired exactly on time.
+    lapsed_at = time.monotonic() - claim_sent_at
     assert lapsed_at >= UNANSWERED_WINDOW, (
         f"the handler stopped at {lapsed_at:.1f}s, ahead of its "
         f"{UNANSWERED_WINDOW}s deadline (beats at {beats})"
