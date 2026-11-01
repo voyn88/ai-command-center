@@ -583,7 +583,7 @@ _APP_BACKLOG_FUNCTIONS = (
     "backlog_scan_claim(text, text, text)",
     # Triage of raw findings (0008): UNTRIAGED -> OPEN/NEEDS_REFINEMENT/DONE/DECIDED.
     "backlog_triage(text, text, text)",
-    # Priority/wave reassignment (0033, VOYN-W0-APP-CONTROL-S6d).
+    # Priority/wave reassignment (0031, VOYN-W0-APP-CONTROL-S6d).
     "backlog_reassign(text, text, text, bigint)",
     # Evidence hygiene (0030): remove proven malformed PR evidence.
     "backlog_clear_evidence(text, text, text, text)",
