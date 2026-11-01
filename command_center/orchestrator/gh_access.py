@@ -22,10 +22,13 @@ Three changes, all here or driven from here:
    registered for the isolated worker lanes (VOYN-W0-AICC-ISOLATED-WORKER-
    NEEDS-READ-ONLY-GIT-ACCESS) -- whose installation token carries its OWN
    REST and GraphQL quota, entirely separate from any human's.
-   ``voyn-aicc-github-token.timer`` already mints it into
-   ``/var/lib/aicc/github`` every 30 minutes, 0640 root:aicc-worker, and the
-   control ticks run as ``aicc-worker``: they can read it today. ``run()``
-   points ``gh`` at that store's ``GH_CONFIG_DIR`` (clearing ``GH_TOKEN`` /
+   ``voyn-aicc-github-token.timer`` mints it into ``/var/lib/aicc/github``
+   every 30 minutes (0640 root:aicc-worker on a worker host, root:voynadmin
+   on a control host). The control ticks run as ``voynadmin`` and read that
+   store; without it they fell back to the ambient human credential and the
+   PR-window tick burned ~400 REST calls per run
+   (VOYN-W0-AICC-PR-WINDOW-TICK-BURNS-REST-QUOTA). ``run()`` points ``gh``
+   at that store's ``GH_CONFIG_DIR`` (clearing ``GH_TOKEN`` /
    ``GITHUB_TOKEN``, which would otherwise win over it) whenever the store is
    present and unexpired, and falls back to the ambient credential otherwise
    rather than failing the tick -- a host without the store (a developer

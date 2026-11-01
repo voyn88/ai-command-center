@@ -9,20 +9,24 @@ and the publisher's ``git push``/``gh pr`` had nothing to authenticate with
 registered the GitHub App ``voyn-aicc-fleet`` on org voyn88; this root timer
 turns its private key into a short-lived installation token (60 minutes,
 refreshed every 30) narrowed to the fleet's repositories, and stores it where
-only the worker principal can read it:
+only the host's tick/lane principal can read it:
 
-- ``/var/lib/aicc/github/token`` (0640 root:aicc-worker) -- read by the git
+- ``/var/lib/aicc/github/token`` (0640 root:<group>) -- read by the git
   credential helper ``aicc-git-credential`` through ``/etc/aicc/gitconfig``;
 - ``/var/lib/aicc/github/gh/hosts.yml`` (0640) -- ``gh`` reads it through the
   lane's ``GH_CONFIG_DIR`` (the AGENT's launcher points GH_CONFIG_DIR at a
   nonexistent path, so untrusted model code never sees the token).
 
-The same store is what gives the CONTROL ticks their own GitHub quota
-(``command_center/orchestrator/gh_access.py``): they run as ``aicc-worker``
-and so can read it, which is what stopped them dying with the operator's own
-exhausted GraphQL budget
-(VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS). Their extra read scopes
-are requested on top of the lane set and degrade to it if ungranted -- see
+``<group>`` is ``aicc-worker`` on a worker host and ``voynadmin`` on a
+control host (the minter resolves whichever local group exists; see
+``resolve_token_group``). The same store is what gives the CONTROL ticks
+their own GitHub quota (``command_center/orchestrator/gh_access.py``): the
+control units run as ``voynadmin`` and the control tmpfiles make the store
+group-readable by that principal, which is what stopped them dying with the
+operator's own exhausted GraphQL budget
+(VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS /
+VOYN-W0-AICC-PR-WINDOW-TICK-BURNS-REST-QUOTA). Their extra read scopes are
+requested on top of the lane set and degrade to it if ungranted -- see
 ``CONTROL_PERMISSIONS``.
 
 Standard library plus ``openssl dgst`` for the RS256 JWT: no new dependency on
@@ -48,6 +52,12 @@ DEFAULT_PEM = Path("/etc/voyn/secrets/aicc-github-app.pem")
 DEFAULT_ROOT = Path("/var/lib/aicc/github")
 DEFAULT_REPOS = ("ai-command-center", "aios", "voyn-logistics-crm")
 DEFAULT_PERMISSIONS = {"contents": "write", "pull_requests": "write", "metadata": "read"}
+#: Group the store files are chowned to. Worker hosts use `aicc-worker` (the
+#: lane principal); control hosts have no such user and run their ticks as
+#: `voynadmin`, so the minter falls through to that login's group when
+#: `aicc-worker` is absent (VOYN-W0-AICC-PR-WINDOW-TICK-BURNS-REST-QUOTA).
+TOKEN_GROUP_ENV = "AICC_GITHUB_TOKEN_GROUP"
+DEFAULT_TOKEN_GROUPS = ("aicc-worker", "voynadmin")
 #: What the CONTROL ticks additionally need once they run under this token
 #: instead of a human's (VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS):
 #: the check rollup and commit statuses a PR's eligibility is decided from,
@@ -139,14 +149,51 @@ def _access_token(app_id, installation_id, pem, repositories, permissions, opene
         return json.load(response)
 
 
-def store(document: dict, root: Path, *, group: str = "aicc-worker", chown: bool = True) -> None:
+def resolve_token_group(preferred: str | None = None) -> str:
+    """Pick a local group that can own the fleet App token store.
+
+    Prefer an explicit override, then the worker-lane group, then the
+    control-tick login. A control host never provisions `aicc-worker`, so
+    without this fall-through the minter died on `grp.getgrnam` and left
+    the ticks on the ambient human credential."""
+    candidates: list[str] = []
+    if preferred:
+        candidates.append(preferred)
+    env_group = (os.environ.get(TOKEN_GROUP_ENV) or "").strip()
+    if env_group:
+        candidates.append(env_group)
+    candidates.extend(DEFAULT_TOKEN_GROUPS)
+    seen: set[str] = set()
+    for name in candidates:
+        if name in seen:
+            continue
+        seen.add(name)
+        try:
+            grp.getgrnam(name)
+        except KeyError:
+            continue
+        return name
+    raise RuntimeError(
+        "no local group for the fleet GitHub token store "
+        f"(tried: {', '.join(candidates) or 'none'})"
+    )
+
+
+def store(
+    document: dict,
+    root: Path,
+    *,
+    group: str | None = None,
+    chown: bool = True,
+) -> None:
     """Write token, expiry and a gh hosts.yml atomically, lane-readable only."""
     token = str(document["token"])
     # Installation tokens run to ~400 characters (a 200-char cap truncated the
     # live token and every private-repo fetch failed, worker-01 2026-09-09).
     if not token.startswith(("ghs_", "ghp_")) or len(token) > 1024 or any(c.isspace() for c in token):
         raise ValueError("installation token has an unexpected shape")
-    gid = grp.getgrnam(group).gr_gid if chown else -1
+    resolved_group = resolve_token_group(group) if chown else (group or "aicc-worker")
+    gid = grp.getgrnam(resolved_group).gr_gid if chown else -1
     root.mkdir(mode=0o750, parents=True, exist_ok=True)
     (root / "gh").mkdir(mode=0o750, exist_ok=True)
 
@@ -187,6 +234,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--installation-id", default=os.environ.get("AICC_GITHUB_INSTALLATION_ID", ""))
     parser.add_argument("--pem", type=Path, default=Path(os.environ.get("AICC_GITHUB_APP_PEM", str(DEFAULT_PEM))))
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT)
+    parser.add_argument(
+        "--group",
+        default=None,
+        help=(
+            "Unix group that may read the store (default: "
+            f"${TOKEN_GROUP_ENV} or aicc-worker, then voynadmin)"
+        ),
+    )
     parser.add_argument("--repository", action="append", default=None)
     args = parser.parse_args(argv)
     if not args.app_id or not args.installation_id:
@@ -200,7 +255,7 @@ def main(argv: list[str] | None = None) -> int:
         permissions=CONTROL_PERMISSIONS,
         fallback_permissions=DEFAULT_PERMISSIONS,
     )
-    store(document, args.root)
+    store(document, args.root, group=args.group)
     print(json.dumps({
         "expires_at": document.get("expires_at"),
         "permissions": document.get("permissions"),

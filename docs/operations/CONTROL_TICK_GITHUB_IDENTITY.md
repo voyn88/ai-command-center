@@ -22,9 +22,13 @@ reset. Nothing in the control plane had a quota of its own.
 for the isolated worker lanes — which carries its own REST and GraphQL budget:
 
 * the token store is `/var/lib/aicc/github` (`gh/hosts.yml` + `expires_at`),
-  written by `voyn-aicc-github-token.timer` every 30 minutes, `0640
-  root:aicc-worker`;
-* the tick units run as `User=aicc-worker`, so they can already read it;
+  written by `voyn-aicc-github-token.timer` every 30 minutes;
+* on a **worker** host the store is `0640 root:aicc-worker` and the lanes
+  read it; on a **control** host the control profile's tmpfiles make it
+  `0640 root:voynadmin` and the repo-owned ticks (`User=voynadmin`) read it
+  — control-01 previously had no store at all and every tick fell back to
+  the ambient human credential (`fleet_store_unreadable`,
+  VOYN-W0-AICC-PR-WINDOW-TICK-BURNS-REST-QUOTA);
 * `GH_TOKEN` / `GITHUB_TOKEN` are cleared for the call, since either would
   override `GH_CONFIG_DIR` inside `gh` and silently keep spending the human's
   quota.
@@ -36,17 +40,21 @@ report — nothing breaks, it is just back to the old quota.
 The PR-window tick — the only loop that touches every open pull request — also
 moved off GraphQL entirely: listing, per-PR details and label writes are REST
 (`gh api repos/...`), details are cached per `(repo, PR, head sha)` for 30
-minutes, and its timer went from 5 to 15 minutes.
+minutes under systemd `CacheDirectory=aicc-gh`, already-blocked PRs with a
+stable reason (`acceptance_rejected`, `merge_conflict`,
+`stale_exact_head_acceptance`) skip detail refreshes on an unchanged head,
+and its timer runs every 15 minutes.
 
 ## What an operator has to do on a control host
 
 1. Place the App's private key, root-only, exactly as on a worker host:
    `/etc/voyn/secrets/aicc-github-app.pem` (0600 root:root).
-2. `systemctl enable --now voyn-aicc-github-token.timer` — the unit and
-   `/etc/aicc/github-app.env` are installed by the transaction on both
-   profiles; only the key and the enablement are host state.
-3. Confirm the store exists and is group-readable:
-   `ls -l /var/lib/aicc/github/gh/hosts.yml` → `-rw-r----- root aicc-worker`.
+2. Re-install (or `systemctl enable --now voyn-aicc-github-token.timer`) —
+   the control profile of the install transaction now creates
+   `/var/lib/aicc/github`, installs the minter, and enables the timer; only
+   the PEM is still host state the owner places by hand.
+3. Confirm the store exists and is group-readable by the tick user:
+   `ls -l /var/lib/aicc/github/gh/hosts.yml` → `-rw-r----- root voynadmin`.
 
 Nothing else changes: the ticks discover the store themselves, so a host that
 has not done this keeps running exactly as it did before.

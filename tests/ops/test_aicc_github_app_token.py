@@ -221,10 +221,12 @@ def test_the_lane_contract_is_wired_end_to_end():
 
 
 def test_the_control_ticks_read_the_same_store_for_their_own_quota():
-    """VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS: the ticks run as
-    `aicc-worker`, which is exactly the group the token store is readable
-    by, so the control plane's GitHub identity is this same minted token --
-    no second credential, no second store."""
+    """VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS: the /srv layout ticks
+    run as `aicc-worker`, which is exactly the group the worker token store
+    is readable by. The control-plane spelling (voyn-aicc-*) runs as
+    `voynadmin` against a store the control tmpfiles make voynadmin-readable
+    (VOYN-W0-AICC-PR-WINDOW-TICK-BURNS-REST-QUOTA) -- same minted token, no
+    second App, no second credential."""
     root = Path(__file__).parents[2]
     gh_access = (root / "command_center/orchestrator/gh_access.py").read_text()
     assert 'DEFAULT_FLEET_CONFIG_DIR = "/var/lib/aicc/github/gh"' in gh_access
@@ -232,3 +234,48 @@ def test_the_control_ticks_read_the_same_store_for_their_own_quota():
         text = (root / f"deploy/systemd/aicc-backlog-{unit}.service").read_text()
         assert "User=aicc-worker" in text, unit
         assert "CacheDirectory=aicc-gh" in text, unit
+    for unit in ("review", "merge", "remediate", "pr-window"):
+        text = (root / f"deploy/systemd/voyn-aicc-{unit}.service").read_text()
+        assert "User=voynadmin" in text, unit
+        assert "CacheDirectory=aicc-gh" in text, unit
+    control_tmpfiles = (root / "deploy/tmpfiles.d/aicc-control.conf").read_text()
+    assert "d /var/lib/aicc/github 0750 root voynadmin -" in control_tmpfiles
+    minter = (root / "ops/aicc_github_app_token.py").read_text()
+    assert "DEFAULT_TOKEN_GROUPS = (\"aicc-worker\", \"voynadmin\")" in minter
+    assert "def resolve_token_group" in minter
+
+
+def test_resolve_token_group_falls_through_to_voynadmin_when_aicc_worker_is_absent(
+    monkeypatch,
+):
+    """control-01 has no aicc-worker group; the minter must still chown the
+    store to a group the tick user can read."""
+    module = _module()
+    groups = {"voynadmin": type("G", (), {"gr_gid": 1000})()}
+
+    def fake_getgrnam(name):
+        if name not in groups:
+            raise KeyError(name)
+        return groups[name]
+
+    monkeypatch.setattr(module.grp, "getgrnam", fake_getgrnam)
+    monkeypatch.delenv(module.TOKEN_GROUP_ENV, raising=False)
+    assert module.resolve_token_group() == "voynadmin"
+    assert module.resolve_token_group("aicc-worker") == "voynadmin"
+
+
+def test_resolve_token_group_prefers_aicc_worker_on_a_worker_host(monkeypatch):
+    module = _module()
+    groups = {
+        "aicc-worker": type("G", (), {"gr_gid": 1002})(),
+        "voynadmin": type("G", (), {"gr_gid": 1000})(),
+    }
+
+    def fake_getgrnam(name):
+        if name not in groups:
+            raise KeyError(name)
+        return groups[name]
+
+    monkeypatch.setattr(module.grp, "getgrnam", fake_getgrnam)
+    monkeypatch.delenv(module.TOKEN_GROUP_ENV, raising=False)
+    assert module.resolve_token_group() == "aicc-worker"

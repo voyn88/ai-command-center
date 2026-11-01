@@ -37,6 +37,11 @@ Environment=GH_REPO=voyn88/ai-command-center
 Environment=AICC_FLEET_REPO=/opt/aicc/source
 Environment=GIT_TERMINAL_PROMPT=0
 EnvironmentFile=-/etc/aicc/pr-window.env
+# Persistent (repo, PR, head) detail cache. Without this the tick fell through
+# to PrivateTmp's /tmp and every run started cold -- cache=0/80, ~400 REST
+# calls per tick (VOYN-W0-AICC-PR-WINDOW-TICK-BURNS-REST-QUOTA). systemd owns
+# /var/cache/aicc-gh as this unit's User and exports CACHE_DIRECTORY.
+CacheDirectory=aicc-gh
 # Only ever relabels: never merges, approves, or weakens a gate
 # (command_center/orchestrator/review_merge.py: reconcile_pr_window).
 ExecStart=/opt/aicc/current/.venv/bin/python -m command_center.db backlog-pr-window --repo-path ${AICC_FLEET_REPO}

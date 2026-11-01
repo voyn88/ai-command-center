@@ -663,6 +663,72 @@ def test_an_unchanged_head_is_served_from_cache_on_the_next_tick(
     assert second.quota is not None and second.quota.cache_hits == 1
 
 
+def test_unchanged_prs_keep_a_warm_tick_under_one_hundred_rest_calls(
+    fake_gh, checkout, fleet_store, monkeypatch
+):
+    """Acceptance for VOYN-W0-AICC-PR-WINDOW-TICK-BURNS-REST-QUOTA: with heads
+    unchanged, a warm tick is one listing (+ rate_limit) plus cache hits --
+    not another ~400-call detail sweep -- and the QUOTA line names the fleet."""
+    from command_center.orchestrator.review_merge import _light_pr_from_rest
+
+    prs = [
+        {
+            "number": number,
+            "html_url": f"https://github.com/{OWNER_REPO}/pull/{number}",
+            "head": {"sha": HEAD},
+            "created_at": "2026-09-09T12:00:00Z",
+            "user": {"login": "voyn-aicc-fleet[bot]"},
+            "labels": [{"name": "review-window:blocked"}],
+        }
+        for number in range(1, 81)
+    ]
+
+    def list_open(_repo_path, _cfg):
+        return [p for p in map(_light_pr_from_rest, prs) if p is not None], None
+
+    monkeypatch.setattr(review_merge, "_list_open_pulls", list_open)
+    monkeypatch.setattr(
+        review_merge, "_set_pr_window_labels", lambda *_args, **_kwargs: True
+    )
+    # Seed the cache as a prior tick would have: every PR is stably blocked
+    # at this head, so the warm tick must not re-fetch details.
+    cache = gh_access.detail_cache()
+    for number in range(1, 81):
+        cache.put(
+            OWNER_REPO,
+            number,
+            HEAD,
+            {
+                "statusCheckRollup": [],
+                "commits": [{"oid": HEAD, "committedDate": "2026-09-09T12:00:00Z"}],
+                "reviews": [
+                    {
+                        "state": "COMMENTED",
+                        "submittedAt": "2026-09-09T13:00:00Z",
+                        "body": f"ACCEPTANCE: REJECT {HEAD}",
+                        "author": {"login": "reviewer"},
+                    }
+                ],
+                "window_block_reason": "acceptance_rejected",
+            },
+        )
+
+    before = len(_calls(fake_gh))
+    report = reconcile_pr_window(
+        str(checkout), PrWindowConfig(stale_seconds=10**12, max_active=5)
+    )
+    spent = len(_calls(fake_gh)) - before
+
+    assert report.quota is not None
+    assert report.quota.identity == gh_access.FLEET
+    assert report.quota.calls < 100
+    assert spent < 100
+    assert report.quota.cache_hits == 80
+    assert len(report.blocked) == 80
+    assert "identity=fleet-app" in report.quota.line()
+    assert report.quota.line().startswith("QUOTA")
+
+
 def test_a_moved_head_is_never_served_from_a_stale_cache_entry(tmp_path):
     """The head sha is part of the KEY, so a push makes the old entry
     unreachable rather than stale -- the one property that makes caching a

@@ -8,16 +8,31 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Fixed — PR-window tick no longer burns the ambient REST quota on control-01 (`VOYN-W0-AICC-PR-WINDOW-TICK-BURNS-REST-QUOTA`)
+- After #911 the control-plane units still ran as `User=voynadmin` against a
+  store that only existed (and was only readable) on worker hosts, so every
+  tick reported `identity=ambient reason=fleet_store_unreadable` and the
+  PR-window tick spent ~400 REST calls per 5-minute run on `dimastov-lab`.
+- Control profile now installs `deploy/tmpfiles.d/aicc-control.conf` (token
+  store under `/var/lib/aicc/github` as `root:voynadmin`), enables
+  `voyn-aicc-github-token.timer` after commit, and the minter falls through
+  to the `voynadmin` group when `aicc-worker` is absent. PEM placement
+  remains an owner step.
+- `CacheDirectory=aicc-gh` on the control tick units so the `(repo, PR, head)`
+  detail cache survives across ticks (PrivateTmp had been wiping `/tmp`);
+  already-blocked PRs with a stable reason skip detail refreshes on an
+  unchanged head; `voyn-aicc-pr-window.timer` is 15 minutes.
+
 ### Fixed — Control ticks have their own GitHub quota (`VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS`)
 - `command_center/orchestrator/gh_access.py`: every `gh` call the review,
   merge and PR-window ticks make now runs under the `voyn-aicc-fleet` App's
   installation token (`/var/lib/aicc/github/gh`, minted by
-  `voyn-aicc-github-token.timer` and readable by the `aicc-worker` principal
-  the ticks run as) instead of whatever human credential is ambient on
-  control-01. On 2026-09-09 21:15-22:10 UTC that human's shared GraphQL quota
-  was exhausted (`API rate limit already exceeded for user ID 297853521`) and
-  all three ticks failed for an hour. A host without the store falls back to
-  the ambient credential and says so; a refusal from the App falls back per
+  `voyn-aicc-github-token.timer` and readable by the tick principal) instead
+  of whatever human credential is ambient on control-01. On 2026-09-09
+  21:15-22:10 UTC that human's shared GraphQL quota was exhausted
+  (`API rate limit already exceeded for user ID 297853521`) and all three
+  ticks failed for an hour. A host without the store falls back to the
+  ambient credential and says so; a refusal from the App falls back per
   call so a scope it was never granted cannot break a tick.
 - The PR-window tick -- the only loop that touches every open pull request --
   moved from `gh pr list`/`gh pr view`/`gh pr edit` (GraphQL) to the REST

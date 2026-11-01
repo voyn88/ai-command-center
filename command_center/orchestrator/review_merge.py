@@ -4236,6 +4236,22 @@ def _pr_age_seconds(
     return max(now - parsed, 0.0), fell_back
 
 
+#: Block reasons that cannot clear without a new head push (or an explicit
+#: human override). A PR already labelled blocked for one of these, whose
+#: head sha is unchanged, must not spend another detail lookup -- the
+#: listing already proves the head, and re-fetching checks/reviews cannot
+#: un-reject or un-conflict it (VOYN-W0-AICC-PR-WINDOW-TICK-BURNS-REST-QUOTA).
+#: Deliberately excludes `checks_stale` / `checks_missing`: those can flip
+#: green on the same head and still get a bounded refresh budget.
+_STABLE_WINDOW_BLOCK_REASONS = frozenset(
+    {
+        "acceptance_rejected",
+        "merge_conflict",
+        "stale_exact_head_acceptance",
+    }
+)
+
+
 def _window_block_reason(
     pr: dict[str, Any], cfg: PrWindowConfig, *, age_seconds: float
 ) -> str | None:
@@ -4268,6 +4284,88 @@ def _window_block_reason(
     ):
         return "stale_exact_head_acceptance"
     return None
+
+
+def _cached_payload_age_seconds(detailed: dict[str, Any], *, now: float) -> float:
+    """Age derived only from fields already on the cached payload.
+
+    Must never touch the network: this runs on the stable-blocked short
+    circuit whose whole point is zero API calls for an unchanged head."""
+    head = str(detailed.get("headRefOid") or "")
+    commits = detailed.get("commits") or []
+    match = next(
+        (item for item in commits if str(item.get("oid") or "") == head), None
+    )
+    date = match.get("committedDate") if isinstance(match, dict) else None
+    if not date:
+        date = detailed.get("createdAt")
+    if not date:
+        return 0.0
+    parsed = _parse_iso8601_seconds(str(date))
+    if parsed is None:
+        return 0.0
+    return max(now - parsed, 0.0)
+
+
+def _cached_stable_block_reason(
+    detailed: dict[str, Any], cfg: PrWindowConfig, *, now: float
+) -> str | None:
+    """Stable block reason recoverable from a cache hit, or None.
+
+    Prefers an explicit `window_block_reason` stamped into the cache when the
+    PR was last labelled blocked; falls back to recomputing from the cached
+    payload when that stamp is absent (older cache entries). Never issues a
+    GitHub call -- a miss simply declines the short circuit."""
+    stamped = detailed.get("window_block_reason")
+    if isinstance(stamped, str) and stamped in _STABLE_WINDOW_BLOCK_REASONS:
+        return stamped
+    age_seconds = _cached_payload_age_seconds(detailed, now=now)
+    reason = _window_block_reason(detailed, cfg, age_seconds=age_seconds)
+    if reason in (None, "stale_exact_head_acceptance") and "reviews" not in detailed:
+        # Staleness and reject markers need reviews; without them we cannot
+        # claim a stable reason from this cache entry.
+        return None
+    if reason in (None, "stale_exact_head_acceptance") and "reviews" in detailed:
+        reason = _window_block_reason(detailed, cfg, age_seconds=age_seconds)
+    return reason if reason in _STABLE_WINDOW_BLOCK_REASONS else None
+
+
+def _remember_window_block_reason(
+    detailed: dict[str, Any],
+    reason: str,
+    cache: gh_access.PrDetailCache | None,
+) -> None:
+    """Persist the block reason next to the cached details for the next tick.
+
+    Only stable reasons are stamped: a transient `checks_stale` must still be
+    eligible for the bounded refresh budget once the cache entry ages out."""
+    if reason not in _STABLE_WINDOW_BLOCK_REASONS or cache is None:
+        return
+    number = int(detailed.get("number") or 0)
+    head = str(detailed.get("headRefOid") or "")
+    if not number or not head:
+        return
+    parsed = _owner_repo_number_from_pr_url(str(detailed.get("url") or ""))
+    if parsed is not None:
+        slug = f"{parsed[0]}/{parsed[1]}"
+    else:
+        return
+    stamped = dict(detailed)
+    stamped["window_block_reason"] = reason
+    # Keep only the detail fields the next tick's cache merge needs; the
+    # light listing fields are re-applied from the fresh list each tick.
+    payload = {
+        key: stamped[key]
+        for key in (
+            "statusCheckRollup",
+            "commits",
+            "reviews",
+            "mergeStateStatus",
+            "window_block_reason",
+        )
+        if key in stamped
+    }
+    cache.put(slug, number, head, payload)
 
 
 def _check_is_red_for_window(check: dict[str, Any]) -> bool:
@@ -4477,6 +4575,15 @@ def _reconcile_pr_window(
         detailed = _pr_window_details(
             repo_path, pr, cache, fetch=False, include_reviews=False
         )
+        if blocked_now and detailed is not None:
+            stable = _cached_stable_block_reason(detailed, cfg, now=now)
+            if stable is not None:
+                # Already blocked for a reason a new head alone can clear:
+                # keep the label, spend no refresh, and do not re-fetch
+                # reviews/checks for an unchanged sha.
+                report.blocked.append((number, stable))
+                _set_pr_window_labels(repo_path, detailed, cfg, cfg.label_blocked)
+                continue
         if (
             blocked_now
             and detailed is None
@@ -4526,6 +4633,7 @@ def _reconcile_pr_window(
                 and blocked_refreshes_used >= blocked_refresh_budget
             ):
                 report.blocked.append((number, reason))
+                _remember_window_block_reason(detailed, reason, cache)
                 _set_pr_window_labels(repo_path, detailed, cfg, cfg.label_blocked)
                 continue
             if blocked_now:
@@ -4566,6 +4674,7 @@ def _reconcile_pr_window(
             reason = _window_block_reason(detailed, cfg, age_seconds=age_seconds)
         if reason is not None:
             report.blocked.append((number, reason))
+            _remember_window_block_reason(detailed, reason, cache)
             _set_pr_window_labels(repo_path, detailed, cfg, cfg.label_blocked)
             continue
         if window_full:

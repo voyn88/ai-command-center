@@ -257,6 +257,75 @@ def test_old_blocked_pr_does_not_starve_fresh_candidate(monkeypatch):
     assert labels == [(2, "review-window:active"), (1, "review-window:blocked")]
 
 
+def test_stable_blocked_prs_skip_detail_lookups_on_unchanged_heads(monkeypatch):
+    """VOYN-W0-AICC-PR-WINDOW-TICK-BURNS-REST-QUOTA: a PR already blocked for
+    a stable reason whose head has not moved must not spend another detail
+    fetch -- the listing already proved the sha is unchanged."""
+    head = "a" * 40
+    light = {
+        "number": 1,
+        "url": "https://github.com/x/repo/pull/1",
+        "headRefOid": head,
+        "createdAt": "2026-01-01T00:00:00Z",
+        "author": {"login": "alice"},
+        "labels": [{"name": "review-window:blocked"}],
+    }
+    cached = {
+        **light,
+        "reviews": [
+            {
+                "state": "COMMENTED",
+                "submittedAt": "2026-01-02T00:00:00Z",
+                "body": f"ACCEPTANCE: REJECT {head}",
+                "author": {"login": "reviewer"},
+            }
+        ],
+        "statusCheckRollup": [],
+        "commits": [{"oid": head, "committedDate": "2026-01-01T00:00:00Z"}],
+        "window_block_reason": "acceptance_rejected",
+    }
+    fetched: list[int] = []
+    labels: list[tuple[int, str]] = []
+
+    class Cache:
+        def get(self, _repo, number, _head):
+            return cached if number == 1 else None
+
+        def put(self, *_args, **_kwargs):
+            return None
+
+        def prune(self):
+            return 0
+
+    monkeypatch.setattr(review_merge.gh_access, "detail_cache", lambda: Cache())
+    monkeypatch.setattr(
+        review_merge, "_list_open_pulls", lambda _repo_path, _cfg: ([light], None)
+    )
+
+    def details(_repo_path, pr, cache=None, *, fetch=True, refresh=False, include_reviews=True):
+        if not fetch:
+            hit = cache.get("x/repo", pr["number"], pr["headRefOid"]) if cache else None
+            return {**pr, **hit} if hit else None
+        fetched.append(pr["number"])
+        return None
+
+    monkeypatch.setattr(review_merge, "_pr_window_details", details)
+    monkeypatch.setattr(
+        review_merge,
+        "_set_pr_window_labels",
+        lambda _repo_path, pr, _cfg, desired: labels.append((pr["number"], desired))
+        or True,
+    )
+
+    report = reconcile_pr_window(
+        "/repo", PrWindowConfig(max_active=1, stale_seconds=10**12, detail_budget=10)
+    )
+
+    assert fetched == []
+    assert report.blocked == [(1, "acceptance_rejected")]
+    assert labels == [(1, "review-window:blocked")]
+
+
 def test_blocked_refresh_budget_leaves_old_blocked_tail_untouched(monkeypatch):
     old_blocked = [
         {

@@ -542,8 +542,10 @@ trap rollback EXIT HUP INT TERM
 # control host provisions only the identities its own specs install against:
 # aicc-control-authority, which owns /etc/aicc/workspace-authority.env on this
 # profile, and aicc-publisher, which the conversion below has to be able to
-# take the worker-era principals out of. No tmpfiles entry is control-plane
-# state, so none runs here.
+# take the worker-era principals out of. The one control tmpfiles entry is
+# the fleet App token store under /var/lib/aicc/github -- without it the
+# control ticks cannot read a minted token and burn the ambient human
+# quota instead (VOYN-W0-AICC-PR-WINDOW-TICK-BURNS-REST-QUOTA).
 if [ "$install_profile" = "worker" ]; then
   systemd-sysusers "$repo_root/deploy/sysusers.d/aicc-agent.conf"
   systemd-tmpfiles --create "$repo_root/deploy/tmpfiles.d/aicc-agent.conf"
@@ -553,6 +555,7 @@ else
   # reuse a numeric gid still held by a worker process. Prove this control-only
   # group is empty, distinct and not held live before any generation is staged.
   run_transaction validate-control-authority
+  systemd-tmpfiles --create "$repo_root/deploy/tmpfiles.d/aicc-control.conf"
 fi
 run_transaction prepare
 transaction_active=1
@@ -640,6 +643,11 @@ trap - EXIT HUP INT TERM
 # review-window labeller instead of "someone typed it once on 2026-09-09"
 # (VOYN-W0-AICC-PR-WINDOW-RECONCILER-NOT-DEPLOYED-ON-CONTROL).
 if [ "$install_profile" = "control" ]; then
+  # Mint the fleet App token on this host (PEM is still owner-placed). Without
+  # this timer the store stays empty and every tick reports
+  # identity=ambient reason=fleet_store_unreadable
+  # (VOYN-W0-AICC-PR-WINDOW-TICK-BURNS-REST-QUOTA).
+  systemctl enable --now voyn-aicc-github-token.timer
   systemctl enable --now voyn-aicc-review.timer voyn-aicc-merge.timer voyn-aicc-remediate.timer voyn-aicc-pr-window.timer
 fi
 echo "AICC_AGENT_PRINCIPAL_ISOLATION_INSTALLED"

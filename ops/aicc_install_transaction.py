@@ -5186,6 +5186,18 @@ CONTROL_ONLY_TIMERS = (
     "voyn-aicc-pr-window.timer",
 )
 CONTROL_ONLY_TIMER = "voyn-aicc-pr-window.timer"
+#: Control-plane tmpfiles: the fleet App token store the ticks read. The
+#: worker profile creates the same path via aicc-agent.conf; control never
+#: runs that file, so without this the store directory does not exist and
+#: every tick falls back to the ambient human credential
+#: (VOYN-W0-AICC-PR-WINDOW-TICK-BURNS-REST-QUOTA).
+CONTROL_ONLY_TMPFILES = ("aicc-control.conf",)
+#: Shared timer installed by both profiles but enabled on control after
+#: commit so a rebuilt control host mints its own fleet token without an
+#: operator remembering `systemctl enable` (PEM placement remains owner
+#: state). Not in CONTROL_ONLY_TIMERS: the unit file is shared, not
+#: control-only, and the subset check against CONTROL_ONLY_UNITS must hold.
+CONTROL_GITHUB_TOKEN_TIMER = "voyn-aicc-github-token.timer"
 
 
 def _runtime_target(target: str) -> bool:
@@ -5529,6 +5541,16 @@ def default_specs(
             )
             for unit in CONTROL_ONLY_UNITS
         )
+        control_tmpfiles = tuple(
+            FileSpec(
+                repo_root / "deploy/tmpfiles.d" / name,
+                f"/usr/lib/tmpfiles.d/{name}",
+                0o644,
+                root_uid,
+                root_gid,
+            )
+            for name in CONTROL_ONLY_TMPFILES
+        )
         purge = tuple(
             removal_spec(target, sensitive=target in SENSITIVE_TARGETS)
             for target in sorted(WORKER_ONLY_TARGETS)
@@ -5539,7 +5561,7 @@ def default_specs(
         purge_directories = tuple(
             directory_removal_spec(target) for target in WORKER_ONLY_DIRECTORIES
         )
-        return kept + control_units + purge + purge_directories
+        return kept + control_units + control_tmpfiles + purge + purge_directories
     return specs
 
 

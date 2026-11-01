@@ -1,14 +1,17 @@
 [Unit]
-Description=Run the AICC PR review-window tick every five minutes
+Description=Run the AICC PR review-window tick every fifteen minutes
 
 [Timer]
 OnBootSec=4min
 # Inactive, not Active: the next tick is scheduled from the end of the last
 # one, so a slow tick (its whole runtime is `gh` calls) never queues another
-# behind itself. The randomisation desynchronises this tick from the review
-# and merge ticks it shares a GitHub quota with
-# (VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS).
-OnUnitInactiveSec=5min
+# behind itself. Fifteen minutes (not five): labelling is advisory, the
+# detail cache holds for 30 minutes, and a 5-minute cadence under a cold
+# cache burned ~4800 REST calls/hour on the ambient human identity
+# (VOYN-W0-AICC-PR-WINDOW-TICK-BURNS-REST-QUOTA). The randomisation
+# desynchronises this tick from the review and merge ticks it shares a
+# GitHub quota with.
+OnUnitInactiveSec=15min
 RandomizedDelaySec=30s
 Unit=voyn-aicc-pr-window.service
 

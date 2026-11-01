@@ -1591,18 +1591,40 @@ def test_the_agent_sysusers_and_tmpfiles_side_effects_are_worker_only():
     ):
         _assert_command_inside_shell_if(text, line, guard)
 
-    # The control host still provisions the one identity its own specs
-    # install against, and nothing else: no agent user, no workspace group,
-    # and no tmpfiles directories at all.
+    # The control host still provisions only the identities its own specs
+    # install against: no agent user, no workspace group. The one control
+    # tmpfiles entry is the fleet App token store the ticks read
+    # (VOYN-W0-AICC-PR-WINDOW-TICK-BURNS-REST-QUOTA).
     assert 'systemd-sysusers "$repo_root/deploy/sysusers.d/aicc-control.conf"' in text
     control = (root / "deploy/sysusers.d/aicc-control.conf").read_text(encoding="utf-8")
     declarations = [
         line for line in control.splitlines() if line and not line.startswith("#")
     ]
     assert declarations == ["g aicc-control-authority -", "g aicc-publisher -"]
-    assert "systemd-tmpfiles" not in text.split(
-        'systemd-sysusers "$repo_root/deploy/sysusers.d/aicc-control.conf"', 1
-    )[1]
+    control_tmpfiles = (
+        'systemd-tmpfiles --create "$repo_root/deploy/tmpfiles.d/aicc-control.conf"'
+    )
+    assert text.count(control_tmpfiles) == 1
+    # Lives in the else branch of the identities/tmpfiles profile fork,
+    # right after the control sysusers line -- never on the worker path
+    # that creates the agent layer.
+    identities_fork = text.split(
+        'systemd-sysusers "$repo_root/deploy/sysusers.d/aicc-agent.conf"', 1
+    )
+    assert len(identities_fork) == 2
+    after_agent_sysusers = identities_fork[1]
+    assert after_agent_sysusers.lstrip().startswith(
+        'systemd-tmpfiles --create "$repo_root/deploy/tmpfiles.d/aicc-agent.conf"'
+    )
+    _worker_branch, control_branch = after_agent_sysusers.split("\nelse\n", 1)
+    control_branch = control_branch.split("\nfi\n", 1)[0]
+    assert control_tmpfiles in control_branch
+    assert 'aicc-agent.conf' not in control_branch
+    tmpfiles = (
+        root / "deploy/tmpfiles.d/aicc-control.conf"
+    ).read_text(encoding="utf-8")
+    assert "d /var/lib/aicc/github 0750 root voynadmin -" in tmpfiles
+    assert "d /var/lib/aicc/github/gh 0750 root voynadmin -" in tmpfiles
 
 
 def test_the_agent_layer_is_only_enabled_for_the_worker_profile():
@@ -2205,13 +2227,16 @@ def test_the_control_profile_installs_the_pr_window_tick(tmp_path):
         "voyn-aicc-pr-window.service",
         "voyn-aicc-pr-window.timer",
     )
+    assert tx.CONTROL_ONLY_TMPFILES == ("aicc-control.conf",)
     for unit in tx.CONTROL_ONLY_UNITS:
         assert f"/etc/systemd/system/{unit}" in control
+    for name in tx.CONTROL_ONLY_TMPFILES:
+        assert f"/usr/lib/tmpfiles.d/{name}" in control
     # A control-only unit is exactly that: the worker profile neither installs
     # it nor is expected to, and the worker-only drop set is unchanged by it.
     assert control - worker == {
         f"/etc/systemd/system/{unit}" for unit in tx.CONTROL_ONLY_UNITS
-    }
+    } | {f"/usr/lib/tmpfiles.d/{name}" for name in tx.CONTROL_ONLY_TMPFILES}
     assert worker - control == tx.WORKER_ONLY_TARGETS
 
 
@@ -2242,6 +2267,7 @@ def test_the_review_and_merge_units_are_immutable_control_ticks(tmp_path):
         assert "Environment=AICC_FLEET_REPO=/opt/aicc/source" in directives  # pragma: allowlist secret
         assert "EnvironmentFile=/etc/aicc/github-app.env" in directives
         assert "EnvironmentFile=-/etc/aicc/review-merge.env" in directives
+        assert "CacheDirectory=aicc-gh" in directives
         assert "source ${AICC_PREPROD_ROOT}/.env" in body
         assert (
             "/opt/aicc/current/.venv/bin/python -m command_center.db "
@@ -2294,9 +2320,14 @@ def test_the_pr_window_unit_carries_no_host_layout_of_its_own(tmp_path):
     # None of the old unit layout that was never on this host.
     for absent in ("/srv/ai-command-center", "/usr/bin/python", "aicc-worker", "/Users"):
         assert absent not in body
+    # Persistent detail cache: without CacheDirectory the tick's PrivateTmp
+    # wiped /tmp between runs and every tick started at cache=0/80.
+    assert "CacheDirectory=aicc-gh" in directives
     # Scheduled from the END of the last tick: the tick's whole runtime is gh
     # calls, and OnUnitActiveSec would queue a second one behind a slow first.
-    assert "OnUnitInactiveSec=5min" in timer
+    # Fifteen minutes: labelling is advisory and a 5-minute cadence burned
+    # the ambient REST quota (VOYN-W0-AICC-PR-WINDOW-TICK-BURNS-REST-QUOTA).
+    assert "OnUnitInactiveSec=15min" in timer
     assert "OnUnitActiveSec" not in timer
     assert "WantedBy=timers.target" in timer
 
@@ -2311,13 +2342,18 @@ def test_the_installer_starts_the_control_timers_after_it_commits(tmp_path):
     tx, _control = _specs("control", tmp_path)
     text = _installer_text()
     enable = "systemctl enable --now " + " ".join(tx.CONTROL_ONLY_TIMERS)
+    enable_token = f"systemctl enable --now {tx.CONTROL_GITHUB_TOKEN_TIMER}"
 
     assert set(tx.CONTROL_ONLY_TIMERS) <= set(tx.CONTROL_ONLY_UNITS)
     _assert_command_inside_shell_if(
         text, enable, 'if [ "$install_profile" = "control" ]; then'
     )
-    assert text.index("run_transaction commit") < text.index(enable)
-    assert text.index("trap - EXIT HUP INT TERM") < text.index(enable)
+    _assert_command_inside_shell_if(
+        text, enable_token, 'if [ "$install_profile" = "control" ]; then'
+    )
+    assert text.index("run_transaction commit") < text.index(enable_token)
+    assert text.index("trap - EXIT HUP INT TERM") < text.index(enable_token)
+    assert text.index(enable_token) < text.index(enable)
     assert text.index(enable) < text.index(
         "echo \"AICC_AGENT_PRINCIPAL_ISOLATION_INSTALLED\""
     ), "a failed enable must not be announced as a completed install"
