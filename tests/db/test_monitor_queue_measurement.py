@@ -208,11 +208,11 @@ def test_an_item_the_fleet_singled_out_still_reaches_the_monitor(monitor_reads):
 
     report = _report(snapshot)
     assert not report.ok
-    assert _failure_classes(report) >= {
-        "dead_letter_growth",
-        "executor_quota_exhausted",
-    }
-    assert "dead_letter_growth:1>0" in report.failures
+    # main's monitor counts a quota death under its own class and NOT also as
+    # dead_letter_growth (one cause, one finding).
+    assert "executor_quota_exhausted" in _failure_classes(report)
+    assert "dead_letter_growth" not in _failure_classes(report)
+    assert "executor_quota_exhausted:1" in report.failures
 
 
 def test_the_snapshot_counts_only_the_trailing_hour(monitor_reads):

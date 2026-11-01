@@ -3469,12 +3469,12 @@ def test_a_workspace_the_fleet_could_not_provision_is_no_fault(
 
     def refuse(spec):
         raise workspace_provisioning.WorkspaceVerificationError(
-            failed_step="worktree_add",
-            remediation="free the branch",
+            failed_step="provision_worktree",
+            remediation="free disk space on the worker",
             expected_workspace=spec.workspace_path,
             actual_workspace=spec.workspace_path,
             expected_branch=spec.expected_branch or "",
-            detail="branch already checked out elsewhere",
+            detail="git worktree add failed: No space left on device",
         )
 
     monkeypatch.setattr(workspace_provisioning, "provision_and_verify", refuse)

@@ -734,6 +734,13 @@ def _quota_detail(
     return {"executor_quota": quota} if quota else {}
 
 
+#: WorkspaceVerificationError steps that mean the fleet failed to build the
+#: isolated workspace (substrate), as opposed to a fact about repository state.
+_PROVISIONING_STEPS = frozenset(
+    {"provision_worktree", "provision_standalone_clone", "task_clone_root_exists"}
+)
+
+
 def _run_agent(
     payload: dict[str, Any], lease_lost: threading.Event, attempt_no: int = 1
 ) -> HandlerOutcome:
@@ -1281,10 +1288,12 @@ def _run_agent(
                     ok=False,
                     reason=f"workspace isolation failed at {exc.failed_step}: {exc.detail}",
                     retryable=True,
-                    # A workspace the fleet owes the run and could not
-                    # provide: substrate, not task -- refund via infra_wait
-                    # (VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH).
-                    infra_wait=True,
+                    # Only the provisioning steps themselves -- the fleet
+                    # could not BUILD the workspace it owes the run -- are
+                    # substrate and refund via infra_wait
+                    # (VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH). Repository
+                    # state facts above stay on the ordinary path.
+                    infra_wait=exc.failed_step in _PROVISIONING_STEPS,
                 )
             run_repository = Path(evidence.workspace_path)
 
