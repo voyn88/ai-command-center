@@ -658,7 +658,19 @@ def _same_mutability_class(current_task_type: str, candidate_task_type: str) -> 
 def _executor_preflight(executor: str, task_type: str) -> tuple[bool, str, str]:
     exhausted_until = agent_runner.executor_exhausted_until(executor)
     if exhausted_until is not None:
-        return False, f"quota exhausted until {exhausted_until.isoformat()}", f"{executor} quota exhausted"
+        # The ACCOUNT is out of quota on this host, not the CLI missing from
+        # it (VOYN-W0-AICC-EXECUTOR-QUOTA-AWARE-ROUTING). Reported in the
+        # same shape as any other unavailability so the caller's existing
+        # search for a healthy cascade link skips this one INSIDE the
+        # delivery it already holds -- no attempt spent proving again what
+        # the last refusal already established, and if no link is healthy the
+        # refusal routes to the infra-wait refund below rather than to the
+        # task's own attempt budget.
+        return (
+            False,
+            f"quota exhausted until {exhausted_until.isoformat()}",
+            f"{executor} quota exhausted",
+        )
     if executor == "cursor" and task_type in agent_runner.MODEL_ONLY_TASK_TYPES:
         return False, "Cursor cannot guarantee zero tools", "model-only executor unavailable"
     if executor == "openai_http":
@@ -684,6 +696,42 @@ def _executor_preflight(executor: str, task_type: str) -> tuple[bool, str, str]:
         return available, detail, "copilot cli unavailable"
     available, detail = agent_runner.claude_cli_preflight()
     return available, detail, "claude cli unavailable"
+
+
+def _quota_skip(executor: str, cascade_step: int | None) -> dict[str, Any] | None:
+    """The telemetry row for a cascade link skipped by an open quota circuit,
+    or `None` when this link's unavailability is not the circuit's doing.
+
+    Read back from `agent_runner` rather than threaded out of
+    `_executor_preflight`: the circuit is the authority on its own deadline,
+    and a link that is unavailable for some other reason (missing CLI, dead
+    sandbox) must not be reported as a quota skip.
+    """
+    exhausted_until = agent_runner.executor_exhausted_until(executor)
+    if exhausted_until is None:
+        return None
+    return {
+        "cascade_step": cascade_step,
+        "executor": executor,
+        "exhausted_until": exhausted_until.isoformat(),
+    }
+
+
+def _quota_detail(
+    exhausted: list[dict[str, Any]], skipped: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """The `work_event` detail for a refusal a quota circuit had a hand in.
+
+    Empty when neither list has anything to say, so an ordinary
+    infrastructure failure keeps writing exactly the audit row it wrote
+    before this task existed.
+    """
+    quota: dict[str, Any] = {}
+    if exhausted:
+        quota["exhausted"] = exhausted
+    if skipped:
+        quota["skipped"] = skipped
+    return {"executor_quota": quota} if quota else {}
 
 
 def _run_agent(
@@ -745,6 +793,14 @@ def _run_agent(
 
     available, detail, unavailable_reason = _executor_preflight(executor, task_type)
     unknown_executors: list[str] = []
+    # Links this delivery declined to run because their account is out of
+    # quota. Telemetry only -- the skipping itself is `_executor_preflight`'s
+    # refusal above -- but it is the evidence that an attempt was NOT spent
+    # on an exhausted executor, so it travels to `work_event`.
+    quota_skips: list[dict[str, Any]] = []
+    first_skip = _quota_skip(executor, cascade_step) if not available else None
+    if first_skip is not None:
+        quota_skips.append(first_skip)
     if not available and link is not None:
         # An open Codex circuit is a routing fact, not a consumed model
         # attempt. Select the next healthy cascade link inside this already
@@ -783,6 +839,9 @@ def _run_agent(
             )
             if not candidate_available:
                 detail, unavailable_reason = candidate_detail, candidate_reason
+                candidate_skip = _quota_skip(candidate_executor, candidate_step)
+                if candidate_skip is not None:
+                    quota_skips.append(candidate_skip)
                 continue
             link = candidate
             cascade_step = candidate_step
@@ -817,6 +876,7 @@ def _run_agent(
                     f"executor(s) {sorted(set(unknown_executors))!r}"
                 ),
                 retryable=True,
+                detail=_quota_detail([], quota_skips),
             )
         # AICC_AGENT_LAUNCH_INFRA_FAILURE (group-writable /opt/aicc, dead
         # launcher socket, ...) is substrate failure: refund via infra_wait,
@@ -827,6 +887,7 @@ def _run_agent(
             reason=f"{unavailable_reason}: {detail}",
             retryable=True,
             infra_wait=True,
+            detail=_quota_detail([], quota_skips),
         )
 
     if lease_lost.is_set():
@@ -1235,6 +1296,11 @@ def _run_agent(
         # unaffected by this change — it closes the narrower, previously-open
         # gap that the OS process kept running regardless of that decision.
         route_failovers: list[dict[str, Any]] = []
+        # Executors this delivery observed refusing for quota, in order. Each
+        # entry is also a circuit this worker opened, so the NEXT delivery --
+        # of this task or any other on this host -- skips the link at
+        # preflight instead of spending an attempt to rediscover it.
+        quota_exhaustions: list[dict[str, Any]] = []
         while True:
             run = agent_runner.run_claude_code(
                 repository_path=run_repository,
@@ -1254,8 +1320,27 @@ def _run_agent(
                 result_text = agent_runner.extract_result_text(run.stdout)
                 quota_signature = run.executor_quota_signature(executor)
                 if quota_signature is not None:
-                    agent_runner.record_executor_exhausted(
-                        executor, cooldown_seconds=60 if executor == "grok" else 1800,
+                    # Recorded BEFORE the failover search below, so the
+                    # candidate preflight sees the circuit this very run
+                    # opened and cannot route back into the account that just
+                    # refused.
+                    exhausted_until = agent_runner.record_executor_exhausted(
+                        executor, cooldown_seconds=60 if executor == "grok" else None
+                    )
+                    quota_exhaustions.append(
+                        {
+                            "cascade_step": cascade_step,
+                            "executor": executor,
+                            "signature": quota_signature,
+                            "exhausted_until": exhausted_until.isoformat(),
+                        }
+                    )
+                    log.warning(
+                        "executor %s is out of quota (%r); withheld on this "
+                        "worker until %s",
+                        executor,
+                        quota_signature,
+                        exhausted_until.isoformat(),
                     )
                 provider_failure = quota_signature is not None or run.is_executor_provider_error(executor) or (
                     executor == "copilot"
@@ -1311,6 +1396,11 @@ def _run_agent(
                             candidate_executor, candidate_task_type
                         )
                         if not candidate_available:
+                            candidate_skip = _quota_skip(
+                                candidate_executor, candidate_step
+                            )
+                            if candidate_skip is not None:
+                                quota_skips.append(candidate_skip)
                             continue
                         route_failovers.append(
                             {
@@ -1357,6 +1447,9 @@ def _run_agent(
                     candidate_executor, candidate_task_type
                 )
                 if not candidate_available:
+                    candidate_skip = _quota_skip(candidate_executor, candidate_step)
+                    if candidate_skip is not None:
+                        quota_skips.append(candidate_skip)
                     continue
                 route_failovers.append(
                     {
@@ -1411,6 +1504,8 @@ def _run_agent(
             "cascade_step": cascade_step,
             "executor": (link or {}).get("executor", "claude"),
             "route_failovers": route_failovers,
+            "executor_quota_exhaustions": quota_exhaustions,
+            "executor_quota_skips": quota_skips,
             **_machine_outcome(result_text),
             "status": run.status,
             "exit_code": run.exit_code,
@@ -1550,14 +1645,22 @@ def _run_agent(
             checkpoint_failure = checkpoint_preserved_candidate()
             if checkpoint_failure is not None:
                 return checkpoint_failure
+            quota_note = (
+                f" [{quota_exhaustions[-1]['executor']} quota exhausted until "
+                f"{quota_exhaustions[-1]['exhausted_until']}]"
+                if quota_exhaustions
+                else ""
+            )
             return HandlerOutcome(
                 ok=False,
                 reason=(
                     "executor infrastructure failure "
                     f"(provider/auth/quota): {_tail(result_text or run.stderr)}"
+                    f"{quota_note}"
                 ),
                 retryable=True,
                 infra_wait=True,
+                detail=_quota_detail(quota_exhaustions, quota_skips),
             )
         if run.is_executor_sandbox_error:
             # bwrap failed before Codex could enter the sandbox or run tools.
