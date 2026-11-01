@@ -1,0 +1,28 @@
+{
+  "endpoint": "GET /repos/voyn88/ai-command-center/branches/main",
+  "captured_at_utc": "2026-11-01T09:49:38Z",
+  "name": "main",
+  "protected": true,
+  "protection": {
+    "enabled": true,
+    "required_status_checks": {
+      "enforcement_level": "everyone",
+      "contexts": [
+        "Final merge gate",
+        "Acceptance gate (independent verdict on exact SHA)"
+      ],
+      "checks": [
+        {
+          "context": "Final merge gate",
+          "app_id": 15368
+        },
+        {
+          "context": "Acceptance gate (independent verdict on exact SHA)",
+          "app_id": 15368
+        }
+      ]
+    }
+  },
+  "head_sha_at_capture": "0714110222f8196ff2e7fc1c6c080f790520e2a6",
+  "note": "Unauthenticated response subset only. Authenticated GET .../protection is required for reviews/enforce_admins/allow_force_pushes/etc."
+}

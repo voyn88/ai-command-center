@@ -75,3 +75,19 @@ the product itself (Git Center reports repo root/HEAD). A dashboard may only
 claim accepted/deployed SHAs backed by `run_provenance`; anything else renders
 **Unknown**. `ROADMAP_STATE.md` and GitHub issues/PRs are projections for
 humans: on conflict, remote GitHub state + runtime.db provenance win.
+
+## Merge enforcement authority (GitHub + application gateway)
+
+Merge into `main` is **not** an unstated GitHub-settings assumption and is
+**not** solely an in-process honour system. Authority is dual-layer; the
+decision record is
+[DR-GITHUB-BRANCH-PROTECTION-001](GOVERNANCE_GITHUB_BRANCH_PROTECTION.md):
+
+| Layer | Authority | Writer / control surface | Recovery / re-verify |
+|---|---|---|---|
+| GitHub-native required checks on `main` | Blocks merges missing the required check-run contexts (`Final merge gate`, `Acceptance gate (independent verdict on exact SHA)`), `enforcement_level=everyone` as of the 2026-11-01 public evidence capture. | Repository admin via GitHub settings / `scripts/enable-branch-protection.sh` (explicit confirm flag; contexts must match this table). Workflow YAML alone does not configure this layer. | `bash scripts/verify-github-branch-protection.sh`; evidence under `docs/audits/github-branch-protection-*/`. |
+| Application merge gateway | `merge_once` in `command_center/orchestrator/review_merge.py` — privileged merge identity, acceptance-marker binding, duplicate-merge guards, and re-check of the same required contexts before `gh pr merge`. | Orchestrator / merge identity only; agents do not hold merge credentials. | Re-run merge tick; failing required checks stay unmerged. |
+
+Do **not** document either layer as if the other were absent. Authenticated-only
+GitHub fields (review count, `enforce_admins`, force-push/delete) remain
+unverified in the public evidence set and must not be implied.

@@ -451,8 +451,15 @@ and MyPy type-check steps alongside — for pull requests into `main`, pushes to
 dispatches on Python 3.14. It uses a read-only token, SHA-pinned actions, and cancels superseded runs for the same
 ref.
 
-The workflow does not configure GitHub branch protection. Whether its result is a required merge
-gate remains a repository-setting concern outside this codebase.
+The workflow YAML does not itself call the branch-protection API. Live repository settings
+(verified 2026-11-01; see
+[docs/GOVERNANCE_GITHUB_BRANCH_PROTECTION.md](docs/GOVERNANCE_GITHUB_BRANCH_PROTECTION.md))
+already require the `Final merge gate` and
+`Acceptance gate (independent verdict on exact SHA)` check-run names on `main`.
+`merge_once` (`command_center/orchestrator/review_merge.py`) is the application merge gateway
+that re-checks those same contexts before merging. Re-verify with
+`bash scripts/verify-github-branch-protection.sh` rather than inferring protection from the
+workflow file alone.
 
 ## 13. Current risks and boundaries
 
@@ -462,8 +469,9 @@ gate remains a repository-setting concern outside this codebase.
 - Live Supervisor ownership is confined to one Python process.
 - `app.py` and several runtime and Portfolio modules are large, concentrated change surfaces.
 - The MyPy type check is informational and non-blocking: it does not gate merges, and the codebase is not yet fully typed.
-- CI runs automatically, but required-check/branch-protection enforcement is not configured by
-  repository code and cannot be inferred from the workflow alone.
+- CI runs automatically; required-check enforcement on `main` is a live GitHub setting (not
+  encoded in workflow YAML). Do not infer absence of protection from the workflow file — see
+  DR-GITHUB-BRANCH-PROTECTION-001 and `scripts/verify-github-branch-protection.sh`.
 - The execution-queue lock is same-host and cooperative; raw queue mutation primitives can bypass
   it, and there is no distributed coordination.
 - Scheduler decisions are point-in-time advice, not persisted claims. Task-id, capacity, and
