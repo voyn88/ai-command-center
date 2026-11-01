@@ -138,6 +138,9 @@
     "command_center/orchestrator/control_plane_reconciler.py": [
       "orchestration"
     ],
+    "command_center/orchestrator/coordination.py": [
+      "orchestration"
+    ],
     "command_center/orchestrator/gh_access.py": [
       "orchestration"
     ],

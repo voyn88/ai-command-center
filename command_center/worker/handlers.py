@@ -35,10 +35,12 @@ stays on the worker host's journal.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
 import shutil
+import subprocess
 import threading
 import uuid
 from contextlib import ExitStack
@@ -53,10 +55,11 @@ from command_center import (
     workspace_provisioning,
 )
 from command_center.db.executor_availability import ExecutorAvailabilityStore
-from command_center.orchestrator.publish import PublishConfig, publish_run
-from command_center.runtime import providers
 from command_center.ops.source_clone_refresh import refresh_source_clone
+from command_center.orchestrator import gh_access
+from command_center.orchestrator.publish import PublishConfig, publish_run
 from command_center.orchestrator.routing import cascade_for
+from command_center.runtime import providers
 from command_center.worker import writer_lease
 from command_center.worker.daemon import Handler, HandlerOutcome
 from command_center.worker.payloads import PayloadError, parse_agent_run
@@ -110,6 +113,144 @@ def _isolated_workspace_path(repository: Path, branch: str) -> Path:
     return workspace_provisioning.task_workspace_path(repository, branch)
 
 
+#: Same origin shapes the orchestrator's review tick trusts when deriving
+#: owner/repo from a local clone (never from a payload URL).
+_ORIGIN_REMOTE = re.compile(
+    r"^(?:https://(?:[^@/]+@)?github\.com/|git@github\.com:|ssh://git@github\.com/)"
+    r"(?P<owner>[^/]+)/(?P<repo>[^/]+?)(?:\.git)?/?$"
+)
+
+
+def _clone_owner_repo(repository: Path) -> tuple[str, str] | None:
+    """(owner, repo) from the clone's ``origin`` remote URL, or None."""
+    try:
+        proc = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            cwd=repository,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    match = _ORIGIN_REMOTE.match((proc.stdout or "").strip())
+    return (match.group("owner"), match.group("repo")) if match else None
+
+
+def _review_pin_currency(
+    repository: Path, pr_number: str, head_sha: str
+) -> tuple[str, str]:
+    """Whether a queued review pin is still the PR's current open head.
+
+    Fetching ``refs/pull/<n>/head`` / ``cat-file`` only proves an object is
+    reachable -- GitHub keeps pull refs after close/merge, and an older sha
+    remains reachable after a force-push. This asks the same fleet/ambient
+    ``gh api`` REST authority the orchestrator uses, with owner/repo taken
+    from the local clone's origin (never from a payload URL).
+
+    Returns ``("current", head)``, ``("stale", "review_pin_stale:...")``, or
+    ``("transient", "review_pin_transient:...")``. Definitive stale
+    (proven closed/merged, or open head moved) must not call a model;
+    missing/null/unknown PR ``state`` is unproven and stays transient
+    infra wait. Transient preserves bounded infra retry.
+    """
+    if not isinstance(pr_number, str) or not re.fullmatch(r"[0-9]{1,10}", pr_number):
+        return "stale", f"review_pin_stale: invalid pr_number {pr_number!r}"
+    if not isinstance(head_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", head_sha):
+        return "stale", f"review_pin_stale: invalid head_sha {head_sha!r}"
+    owned = _clone_owner_repo(repository)
+    if owned is None:
+        return (
+            "transient",
+            (
+                "review_pin_transient: no github origin on clone "
+                "(cannot establish trusted PR authority)"
+            ),
+        )
+    owner, repo = owned
+    # ``gh_access.run`` uses ``subprocess.run(..., timeout=...)`` without a
+    # local catch; TimeoutExpired (a SubprocessError) and launch OSErrors
+    # (missing ``gh``, EPERM, …) must stay on the infra_wait path like a
+    # non-zero gh exit -- never reach the daemon's generic retryable handler
+    # without ``infra_wait``, and never spend a model call.
+    try:
+        proc = gh_access.run(
+            ["api", f"repos/{owner}/{repo}/pulls/{pr_number}"],
+            str(repository),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return (
+            "transient",
+            f"review_pin_transient: pull lookup failed: {exc}",
+        )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()[-300:]
+        return (
+            "transient",
+            f"review_pin_transient: pull lookup failed: {detail or 'gh unavailable'}",
+        )
+    try:
+        data = json.loads(proc.stdout or "{}")
+        state = data.get("state")
+        merged_at = data.get("merged_at")
+        current_head = data["head"]["sha"]
+    except (KeyError, TypeError, AttributeError, json.JSONDecodeError) as exc:
+        return (
+            "transient",
+            f"review_pin_transient: pull body undecodable: {exc}",
+        )
+    if not isinstance(current_head, str) or not re.fullmatch(
+        r"[0-9a-f]{40}", current_head
+    ):
+        return (
+            "transient",
+            f"review_pin_transient: pull head sha malformed: {current_head!r}",
+        )
+    # Only proven closed/merged (or a moved open head below) is definitive
+    # stale. Missing/null/unknown ``state`` is unproven -- keep as infra wait
+    # rather than permanently refusing a pin that may still be open.
+    if merged_at:
+        return (
+            "stale",
+            f"review_pin_stale: pull {pr_number} is merged, not open at {head_sha}",
+        )
+    if state == "closed":
+        return (
+            "stale",
+            f"review_pin_stale: pull {pr_number} is 'closed', not open at {head_sha}",
+        )
+    if state != "open":
+        return (
+            "transient",
+            f"review_pin_transient: pull {pr_number} state unproven: {state!r}",
+        )
+    if current_head != head_sha:
+        return (
+            "stale",
+            (
+                f"review_pin_stale: pull {pr_number} head is {current_head}, "
+                f"queued pin was {head_sha}"
+            ),
+        )
+    return "current", current_head
+
+
+def _refuse_stale_or_transient_pin(
+    status: str, detail: str
+) -> HandlerOutcome | None:
+    """Map a currency check onto a pre-model refusal, or None when current."""
+    if status == "current":
+        return None
+    if status == "stale":
+        return HandlerOutcome(ok=False, reason=detail, retryable=False)
+    return HandlerOutcome(
+        ok=False, reason=detail, retryable=True, infra_wait=True
+    )
+
+
 def _review_head_checkout(
     repository: Path, pr_number: str, head_sha: str
 ) -> tuple[Path | None, str | None]:
@@ -122,8 +263,10 @@ def _review_head_checkout(
     for servers that allow it), verifies the exact object is present, adds a
     detached worktree, and verifies the worktree's HEAD is the exact sha --
     fail closed on any mismatch. Read-only-ness is enforced by the runner's
-    capability profile, not by this checkout. Returns ``(path, None)`` or
-    ``(None, retryable_reason)``."""
+    capability profile, not by this checkout. Object reachability alone does
+    **not** prove the PR is still open at ``head_sha`` -- callers must run
+    ``_review_pin_currency`` first (the agent_run handler does). Returns
+    ``(path, None)`` or ``(None, retryable_reason)``."""
     fetch = agent_runner._run_git(
         ["fetch", "origin", f"refs/pull/{pr_number}/head"], repository, timeout=120
     )
@@ -914,7 +1057,39 @@ def _run_agent(
                     ),
                     retryable=False,
                 )
-            if agent_runner.principal_isolation_required():
+            # Scheduling already revalidated the snapshot; a queued item can
+            # still land after close/merge/head-move. Object fetch alone does
+            # not prove currency -- refuse before any model call.
+            refused = _refuse_stale_or_transient_pin(
+                *_review_pin_currency(
+                    repository,
+                    request.review_head_pr_number or "",
+                    request.review_head_sha,
+                )
+            )
+            if refused is not None:
+                return refused
+            # model_only independent_review embeds the diff in the prompt and
+            # runs with tools stripped: currency is the whole pin contract.
+            # Still take the ordinary read-only isolated clone when isolation
+            # is required -- without a head pin (the prompt carries the diff).
+            if task_type in agent_runner.MODEL_ONLY_TASK_TYPES:
+                if agent_runner.principal_isolation_required():
+                    ok, failure = _refresh_read_only_source(repository)
+                    if not ok:
+                        return HandlerOutcome(
+                            ok=False, reason=failure or "?", retryable=True
+                        )
+                    checkout, failure, retryable = _read_only_isolated_checkout(
+                        repository
+                    )
+                    if checkout is None:
+                        return HandlerOutcome(
+                            ok=False, reason=failure or "?", retryable=retryable
+                        )
+                    stack.callback(_remove_read_only_isolated_checkout, checkout)
+                    run_repository = checkout
+            elif agent_runner.principal_isolation_required():
                 # Under isolation the pinned checkout is the same detached
                 # clone a plain read-only run gets, detached at the exact PR
                 # head instead of the source HEAD: a `git worktree add` would
@@ -943,12 +1118,14 @@ def _run_agent(
                     request.review_head_pr_number or "",
                     request.review_head_sha,
                 )
-            if checkout is None:
-                # Fetch/worktree trouble is repository or network state a
-                # later delivery (or another host) can genuinely cure.
-                return HandlerOutcome(ok=False, reason=failure or "?", retryable=True)
-            stack.callback(_remove_review_head_checkout, repository, checkout)
-            run_repository = checkout
+                if checkout is None:
+                    # Fetch/worktree trouble is repository or network state a
+                    # later delivery (or another host) can genuinely cure.
+                    return HandlerOutcome(
+                        ok=False, reason=failure or "?", retryable=True
+                    )
+                stack.callback(_remove_review_head_checkout, repository, checkout)
+                run_repository = checkout
         if (
             task_type not in agent_runner.MUTATING_TASK_TYPES
             and request.review_head_sha is None
