@@ -88,6 +88,19 @@ class BacklogStore:
         )
         return bool(ok), str(reason or ""), revision
 
+    def reassign(
+        self,
+        task_id: str,
+        wave: str,
+        priority: str | None,
+        expected_revision: int,
+    ) -> tuple[bool, str, int | None]:
+        ok, reason, revision = self._row(
+            "SELECT * FROM backlog_reassign(%s, %s, %s, %s)",
+            (task_id, wave, priority, expected_revision),
+        )
+        return bool(ok), str(reason or ""), revision
+
     def resume_deferred(self, task_id: str) -> tuple[bool, str, int | None]:
         """DEFER_TO_USER -> OPEN through the 0014 machine gate: granted only
         for a task whose latest park was a technical `cascade_exhausted:%`

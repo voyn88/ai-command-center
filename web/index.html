@@ -3,8 +3,20 @@
   <head>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <title>AI Command Center</title>
+
+    <!-- PWA installability (VOYN-W0-APP-CONTROL-S3): the iPhone reaches this
+         SPA over the tailnet and adds it to the home screen — no native app,
+         no App Store, no service worker (a caching layer would risk showing
+         a stale queue/run status, defeating the point of the screen). -->
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <meta name="theme-color" content="#121732" />
+    <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="AICC" />
   </head>
   <body>
     <div id="root"></div>

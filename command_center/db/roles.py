@@ -547,8 +547,10 @@ _WORKER_FUNCTIONS = (
     "queue_fail_lease_wait(text, text, text, integer)",
     # A sibling refund path for host/launcher/provider infrastructure
     # failures. These are not task attempts, but must still be bounded under
-    # their own wait budget.
-    "queue_fail_infra_wait(text, text, text, integer)",
+    # their own wait budget. The trailing jsonb (0025) is the caller's own
+    # evidence for the audit row -- which executor is out of quota and until
+    # when this worker withholds it -- and defaults to NULL.
+    "queue_fail_infra_wait(text, text, text, integer, jsonb)",
 )
 
 # Deliberately not `queue_claim`: only a role that PostgreSQL authenticated as a
@@ -587,6 +589,8 @@ _APP_BACKLOG_FUNCTIONS = (
     "backlog_scan_claim(text, text, text)",
     # Triage of raw findings (0008): UNTRIAGED -> OPEN/NEEDS_REFINEMENT/DONE/DECIDED.
     "backlog_triage(text, text, text)",
+    # Priority/wave reassignment (0035, VOYN-W0-APP-CONTROL-S6d).
+    "backlog_reassign(text, text, text, bigint)",
     # Evidence hygiene (0030): remove proven malformed PR evidence.
     "backlog_clear_evidence(text, text, text, text)",
     # 0021: read-only deploy preflight with dispatch's privileges; the task
