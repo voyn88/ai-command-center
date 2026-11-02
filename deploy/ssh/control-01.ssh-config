@@ -1,0 +1,37 @@
+# Operator-side SSH client config (VOYN-W0-AICC-CONTROL-PLANE-RESILIENCE).
+#
+# Install on the OPERATOR's machine (the Mac that drives control-01), not on
+# control-01 itself:
+#   mkdir -p ~/.ssh/config.d
+#   cp deploy/ssh/control-01.ssh-config ~/.ssh/config.d/aicc-control-01
+#   mkdir -p -m 700 ~/.ssh/control
+#   grep -q '^Include ~/.ssh/config.d/\*' ~/.ssh/config || \
+#     { echo 'Include ~/.ssh/config.d/*'; cat ~/.ssh/config; } > /tmp/sshcfg && \
+#     mv /tmp/sshcfg ~/.ssh/config
+#   # ssh_config(5): an `Include` line only affects lines AFTER it, so it
+#   # must be the first line of ~/.ssh/config, not appended to the end.
+#
+# Incident this fixes: every new SSH session to control-01 over Tailscale is
+# a fresh TCP+auth round trip; a client Mac sleeping/waking or a flaky
+# network multiplies that into the same reconnect churn fail2ban's ignoreip
+# (deploy/fail2ban/voyn-aicc.local) treats as an attack pattern from the
+# server side. `ControlMaster`/`ControlPersist` fix the client side of the
+# SAME problem: one real connection is kept open and reused, so an editor,
+# a shell, and a git push over the same host share one auth handshake
+# instead of each contributing to the churn.
+#
+# `ServerAliveInterval`/`ServerAliveCountMax` detect a Tailscale drop (the
+# client sleeping is the common case) and let the shared master exit
+# promptly rather than wedge silently -- a session against a dead master
+# fails fast and reconnects, instead of hanging until some remote timeout.
+
+Host control-01
+    ControlMaster auto
+    ControlPath ~/.ssh/control/%r@%h:%p
+    # Survives the terminal tab that opened it closing; a fresh session
+    # within 10 minutes of the last one reuses the connection instead of
+    # renegotiating.
+    ControlPersist 10m
+    ServerAliveInterval 15
+    ServerAliveCountMax 3
+    TCPKeepAlive yes

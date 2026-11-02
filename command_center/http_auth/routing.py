@@ -54,9 +54,16 @@ __all__ = [
 MUTATING_VERBS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
 #: ``(method, path template) -> operation``. Exhaustive over both HTTP
-#: surfaces: ``command_center/api/app.py`` (27) and
-#: ``command_center/webapi/app.py`` (3: two dispatch writes and the queue
-#: audit enqueue, VOYN-W0-APP-CONTROL-S1/S4).
+#: surfaces: ``command_center/api/app.py`` (30: the original 27 plus the
+#: chat-text backlog intake draft/confirm, VOYN-W0-APP-CONTROL-S6a, plus the
+#: backlog reassign, VOYN-W0-APP-CONTROL-S6d) and
+#: ``command_center/webapi/app.py`` (6: two dispatch writes, the queue audit
+#: enqueue (VOYN-W0-APP-CONTROL-S1/S4), and the same backlog intake
+#: draft/confirm + reassign trio mounted a second time here so the owner's
+#: browser client — which only ever talks to this app — can reach them
+#: (VOYN-W0-APP-CONTROL-S6a/S6c/S6d)). Each (method, path) key is shared by
+#: both mounts, so one entry guards the operation identically wherever it is
+#: included.
 ROUTE_OPERATIONS: dict[tuple[str, str], str] = {
     # -- command_center/api/wave1_routes.py -------------------------------
     ("POST", "/api/v1/proposals"): "proposals:create",
@@ -99,6 +106,11 @@ ROUTE_OPERATIONS: dict[tuple[str, str], str] = {
     ("PUT", "/api/v1/dispatch/policy"): "dispatch:policy:update",
     # -- command_center/webapi/queue_routes.py ----------------------------
     ("POST", "/api/v1/queue/audit"): "queue:audit:enqueue",
+    # -- command_center/api/backlog_intake_routes.py (VOYN-W0-APP-CONTROL-S6a)
+    ("POST", "/api/v1/backlog/intake/draft"): "backlog:intake:draft",
+    ("POST", "/api/v1/backlog/intake/confirm"): "backlog:intake:confirm",
+    # -- command_center/api/backlog_reassign_routes.py (VOYN-W0-APP-CONTROL-S6d)
+    ("POST", "/api/v1/backlog/tasks/{task_id}/reassign"): "backlog:reassign",
 }
 
 
