@@ -159,3 +159,41 @@ def test_repair_never_introduces_grammar_characters():
 
     assert "\n" not in result.text
     assert result.text.count("|") == 1  # the one the owner actually dictated
+
+
+def test_ordinal_wave_scan_matches_the_regex_it_replaced():
+    """CodeQL py/polynomial-redos regression: same output as the old regex."""
+    import re
+
+    from command_center.db import voice_transcript as vt
+
+    old = re.compile(
+        r"(?<![0-9A-Za-zА-Яа-яЁё-])([а-яё]+)\s+(волн[а-яё]*)(?![0-9A-Za-zА-Яа-яЁё-])",
+        re.I,
+    )
+    samples = [
+        "первая волна",
+        "заведи вторую  волну срочно",
+        "волна волна волна",
+        "xпервая волна",
+        "-первая волна",
+        "ПЕРВАЯ ВОЛНА и третья волна",
+        "первая волна-1",
+        "нулевая\tволна, ёмкая волна",
+        "первая волнаx",
+        "",
+        "волна",
+    ]
+    for text in samples:
+        expected = old.sub(lambda m: f"<{m.group(1)}|{m.group(0)}>", text)
+        got = vt._ordinal_wave_sub(text, lambda whole, ordinal: f"<{ordinal}|{whole}>")
+        assert got == expected, text
+
+
+def test_ordinal_wave_scan_is_linear_on_long_letter_runs():
+    import time
+
+    text = "а" * 200_000 + " x"
+    started = time.monotonic()
+    normalize_transcript(text)
+    assert time.monotonic() - started < 2.0
