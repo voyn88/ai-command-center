@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from command_center.platform import DensityMode
+from command_center.platform import DataSourceMode, DensityMode
 
 from .. import i18n, tokens
 from ..theme import ThemeMode
@@ -30,6 +30,10 @@ _DENSITY_LABELS: tuple[tuple[DensityMode, str], ...] = (
     (DensityMode.COMFORTABLE, i18n.DENSITY_COMFORTABLE),
     (DensityMode.COMPACT, i18n.DENSITY_COMPACT),
 )
+_DATA_SOURCE_LABELS: tuple[tuple[DataSourceMode, str], ...] = (
+    (DataSourceMode.LOCAL, i18n.DATA_SOURCE_LOCAL),
+    (DataSourceMode.SERVER, i18n.DATA_SOURCE_SERVER),
+)
 
 
 class SettingsForm(QWidget):
@@ -39,12 +43,14 @@ class SettingsForm(QWidget):
     density_mode_changed = Signal(object)
     window_geometry_reset_requested = Signal()
     workspace_save_requested = Signal(object)
+    data_source_mode_changed = Signal(object)
 
     def __init__(
         self,
         current_mode: ThemeMode,
         current_density: DensityMode,
         selected_project: str | None,
+        current_data_source_mode: DataSourceMode = DataSourceMode.LOCAL,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -90,6 +96,30 @@ class SettingsForm(QWidget):
             self._density_buttons[mode] = radio
             density_box.addWidget(radio)
         root.addWidget(density)
+
+        data_source = QGroupBox(i18n.SETTINGS_DATA_SOURCE_GROUP)
+        data_source.setAccessibleName(i18n.SETTINGS_DATA_SOURCE_ACCESSIBLE)
+        data_source_box = QVBoxLayout(data_source)
+        data_source_box.setSpacing(tokens.SPACE_SM)
+        self._data_source_group = QButtonGroup(self)
+        self._data_source_group.setExclusive(True)
+        self._data_source_buttons: dict[DataSourceMode, QRadioButton] = {}
+        for mode, label in _DATA_SOURCE_LABELS:
+            radio = QRadioButton(label)
+            radio.setObjectName(f"DataSourceMode{mode.value.title()}")
+            radio.setAccessibleName(label)
+            radio.setChecked(mode is current_data_source_mode)
+            radio.toggled.connect(
+                lambda checked, m=mode: checked and self.data_source_mode_changed.emit(m)
+            )
+            self._data_source_group.addButton(radio)
+            self._data_source_buttons[mode] = radio
+            data_source_box.addWidget(radio)
+        data_source_description = QLabel(i18n.SETTINGS_DATA_SOURCE_DESCRIPTION)
+        data_source_description.setObjectName("DataSourceDescription")
+        data_source_description.setWordWrap(True)
+        data_source_box.addWidget(data_source_description)
+        root.addWidget(data_source)
 
         window = QGroupBox(i18n.SETTINGS_WINDOW_GROUP)
         window_box = QVBoxLayout(window)
@@ -162,18 +192,23 @@ class SettingsForm(QWidget):
     def density_buttons(self) -> dict[DensityMode, QRadioButton]:
         return dict(self._density_buttons)
 
+    def data_source_buttons(self) -> dict[DataSourceMode, QRadioButton]:
+        return dict(self._data_source_buttons)
+
 
 class SettingsPage(BasePage):
     theme_mode_changed = Signal(object)
     density_mode_changed = Signal(object)
     window_geometry_reset_requested = Signal()
     workspace_save_requested = Signal(object)
+    data_source_mode_changed = Signal(object)
 
     def __init__(
         self,
         current_mode: ThemeMode,
         current_density: DensityMode = DensityMode.COMFORTABLE,
         selected_project: str | None = None,
+        current_data_source_mode: DataSourceMode = DataSourceMode.LOCAL,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(
@@ -186,6 +221,7 @@ class SettingsPage(BasePage):
             current_mode,
             current_density,
             selected_project,
+            current_data_source_mode,
         )
         self.form.theme_mode_changed.connect(self.theme_mode_changed.emit)
         self.form.density_mode_changed.connect(self.density_mode_changed.emit)
@@ -193,6 +229,7 @@ class SettingsPage(BasePage):
             self.window_geometry_reset_requested.emit
         )
         self.form.workspace_save_requested.connect(self.workspace_save_requested.emit)
+        self.form.data_source_mode_changed.connect(self.data_source_mode_changed.emit)
         self.add_content(self.form, stretch=1)
 
     def set_mode(self, mode: ThemeMode) -> None:
@@ -204,6 +241,9 @@ class SettingsPage(BasePage):
 
     def density_buttons(self) -> dict[DensityMode, QRadioButton]:
         return self.form.density_buttons()
+
+    def data_source_buttons(self) -> dict[DataSourceMode, QRadioButton]:
+        return self.form.data_source_buttons()
 
     def apply_density(self, mode: DensityMode) -> None:
         self.form.apply_density(mode)

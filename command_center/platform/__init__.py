@@ -11,6 +11,7 @@ from .paths import (
 from .preferences import (
     APPLICATION,
     ORGANIZATION,
+    DataSourceMode,
     DensityMode,
     SettingsStore,
     ThemeMode,
@@ -22,6 +23,7 @@ from .theme import SystemThemeMonitor, system_theme
 __all__ = [
     "APPLICATION",
     "ORGANIZATION",
+    "DataSourceMode",
     "DensityMode",
     "SettingsStore",
     "SystemThemeMonitor",

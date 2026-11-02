@@ -539,16 +539,22 @@ _WORKER_FUNCTIONS = (
     "queue_complete(text, text, jsonb)",
     "queue_fail(text, text, text, boolean)",
     # 0021: the worker-host fail-closed probe records what it measured.
+    # 0038 adds the two-argument overload: clear this source's findings EXCEPT
+    # the ones this tick still measures, so a resolved failure stops waiting
+    # for its unrelated siblings to go green too.
     "monitor_record_finding(text, text, jsonb)",
     "monitor_clear_finding(text)",
+    "monitor_clear_finding(text, text[])",
     # A second, narrower fail path for a refusal that names no fault in the
     # work itself (VOYN-W0-AICC-PUBLISH-LEASE-CONTENTION-BURNS-ATTEMPT) --
     # see 0022_queue_fail_lease_wait.
     "queue_fail_lease_wait(text, text, text, integer)",
     # A sibling refund path for host/launcher/provider infrastructure
     # failures. These are not task attempts, but must still be bounded under
-    # their own wait budget.
-    "queue_fail_infra_wait(text, text, text, integer)",
+    # their own wait budget. The trailing jsonb (0025) is the caller's own
+    # evidence for the audit row -- which executor is out of quota and until
+    # when this worker withholds it -- and defaults to NULL.
+    "queue_fail_infra_wait(text, text, text, integer, jsonb)",
 )
 
 # Deliberately not `queue_claim`: only a role that PostgreSQL authenticated as a
@@ -556,6 +562,13 @@ _WORKER_FUNCTIONS = (
 _APP_FUNCTIONS = (
     "queue_enqueue(text, text, jsonb, text, text, integer, integer, integer, integer)",
     "queue_reap()",
+    # 0040 adds the bounded arity: one call is one transaction, and an
+    # interrupted transaction recovers nothing at all, so `WorkQueueAdmin.reap`
+    # commits batches instead of betting a whole backlog on a tick that
+    # `aicc-queue-reaper.service` gives 60 seconds. Both arities are listed
+    # because PostgreSQL identifies a function by its argument types — the
+    # reason this inventory carries signatures at all.
+    "queue_reap(integer)",
     "queue_redrive(text, integer)",
 )
 
@@ -587,16 +600,20 @@ _APP_BACKLOG_FUNCTIONS = (
     "backlog_scan_claim(text, text, text)",
     # Triage of raw findings (0008): UNTRIAGED -> OPEN/NEEDS_REFINEMENT/DONE/DECIDED.
     "backlog_triage(text, text, text)",
+    # Priority/wave reassignment (0035, VOYN-W0-APP-CONTROL-S6d).
+    "backlog_reassign(text, text, text, bigint)",
     # Evidence hygiene (0030): remove proven malformed PR evidence.
     "backlog_clear_evidence(text, text, text, text)",
     # 0021: read-only deploy preflight with dispatch's privileges; the task
     # class setter the planner uses for split children and monitor tasks; the
     # monitor-finding record/clear pair (shared with worker hosts, see
-    # _WORKER_FUNCTIONS) and the control-plane-only task link.
+    # _WORKER_FUNCTIONS, including 0038's partial-clear overload) and the
+    # control-plane-only task link.
     "backlog_dispatch_smoke()",
     "backlog_set_task_class(text, text)",
     "monitor_record_finding(text, text, jsonb)",
     "monitor_clear_finding(text)",
+    "monitor_clear_finding(text, text[])",
     "monitor_link_task(bigint, text)",
     # Audit trail for where a record came from (0020); the importer's stamp
     # that a row was migrated rather than authored directly in the store.
@@ -871,14 +888,15 @@ def render_table_grants(
     `REVOKE ALL`, so re-running it after a role has been widened by hand puts
     the database back on the declared matrix instead of layering on top of it.
 
-    ``existing_relations`` / ``existing_functions`` (names, not signatures)
-    restrict the GRANT statements to objects that exist. ``None`` — the pure
-    default every render test uses — renders the full matrix. The filter
-    exists for a database standing at an intermediate migration version
-    (downgrade tests, partial upgrades): granting on a not-yet-created table
-    raises, yet the matrix must still describe the whole schema. Skipping is
-    safe against drift because absence of a declared grant on a LIVE object
-    is exactly what tests/db/test_grant_compliance.py (#321) turns red.
+    ``existing_relations`` (names) / ``existing_functions`` (``name/arity``
+    keys, see `_function_key`) restrict the GRANT statements to objects that
+    exist. ``None`` — the pure default every render test uses — renders the
+    full matrix. The filter exists for a database standing at an intermediate
+    migration version (downgrade tests, partial upgrades): granting on a
+    not-yet-created table raises, yet the matrix must still describe the whole
+    schema. Skipping is safe against drift because absence of a declared grant
+    on a LIVE object is exactly what tests/db/test_grant_compliance.py (#321)
+    turns red.
     """
     _require_identifier(schema)
     statements: list[str] = []
@@ -887,10 +905,7 @@ def render_table_grants(
         return existing_relations is None or name in existing_relations
 
     def _function_exists(signature: str) -> bool:
-        return (
-            existing_functions is None
-            or signature.partition("(")[0] in existing_functions
-        )
+        return existing_functions is None or _function_key(signature) in existing_functions
 
     # Re-stripping PUBLIC here rather than only at bootstrap is what makes this
     # cover objects created by *later* migrations: at bootstrap the schema is
@@ -1038,12 +1053,15 @@ def apply_table_grants(conn, schema: str = "public") -> int:
             (schema,),
         )
         relations = {row[0] for row in cur.fetchall()}
+        # Name AND arity: `monitor_clear_finding` exists under two signatures
+        # from 0038 on, and only one of them exists before it (see
+        # `_function_key`).
         cur.execute(
-            "SELECT p.proname FROM pg_proc p JOIN pg_namespace n "
+            "SELECT p.proname, p.pronargs FROM pg_proc p JOIN pg_namespace n "
             "ON n.oid = p.pronamespace WHERE n.nspname = %s",
             (schema,),
         )
-        functions = {row[0] for row in cur.fetchall()}
+        functions = {f"{row[0]}/{row[1]}" for row in cur.fetchall()}
     return _execute(
         conn,
         render_table_grants(
@@ -1057,6 +1075,37 @@ def _execute(conn, statements: list[str]) -> int:
         for statement in statements:
             cur.execute(statement)
     return len(statements)
+
+
+def _function_key(signature: str) -> str:
+    """`name(type, ...)` -> `name/arity`, the key the existence filter matches.
+
+    The bare NAME used to be enough, because every function in this schema had
+    exactly one signature. 0038's `monitor_clear_finding(text, text[])` is the
+    first overload, and it made name-matching wrong in the one direction that
+    raises: at any version between 0021 and 0038 the name is present (0021's
+    one-argument form) while the two-argument form is not, so
+    `apply_table_grants` would emit a GRANT for a function that does not exist
+    and abort the whole matrix -- exactly the intermediate-version case the
+    filter is for.
+
+    Arity rather than the argument types on purpose. It is what PostgreSQL
+    itself resolves this overload pair by, and it is read from `pg_proc.pronargs`
+    -- an integer, so no type-name SPELLING has to agree between this table and
+    the catalog. Matching on rendered types would put `timestamptz` against
+    `timestamp with time zone` and skip a grant SILENTLY, which is the failure
+    mode worth avoiding here: a missing grant is an outage the next deploy
+    inherits, while a surplus statement is a loud error.
+
+    `pronargs` counts input arguments only -- OUT parameters (`_queue_owns`) and
+    `RETURNS TABLE` columns (`enroll_redeem_ticket`) are not in it, and neither
+    are they in these declared signatures -- and it counts arguments that have
+    defaults (`monitor_record_finding`'s `p_detail`), which are likewise
+    declared here.
+    """
+    name, _, rest = signature.partition("(")
+    arguments = [a for a in (a.strip() for a in rest[:-1].split(",")) if a]
+    return f"{name}/{len(arguments)}"
 
 
 def _require_function_signature(signature: str) -> None:
@@ -1073,7 +1122,12 @@ def _require_function_signature(signature: str) -> None:
     for argument in (a.strip() for a in rest[:-1].split(",")):
         if not argument:
             continue
-        _require_identifier(argument)
+        # An argument may be an array type (0038's `monitor_clear_finding(text,
+        # text[])`). The brackets are the only punctuation admitted, and only
+        # as a suffix: `text[]` is guarded as `text` plus a shape PostgreSQL
+        # spells exactly this way, while `text[]evil` or `text]` still fail.
+        base = argument[:-2] if argument.endswith("[]") else argument
+        _require_identifier(base)
 
 
 def _require_identifier(name: str) -> None:
