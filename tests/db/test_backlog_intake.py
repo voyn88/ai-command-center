@@ -62,3 +62,31 @@ def test_more_than_one_task_line_is_refused_rather_than_guessed_at():
     assert not draft.ok
     assert draft.task is None
     assert "expected exactly one task line, found 2" in draft.reason
+
+
+def test_repo_hint_scan_matches_the_regex_it_replaced_and_is_linear():
+    """CodeQL py/polynomial-redos regression for the `Target repo` hint."""
+    import re
+    import time
+
+    from command_center.db.backlog_parser import _repo_hint
+
+    old = re.compile(r"Target repo[^`]*`([^`]+)`")
+    samples = [
+        "Target repo: `voyn88/x`",
+        "no hint here",
+        "Target repo `` then Target repo `a/b`",
+        "Target repo `` `c/d`",
+        "Target repo ``",
+        "Target repo `unterminated",
+        "x `y` Target repo\nnext `z/w` tail",
+        "Target repo Target repo `e/f`",
+    ]
+    for body in samples:
+        m = old.search(body)
+        assert _repo_hint(body) == (m.group(1) if m else None), body
+
+    body = "Target repo" * 100_000
+    started = time.monotonic()
+    assert _repo_hint(body) is None
+    assert time.monotonic() - started < 2.0

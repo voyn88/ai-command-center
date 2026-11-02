@@ -129,10 +129,52 @@ _WAVE_PHRASE = re.compile(
     r"(?![0-9A-Za-zА-Яа-яЁё-])",
     re.I,
 )
-_ORDINAL_WAVE_PHRASE = re.compile(
-    r"(?<![0-9A-Za-zА-Яа-яЁё-])([а-яё]+)\s+(волн[а-яё]*)(?![0-9A-Za-zА-Яа-яЁё-])",
-    re.I,
+# «первая волна» -> "Wave 1". Only the anchor word «волн…» is matched by a
+# regex; the ordinal word before it is found by a backward scan in
+# :func:`_ordinal_wave_sub`. The single-regex form
+# ``([а-яё]+)\s+(волн[а-яё]*)`` backtracks quadratically on long letter runs
+# (CodeQL py/polynomial-redos; the transcript is owner-supplied input).
+_WAVE_WORD = re.compile(r"(?<![0-9A-Za-zА-Яа-яЁё-])волн[а-яё]*(?![0-9A-Za-zА-Яа-яЁё-])", re.I)
+_WORD_BOUNDARY_CHARS = frozenset(
+    "0123456789-"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+    "АБВГДЕЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдежзийклмнопрстуфхцчшщъыьэюяЁё"
 )
+
+
+def _is_cyrillic_letter(char: str) -> bool:
+    lowered = char.lower()
+    return "а" <= lowered <= "я" or lowered == "ё"
+
+
+def _ordinal_wave_sub(text: str, replace) -> str:
+    r"""Equivalent of ``re.sub(r"(?<!B)([а-яё]+)\s+(волн[а-яё]*)(?!B)", ...)``.
+
+    ``replace(whole, ordinal)`` returns the replacement for the span that runs
+    from the ordinal word through the «волн…» word. Matches never overlap and
+    never start before the end of the previous one, as with ``re.sub``.
+    """
+    out: list[str] = []
+    last_end = 0
+    for wave in _WAVE_WORD.finditer(text):
+        ws_end = wave.start()
+        ws_start = ws_end
+        while ws_start > last_end and text[ws_start - 1].isspace():
+            ws_start -= 1
+        if ws_start == ws_end:
+            continue
+        word_start = ws_start
+        while word_start > last_end and _is_cyrillic_letter(text[word_start - 1]):
+            word_start -= 1
+        if word_start == ws_start:
+            continue
+        if word_start > 0 and text[word_start - 1] in _WORD_BOUNDARY_CHARS:
+            continue
+        out.append(text[last_end:word_start])
+        out.append(replace(text[word_start : wave.end()], text[word_start:ws_start]))
+        last_end = wave.end()
+    out.append(text[last_end:])
+    return "".join(out)
 # «приоритет ноль» / «пи ноль» / «п 1» / Cyrillic «р0» -> "P0".
 # The bare-letter forms carry a Cyrillic `р`/`П` on purpose: a recognizer
 # writing the Cyrillic homoglyph produces a token that renders identically to
@@ -172,12 +214,12 @@ def normalize_transcript(text: str) -> TranscriptNormalization:
     def wave(match: re.Match[str]) -> str:
         return record(match.group(0), f"Wave {_digit(match.group(2))}")
 
-    def ordinal_wave(match: re.Match[str]) -> str:
-        stem = match.group(1).casefold()
+    def ordinal_wave(whole: str, ordinal: str) -> str:
+        stem = ordinal.casefold()
         for prefix, digit in _ORDINAL_WAVE_STEMS.items():
             if stem.startswith(prefix):
-                return record(match.group(0), f"Wave {digit}")
-        return match.group(0)
+                return record(whole, f"Wave {digit}")
+        return whole
 
     def priority(match: re.Match[str]) -> str:
         return record(match.group(0), f"P{_digit(match.group(1))}")
@@ -188,7 +230,7 @@ def normalize_transcript(text: str) -> TranscriptNormalization:
 
         return replace
 
-    result = _ORDINAL_WAVE_PHRASE.sub(ordinal_wave, text.strip())
+    result = _ordinal_wave_sub(text.strip(), ordinal_wave)
     result = _WAVE_PHRASE.sub(wave, result)
     result = _PRIORITY_PHRASE.sub(priority, result)
     for pattern, canonical in _TERM_PATTERNS:
