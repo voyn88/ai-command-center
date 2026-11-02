@@ -183,6 +183,10 @@ def test_ordinal_wave_scan_matches_the_regex_it_replaced():
         "первая волнаx",
         "",
         "волна",
+        "волнволнволн",
+        "первая волнволнволн1",
+        "первая ВОЛНЫ",
+        "первая волна1 вторая волна",
     ]
     for text in samples:
         expected = old.sub(lambda m: f"<{m.group(1)}|{m.group(0)}>", text)
@@ -194,6 +198,15 @@ def test_ordinal_wave_scan_is_linear_on_long_letter_runs():
     import time
 
     text = "а" * 200_000 + " x"
+    started = time.monotonic()
+    normalize_transcript(text)
+    assert time.monotonic() - started < 2.0
+
+
+def test_wave_word_scan_is_linear_on_repeated_stems():
+    import time
+
+    text = "первая " + "волн" * 100_000 + "1"
     started = time.monotonic()
     normalize_transcript(text)
     assert time.monotonic() - started < 2.0
