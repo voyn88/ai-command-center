@@ -26,7 +26,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from command_center import task_ordering, tasks_repository
 from command_center.api import models, schemas
+from command_center.api import service as read_service
 from command_center.api import wave1_schemas as w
 from command_center.digest import DigestService
 from command_center.digest import complete_owner_item as _complete_owner_item
@@ -42,8 +44,6 @@ from command_center.project_config import is_sensitive
 from command_center.runtime import db
 from command_center.runtime.db.core import current_schema_version, resolve_db_path
 from command_center.runtime.db.schema import SCHEMA_VERSION
-from command_center import task_ordering, tasks_repository
-from command_center.api import service as read_service
 from command_center.tasks_repository import create_task
 
 # Repo root is three levels up: <root>/command_center/api/wave1_service.py

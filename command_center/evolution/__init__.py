@@ -15,10 +15,25 @@ from command_center.evolution.breeding import (
     is_projected_improvement,
     projected_fitness,
 )
-from command_center.evolution.scorer import DEFAULT_WEIGHTS, FitnessWeights, dimension_value, fitness
+from command_center.evolution.scorer import (
+    DEFAULT_WEIGHTS,
+    FitnessWeights,
+    dimension_value,
+    fitness,
+)
 from command_center.evolution.seeds import DEFAULT_SEED_CONFIG_AGENTS
-from command_center.evolution.store import evolve_population, load_population, record_outcome, seed_population
-from command_center.evolution.types import ConfigAgent, ConfigMetrics, RunOutcome, metrics_from_outcomes
+from command_center.evolution.store import (
+    evolve_population,
+    load_population,
+    record_outcome,
+    seed_population,
+)
+from command_center.evolution.types import (
+    ConfigAgent,
+    ConfigMetrics,
+    RunOutcome,
+    metrics_from_outcomes,
+)
 
 __all__ = [
     "ConfigAgent",

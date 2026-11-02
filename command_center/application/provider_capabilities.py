@@ -6,12 +6,12 @@ and never treats binary presence as proof of authentication.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from enum import Enum
 import json
 import os
 import shutil
 from collections.abc import Mapping
+from dataclasses import dataclass
+from enum import Enum
 from typing import Callable, Protocol
 from urllib.error import URLError
 from urllib.request import urlopen

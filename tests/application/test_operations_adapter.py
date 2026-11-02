@@ -1,6 +1,8 @@
 from types import SimpleNamespace
 
 from command_center.application.operations_adapter import OperationsAdapter
+from command_center.application.server_queue import ServerQueueItem
+from command_center.platform.preferences import DataSourceMode
 
 
 class FakeAPI:
@@ -59,3 +61,94 @@ def test_agents_include_live_load(monkeypatch):
     )
     rows = OperationsAdapter(workspace_home_adapter=FakeWorkspace()).agents()
     assert rows[0]["running"] == 2
+
+
+def test_execution_reads_local_runtime_by_default():
+    rows = OperationsAdapter(workspace_home_adapter=FakeWorkspace()).execution()
+    assert rows == [{"project": "AIOS", "state": "RUNNING"}, {"project": "AIOS", "state": "COMPLETED"}]
+
+
+class FakeServerQueueClient:
+    def __init__(self, items):
+        self._items = items
+
+    def list_items(self, **_kwargs):
+        return self._items
+
+    def close(self):
+        return None
+
+
+def test_execution_reads_the_server_queue_when_toggled_to_server():
+    item = ServerQueueItem(
+        work_item_id="wi-1",
+        queue="execution",
+        state="ready",
+        task_id="T-1",
+        repository_id="repo-1",
+        priority=1,
+        attempt_count=0,
+        max_attempts=3,
+        created_at="2026-01-01T00:00:00Z",
+        updated_at=None,
+    )
+    adapter = OperationsAdapter(
+        workspace_home_adapter=FakeWorkspace(),
+        data_source_mode=lambda: DataSourceMode.SERVER,
+        server_queue_client=FakeServerQueueClient([item]),
+    )
+    rows = adapter.execution()
+    assert rows == [
+        {
+            "project": "repo-1",
+            "state": "ready",
+            "task_type": "execution",
+            "run_id": "wi-1",
+            "created_at": "2026-01-01T00:00:00Z",
+        }
+    ]
+
+
+def test_execution_server_row_falls_back_to_task_id_without_a_repository():
+    item = ServerQueueItem(
+        work_item_id="wi-2",
+        queue="execution",
+        state="claimed",
+        task_id="T-2",
+        repository_id=None,
+        priority=1,
+        attempt_count=1,
+        max_attempts=3,
+        created_at=None,
+        updated_at=None,
+    )
+    adapter = OperationsAdapter(
+        workspace_home_adapter=FakeWorkspace(),
+        data_source_mode=lambda: DataSourceMode.SERVER,
+        server_queue_client=FakeServerQueueClient([item]),
+    )
+    assert adapter.execution()[0]["project"] == "T-2"
+
+
+def test_toggling_mode_takes_effect_on_the_next_read_without_reconstruction():
+    mode = {"value": DataSourceMode.LOCAL}
+    item = ServerQueueItem(
+        work_item_id="wi-3",
+        queue="execution",
+        state="ready",
+        task_id=None,
+        repository_id=None,
+        priority=None,
+        attempt_count=None,
+        max_attempts=None,
+        created_at=None,
+        updated_at=None,
+    )
+    adapter = OperationsAdapter(
+        workspace_home_adapter=FakeWorkspace(),
+        data_source_mode=lambda: mode["value"],
+        server_queue_client=FakeServerQueueClient([item]),
+    )
+    assert adapter.execution() == [{"project": "AIOS", "state": "RUNNING"}, {"project": "AIOS", "state": "COMPLETED"}]
+    mode["value"] = DataSourceMode.SERVER
+    assert adapter.execution()[0]["run_id"] == "wi-3"

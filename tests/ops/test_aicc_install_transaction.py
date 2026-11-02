@@ -3529,6 +3529,10 @@ def test_the_control_purge_covers_every_retired_worker_unit():
 
     assert module.RETIRED_LEGACY_UNITS < module.CONTROL_PURGE_UNITS
     assert "aicc-agent-launcher.socket" in module.CONTROL_PURGE_UNITS
+    # Credential rotation is worker-only substrate; a hand-linked timer on
+    # control-01 sat Result=resources forever (OnUnitInactiveSec-only).
+    assert "voyn-aicc-credential-rotation.timer" in module.CONTROL_PURGE_UNITS
+    assert "voyn-aicc-credential-rotation.service" in module.CONTROL_PURGE_UNITS
     assert (
         "/etc/systemd/system/voyn-aicc-source-clone-refresh.service"
         in module.WORKER_ONLY_TARGETS
@@ -3552,6 +3556,42 @@ def test_the_control_purge_covers_every_retired_worker_unit():
     # The boot recovery capsule is the one agent-adjacent unit that must keep
     # running: it is what retries an interrupted rollback.
     assert "aicc-principal-recovery.service" not in module.CONTROL_PURGE_UNITS
+
+
+def test_credential_rotation_is_purged_by_unit_name_not_by_a_file_spec(tmp_path):
+    """Restores the coverage of the two WORKER_ONLY_TARGETS assertions dropped
+    when #1032 met main: credential rotation's unit files are NOT installed by
+    this transaction, so neither profile carries a file spec for them -- the
+    worker does not install them here, and the control host retires them by
+    unit name through CONTROL_PURGE_UNITS (stop/disable), not by a remove
+    spec that would claim a file this generation never owned."""
+    module = _module()
+    repo = Path(__file__).parents[2]
+    authority = tmp_path / "authority.env"
+    authority.write_text("AICC_WORKSPACE_ROOTS=./tmp/workspaces\n", encoding="utf-8")
+    claude = tmp_path / "claude.json"
+    codex = tmp_path / "codex.json"
+    claude.write_text("{}", encoding="utf-8")
+    codex.write_text("{}", encoding="utf-8")
+    rotation = {
+        "/etc/systemd/system/voyn-aicc-credential-rotation.service",
+        "/etc/systemd/system/voyn-aicc-credential-rotation.timer",
+    }
+    for profile in ("worker", "control"):
+        specs = module.default_specs(
+            repo,
+            authority_env=authority,
+            claude_auth=claude,
+            codex_auth=codex,
+            resolve_identities=False,
+            profile=profile,
+        )
+        assert not rotation & {spec.target for spec in specs}, profile
+    assert not rotation & module.WORKER_ONLY_TARGETS
+    assert {
+        "voyn-aicc-credential-rotation.service",
+        "voyn-aicc-credential-rotation.timer",
+    } <= module.CONTROL_PURGE_UNITS
 
 
 def test_the_whole_control_generation_validates_as_one_spec_set(tmp_path):

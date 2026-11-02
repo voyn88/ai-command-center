@@ -11,13 +11,11 @@ they did against the single module.
 
 from __future__ import annotations
 
-import logging
-
 import json
+import logging
 import time
 from pathlib import Path
 from typing import Any, Iterable
-
 
 import command_center.runtime.db as db  # facade (late-bound; see docstring)
 

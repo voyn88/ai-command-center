@@ -23,7 +23,6 @@ from pathlib import Path
 from typing import Callable, Iterator, TypeVar
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-
 import command_center.runtime.db as db  # facade (late-bound; see docstring)
 
 _LOG = logging.getLogger(__name__)

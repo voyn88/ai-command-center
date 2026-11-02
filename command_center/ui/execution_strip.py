@@ -20,9 +20,8 @@ from pathlib import Path
 
 import streamlit as st
 
-from command_center import execution_queue, tasks_repository
+from command_center import execution_queue, read_model, tasks_repository
 from command_center.runtime.api import ExecutionCenterAPI
-from command_center import read_model
 from command_center.runtime.db import RUN_STATES
 from command_center.ui import execution_metrics, tokens
 

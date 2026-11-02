@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
-import os
-from collections.abc import Mapping
 from typing import Protocol
 from urllib.parse import urlsplit
 

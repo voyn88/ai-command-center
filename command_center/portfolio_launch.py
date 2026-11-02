@@ -95,8 +95,20 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from command_center import execution_queue, git_info, models, storage, workspace_provisioning, worktree_launcher
-from command_center.portfolio_models import PortfolioCardError, PortfolioTask, unmet_requirements, validate_task_id
+from command_center import (
+    execution_queue,
+    git_info,
+    models,
+    storage,
+    workspace_provisioning,
+    worktree_launcher,
+)
+from command_center.portfolio_models import (
+    PortfolioCardError,
+    PortfolioTask,
+    unmet_requirements,
+    validate_task_id,
+)
 from command_center.runtime import db as runtime_db
 
 WORKTREES_ROOT_ENV = "AICC_PORTFOLIO_WORKTREES_ROOT"

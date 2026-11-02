@@ -27,7 +27,6 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
-
 _POSIX_PS_START_SCHEME = "posix-ps-utc-v1:"
 _LINUX_PROCFS_START_SCHEME = "linux-procfs-startticks-v1:"
 _LINUX_PROCFS_BOOT_START_SCHEME = "linux-procfs-bootid-startticks-v2:"

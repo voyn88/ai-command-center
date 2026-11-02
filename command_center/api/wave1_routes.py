@@ -15,12 +15,12 @@ from fastapi import APIRouter, HTTPException, Query
 
 from command_center.advisor import api as advisor_api
 from command_center.advisor.schemas import AdvisorRunRequest, AdvisorRunResponse
-from command_center.arena import api as arena_api
-from command_center.arena.schemas import DuelRunRequest, DuelRunResponse
-from command_center.arena.scorer import TooFewVariantsError
 from command_center.api import models, schemas
 from command_center.api import wave1_schemas as w
 from command_center.api import wave1_service as service
+from command_center.arena import api as arena_api
+from command_center.arena.schemas import DuelRunRequest, DuelRunResponse
+from command_center.arena.scorer import TooFewVariantsError
 
 router = APIRouter(prefix="/api/v1", tags=["wave1"])
 

@@ -13,8 +13,8 @@ from __future__ import annotations
 from command_center.application.aios_status import (
     AIOSCoreReadiness,
     AIOSCoreStatus,
-    AIOSStatusError,
     AIOSStatusClient,
+    AIOSStatusError,
     create_aios_status_client,
 )
 from command_center.application.provider_capabilities import (

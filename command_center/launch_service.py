@@ -37,8 +37,8 @@ from command_center import (
     project_config,
     workspace_provisioning,
 )
-from command_center.runtime import context_service, db as runtime_db
-
+from command_center.runtime import context_service
+from command_center.runtime import db as runtime_db
 
 # Decisions `prepare_task_launch` returns — the single classification both the
 # Kanban launcher and the execution queue branch on, so neither reimplements

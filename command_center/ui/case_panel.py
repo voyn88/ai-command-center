@@ -8,13 +8,13 @@ import streamlit as st
 
 from command_center import alert_store, case_store, evidence_store
 from command_center.case_store import (
+    CASE_STATES,
+    PRIORITIES,
     CaseNotFound,
     CaseStoreError,
     InvalidTransition,
     MissingRequiredField,
     PermissionDenied,
-    CASE_STATES,
-    PRIORITIES,
 )
 
 _STATE_BADGE: dict[str, str] = {

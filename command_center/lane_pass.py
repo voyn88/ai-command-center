@@ -57,7 +57,10 @@ def run_once(root: Path, *, repo: str = "ai-command-center") -> dict[str, Any]:
 
     deploy_payload: dict[str, Any] = {}
     try:
-        from command_center.deployment.self_deploy import SelfDeployConfig, self_deploy_once
+        from command_center.deployment.self_deploy import (
+            SelfDeployConfig,
+            self_deploy_once,
+        )
 
         deploy_guard = lane_budget.check_dispatch(root, repo=repo, kind="remediation")
         if not deploy_guard.allowed:

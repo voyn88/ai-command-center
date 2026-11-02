@@ -26,6 +26,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from command_center import __version__, models, read_model, task_ordering
+from command_center.api import schemas
 from command_center.integration.collectors import collect_health
 from command_center.integration.registry import get_entry, load_entries
 from command_center.project_config import is_sensitive
@@ -33,8 +34,6 @@ from command_center.runtime.db.core import resolve_db_path
 from command_center.runtime.runs_read import list_unified_runs
 from command_center.tasks_repository import load_tasks
 from command_center.ui.git_readers import get_git_log
-
-from command_center.api import schemas
 
 # Repo root is three levels up: <root>/command_center/api/service.py
 ROOT = Path(__file__).resolve().parents[2]

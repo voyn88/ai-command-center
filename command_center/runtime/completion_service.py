@@ -28,9 +28,9 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from command_center import run_lineage as provenance
 from command_center import storage
 from command_center.runtime import db as runtime_db
-from command_center import run_lineage as provenance
 from command_center.runtime import git_ops, repo_state, validation
 from command_center.runtime.completion import (
     CompletionAction,

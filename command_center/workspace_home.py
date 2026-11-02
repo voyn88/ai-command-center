@@ -24,9 +24,15 @@ import os
 from datetime import UTC, datetime
 from pathlib import Path
 
-from command_center import activity_log, agent_runner, models, project_config, report_parser
+from command_center import (
+    activity_log,
+    agent_runner,
+    git_info,
+    models,
+    project_config,
+    report_parser,
+)
 from command_center import artifacts as artifacts_module
-from command_center import git_info
 from command_center.runtime import db as runtime_db
 from command_center.runtime.api import ExecutionCenterAPI
 

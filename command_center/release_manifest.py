@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
-from pathlib import Path
 import re
+from dataclasses import dataclass
+from pathlib import Path
 
 SOURCE_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 ALLOWED_PLATFORMS = {"linux", "macos", "windows", "web", "streamlit", "cross-platform"}

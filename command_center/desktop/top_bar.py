@@ -16,8 +16,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QKeySequence
 from PySide6.QtWidgets import QComboBox, QHBoxLayout, QLabel, QToolButton, QWidget
 
-from . import tokens
-from . import i18n
+from . import i18n, tokens
 
 
 class TopBar(QWidget):
