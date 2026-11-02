@@ -1,0 +1,190 @@
+{
+  "migrations": {
+    "0001": {
+      "down": "sha256:719c2ea03a44f76f63f3c3133375d88b938bba34be757c802afa205fc42bd362",
+      "slug": "initial",
+      "up": "sha256:8022c5c693efa1a4d2eea53dde1245134de9b04d693880a72446d8948aa0a5dd"
+    },
+    "0002": {
+      "down": "sha256:7b3fe20130af29d4787fa10e34589234aeff253f1778621888f318ecd5f7948f",
+      "slug": "queue_claim",
+      "up": "sha256:4899588ad421ce8cdc7dcccd12fcfa6539be019a1cb667153d344aec1a5ed5b6"
+    },
+    "0003": {
+      "down": "sha256:fb3f84ad458862628aa2b2d9daed8ba84ce3b1adbfbda8dfdde2373d45ca8d2b",
+      "slug": "worker_enrollment",
+      "up": "sha256:2e87bc9eeb0119838cdf828257c25fee7ae6b0e492421821229e2323696e5174"
+    },
+    "0004": {
+      "down": "sha256:b3daeb7dfc74098dd576507c5db13c9f94dd4e779c6dc35741c635e2b272d59d",
+      "slug": "run_finalized_at",
+      "up": "sha256:63437b4e6dc44035ff2602743177f5f509a86a58de18b832a561547bc79aca2d"
+    },
+    "0005": {
+      "down": "sha256:1bd5921c73ac14153f3e21a0b0b5301b841de7fb889389bdd7709296e1ba3fa7",
+      "slug": "backlog_store",
+      "up": "sha256:294a5c87f374635496f4e47ad4e12aedf78ee7330ae4ba174d0ddb062864d993"
+    },
+    "0006": {
+      "down": "sha256:429ecb964028d05f357ebdb83ece0748687b78dcd11c203c1ab2dce65a0fb9b3",
+      "slug": "backlog_planner",
+      "up": "sha256:4f36e4a4239b7e9775899a8c9bf7fe3547120249ccd812e132d84667e8cd5ea9"
+    },
+    "0007": {
+      "down": "sha256:60e1d510bf788c9054df2c28985088f0c807d27a1585a94897157acad5238839",
+      "slug": "backlog_ingest",
+      "up": "sha256:6e4efd3814492fb747d2809a968fd91eb666b6a83037a4c6be5b64dde75fbdac"
+    },
+    "0008": {
+      "down": "sha256:787c6c0621f95fce161cfb59c5e8b949011d57a3f1ec192c542d43a9979d0887",
+      "slug": "backlog_triage",
+      "up": "sha256:07004845a40c95df7e9cae1a83cc5ce4f162a637c1e216e650c7ed4430cae838"
+    },
+    "0009": {
+      "down": "sha256:b73b3729770f521a1b7d819f65761a05d280991762d07d6b75c9810acd626311",
+      "slug": "backlog_ingest_task_status",
+      "up": "sha256:a65b1e8221560fabe38c203d7184539e6129950ae73dfdb1812200188652365b"
+    },
+    "0010": {
+      "down": "sha256:44f9cd8e7e027628f295ea9cd8863db531ed95e1b5badcfe50f62c38125a2fa5",
+      "slug": "review_cycle_remediation",
+      "up": "sha256:89a460750e273d7b368fe30f94d5c589b6a7e4fc9eee478823f5e44f4a0ad98f"
+    },
+    "0011": {
+      "down": "sha256:bcb77340c54d3ed0af1dfdcc9bd480076eca08a8a176f766575d390505885bf5",
+      "slug": "backlog_ingest_requires_pr",
+      "up": "sha256:97305e3ad745b96a4938b2ca26d72ac7b2bf07a12f66f381c0d7d74dd8665460"
+    },
+    "0012": {
+      "down": "sha256:c5f14febe4fb7114cf8286c331e30bcb0326ea9a187c715070cca21d715cef72",
+      "slug": "backlog_technical_failures_stay_operational",
+      "up": "sha256:76d7fcf2e91c430867b540397a639a690c3eacd6a8a30076714891373acd234d"
+    },
+    "0013": {
+      "down": "sha256:ea509735070bb7dc6b04c4d36eb285f3791078215e57d5a5764ab3a253867580",
+      "slug": "current_credential_expiry",
+      "up": "sha256:9baac877005586da90444f06ee00e1d014e1ea67827efaae367e2b23aca99e33"
+    },
+    "0014": {
+      "down": "sha256:1d71ca557cb776dc9718b4e4fed92b43fcd44a991677d175339bba02c4d7b326",
+      "slug": "backlog_defer_auto_resume",
+      "up": "sha256:f41dfc5bf103abc61398366c95f2f011cee50288beaa7c0b01373053f126d55f"
+    },
+    "0015": {
+      "down": "sha256:351b6391c43e382ca8917dad5fe2f9c62b8ce852e0d735ad4322fc24a56fa193",
+      "slug": "backlog_scan_cursor",
+      "up": "sha256:5062e245ca9d3ecbe49b1cf6402063048b1dddbebd03c1528d6839e3c3264f28"
+    },
+    "0016": {
+      "down": "sha256:c88cf4962c002a0b9b06d805878b44cf5ed32152b424b78dce1e45f0c85f361a",
+      "slug": "run_finalization_claim",
+      "up": "sha256:3d6b885ec3ba39115b1ce71e05d27c28b1344be279b3df7a2b0a8384c0b10dbf"
+    },
+    "0017": {
+      "down": "sha256:2e0d3dd2e77be33e5cee8d36349d47e18f6219c5d977ce43dc0f9c3b572b11da",
+      "slug": "backlog_resume_window",
+      "up": "sha256:a9bcee7d3e901eb9049d20fb18f308d6d0ee2e9584ccf175b11314ad7105185b"
+    },
+    "0018": {
+      "down": "sha256:91b3417c3626051158391f42867b2a403bae04a686a8a30e42bfa8c887723a1e",
+      "slug": "backlog_recover_stuck_ready_to_review",
+      "up": "sha256:bd1b70100dc817d17d740005814ebea89a3f565446c3d51b25c655bfbe69b960"
+    },
+    "0019": {
+      "down": "sha256:b37f6b870967fc9188ddd36d24233d30ca4a1180eeccdffc87b6efaa59e939a4",
+      "slug": "backlog_task_class",
+      "up": "sha256:6846cd6ab96bc8c1e4ccf733387ff81ff22177c9c252c6fd228cb73c4b71e440"
+    },
+    "0020": {
+      "down": "sha256:c517f4fd0087ee2f3f8dd63aa7e98d2d454efa2d269caae1dd4691964f2e3bea",
+      "slug": "backlog_eligible_view_owner",
+      "up": "sha256:dec7df5df46d90160cc9a8fc278554a3ae72805aa3360f6593d95b533f834999"
+    },
+    "0021": {
+      "down": "sha256:80dc8e6e392fa2fb506914df17a6f00a1b92677d35ea65a0246d6d3c23f2dd70",
+      "slug": "pipeline_auto_split_smoke_monitor_findings",
+      "up": "sha256:cf91a1c0b26cb892f06098c512115b5f25840420a95e656525951865fc6908b9"
+    },
+    "0022": {
+      "down": "sha256:c040047617a1805b12a608b94df240dc8b66dbbc053495e4538fbac06ff211d8",
+      "slug": "queue_fail_lease_wait",
+      "up": "sha256:633f0e9496d6adc49e85847482b7a35c2f993558cb97e9c3ce5e657e12bf2cd6"
+    },
+    "0023": {
+      "down": "sha256:21a0b4e58847050a6afeadd3df8fa8fa828cdb61fd058f08354c4081c67a888c",
+      "slug": "backlog_import_provenance",
+      "up": "sha256:c9269ec5e6bf7aa6abeeb029d0dd3496b12374ce96ab423a31fa13db93883eb4"
+    },
+    "0024": {
+      "down": "sha256:e7f53e95dc05f4703d26011f3e0ead9bc84564c66a17998b95352cb63b82c852",
+      "slug": "queue_fail_infra_wait",
+      "up": "sha256:9195cbe560d1259ab07c473c10f68ced39c0623aaa21387f1f8bb27c463f1433"
+    },
+    "0025": {
+      "down": "sha256:712cc5407fb59f5bf210323a863e856ab26929fd44f0d19f7d51db2115aa9a8b",
+      "slug": "queue_claim_resyncs_attempt_history",
+      "up": "sha256:a3762b26796aa274acaf06e8938baa224debb2de3d50603b60ce1ac88de8d5e8"
+    },
+    "0026": {
+      "down": "sha256:98491e29e3586cbf4fc6453703696b0b6f332e2c62fc53bc30ad4e20c5ed9436",
+      "slug": "queue_claim_budget_counts_only_consumed_attempts",
+      "up": "sha256:eebb1de26874f09918f176e876d40095ba6113a0174160f9d09583f60390f985"
+    },
+    "0027": {
+      "down": "sha256:8149bd2a8e4e6a9cd9f5f2b5a2240c5cddc0afb784d833f865342ba8be6c2c54",
+      "slug": "queue_redrive_clears_wait_budgets",
+      "up": "sha256:cbd73ecb20aea8483f4835b0ed708cb4048ad3795cb8d56eef792cb7513f78ce"
+    },
+    "0028": {
+      "down": "sha256:a1e9071104e94f9081047966a69b180d6193581cacfdc7018b0d0ce3655292b2",
+      "slug": "queue_lease_wait_refunds_on_exhaustion",
+      "up": "sha256:d1d862efb73f864b7a9d7b120bd727968bbf25f7cb96a77b0160dc2e6eeb1e0e"
+    },
+    "0029": {
+      "down": "sha256:6c418cf95c1abf2da4fde6be2294a5289498846ee3ef2d4e2c2587ff7fded966",
+      "slug": "backlog_owner_decision",
+      "up": "sha256:e3a3e09a520d04c6acc7cf476333b0db8602f4f5664d0a519bd9a458988d0072"
+    },
+    "0030": {
+      "down": "sha256:5c4db6c90f07594cd4e6b79e3a57c2706c339fa7073b8efbf6624550add5715e",
+      "slug": "repo_route_and_evidence_hygiene",
+      "up": "sha256:c26381f57d2fbe463fb2ac31beeedf88a2106ddecc85e8aec9d053a1f4656367"
+    },
+    "0031": {
+      "down": "sha256:7ac25b63a2c5c9d8878d8132fce2010516de627ea03e08530675989e163dbbed",
+      "slug": "backlog_insert_seq_tiebreaker",
+      "up": "sha256:44ce04938f1186798fc26fd50352044770ce028469468834822db4c15e89e14f"
+    },
+    "0032": {
+      "down": "sha256:829193cfcc87d70c80d4e05c4b87a121507bd42f244ab4364546f12aa7d3ba77",
+      "slug": "coordinator_v2",
+      "up": "sha256:84b201a224fa0154da9692a72b0ee7424be2a7c5080428e86957806341340631"
+    },
+    "0033": {
+      "down": "sha256:4740b837bcc37f4e3030fc0f6d7e4eb21d6e822663ad7e57c17c7f8b87cfa104",
+      "slug": "infra_wait_quota_detail",
+      "up": "sha256:be31f7954c0a54a3d83bec877d979ef8cf356486c54f3b166b26c60a18370627"
+    },
+    "0034": {
+      "down": "sha256:161707ab545efb72425c54b5f56a516322fc65f581c48cd106606855a4adaa95",
+      "slug": "launch_infra_failure_stays_operational",
+      "up": "sha256:771edbc9a8e0ee54aebbcc55afadb7512ee54c66b6b82dc29f1f78f4a6bc24b5"
+    },
+    "0035": {
+      "down": "sha256:caca5afacf3a3fa35404a20b44404cb65d8a9e63bc119c87c249eb2272716f3d",
+      "slug": "backlog_reassign",
+      "up": "sha256:25af73aa3d0e5e428cf0e29da7dcbc8adbbe90a620cf4a5828e167b122ba2b2d"
+    },
+    "0036": {
+      "down": "sha256:24fc8062a314f427c3da007bf70e54e984973b92f26a5f80e22a8d1f62161dfc",
+      "slug": "queue_reap_lease_lapse_refunds",
+      "up": "sha256:325ef4ec27e22791a59e3efec6d42df026b563f3b9d872e89f6e590da2f4b37c"
+    },
+    "0037": {
+      "down": "sha256:e614d428a72d1e4f33cd7c060b005135ea8207587458f3f89823488f9aefd0a4",
+      "slug": "queue_wait_budget_needs_a_serving_fleet",
+      "up": "sha256:6193172e9c8c8bb9c67a30bb140fb4166eb746d1f7680192f317bd96e7ebc1b4"
+    }
+  },
+  "note": "SHA-256 of every migration file, recorded when the migration shipped. `up` is the value the database's own schema_migration ledger holds; MigrationRunner.upgrade verifies it BEFORE applying anything pending, so editing an already-applied migration does not correct that migration -- it stops the deploy from applying every LATER one. Changing an entry below is a deliberate act with a live consequence, not bookkeeping. Check it with: python -m command_center.db migration-lock. After ADDING a migration, regenerate with: python scripts/migration_lock.py --write"
+}

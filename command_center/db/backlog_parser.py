@@ -84,7 +84,33 @@ def _strip_bold(text: str) -> str:
     return text
 
 
-_REPO_HINT = re.compile(r"Target repo[^`]*`([^`]+)`")
+_REPO_HINT_MARKER = "Target repo"
+
+
+def _repo_hint(body: str) -> str | None:
+    """Return the first back-quoted value following a ``Target repo`` marker.
+
+    Same result as ``re.search(r"Target repo[^`]*`([^`]+)`", body)`` but in
+    linear time: the regex form rescans to the end of the body from every
+    marker occurrence, which is quadratic on bodies that repeat the marker
+    (CodeQL py/polynomial-redos; the body is owner-submitted via the intake
+    route).
+    """
+    start = 0
+    while True:
+        i = body.find(_REPO_HINT_MARKER, start)
+        if i < 0:
+            return None
+        open_tick = body.find("`", i + len(_REPO_HINT_MARKER))
+        if open_tick < 0:
+            return None
+        close_tick = body.find("`", open_tick + 1)
+        if close_tick < 0:
+            return None
+        if close_tick > open_tick + 1:
+            return body[open_tick + 1 : close_tick]
+        # empty `` pair: any marker before it hits the same pair, resume after it
+        start = open_tick + 1
 
 # Repo inference from the task-id family, so the whole backlog is machine-
 # routable without a per-record hint. An explicit `Target repo` hint always
@@ -144,9 +170,9 @@ def parse_backlog(text: str) -> ParseReport:
             body = (body + "\n" if body else "") + "\n".join(body_extra)
         repo = current.repo
         if repo is None:
-            hint = _REPO_HINT.search(body)
+            hint = _repo_hint(body)
             if hint:
-                repo = hint.group(1).strip()
+                repo = hint.strip()
         if repo is None:
             repo = _infer_repo(current.task_id)
         report.tasks.append(

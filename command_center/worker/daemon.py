@@ -16,6 +16,11 @@ Design decisions, each traceable to the shipped substrate:
   current attempt runs to completion inside systemd's stop timeout. A second
   signal — or the timeout's SIGKILL — abandons it, and the lease expiry plus
   the control plane's reaper make that abandonment safe by construction.
+  Safe, and now also *free*: a lapse is charged to the queue's bounded
+  lease-wait budget rather than to the item's ``max_attempts`` (migration
+  0036), because the heartbeat below runs beside the handler -- so a lease
+  can only lapse when this PROCESS stopped beating, which is never evidence
+  about the payload it was holding (VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH).
 * **Drain ACK does not imply idle.** ``aicc-drained`` retains its legacy
   meaning (claim gate closed, possibly busy). ``aicc-drained-busy`` explicitly
   identifies unsettled local work. ``aicc-drained-idle`` additionally
@@ -85,6 +90,21 @@ class HandlerOutcome:
     # broken sandbox, or a provider outage says the work did not get a fair
     # execution slot.
     infra_wait: bool = False
+    # Structured evidence about the REFUSAL, for the audit row rather than
+    # for the result row (VOYN-W0-AICC-EXECUTOR-QUOTA-AWARE-ROUTING: which
+    # executor is out of quota, and until when this worker will withhold it).
+    # `result` is the item's outcome and is only written by `queue_complete`,
+    # so a refusal has no way to carry a fact forward otherwise; this travels
+    # into `work_event.detail` alongside the wait counters. Empty for every
+    # outcome that has nothing extra to say, which is almost all of them.
+    detail: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def no_fault(self) -> bool:
+        """True for a refusal that names no fault in the work item -- either
+        wait class. Read-only shorthand for tests and audit wording; routing
+        always goes through the specific flag."""
+        return self.lease_wait or self.infra_wait
 
 
 class Handler(Protocol):
@@ -345,10 +365,16 @@ class WorkerDaemon:
         try:
             if outcome.ok:
                 accepted = self._store.complete(work, outcome.result)
-            elif outcome.lease_wait:
+            # A wait implies `retryable`: an outcome that also says
+            # retryable=False is a final verdict, and the refund path must not
+            # quietly turn it back into a redelivery (VOYN-MON-CONTROL-01-
+            # QUEUE-DEAD-LETTER-GROWTH).
+            elif outcome.lease_wait and outcome.retryable:
                 accepted = self._store.fail_lease_wait(work, reason=outcome.reason)
-            elif outcome.infra_wait:
-                accepted = self._store.fail_infra_wait(work, reason=outcome.reason)
+            elif outcome.infra_wait and outcome.retryable:
+                accepted = self._store.fail_infra_wait(
+                    work, reason=outcome.reason, detail=outcome.detail or None
+                )
             else:
                 accepted = self._store.fail(
                     work, reason=outcome.reason, retryable=outcome.retryable

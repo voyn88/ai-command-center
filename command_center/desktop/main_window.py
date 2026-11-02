@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from command_center.platform import DensityMode
+from command_center.platform import DataSourceMode, DensityMode
 
 from . import i18n
 from .pages.home import HomePage
@@ -130,6 +130,7 @@ class AppShell(QWidget):
             self._theme.mode,
             self._settings.density_mode(),
             self._settings.selected_project(),
+            self._settings.data_source_mode(),
         )
         settings_page.theme_mode_changed.connect(self._on_theme_mode_changed)
         settings_page.density_mode_changed.connect(self._on_density_mode_changed)
@@ -138,6 +139,9 @@ class AppShell(QWidget):
         )
         settings_page.workspace_save_requested.connect(
             self._on_workspace_save_requested
+        )
+        settings_page.data_source_mode_changed.connect(
+            self._on_data_source_mode_changed
         )
         self._settings_page = settings_page
         self._add_page(settings_page)
@@ -197,6 +201,15 @@ class AppShell(QWidget):
     def _on_workspace_save_requested(self, project_id: str | None) -> None:
         self._settings.set_selected_project(project_id)
         self._settings.sync()
+
+    def _on_data_source_mode_changed(self, mode: DataSourceMode) -> None:
+        self._settings.set_data_source_mode(mode)
+        self._settings.sync()
+        # The toggle is meant to take effect immediately, not on the next
+        # navigation/refresh (VOYN-W0-APP-CONTROL-S2): re-load "Выполнение"
+        # right away if it is the page currently on screen.
+        if self.current_section_key == "execution":
+            self._load_operational_page("execution")
 
     # --- data / refresh ----------------------------------------------------
     def load_workspace_home(self, adapter: object, operations_adapter: object | None = None) -> None:

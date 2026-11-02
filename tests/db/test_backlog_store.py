@@ -139,6 +139,48 @@ def test_optimistic_lock_refuses_the_loser_of_a_race(store) -> None:
     assert second[2] == 2, "the refusal reports the current revision for re-read"
 
 
+# -- reassignment (wave/priority) ---------------------------------------------
+
+
+def test_reassign_changes_wave_and_priority_and_bumps_revision(store) -> None:
+    assert store.upsert_task(_task("VOYN-W0-REASSIGN"))[0]
+    ok, reason, rev = store.reassign("VOYN-W0-REASSIGN", "1", "P2", 1)
+    assert ok and reason == "reassigned" and rev == 2
+    task = store.get_task("VOYN-W0-REASSIGN")
+    assert task["wave"] == "1"
+    assert task["priority"] == "P2"
+    assert task["revision"] == 2
+    assert task["status"] == "OPEN", "reassignment does not touch the status machine"
+
+
+def test_reassign_to_the_same_values_is_a_no_op_that_does_not_bump_revision(store) -> None:
+    assert store.upsert_task(_task("VOYN-W0-REASSIGN-NOOP"))[0]
+    ok, reason, rev = store.reassign("VOYN-W0-REASSIGN-NOOP", "0", "P0", 1)
+    assert ok and reason == "unchanged" and rev == 1
+    assert store.get_task("VOYN-W0-REASSIGN-NOOP")["revision"] == 1
+
+
+def test_reassign_refuses_an_unknown_task(store) -> None:
+    ok, reason, rev = store.reassign("VOYN-W0-NO-SUCH-TASK", "1", "P1", 1)
+    assert not ok and reason == "unknown_task" and rev is None
+
+
+def test_reassign_refuses_a_malformed_priority(store) -> None:
+    assert store.upsert_task(_task("VOYN-W0-REASSIGN-BAD"))[0]
+    ok, reason, rev = store.reassign("VOYN-W0-REASSIGN-BAD", "1", "not-a-priority", 1)
+    assert not ok and reason.startswith("constraint:")
+    assert store.get_task("VOYN-W0-REASSIGN-BAD")["wave"] == "0", "a refusal changes nothing"
+
+
+def test_reassign_optimistic_lock_refuses_the_loser_of_a_race(store) -> None:
+    assert store.upsert_task(_task("VOYN-W0-REASSIGN-RACE"))[0]
+    first = store.reassign("VOYN-W0-REASSIGN-RACE", "1", "P1", 1)
+    assert first[0] and first[2] == 2
+    second = store.reassign("VOYN-W0-REASSIGN-RACE", "2", "P2", 1)  # stale read
+    assert second[0] is False and second[1] == "revision_conflict"
+    assert second[2] == 2, "the refusal reports the current revision for re-read"
+
+
 # -- dependencies -------------------------------------------------------------
 
 

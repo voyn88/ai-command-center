@@ -314,6 +314,10 @@ def test_principal_isolation_failure_is_retryable_not_a_task_result(
     )
     assert not outcome.ok
     assert outcome.retryable
+    assert outcome.infra_wait, (
+        "AICC_AGENT_LAUNCH_INFRA_FAILURE must refund via infra_wait "
+        "(no attempt burn, no cascade_exhausted park)"
+    )
     assert "agent principal isolation" in outcome.reason
     assert not removed, "ambiguous launcher failure must preserve task-local work"
 
@@ -3047,3 +3051,530 @@ def test_read_only_isolated_checkout_packs_refs_after_a_wholesale_pr_fetch(
     loose_dirs = [p for p in loose.iterdir() if p.is_dir()] if loose.exists() else []
     assert loose_dirs == [], loose_dirs
     handlers_module._remove_read_only_isolated_checkout(target)
+
+
+# ---------------------------------------------------------------------------
+# Quota-aware routing (VOYN-W0-AICC-EXECUTOR-QUOTA-AWARE-ROUTING): a quota
+# refusal is a fact about the ACCOUNT, so it must outlive the delivery that
+# discovered it. The next delivery skips the exhausted link at preflight --
+# which is the whole point: the skip happens inside a delivery the worker
+# already holds, so no attempt is spent rediscovering an exhaustion the last
+# refusal already established.
+# ---------------------------------------------------------------------------
+
+
+def _codex_quota_run(**kwargs):
+    return agent_runner.RunResult(
+        status="failed",
+        exit_code=1,
+        stdout="",
+        stderr=(
+            "ERROR: You've hit your usage limit. Visit "
+            "https://chatgpt.com/codex/settings/usage to purchase more credits "
+            "or try again at Sep 15th, 2026 1:24 AM."
+        ),
+        duration_seconds=0.1,
+        started_at="2026-09-22T12:00:00+00:00",
+        completed_at="2026-09-22T12:00:03+00:00",
+    )
+
+
+def test_a_quota_refusal_opens_the_circuit_and_reports_when_it_reopens(
+    handler, monkeypatch
+):
+    run_agent, runs = handler
+
+    def failed_codex(**kwargs):
+        runs.append(kwargs)
+        return _codex_quota_run()
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", failed_codex)
+    payload = _cascade_payload()
+    payload["cascade"] = [{"executor": "codex", "task_type": "review"}]
+
+    outcome = run_agent(payload, _event(), 1)
+
+    assert not outcome.ok and outcome.retryable and outcome.infra_wait
+    assert agent_runner.executor_exhausted_until("codex") is not None
+    exhausted = outcome.detail["executor_quota"]["exhausted"]
+    assert [entry["executor"] for entry in exhausted] == ["codex"]
+    assert exhausted[0]["signature"] == "hit your usage limit"
+    assert (
+        exhausted[0]["exhausted_until"]
+        == agent_runner.executor_exhausted_until("codex").isoformat()
+    )
+    # The same instant is legible without a jsonb reader, in the text the
+    # refund writes to `work_attempt.outcome_reason`.
+    assert f"codex quota exhausted until {exhausted[0]['exhausted_until']}" in (
+        outcome.reason
+    )
+
+
+def test_a_later_task_skips_the_exhausted_link_without_running_it(
+    handler, monkeypatch
+):
+    """The acceptance criterion: the second delivery neither launches the
+    exhausted executor nor spends an attempt on it -- it runs the healthy
+    link inside the delivery it already holds and succeeds."""
+    run_agent, runs = handler
+
+    def codex_quota_then_claude(**kwargs):
+        runs.append(kwargs)
+        if kwargs["executor"] == "codex":
+            return _codex_quota_run()
+        return agent_runner.RunResult(
+            status="completed",
+            exit_code=0,
+            stdout='{"result": "done"}',
+            stderr="",
+            duration_seconds=0.1,
+            started_at="2026-09-22T12:00:04+00:00",
+            completed_at="2026-09-22T12:00:05+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", codex_quota_then_claude)
+    payload = _cascade_payload()
+    payload["cascade"] = [
+        {"executor": "codex", "task_type": "review"},
+        {"executor": "claude", "task_type": "review"},
+    ]
+
+    first = run_agent(payload, _event(), 1)
+    assert first.ok
+    assert [run["executor"] for run in runs] == ["codex", "claude"]
+
+    runs.clear()
+    # A DIFFERENT task, delivered afterwards on this worker: the circuit is
+    # the executor's, not the item's.
+    second_payload = _cascade_payload()
+    second_payload["backlog_task_id"] = "VOYN-W0-OTHER-TASK"
+    second_payload["cascade"] = payload["cascade"]
+    second = run_agent(second_payload, _event(), 1)
+
+    assert second.ok
+    assert [run["executor"] for run in runs] == ["claude"], (
+        "the exhausted executor must not be launched again"
+    )
+    assert second.result["cascade_step"] == 2
+    assert second.result["executor_quota_skips"] == [
+        {
+            "cascade_step": 1,
+            "executor": "codex",
+            "exhausted_until": agent_runner.executor_exhausted_until(
+                "codex"
+            ).isoformat(),
+        }
+    ]
+
+
+def test_a_cascade_of_only_exhausted_links_refunds_the_attempt(handler, monkeypatch):
+    """Every link out of quota is a fact about the substrate, not the task:
+    the refusal routes to the infra-wait refund (`daemon.HandlerOutcome.
+    infra_wait`), so the item's own attempt budget is untouched and the
+    audit row carries the deadline the worker is waiting on."""
+    run_agent, runs = handler
+    monkeypatch.setattr(agent_runner, "run_claude_code", lambda **kwargs: None)
+    until = agent_runner.record_executor_exhausted("codex", cooldown_seconds=1800)
+    agent_runner.record_executor_exhausted("claude", cooldown_seconds=1800)
+
+    payload = _cascade_payload()
+    payload["cascade"] = [
+        {"executor": "codex", "task_type": "review"},
+        {"executor": "claude", "task_type": "review"},
+    ]
+    outcome = run_agent(payload, _event(), 1)
+
+    assert not outcome.ok and outcome.retryable and outcome.infra_wait
+    assert runs == [], "no executor may be launched while every link is exhausted"
+    assert "quota exhausted" in outcome.reason
+    skipped = outcome.detail["executor_quota"]["skipped"]
+    assert {entry["executor"] for entry in skipped} == {"codex", "claude"}
+    assert skipped[0]["exhausted_until"] == until.isoformat()
+
+
+def test_a_lapsed_circuit_puts_the_executor_back_in_the_cascade(handler, monkeypatch):
+    run_agent, runs = handler
+    # Opened with a window that has already closed by the time the delivery
+    # reads it: the preflight's own read is what clears it.
+    agent_runner.record_executor_exhausted(
+        "codex", cooldown_seconds=1, now=datetime(2020, 1, 1, tzinfo=UTC)
+    )
+    payload = _cascade_payload()
+    payload["cascade"] = [{"executor": "codex", "task_type": "review"}]
+
+    outcome = run_agent(payload, _event(), 1)
+
+    assert outcome.ok
+    assert [run["executor"] for run in runs] == ["codex"]
+    assert outcome.result["executor_quota_skips"] == []
+
+
+def test_a_transcript_that_quotes_a_quota_message_never_opens_the_circuit(
+    handler, monkeypatch
+):
+    """The two controls keep their own blast radii.
+
+    A failed attempt whose own transcript echoes a quota phrase still routes
+    as a provider failure for THIS attempt -- that is the pre-existing broad
+    check, and the cost of its false positive is one redundant route switch.
+    It must not also withhold the executor from every later task on this
+    host: the circuit reads the refusal channel only (independent review of
+    #705), so it stays closed here.
+    """
+    run_agent, runs = handler
+
+    def echoing_failure(**kwargs):
+        runs.append(kwargs)
+        return agent_runner.RunResult(
+            status="failed",
+            exit_code=1,
+            stdout=(
+                '{"result": "I printed tests/fixtures/fake_codex.py, which '
+                'contains \\"usage limit reached; check your quota\\"."}'
+            ),
+            stderr="pytest exited 1: 3 assertions did not hold",
+            duration_seconds=0.1,
+            started_at="2026-09-22T12:00:00+00:00",
+            completed_at="2026-09-22T12:00:03+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", echoing_failure)
+    payload = _cascade_payload()
+    payload["cascade"] = [{"executor": "codex", "task_type": "review"}]
+
+    outcome = run_agent(payload, _event(), 1)
+
+    assert [run["executor"] for run in runs] == ["codex"]
+    assert not outcome.ok and outcome.infra_wait  # the attempt-level classification
+    assert agent_runner.executor_exhausted_until("codex") is None, (
+        "an echoed transcript must not withhold the account from later tasks"
+    )
+    assert outcome.detail == {}
+
+
+def test_failover_after_a_quota_refusal_walks_past_an_already_exhausted_link(
+    handler, monkeypatch
+):
+    """The failover search inside the delivery obeys the circuit too: the
+    middle link's account is already known to be out of quota, so it is never
+    launched -- the run moves straight to the link that can serve."""
+    run_agent, runs = handler
+    monkeypatch.setattr(
+        agent_runner, "claude_cli_preflight", lambda binary=None: (True, "ok")
+    )
+    agent_runner.record_executor_exhausted("copilot", cooldown_seconds=1800)
+
+    def codex_quota_then_success(**kwargs):
+        runs.append(kwargs)
+        if kwargs["executor"] == "codex":
+            return _codex_quota_run()
+        return agent_runner.RunResult(
+            status="completed",
+            exit_code=0,
+            stdout='{"result": "done"}',
+            stderr="",
+            duration_seconds=0.1,
+            started_at="2026-09-22T12:00:04+00:00",
+            completed_at="2026-09-22T12:00:05+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", codex_quota_then_success)
+    payload = _cascade_payload()
+    payload["cascade"] = [
+        {"executor": "codex", "task_type": "review"},
+        {"executor": "copilot", "task_type": "review"},
+        {"executor": "claude", "task_type": "review"},
+    ]
+
+    outcome = run_agent(payload, _event(), 1)
+
+    assert outcome.ok
+    assert [run["executor"] for run in runs] == ["codex", "claude"]
+    assert outcome.result["cascade_step"] == 3
+    assert [skip["executor"] for skip in outcome.result["executor_quota_skips"]] == (
+        ["copilot"]
+    )
+    assert [
+        entry["executor"] for entry in outcome.result["executor_quota_exhaustions"]
+    ] == ["codex"]
+
+
+# -- VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH (#982): whose fault a refusal
+# names. `no_fault` is HandlerOutcome's read-only shorthand for
+# `lease_wait or infra_wait`; the routing itself goes through those flags.
+
+
+def test_lease_unavailable_publish_failure_is_no_fault_not_a_spent_attempt(
+    handler, monkeypatch
+) -> None:
+    """VOYN-W0-AICC-PUBLISH-LEASE-CONTENTION-BURNS-ATTEMPT, live 2026-09-06
+    (wki_55f316db): a guarded publish lost the writer-lease race to a
+    sibling lane -- neighbouring publishes for OTHER tasks succeeded
+    04:57-04:58Z while this one got `lease_unavailable`. That names no fault
+    in this run's own (already-committed) work, so the outcome must set
+    `no_fault=True` -- routing the daemon to the refund-and-bound path
+    instead of spending this item's `max_attempts` on contention it had no
+    part in causing."""
+    import command_center.worker.handlers as handlers_module
+
+    run_agent, _runs = handler
+    monkeypatch.setenv("AICC_PUBLISH_DEPLOY_KEY", "/dev/null")
+
+    def fake_publish(repository, cfg):
+        return PublishResult(
+            ok=False,
+            reason="lease_unavailable: held by server-worker-b pid 4242",
+        )
+
+    monkeypatch.setattr(handlers_module, "publish_run", fake_publish)
+
+    outcome = run_agent(_payload(task_type="implementation"), _event(), 1)
+    assert not outcome.ok and outcome.retryable is True
+    assert outcome.no_fault is True
+    assert "lease_unavailable" in outcome.reason
+
+
+def test_other_publish_failures_are_not_no_fault(handler, monkeypatch) -> None:
+    """Only `lease_unavailable` names contention with no fault of its own;
+    every other publish failure (a bad push, a dead `gh`) must keep spending
+    the ordinary attempt budget -- a regression here would let a genuinely
+    broken publish retry forever off a budget nothing spends down."""
+    import command_center.worker.handlers as handlers_module
+
+    run_agent, _runs = handler
+    monkeypatch.setenv("AICC_PUBLISH_DEPLOY_KEY", "/dev/null")
+
+    def fake_publish(repository, cfg):
+        return PublishResult(ok=False, reason="push_failed: non-fast-forward")
+
+    monkeypatch.setattr(handlers_module, "publish_run", fake_publish)
+
+    outcome = run_agent(_payload(task_type="implementation"), _event(), 1)
+    assert not outcome.ok and outcome.retryable is True
+    assert outcome.no_fault is False
+
+
+def _cascade(*executors: str, task_type: str = "implementation"):
+    return [{"executor": e, "task_type": task_type} for e in executors]
+
+
+def test_a_provider_quota_refusal_on_the_last_link_is_no_fault(
+    handler, monkeypatch
+) -> None:
+    """The finding this task closes. A provider/auth/quota refusal happens
+    before any model work, and the in-lease failover a few lines above the
+    return says so outright ("an exhausted account neither consumes an
+    attempt nor creates a red work_attempt row") -- but that accounting only
+    held while a healthy candidate link remained. On the LAST link the very
+    same refusal fell through to the ordinary retryable path and spent one
+    of the item's `max_attempts`, which the planner sets to the cascade
+    length: two of them dead-lettered a task that had never spent a single
+    model attempt, and control-01:queue measured the pile as
+    `dead_letter_growth`."""
+    run_agent, _runs = handler
+
+    def exhausted(**kwargs):
+        return agent_runner.RunResult(
+            status="failed",
+            exit_code=1,
+            stdout=json.dumps(
+                {
+                    "is_error": True,
+                    "api_error_status": 429,
+                    "result": "You've hit your session limit",
+                }
+            ),
+            stderr="",
+            duration_seconds=0.4,
+            started_at="2026-09-09T00:00:00+00:00",
+            completed_at="2026-09-09T00:00:00+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", exhausted)
+
+    outcome = run_agent(
+        _payload(task_type="independent_review", cascade=_cascade("claude")),
+        _event(),
+        1,
+    )
+    assert not outcome.ok and outcome.retryable
+    assert "provider/auth/quota" in outcome.reason
+    assert outcome.no_fault is True
+
+
+def test_an_executor_unavailable_on_every_link_is_no_fault(
+    handler, monkeypatch
+) -> None:
+    """`orchestrator.routing` records what this cost live: a link whose CLI
+    the isolated principal refuses burned "48 dead attempts in 20 minutes"
+    through `max_attempts`. Absent capacity is a fact about the host, so the
+    refusal must not be charged to the item."""
+    run_agent, runs = handler
+    monkeypatch.setattr(
+        agent_runner, "claude_cli_preflight", lambda binary=None: (False, "no cli")
+    )
+
+    outcome = run_agent(
+        _payload(task_type="independent_review", cascade=_cascade("claude")),
+        _event(),
+        1,
+    )
+    assert not outcome.ok and outcome.retryable
+    assert "cli unavailable" in outcome.reason
+    assert outcome.no_fault is True
+    assert runs == []
+
+
+def test_a_repository_this_host_cannot_see_is_no_fault(handler, monkeypatch) -> None:
+    """Host-local state: the row may resolve perfectly on another lane."""
+    run_agent, _runs = handler
+
+    def refuse(project_id, path):
+        raise agent_runner.RunnerError(f"unknown project {project_id!r}")
+
+    monkeypatch.setattr(agent_runner, "validate_repository", refuse)
+
+    outcome = run_agent(_payload(), _event(), 1)
+    assert not outcome.ok and outcome.retryable
+    assert outcome.no_fault is True
+
+
+def test_the_runner_never_starting_is_no_fault(handler, monkeypatch) -> None:
+    """Nothing executed and nothing was billed -- the launch is fleet state."""
+    run_agent, _runs = handler
+
+    def never_started(**kwargs):
+        return agent_runner.RunResult(
+            status="failed",
+            exit_code=None,
+            stdout="",
+            stderr="no binary",
+            duration_seconds=0.0,
+            started_at="2026-09-09T00:00:00+00:00",
+            completed_at="2026-09-09T00:00:00+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", never_started)
+    outcome = run_agent(_payload(), _event(), 1)
+    assert not outcome.ok and outcome.retryable
+    assert outcome.no_fault is True
+
+
+def test_a_workspace_the_fleet_could_not_provision_is_no_fault(
+    handler, monkeypatch, tmp_path
+) -> None:
+    """The isolated worktree is what the fleet owes the run; failing to
+    provide one says nothing about the work item."""
+    run_agent, runs = handler
+
+    def refuse(spec):
+        raise workspace_provisioning.WorkspaceVerificationError(
+            failed_step="provision_worktree",
+            remediation="free disk space on the worker",
+            expected_workspace=spec.workspace_path,
+            actual_workspace=spec.workspace_path,
+            expected_branch=spec.expected_branch or "",
+            detail="git worktree add failed: No space left on device",
+        )
+
+    monkeypatch.setattr(workspace_provisioning, "provision_and_verify", refuse)
+
+    outcome = run_agent(_payload(task_type="implementation"), _event(), 1)
+    assert not outcome.ok and outcome.retryable
+    assert "workspace isolation failed" in outcome.reason
+    assert outcome.no_fault is True
+    assert runs == []
+
+
+def test_dispatch_lease_contention_is_no_fault(handler, lease_tool, tmp_path) -> None:
+    """Migration 0022 refused to charge writer-lease contention to the item,
+    but wired the refund to exactly one call site (the publish push). The
+    dispatch-boundary gate is the same contention seen a few seconds
+    earlier, and it was still spending the budget."""
+    run_agent, runs = handler
+    lease_tool(_lease_row(isolated_path(tmp_path)))
+
+    outcome = run_agent(_payload(task_type="implementation"), _event())
+    assert not outcome.ok and outcome.retryable
+    assert outcome.no_fault is True
+    assert runs == []
+
+
+def test_the_full_lifecycle_lease_acquire_refusal_is_no_fault(
+    handler, monkeypatch, tmp_path
+) -> None:
+    """The other half of the same gate: `blocking_lease` sees nothing, then
+    the acquire itself loses the race to a sibling lane."""
+    run_agent, runs = handler
+    binary = tmp_path / "fake-voyn-lease"
+    binary.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "list" ]; then echo "[]"; exit 0; fi\n'
+        'case "$3" in\n'
+        "  acquire) echo 'lease already held by another writer' >&2; exit 1 ;;\n"
+        "  *) exit 0 ;;\n"
+        "esac\n"
+    )
+    binary.chmod(0o755)
+    monkeypatch.setenv("VOYN_LEASE_TOOL", str(binary))
+    monkeypatch.setenv("VOYN_LEASE_DSN", "postgresql://authority/present")
+
+    outcome = run_agent(_payload(task_type="implementation"), _event())
+    assert not outcome.ok and outcome.retryable
+    assert "writer lease unavailable" in outcome.reason
+    assert outcome.no_fault is True
+    assert runs == []
+
+
+def test_a_run_that_executed_and_failed_is_never_no_fault(handler, monkeypatch) -> None:
+    """The boundary, stated from the other side: an agent that ran and
+    failed is a RESULT (`ok=True`, the control plane reads it), and a
+    publish that pushed badly is evidence about this run's own output --
+    neither may reach the refund path, or a genuinely broken item would
+    retry against a budget nothing spends down."""
+    import command_center.worker.handlers as handlers_module
+
+    run_agent, _runs = handler
+
+    def failed_run(**kwargs):
+        return agent_runner.RunResult(
+            status="failed",
+            exit_code=1,
+            stdout="partial",
+            stderr="boom",
+            duration_seconds=2.0,
+            started_at="2026-09-09T00:00:00+00:00",
+            completed_at="2026-09-09T00:00:02+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", failed_run)
+    executed = run_agent(_payload(), _event(), 1)
+    assert executed.ok and executed.no_fault is False
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", lambda **kw: agent_runner.RunResult(
+        status="completed",
+        exit_code=0,
+        stdout='{"result": "done"}',
+        stderr="",
+        duration_seconds=1.0,
+        started_at="2026-09-09T00:00:00+00:00",
+        completed_at="2026-09-09T00:00:01+00:00",
+    ))
+    monkeypatch.setenv("AICC_PUBLISH_DEPLOY_KEY", "/dev/null")
+    monkeypatch.setattr(
+        handlers_module,
+        "publish_run",
+        lambda repository, cfg: PublishResult(ok=False, reason="push_failed: rejected"),
+    )
+    published = run_agent(_payload(task_type="implementation"), _event(), 1)
+    assert not published.ok and published.retryable
+    assert published.no_fault is False
+
+
+def test_a_payload_defect_is_neither_retryable_nor_no_fault(handler) -> None:
+    """A defect IS evidence about the item -- the refund path would only
+    keep re-delivering something no host can execute."""
+    run_agent, _runs = handler
+    outcome = run_agent(_payload(v=2), _event(), 1)
+    assert not outcome.ok and not outcome.retryable
+    assert outcome.no_fault is False
