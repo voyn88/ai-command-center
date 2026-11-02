@@ -325,7 +325,7 @@ def test_backlog_plan_propagates_repository_path_to_coordinator(monkeypatch, exp
     monkeypatch.setattr(cli.pool, "open_pool", lambda _config: None)
     monkeypatch.setattr(cli.pool, "close_pool", lambda: None)
     monkeypatch.setattr(cli.pool, "connection", lambda: nullcontext(object()))
-    monkeypatch.setattr(planner, "plan_once", lambda *_args: planner.PlanReport())
+    monkeypatch.setattr(planner, "plan_once", lambda *_args, **_kwargs: planner.PlanReport())
     captured = []
     monkeypatch.setattr(coordination, "coordinate_once", lambda _factory, limits: captured.append(limits.repository_path) or coordination.CoordinationReport())
     argv = ["backlog-plan"] + (["--repo-path", "/srv/explicit-repo"] if explicit else [])
