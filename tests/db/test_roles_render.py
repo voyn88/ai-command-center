@@ -228,6 +228,11 @@ def test_the_worker_reaches_the_queue_only_through_the_six_protocol_steps() -> N
     # And the enrolment layer: prove its own identity, read only the
     # server-authoritative expiry of that proved credential, rotate its own
     # secret, and nothing else — a worker cannot mint or redeem an enrolment.
+    #
+    # And the fleet-wide availability layer (0018, VOYN-W0-AICC-EXECUTOR-
+    # QUOTA-VISIBILITY): report its own observation of a provider failure, or
+    # clear one early after its own successful run — nothing that lets it
+    # read another host's decisions or bypass the queue-claim protocol above.
     assert granted == {
         "queue_claim",
         "queue_heartbeat",
@@ -238,6 +243,9 @@ def test_the_worker_reaches_the_queue_only_through_the_six_protocol_steps() -> N
         "identity_assert",
         "identity_current_credential",
         "enroll_rotate_self",
+        "executor_mark_unavailable",
+        "executor_mark_available",
+
         # 0021: the worker-host fail-closed probe records what it measured
         # (a finding row keyed by source+failure, and its clearing); neither
         # reads the backlog nor the queue, and the planner -- not the worker
@@ -280,6 +288,9 @@ def test_the_control_plane_cannot_claim() -> None:
         "backlog_transition",
         "backlog_record_evidence",
         "backlog_record_remediation",
+        # VOYN-W0-AICC-REVIEW-FULLCONTEXT-TRIAGE (0042): the minor-findings
+        # follow-up lineage, alongside the remediation lineage above.
+        "backlog_record_followup",
         "backlog_add_dependency",
         "backlog_lease_acquire",
         "backlog_lease_heartbeat",
@@ -291,6 +302,7 @@ def test_the_control_plane_cannot_claim() -> None:
         # VOYN-W0-AICC-DEFER-AUTO-RESUME (0014): the machine exit from
         # DEFER_TO_USER for technical parks.
         "backlog_resume_deferred",
+        "backlog_declare_required_authority",
         # VOYN-W0-AICC-NO-RECOVERY-PATH-STUCK-READY-TO-REVIEW (0018): the
         # machine exit from READY_TO_REVIEW for a task stuck there with no
         # `pr` evidence.
@@ -299,6 +311,10 @@ def test_the_control_plane_cannot_claim() -> None:
         # scan cursor for the tick windows.
         "backlog_scan_claim",
         "backlog_triage",
+        # VOYN-W0-AICC-BGE-M3-DEDUP-SCAN (0025): the same 'duplicate' decision
+        # one state over — OPEN -> DECIDED, with the canonical task named.
+        "backlog_mark_duplicate",
+
         # 0030: clear proven malformed evidence through the audited function.
         "backlog_clear_evidence",
         # 0021: read-only deploy preflight with dispatch's privileges; the
@@ -309,12 +325,18 @@ def test_the_control_plane_cannot_claim() -> None:
         "monitor_record_finding",
         "monitor_clear_finding",
         "monitor_link_task",
-        # VOYN-W0-AICC-BACKLOG-PG-CANONICAL-GATE (0020): the importer's stamp
-        # of where a migrated row came from.
+        # VOYN-W0-AICC-BACKLOG-PG-CANONICAL-GATE (0023): the importer's stamp
+        # of where a migrated row came from, and (0025,
+        # ...-CANONICAL-GATE-REM) the atomic insert-and-stamp that makes the
+        # stamp inseparable from the insert it describes.
         "backlog_record_provenance",
+        "backlog_import_task",
+
         # 0029: bounded row lock and audited owner decision, no table UPDATE.
         "backlog_owner_lock",
         "backlog_owner_decision",
+        # 0035: optimistic-revision priority/wave reassignment (APP-CONTROL-S6d).
+        "backlog_reassign",
         # 0032: durable Grok↔Cursor coordination CAS surface.
         "coordinator_state_read",
         "coordinator_enqueue",
@@ -350,11 +372,30 @@ def test_function_grants_are_revoked_before_they_are_reapplied() -> None:
 
 
 @pytest.mark.parametrize(
-    "bad", ["queue_claim(text; DROP TABLE task)", "queue_claim(text"]
+    "bad",
+    [
+        "queue_claim(text; DROP TABLE task)",
+        "queue_claim(text",
+        # An array suffix is allowed, but only as a suffix and only on an
+        # otherwise plain identifier.
+        "monitor_clear_finding(text, te xt[])",
+        "monitor_clear_finding(text, []text)",
+    ],
 )
 def test_function_signature_guard_rejects_injection(bad: str) -> None:
     with pytest.raises(ValueError):
         roles._require_function_signature(bad)
+
+
+def test_function_signature_guard_accepts_only_suffix_array_types() -> None:
+    roles._require_function_signature("monitor_clear_finding(text, text[])")
+    for bad in (
+        "monitor_clear_finding(text, text[]evil)",
+        "monitor_clear_finding(text, text])",
+        "monitor_clear_finding(text, text[; DROP TABLE task])",
+    ):
+        with pytest.raises(ValueError):
+            roles._require_function_signature(bad)
 
 
 def test_a_worker_host_role_is_a_login_member_of_the_worker_group() -> None:
@@ -403,3 +444,55 @@ def test_identity_sequences_match_the_ddl() -> None:
 def test_identifier_guard_rejects_injection(bad: str) -> None:
     with pytest.raises(ValueError, match="not a safe"):
         roles.render_grants(bad)
+
+
+def test_an_overloaded_function_is_filtered_by_arity_not_by_name() -> None:
+    """A database between 0021 and 0038 has `monitor_clear_finding(text)` and
+    not `monitor_clear_finding(text, text[])`.
+
+    `apply_table_grants` runs the whole matrix in ONE transaction, so emitting
+    a GRANT for the absent overload does not skip one privilege -- it aborts
+    every grant in the run. Before 0038 no name in this schema had two
+    signatures, which is what made matching on the bare name look sufficient.
+    """
+    one_arg = "GRANT EXECUTE ON FUNCTION public.monitor_clear_finding(text) TO"
+    two_arg = "GRANT EXECUTE ON FUNCTION public.monitor_clear_finding(text, text[]) TO"
+
+    def _emitted(existing: set[str]) -> tuple[bool, bool]:
+        rendered = "\n".join(
+            roles.render_table_grants(
+                existing_relations=set(roles.ALL_TABLES) | set(roles.ALL_VIEWS),
+                existing_functions=existing,
+            )
+        )
+        return one_arg in rendered, two_arg in rendered
+
+    every_function = {
+        roles._function_key(signature)
+        for privileges in roles.FUNCTION_PRIVILEGES.values()
+        for signature in privileges
+    }
+    assert _emitted(every_function) == (True, True)
+    # The pre-0038 catalog: same name, one arity.
+    assert _emitted(every_function - {"monitor_clear_finding/2"}) == (True, False)
+    # And the filter is not merely dropping both: the arity it keeps is the
+    # arity it was told about.
+    assert _emitted(every_function - {"monitor_clear_finding/1"}) == (False, True)
+
+
+def test_function_keys_are_name_and_argument_count() -> None:
+    """The key `apply_table_grants` builds from `pg_proc.pronargs` must be the
+    key the declared signatures render to -- a mismatch would skip every
+    function grant silently rather than raise."""
+    assert roles._function_key("backlog_dispatch_smoke()") == "backlog_dispatch_smoke/0"
+    assert roles._function_key("monitor_clear_finding(text)") == "monitor_clear_finding/1"
+    assert (
+        roles._function_key("monitor_clear_finding(text, text[])")
+        == "monitor_clear_finding/2"
+    )
+    # Arguments carrying a DEFAULT are declared and counted here exactly as
+    # `pronargs` counts them.
+    assert (
+        roles._function_key("monitor_record_finding(text, text, jsonb)")
+        == "monitor_record_finding/3"
+    )

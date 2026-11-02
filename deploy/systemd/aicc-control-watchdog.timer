@@ -1,0 +1,18 @@
+# Schedule for aicc-control-watchdog.service (VOYN-W0-AICC-CONTROL-PLANE-
+# RESILIENCE). 3 minutes stays well inside the reconciler's own stale budget
+# (its "aicc-control-reconciler.timer" DECLARED_TIMERS entry: 120s interval x
+# 5 missed intervals = 10 minutes before control-reconcile itself reads
+# stale) -- the cross-check must notice well before that window closes, not
+# exactly at its edge.
+
+[Unit]
+Description=Run the AICC control-plane heartbeat watchdog every 3 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=3min
+AccuracySec=15s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

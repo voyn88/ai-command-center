@@ -1,0 +1,17 @@
+# Schedule for aicc-control-reconciler.service (VOYN-W0-AICC-CONTROL-PLANE-
+# RESILIENCE). 2 minutes matches the "aicc-control-reconciler.timer" entry's
+# own `interval_seconds=120` in control_plane_reconciler.DECLARED_TIMERS --
+# the tick watches its own trigger timer through the same is-active check
+# every other declared timer gets, so keep these two numbers together.
+
+[Unit]
+Description=Run the AICC control-plane reconciler every 2 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+AccuracySec=15s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

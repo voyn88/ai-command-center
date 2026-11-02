@@ -332,9 +332,12 @@ def test_migration_0032_is_paired_and_registers_table():
     up = (sql_dir / "0032_coordinator_v2.up.sql").read_text(encoding="utf-8")
     assert "coordinator_cas_begin" in up
     assert "CREATE TABLE coordinator_state" in up
-    found = migrations.discover()
-    assert found[-1].slug == "coordinator_v2"
-    assert found[-1].version == 32
+    # Pinned by VERSION, not by position: 0032 stays coordinator_v2 forever
+    # (a shipped migration is immutable), but later migrations (0033+) are
+    # appended after it, so "the last one" is not a property of 0032.
+    found = {migration.version: migration for migration in migrations.discover()}
+    assert found[32].slug == "coordinator_v2"
+    assert sorted(found) == list(range(1, len(found) + 1))
 
 
 # ---------------------------------------------------------------------------

@@ -185,6 +185,15 @@ def _item(admin_conn, item_id: str) -> tuple:
         return cur.fetchone()
 
 
+def _lease_waits(admin_conn, item_id: str) -> int:
+    """0022's second budget, which `_item` predates."""
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "SELECT lease_wait_count FROM work_item WHERE work_item_id = %s", (item_id,)
+        )
+        return cur.fetchone()[0]
+
+
 def _events(admin_conn, item_id: str) -> list[tuple]:
     with admin_conn.cursor() as cur:
         cur.execute(
@@ -1294,6 +1303,10 @@ def test_the_last_lease_wait_refunds_its_attempt_like_every_one_before(
         _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names),
         psycopg.connect(host_dsns[0], autocommit=True) as worker,
     ):
+        # 0037: the wait budget only dead-letters an item the serving fleet
+        # singled out, so the exhausting refusal needs a served sibling.
+        with psycopg.connect(app_dsn, autocommit=True) as app:
+            _a_served_fleet(app, worker)
         for delivery, expected in enumerate(
             ("lease_wait_requeued", "lease_wait_requeued", "lease_wait_dead_lettered"),
             start=1,
@@ -1399,7 +1412,10 @@ def test_redrive_clears_both_wait_budgets_it_widens_the_attempts_for(
                 "SELECT ok, reason FROM queue_fail_infra_wait(%s, %s, %s, 5)",
                 (verdict[3], token, "executor infrastructure failure: launcher"),
             ) == (True, "infra_wait_requeued")
-            # ... then two lease waits against a cap of one: the second exceeds it.
+            # ... then two lease waits against a cap of one: the second exceeds it
+            # (0037: only while the fleet is demonstrably serving a sibling).
+            with psycopg.connect(app_dsn, autocommit=True) as app:
+                _a_served_fleet(app, worker)
             for expected in ("lease_wait_requeued", "lease_wait_dead_lettered"):
                 token, token_hash = _token()
                 verdict = _claim(worker, token_hash)
@@ -1441,6 +1457,98 @@ def test_redrive_clears_both_wait_budgets_it_widens_the_attempts_for(
             (item_id,),
         )
         assert cur.fetchall() == [("2", "1")]
+
+
+def test_infra_wait_merges_the_callers_detail_into_the_audit_row(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """0033: the refund's own counters say an attempt was given back; only the
+    caller can say WHY. A refusal writes no `work_result` row -- `queue_complete`
+    is the only path that does -- so quota-aware routing's evidence (which
+    executor is exhausted, until when this worker withholds it) travels in the
+    audit row's detail. The server-decided counters are applied last and cannot
+    be overwritten by the caller.
+    """
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
+    with psycopg.connect(app_dsn, autocommit=True) as app:
+        item_id = _enqueue(app, "infra-detail", max_attempts=1, backoff_seconds=0)
+
+    quota = json.dumps(
+        {
+            "executor_quota": {
+                "exhausted": [
+                    {
+                        "executor": "codex",
+                        "signature": "hit your usage limit",
+                        "exhausted_until": "2026-09-22T12:30:00+00:00",
+                    }
+                ]
+            },
+            # A caller must not be able to rewrite the counters the server
+            # decided; this key is applied first and then overwritten.
+            "infra_wait_count": 99,
+        }
+    )
+    with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
+        with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+            token, token_hash = _token()
+            verdict = _claim(worker, token_hash)
+            assert _call(
+                worker,
+                "SELECT ok, reason FROM queue_fail_infra_wait(%s, %s, %s, 2, %s::jsonb)",
+                (verdict[3], token, "executor infrastructure failure: out of quota", quota),
+            ) == (True, "infra_wait_requeued")
+
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "SELECT detail FROM work_event WHERE work_item_id = %s AND reason = %s",
+            (item_id, "infra_wait_requeued"),
+        )
+        detail = cur.fetchone()[0]
+    if isinstance(detail, str):
+        detail = json.loads(detail)
+    assert detail["executor_quota"]["exhausted"][0]["exhausted_until"] == (
+        "2026-09-22T12:30:00+00:00"
+    )
+    assert detail["infra_wait_count"] == 1, "the server decides the counters"
+    assert detail["max_infra_waits"] == 2
+
+
+def test_infra_wait_still_audits_without_a_caller_detail(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """The argument defaults to NULL, so a pre-0025 four-argument call (a
+    worker mid-rolling-deploy) resolves to the same function and writes the
+    row it wrote before."""
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
+    with psycopg.connect(app_dsn, autocommit=True) as app:
+        item_id = _enqueue(app, "infra-no-detail", max_attempts=1, backoff_seconds=0)
+
+    with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
+        with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+            token, token_hash = _token()
+            verdict = _claim(worker, token_hash)
+            assert _call(
+                worker,
+                "SELECT ok, reason FROM queue_fail_infra_wait(%s, %s, %s, 2)",
+                (verdict[3], token, "executor infrastructure failure: socket inactive"),
+            ) == (True, "infra_wait_requeued")
+
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "SELECT detail FROM work_event WHERE work_item_id = %s AND reason = %s",
+            (item_id, "infra_wait_requeued"),
+        )
+        detail = cur.fetchone()[0]
+    if isinstance(detail, str):
+        detail = json.loads(detail)
+    assert detail == {
+        "infra_wait_count": 1,
+        "max_infra_waits": 2,
+        "attempt_count": 0,
+    }
 
 
 def test_the_dead_letter_view_preserves_the_cause_and_the_history(
@@ -1553,6 +1661,645 @@ def test_redrive_of_an_unknown_item_is_refused_and_the_refusal_survives(
     assert [e[2] for e in _events(admin_conn, live_id) if e[1] == "rejected"] == [
         "not_dead_lettered"
     ]
+
+
+# ---------------------------------------------------------------------------
+# The no-fault budget (0022) and the DLQ exit that has to understand it (0024)
+# ---------------------------------------------------------------------------
+
+
+def _a_served_fleet(app, worker, *, priority: int = 50) -> str:
+    """Put one delivery that REACHED THE WORK into the queue's recent history.
+
+    Since 0028 the no-fault wait budget is spent only while the fleet is
+    demonstrably serving other items -- `_queue_fleet_is_serving`, the same
+    question `infra_monitor` asks as `recent_succeeded`. Exhausting that
+    budget is therefore a verdict about an item that was SINGLED OUT, and a
+    test that wants the dead-letter branch has to say so by supplying the
+    siblings it was singled out from. Without this, 21 refusals mean a
+    capacity outage, and the item correctly stays `ready`.
+
+    Deliberately terminal and deliberately first in line: a completed item
+    leaves the ready pool for good, and the priority means the claim inside
+    here cannot take the row the caller is testing (`queue_claim` orders
+    `priority DESC`). Returns the sibling's id so a caller asserting over the
+    whole queue can exclude it.
+    """
+    sibling = _enqueue(
+        app,
+        f"served-{secrets.token_hex(4)}",
+        max_attempts=1,
+        priority=priority,
+        backoff_seconds=0,
+    )
+    token, token_hash = _token()
+    verdict = _claim(worker, token_hash)
+    assert verdict[0] and verdict[2] == sibling, verdict[1]
+    assert _call(
+        worker,
+        "SELECT ok FROM queue_complete(%s, %s, %s::jsonb)",
+        (verdict[3], token, json.dumps({"served": True})),
+    ) == (True,)
+    return sibling
+
+
+def _waits(admin_conn, item_id: str) -> int:
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "SELECT lease_wait_count FROM work_item WHERE work_item_id = %s",
+            (item_id,),
+        )
+        return cur.fetchone()[0]
+
+
+def test_a_no_fault_refusal_refunds_the_attempt_it_was_handed(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """`queue_fail_lease_wait` is the arithmetic the whole fix rests on.
+
+    `queue_claim` advances `attempt_count` when it hands the delivery out, so
+    a refusal that names no fault in the WORK has to give that increment back
+    or contention spends the item's budget. Proven here against the server,
+    not against a fake: one claim, one no-fault failure, and the item is back
+    to `ready` with its attempt budget untouched and the refusal counted on
+    the separate `lease_wait_count` instead.
+
+    `max_attempts=1` is the sharp case -- under `queue_fail` this same item
+    would be in the dead letter after this one delivery.
+    """
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
+    with psycopg.connect(app_dsn, autocommit=True) as app:
+        item_id = _enqueue(app, "no-fault", max_attempts=1, backoff_seconds=0)
+
+    with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
+        with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+            token, token_hash = _token()
+            verdict = _claim(worker, token_hash)
+            assert verdict[0]
+            assert _item(admin_conn, item_id)[1] == 1, "the claim spent the attempt"
+
+            ok, reason = _call(
+                worker,
+                "SELECT ok, reason FROM queue_fail_lease_wait(%s, %s, %s, %s)",
+                (verdict[3], token, "lease_unavailable: held by a sibling lane", 20),
+            )
+            assert ok is True and reason == "lease_wait_requeued"
+
+        state = _item(admin_conn, item_id)
+        assert state[0] == "ready", "a no-fault refusal returns the item to the pool"
+        assert state[1] == 0, "the attempt the claim spent was refunded"
+        assert state[2] == 1, "the attempt budget itself is untouched"
+        assert state[5] is None, "nothing was dead-lettered"
+        assert _waits(admin_conn, item_id) == 1, "counted on its own budget instead"
+
+
+def test_a_refunded_item_can_be_claimed_again(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH: the refund is only a fix
+    if the item it returns to the pool can actually be delivered again.
+
+    Until 0025 it could not. `queue_claim` numbered the new attempt
+    `attempt_count + 1` -- the same column the refund had just decremented --
+    so the next claim re-used an `attempt_no` the item's own history already
+    held and `UNIQUE (work_item_id, attempt_no)` raised *out of* the
+    SECURITY DEFINER function. The worker calls `claim()` from its main loop,
+    so the lane died on the exception and systemd restarted it into the same
+    still-ready, still-highest-priority row: one refunded item stopped the
+    whole fleet from claiming anything.
+
+    The delivery number now comes from the attempt history and the budget from
+    `attempt_count`, so the second delivery is `attempt_no` 2 with the model
+    budget still whole. `attempt_no` is also what selects the executor cascade
+    link (`worker.handlers._cascade_step`), which is why the refund must not
+    hand the same number out twice even though it gives the budget back.
+    """
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
+    with psycopg.connect(app_dsn, autocommit=True) as app:
+        item_id = _enqueue(app, "refunded-then-claimed", max_attempts=2, backoff_seconds=0)
+
+    with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
+        with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+            token, token_hash = _token()
+            first = _claim(worker, token_hash)
+            assert first[0] and first[4] == 1
+            assert _call(
+                worker,
+                "SELECT ok, reason FROM queue_fail_lease_wait(%s, %s, %s, %s)",
+                (first[3], token, "lease_unavailable: held by a sibling lane", 20),
+            ) == (True, "lease_wait_requeued")
+            assert _item(admin_conn, item_id)[1] == 0, "the attempt was refunded"
+
+            # The claim that used to raise `duplicate key value violates unique
+            # constraint "idx_work_attempt_item_no"`.
+            token, token_hash = _token()
+            second = _claim(worker, token_hash)
+            assert second[0], second[1]
+            assert second[2] == item_id
+            assert second[4] == 2, "a fresh delivery number, not the refunded one"
+
+            # And it is a real, ownable claim: the delivery reports its own
+            # outcome rather than colliding with the attempt before it.
+            assert _call(
+                worker,
+                "SELECT ok FROM queue_complete(%s, %s, %s::jsonb)",
+                (second[3], token, json.dumps({"done": True})),
+            ) == (True,)
+
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "SELECT attempt_no, state FROM work_attempt WHERE work_item_id = %s "
+            "ORDER BY attempt_no",
+            (item_id,),
+        )
+        assert cur.fetchall() == [(1, "failed"), (2, "succeeded")]
+    state = _item(admin_conn, item_id)
+    assert state[0] == "succeeded"
+    assert state[1] == 1, "one delivery spent the budget; the refunded one did not"
+
+
+def test_the_no_fault_budget_is_bounded_and_names_its_own_cause(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """The refund is not a licence to retry forever.
+
+    Contention that never clears *while the fleet serves its siblings* still
+    terminates in the DLQ -- with `lease_wait_exhausted`, a cause an operator
+    can tell apart from an item whose own attempts kept failing, and which
+    carries the refusal text so `infra_monitor` can still classify a capacity
+    outage as one.
+
+    `_a_served_fleet` is what makes this item *singled out* rather than one
+    of a queue nobody is serving; see 0028 and the outage test below for the
+    other side of that line.
+    """
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
+    with psycopg.connect(app_dsn, autocommit=True) as app:
+        item_id = _enqueue(app, "capped", max_attempts=5, backoff_seconds=0)
+
+    reason = "executor infrastructure failure (provider/auth/quota): session limit"
+    with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
+        with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+            with psycopg.connect(app_dsn, autocommit=True) as app:
+                _a_served_fleet(app, worker)
+            for delivery, expected in enumerate(
+                ("lease_wait_requeued", "lease_wait_requeued",
+                 "lease_wait_dead_lettered"),
+                start=1,
+            ):
+                token, token_hash = _token()
+                verdict = _claim(worker, token_hash)
+                assert verdict[0], verdict[1]
+                # Each refusal returns the BUDGET and keeps the DELIVERY
+                # number moving (0025); a delivery number that came back with
+                # the budget would collide with the attempt row just written.
+                assert verdict[4] == delivery
+                ok, got = _call(
+                    worker,
+                    "SELECT ok, reason FROM queue_fail_lease_wait(%s, %s, %s, %s)",
+                    (verdict[3], token, reason, 2),
+                )
+                assert ok is True and got == expected
+
+    state = _item(admin_conn, item_id)
+    assert state[0] == "dead"
+    assert state[5] == f"lease_wait_exhausted: {reason}"
+    # infra_monitor buckets a DLQ row by its `dead_reason`; the refusal text
+    # has to survive into it or a quota outage lands in the generic class.
+    assert re.search(r"(?i)session limit", state[5])
+    # 0026: the refusal that exhausts the wait budget refunds its attempt like
+    # every refusal before it, so the DLQ row an operator reads says plainly
+    # that this item never spent a model attempt of its own.
+    assert state[1] == 0, "not one model attempt was ever spent on this item"
+
+
+def test_an_outage_that_refuses_everything_does_not_empty_the_queue_into_the_dlq(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH, at the horizon the wait
+    budget actually buys.
+
+    `_queue_backoff(2, n)` -- 2 is the backoff every dispatch enqueues with --
+    runs 2, 4, 8 … 256 and then sits at its 300s cap, so 20 waits is 68.5
+    minutes of waiting (asserted below from the database's own function, not
+    from arithmetic in this file). The fleet's dominant outage is four times
+    that: `orchestrator.routing` records the Claude credential as a Max
+    subscription with a FIVE-HOUR rolling cap, and 142 of 167 parked tasks on
+    2026-08-23 were "You've hit your session limit" -- a response
+    `worker.handlers` routes to `no_fault`, i.e. straight to this budget. So
+    every item in flight when that window closed spent its whole budget in
+    the first sixty-nine minutes and dead-lettered having never reached a
+    model, with nothing but an operator's `queue-redrive` to bring it back.
+
+    Both halves of the rule are the same item here. Twenty-five refusals with
+    NOTHING else getting through leave it `ready` with both model attempts
+    intact; one served sibling later, the very next refusal -- identical text,
+    identical budget -- is the dead letter, because now it is this item being
+    singled out.
+    """
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
+    with psycopg.connect(app_dsn, autocommit=True) as app:
+        item_id = _enqueue(app, "outage", max_attempts=2, backoff_seconds=0)
+
+    reason = (
+        "executor infrastructure failure (provider/auth/quota): "
+        "You've hit your session limit"
+    )
+    with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
+        with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+            for delivery in range(1, 26):
+                token, token_hash = _token()
+                verdict = _claim(worker, token_hash)
+                assert verdict[0], verdict[1]
+                ok, got = _call(
+                    worker,
+                    "SELECT ok, reason FROM queue_fail_lease_wait(%s, %s, %s, %s)",
+                    (verdict[3], token, reason, 20),
+                )
+                assert (ok, got) == (True, "lease_wait_requeued"), delivery
+
+            state = _item(admin_conn, item_id)
+            assert state[0] == "ready", "an outage is not a verdict on the work"
+            assert state[5] is None
+            assert state[1] == 0, "and the item still has not reached a model"
+            assert _waits(admin_conn, item_id) == 25, (
+                "every refusal is still counted -- the backoff is computed "
+                "from it, so an outage must not become a poll loop"
+            )
+
+            # Now the fleet is demonstrably serving its other work, and the
+            # identical refusal means something different about this item.
+            with psycopg.connect(app_dsn, autocommit=True) as app:
+                _a_served_fleet(app, worker)
+            token, token_hash = _token()
+            verdict = _claim(worker, token_hash)
+            assert verdict[0] and verdict[2] == item_id, verdict[1]
+            assert _call(
+                worker,
+                "SELECT ok, reason FROM queue_fail_lease_wait(%s, %s, %s, %s)",
+                (verdict[3], token, reason, 20),
+            ) == (True, "lease_wait_dead_lettered")
+
+    assert _item(admin_conn, item_id)[0] == "dead"
+
+    # The number the budget is measured against, read from the database
+    # rather than asserted from a comment: 20 waits at the enqueued backoff
+    # is about an hour, and the outage above is five.
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "SELECT sum(extract(epoch FROM _queue_backoff(2, n)))/60 "
+            "FROM generate_series(1, 20) n"
+        )
+        minutes = float(cur.fetchone()[0])
+    assert 60 < minutes < 90, minutes
+
+
+def test_a_delivery_that_reached_the_work_clears_the_wait_budget(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """The second half of 0028.
+
+    `lease_wait_count` was cumulative over an item's whole life and reset by
+    nothing but `queue_redrive` (0024), so an item that waited out one long
+    outage carried that number for the rest of its existence: an ordinary
+    lease race weeks later was its 21st wait and dead-lettered it on a budget
+    that had been spent by an unrelated, long-recovered condition.
+
+    `queue_fail`'s requeue is the one non-terminal exit that means a delivery
+    got past the fleet and came back with a verdict about the WORK, so it
+    clears the budget -- 20 CONSECUTIVE refusals, not 20 across the months an
+    item may live. It cannot become an unbounded retry: reaching the reset
+    costs a real `attempt_count`, which nothing refunds, so `max_attempts`
+    caps how many times the budget can be cleared. The cleared number travels
+    into the audit, exactly as the redrive's does.
+    """
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
+    with psycopg.connect(app_dsn, autocommit=True) as app:
+        item_id = _enqueue(app, "carried", max_attempts=3, backoff_seconds=0)
+
+    with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
+        with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+            with psycopg.connect(app_dsn, autocommit=True) as app:
+                _a_served_fleet(app, worker)
+            # Two no-fault refusals against a cap of two: the budget is now
+            # exactly spent, and a third would be the dead letter.
+            for _ in range(2):
+                token, token_hash = _token()
+                verdict = _claim(worker, token_hash)
+                assert verdict[0], verdict[1]
+                assert _call(
+                    worker,
+                    "SELECT ok, reason FROM queue_fail_lease_wait(%s, %s, %s, %s)",
+                    (verdict[3], token, "writer lease unavailable", 2),
+                ) == (True, "lease_wait_requeued")
+            assert _waits(admin_conn, item_id) == 2
+
+            # One delivery that actually ran and reported on the work.
+            token, token_hash = _token()
+            verdict = _claim(worker, token_hash)
+            assert verdict[0], verdict[1]
+            assert _call(
+                worker,
+                "SELECT ok, reason FROM queue_fail(%s, %s, %s, true)",
+                (verdict[3], token, "the agent produced no verdict"),
+            ) == (True, "requeued")
+            assert _waits(admin_conn, item_id) == 0, "the wait budget starts over"
+            assert _item(admin_conn, item_id)[1] == 1, "that delivery is spent"
+
+            # So the next fleet refusal is wait number one again, not the
+            # twenty-first of a lifetime -- the item survives it.
+            token, token_hash = _token()
+            verdict = _claim(worker, token_hash)
+            assert verdict[0], verdict[1]
+            assert _call(
+                worker,
+                "SELECT ok, reason FROM queue_fail_lease_wait(%s, %s, %s, %s)",
+                (verdict[3], token, "writer lease unavailable", 2),
+            ) == (True, "lease_wait_requeued")
+
+    assert _item(admin_conn, item_id)[0] == "ready"
+    assert _waits(admin_conn, item_id) == 1
+
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "SELECT detail ->> 'cleared_lease_wait_count' FROM work_event "
+            "WHERE work_item_id = %s AND event = 'fail' AND reason = 'requeued'",
+            (item_id,),
+        )
+        assert cur.fetchall() == [("2",)]
+
+
+def test_redrive_clears_the_no_fault_budget_it_widens_the_attempts_for(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH: the DLQ's exit has to
+    work for the items the FLEET put there.
+
+    Before 0024 a redrive widened `max_attempts` and cleared `dead_reason`
+    but carried `lease_wait_count` across unchanged -- so an item
+    dead-lettered as `lease_wait_exhausted` came back `ready` with its wait
+    budget still spent, and the very next no-fault refusal re-dead-lettered
+    it immediately. The redrive was a no-op and the re-death was counted as
+    fresh dead-letter growth all over again.
+
+    The asymmetry is deliberate and asserted here in one place: the attempt
+    history still is NOT reset (that is what stops a redrive loop from
+    silently granting infinite retries), while the wait budget IS -- it
+    measures what the fleet was doing to the item, and the redrive is the
+    operator's audited assertion that it stopped.
+    """
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
+    with psycopg.connect(app_dsn, autocommit=True) as app:
+        item_id = _enqueue(app, "fleet-dead", max_attempts=2, backoff_seconds=0)
+
+    with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
+        with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+            # The fleet is serving its other work throughout, so the refusals
+            # below are this item being singled out rather than an outage
+            # (0028) -- which is what lets them reach the dead letter this
+            # test is about redriving.
+            with psycopg.connect(app_dsn, autocommit=True) as app:
+                _a_served_fleet(app, worker)
+            # One real attempt is spent first, so the assertions below can tell
+            # "the attempt history survived" apart from "there was none".
+            token, token_hash = _token()
+            verdict = _claim(worker, token_hash)
+            _call(
+                worker,
+                "SELECT ok, reason FROM queue_fail(%s, %s, %s, true)",
+                (verdict[3], token, "a real failure"),
+            )
+            # Then two no-fault refusals against a cap of one: the first is
+            # inside the budget and requeues, the second exceeds it. The
+            # dead-letter branch is `waits > cap`, so a cap of one takes two
+            # refusals to reach -- and the item has to survive the first one,
+            # which is the delivery the pre-0025 claim could not even hand out.
+            for expected in ("lease_wait_requeued", "lease_wait_dead_lettered"):
+                token, token_hash = _token()
+                verdict = _claim(worker, token_hash)
+                assert verdict[0], verdict[1]
+                ok, got = _call(
+                    worker,
+                    "SELECT ok, reason FROM queue_fail_lease_wait(%s, %s, %s, %s)",
+                    (verdict[3], token, "writer lease unavailable", 1),
+                )
+                assert ok is True and got == expected
+
+        assert _item(admin_conn, item_id)[0] == "dead"
+        assert _waits(admin_conn, item_id) == 2, "the cap was exceeded, not merely met"
+
+        with psycopg.connect(app_dsn, autocommit=True) as app:
+            assert _call(app, "SELECT queue_redrive(%s, 2)", (item_id,))[0] is True
+
+        state = _item(admin_conn, item_id)
+        assert state[0] == "ready"
+        assert state[1] == 1, "the real failure's attempt is still not reset"
+        assert state[2] == 4, "the attempt budget is still widened explicitly"
+        assert state[5] is None
+        assert _waits(admin_conn, item_id) == 0, "the wait budget starts over"
+
+        # The whole point: the redriven item survives the next fleet refusal
+        # instead of falling straight back into the dead letter.
+        with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+            token, token_hash = _token()
+            verdict = _claim(worker, token_hash)
+            assert verdict[0], verdict[1]
+            ok, got = _call(
+                worker,
+                "SELECT ok, reason FROM queue_fail_lease_wait(%s, %s, %s, %s)",
+                (verdict[3], token, "writer lease unavailable", 1),
+            )
+            assert ok is True and got == "lease_wait_requeued"
+        assert _item(admin_conn, item_id)[0] == "ready"
+
+    # The number the reset dropped is preserved in the audit, so clearing the
+    # budget does not erase the history of it.
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "SELECT detail ->> 'cleared_lease_wait_count' FROM work_event "
+            "WHERE work_item_id = %s AND event = 'redrive' AND outcome = 'granted'",
+            (item_id,),
+        )
+        assert cur.fetchall() == [("2",)]
+
+
+# ---------------------------------------------------------------------------
+# A lapsed lease is the fleet's fact, not the item's (0027)
+# ---------------------------------------------------------------------------
+
+
+def _lose_the_worker(admin_conn, psycopg, app_dsn, attempt_id: str) -> None:
+    """What a killed lane looks like to the server: an attempt that stops
+    heartbeating, its deadline passing, and the reaper's next tick.
+
+    Nothing here forges a queue state -- only the wall clock is hurried, and
+    only for the one attempt. That is the whole of the difference between a
+    lane that was OOM-killed mid-run and this loop.
+    """
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "UPDATE work_attempt SET visible_until = now() - interval '1 second' "
+            "WHERE attempt_id = %s",
+            (attempt_id,),
+        )
+        assert cur.rowcount == 1
+    with psycopg.connect(app_dsn, autocommit=True) as app:
+        assert _call(app, "SELECT queue_reap()", ())[0] == 1
+
+
+def test_losing_a_worker_does_not_spend_the_items_model_attempts(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """VOYN-MON-CONTROL-01-QUEUE-DEAD-LETTER-GROWTH, the reaper's share of it.
+
+    `max_attempts` is the executor cascade's length -- two links -- so before
+    0027 two lease lapses were enough to dead-letter an item that had never
+    reached a model. And a lapse is not rare: the lane is OOM-killed at
+    `MemoryMax=6G`, restarted by `WatchdogSec=240s`, restarted again by
+    `Restart=always`, or simply cannot reach PostgreSQL to report -- three
+    branches of `daemon._execute` choose this exit deliberately, each
+    promising in its own comment that "a later delivery retries".
+
+    A lapse cannot be evidence about the payload, because the heartbeat runs
+    BESIDE the handler: a handler that hangs keeps renewing its lease and the
+    item stays `claimed` (the monitor's `queue_stalled`), never reaching the
+    reaper at all. So five worker losses here leave both model attempts
+    unspent and the item claimable -- the promise, now payable.
+    """
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
+    with psycopg.connect(app_dsn, autocommit=True) as app:
+        item_id = _enqueue(app, "lost-worker", max_attempts=2, backoff_seconds=0)
+
+    with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
+        with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+            for delivery in range(1, 6):
+                verdict = _claim(worker, _token()[1])
+                assert verdict[0], verdict[1]
+                # The DELIVERY number climbs while the BUDGET does not (0025).
+                # Both matter: a delivery number that came back with the
+                # refunded budget would collide with the attempt row this
+                # claim just wrote, and a cascade that re-read the same number
+                # would re-run the link whose host has just died.
+                assert verdict[4] == delivery
+                assert _item(admin_conn, item_id)[1] == 1, "the claim spent one"
+
+                _lose_the_worker(admin_conn, psycopg, app_dsn, verdict[3])
+
+                state = _item(admin_conn, item_id)
+                assert state[0] == "ready", "still deliverable after a lost lane"
+                assert state[1] == 0, "the lapse gave the attempt back"
+                assert state[3] is None
+                assert _waits(admin_conn, item_id) == delivery
+
+            # And the budget it kept is a real one: the item still has both
+            # model attempts to spend on the executors the cascade names.
+            for expected in ("requeued", "dead_lettered"):
+                token, token_hash = _token()
+                verdict = _claim(worker, token_hash)
+                assert verdict[0], verdict[1]
+                assert _call(
+                    worker,
+                    "SELECT ok, reason FROM queue_fail(%s, %s, %s, true)",
+                    (verdict[3], token, "the model ran and failed"),
+                ) == (True, expected)
+
+    state = _item(admin_conn, item_id)
+    assert state[0] == "dead"
+    assert state[5] == "max_attempts_exhausted: the model ran and failed"
+    assert state[1] == 2, "the dead letter is the item's own two attempts"
+
+
+def test_lapses_that_never_stop_still_terminate_in_the_dead_letter(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """The refund is not a licence to retry forever.
+
+    A payload that somehow takes its worker down every single time -- while
+    every OTHER item on the queue is being served, which is what makes the
+    payload the suspect (0028) -- still reaches the DLQ, on the bounded fleet
+    budget (20 waits, the number `work_queue_store.fail_lease_wait` passes)
+    rather than on the cascade's two. The cause names the budget that ran out
+    AND the condition that spent it, so the DLQ shows one class for "the
+    fleet put it here" while an operator can still tell a dying lane apart
+    from writer-lease contention.
+    """
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
+    with psycopg.connect(app_dsn, autocommit=True) as app:
+        item_id = _enqueue(app, "never-beats", max_attempts=2, backoff_seconds=0)
+
+    with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
+        with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+            with psycopg.connect(app_dsn, autocommit=True) as app:
+                _a_served_fleet(app, worker)
+            for lapse in range(1, 22):
+                verdict = _claim(worker, _token()[1])
+                assert verdict[0], verdict[1]
+                _lose_the_worker(admin_conn, psycopg, app_dsn, verdict[3])
+                # The cap is exceeded, not merely met: 20 lapses requeue and
+                # the 21st is the one that gives up.
+                assert _item(admin_conn, item_id)[0] == (
+                    "dead" if lapse > 20 else "ready"
+                )
+
+    state = _item(admin_conn, item_id)
+    assert state[5] == "lease_wait_exhausted: visibility_timeout"
+    assert state[1] == 0, "not one model attempt was ever spent on this item"
+    assert _waits(admin_conn, item_id) == 21
+    # The attempt rows survive the refund -- the refund returns the budget,
+    # never the history, and `work_dlq` shows an operator both numbers.
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "SELECT attempts_recorded, attempt_count, last_attempt_reason "
+            "FROM work_dlq WHERE work_item_id = %s",
+            (item_id,),
+        )
+        assert cur.fetchone() == (21, 0, "visibility_timeout")
+
+    # And the operator's exit still works on it: 0024 resets exactly this
+    # budget, so a redriven item is not re-dead-lettered by the next lapse.
+    with psycopg.connect(app_dsn, autocommit=True) as app:
+        assert _call(app, "SELECT queue_redrive(%s, 1)", (item_id,))[0] is True
+    assert _waits(admin_conn, item_id) == 0
+
+
+def test_lapses_while_nothing_is_being_served_are_an_outage_not_a_verdict(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """The reaper takes the same 0028 gate as the refusal path, and it is the
+    path that matters most for it: nobody reported anything here. A lapse
+    means the worker PROCESS stopped beating -- an OOM kill, a watchdog
+    restart, a host loss, a database outage -- and a rolling restart or a
+    cluster failover produces exactly this on every lane at once.
+
+    Twenty-five lapses with nothing else getting through leave the item
+    `ready` with its model attempts intact, instead of the DLQ row a
+    fleet-wide restart used to write for every item in flight.
+    """
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
+    with psycopg.connect(app_dsn, autocommit=True) as app:
+        item_id = _enqueue(app, "whole-fleet-restarted", max_attempts=2, backoff_seconds=0)
+
+    with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
+        with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+            for lapse in range(1, 26):
+                verdict = _claim(worker, _token()[1])
+                assert verdict[0], verdict[1]
+                _lose_the_worker(admin_conn, psycopg, app_dsn, verdict[3])
+                assert _item(admin_conn, item_id)[0] == "ready", lapse
+
+    state = _item(admin_conn, item_id)
+    assert state[5] is None, "no dead letter for a fleet that stopped beating"
+    assert state[1] == 0, "and not one model attempt spent"
+    assert _waits(admin_conn, item_id) == 25
 
 
 # ---------------------------------------------------------------------------
@@ -1709,6 +2456,23 @@ def test_every_reachable_audit_site_writes_a_row(
             ) == (False, "attempt_expired")
 
             # expire: granted/dead_lettered — the reaper branch that exhausts.
+            # It exhausts the LEASE-WAIT budget (0027), so the one lapse above
+            # leaves nineteen more before the twenty-first gives up; forcing
+            # the counter is the honest way to drive this one site without
+            # making an audit sweep into a twenty-claim loop, and the arithmetic
+            # itself is pinned by
+            # `test_lapses_that_never_stop_still_terminate_in_the_dead_letter`.
+            #
+            # The served sibling is the other half of that branch's condition
+            # since 0028: a budget exhausted while NOTHING is being served is
+            # an outage, requeues, and would never reach this audit site.
+            with psycopg.connect(app_dsn, autocommit=True) as app:
+                _a_served_fleet(app, worker)
+            with admin_conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE work_item SET lease_wait_count = 20 WHERE work_item_id = %s",
+                    (requeued_item,),
+                )
             token, token_hash = _token()
             third = _claim(worker, token_hash, visibility=SHORT_VISIBILITY)
             assert third[0] and third[4] == 3
@@ -1798,6 +2562,15 @@ def test_the_reaper_audits_both_of_its_branches(
     The sweep above would catch it, but a reader looking for "is re-delivery
     audited?" should find a test that says so rather than have to trust a
     registry entry.
+
+    Reaching the dead-letter branch takes 21 lapses, not 2: since 0027 it is
+    the item's bounded LEASE-WAIT budget that runs out here, never its
+    `max_attempts`. Both numbers travel into each audit row, because "why is
+    this item back on the queue for the ninth time" is answered by the wait
+    count and "how much of its own budget is left" by the attempt count, and
+    the whole bug was reading one of them as the other. Since 0028 it also
+    takes a fleet that is serving its siblings, which the audit rows record
+    as `fleet_is_serving` for the same reason.
     """
     _provision(admin_conn, psycopg, test_dsn, role_passwords)
     app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
@@ -1806,7 +2579,9 @@ def test_the_reaper_audits_both_of_its_branches(
 
     with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
         with psycopg.connect(host_dsns[0], autocommit=True) as worker:
-            for _ in range(2):
+            with psycopg.connect(app_dsn, autocommit=True) as app:
+                _a_served_fleet(app, worker)
+            for _ in range(21):
                 verdict = _claim(worker, _token()[1], visibility=SHORT_VISIBILITY)
                 assert verdict[0], verdict[1]
                 with admin_conn.cursor() as cur:
@@ -1819,13 +2594,21 @@ def test_the_reaper_audits_both_of_its_branches(
                     assert _call(app, "SELECT queue_reap()", ())[0] == 1
 
     expiries = [e for e in _events(admin_conn, item_id) if e[0] == "expire"]
-    assert [(e[1], e[2]) for e in expiries] == [
-        ("granted", "requeued"),
-        ("granted", "dead_lettered"),
-    ]
+    assert [(e[1], e[2]) for e in expiries] == (
+        [("granted", "requeued")] * 20 + [("granted", "dead_lettered")]
+    )
     # The actor is the reaper's connected role, not the worker whose attempt it
     # expired — the one place the audit's actor and the attempt's owner differ.
     assert {e[3] for e in expiries} == {roles.APP_ROLE}
+
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "SELECT detail ->> 'lease_wait_count', detail ->> 'attempt_count' "
+            "FROM work_event WHERE work_item_id = %s AND event = 'expire' "
+            "ORDER BY seq",
+            (item_id,),
+        )
+        assert cur.fetchall() == [(str(n), "0") for n in range(1, 22)]
 
 
 def test_enqueue_is_idempotent_per_queue_and_key(
@@ -2150,3 +2933,469 @@ def test_the_queue_mirror_is_untouched_by_this_migration(
             "ORDER BY ordinal_position"
         )
         assert cur.fetchall() == after
+
+
+def test_a_duplicate_enqueue_cannot_lose_the_audit_sequence_race(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """THE REGRESSION (0039). `_queue_audit` numbers `work_event.seq` as
+    `max(seq) + 1` and says in its own comment why that needs no retry loop:
+    "every caller passing a non-null work_item_id already holds that item's
+    row lock". The duplicate-enqueue path resolved the existing item with a
+    bare SELECT and held nothing.
+
+    The FK's `FOR KEY SHARE` is not that lock and cannot stand in for it: it
+    does not conflict with itself, and it is taken by the audit's INSERT --
+    after the `max(seq)` subquery in the same statement has been evaluated. So
+    two dispatchers re-enqueueing one in-flight key both work out the same
+    number and the unique index refuses the second.
+
+    Driven deterministically rather than by racing threads and hoping: the
+    first enqueue holds its transaction open, so the second is at the exact
+    interleaving the bug needs -- its `seq` decided, its commit behind the
+    other's. Without the lock in 0039 the second raises `UniqueViolation` on
+    `idx_work_event_item_seq`; with it, it waits on the row instead and reads
+    `max(seq)` again afterwards.
+    """
+    import threading
+
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
+    with psycopg.connect(app_dsn, autocommit=True) as app:
+        item_id = _enqueue(app, "in-flight-key")
+
+    # Two dispatchers, each retrying the same enqueue -- which is what the
+    # idempotency key is for, and what `aicc-backlog-review.timer`,
+    # `aicc-backlog-merge.timer` and the planner do to work already queued.
+    first = psycopg.connect(app_dsn)
+    second = psycopg.connect(app_dsn)
+    raised: dict[str, BaseException] = {}
+    finished = threading.Event()
+    try:
+        with first.cursor() as cur:
+            cur.execute(
+                "SELECT queue_enqueue(%s, %s, '{}'::jsonb)", (QUEUE, "in-flight-key")
+            )
+            assert cur.fetchone()[0] == item_id
+
+        def duplicate() -> None:
+            try:
+                with second.cursor() as cur:
+                    cur.execute(
+                        "SELECT queue_enqueue(%s, %s, '{}'::jsonb)",
+                        (QUEUE, "in-flight-key"),
+                    )
+                    assert cur.fetchone()[0] == item_id
+                second.commit()
+            except BaseException as error:  # noqa: BLE001 — reported below
+                raised["error"] = error
+            finally:
+                finished.set()
+
+        worker = threading.Thread(target=duplicate)
+        worker.start()
+        # Long enough that the second enqueue has reached its wait; with the
+        # bare SELECT it does not wait at all and is already past it.
+        time.sleep(0.5)
+        first.commit()
+        assert finished.wait(timeout=10), "the second enqueue never returned"
+        worker.join(timeout=5)
+    finally:
+        first.close()
+        second.close()
+
+    assert "error" not in raised, (
+        "a duplicate enqueue raised instead of recording its refusal: "
+        f"{raised.get('error')!r}"
+    )
+
+    # Both refusals are on the record, and the per-item sequence is still
+    # gap-free -- which is the property `idx_work_event_item_seq` exists to
+    # keep and the reason a deleted row is detectable.
+    events = _events(admin_conn, item_id)
+    assert [event[2] for event in events] == [
+        None,
+        "duplicate_idempotency_key",
+        "duplicate_idempotency_key",
+    ]
+    assert [event[4] for event in events] == [1, 2, 3]
+
+
+def test_a_duplicate_enqueue_does_not_raise_against_the_items_own_heartbeat(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """The pairing this fleet actually produces, and the reason 0039 is not
+    only about two dispatchers.
+
+    A worker holding an item beats every ``beat_interval_seconds`` (~75s on
+    the deployed lanes), and every beat is an audited write to that item taken
+    under `_queue_owns`'s `FOR UPDATE`. A review or merge tick re-enqueueing
+    that item's key lands on the duplicate path with no lock at all, so it
+    settles its `seq` on a pre-beat snapshot, waits for the beat's FK lock,
+    and commits a number the beat has already used.
+
+    Note the asymmetry the fix rests on: the LOCKED party never loses. It is
+    always the unlocked duplicate enqueue that raises -- which is why the
+    defect showed up as dispatch failing rather than as the queue protocol
+    failing, and why nothing in the worker path could have caught it.
+    """
+    import threading
+
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
+    with psycopg.connect(app_dsn, autocommit=True) as app:
+        item_id = _enqueue(app, "beating-key")
+
+    with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
+        with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+            token, token_hash = _token()
+            claimed = _claim(worker, token_hash)
+            assert claimed[0], claimed
+
+        beating = psycopg.connect(host_dsns[0])
+        enqueuing = psycopg.connect(app_dsn)
+        raised: dict[str, BaseException] = {}
+        finished = threading.Event()
+        try:
+            with beating.cursor() as cur:
+                cur.execute(
+                    "SELECT ok FROM queue_heartbeat(%s, %s)", (claimed[3], token)
+                )
+                assert cur.fetchone()[0] is True
+
+            def duplicate() -> None:
+                try:
+                    with enqueuing.cursor() as cur:
+                        cur.execute(
+                            "SELECT queue_enqueue(%s, %s, '{}'::jsonb)",
+                            (QUEUE, "beating-key"),
+                        )
+                        assert cur.fetchone()[0] == item_id
+                    enqueuing.commit()
+                except BaseException as error:  # noqa: BLE001 — reported below
+                    raised["error"] = error
+                finally:
+                    finished.set()
+
+            thread = threading.Thread(target=duplicate)
+            thread.start()
+            time.sleep(0.5)
+            beating.commit()
+            assert finished.wait(timeout=10), "the duplicate enqueue never returned"
+            thread.join(timeout=5)
+        finally:
+            beating.close()
+            enqueuing.close()
+
+    assert "error" not in raised, (
+        "a re-enqueue of in-flight work raised against its own heartbeat: "
+        f"{raised.get('error')!r}"
+    )
+    events = _events(admin_conn, item_id)
+    assert [event[0] for event in events] == [
+        "enqueue",
+        "claim",
+        "heartbeat",
+        "enqueue",
+    ]
+    assert [event[4] for event in events] == [1, 2, 3, 4]
+
+
+def test_a_lease_renewed_mid_reap_is_not_expired_anyway(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """The reap's re-test under the lock must carry BOTH halves of the scan's
+    predicate (0041).
+
+    `queue_reap` reads `work_attempt` once, at its transaction's snapshot, and
+    then re-tests each attempt under the item's row lock before expiring it.
+    0002 wrote that re-test as `state = 'active'` alone -- "a completion may
+    have landed since the scan". A completion is not the only thing that can
+    land there. `queue_heartbeat` moves `visible_until` and leaves `state`
+    exactly where it was, so a beat that committed between the scan and the
+    lock passed the re-test and had its lease expired anyway.
+
+    0040's `SKIP LOCKED` narrowed the window and could not close it: while the
+    beat's transaction is open it holds the item `FOR UPDATE` (`_queue_owns`),
+    so a reap arriving then defers the item -- correct. What remains is the
+    beat that has already COMMITTED and released, which is what this test
+    stages.
+
+    Nothing here is simulated. The beat is a real `queue_heartbeat` from a
+    transaction that opened while the lease was still live -- which is what
+    makes it a beat that raced its own deadline, since
+    `transaction_timestamp()` freezes there -- and it commits while a real
+    `queue_reap` is blocked mid-loop on another attempt's row. The block is the
+    device that makes the interleaving deterministic instead of a race the
+    suite would only lose sometimes; it is waited for in `pg_stat_activity`
+    rather than slept at.
+
+    What the defect costs is why it is filed under a stall: the lane is still
+    running. Its next beat and its `queue_complete` both resolve to
+    `attempt_superseded`, so `worker.daemon._execute` discards an outcome worth
+    up to one whole `TimeoutStopSec=3660s` attempt; the item goes back on the
+    due-ready pile `infra_monitor.evaluate` weighs, to be executed a second
+    time; and the attempt `queue_claim` charged for the delivery is spent with
+    no refund, so enough repeats dead-letter a perfectly healthy item.
+    """
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
+    with psycopg.connect(app_dsn, autocommit=True) as app:
+        blocking_id = _enqueue(app, "blocks-the-reap", backoff_seconds=0)
+        beating_id = _enqueue(app, "beats-the-reap", backoff_seconds=0)
+
+    with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
+        with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+            blocking = _claim(worker, _token()[1])
+            beating_token, beating_hash = _token()
+            beating = _claim(worker, beating_hash)
+        assert blocking[0] and beating[0], (blocking[1], beating[1])
+        assert blocking[2] == blocking_id and beating[2] == beating_id
+
+        # The beating lane's heartbeat transaction opens HERE, while its lease
+        # is still live, and is not committed until the reap is under way.
+        beat = psycopg.connect(host_dsns[0])
+        try:
+            with beat.cursor() as cur:
+                cur.execute("SELECT 1")  # freezes transaction_timestamp()
+
+            with admin_conn.cursor() as cur:
+                # `blocking` lapsed long ago, so the reap reaches it first
+                # (`ORDER BY a.visible_until`). `beating` lapses just after the
+                # beat's frozen clock and well before the reap's -- the beat is
+                # therefore still entitled to renew, and the reap still selects
+                # the attempt.
+                cur.execute(
+                    "UPDATE work_attempt SET visible_until = now() - interval '1 hour' "
+                    "WHERE attempt_id = %s",
+                    (blocking[3],),
+                )
+                cur.execute(
+                    "UPDATE work_attempt "
+                    "SET visible_until = now() + interval '0.5 seconds' "
+                    "WHERE attempt_id = %s",
+                    (beating[3],),
+                )
+            time.sleep(1.0)
+
+            # Pin the blocking attempt's row so the reap stops inside its loop,
+            # after the scan has already selected both attempts. Nothing in the
+            # protocol takes this lock; the test does, because a reap that ran
+            # straight through would leave no window to commit into.
+            pin = psycopg.connect(
+                _as_role(test_dsn, roles.MIGRATOR_ROLE, role_passwords[roles.MIGRATOR_ROLE])
+            )
+            try:
+                with pin.cursor() as cur:
+                    cur.execute(
+                        "SELECT 1 FROM work_attempt WHERE attempt_id = %s FOR UPDATE",
+                        (blocking[3],),
+                    )
+                    assert cur.fetchone() is not None
+
+                reaped: dict[str, object] = {}
+
+                def reap() -> None:
+                    try:
+                        with psycopg.connect(app_dsn, autocommit=True) as app:
+                            reaped["n"] = _call(app, "SELECT queue_reap()", ())[0]
+                    except BaseException as error:  # noqa: BLE001 — reported below
+                        reaped["error"] = error
+
+                thread = threading.Thread(target=reap)
+                thread.start()
+                try:
+                    deadline = time.monotonic() + 15
+                    while time.monotonic() < deadline:
+                        with admin_conn.cursor() as cur:
+                            cur.execute(
+                                # Scoped to this test's own database and to
+                                # other backends: `pg_stat_activity` is
+                                # cluster-wide, and the pattern below appears
+                                # in this very statement's `query` text.
+                                "SELECT count(*) FROM pg_stat_activity "
+                                "WHERE datname = current_database() "
+                                "AND pid <> pg_backend_pid() "
+                                "AND query LIKE '%%queue_reap%%' "
+                                "AND wait_event_type = 'Lock'"
+                            )
+                            if cur.fetchone()[0]:
+                                break
+                        time.sleep(0.05)
+                    else:
+                        raise AssertionError("the reap never blocked on the pinned row")
+
+                    # The beat lands now: inside the reap's transaction, after
+                    # its scan, and committed before it reaches this attempt.
+                    with beat.cursor() as cur:
+                        cur.execute(
+                            "SELECT ok, reason FROM queue_heartbeat(%s, %s)",
+                            (beating[3], beating_token),
+                        )
+                        assert cur.fetchone() == (True, None), (
+                            "the staged beat must be one the protocol accepts, or "
+                            "this test proves nothing about a renewed lease"
+                        )
+                    beat.commit()
+                finally:
+                    pin.rollback()
+                    thread.join(timeout=20)
+                assert not thread.is_alive(), "the reap never finished"
+                assert "error" not in reaped, reaped.get("error")
+            finally:
+                pin.close()
+        finally:
+            beat.close()
+
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "SELECT state, visible_until > now() FROM work_attempt WHERE attempt_id = %s",
+            (beating[3],),
+        )
+        attempt_state, lease_live = cur.fetchone()
+
+    assert lease_live, "the staged renewal did not survive to the assertion"
+    assert attempt_state == "active", (
+        "queue_reap expired an attempt whose lease the protocol had just "
+        "renewed: the re-test under the item's row lock checked only that the "
+        "attempt was still 'active' and not that it was still lapsed"
+    )
+    # And the consequence the worker would actually feel: the item is still
+    # its claim, so its beats and its result are still accepted.
+    state, _count, _max, current, _result, _dead = _item(admin_conn, beating_id)
+    assert (state, current) == ("claimed", beating[3])
+    # The blocking item was recovered in the same tick -- the fix defers a
+    # renewed lease, not the reap.
+    assert _item(admin_conn, blocking_id)[0] == "ready"
+    assert reaped["n"] == 1
+
+
+def test_a_completion_landed_mid_reap_is_not_expired_over(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """The other half of the same re-test, which 0002 wrote and nothing proved.
+
+    `queue_reap`'s re-test has carried `state = 'active'` since 0002, with the
+    comment that says why -- "a completion may have landed since the scan". The
+    test above pins the half 0041 added; deleting the half 0002 wrote left the
+    whole suite green, which is the same shape of unproven guard this branch
+    has been closing everywhere else. So it is pinned here, by the same
+    deterministic staging: a real `queue_complete` from a transaction that
+    opened while the lease was live, committing while a real `queue_reap` is
+    blocked mid-loop on another attempt's row.
+
+    Without it the reap expires a succeeded attempt and then rewrites its item
+    -- back to `ready`, so finished work is executed again, or straight to
+    `dead` once the budget is spent, so finished work needs an operator's
+    `queue_redrive` to come back. Either way the result the worker wrote is
+    still in `work_result` with nothing pointing at it.
+    """
+    _provision(admin_conn, psycopg, test_dsn, role_passwords)
+    app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
+    with psycopg.connect(app_dsn, autocommit=True) as app:
+        blocking_id = _enqueue(app, "blocks-the-reap", backoff_seconds=0)
+        finishing_id = _enqueue(app, "finishes-mid-reap", backoff_seconds=0)
+
+    with _worker_hosts(admin_conn, psycopg, test_dsn, 1) as (host_dsns, _names):
+        with psycopg.connect(host_dsns[0], autocommit=True) as worker:
+            blocking = _claim(worker, _token()[1])
+            finishing_token, finishing_hash = _token()
+            finishing = _claim(worker, finishing_hash)
+        assert blocking[0] and finishing[0], (blocking[1], finishing[1])
+        assert finishing[2] == finishing_id
+
+        finish = psycopg.connect(host_dsns[0])
+        try:
+            with finish.cursor() as cur:
+                cur.execute("SELECT 1")  # freezes transaction_timestamp()
+
+            with admin_conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE work_attempt SET visible_until = now() - interval '1 hour' "
+                    "WHERE attempt_id = %s",
+                    (blocking[3],),
+                )
+                cur.execute(
+                    "UPDATE work_attempt "
+                    "SET visible_until = now() + interval '0.5 seconds' "
+                    "WHERE attempt_id = %s",
+                    (finishing[3],),
+                )
+            time.sleep(1.0)
+
+            pin = psycopg.connect(
+                _as_role(test_dsn, roles.MIGRATOR_ROLE, role_passwords[roles.MIGRATOR_ROLE])
+            )
+            try:
+                with pin.cursor() as cur:
+                    cur.execute(
+                        "SELECT 1 FROM work_attempt WHERE attempt_id = %s FOR UPDATE",
+                        (blocking[3],),
+                    )
+                    assert cur.fetchone() is not None
+
+                reaped: dict[str, object] = {}
+
+                def reap() -> None:
+                    try:
+                        with psycopg.connect(app_dsn, autocommit=True) as app:
+                            reaped["n"] = _call(app, "SELECT queue_reap()", ())[0]
+                    except BaseException as error:  # noqa: BLE001 — reported below
+                        reaped["error"] = error
+
+                thread = threading.Thread(target=reap)
+                thread.start()
+                try:
+                    deadline = time.monotonic() + 15
+                    while time.monotonic() < deadline:
+                        with admin_conn.cursor() as cur:
+                            cur.execute(
+                                # Scoped to this test's own database and to
+                                # other backends: `pg_stat_activity` is
+                                # cluster-wide, and the pattern below appears
+                                # in this very statement's `query` text.
+                                "SELECT count(*) FROM pg_stat_activity "
+                                "WHERE datname = current_database() "
+                                "AND pid <> pg_backend_pid() "
+                                "AND query LIKE '%%queue_reap%%' "
+                                "AND wait_event_type = 'Lock'"
+                            )
+                            if cur.fetchone()[0]:
+                                break
+                        time.sleep(0.05)
+                    else:
+                        raise AssertionError("the reap never blocked on the pinned row")
+
+                    with finish.cursor() as cur:
+                        cur.execute(
+                            "SELECT ok, reason FROM queue_complete(%s, %s, %s::jsonb)",
+                            (finishing[3], finishing_token, json.dumps({"done": True})),
+                        )
+                        assert cur.fetchone() == (True, None), (
+                            "the staged completion must be one the protocol "
+                            "accepts, or this test proves nothing"
+                        )
+                    finish.commit()
+                finally:
+                    pin.rollback()
+                    thread.join(timeout=20)
+                assert not thread.is_alive(), "the reap never finished"
+                assert "error" not in reaped, reaped.get("error")
+            finally:
+                pin.close()
+        finally:
+            finish.close()
+
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "SELECT state FROM work_attempt WHERE attempt_id = %s", (finishing[3],)
+        )
+        assert cur.fetchone()[0] == "succeeded", (
+            "queue_reap expired an attempt that had already succeeded: the "
+            "re-test under the item's row lock did not re-read its state"
+        )
+    state, _count, _max, current, result_id, _dead = _item(admin_conn, finishing_id)
+    assert (state, current) == ("succeeded", None)
+    assert result_id is not None, "the completed item lost the result it wrote"
+    assert _item(admin_conn, blocking_id)[0] == "ready"
+    assert reaped["n"] == 1
