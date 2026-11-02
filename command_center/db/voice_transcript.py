@@ -134,7 +134,10 @@ _WAVE_PHRASE = re.compile(
 # :func:`_ordinal_wave_sub`. The single-regex form
 # ``([а-яё]+)\s+(волн[а-яё]*)`` backtracks quadratically on long letter runs
 # (CodeQL py/polynomial-redos; the transcript is owner-supplied input).
-_WAVE_WORD = re.compile(r"(?<![0-9A-Za-zА-Яа-яЁё-])волн[а-яё]*(?![0-9A-Za-zА-Яа-яЁё-])", re.I)
+# Only the fixed stem is matched by a regex; the word boundaries and the
+# letter suffix are checked by hand in :func:`_wave_words` (a quantified
+# suffix before a lookahead is itself flagged as polynomial by CodeQL).
+_WAVE_STEM = re.compile("волн", re.I)
 _WORD_BOUNDARY_CHARS = frozenset(
     "0123456789-"
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
@@ -147,6 +150,21 @@ def _is_cyrillic_letter(char: str) -> bool:
     return "а" <= lowered <= "я" or lowered == "ё"
 
 
+def _wave_words(text: str):
+    """Yield ``(start, end)`` of each whole word «волн…», like
+    ``(?<!B)волн[а-яё]*(?!B)`` with ``re.I``, in linear time."""
+    for stem in _WAVE_STEM.finditer(text):
+        start = stem.start()
+        if start > 0 and text[start - 1] in _WORD_BOUNDARY_CHARS:
+            continue
+        end = stem.end()
+        while end < len(text) and _is_cyrillic_letter(text[end]):
+            end += 1
+        if end < len(text) and text[end] in _WORD_BOUNDARY_CHARS:
+            continue
+        yield start, end
+
+
 def _ordinal_wave_sub(text: str, replace) -> str:
     r"""Equivalent of ``re.sub(r"(?<!B)([а-яё]+)\s+(волн[а-яё]*)(?!B)", ...)``.
 
@@ -156,8 +174,8 @@ def _ordinal_wave_sub(text: str, replace) -> str:
     """
     out: list[str] = []
     last_end = 0
-    for wave in _WAVE_WORD.finditer(text):
-        ws_end = wave.start()
+    for wave_start, wave_end in _wave_words(text):
+        ws_end = wave_start
         ws_start = ws_end
         while ws_start > last_end and text[ws_start - 1].isspace():
             ws_start -= 1
@@ -171,8 +189,8 @@ def _ordinal_wave_sub(text: str, replace) -> str:
         if word_start > 0 and text[word_start - 1] in _WORD_BOUNDARY_CHARS:
             continue
         out.append(text[last_end:word_start])
-        out.append(replace(text[word_start : wave.end()], text[word_start:ws_start]))
-        last_end = wave.end()
+        out.append(replace(text[word_start:wave_end], text[word_start:ws_start]))
+        last_end = wave_end
     out.append(text[last_end:])
     return "".join(out)
 # «приоритет ноль» / «пи ноль» / «п 1» / Cyrillic «р0» -> "P0".
