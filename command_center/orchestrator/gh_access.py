@@ -469,15 +469,15 @@ def _cache_root(env: Mapping[str, str] | None = None) -> Path | None:
         state = env.get("CACHE_DIRECTORY")
         if state:
             candidates.append(Path(state.split(":")[0]) / "gh-details")
-        home_cache = env.get("XDG_CACHE_HOME") or env.get("HOME")
+        home_cache = env.get("XDG_CACHE_HOME") or env.get("HOME") or env.get("USERPROFILE")
         if home_cache:
             base = Path(home_cache)
             if not env.get("XDG_CACHE_HOME"):
                 base = base / ".cache"
             candidates.append(base / "aicc" / "gh-details")
-        candidates.append(
-            Path(tempfile.gettempdir()) / f"aicc-gh-details-{os.getuid()}"
-        )
+        uid = (str(os.getuid()) if hasattr(os, "getuid") else
+               hashlib.sha256((env.get("USERNAME") or "unknown").encode()).hexdigest()[:16])
+        candidates.append(Path(tempfile.gettempdir()) / f"aicc-gh-details-{uid}")
     for candidate in candidates:
         try:
             candidate.mkdir(parents=True, exist_ok=True)
@@ -515,7 +515,8 @@ class PrDetailCache:
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> PrDetailCache:
         ttl = _cache_ttl(env)
-        return cls(_cache_root(env) if ttl else None, ttl)
+        # Cursor persistence must survive disabled detail caching (ttl=0).
+        return cls(_cache_root(env), ttl)
 
     @property
     def enabled(self) -> bool:

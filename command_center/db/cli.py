@@ -361,6 +361,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"BLOCKED   #{number}: {reason}")
         for number, head in window.age_fallback:
             print(f"AGE-FALLBACK #{number} -> {head}: createdAt used")
+        for number, head in window.unchecked:
+            print(f"UNCHECKED #{number} -> {head}: detail budget exhausted, label kept")
         for number, head in window.unreadable:
             print(f"UNREADABLE #{number} -> {head}: detail lookup failed, label kept")
         if window.quota is not None:

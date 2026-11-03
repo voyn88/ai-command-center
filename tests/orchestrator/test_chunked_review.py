@@ -137,7 +137,7 @@ def test_reconcile_enqueues_only_fresh_chunk_retry(monkeypatch):
     monkeypatch.setattr(
         review_merge,
         "_next_retry_key",
-        lambda _factory, _task, base_key, _head: f"{base_key}:retry:1"
+        lambda _factory, _task, base_key, _head, _snapshot=None: f"{base_key}:retry:1"
         if base_key == target else None,
     )
     monkeypatch.setattr(

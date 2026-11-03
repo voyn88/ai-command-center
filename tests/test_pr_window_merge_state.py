@@ -1,7 +1,14 @@
 from __future__ import annotations
 
+import pytest
+
 from command_center.orchestrator import review_merge
 from command_center.orchestrator.review_merge import PrWindowConfig, reconcile_pr_window
+
+
+@pytest.fixture(autouse=True)
+def isolated_window_cache(tmp_path, monkeypatch):
+    monkeypatch.setenv("AICC_GH_CACHE_DIR", str(tmp_path / "cache"))
 
 
 def _pr(number: int, head: str, *, label: str | None = None, merge_state: str = "CLEAN"):
