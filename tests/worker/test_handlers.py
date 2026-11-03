@@ -2312,8 +2312,13 @@ def test_review_head_checkout_builds_a_detached_worktree_at_the_exact_sha(
     assert checkout is not None and checkout.is_dir()
     assert git(checkout, "rev-parse", "HEAD") == head_sha
 
+    second, second_failure = _review_head_checkout(clone, "7", head_sha)
+    assert second_failure is None and second != checkout
+    assert git(checkout, "rev-parse", "HEAD") == head_sha
     _remove_review_head_checkout(clone, checkout)
     assert not checkout.exists()
+    assert second is not None and git(second, "rev-parse", "HEAD") == head_sha
+    _remove_review_head_checkout(clone, second)
 
     missing, failure = _review_head_checkout(clone, "7", "f" * 40)
     assert missing is None and "unreachable" in failure

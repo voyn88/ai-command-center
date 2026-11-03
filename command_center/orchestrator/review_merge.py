@@ -1421,10 +1421,16 @@ def _bind_media_review(payload: dict[str, Any], snapshot: _PRSnapshot, pr_url: s
     if not paths:
         return paths is not None
     parsed = _owner_repo_number_from_pr_url(pr_url)
-    route = _verification_review_cascade()
+    # Preserve retry failover order; only these CLI adapters transport images.
+    candidates = payload.get("cascade") or _verification_review_cascade()
+    route = [
+        {**link, "task_type": "verification_review", "capability": "read_only"}
+        for link in candidates
+        if isinstance(link, dict) and link.get("executor") in {"codex", "claude"}
+    ]
     if parsed is None or not route:
         return False
-    payload.update(task_type="verification_review", cascade=route,
+    payload.update(task_type="verification_review", cascade=route, media_review=True,
                    review_head={"pr_number": parsed[2], "head_sha": snapshot.head})
     return True
 
@@ -2733,7 +2739,9 @@ def _verified_rejection_outcome(
             "head_sha": snapshot.head,
         },
     }
-    enqueue(cfg.queue, key, payload, task_id, len(cascade))
+    if not _bind_media_review(payload, snapshot, pr_url):
+        return "REMEDIATE", findings
+    enqueue(cfg.queue, key, payload, task_id, len(payload["cascade"]))
     return "WAIT", "verification_enqueued"
 
 

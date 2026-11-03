@@ -145,3 +145,33 @@ def test_disabled_cache_keeps_stable_cursor_directory_on_windows(tmp_path, monke
     second = m.gh_access.PrDetailCache.from_env(env)
     assert not first.enabled
     assert first.directory == second.directory == tmp_path / ".cache/aicc/gh-details"
+
+
+def test_media_binding_preserves_failover_and_filters_text_only_adapters():
+    payload = {"cascade": [
+        {"executor": "claude"}, {"executor": "grok"}, {"executor": "codex"}
+    ]}
+    assert m._bind_media_review(payload, snap(PNG), PR)
+    assert [x["executor"] for x in payload["cascade"]] == ["claude", "codex"]
+    assert all(x["capability"] == "read_only" for x in payload["cascade"])
+    assert payload["media_review"] is True
+
+
+def test_media_owner_alternatives_has_no_image_route(monkeypatch):
+    monkeypatch.setenv("AICC_EXECUTOR_PROFILE", "owner-alternatives")
+    assert not m._bind_media_review({}, snap(PNG), PR)
+
+
+def test_worker_profile_cannot_rewrite_media_into_text_only(monkeypatch):
+    import threading
+
+    from command_center.worker import handlers
+    monkeypatch.setenv("AICC_EXECUTOR_PROFILE", "owner-alternatives")
+    monkeypatch.setattr(handlers, "parse_agent_run", lambda _: SimpleNamespace(
+        task_type="verification_review"))
+    # Preserve the real profile rewrite while keeping request construction local.
+    monkeypatch.setattr(handlers, "replace", lambda request, **kw: SimpleNamespace(
+        task_type=request.task_type, model=None, **kw))
+    result = handlers._run_agent({"media_review": True}, threading.Event())
+    assert not result.ok and result.infra_wait
+    assert result.reason == "media_review_image_executor_unavailable"

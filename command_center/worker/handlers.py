@@ -277,12 +277,11 @@ def _review_head_checkout(
             f"review_head {head_sha} unreachable after fetching "
             f"refs/pull/{pr_number}/head: {detail}"
         )
-    target = Path(f"{repository}-worktrees") / f"verify-{pr_number}-{head_sha[:12]}"
+    # Each concurrent chunk owns its checkout for its entire review lifetime.
+    target = Path(f"{repository}-worktrees") / (
+        f"verify-{pr_number}-{head_sha[:12]}-{uuid.uuid4().hex}"
+    )
     with _provision_lock(str(target)):
-        if target.exists():
-            # A crashed earlier attempt's leftover: same key, same sha --
-            # rebuild rather than trust a directory whose state is unknown.
-            _remove_review_head_checkout(repository, target)
         target.parent.mkdir(parents=True, exist_ok=True)
         added = agent_runner._run_git(
             ["worktree", "add", "--detach", str(target), head_sha],
@@ -727,6 +726,13 @@ def _run_agent(
                 ok=False,
                 reason=f"executor_unavailable: {executor!r} (cascade step {cascade_step})",
                 retryable=True,
+            )
+        # Operator profile rewrites must not downgrade an image review to
+        # a text-only adapter, even for a job queued before the profile changed.
+        if payload.get("media_review") and executor not in {"codex", "claude"}:
+            return HandlerOutcome(
+                ok=False, reason="media_review_image_executor_unavailable",
+                retryable=True, infra_wait=True,
             )
         task_type = str(link.get("task_type", task_type))
         model_override = link.get("model")
