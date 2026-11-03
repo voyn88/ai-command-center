@@ -42,7 +42,7 @@ As verified on November 3 around 14:45 Moscow time:
 
 The active window held #914/#979/#990/#991/#992. #982 did not appear in sampled ticks; its exclusion cause is **unproven**. A workflow success is not an independent acceptance verdict. Re-query current SHAs and actual Linux/PostgreSQL, Windows, CodeQL/security, final gate and independent review before acting. Skipped checks are not successes.
 
-Both servers still pointed at release `d0cbffc2a2d19e05ee9db8ab5dfb24b8be0ee66a` during handoff. No new deployment was performed by this migration. Worker service was observed `activating`; recheck health before any release.
+Both servers still pointed at release `d0cbffc2a2d19e05ee9db8ab5dfb24b8be0ee66a` during handoff. No new deployment was performed by this migration. Worker service was first observed `activating`, then `auto-restart` with `Result=exit-code` during the 15:06 Moscow check. Its cause is not established. Diagnose and verify health before any release; archive verification does not establish service health.
 
 Claude CLI is not logged in. The user clarified that login had not happened. Run `claude auth login` interactively on the intended machine, then give Claude a read-only #982/#991 diagnosis and verify its actual answer. Do not reuse expired OAuth or bypass denied service-account permissions.
 
