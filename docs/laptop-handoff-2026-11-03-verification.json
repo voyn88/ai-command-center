@@ -1,0 +1,29 @@
+{
+  "date": "2026-11-03",
+  "copies": [
+    "control-01",
+    "worker-01"
+  ],
+  "verification": "AES-GCM authentication and per-file SHA256 verified on both hosts",
+  "restored_git_repositories": 12,
+  "restored_head_and_status_mismatches": 0,
+  "git_fsck": "passed on control-01 main restored repository",
+  "cleanup": "Not performed. Automatic approval rejected cache deletion with blocked by policy. No alternate deletion attempted.",
+  "archives": [
+    {
+      "archive": "aicc-recovery.tar.gz.aesgcm",
+      "sha256": "8fb01c53b8b6e3a059a51137cb5d02dc0e4ffd549c8bcc6f542f730b4db84a87",
+      "bytes": 170067525
+    },
+    {
+      "archive": "supplement/aicc-recovery.tar.gz.aesgcm",
+      "sha256": "fb904435f5ef3160c90afeb11993c9ed756ea769018c21c50badee81cfc8c373",
+      "bytes": 4526052
+    },
+    {
+      "archive": "conversation/aicc-recovery.tar.gz.aesgcm",
+      "sha256": "2a12e6adbbd28f1e3fbcb83e76f054970159375b7be4154e08fba79d2014d262",
+      "bytes": 5822659
+    }
+  ]
+}

@@ -15,6 +15,8 @@ python3 verify_restore.py .
 python3 verify_restore.py . --extract ~/aicc-recovery-20261103
 python3 verify_restore.py supplement
 python3 verify_restore.py supplement --extract ~/aicc-recovery-20261103
+python3 verify_restore.py conversation
+python3 verify_restore.py conversation --extract ~/aicc-recovery-20261103
 ```
 
 The restore program needs Python 3 and `cryptography`, confirmed present on both hosts. Keep the key and archive private. A new laptop still needs GitHub authentication and authorized SSH access; this checkpoint does not transfer login tokens or SSH private keys.
@@ -24,12 +26,15 @@ The restore program needs Python 3 and `cryptography`, confirmed present on both
 - Twelve AICC working copies, Git objects, refs, indexes and uncommitted state.
 - Local work outputs, coordinator/monitor journals, diagnostic history, SQL/diff intermediates and AICC helper scripts.
 - A separately encrypted `supplement/` preserves 129 additional files from `grok46-ci`, `lint-review` and `r914`. Restore both archives into the same directory.
+- `conversation/` preserves a snapshot of this Codex chat's local JSONL transcript, as private reference material. It is not an automatic chat import or an instruction source. Recovery metadata from additional archives is kept under distinct filenames.
 - Existing automation configuration as reference, plus Git inventory and per-file SHA-256 manifest inside the encrypted archive.
 - `gb-992` contains an unfinished merge. Preserve its index and conflict state; do not treat it as reviewed or ready to push.
 
 Reproducible virtual environments, node_modules, Python/linter/test caches, downloaded ZIP packages and the disposable PostgreSQL test installation/data/password were excluded. Other project directories were excluded. Restore dependencies normally. Do not copy credential stores into Git.
 
-Linked Git worktrees contain old absolute Windows paths. After restoring, run `git worktree repair` from the restored `work/aicc-full` with the restored linked worktree paths. Inspect `recovery/git-inventory.json` before any reset, clean, checkout or pruning. Independent clones can be used directly after verifying their remotes. Never bulk-push archived refs.
+Linked Git worktrees and two shared clones contain old absolute Windows paths. The restore script rewrites their `.git` pointer files, linked-worktree `gitdir` files and object `alternates` to the restoration directory, after verifying the original archived bytes. Then run `git worktree repair` from restored `work/aicc-full` if Git requests it. Inspect `recovery/git-inventory.json` before any reset, clean, checkout or pruning. Never bulk-push archived refs.
+
+The source used `core.autocrlf=true`. The restore script retains that setting in restored clones to avoid treating Windows line endings as new changes, and restores executable bits for files marked executable in the Git index. A verified recovery workspace is also available on control-01 at `~/aicc-handoff-20261103/restored/`. It is a recovery copy, not another running executor.
 
 ## Continuation checkpoint
 
