@@ -13,6 +13,8 @@ cd ~/aicc-handoff-20261103
 sha256sum -c SHA256SUMS
 python3 verify_restore.py .
 python3 verify_restore.py . --extract ~/aicc-recovery-20261103
+python3 verify_restore.py supplement
+python3 verify_restore.py supplement --extract ~/aicc-recovery-20261103
 ```
 
 The restore program needs Python 3 and `cryptography`, confirmed present on both hosts. Keep the key and archive private. A new laptop still needs GitHub authentication and authorized SSH access; this checkpoint does not transfer login tokens or SSH private keys.
@@ -21,6 +23,7 @@ The restore program needs Python 3 and `cryptography`, confirmed present on both
 
 - Twelve AICC working copies, Git objects, refs, indexes and uncommitted state.
 - Local work outputs, coordinator/monitor journals, diagnostic history, SQL/diff intermediates and AICC helper scripts.
+- A separately encrypted `supplement/` preserves 129 additional files from `grok46-ci`, `lint-review` and `r914`. Restore both archives into the same directory.
 - Existing automation configuration as reference, plus Git inventory and per-file SHA-256 manifest inside the encrypted archive.
 - `gb-992` contains an unfinished merge. Preserve its index and conflict state; do not treat it as reviewed or ready to push.
 
