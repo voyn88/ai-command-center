@@ -1,0 +1,50 @@
+{
+  "branch_main_public_protection_subset": {
+    "name": "main",
+    "note": "Unauthenticated branch endpoint returns only a subset (enabled + required_status_checks). Fields such as required_pull_request_reviews / enforce_admins / allow_force_pushes require authenticated GET .../branches/main/protection and are NOT asserted here.",
+    "protected": true,
+    "protection": {
+      "enabled": true,
+      "required_status_checks": {
+        "checks": [
+          {
+            "app_id": 15368,
+            "context": "Final merge gate"
+          },
+          {
+            "app_id": 15368,
+            "context": "Acceptance gate (independent verdict on exact SHA)"
+          }
+        ],
+        "contexts": [
+          "Final merge gate",
+          "Acceptance gate (independent verdict on exact SHA)"
+        ],
+        "enforcement_level": "everyone"
+      }
+    }
+  },
+  "captured_at_utc": "2026-11-01T09:49:38Z",
+  "endpoints": [
+    "GET /repos/voyn88/ai-command-center",
+    "GET /repos/voyn88/ai-command-center/branches/main",
+    "GET /repos/voyn88/ai-command-center/rules/branches/main",
+    "GET /repos/voyn88/ai-command-center/rulesets"
+  ],
+  "rules_applied_to_main": [],
+  "rulesets": [
+    {
+      "enforcement": "active",
+      "id": 20717451,
+      "name": "release-tag-protection",
+      "target": "tag"
+    }
+  ],
+  "source": "Unauthenticated GitHub REST API (api.github.com)",
+  "visibility": {
+    "default_branch": "main",
+    "full_name": "voyn88/ai-command-center",
+    "private": false,
+    "visibility": "public"
+  }
+}

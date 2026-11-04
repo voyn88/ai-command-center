@@ -123,8 +123,11 @@ Current boundaries:
   only exact-workspace exclusion is enforced transactionally by the runtime launch path.
 - Fail-closed workspace verification is scoped to normal task-v2 callers that supply
   `WorkspaceSpec`; low-level/ad-hoc launches preserve their separate behavior.
-- The current private-repository plan does not expose branch protection/rulesets, so CI is
-  automatic but required-check enforcement remains an operator merge discipline.
+- `voyn88/ai-command-center` is public; GitHub branch protection on `main` already requires
+  `Final merge gate` and `Acceptance gate (independent verdict on exact SHA)` (verified
+  2026-11-01 — see DR-GITHUB-BRANCH-PROTECTION-001). `merge_once` is the application merge
+  gateway that consumes those checks; it is not a substitute for missing GitHub protection.
+  Re-verify with `bash scripts/verify-github-branch-protection.sh`.
 - Git worktree creation, push, pull-request creation and merge are privileged capabilities with
   confirmation or policy safeguards.
 - The native PySide6 desktop client remains documentation and design work only.
