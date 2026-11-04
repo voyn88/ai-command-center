@@ -454,6 +454,19 @@ done
 run_transaction validate
 sh -n "$repo_root/ops/verify-agent-principal-boundary.sh"
 
+# Host preconditions this install cannot establish for itself, reported
+# BEFORE the first generation is staged and long before `apply`. The one that
+# exists today is drop-in ordering: an operator drop-in whose file name sorts
+# after 20-principal-isolation.conf makes `verify_unit_configuration` refuse
+# every lane no matter what this release writes, and that refusal arrives at
+# the rollout -- the first step AFTER apply -- so the only way out was a full
+# generation rollback (worker-01, 2026-09-09, 30-github-token-hotfix.conf).
+# Failing here instead costs the operator one message naming the file.
+# Worker profile only: a control install removes the worker units outright.
+if [ "$install_profile" = worker ]; then
+  run_rollout preflight --lanes "$repo_root/deploy/aicc/worker-lanes"
+fi
+
 if [ -e "$state_dir" ]; then
   [ ! -L "$state_dir" ] && [ -d "$state_dir" ] && \
     [ "$(stat -c %U:%G:%a "$state_dir")" = root:root:700 ] || {
@@ -536,6 +549,12 @@ rollback() {
       # service snapshot instead of silently discarding failed stop/disable.
       rollback_complete=0
       echo "principal-isolation rollback incomplete; durable WAL retained" >&2
+      # `recover` quiesces the snapshot before restoring files and starts
+      # units only after that restore completes. If it failed, the generation
+      # may be only partly restored; keep every unit (including the launcher
+      # socket) down. Starting even one service here would let it consume an
+      # internally inconsistent file set while the WAL still says recovery is
+      # incomplete. Boot/operator recovery is the only safe restart path.
     fi
   fi
   # Best-effort and unconditional: this transaction must never exit leaving

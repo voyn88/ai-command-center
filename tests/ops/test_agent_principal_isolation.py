@@ -2853,3 +2853,124 @@ def test_mac_transport_environment_is_root_private_not_shared_with_agents(launch
     env_file.write_text("GH_TOKEN=publisher-secret\n")
     with pytest.raises(launcher.LaunchRefused, match="not allowlisted"):
         launcher._validate_environment_file(env_file, "claude", allowed_keys=keys, root_private=True)
+# --- VOYN-W0-AICC-INSTALL-ROLLBACK-VS-MODEL-AUTH-WRITEBACK -------------------
+
+
+def _run_rollback_trap(tmp_path, **environment):
+    """Execute the installer's rollback trap against stubbed host commands.
+
+    The trap is lifted verbatim out of the installer -- functions and all --
+    so this exercises the shipped code rather than a paraphrase of it. Only
+    the commands that would touch the host are stubbed.
+    """
+    text = _installer_text()
+    block = text[
+        text.index("rollback() {") : text.index("\ntrap rollback EXIT HUP INT TERM")
+    ]
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "pending.json").write_text("{}", encoding="utf-8")
+    (state / "attempt-units.json").write_text("{}", encoding="utf-8")
+    log = tmp_path / "log"
+    log.write_text("", encoding="utf-8")
+    harness = f"""
+set -eu
+LOG={log}
+state_dir={state}
+attempt_units="$state_dir/attempt-units.json"
+baseline_units="$state_dir/baseline-units.json"
+baseline_release="$state_dir/baseline-release"
+release_staging=
+pending_release_manifest=
+release_dir=
+install_profile="$INSTALL_PROFILE"
+transaction_active=1
+baseline_created=0
+# The real one is `[ -e "$1" ] || [ -L "$1" ]`; the launcher socket unit is
+# answered from the fixture so the test does not depend on this machine's /etc.
+path_present() {{
+  case "$1" in
+    */aicc-agent-launcher.socket) [ "$SOCKET_UNIT_PRESENT" = 1 ] ;;
+    *) [ -e "$1" ] || [ -L "$1" ] ;;
+  esac
+}}
+run_transaction() {{ printf 'run_transaction %s\\n' "$*" >>"$LOG"; return "$RECOVER_RC"; }}
+run_rollout() {{ printf 'run_rollout %s\\n' "$*" >>"$LOG"; return "$ROLLOUT_RC"; }}
+systemctl() {{
+  printf 'systemctl %s\\n' "$*" >>"$LOG"
+  if [ "$1" = is-enabled ]; then printf '%s\\n' "$SOCKET_ENABLED"; fi
+}}
+release_lane_timers() {{ printf 'release_lane_timers\\n' >>"$LOG"; }}
+{block}
+(exit 7) || rollback
+"""
+    result = subprocess.run(
+        ["/bin/sh", "-c", harness],
+        capture_output=True,
+        check=False,
+        text=True,
+        env={
+            "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+            "INSTALL_PROFILE": "worker",
+            "RECOVER_RC": "1",
+            "ROLLOUT_RC": "0",
+            "SOCKET_UNIT_PRESENT": "1",
+            "SOCKET_ENABLED": "enabled",
+            **environment,
+        },
+    )
+    return result, log.read_text(encoding="utf-8").splitlines(), state
+
+
+def test_failed_rollback_leaves_all_units_quiesced(tmp_path):
+    """A failed file recovery may have restored only part of a generation.
+    The WAL and snapshot remain, and no service -- especially the launcher
+    socket -- may be restarted against that inconsistent file set."""
+    result, log, state = _run_rollback_trap(tmp_path)
+
+    assert "systemctl disable --now aicc-agent-launcher.socket" in log
+    disable = log.index("systemctl disable --now aicc-agent-launcher.socket")
+    release = log.index("release_lane_timers")
+    assert disable < release
+    assert not [line for line in log if line.startswith("run_rollout restore")]
+    assert "systemctl enable --now aicc-agent-launcher.socket" not in log
+    # The WAL and the snapshot it will be retried against are both retained.
+    assert (state / "pending.json").exists()
+    assert (state / "attempt-units.json").exists()
+    assert "rollback incomplete" in result.stderr
+    assert result.returncode == 7
+
+
+def test_successful_rollback_does_not_restore_units_twice(tmp_path):
+    """`recover` restores the snapshot itself when it succeeds. The extra
+    restore belongs to the failure path only."""
+    result, log, state = _run_rollback_trap(tmp_path, RECOVER_RC="0")
+
+    assert not [line for line in log if line.startswith("run_rollout restore")]
+    assert result.returncode == 7
+    # A completed rollback consumes the snapshot, as it always did.
+    assert not (state / "attempt-units.json").exists()
+
+
+def test_failed_control_rollback_also_keeps_launcher_quiesced(tmp_path):
+    _result, log, _state = _run_rollback_trap(tmp_path, INSTALL_PROFILE="control")
+    assert "systemctl enable --now aicc-agent-launcher.socket" not in log
+
+
+def test_dropin_ordering_is_preflighted_before_the_generation_is_staged():
+    """The precondition that failed the whole install on worker-01 is a
+    property of the host, not of the release: reported before the first target
+    is staged, and named, instead of surfacing at the rollout after apply()."""
+    text = _installer_text()
+    preflight = text.index(
+        'run_rollout preflight --lanes "$repo_root/deploy/aicc/worker-lanes"'
+    )
+    assert preflight < text.index("run_transaction prepare")
+    assert preflight < text.index("run_transaction apply")
+    assert preflight < text.index("run_rollout rollout --lanes")
+    # Worker profile only: a control install removes the worker units.
+    _assert_command_inside_shell_if(
+        text,
+        'run_rollout preflight --lanes "$repo_root/deploy/aicc/worker-lanes"',
+        'if [ "$install_profile" = worker ]; then',
+    )
