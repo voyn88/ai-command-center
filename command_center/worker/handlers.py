@@ -53,7 +53,7 @@ from command_center.ops.source_clone_refresh import refresh_source_clone
 from command_center.orchestrator import gh_access
 from command_center.orchestrator.publish import PublishConfig, publish_run
 from command_center.orchestrator.routing import cascade_for
-from command_center.worker import writer_lease
+from command_center.worker import admission, writer_lease
 from command_center.worker.daemon import Handler, HandlerOutcome
 from command_center.worker.payloads import PayloadError, parse_agent_run
 from command_center.worker.worktree_lease import blocking_lease
@@ -687,7 +687,8 @@ def _executor_preflight(executor: str, task_type: str) -> tuple[bool, str, str]:
 
 
 def _run_agent(
-    payload: dict[str, Any], lease_lost: threading.Event, attempt_no: int = 1
+    payload: dict[str, Any], lease_lost: threading.Event, attempt_no: int = 1,
+    *, apply_operator_profile: bool = True,
 ) -> HandlerOutcome:
     request = parse_agent_run(payload)
     if isinstance(request, PayloadError):
@@ -697,11 +698,13 @@ def _run_agent(
 
     # Explicit operator profile also covers already queued subscription work.
     # Preserve the requested capability class, prompt, task and idempotency key.
-    if os.environ.get("AICC_EXECUTOR_PROFILE") == "owner-alternatives":
+    if apply_operator_profile and os.environ.get("AICC_EXECUTOR_PROFILE") in {"owner-alternatives", "owner-cascade"}:
         requested_type = request.task_type
         request = replace(request, cascade=tuple(
             {**entry, "task_type": requested_type}
-            for entry in cascade_for("implementation")
+            for entry in cascade_for(
+                "implementation" if requested_type in agent_runner.MUTATING_TASK_TYPES else "review"
+            )
             if requested_type not in agent_runner.MODEL_ONLY_TASK_TYPES
             or entry["executor"] == "grok"
         ))
@@ -730,6 +733,8 @@ def _run_agent(
             )
         task_type = str(link.get("task_type", task_type))
         model_override = link.get("model")
+        if "model" in link:
+            model = None
         if isinstance(model_override, str) and model_override.strip():
             model = model_override
 
@@ -790,6 +795,8 @@ def _run_agent(
             task_type = candidate_task_type
             model = request.model
             model_override = candidate.get("model")
+            if "model" in candidate:
+                model = None
             if isinstance(model_override, str) and model_override.strip():
                 model = model_override
             available, detail, unavailable_reason = (
@@ -986,6 +993,13 @@ def _run_agent(
             stack.callback(_remove_read_only_isolated_checkout, checkout)
             run_repository = checkout
         if task_type in agent_runner.MUTATING_TASK_TYPES:
+            try:
+                stack.enter_context(admission.hold(request.project_id))
+            except admission.AdmissionRefused as exc:
+                return HandlerOutcome(
+                    ok=False, reason=str(exc), retryable=True,
+                    lease_wait=exc.contention, infra_wait=not exc.contention,
+                )
             expected_branch = f"backlog/{backlog_task}"
             try:
                 isolated_workspace = _isolated_workspace_path(
@@ -1231,7 +1245,10 @@ def _run_agent(
         # unaffected by this change — it closes the narrower, previously-open
         # gap that the OS process kept running regardless of that decision.
         route_failovers: list[dict[str, Any]] = []
+        tried_steps: set[int] = set()
         while True:
+            if cascade_step is not None:
+                tried_steps.add(cascade_step)
             run = agent_runner.run_claude_code(
                 repository_path=run_repository,
                 prompt=request.prompt,
@@ -1291,9 +1308,10 @@ def _run_agent(
                     and cascade_step is not None
                     and not lease_lost.is_set()
                 ):
-                    for candidate_step in range(
-                        cascade_step + 1, len(request.cascade) + 1
-                    ):
+                    for offset in range(1, len(request.cascade)):
+                        candidate_step = ((cascade_step - 1 + offset) % len(request.cascade)) + 1
+                        if candidate_step in tried_steps:
+                            continue
                         candidate = request.cascade[candidate_step - 1]
                         candidate_executor = str(candidate.get("executor"))
                         if candidate_executor not in agent_runner.COMMAND_BUILDERS:
@@ -1319,6 +1337,8 @@ def _run_agent(
                         task_type = candidate_task_type
                         model = request.model
                         model_override = candidate.get("model")
+                        if "model" in candidate:
+                            model = None
                         if isinstance(model_override, str) and model_override.strip():
                             model = model_override
                         link = candidate
@@ -1341,7 +1361,10 @@ def _run_agent(
             if not unchanged or cascade_step is None:
                 break
             fallback_selected = False
-            for candidate_step in range(cascade_step + 1, len(request.cascade) + 1):
+            for offset in range(1, len(request.cascade)):
+                candidate_step = ((cascade_step - 1 + offset) % len(request.cascade)) + 1
+                if candidate_step in tried_steps:
+                    continue
                 candidate = request.cascade[candidate_step - 1]
                 candidate_executor = str(candidate.get("executor"))
                 if candidate_executor not in agent_runner.COMMAND_BUILDERS:
@@ -1365,6 +1388,8 @@ def _run_agent(
                 task_type = candidate_task_type
                 model = request.model
                 model_override = candidate.get("model")
+                if "model" in candidate:
+                    model = None
                 if isinstance(model_override, str) and model_override.strip():
                     model = model_override
                 link = candidate
@@ -1835,4 +1860,9 @@ def _run_agent(
 
 
 def build_handlers() -> dict[str, Handler]:
-    return {"agent_run": _run_agent}
+    from command_center.worker.simple_tasks import run_simple_task
+
+    def simple_task(payload, lease_lost, attempt_no=1):
+        return run_simple_task(payload, lease_lost, attempt_no, remote_run=_run_agent)
+
+    return {"agent_run": _run_agent, "simple_task": simple_task}

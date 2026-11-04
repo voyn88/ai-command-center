@@ -324,6 +324,9 @@
     "command_center/worker/__main__.py": [
       "orchestration"
     ],
+    "command_center/worker/admission.py": [
+      "orchestration"
+    ],
     "command_center/worker/credential_file.py": [
       "orchestration"
     ],
@@ -340,6 +343,9 @@
       "orchestration"
     ],
     "command_center/worker/sdnotify.py": [
+      "orchestration"
+    ],
+    "command_center/worker/simple_tasks.py": [
       "orchestration"
     ],
     "command_center/worker/worktree_lease.py": [

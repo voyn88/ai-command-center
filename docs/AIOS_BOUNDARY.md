@@ -240,6 +240,28 @@ section below for why it exists at all):
   baseline entry records its reviewed SRV placement, not permission for a new
   general orchestration engine or a weakening of ADR-0008. The scanner remains
   unchanged, and convergence follows the SRV exception below.
+  `command_center/worker/simple_tasks.py` and `worker/admission.py`
+  (PR #1080) extend this same SRV composition boundary. The simple-task
+  handler consumes one work item and its existing cancellation event; it
+  performs one bounded loopback HTTP completion, validates a closed JSON
+  contract, and delegates remote fallback to the existing runner and its
+  read-only sandbox. It owns no claim, heartbeat, retry scheduling, task
+  completion authority, process lifecycle, database or new queue. The
+  PostgreSQL queue remains responsible for attempts and infrastructure-wait.
+  Candidate ordering is advisory over already eligible IDs; it cannot grant
+  execution, publish, mutate a repository or supply acceptance evidence.
+  The admission helper only narrows the existing worker's mutating path via
+  operator configuration and an OS file lock shared by this host's lanes.
+  It neither issues identities nor replaces/acquires the existing database
+  task/publisher leases. A process exit releases the OS lock; no second lease
+  store or scheduler is introduced. The locks are local serialization, not a
+  claim of multi-host exclusion; existing authority fences remain required.
+  Both files classify as orchestration because of their worker package path.
+  Their explicit baseline entries record this reviewed SRV placement, not
+  an exception for arbitrary local engines. The scanner and legacy freeze
+  are unchanged. Convergence follows the same accepted AIOS dispatch contract
+  as the enclosing SRV worker; provider execution and admission must move
+  with that worker rather than survive as a parallel scheduler.
   `command_center/orchestrator/gh_access.py`
   (VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS) is a baseline addition
   of the same shape as `github_app_auth.py`: a transport adapter that chooses
