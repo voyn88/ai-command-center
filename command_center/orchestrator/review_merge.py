@@ -3356,19 +3356,61 @@ def _merge_state(repo_path: str, pr_url: str) -> str:
     and its branch must be updated before it can ever merge; DIRTY means a real
     conflict that only a rebase can resolve.
     """
-    view = _gh(["pr", "view", pr_url, "--json", "mergeStateStatus,state"], repo_path)
+    state, _head = _merge_state_and_head(repo_path, pr_url)
+    return state
+
+
+def _merge_state_and_head(repo_path: str, pr_url: str) -> tuple[str, str]:
+    """Like `_merge_state`, but also returns the PR head sha when known."""
+    view = _gh(
+        ["pr", "view", pr_url, "--json", "mergeStateStatus,state,headRefOid"],
+        repo_path,
+    )
     if view.returncode != 0:
-        return ""
+        return "", ""
     # A zero exit with malformed/empty output (a transient gh hiccup) is a
     # failed lookup, not a reason to abort the whole merge tick: treat any
     # unparseable response as "" exactly as the docstring promises.
     try:
         data = json.loads(view.stdout or "{}")
     except json.JSONDecodeError:
-        return ""
+        return "", ""
     if not isinstance(data, dict) or data.get("state") != "OPEN":
-        return ""
-    return str(data.get("mergeStateStatus") or "")
+        return "", ""
+    return (
+        str(data.get("mergeStateStatus") or ""),
+        str(data.get("headRefOid") or ""),
+    )
+
+
+def _gh_pull_update_branch(
+    repo_path: str, pr_url: str, *, expected_head_sha: str
+) -> subprocess.CompletedProcess[str]:
+    """Bring a BEHIND PR current via GitHub's REST update-branch endpoint.
+
+    Hosts whose `gh` predates `gh pr update-branch` (live merge-train defect
+    on control-01, 2026-08-26) still expose this route through `gh api`.
+    """
+    parsed = _owner_repo_number_from_pr_url(pr_url)
+    if parsed is None:
+        return subprocess.CompletedProcess(
+            ["gh", "api"],
+            1,
+            "",
+            f"no_repo_route: {pr_url!r}",
+        )
+    owner, repo, number = parsed
+    return _gh(
+        [
+            "api",
+            "-X",
+            "PUT",
+            f"repos/{owner}/{repo}/pulls/{number}/update-branch",
+            "-f",
+            f"expected_head_sha={expected_head_sha}",
+        ],
+        repo_path,
+    )
 
 
 def _pr_window_expensive_read_decision(
@@ -4447,7 +4489,7 @@ def _merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -
             # before the call -- so repeated failures cannot exceed the
             # per-tick mutation budget. DIRTY here would be a real conflict,
             # left for a rebase.
-            state = _merge_state(repo_path, pr_url)
+            state, head_sha = _merge_state_and_head(repo_path, pr_url)
             if state == "DIRTY":
                 report.skipped.append((task_id, "branch_dirty_needs_rebase"))
                 continue
@@ -4457,7 +4499,14 @@ def _merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -
                     continue
                 branch_updates += 1
                 actions += 1
-                updated = _gh(["pr", "update-branch", pr_url], repo_path)
+                if not re.fullmatch(r"[0-9a-f]{40}", head_sha):
+                    report.skipped.append(
+                        (task_id, "branch_update_failed: head_lookup_failed")
+                    )
+                    continue
+                updated = _gh_pull_update_branch(
+                    repo_path, pr_url, expected_head_sha=head_sha
+                )
                 if updated.returncode == 0:
                     # The new head is a fresh, unmarked commit even though
                     # the PR's own diff may not have changed at all -- see

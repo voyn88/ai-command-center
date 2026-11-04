@@ -2162,16 +2162,17 @@ def test_review_once_no_longer_enqueues_an_eager_adjudication(rig, _test_repo_ro
 
 def test_merge_train_updates_a_behind_pr(rig, monkeypatch):  # noqa: F811
     """A PR only BEHIND main (base advanced after it branched) is brought
-    current with `gh pr update-branch` so it re-enters the merge path instead
-    of gridlocking; nothing is merged this tick."""
+    current with the REST update-branch endpoint so it re-enters the merge path
+    instead of gridlocking; nothing is merged this tick."""
     app_factory, store, _ = rig
-    _ready(store, app_factory, "VOYN-W0-MT1", "https://github.com/x/y/pull/41")
+    pr_url = "https://github.com/x/y/pull/41"
+    _ready(store, app_factory, "VOYN-W0-MT1", pr_url)
     head = "a" * 40
     calls = []
 
     def fake_gh(argv, repo):
         import subprocess
-        calls.append(argv[:2])
+        calls.append(list(argv))
         if argv[:2] == ["pr", "view"]:
             body = json.dumps({
                 "state": "OPEN", "headRefOid": head, "mergeStateStatus": "BEHIND",
@@ -2181,13 +2182,21 @@ def test_merge_train_updates_a_behind_pr(rig, monkeypatch):  # noqa: F811
                 "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}, {"name": "Final merge gate", "conclusion": "SUCCESS"}, {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS"}],
             })
             return subprocess.CompletedProcess(argv, 0, body, "")
-        if argv[:2] == ["pr", "update-branch"]:
+        if (
+            argv[:4] == ["api", "-X", "PUT"]
+            and argv[4] == "repos/x/y/pulls/41/update-branch"
+            and argv[5:7] == ["-f", f"expected_head_sha={head}"]
+        ):
             return subprocess.CompletedProcess(argv, 0, "updated", "")
         return subprocess.CompletedProcess(argv, 1, "", "?")
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     report = merge_once(app_factory, "/tmp")
-    assert ["pr", "update-branch"] in calls
+    assert any(
+        c[:4] == ["api", "-X", "PUT"]
+        and c[4] == "repos/x/y/pulls/41/update-branch"
+        for c in calls
+    )
     assert ("VOYN-W0-MT1", "branch_updated_behind_main") in report.skipped
     assert not report.merged
 
@@ -2216,7 +2225,7 @@ def test_merge_train_does_not_update_an_unaccepted_behind_pr(rig, monkeypatch): 
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     report = merge_once(app_factory, "/tmp")
-    assert ["pr", "update-branch"] not in calls
+    assert not any(c[:2] == ["api", "-X"] and "update-branch" in c for c in calls)
     assert ("VOYN-W0-MT3", "no_accept_marker_on_head") in report.skipped
     assert not report.merged
 
@@ -2258,7 +2267,7 @@ def test_merge_train_leaves_a_dirty_pr_for_rebase(rig, monkeypatch):  # noqa: F8
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     report = merge_once(app_factory, "/tmp")
-    assert ["pr", "update-branch"] not in calls
+    assert not any(c[:2] == ["api", "-X"] and "update-branch" in c for c in calls)
     assert ("VOYN-W0-MT2", "branch_dirty_needs_rebase") in report.skipped
 
 
@@ -2282,8 +2291,12 @@ def test_merge_train_update_cap_is_bounded(rig, monkeypatch):  # noqa: F811
                 "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}, {"name": "Final merge gate", "conclusion": "SUCCESS"}, {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS"}],
             })
             return subprocess.CompletedProcess(argv, 0, body, "")
-        if argv[:2] == ["pr", "update-branch"]:
-            updates.append(argv)
+        if (
+            argv[:4] == ["api", "-X", "PUT"]
+            and argv[4].startswith("repos/x/y/pulls/")
+            and argv[4].endswith("/update-branch")
+        ):
+            updates.append(list(argv))
             return subprocess.CompletedProcess(argv, 0, "updated", "")
         return subprocess.CompletedProcess(argv, 1, "", "?")
 
@@ -2292,6 +2305,52 @@ def test_merge_train_update_cap_is_bounded(rig, monkeypatch):  # noqa: F811
     assert len(updates) == 2
     assert sum(1 for _, r in report.skipped if r == "branch_updated_behind_main") == 2
     assert sum(1 for _, r in report.skipped if r == "branch_behind_update_capped") == 2
+
+
+def test_gh_pull_update_branch_rejects_unparseable_pr_url():
+    """REST update-branch must fail closed without calling `gh api` when the
+    PR URL cannot be routed (VOYN-W0-AICC-MERGE-TRAIN-UPDATE-BRANCH-BROKEN)."""
+    result = review_merge._gh_pull_update_branch(
+        "/tmp", "https://github.com/bad", expected_head_sha="a" * 40
+    )
+    assert result.returncode != 0
+    assert "no_repo_route" in result.stderr
+
+
+def test_merge_train_branch_update_failed_on_no_repo_route(rig, monkeypatch):  # noqa: F811
+    """When update-branch routing fails, merge_once records branch_update_failed
+    instead of raising."""
+    app_factory, store, _ = rig
+    pr_url = "https://github.com/x/y/pull/44"
+    _ready(store, app_factory, "VOYN-W0-MT-ROUTE", pr_url)
+    head = "e" * 40
+
+    def fake_gh(argv, repo):
+        import subprocess
+        if argv[:2] == ["pr", "view"]:
+            body = json.dumps({
+                "state": "OPEN", "headRefOid": head, "mergeStateStatus": "BEHIND",
+                "author": {"login": "writer-bot"},
+                "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}",
+                             "author": {"login": "voyn88-acceptance-gate[bot]"}}],
+                "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}, {"name": "Final merge gate", "conclusion": "SUCCESS"}, {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS"}],
+            })
+            return subprocess.CompletedProcess(argv, 0, body, "")
+        return subprocess.CompletedProcess(argv, 1, "", "?")
+
+    def fake_update(repo_path, url, *, expected_head_sha):
+        import subprocess
+        return subprocess.CompletedProcess(
+            [], 1, "", f"no_repo_route: {url!r}"
+        )
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    monkeypatch.setattr(review_merge, "_gh_pull_update_branch", fake_update)
+    report = merge_once(app_factory, "/tmp")
+    assert (
+        "VOYN-W0-MT-ROUTE",
+        f"branch_update_failed: no_repo_route: {pr_url!r}",
+    ) in report.skipped
 
 
 def test_marker_post_reruns_the_failing_pull_request_acceptance_gate(monkeypatch):
@@ -2602,7 +2661,7 @@ def test_a_pr_the_queue_is_already_building_is_a_free_wait(rig, monkeypatch):  #
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     report = merge_once(app_factory, "/tmp")
     assert ["pr", "merge"] not in calls
-    assert ["pr", "update-branch"] not in calls
+    assert not any(c[:2] == ["api", "-X"] and "update-branch" in c for c in calls)
     assert (
         "VOYN-W0-MQ-WAIT",
         "awaiting_merge_queue:state=AWAITING_CHECKS,position=2",
@@ -2641,7 +2700,7 @@ def test_a_queued_entry_is_never_torn_out_of_the_queue_by_a_branch_update(rig, m
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     report = merge_once(app_factory, "/tmp")
-    assert ["pr", "update-branch"] not in calls
+    assert not any(c[:2] == ["api", "-X"] and "update-branch" in c for c in calls)
     assert not any(r == "branch_updated_behind_main" for _, r in report.skipped)
     assert any(
         t == "VOYN-W0-MQ-BEHIND" and r.startswith("awaiting_merge_queue")
