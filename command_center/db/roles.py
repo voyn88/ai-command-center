@@ -136,6 +136,13 @@ ALL_TABLES: tuple[str, ...] = (
     "council_decision",
     "council_event",
     "council_vote",
+    "delivery_team_corrective_assignment",
+    "delivery_team_corrective_check",
+    "delivery_team_acceptance_check",
+    "delivery_team_incident",
+    "delivery_team_stage",
+    "delivery_team_evidence",
+    "delivery_team_release_receipt",
     "digest_item",
     "enrollment_ticket",
     "market_install_log",
@@ -194,6 +201,8 @@ ALL_VIEWS: tuple[str, ...] = (
 # the sequence in addition to INSERT on the table.
 IDENTITY_SEQUENCES: MappingProxyType[str, str] = MappingProxyType(
     {
+        "delivery_team_evidence": "delivery_team_evidence_evidence_id_seq",
+        "delivery_team_release_receipt": "delivery_team_release_receipt_receipt_id_seq",
         "backlog_event": "backlog_event_event_id_seq",
         "backlog_evidence": "backlog_evidence_evidence_id_seq",
         "completion_event": "completion_event_id_seq",
@@ -311,6 +320,15 @@ _MONITOR_FINDING_TABLES: dict[str, frozenset[str]] = {
 # test_worker_can_call_backlog_resume_deferred_without_grants /
 # test_worker_cannot_call_backlog_resume_deferred_when_grants_are_applied).
 _APP_BACKLOG_TABLES: dict[str, frozenset[str]] = {
+    # Native delivery-team authority: app reads, functions own all writes.
+    "delivery_team_corrective_assignment": _READ,
+    "delivery_team_corrective_check": _READ,
+    "delivery_team_acceptance_check": _READ,
+    "delivery_team_incident": _READ,
+    "delivery_team_stage": _READ,
+    "delivery_team_evidence": _READ,
+    "delivery_team_release_receipt": _READ,
+
     "backlog_task": _READ,
     "backlog_dependency": _READ,
     "backlog_evidence": _READ,
@@ -323,6 +341,14 @@ _APP_BACKLOG_TABLES: dict[str, frozenset[str]] = {
 }
 
 _WORKER_BACKLOG_TABLES: dict[str, frozenset[str]] = {
+    "delivery_team_corrective_assignment": _NONE,
+    "delivery_team_corrective_check": _NONE,
+    "delivery_team_acceptance_check": _NONE,
+    "delivery_team_incident": _NONE,
+    "delivery_team_stage": _NONE,
+    "delivery_team_evidence": _NONE,
+    "delivery_team_release_receipt": _NONE,
+
     "backlog_task": _NONE,
     "backlog_dependency": _NONE,
     "backlog_evidence": _NONE,
@@ -614,6 +640,15 @@ _APP_BACKLOG_FUNCTIONS = (
     "backlog_record_provenance(text, text, jsonb)",
     "backlog_owner_decision(text, bigint, text, text)",
     "backlog_owner_lock(text)",
+    "delivery_team_sync(integer, jsonb)",
+    "delivery_team_candidates(integer, jsonb)",
+    "delivery_team_dispatch(text, bigint, text, text, jsonb, integer)",
+    "delivery_team_ingest(integer)",
+    "delivery_team_stage_current(text, bigint, text)",
+    "delivery_team_ready(text, bigint)",
+    "delivery_team_accepted(text, bigint)",
+    "delivery_team_retry(text, bigint, text, text)",
+    "delivery_team_record_incident(text, bigint, text, text, text, text, text, jsonb)",
     # Coordination v2 (0031): durable snapshot/in-flight CAS; no DML path.
     "coordinator_state_read(text)",
     "coordinator_enqueue(text, text, text, text, text, jsonb)",
@@ -669,7 +704,13 @@ FUNCTION_PRIVILEGES: MappingProxyType[str, tuple[str, ...]] = MappingProxyType(
         # is silent in each task's own suite.
         APP_ROLE: _APP_FUNCTIONS + _APP_ENROLMENT_FUNCTIONS + _APP_BACKLOG_FUNCTIONS,
         WORKER_ROLE: _WORKER_FUNCTIONS + _WORKER_ENROLMENT_FUNCTIONS,
-        OPERATOR_ROLE: _OPERATOR_FUNCTIONS,
+        OPERATOR_ROLE: _OPERATOR_FUNCTIONS + (
+            "delivery_team_assign_correction(text, bigint, text, jsonb, text)",
+            "delivery_team_record_corrective_check(text, bigint, text, text, bigint, text, text, text, text, timestamptz)",
+            "delivery_team_release_scope(text, bigint)",
+            "delivery_team_record_acceptance(text, bigint, text, text, text, text, timestamptz)",
+            "delivery_team_record_release(text, bigint, text, text, jsonb, text)",
+        ),
     }
 )
 

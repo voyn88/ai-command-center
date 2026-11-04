@@ -703,7 +703,7 @@ def _run_agent(
 
     # Explicit operator profile also covers already queued subscription work.
     # Preserve the requested capability class, prompt, task and idempotency key.
-    if apply_operator_profile and os.environ.get("AICC_EXECUTOR_PROFILE") in {"owner-alternatives", "owner-cascade"}:
+    if request.delivery_team is None and apply_operator_profile and os.environ.get("AICC_EXECUTOR_PROFILE") in {"owner-alternatives", "owner-cascade"}:
         requested_type = request.task_type
         request = replace(request, cascade=tuple(
             {**entry, "task_type": requested_type}
@@ -884,6 +884,7 @@ def _run_agent(
     # comment for the branch-not-attempt naming decision.
     run_repository = repository
     isolated_workspace: Path | None = None
+    observed_source_sha: str | None = None
 
     # VOYN-W0-AICC-LEASE-FULL-LIFECYCLE-FENCE: everything from here to the
     # function's return travels inside one `ExitStack`, closed in the
@@ -895,6 +896,24 @@ def _run_agent(
     # nothing is ever entered, so `stack.close()` is a no-op.
     stack = ExitStack()
     try:
+        if request.delivery_team_source_sha is not None:
+            # This is a commit/release review, not a claim that an old PR is
+            # still open. Reuse the isolated clone's exact-object enforcement;
+            # never weaken the independent PR currency path below.
+            if not agent_runner.principal_isolation_required():
+                return HandlerOutcome(ok=False, reason="delivery team source pin requires principal isolation", retryable=False)
+            ok, failure = _refresh_read_only_source(repository)
+            if not ok:
+                return HandlerOutcome(ok=False, reason=failure or "source refresh unavailable", retryable=True)
+            checkout, failure, retryable = _read_only_isolated_checkout(repository, pin_sha=request.delivery_team_source_sha)
+            if checkout is None:
+                return HandlerOutcome(ok=False, reason=failure or "pinned source unavailable", retryable=retryable)
+            stack.callback(_remove_read_only_isolated_checkout, checkout)
+            observed = agent_runner._run_git(["rev-parse", "HEAD"], checkout)
+            if observed is None or observed.returncode != 0 or observed.stdout.strip() != request.delivery_team_source_sha:
+                return HandlerOutcome(ok=False, reason="delivery team source SHA mismatch", retryable=False)
+            observed_source_sha = observed.stdout.strip()
+            run_repository = checkout
         if request.review_head_sha is not None:
             # VOYN-W0-AICC-REVIEW-AUTO-ACCEPT: run this agent in a detached
             # checkout at the PR's exact head. Only meaningful for read-only
@@ -982,6 +1001,7 @@ def _run_agent(
         if (
             task_type not in agent_runner.MUTATING_TASK_TYPES
             and request.review_head_sha is None
+            and request.delivery_team_source_sha is None
             and agent_runner.principal_isolation_required()
         ):
             # VOYN-W0-AICC-READ-ONLY-RUNS-NEED-AN-ISOLATED-WORKSPACE: a
@@ -1448,6 +1468,26 @@ def _run_agent(
             "stderr_tail": _tail(run.stderr),
             "result_text": _tail(result_text),
         }
+        if observed_source_sha is not None:
+            result["observed_source_sha"] = observed_source_sha
+        # Preserve the bounded structured result before human-readable tails
+        # truncate it. A successful process is not a successful stage review.
+        if request.delivery_team is not None and run.status == "completed":
+            from command_center.orchestrator.delivery_team import (
+                TeamResultError,
+                parse_role_result,
+            )
+
+            try:
+                result["delivery_team_result"] = parse_role_result(
+                    result_text, request.delivery_team
+                )
+            except TeamResultError as exc:
+                return HandlerOutcome(
+                    ok=False,
+                    reason=f"invalid delivery-team result: {exc}",
+                    retryable=False,
+                )
 
         def checkpoint_preserved_candidate() -> HandlerOutcome | None:
             """Authenticate the committed prefix before an infrastructure retry."""

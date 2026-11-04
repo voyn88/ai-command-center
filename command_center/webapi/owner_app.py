@@ -6,7 +6,11 @@ canonical database and planner; neither mode creates a local task store.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import os
+import re
+import stat
 import secrets
 import time
 from contextlib import asynccontextmanager
@@ -14,12 +18,17 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from command_center.backlog_client import load_projection
+from command_center.deployment.runtime_version import capture_runtime_version
 from native_gateway.redaction import sanitize_value
+
+
+# Resolve while this module is imported, before a deployment can switch current.
+_OWNER_MODULE_FILE = Path(__file__).resolve()
 
 
 def _project(owner: str) -> str:
@@ -56,7 +65,57 @@ def read_backlog(path: Path) -> dict:
     }
 
 
+
+def _read_team_artifact(root: Path | None, name: str) -> bytes | None:
+    """Read only a bounded, content-addressed release observation, without links."""
+    if (root is None or not root.is_absolute()
+            or not re.fullmatch(r'[a-f0-9]{64}\.json', name)
+            or not hasattr(os, 'O_NOFOLLOW') or not hasattr(os, 'O_DIRECTORY')
+            or os.open not in os.supports_dir_fd):
+        return None
+    directory_fd = None
+    try:
+        directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        descriptor = os.open(
+            name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd,
+        )
+        with os.fdopen(descriptor, 'rb') as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_size > 65536:
+                return None
+            raw = stream.read(65537)
+        if len(raw) > 65536 or hashlib.sha256(raw).hexdigest() != name[:-5]:
+            return None
+
+        def unique_fields(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError('duplicate field')
+                result[key] = value
+            return result
+
+        value = json.loads(raw, object_pairs_hook=unique_fields)
+        fields = {
+            'schema', 'task_id', 'revision', 'repo', 'environment', 'sha',
+            'version_url', 'health_url', 'health', 'criteria', 'started_at',
+            'observed_at', 'business_acceptance',
+        }
+        if (not isinstance(value, dict) or set(value) != fields
+                or value.get('schema') != 'delivery-release-observation/v1'
+                or value.get('business_acceptance') is not False):
+            return None
+        return raw
+    except (OSError, ValueError, UnicodeError, RecursionError):
+        return None
+    finally:
+        if directory_fd is not None:
+            os.close(directory_fd)
+
 def create_app() -> FastAPI:
+    runtime_version = capture_runtime_version(_OWNER_MODULE_FILE)
+    artifact_setting = os.environ.get('AICC_TEAM_ARTIFACT_DIR', '')
+    artifact_root = Path(artifact_setting) if artifact_setting else None
     credential = os.environ.get('AICC_OWNER_UPSTREAM_KEY', '')
     if len(credential) < 32:
         raise RuntimeError('AICC_OWNER_UPSTREAM_KEY must contain at least 32 characters')
@@ -70,13 +129,14 @@ def create_app() -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app):
-        if command_key:
+        uses_database = bool(command_key or os.environ.get('AICC_PG_HOST'))
+        if uses_database:
             from command_center.db import pool
             pool.open_pool()
         try:
             yield
         finally:
-            if command_key:
+            if uses_database:
                 pool.close_pool()
 
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
@@ -100,6 +160,25 @@ def create_app() -> FastAPI:
     @app.get('/api/backlog')
     def backlog():
         return {**read_backlog(projection), 'commands_enabled': bool(command_key), 'read_only': not bool(command_key)}
+
+    @app.get('/api/team')
+    def team(limit: int = Query(default=30, ge=1, le=100), offset: int = Query(default=0, ge=0)):
+        from command_center.api.delivery_team_routes import read_team
+        return read_team(limit=limit, offset=offset)
+
+    @app.get('/api/team/artifacts/{artifact_name}')
+    def team_artifact(artifact_name: str):
+        raw = _read_team_artifact(artifact_root, artifact_name)
+        if raw is None:
+            raise HTTPException(404, 'Artifact not found')
+        return Response(content=raw, media_type='application/json')
+
+    @app.get('/api/version')
+    def version():
+        if runtime_version.sha is None:
+            return JSONResponse({'status': 'unknown', 'sha': None}, status_code=503)
+        return {'status': 'known', 'sha': runtime_version.sha,
+                'source': 'immutable_release_at_startup'}
 
     @app.get('/healthz')
     def health():
