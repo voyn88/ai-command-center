@@ -1341,3 +1341,4 @@ def test_cursor_unavailable_model_is_provider_refusal():
     diagnostic = "Cannot use this model: auto. Available models: composer-2.5"
     assert _provider_error_run(stderr=diagnostic).is_executor_provider_error("cursor")
     assert not _provider_error_run(status="completed", exit_code=0, stdout=diagnostic).is_executor_provider_error("cursor")
+    assert not _provider_error_run(stdout=diagnostic, stderr="tests failed").is_executor_provider_error("cursor")
