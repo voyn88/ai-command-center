@@ -1282,6 +1282,26 @@ def test_quota_circuit_refuses_invalid_deadlines(seconds):
         agent_runner.record_executor_exhausted("cursor", cooldown_seconds=seconds)
 
 
+@pytest.mark.parametrize("status,exit_code,stdout,stderr,expected", [
+    ("failed", 1, "", "provider HTTP 402", "HTTP 402"),
+    ("failed", 1, "", "provider HTTP 402\n", "HTTP 402"),
+    ("completed", 0, "", "provider HTTP 402", None),
+    ("failed", None, "", "provider HTTP 402", None),
+    ("failed", 0, "", "provider HTTP 402", None),
+    ("failed", 1, "", "provider HTTP 401", None),
+    ("failed", 1, "", "provider HTTP 403", None),
+    ("failed", 1, "", "provider HTTP 429", "HTTP 429"),
+    ("failed", 1, "", "provider HTTP 402\nadditional task prose", None),
+    ("failed", 1, "provider HTTP 402", "tests failed", None),
+    ("failed", 1, "", "quoted provider HTTP 402", None),
+])
+def test_grok_billing_refusal_triggers_quota_circuit_only_for_fixed_diagnostic(
+    status, exit_code, stdout, stderr, expected
+):
+    run = _provider_error_run(status, exit_code, stdout, stderr)
+    assert run.executor_quota_signature("grok") == expected
+
+
 def test_quota_signature_ignores_success_and_quoted_stdout():
     assert _provider_error_run(stderr="provider HTTP 429").executor_quota_signature("grok")
     assert _provider_error_run(stderr="provider HTTP 401").executor_quota_signature("grok") is None
