@@ -244,6 +244,7 @@ def test_the_worker_reaches_the_queue_only_through_the_six_protocol_steps() -> N
         # -- turns a finding into a task.
         "monitor_record_finding",
         "monitor_clear_finding",
+        "monitor_clear_resolved_findings",
     }
     assert roles.VIEW_PRIVILEGES[roles.WORKER_ROLE] == {}
 
@@ -308,6 +309,7 @@ def test_the_control_plane_cannot_claim() -> None:
         "backlog_set_task_class",
         "monitor_record_finding",
         "monitor_clear_finding",
+        "monitor_clear_resolved_findings",
         "monitor_link_task",
         # VOYN-W0-AICC-BACKLOG-PG-CANONICAL-GATE (0020): the importer's stamp
         # of where a migrated row came from.
