@@ -1,13 +1,11 @@
 # Per-host self-deploy tick (VOYN-W0-AICC-DEPLOY-AUTOMATION).
 #
-# Two install variants -- the difference is ONLY the ExecStart flags, and the
-# committed default is the CONTROL host (database owner: migrations run,
-# no restarts -- its ticks are oneshot units that re-exec from /opt/aicc/current
-# on their next firing). A WORKER host replaces ExecStart with the variant
-# below: no --migrate (the worker role holds no DDL privilege) and its own
-# --restart list (SIGTERM is a graceful drain for the daemons):
-#
-#   ExecStart=/bin/bash -lc "exec /opt/aicc/current/.venv/bin/python -m command_center.db self-deploy --repo-path ${AICC_SOURCE_REPO} --release-root /opt/aicc --release-venv ${AICC_RUNTIME_VENV} --restart voyn-aicc-worker.service --restart voyn-aicc-worker-2.service --restart voyn-aicc-worker@3.service --restart voyn-aicc-worker@4.service"
+# This is the CONTROL host variant: the database owner, so migrations run and
+# no service is restarted (its ticks are oneshot units that re-exec from
+# /opt/aicc/current on their next firing). Workers do not install this unit.
+# voyn-aicc-self-deploy-worker.service stays retired; worker hosts stage
+# immutable releases with voyn-aicc-worker-release-deploy
+# (VOYN-W0-AICC-SYSTEMD-DRIFT-VERSIONED-UNITS).
 #
 # The command is fail-closed (diverged/dirty checkout, dependency-manifest
 # change) and rolls back checkout + services on migration/smoke/restart

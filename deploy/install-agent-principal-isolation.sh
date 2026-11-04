@@ -701,6 +701,13 @@ trap - EXIT HUP INT TERM
 # review-window labeller instead of "someone typed it once on 2026-09-09"
 # (VOYN-W0-AICC-PR-WINDOW-RECONCILER-NOT-DEPLOYED-ON-CONTROL).
 if [ "$install_profile" = "control" ]; then
-  systemctl enable --now voyn-aicc-review.timer voyn-aicc-merge.timer voyn-aicc-remediate.timer voyn-aicc-credential-rescue.timer voyn-aicc-pr-window.timer
+  systemctl enable --now voyn-aicc-review.timer voyn-aicc-merge.timer voyn-aicc-remediate.timer voyn-aicc-credential-rescue.timer voyn-aicc-pr-window.timer voyn-queue-monitor.timer
+  # Control still tracks the repository with this tick. Workers retired it
+  # above in favor of voyn-aicc-worker-release-deploy; enabling it here would
+  # undo that retirement.
+  systemctl enable --now voyn-aicc-self-deploy.timer
+fi
+if [ "$install_profile" = "worker" ]; then
+  systemctl enable --now voyn-infra-monitor.timer
 fi
 echo "AICC_AGENT_PRINCIPAL_ISOLATION_INSTALLED"
