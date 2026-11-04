@@ -873,6 +873,10 @@ def test_acceptance_before_receipt_observation_is_rejected_in_long_transaction(r
         assert cur.fetchone() == (True,)
         cur.execute(ACCEPTANCE_SQL, (TASK, SHA, "C1", "business-check-1", ACCEPTANCE_REF, before_receipt))
         assert cur.fetchone() == (False,)
+        cur.execute("SELECT clock_timestamp()")
+        after_receipt = cur.fetchone()[0]
+        cur.execute(ACCEPTANCE_SQL, (TASK, SHA, "C1", "business-check-1", ACCEPTANCE_REF, after_receipt))
+        assert cur.fetchone() == (True,)
 
 
 def test_one_correction_can_cover_two_related_incidents(rig, connect_as, psycopg):  # noqa: F811
@@ -899,3 +903,46 @@ def test_one_correction_can_cover_two_related_incidents(rig, connect_as, psycopg
     c = candidate(factory, "auditor")
     value.update({k:c[k] for k in ("revision","input_digest")})
     assert complete_stage(rig, c, value) == [(TASK, "auditor", "pass")]
+
+
+def test_latest_sha_requires_matching_release_before_production_qa(rig, connect_as):  # noqa: F811
+    factory, store, _queue = rig
+    prepare_post_code_candidate(rig, connect_as, "production_qa")
+    new_sha = "b" * 40
+    assert store.record_evidence(TASK, "sha", new_sha)[0]
+    sync_task(factory)
+    for stage in ("independent_reviewer", "devops"):
+        c = candidate(factory, stage)
+        assert complete_stage(rig, c, result(c, sha=new_sha)) == [(TASK, stage, "pass")]
+        sync_task(factory)
+    assert not any(c[0]["stage"] == "production_qa" for c in rows(factory, "SELECT * FROM delivery_team_candidates(100)"))
+    assert rows(lambda: connect_as(roles.OPERATOR_ROLE),
+                "SELECT delivery_team_record_release(%s,1,%s,'production','[\"C1\"]'::jsonb,'receipt:new-sha')",
+                (TASK, new_sha)) == [(True,)]
+    sync_task(factory)
+    assert candidate(factory, "production_qa")["context"]["source_sha"] == new_sha
+
+
+def test_latest_invalid_sha_blocks_post_code_candidate(rig):  # noqa: F811
+    factory, store, _queue = rig
+    enroll(rig)
+    preflight(rig)
+    assert store.record_evidence(TASK, "pr", "https://github.com/example/repo/pull/1")[0]
+    assert store.record_evidence(TASK, "sha", SHA)[0]
+    sync_task(factory)
+    assert candidate(factory, "independent_reviewer")["context"]["source_sha"] == SHA
+    assert store.record_evidence(TASK, "sha", "invalid-latest-sha")[0]
+    sync_task(factory)
+    assert rows(factory, "SELECT * FROM delivery_team_candidates(100)") == []
+
+
+@pytest.mark.parametrize("stop", [False, True])
+def test_real_gate_preserves_unenrolled_legacy_and_holds_enrolled(rig, monkeypatch, stop):  # noqa: F811
+    from command_center.orchestrator import delivery_team
+    factory, store, _queue = rig
+    monkeypatch.setenv("AICC_DELIVERY_TEAM_ENABLED", "1")
+    monkeypatch.setenv("AICC_DELIVERY_TEAM_STOP", "1" if stop else "0")
+    assert store.upsert_task(_task(TASK + "-LEGACY", repo="repo-one"))[0]
+    assert delivery_team.implementation_gate(factory, TASK + "-LEGACY", 1) == (True, "unenrolled")
+    enroll(rig)
+    assert delivery_team.implementation_gate(factory, TASK, 1)[0] is False

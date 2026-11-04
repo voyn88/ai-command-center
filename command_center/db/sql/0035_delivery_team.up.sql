@@ -275,10 +275,12 @@ RETURNS boolean LANGUAGE sql STABLE SET search_path = pg_catalog, public AS $$
       AND a.stage='auditor' AND a.status='passed'
       AND a.input_digest=_delivery_team_digest(a.task_id,a.revision,a.ordinal)) END
    AND (s.ordinal NOT IN (8,9,10) OR
-      (EXISTS(SELECT 1 FROM backlog_evidence e WHERE e.task_id=s.task_id AND e.kind='sha' AND e.value~'^[a-f0-9]{40}$')
+      ((SELECT e.value~'^[a-f0-9]{40}$' FROM backlog_evidence e WHERE e.task_id=s.task_id AND e.kind='sha' ORDER BY e.evidence_id DESC LIMIT 1)
        AND EXISTS(SELECT 1 FROM backlog_evidence e WHERE e.task_id=s.task_id AND e.kind='pr')))
    AND (s.ordinal<>10 OR EXISTS(SELECT 1 FROM delivery_team_release_receipt r
-        WHERE r.task_id=s.task_id AND r.revision=s.revision AND r.environment='production'))
+        WHERE r.task_id=s.task_id AND r.revision=s.revision AND r.environment='production'
+          AND r.sha=(SELECT e.value FROM backlog_evidence e WHERE e.task_id=s.task_id
+                     AND e.kind='sha' ORDER BY e.evidence_id DESC LIMIT 1)))
    FROM delivery_team_stage s JOIN backlog_task t ON t.task_id=s.task_id AND t.revision=s.revision
    WHERE s.task_id=p_task_id AND s.revision=p_revision AND s.stage=p_stage),false)
 $$;

@@ -208,6 +208,11 @@ def incident_key(project: str, run_id: str, sha: str, signature: str) -> str:
 
 def build_payload(candidate: Mapping[str, Any], route: tuple[str, str], timeout_seconds: int = 900) -> dict[str, Any]:
     metadata = _metadata({k: candidate[k] for k in ("task_id", "revision", "stage", "input_digest")})
+    context = candidate.get("context")
+    if context is None:
+        context = {}
+    if not isinstance(context, dict):
+        raise TeamResultError("candidate context must be an object")
     example = {"schema": SCHEMA, **metadata, "verdict": "blocked", "criteria": [{"id": "C1", "description": "Criterion from the agreed task"}], "evidence": [], "blockers": ["Missing evidence or required decision"], "summary": "Concrete assessment"}
     rca_instructions = ""
     if metadata["stage"] in {"auditor", "cto_rca"}:
@@ -233,12 +238,13 @@ def build_payload(candidate: Mapping[str, Any], route: tuple[str, str], timeout_
     payload = {"kind": "agent_run", "v": 1, "project_id": route[0], "repository_path": route[1], "task_type": "review", "prompt": prompt,
             "timeout_seconds": timeout_seconds, "untrusted": False, "cascade": [{"executor": e, "task_type": "review"} for e in ("codex", "claude")], "delivery_team": metadata}
     if metadata["stage"] in {"independent_reviewer", "devops", "production_qa"}:
-        context = candidate.get("context") or {}
         source_sha = context.get("source_sha")
         if not isinstance(source_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", source_sha):
             raise TeamResultError("post-code stage requires authoritative source SHA")
-        if metadata["stage"] == "production_qa" and (context.get("release_receipt") or {}).get("sha") != source_sha:
-            raise TeamResultError("production receipt/source SHA mismatch")
+        if metadata["stage"] == "production_qa":
+            receipt = context.get("release_receipt")
+            if not isinstance(receipt, dict) or receipt.get("sha") != source_sha:
+                raise TeamResultError("production receipt/source SHA mismatch")
         payload["delivery_team_source_sha"] = source_sha
     return payload
 
@@ -303,13 +309,18 @@ def validate_role_request(expected: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def implementation_gate(connection_factory, task_id: str, revision: int) -> tuple[bool, str]:
-    """No feature -> legacy path; stop -> hold, never bypass readiness."""
+    """Hold enrolled tasks only; legacy tasks retain their existing gate."""
     if not enabled():
         return True, "disabled"
+    with connection_factory() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT EXISTS(SELECT 1 FROM delivery_team_stage WHERE task_id=%s), "
+            "delivery_team_ready(%s,%s)", (task_id, task_id, revision)
+        )
+        row = cur.fetchone()
+    if row and row[0] is False:
+        return True, "unenrolled"
     if stopped():
         return False, "delivery_team_stopped"
-    with connection_factory() as conn, conn.cursor() as cur:
-        cur.execute("SELECT delivery_team_ready(%s,%s)", (task_id, revision))
-        row = cur.fetchone()
-    ready = bool(row and row[0] is True)
+    ready = bool(row and row[1] is True)
     return ready, "ready" if ready else "delivery_team_prerequisites"

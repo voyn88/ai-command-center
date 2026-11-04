@@ -67,11 +67,13 @@ def test_stop_holds_gate_and_ingests_without_dispatch(monkeypatch):
     monkeypatch.setenv("AICC_DELIVERY_TEAM_STOP","1")
     factory=MagicMock()
     cur=factory.return_value.__enter__.return_value.cursor.return_value.__enter__.return_value
-    cur.fetchall.return_value=[]
+    cur.fetchall.side_effect = [[], [("VOYN-TEAM-1", "ba", "pass")]]
+    cur.fetchone.return_value = (True, False)
     report=team.tick(factory)
     assert report.stopped and not report.dispatched
     calls=[x.args[0] for x in cur.execute.call_args_list]
-    assert len(calls)==2 and all("candidates" not in s and "dispatch" not in s for s in calls)
+    assert calls == ["SELECT * FROM delivery_team_sync(%s,%s::jsonb)", "SELECT * FROM delivery_team_ingest(%s)"]
+    assert report.ingested == [("VOYN-TEAM-1", "ba", "pass")]
     assert team.implementation_gate(factory,"T",1)==(False,"delivery_team_stopped")
 
 
@@ -118,7 +120,7 @@ def test_rca_requires_structured_actions_and_cause(stage):
     expected = dict(META, stage=stage)
     value = rca_result(stage)
     assert team.parse_role_result(value, expected)
-    for field in ("incident_key", "facts", "root_cause", "missed_control", "actions"):
+    for field in ("incident_key", "facts", "hypotheses", "root_cause", "missed_control", "actions"):
         broken = json.loads(json.dumps(value))
         del broken["rca"][0][field]
         with pytest.raises(team.TeamResultError):
@@ -164,3 +166,50 @@ def test_incident_identity_uses_utf8_length_framing():
     assert team.incident_key(*parts) == hashlib.sha256(framed).hexdigest()
     with pytest.raises(team.TeamResultError):
         team.incident_key("repo", "run", None, "failure")
+
+
+@pytest.mark.parametrize("stop", [False, True])
+def test_unenrolled_legacy_gate_is_not_held(monkeypatch, stop):
+    monkeypatch.setenv("AICC_DELIVERY_TEAM_ENABLED", "1")
+    monkeypatch.setenv("AICC_DELIVERY_TEAM_STOP", "1" if stop else "0")
+    factory = MagicMock()
+    cur = factory.return_value.__enter__.return_value.cursor.return_value.__enter__.return_value
+    cur.fetchone.return_value = (False, False)
+    assert team.implementation_gate(factory, "VOYN-LEGACY", 1) == (True, "unenrolled")
+
+
+@pytest.mark.parametrize("context", [[1], "invalid", {"source_sha": "b" * 40, "release_receipt": [1]}])
+def test_malformed_context_isolated_before_next_candidate(monkeypatch, context):
+    from command_center.orchestrator import planner
+    monkeypatch.setenv("AICC_DELIVERY_TEAM_ENABLED", "1")
+    monkeypatch.delenv("AICC_DELIVERY_TEAM_STOP", raising=False)
+    monkeypatch.delenv("AICC_DELIVERY_TEAM_TASK_IDS", raising=False)
+    monkeypatch.setattr(planner, "repo_route", lambda _: ("AIOS", "/repo"))
+    factory = MagicMock()
+    cur = factory.return_value.__enter__.return_value.cursor.return_value.__enter__.return_value
+    bad = dict(META, stage="production_qa", repo="repo", context=context)
+    good = dict(META, task_id="VOYN-GOOD", repo="repo")
+    cur.fetchall.side_effect = [[], [], [(bad,), (good,)], [(True, "queued", "work-good")]]
+    report = team.tick(factory)
+    assert report.refused[0][:2] == (META["task_id"], "invalid_candidate")
+    assert report.dispatched == [("VOYN-GOOD", "ba", "work-good")]
+
+
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+def test_raw_json_nonfinite_rejected_during_decode(constant):
+    raw = json.dumps(result()).replace('"revision": 2', '"revision": ' + constant)
+    with pytest.raises(team.TeamResultError, match="invalid role JSON") as error:
+        team.parse_role_result(raw, META)
+    assert str(error.value.__cause__) == "nonfinite JSON"
+    assert team.parse_role_result(json.dumps(result()), META)["revision"] == 2
+
+
+def test_empty_criteria_rejected_without_foreign_evidence():
+    with pytest.raises(team.TeamResultError, match="criteria required"):
+        team.parse_role_result(result(criteria=[], evidence=[], verdict="blocked", blockers=["No agreed criteria"]), META)
+
+
+def test_auditor_can_cite_incident_evidence_without_code_sha():
+    value = rca_result("auditor")
+    value["evidence"][0]["sha"] = None
+    assert team.parse_role_result(value, dict(META, stage="auditor"))["verdict"] == "pass"
