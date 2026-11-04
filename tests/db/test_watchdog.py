@@ -17,12 +17,11 @@ from command_center.ops.tick_stall_watchdog import (
     record_skips,
     watchdog_once,
 )
-from tests.db.test_backlog_planner import (  # noqa: F401 — pytest fixtures
-    _test_repo_routes,
-    rig,
-)
 
-pytestmark = [pytest.mark.serial, pytest.mark.usefixtures("role_passwords")]
+pytestmark = [
+    pytest.mark.serial,
+    pytest.mark.usefixtures("role_passwords", "_test_repo_routes"),
+]
 
 STALLED = "VOYN-W0-WD-STALLED"
 REASON = "no_review_result_yet"
@@ -63,7 +62,7 @@ def _task_row(app_factory, task_id: str):
         return cur.fetchone()
 
 
-def test_five_consecutive_skips_escalate_exactly_once(rig) -> None:  # noqa: F811
+def test_five_consecutive_skips_escalate_exactly_once(rig) -> None:
     app_factory, store, _queue = rig
     _stalled_task(store)
     _record_ticks(app_factory, 5)
@@ -80,7 +79,7 @@ def test_five_consecutive_skips_escalate_exactly_once(rig) -> None:  # noqa: F81
     assert STALLED in title
 
 
-def test_a_second_run_over_the_same_episode_does_not_duplicate(rig) -> None:  # noqa: F811
+def test_a_second_run_over_the_same_episode_does_not_duplicate(rig) -> None:
     app_factory, store, _queue = rig
     _stalled_task(store)
     _record_ticks(app_factory, 6)
@@ -99,7 +98,7 @@ def test_a_second_run_over_the_same_episode_does_not_duplicate(rig) -> None:  # 
     assert len(_escalations(app_factory)) == 1
 
 
-def test_fewer_than_threshold_ticks_do_not_escalate(rig) -> None:  # noqa: F811
+def test_fewer_than_threshold_ticks_do_not_escalate(rig) -> None:
     app_factory, store, _queue = rig
     _stalled_task(store)
     _record_ticks(app_factory, 4)
@@ -109,7 +108,7 @@ def test_fewer_than_threshold_ticks_do_not_escalate(rig) -> None:  # noqa: F811
     assert _escalations(app_factory) == []
 
 
-def test_the_watchdog_never_mutates_the_stalled_task(rig) -> None:  # noqa: F811
+def test_the_watchdog_never_mutates_the_stalled_task(rig) -> None:
     app_factory, store, _queue = rig
     _stalled_task(store)
     before = _task_row(app_factory, STALLED)
@@ -119,7 +118,7 @@ def test_the_watchdog_never_mutates_the_stalled_task(rig) -> None:  # noqa: F811
     assert _task_row(app_factory, STALLED) == before
 
 
-def test_an_interleaved_reason_resets_the_streak_on_live_rows(rig) -> None:  # noqa: F811
+def test_an_interleaved_reason_resets_the_streak_on_live_rows(rig) -> None:
     app_factory, store, _queue = rig
     _stalled_task(store)
     with app_factory() as conn:
@@ -136,7 +135,7 @@ def test_an_interleaved_reason_resets_the_streak_on_live_rows(rig) -> None:  # n
     assert _escalations(app_factory) == []
 
 
-def test_empty_tick_breaks_streak_and_new_episode_has_new_identity(rig):  # noqa: F811
+def test_empty_tick_breaks_streak_and_new_episode_has_new_identity(rig):
     app_factory, store, _queue = rig
     _stalled_task(store)
     _record_ticks(app_factory, 5)
@@ -152,7 +151,7 @@ def test_empty_tick_breaks_streak_and_new_episode_has_new_identity(rig):  # noqa
     assert first.escalated[0][1] != second.escalated[0][1]
 
 
-def test_long_streak_retains_episode_after_history_window_would_shift(rig):  # noqa: F811
+def test_long_streak_retains_episode_after_history_window_would_shift(rig):
     app_factory, store, _queue = rig
     _stalled_task(store)
     _record_ticks(app_factory, 5)
@@ -167,7 +166,7 @@ def test_long_streak_retains_episode_after_history_window_would_shift(rig):  # n
     assert len(_escalations(app_factory)) == 1
 
 
-def test_same_task_different_reason_and_kind_do_not_collide(rig):  # noqa: F811
+def test_same_task_different_reason_and_kind_do_not_collide(rig):
     app_factory, store, _queue = rig
     _stalled_task(store)
     with app_factory() as conn:
@@ -180,7 +179,7 @@ def test_same_task_different_reason_and_kind_do_not_collide(rig):  # noqa: F811
     assert len({task for _, task in report.escalated}) == 4
 
 
-def test_normal_window_wait_and_completed_task_do_not_create_work(rig):  # noqa: F811
+def test_normal_window_wait_and_completed_task_do_not_create_work(rig):
     app_factory, store, _queue = rig
     _stalled_task(store)
     _record_ticks(app_factory, 4)
@@ -197,7 +196,7 @@ def test_normal_window_wait_and_completed_task_do_not_create_work(rig):  # noqa:
 
 
 @pytest.mark.parametrize("suffix", ["", "-REM", "-REM-REM"])
-def test_escalations_cannot_recursively_spawn_more_escalations(rig, suffix):  # noqa: F811
+def test_escalations_cannot_recursively_spawn_more_escalations(rig, suffix):
     app_factory, store, _queue = rig
     _stalled_task(store)
     _record_ticks(app_factory, 5)

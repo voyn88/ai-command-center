@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import pytest
 
-from tests.db.test_backlog_planner import _test_repo_routes, rig  # noqa: F401
 
 # `rig` provisions cluster-level roles (aicc_migrator, aicc_worker, ...) that
 # every xdist worker's database shares; running these tests under xdist
@@ -15,7 +14,10 @@ from tests.db.test_backlog_planner import _test_repo_routes, rig  # noqa: F401
 # shared catalog rows (VOYN-W0-AICC-FLAKE-RIG-ROLE-SETUP-CONCURRENT-UPDATE).
 # `tests/db/test_backlog_planner.py`, `rig`'s home module, already opts out of
 # xdist this way; every other module that borrows `rig` must do the same.
-pytestmark = [pytest.mark.serial, pytest.mark.usefixtures("role_passwords")]
+pytestmark = [
+    pytest.mark.serial,
+    pytest.mark.usefixtures("role_passwords", "_test_repo_routes"),
+]
 
 
 def _untriaged(store, factory, task_id):
@@ -36,7 +38,7 @@ def _status(factory, task_id):
         return cur.fetchone()[0]
 
 
-def test_accept_opens_the_finding(rig):  # noqa: F811
+def test_accept_opens_the_finding(rig):
     f, store, _ = rig
     _untriaged(store, f, "VOYN-W0-T1")
     ok, reason = _triage(f, "VOYN-W0-T1", "accept")
@@ -44,14 +46,14 @@ def test_accept_opens_the_finding(rig):  # noqa: F811
     assert _status(f, "VOYN-W0-T1") == "OPEN"
 
 
-def test_refine_needs_refinement(rig):  # noqa: F811
+def test_refine_needs_refinement(rig):
     f, store, _ = rig
     _untriaged(store, f, "VOYN-W0-T2")
     ok, reason = _triage(f, "VOYN-W0-T2", "refine")
     assert ok and reason == "NEEDS_REFINEMENT"
 
 
-def test_duplicate_is_decided_with_traceable_detail(rig):  # noqa: F811
+def test_duplicate_is_decided_with_traceable_detail(rig):
     f, store, _ = rig
     _untriaged(store, f, "VOYN-W0-T3")
     ok, reason = _triage(f, "VOYN-W0-T3", "duplicate", "superseded by VOYN-W0-T1")
@@ -62,7 +64,7 @@ def test_duplicate_is_decided_with_traceable_detail(rig):  # noqa: F811
         assert "superseded" in str(cur.fetchone()[0])
 
 
-def test_done_requires_pr_and_sha_evidence(rig):  # noqa: F811
+def test_done_requires_pr_and_sha_evidence(rig):
     f, store, _ = rig
     _untriaged(store, f, "VOYN-W0-T4")
     # bare 'done' is refused — a finding cannot claim delivery without receipts
@@ -78,7 +80,7 @@ def test_done_requires_pr_and_sha_evidence(rig):  # noqa: F811
     assert ok and reason == "DONE"
 
 
-def test_triage_only_from_untriaged(rig):  # noqa: F811
+def test_triage_only_from_untriaged(rig):
     f, store, _ = rig
     from tests.db.test_backlog_planner import _task
     assert store.upsert_task(_task("VOYN-W0-T5", status="OPEN"))[0]
@@ -86,7 +88,7 @@ def test_triage_only_from_untriaged(rig):  # noqa: F811
     assert not ok and "not_untriaged" in reason
 
 
-def test_unknown_decision_is_refused_as_data(rig):  # noqa: F811
+def test_unknown_decision_is_refused_as_data(rig):
     f, store, _ = rig
     _untriaged(store, f, "VOYN-W0-T6")
     ok, reason = _triage(f, "VOYN-W0-T6", "nonsense")
@@ -94,7 +96,7 @@ def test_unknown_decision_is_refused_as_data(rig):  # noqa: F811
     assert _status(f, "VOYN-W0-T6") == "UNTRIAGED"
 
 
-def test_concurrent_triage_of_one_finding_applies_once(rig):  # noqa: F811
+def test_concurrent_triage_of_one_finding_applies_once(rig):
     """The only serializer of two simultaneous triages of one finding is the
     row lock (backlog_triage has no optimistic revision gate, unlike
     transition/dispatch). Removing FOR UPDATE lets both read UNTRIAGED and
