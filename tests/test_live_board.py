@@ -100,6 +100,20 @@ def test_done_task_is_not_launchable():
     assert gate.code == live_board.GATE_ALREADY_DONE
 
 
+def test_master_projection_task_is_not_launchable(tmp_path):
+    """A master-projection record (the read-only backlog fallback view) must
+    never gate as launchable, even when every other condition (workspace,
+    dependencies, no active run) would otherwise allow it — `save_tasks`
+    drops such records structurally on write, so the gate must refuse them
+    before the write path ever sees the launch (VOYN-W0-AICC-READONLY-
+    LAUNCH-SURFACES)."""
+    task = _task("T1", workspace_path=str(tmp_path), source="master", read_only=True)
+    gate = live_board.launch_gate(task, tasks_by_id=_by_id(task), active_runs=[])
+
+    assert not gate.allowed
+    assert gate.code == live_board.GATE_READ_ONLY
+
+
 def test_unmet_dependency_blocks_launch_and_names_the_dependency(tmp_path):
     dep = _task("DEP", title="Сначала это", status="Backlog")
     task = _task("T1", depends_on=["DEP"], workspace_path=str(tmp_path))
