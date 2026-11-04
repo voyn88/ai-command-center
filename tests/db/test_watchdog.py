@@ -12,7 +12,7 @@ from __future__ import annotations
 import pytest
 
 from command_center.db.backlog_parser import ParsedTask
-from command_center.orchestrator.watchdog import (
+from command_center.ops.tick_stall_watchdog import (
     WatchdogConfig,
     record_skips,
     watchdog_once,

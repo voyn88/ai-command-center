@@ -115,7 +115,7 @@ UNMIRRORED_SCHEMA_TABLES: dict[str, Exclusion] = {
         task="VOYN-OPS-AICC-PUBLISH-WINDOW-STARVATION",
     ),
     "tick_observation": Exclusion(
-        reason="PostgreSQL-native tick observations; no SQLite counterpart.",
+        reason="PostgreSQL-native observations include empty ticks to break stale failure streaks; no SQLite database ever owned these records, so there is no source to mirror.",
         task="VOYN-W0-AICC-TICK-STALL-WATCHDOG",
     ),
     "tick_skip_event": Exclusion(

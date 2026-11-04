@@ -11,7 +11,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from command_center.orchestrator.watchdog import (
+from command_center.ops.tick_stall_watchdog import (
     StallEpisode,
     TickSnapshot,
     detect_stalls,

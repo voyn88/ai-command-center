@@ -9,6 +9,11 @@ stale-head verdict; all three found live on 2026-09-07 on PRs #774, #707 and
 #766 by a human running ad-hoc ssh monitor loops) had no watcher that
 survives a terminal.
 
+This is an operational findings projection over existing ticks, not an
+execution engine: it owns no connection, worker, scheduler, claim/lease,
+retry, or task dispatch. The caller provides the existing PostgreSQL
+connection and the backlog protocol owns all lifecycle transitions.
+
 Three pieces, all data:
 
 - :func:`record_skips` — called by the tick CLI handlers at the point they

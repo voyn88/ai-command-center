@@ -647,7 +647,7 @@ def main(argv: list[str] | None = None) -> int:
                 from contextlib import nullcontext as _nc
 
                 from command_center.db.work_queue_store import WorkQueueStore
-                from command_center.orchestrator import watchdog as _watchdog
+                from command_center.ops import tick_stall_watchdog as _watchdog
 
                 from command_center.orchestrator import gh_access
                 from command_center.orchestrator.review_merge import (
@@ -753,7 +753,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.command == "backlog-merge":
                 from contextlib import nullcontext as _nc
 
-                from command_center.orchestrator import watchdog as _watchdog
+                from command_center.ops import tick_stall_watchdog as _watchdog
                 from command_center.orchestrator.review_merge import merge_once
 
                 report = merge_once(lambda: _nc(conn), args.repo_path)
@@ -782,7 +782,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.command == "backlog-watchdog":
                 from contextlib import nullcontext as _nc
 
-                from command_center.orchestrator.watchdog import (
+                from command_center.ops.tick_stall_watchdog import (
                     WatchdogConfig,
                     watchdog_once,
                 )
