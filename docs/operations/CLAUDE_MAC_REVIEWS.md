@@ -63,3 +63,13 @@ Closed-unmerged PRs, already-merged deliveries lacking acceptance evidence, red
 code checks and missing PR evidence are separate triage findings. They are not
 silently marked DONE. Preserve the original evidence and use verified outcomes
 and the existing revision-checked lifecycle when resolving them.
+
+Finding verification uses repository tools on the worker. Inside the privileged
+broker, Codex relies on the systemd filesystem boundary for read-only runs too:
+`ProtectSystem=strict`, a read-only `/workspace` bind, only `/agent-home` writable,
+an isolated dynamic UID and zero capabilities remain enforced. Its nested bwrap
+cannot initialize under `ProcSubset=pid` because kernel overflow-UID metadata is
+intentionally hidden. The CLI therefore uses `danger-full-access` only inside
+this externally constrained unit; outside the broker its read-only mode stays
+unchanged. Verification policy `verify-v4` creates fresh work identities so old
+unavailable-checkout results are not reused as evidence from the repaired path.

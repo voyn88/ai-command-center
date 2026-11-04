@@ -1975,7 +1975,7 @@ def test_chunk_review_rows_is_empty_for_a_single_chunk_review(rig, monkeypatch):
     assert rows == []
 
 
-def test_verification_key_is_scoped_by_head_and_findings():
+def test_verification_key_is_scoped_by_head_findings_and_policy(monkeypatch):
     snap_a = _snapshot("a" * 40)
     key = review_merge._verification_key("T", "https://github.com/x/y/pull/1", snap_a, "f1")
     assert key.startswith("verify:T:1:" + "a" * 40)
@@ -1986,6 +1986,11 @@ def test_verification_key_is_scoped_by_head_and_findings():
         "T", "https://github.com/x/y/pull/1", _snapshot("b" * 40), "f1"
     )
     assert len({key, other_findings, other_head}) == 3
+    monkeypatch.setattr(review_merge, "_VERIFICATION_POLICY_VERSION", "verify-v3")
+    old_contract = review_merge._verification_key(
+        "T", "https://github.com/x/y/pull/1", snap_a, "f1"
+    )
+    assert old_contract != key  # old unavailable-tree verdicts are immutable history
     assert review_merge._verification_key("T", "not-a-pr-url", snap_a, "f1") is None
 
 

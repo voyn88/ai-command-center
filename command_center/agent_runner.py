@@ -950,7 +950,7 @@ def build_codex_command(
 
     Profile mapping, deliberately equivalent rather than merely similar:
 
-    * `PROFILE_READ_ONLY`   -> `--sandbox read-only`. The sandbox is the
+    * `PROFILE_READ_ONLY`   -> `--sandbox read-only` outside principal isolation. The sandbox is the
       enforcement, exactly as `--tools` is for Claude: a read-only sandbox
       cannot write the tree no matter what the model decides to attempt.
     * `PROFILE_TRUSTED_DEVELOPMENT` -> `--sandbox workspace-write`, which
@@ -971,17 +971,19 @@ def build_codex_command(
     executor, so nothing downstream has to learn a second format.
     """
     profile = profile_for_task_type(task_type)
-    if profile == PROFILE_READ_ONLY:
-        sandbox = "read-only"
-    elif principal_isolation_required():
+    if principal_isolation_required():
         # Under principal isolation the systemd unit the broker builds is the
         # boundary (dynamic uid, only /workspace writable, ProtectSystem=
         # strict, no capabilities); Codex's own bubblewrap on top mounted
         # .git read-only, so the commit the fleet contract requires could
         # never land (worker-01 2026-09-09). Owner decision 2026-09-09: no
-        # inner sandbox INSIDE the unit. The launcher builds the same argv
+        # inner sandbox INSIDE the unit. Read-only units additionally bind
+        # /workspace read-only; their nested bwrap cannot initialize under
+        # ProcSubset=pid. The launcher builds the same argv
         # (a test pins both against each other).
         sandbox = "danger-full-access"
+    elif profile == PROFILE_READ_ONLY:
+        sandbox = "read-only"
     else:
         sandbox = "workspace-write"
     command = [
