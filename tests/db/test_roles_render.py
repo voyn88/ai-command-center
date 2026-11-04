@@ -366,6 +366,21 @@ def test_a_worker_host_role_is_a_login_member_of_the_worker_group() -> None:
     assert "PASSWORD" not in statement
 
 
+def test_product_roles_render_as_nologin_groups() -> None:
+    """VOYN-W0-AICC-SHARED-PASSWORD-CONTRACT: fleet-wide roles are grant
+    carriers, not a shared database login. Enrolment mints one LOGIN role per
+    host (0003); bootstrap SQL must never render a passworded shared worker."""
+    for role in (
+        roles.MIGRATOR_ROLE,
+        roles.APP_ROLE,
+        roles.WORKER_ROLE,
+        roles.OPERATOR_ROLE,
+    ):
+        rendered = roles.render_role_creation(role)
+        assert "NOLOGIN" in rendered
+        assert " LOGIN" not in rendered.replace("NOLOGIN", "")
+
+
 def test_app_covers_every_table() -> None:
     assert set(roles.PRIVILEGES[roles.APP_ROLE]) == set(roles.ALL_TABLES)
 

@@ -240,10 +240,14 @@ class ReconcileReport:
 
 @dataclass
 class PrEvidenceReport:
-    """See `reconcile_pr_evidence`. Records evidence; never changes a status."""
+    """See `reconcile_pr_evidence`. Records `pr` evidence; may recover a task
+    that is READY_TO_REVIEW with none when its branch never reached origin."""
 
     #: (task_id, pr_url) newly recorded from the task's own branch.
     recorded: list[tuple[str, str]] = field(default_factory=list)
+    #: (task_id, target status or detail) returned to the pool because no open
+    #: PR exists and the task branch is absent from origin (0018).
+    recovered: list[tuple[str, str]] = field(default_factory=list)
     #: (task_id, reason) examined and deliberately left alone.
     skipped: list[tuple[str, str]] = field(default_factory=list)
 
@@ -253,6 +257,103 @@ class PrEvidenceReport:
 #: convention this function invents.
 def _task_branch(task_id: str) -> str:
     return f"backlog/{task_id}"
+
+
+def _remote_task_branch_sha(repo_path: str, branch: str) -> tuple[str, str]:
+    """Whether `refs/heads/<branch>` exists on `origin`.
+
+    Returns ``(outcome, sha)`` where *outcome* is ``ok`` (sha may be empty
+    when the ref is absent), or ``failed`` when the lookup itself failed."""
+    try:
+        proc = subprocess.run(
+            ["git", "ls-remote", "--heads", "origin", f"refs/heads/{branch}"],
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "failed", ""
+    if proc.returncode != 0:
+        return "failed", ""
+    lines = [line.split() for line in proc.stdout.splitlines() if line.strip()]
+    if not lines:
+        return "ok", ""
+    if len(lines) != 1 or len(lines[0]) != 2 or lines[0][1] != f"refs/heads/{branch}":
+        return "failed", ""
+    sha = lines[0][0]
+    if len(sha) != 40 or any(c not in "0123456789abcdefABCDEF" for c in sha):
+        return "failed", ""
+    return "ok", sha.lower()
+
+
+def _create_open_pr_for_task_branch(
+    repo_path: str,
+    task_id: str,
+    branch: str,
+    head_sha: str,
+    *,
+    base: str = "main",
+) -> tuple[str | None, str]:
+    """Open a pull request for a branch that is already on origin without one."""
+    view = _gh(
+        [
+            "pr",
+            "view",
+            branch,
+            "--json",
+            "url,headRefOid,baseRefName,state",
+        ],
+        repo_path,
+    )
+    if view.returncode == 0:
+        try:
+            snapshot = json.loads(view.stdout)
+        except (TypeError, ValueError):
+            snapshot = None
+        if isinstance(snapshot, dict) and snapshot.get("state") == "OPEN":
+            url = snapshot.get("url")
+            if isinstance(url, str) and url:
+                return url, ""
+    body = f"Autonomous delivery of {task_id}.\n\nHEAD_SHA: {head_sha}\n"
+    created = _gh(
+        [
+            "pr",
+            "create",
+            "--base",
+            base,
+            "--head",
+            branch,
+            "--title",
+            f"{task_id}: autonomous delivery",
+            "--body",
+            body,
+        ],
+        repo_path,
+    )
+    if created.returncode != 0:
+        detail = (created.stderr or created.stdout or "").strip()[:160]
+        return None, f"pr_create_failed: {detail}"
+    reference = created.stdout.strip()
+    if not reference:
+        return None, "pr_create_missing_url"
+    after = _gh(
+        ["pr", "view", reference, "--json", "url,state"],
+        repo_path,
+    )
+    if after.returncode != 0:
+        return None, "pr_unreadable_after_create"
+    try:
+        payload = json.loads(after.stdout)
+    except (TypeError, ValueError):
+        return None, "pr_unreadable_after_create"
+    if not isinstance(payload, dict) or payload.get("state") != "OPEN":
+        return None, "pr_not_open_after_create"
+    url = payload.get("url")
+    if not isinstance(url, str) or not url:
+        return None, "pr_not_open_after_create"
+    return url, ""
 
 
 def reconcile_pr_evidence(
@@ -296,9 +397,13 @@ def reconcile_pr_evidence(
     origin of that checkout and nothing else, so a task can never be attached
     to a pull request in another repository.
 
-    Reporting only: no status is changed here. A task becomes reviewable
-    because it is `READY_TO_REVIEW` and now has evidence, through the same
-    path it always did.
+    Reporting only: no status is changed here except when a task is
+    READY_TO_REVIEW with no `pr` evidence and its branch does not exist on
+    origin — then ``backlog_recover_stuck_ready_to_review`` (0018) returns it
+    to OPEN for a fresh publish attempt. When the branch exists on origin but
+    no open pull request matches, a PR is opened here (the same gap
+    ``publish_run`` closes on the worker, but a push without ``gh pr create``
+    leaves review blind until something records evidence).
     """
     # Imported here, as  does, so this module keeps its
     # import-time independence from the planner.
@@ -348,7 +453,47 @@ def reconcile_pr_evidence(
             and entry["url"]
         ]
         if not matches:
-            report.skipped.append((row_task_id, "no_open_pr_on_task_branch"))
+            remote_outcome, remote_sha = _remote_task_branch_sha(repo_path, branch)
+            if remote_outcome == "failed":
+                report.skipped.append((row_task_id, "no_open_pr_on_task_branch"))
+                continue
+            if not remote_sha:
+                with factory() as conn, conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT * FROM backlog_recover_stuck_ready_to_review(%s)",
+                        (row_task_id,),
+                    )
+                    verdict = cur.fetchone()
+                if verdict and verdict[0]:
+                    report.recovered.append((row_task_id, str(verdict[1])))
+                else:
+                    reason = (
+                        (verdict[1] if verdict and len(verdict) > 1 else "")
+                        or "unknown"
+                    )
+                    report.skipped.append(
+                        (row_task_id, f"no_open_pr_on_task_branch: recover_refused: {reason}")
+                    )
+                continue
+            pr_url, failure = _create_open_pr_for_task_branch(
+                repo_path, row_task_id, branch, remote_sha
+            )
+            if pr_url is None:
+                report.skipped.append(
+                    (row_task_id, failure or "no_open_pr_on_task_branch")
+                )
+                continue
+            with factory() as conn, conn.cursor() as cur:
+                cur.execute(
+                    "SELECT * FROM backlog_record_evidence(%s, 'pr', %s)",
+                    (row_task_id, pr_url),
+                )
+                verdict = cur.fetchone()
+            if not verdict or not verdict[0]:
+                reason = (verdict[1] if verdict and len(verdict) > 1 else "") or "unknown"
+                report.skipped.append((row_task_id, f"evidence_refused: {reason}"))
+                continue
+            report.recorded.append((row_task_id, pr_url))
             continue
         if len(matches) > 1:
             report.skipped.append((row_task_id, "ambiguous_open_prs_on_branch"))
