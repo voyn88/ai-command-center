@@ -13,8 +13,10 @@ import pytest
 
 from command_center.db.backlog_parser import ParsedTask
 from command_center.ops.tick_stall_watchdog import (
+    PR_EVIDENCE_NO_OPEN_PR,
     WatchdogConfig,
     record_skips,
+    recover_ready_without_open_pr_streaks,
     watchdog_once,
 )
 from tests.db.test_backlog_planner import (  # noqa: F401 — pytest fixtures
@@ -208,3 +210,137 @@ def test_escalations_cannot_recursively_spawn_more_escalations(rig, suffix):  # 
             record_skips(conn, "review_marker", f"child-{index}", [(child, REASON)])
     assert not watchdog_once(app_factory).escalated
     assert len(_escalations(app_factory)) == 1
+
+
+PR_STALLED = "VOYN-W0-WD-PR-STUCK"
+
+
+def _record_pr_evidence_skips(app_factory, count: int) -> None:
+    with app_factory() as conn:
+        for index in range(count):
+            record_skips(
+                conn,
+                "pr_evidence",
+                f"pr-tick-{index:04}",
+                [(PR_STALLED, PR_EVIDENCE_NO_OPEN_PR)],
+            )
+
+
+def test_sustained_no_open_pr_skips_recover_task_to_open(rig) -> None:  # noqa: F811
+    app_factory, store, _queue = rig
+    ok, reason, _changed = store.upsert_task(
+        ParsedTask(
+            task_id=PR_STALLED,
+            wave="0",
+            priority="P1",
+            status="READY_TO_REVIEW",
+            kind="task",
+            title="Stuck without PR evidence",
+            body="",
+            repo="repo-one",
+            line_no=1,
+        )
+    )
+    assert ok, reason
+    _record_pr_evidence_skips(app_factory, 5)
+
+    with app_factory() as conn:
+        report = recover_ready_without_open_pr_streaks(conn, threshold=5)
+
+    assert report.recovered == [PR_STALLED]
+    assert report.refused == []
+    status, _revision, _title = _task_row(app_factory, PR_STALLED)
+    assert status == "OPEN"
+
+
+def test_fewer_than_threshold_no_open_pr_skips_do_not_recover(rig) -> None:  # noqa: F811
+    app_factory, store, _queue = rig
+    ok, reason, _changed = store.upsert_task(
+        ParsedTask(
+            task_id=PR_STALLED,
+            wave="0",
+            priority="P1",
+            status="READY_TO_REVIEW",
+            kind="task",
+            title="Stuck without PR evidence",
+            body="",
+            repo="repo-one",
+            line_no=1,
+        )
+    )
+    assert ok, reason
+    _record_pr_evidence_skips(app_factory, 4)
+
+    with app_factory() as conn:
+        report = recover_ready_without_open_pr_streaks(conn, threshold=5)
+
+    assert report.recovered == []
+    status, _revision, _title = _task_row(app_factory, PR_STALLED)
+    assert status == "READY_TO_REVIEW"
+
+
+PR_STALLED = "VOYN-W0-WD-PR-STUCK"
+
+
+def _record_pr_evidence_skips(app_factory, count: int) -> None:
+    with app_factory() as conn:
+        for index in range(count):
+            record_skips(
+                conn,
+                "pr_evidence",
+                f"pr-tick-{index:04}",
+                [(PR_STALLED, PR_EVIDENCE_NO_OPEN_PR)],
+            )
+
+
+def test_sustained_no_open_pr_skips_recover_task_to_open(rig) -> None:  # noqa: F811
+    app_factory, store, _queue = rig
+    ok, reason, _changed = store.upsert_task(
+        ParsedTask(
+            task_id=PR_STALLED,
+            wave="0",
+            priority="P1",
+            status="READY_TO_REVIEW",
+            kind="task",
+            title="Stuck without PR evidence",
+            body="",
+            repo="repo-one",
+            line_no=1,
+        )
+    )
+    assert ok, reason
+    _record_pr_evidence_skips(app_factory, 5)
+
+    with app_factory() as conn:
+        report = recover_ready_without_open_pr_streaks(conn, threshold=5)
+
+    assert report.recovered == [PR_STALLED]
+    assert report.refused == []
+    status, _revision, _title = _task_row(app_factory, PR_STALLED)
+    assert status == "OPEN"
+
+
+def test_fewer_than_threshold_no_open_pr_skips_do_not_recover(rig) -> None:  # noqa: F811
+    app_factory, store, _queue = rig
+    ok, reason, _changed = store.upsert_task(
+        ParsedTask(
+            task_id=PR_STALLED,
+            wave="0",
+            priority="P1",
+            status="READY_TO_REVIEW",
+            kind="task",
+            title="Stuck without PR evidence",
+            body="",
+            repo="repo-one",
+            line_no=1,
+        )
+    )
+    assert ok, reason
+    _record_pr_evidence_skips(app_factory, 4)
+
+    with app_factory() as conn:
+        report = recover_ready_without_open_pr_streaks(conn, threshold=5)
+
+    assert report.recovered == []
+    status, _revision, _title = _task_row(app_factory, PR_STALLED)
+    assert status == "READY_TO_REVIEW"
