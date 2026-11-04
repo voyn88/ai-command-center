@@ -508,7 +508,7 @@ def test_daily_spend_budget_gates_new_launches_only(tmp_path, api, fake_claude):
         prompt="prior", is_resume=False,
     )
     runtime_db.append_run_event(
-        api.db_path, prior["id"], "stream_event",
+        api.db_path, prior["id"], "result",
         {"type": "result", "total_cost_usd": 1.5, "usage": {"input_tokens": 1}},
     )
     with runtime_db.connect(api.db_path) as conn:
@@ -601,6 +601,7 @@ def test_daily_spend_usd_returns_zero_for_an_empty_window(tmp_path, monkeypatch)
         {"payload": {"type": "result", "total_cost_usd": True}},
         {"payload": {"type": "result", "total_cost_usd": float("nan")}},
         {"payload": {"type": "result", "total_cost_usd": float("inf")}},
+        {"payload": {"type": "result", "total_cost_usd": 10**400}},
     ],
 )
 def test_daily_spend_usd_raises_on_a_cost_event_it_cannot_read(tmp_path, monkeypatch, row):
@@ -634,6 +635,43 @@ def test_daily_spend_usd_raises_when_the_store_is_unavailable(tmp_path, monkeypa
 
     assert excinfo.value.kind == task_pipeline.SPEND_UNKNOWN_STORAGE_UNAVAILABLE
     assert isinstance(excinfo.value.__cause__, OSError)
+
+
+def test_daily_spend_usd_does_not_relabel_programming_errors_as_storage_outages(
+    tmp_path, monkeypatch
+):
+    """The typed storage contract is not a blanket exception handler."""
+
+    def _bug(_db_path):
+        raise AttributeError("connect typo")
+
+    monkeypatch.setattr(task_pipeline.runtime_db, "connect", _bug)
+
+    with pytest.raises(AttributeError, match="connect typo"):
+        task_pipeline.daily_spend_usd(tmp_path / "runtime.db")
+
+
+def test_daily_spend_usd_queries_only_final_result_events(tmp_path, monkeypatch):
+    captured = {}
+
+    class _Cursor:
+        def fetchall(self):
+            return []
+
+    class _Conn:
+        def execute(self, sql, params):
+            captured["sql"] = sql
+            captured["params"] = params
+            return _Cursor()
+
+    @contextlib.contextmanager
+    def _connect(_db_path):
+        yield _Conn()
+
+    monkeypatch.setattr(task_pipeline.runtime_db, "connect", _connect)
+
+    assert task_pipeline.daily_spend_usd(tmp_path / "runtime.db") == 0.0
+    assert "run_event.event_type = 'result'" in captured["sql"]
 
 
 def test_tick_reports_an_unreadable_spend_as_unknown_not_as_the_cap_being_hit(

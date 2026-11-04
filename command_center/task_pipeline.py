@@ -2479,9 +2479,10 @@ def daily_spend_usd(db_path: Path, *, now: str | None = None) -> float:
     24 hours (runs whose `completed_at` falls in the window, plus still-running
     work started in it). Reads only the final `result` stream events, which are
     the single truthful cost source — nothing is estimated or fabricated; a
-    run whose provider reported no cost contributes 0, and a window with no
+    result event with no `total_cost_usd` field contributes 0, and a window with no
     runs at all sums to `0.0` rather than raising: "nothing was spent" is a
-    measurement.
+    measurement. An explicit `total_cost_usd: null` is corrupt rather than
+    "no reported cost": the provider emitted the field but not a numeric value.
 
     Raises `SpendUnknownError` — returning no number whatsoever — for the two
     states in which a returned sum would be a lie:
@@ -2503,28 +2504,27 @@ def daily_spend_usd(db_path: Path, *, now: str | None = None) -> float:
     """
     import json as _json
     import math as _math
+    import sqlite3 as _sqlite3
     from datetime import datetime as _dt, timedelta as _td
 
     anchor = _dt.fromisoformat(now) if now else _dt.now()
     cutoff = (anchor - _td(hours=24)).isoformat(timespec="seconds")
     total = 0.0
-    # Broad only at the storage boundary, and it swallows nothing: every
-    # failure of the query is re-raised as the typed "no sum exists" signal
-    # with the original chained. The backing store is SQLite here and
-    # PostgreSQL in the mirror, so the driver exception types are not one
-    # closed set to enumerate.
+    # Only storage/driver failures are translated. Programming errors such as
+    # AttributeError, TypeError, or malformed SQL must retain their original
+    # type so callers cannot accidentally launder a bug into "store down".
     try:
         with runtime_db.connect(db_path) as conn:
             rows = conn.execute(
                 """
                 SELECT run_event.payload_json AS payload FROM run_event
                   JOIN run ON run.id = run_event.run_id
-                   AND CAST(run_event.payload_json AS TEXT) LIKE '%total_cost_usd%'
+                   AND run_event.event_type = 'result'
                    AND (run.completed_at >= ? OR (run.completed_at IS NULL AND run.created_at >= ?))
                 """,
                 (cutoff, cutoff),
             ).fetchall()
-    except Exception as exc:  # noqa: BLE001 — re-raised as a typed signal below
+    except (_sqlite3.Error, OSError) as exc:
         raise SpendUnknownError(
             SPEND_UNKNOWN_STORAGE_UNAVAILABLE,
             f"trailing-24h spend could not be read from {db_path}: {exc}",
@@ -2555,7 +2555,13 @@ def daily_spend_usd(db_path: Path, *, now: str | None = None) -> float:
                 SPEND_UNKNOWN_CORRUPT_COST_EVENT,
                 f"run_event total_cost_usd is a {type(cost).__name__}, not a number: {cost!r}",
             )
-        cost = float(cost)
+        try:
+            cost = float(cost)
+        except OverflowError as exc:
+            raise SpendUnknownError(
+                SPEND_UNKNOWN_CORRUPT_COST_EVENT,
+                f"run_event total_cost_usd is outside the finite float range: {cost!r}",
+            ) from exc
         if not _math.isfinite(cost):
             # A NaN would be the worst possible value to let through: it
             # poisons the total, and `(projected + nan) > ceiling` is False —

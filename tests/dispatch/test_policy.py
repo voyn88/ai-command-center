@@ -240,7 +240,10 @@ def test_an_unmeasured_spend_under_a_live_ceiling_is_refused_loudly():
     fail-open this engine exists to prevent, so it raises instead."""
     policy = DispatchPolicy()
 
-    with pytest.raises(ValueError):
+    with pytest.raises(
+        ValueError,
+        match=r"daily_spend_usd is None under a ceiling.*budget_unknown=True",
+    ):
         _plan(
             [_task("t1")],
             [_executor("claude_code", cost=0.5)],
