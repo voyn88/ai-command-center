@@ -28,6 +28,7 @@ from command_center import (
     task_import,
     task_pipeline,
     task_view,
+    tasks_repository,
     tournament_store,
 )
 from command_center.runtime import api as runtime_api
@@ -936,11 +937,12 @@ def render_home_dashboard(
                 if st.button("Открыть задачу", key="home_hero_open_task", icon=":material/task_alt:", width="stretch"):
                     st.session_state.pending_nav = "kanban"
                     st.rerun()
-            with hero_cols[1]:
-                if st.button("Запустить", key="home_hero_launch", icon=":material/play_arrow:", type="primary", width="stretch"):
-                    st.session_state.pending_nav = "execution_center"
-                    st.session_state.pending_exec_center_project = hero_task.get("project")
-                    st.rerun()
+            if not hero_task.get("read_only") and not tasks_repository.is_master_projection_task(hero_task):
+                with hero_cols[1]:
+                    if st.button("Запустить", key="home_hero_launch", icon=":material/play_arrow:", type="primary", width="stretch"):
+                        st.session_state.pending_nav = "execution_center"
+                        st.session_state.pending_exec_center_project = hero_task.get("project")
+                        st.rerun()
     else:
         st.info("➡ Нет открытых незаблокированных задач — создайте новую.")
 
