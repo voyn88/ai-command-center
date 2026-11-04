@@ -407,8 +407,12 @@ def _validated_workspace(value: str, roots: tuple[Path, ...]) -> Path:
     return resolved
 
 
-def _validate_environment_file(path: Path, executor: str, *, allowed_keys: frozenset[str] | None = None) -> bool:
-    if not _private_agent_environment(path, optional=True):
+def _validate_environment_file(path: Path, executor: str, *, allowed_keys: frozenset[str] | None = None, root_private: bool = False) -> bool:
+    if root_private:
+        present = _regular_file_policy(path, expected_uid=0, expected_gid=0, exact_mode=0o600, optional=True)
+    else:
+        present = _private_agent_environment(path, optional=True)
+    if not present:
         return False
     allowed = COMMON_AGENT_ENV_KEYS | (PROVIDER_AGENT_ENV_KEYS[executor] if allowed_keys is None else allowed_keys)
     for line_no, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
@@ -1204,7 +1208,7 @@ def _systemd_command(
         ),
     ]
     if executor == "claude" and manifest["profile"] == "model_only":
-        if not _validate_environment_file(CLAUDE_MAC_ENV_FILE, executor, allowed_keys=frozenset({"AICC_CLAUDE_MAC_TOKEN", "AICC_CLAUDE_MAC_CA_B64"})):
+        if not _validate_environment_file(CLAUDE_MAC_ENV_FILE, executor, allowed_keys=frozenset({"AICC_CLAUDE_MAC_TOKEN", "AICC_CLAUDE_MAC_CA_B64"}), root_private=True):
             raise LaunchRefused("Claude Mac inference transport is not configured")
         command.append(f"--property=EnvironmentFile={CLAUDE_MAC_ENV_FILE}")
     else:
