@@ -404,3 +404,113 @@ def test_in_progress_checks_keep_the_active_window_label(monkeypatch):
     assert report.active == [(1, head)]
     assert report.blocked == []
     assert labels == [(1, "review-window:active")]
+
+
+@pytest.mark.parametrize("label", [None, "review-window:active", "queue-active"])
+def test_draft_from_rest_listing_frees_slot_without_detail_reads(monkeypatch, label):
+    draft = {"number": 1, "html_url": "https://github.com/x/repo/pull/1",
+             "head": {"sha": "a" * 40}, "draft": True,
+             "labels": [{"name": label}] if label else []}
+    clean = _pr(2, "b" * 40)
+    writes = []
+    monkeypatch.setattr(review_merge, "_origin_owner_repo", lambda _: ("x", "repo"))
+    monkeypatch.setattr(review_merge, "_rest_json", lambda *_: (review_merge._REST_OK, [draft]))
+    listed, failure = review_merge._list_open_pulls("/repo", PrWindowConfig())
+    assert failure is None and listed[0]["isDraft"] is True
+    monkeypatch.setattr(review_merge, "_list_open_pulls", lambda *_: (listed + [clean], None))
+    original_details = review_merge._pr_window_details
+
+    def details(repo, pr, *args, **kwargs):
+        assert pr["number"] != 1, "draft must be excluded before any detail/cache lookup"
+        return original_details(repo, pr, *args, **kwargs)
+
+    monkeypatch.setattr(review_merge, "_pr_window_details", details)
+    monkeypatch.setattr(review_merge, "_remove_pr_window_labels", lambda _, pr, cfg, labels: writes.append((pr["number"], labels)) or True)
+    monkeypatch.setattr(review_merge, "_set_pr_window_labels", lambda _, pr, cfg, label: writes.append((pr["number"], label)) or True)
+    report = reconcile_pr_window("/repo", PrWindowConfig(max_active=1, detail_budget=0, stale_seconds=10**12))
+    assert report.blocked == [(1, "draft")]
+    assert report.active == [(2, "b" * 40)]
+    assert writes[:2] == [(1, {"queue-active", "review-window:active"}), (1, "review-window:blocked")]
+
+
+@pytest.mark.parametrize("cached_draft", [None, False, True])
+@pytest.mark.parametrize("listed_draft", [False, True])
+def test_fresh_draft_state_overrides_cached_missing_or_stale_flag(monkeypatch, cached_draft, listed_draft):
+    cached = _pr(1, "a" * 40)
+    if cached_draft is not None:
+        cached["isDraft"] = cached_draft
+    light = review_merge._light_pr_from_rest({
+        "number": 1, "html_url": "https://github.com/x/repo/pull/1",
+        "head": {"sha": "a" * 40}, "draft": listed_draft,
+        "labels": [{"name": "review-window:blocked"}],
+    })
+
+    class Cache:
+        enabled = True
+
+        def get(self, *_):
+            return cached
+
+    cache = Cache()
+    detailed = review_merge._pr_window_details("/repo", light, cache, fetch=False)
+    assert detailed["isDraft"] is listed_draft
+    cfg = PrWindowConfig(max_active=1, detail_budget=0, stale_seconds=10**12)
+    assert review_merge._window_block_reason(detailed, cfg, age_seconds=0) == ("draft" if listed_draft else None)
+    # A readied PR with the same head is admitted despite an old blocked label
+    # and a cache that still says draft; no cache flush/detail request required.
+    monkeypatch.setattr(review_merge, "_list_open_pulls", lambda *_: ([light], None))
+    monkeypatch.setattr(review_merge.gh_access, "detail_cache", lambda: cache)
+    monkeypatch.setattr(review_merge, "_remove_pr_window_labels", lambda *_: True)
+    monkeypatch.setattr(review_merge, "_set_pr_window_labels", lambda *_: True)
+    report = reconcile_pr_window("/repo", cfg)
+    assert report.active == ([] if listed_draft else [(1, "a" * 40)])
+    assert report.blocked == ([(1, "draft")] if listed_draft else [])
+
+
+def test_draft_failed_active_label_removal_stays_fail_closed(monkeypatch):
+    draft = _pr(1, "a" * 40, label="queue-active")
+    draft["isDraft"] = True
+    monkeypatch.setattr(review_merge, "_list_open_pulls", lambda *_: ([draft, _pr(2, "b" * 40)], None))
+    monkeypatch.setattr(review_merge, "_remove_pr_window_labels", lambda *_: False)
+    monkeypatch.setattr(review_merge, "_set_pr_window_labels", lambda *_: True)
+    report = reconcile_pr_window("/repo", PrWindowConfig(max_active=1, stale_seconds=10**12))
+    assert report.unreadable == [(1, "a" * 40)]
+    assert not report.active and not report.blocked
+    assert report.waiting == [(2, "b" * 40)]
+
+
+@pytest.mark.parametrize("active_labels", [
+    {"review-window:active"}, {"queue-active"},
+    {"review-window:active", "queue-active"},
+])
+def test_draft_demotion_mutates_each_active_label_once(monkeypatch, active_labels):
+    import subprocess
+    from urllib.parse import unquote
+
+    draft = _pr(1, "a" * 40)
+    draft["isDraft"] = True
+    live_labels = active_labels | {"P1", "maintainer-note"}
+    draft["labels"] = [{"name": name} for name in sorted(live_labels)]
+    calls = []
+    monkeypatch.setattr(review_merge, "_list_open_pulls", lambda *_: ([draft], None))
+
+    def transport(args, _repo):
+        calls.append(args)
+        method = args[2]
+        if method == "DELETE":
+            label = unquote(args[3].rsplit("/", 1)[1])
+            assert label in live_labels, "duplicate DELETE would fail with GitHub 404"
+            live_labels.remove(label)
+        elif method == "POST":
+            assert args[4] == "-f"
+            live_labels.add(args[5].removeprefix("labels[]="))
+        else:
+            raise AssertionError(f"unexpected mutation: {args}")
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(review_merge, "_gh", transport)
+    report = reconcile_pr_window("/repo", PrWindowConfig(max_active=1, detail_budget=0))
+    assert report.blocked == [(1, "draft")] and not report.unreadable
+    assert live_labels == {"P1", "maintainer-note", "review-window:blocked"}
+    assert len([call for call in calls if call[2] == "DELETE"]) == len(active_labels)
+    assert len([call for call in calls if call[2] == "POST"]) == 1

@@ -4958,6 +4958,8 @@ def _window_block_reason(
     already carries a fresh accept marker at its current head is never
     blocked for age alone, since `merge_once`'s own gate is what decides its
     fate from there."""
+    if pr.get("isDraft") is True:
+        return "draft"
     head = str(pr.get("headRefOid") or "")
     author_login = (pr.get("author") or {}).get("login")
     reviews = pr.get("reviews") or []
@@ -5167,6 +5169,26 @@ def _reconcile_pr_window(
         )
         window_full = selected >= cfg.max_active
         needs_merge_state = active_now or not window_full
+        # Draft is mutable without a head change, so the fresh listing is
+        # authoritative even if detail cache/budget is unavailable. Do not
+        # spend checks/reviews budget or keep a draft's active slot.
+        if pr.get("isDraft") is True:
+            if not _remove_pr_window_labels(
+                repo_path, pr, cfg, {cfg.label_active, _QUEUE_ACTIVE_LABEL}
+            ):
+                selected += int(active_now)
+                report.unreadable.append((number, head))
+                continue
+            report.blocked.append((number, "draft"))
+            # Removal succeeded: the setter must not delete those labels a
+            # second time from the stale listing (GitHub would return 404).
+            draft_pr = dict(pr)
+            draft_pr["labels"] = [
+                {"name": name}
+                for name in sorted(labels - {cfg.label_active, _QUEUE_ACTIVE_LABEL})
+            ]
+            _set_pr_window_labels(repo_path, draft_pr, cfg, cfg.label_blocked)
+            continue
         if queue_waiting_now:
             report.waiting.append((number, head))
             _remove_pr_window_labels(
@@ -5322,6 +5344,7 @@ def _light_pr_from_rest(item: Any) -> dict[str, Any] | None:
         "number": item["number"],
         "url": str(item.get("html_url") or ""),
         "headRefOid": str((item.get("head") or {}).get("sha") or ""),
+        "isDraft": item.get("draft") is True,
         "createdAt": str(item.get("created_at") or ""),
         "author": {"login": (item.get("user") or {}).get("login")},
         "labels": [
@@ -5556,6 +5579,10 @@ def _pr_window_details(
         if cached is not None:
             merged = dict(pr)
             merged.update(cached)
+            # Draft/readied transitions do not change the cache's head key.
+            # Preserve this tick's listing value over stale cached metadata.
+            if "isDraft" in pr:
+                merged["isDraft"] = pr["isDraft"]
             if all(key in merged for key in required):
                 if quota is not None:
                     quota.cache_hits += 1
