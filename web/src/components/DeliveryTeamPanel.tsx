@@ -26,6 +26,7 @@ export default function DeliveryTeamPanel({ refresh = 0 }: { refresh?: number })
   return <GlassPanel title="Команда разработки" action={<button className="owner-button" disabled={loading} onClick={() => setRetry(n => n + 1)}>Обновить команду</button>}>
     {loading && <p role="status">Загружаем назначения команды…</p>}
     {error && <p role="alert">Данные команды временно недоступны. Статусы не подтверждены.</p>}
+    {!loading && (error || (data && !data.available)) && offset > 0 && <button className="owner-button" onClick={() => setOffset(n => Math.max(0, n - 30))}>Предыдущие</button>}
     {data && <>
       <p>Источник: канонический серверный реестр · {date(data.updated_at)} · Только просмотр</p>
       <p>Команда: {data.enabled ? 'включена' : 'не включена'} · Выполнение: {data.stopped ? 'остановлено' : 'стоп не установлен'}</p>
@@ -36,7 +37,7 @@ export default function DeliveryTeamPanel({ refresh = 0 }: { refresh?: number })
         <div className="owner-kpis">
           <p>Задач в текущем реестре: <strong>{data.total}</strong></p>
           <p>Заблокировано: <strong>{data.counts?.blocked}</strong></p>
-          <p>SHA в реестре: <strong>{data.counts?.sha_recorded}</strong></p>
+          <p>Задачи с записанным SHA (включая историю): <strong>{data.counts?.sha_recorded ?? 'Нет данных'}</strong></p>
           <p>Production принят: <strong>{data.counts?.production_accepted}</strong></p>
         </div>
         <p>Записанный SHA и пройденное ревью не подтверждают слияние или приёмку production. Слияние: отдельного подтверждения в этом реестре нет.</p>
