@@ -43,6 +43,16 @@ def test_canonical_project_id_falls_back_to_raw_for_unknown():
     assert project_config.canonical_project_id("") == ""
 
 
+def test_project_path_component_maps_known_names_and_sanitizes_unknown():
+    from command_center.runtime.reports import project_path_component
+
+    assert project_path_component("AI Command Center") == "AICC"
+    assert project_path_component("  ai   command center ") == "AICC"
+    assert project_path_component(None) == "UNKNOWN"
+    assert project_path_component("Totally Unknown") == "Totally_Unknown"
+    assert project_path_component("../../root") == "______root"
+
+
 def test_project_matches_none_is_all_projects():
     assert project_config.project_matches("AI Command Center", None) is True
     assert project_config.project_matches("anything", None) is True
