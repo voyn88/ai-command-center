@@ -20,16 +20,62 @@ Vocabulary facts measured on the real file (2026-08-19), not assumed:
   are reported (an importer that silently overwrote would let the last stray
   copy of a record rewrite the canonical one).
 
+Since BO-S4 this module owns BOTH directions of the format. The projection
+(``backlog_projection.render_backlog``) renders records that this parser
+reads back; the two halves share the constants and the escaping helpers
+below so they cannot drift into "renders one dialect, parses another".
+
+Two constructs exist only for that round trip, and both are conservative —
+they are emitted only for a value the authored dialect cannot carry, so a
+hand-written file never sees them:
+
+* the MACHINE DIRECTIVE ``<!-- voyn:machine {...} -->`` — a comment line
+  under a record carrying the fields the human line has no slot for
+  (``kind``, ``repo``) or cannot spell (a ``title`` holding a backtick or a
+  field separator). It is the authority: ``kind`` is a stored column that
+  is NOT a function of the id (the store accepts ``kind='gate'`` on an id
+  without a ``-G<n>`` suffix and the converse), and ``repo`` reconstructed
+  from the body hint or the id family is a GUESS — the rule against
+  substring inference applies to a round trip too;
+* the ESCAPED BODY LINE ``\\"…"`` (a backslash and a JSON string) — for a
+  body line that would not survive reparse verbatim: one that is blank,
+  carries leading/trailing whitespace (continuations are read with
+  ``str.strip``), holds a character ``str.splitlines`` would break on, or
+  is shaped like a record or a directive. ``body_line_is_literal`` is the
+  single predicate deciding this, and the renderer consults exactly it.
+
 Pure module: no database, no I/O beyond the text it is given — so its tests
 are hermetic and the store's tests need only prove the seam.
 """
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
+from typing import Any
 
-__all__ = ["ParsedTask", "ParseReport", "parse_backlog"]
+__all__ = [
+    "ParsedTask",
+    "ParseReport",
+    "parse_backlog",
+    "EXECUTABLE_STATUSES",
+    "NON_EXECUTABLE_STATUSES",
+    "STATUSES",
+    "KINDS",
+    "NAMED_WAVES",
+    "NUMERIC_WAVE",
+    "PRIORITY_SHAPE",
+    "TASK_ID_SHAPE",
+    "FIELD_SEP",
+    "VERTICAL_WHITESPACE",
+    "MACHINE_FIELDS",
+    "encode_machine_directive",
+    "decode_machine_directive",
+    "body_line_is_literal",
+    "encode_body_line",
+    "decode_body_line",
+]
 
 EXECUTABLE_STATUSES = ("OPEN", "IN_PROGRESS", "READY_TO_REVIEW", "DONE")
 NON_EXECUTABLE_STATUSES = (
@@ -40,21 +86,62 @@ NON_EXECUTABLE_STATUSES = (
     "DECIDED",
 )
 STATUSES = frozenset(EXECUTABLE_STATUSES + NON_EXECUTABLE_STATUSES)
+#: The stored `kind` vocabulary (migration 0005's CHECK), and a column in its
+#: own right: the `-G<n>` id suffix only SEEDS it when a record is first read
+#: out of an authored file.
+KINDS = ("task", "gate")
+#: The file's closed set of named lanes and idea pools, exactly as observed:
+#: W1/W7 are FUTURE-wave idea pools and deliberately distinct from waves 1/7
+#: (the W0-vs-W00 distinctness rule); P1/P0.5 are lane names of the idea
+#: sections, not priorities.
+NAMED_WAVES = ("COM", "WOW", "AICOS", "W1", "W7", "P1", "P0.5")
+#: The separator between the fields of a record line. One definition: the
+#: renderer joins with it and every "can this value be spelled inline"
+#: predicate tests against it.
+FIELD_SEP = " | "
 
 _TASK_LINE = re.compile(r"^(\s*)- \*\*(VOYN-[A-Za-z0-9._-]+)\*\* \| (.+)$")
 #: A line SHAPED like a record whose id is outside the VOYN namespace. Not a
 #: task — but not silently droppable either: it is either a typo in a real
 #: record or a foreign record, and both belong in the report.
 _RECORD_SHAPED = re.compile(r"^\s*- \*\*([^*]+)\*\* \| ")
-#: Numeric waves ("Wave N") plus the file's closed set of named lanes and
-#: idea pools, exactly as observed: W1/W7 are FUTURE-wave idea pools and
-#: deliberately distinct from waves 1/7 (the W0-vs-W00 distinctness rule);
-#: P1/P0.5 are lane names of the idea sections, not priorities.
-_WAVE = re.compile(r"^Wave ([0-9]+(?:\.[0-9]+)?)$|^(COM|WOW|AICOS|W1|W7|P1|P0\.5)$")
+#: Numeric waves ("Wave N") plus the named lanes above.
+NUMERIC_WAVE = re.compile(r"^[0-9]+(?:\.[0-9]+)?$")
+_WAVE = re.compile(
+    r"^Wave ([0-9]+(?:\.[0-9]+)?)$"
+    + r"|^("
+    + "|".join(re.escape(w) for w in NAMED_WAVES)
+    + r")$"
+)
 _PRIORITY = re.compile(r"^P([0-9])(?:\s*\(.*\))?$", re.S)
+#: The exact stored priority shape (0005's CHECK), with no annotation slack.
+PRIORITY_SHAPE = re.compile(r"^P[0-9]$")
 _SLUG = re.compile(r"^`([^`]+)`$")
 _GATE_ID = re.compile(r"-G[0-9]+$")
-_ID_SHAPE = re.compile(r"^VOYN-[A-Za-z0-9][A-Za-z0-9._-]*$")
+TASK_ID_SHAPE = re.compile(r"^VOYN-[A-Za-z0-9][A-Za-z0-9._-]*$")
+_ID_SHAPE = TASK_ID_SHAPE
+
+#: Every boundary `str.splitlines` recognises — far wider than \r\n (\v, \f,
+#: FS/GS/RS, \x85, U+2028/U+2029). A value carrying one of these cannot be
+#: spelled on a line at all: the parser would read it as two lines. The same
+#: class is why `backlog_export` scrubs them from its record projection; here
+#: the round trip needs them PRESERVED, so they force the escaped form.
+VERTICAL_WHITESPACE = re.compile("[\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029]")
+
+#: The machine directive: an HTML comment (invisible in rendered Markdown)
+#: carrying a JSON object of stored fields the human line cannot hold.
+#: `(.*)` is GREEDY on purpose — a value may itself contain `-->`, and only
+#: the LAST one, anchored at end-of-line, is the terminator.
+_MACHINE_DIRECTIVE = re.compile(r"^<!--\s*voyn:machine\s+(.*)\s*-->$")
+MACHINE_DIRECTIVE_PREFIX = "<!-- voyn:machine "
+MACHINE_DIRECTIVE_SUFFIX = " -->"
+#: Closed vocabulary — an unknown key is reported, never applied. A directive
+#: may not carry `body` (per-line escaping keeps the body readable) nor any
+#: field the record line already spells exactly (wave/status/priority/id),
+#: so the file can never disagree with itself about those.
+MACHINE_FIELDS = ("kind", "repo", "title")
+#: The escaped-body-line marker.
+BODY_ESCAPE_PREFIX = "\\"
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +162,105 @@ class ParseReport:
     tasks: list[ParsedTask] = field(default_factory=list)
     #: (line_no, reason, line excerpt) — nothing is dropped silently.
     unparsed: list[tuple[int, str, str]] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# The round-trip format: the two constructs the projection renders and this
+# parser reads back. Both live here, next to the shapes they must dodge, so
+# "what the renderer escapes" and "what the parser unescapes" are one fact.
+# ---------------------------------------------------------------------------
+
+
+def body_line_is_literal(line: str) -> bool:
+    """True when ``line`` is one the projection may write verbatim.
+
+    Verbatim means: indented by the renderer, then read back by the
+    continuation branch below — which applies ``str.strip`` — and compared
+    equal. Each clause is one way that identity fails, and none of them is
+    hypothetical:
+
+    * empty: a blank line is not a continuation at all, it is skipped;
+    * ``line != line.strip()``: leading or trailing whitespace (spaces, tabs)
+      is removed on the way back in;
+    * a leading backslash: it would be read as the escape marker;
+    * vertical whitespace: ``str.splitlines`` would break the line in two;
+    * record-shaped or directive-shaped: the line would be read as a NEW
+      record (``_TASK_LINE`` accepts any indent), as an out-of-namespace
+      record report, or as a machine directive — a stored body line may look
+      like any of these, and it must not become one.
+    """
+    return bool(
+        line
+        and line == line.strip()
+        and not line.startswith(BODY_ESCAPE_PREFIX)
+        and VERTICAL_WHITESPACE.search(line) is None
+        and _TASK_LINE.match(line) is None
+        and _RECORD_SHAPED.match(line) is None
+        and _MACHINE_DIRECTIVE.match(line) is None
+    )
+
+
+def encode_body_line(line: str) -> str:
+    """The escaped form of a body line: a backslash and a JSON string.
+
+    ``ensure_ascii`` stays on: it is what makes the result single-line and
+    whitespace-fenced — every control character, every ``str.splitlines``
+    boundary and every non-ASCII character becomes a ``\\uXXXX`` escape, and
+    the surrounding quotes hold the value's own leading/trailing spaces.
+    """
+    return BODY_ESCAPE_PREFIX + json.dumps(line)
+
+
+def decode_body_line(line: str) -> str:
+    """The inverse, on an ALREADY-stripped continuation line.
+
+    A line that merely starts with a backslash is not necessarily ours — an
+    authored file may hold one — so a payload that is not a JSON string comes
+    back as itself, which is exactly the behaviour that predates the escape.
+    """
+    if not line.startswith(BODY_ESCAPE_PREFIX):
+        return line
+    try:
+        decoded = json.loads(line[len(BODY_ESCAPE_PREFIX) :])
+    except ValueError:
+        return line
+    return decoded if isinstance(decoded, str) else line
+
+
+def encode_machine_directive(values: dict[str, Any]) -> str:
+    """The machine directive line for ``values`` (keys sorted, so the whole
+    projection is byte-deterministic for a given store state)."""
+    unknown = sorted(set(values) - set(MACHINE_FIELDS))
+    if unknown:
+        raise ValueError(f"unknown machine field(s): {unknown}")
+    return (
+        MACHINE_DIRECTIVE_PREFIX
+        + json.dumps(values, sort_keys=True)
+        + MACHINE_DIRECTIVE_SUFFIX
+    )
+
+
+def decode_machine_directive(payload: str) -> tuple[dict[str, Any], str | None]:
+    """``(values, error)`` for a directive payload — refusals are data here
+    too. Every field is checked against its stored vocabulary before it is
+    allowed to override anything: a directive is machine input, and machine
+    input that does not normalize is reported, never guessed at."""
+    try:
+        values = json.loads(payload)
+    except ValueError as exc:
+        return {}, f"machine directive is not JSON: {exc.args[0] if exc.args else exc}"
+    if not isinstance(values, dict):
+        return {}, f"machine directive is not an object: {type(values).__name__}"
+    for key, value in values.items():
+        if key not in MACHINE_FIELDS:
+            return {}, f"unknown machine field: {key!r}"
+        if key == "kind" and value not in KINDS:
+            return {}, f"kind outside vocabulary: {value!r}"
+        if key == "repo" and not (value is None or isinstance(value, str)):
+            return {}, f"repo does not normalize: {value!r}"
+        if key == "title" and not isinstance(value, str):
+            return {}, f"title does not normalize: {value!r}"
+    return values, None
 
 
 def _strip_bold(text: str) -> str:
@@ -134,29 +320,40 @@ def parse_backlog(text: str) -> ParseReport:
     current: ParsedTask | None = None
     current_indent = 0
     body_extra: list[str] = []
+    machine: dict[str, Any] = {}
 
     def flush() -> None:
-        nonlocal current, body_extra
+        nonlocal current, body_extra, machine
         if current is None:
+            machine = {}
             return
         body = current.body
         if body_extra:
             body = (body + "\n" if body else "") + "\n".join(body_extra)
-        repo = current.repo
-        if repo is None:
-            hint = _REPO_HINT.search(body)
-            if hint:
-                repo = hint.group(1).strip()
-        if repo is None:
-            repo = _infer_repo(current.task_id)
+        # An explicit machine directive is the authority; the hint and the
+        # family inference below are the FALLBACK for an authored file that
+        # has no directive. Note the membership test rather than a truthiness
+        # or None test: `repo: null` in a directive is a stored value (this
+        # task routes nowhere), and it has to beat inference, or a projected
+        # record would acquire a repo on the way back in.
+        if "repo" in machine:
+            repo = machine["repo"]
+        else:
+            repo = current.repo
+            if repo is None:
+                hint = _REPO_HINT.search(body)
+                if hint:
+                    repo = hint.group(1).strip()
+            if repo is None:
+                repo = _infer_repo(current.task_id)
         report.tasks.append(
             ParsedTask(
                 task_id=current.task_id,
                 wave=current.wave,
                 priority=current.priority,
                 status=current.status,
-                kind=current.kind,
-                title=current.title,
+                kind=machine.get("kind", current.kind),
+                title=machine.get("title", current.title),
                 body=body,
                 repo=repo,
                 line_no=current.line_no,
@@ -164,10 +361,12 @@ def parse_backlog(text: str) -> ParseReport:
         )
         current = None
         body_extra = []
+        machine = {}
 
     for line_no, line in enumerate(lines, start=1):
         match = _TASK_LINE.match(line)
         if match is None:
+            stripped = line.strip()
             shaped = _RECORD_SHAPED.match(line)
             if shaped is not None:
                 flush()
@@ -175,29 +374,44 @@ def parse_backlog(text: str) -> ParseReport:
                     (
                         line_no,
                         f"id outside the VOYN namespace: {shaped.group(1)!r}",
-                        line.strip()[:160],
+                        stripped[:160],
                     )
                 )
+                continue
+            directive = _MACHINE_DIRECTIVE.match(stripped)
+            if directive is not None:
+                # Machine metadata for the record above: applied, never
+                # carried into the body. A directive that does not normalize
+                # — or one with no record to belong to — is reported like any
+                # other unreadable line instead of being silently skipped.
+                if current is None:
+                    report.unparsed.append(
+                        (line_no, "machine directive outside a record", stripped[:160])
+                    )
+                    continue
+                values, error = decode_machine_directive(directive.group(1))
+                if error is not None:
+                    report.unparsed.append((line_no, error, stripped[:160]))
+                else:
+                    machine.update(values)
                 continue
             # Continuation prose under the current record keeps its evidence
             # (acceptance bullets, target repo, notes) in the body.
             if (
                 current is not None
-                and line.strip()
+                and stripped
                 and (
                     len(line) - len(line.lstrip()) > current_indent
                     or not line.lstrip().startswith("- **")
                 )
             ):
                 if len(line) - len(line.lstrip()) > current_indent:
-                    body_extra.append(line.strip())
-                elif not line.strip().startswith("#") and not line.strip().startswith(
-                    "- "
-                ):
-                    body_extra.append(line.strip())
+                    body_extra.append(decode_body_line(stripped))
+                elif not stripped.startswith("#") and not stripped.startswith("- "):
+                    body_extra.append(decode_body_line(stripped))
                 else:
                     flush()
-            elif current is not None and line.strip().startswith("#"):
+            elif current is not None and stripped.startswith("#"):
                 flush()
             continue
 

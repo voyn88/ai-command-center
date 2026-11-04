@@ -236,6 +236,94 @@ def test_import_stamps_provenance_on_first_migration_only(store) -> None:
     assert len(provenance_after) == 1, "a stable row is stamped once, not per import run"
 
 
+def test_export_then_reimport_is_a_fixed_point(store) -> None:
+    """BO-S4's seam, proved through the real store rather than in the
+    renderer's own terms: whatever is IN the tables comes back out of the
+    projection and re-enters as no change at all (``changed == 0``).
+
+    The fixtures are chosen to contradict, one by one, every value the
+    import-side parser would otherwise re-derive for itself. A row whose
+    stored value agrees with the inference proves nothing here — both paths
+    would produce the same answer and a projection that dropped the field
+    entirely would still pass:
+
+    * ``kind='gate'`` on an id with NO ``-G<n>`` suffix, and ``kind='task'``
+      on an id that HAS one — the suffix inference is wrong in both
+      directions;
+    * ``repo=NULL`` on an ``AICC``-family id, whose family infers
+      ``ai-command-center``; and ``repo='ai-command-center'`` on an ``OPS``
+      id, whose family infers NULL;
+    * a body holding a ``Target repo`` hint on a row stored with
+      ``repo=NULL`` — the hint outranks family inference on import;
+    * a body line shaped exactly like a record, which a naive projection
+      re-emits as a continuation and the parser then reads as a NEW task.
+    """
+    fixtures = [
+        _task(
+            "VOYN-W0-EXPORT1",
+            body=(
+                "- **VOYN-W0-NOT-A-REAL-TASK** | Wave 0 | DONE | P0 | `x` | injected\n"
+                "  - Target repo (owner decision): `aios`.\n"
+                "trailing whitespace  "
+            ),
+            repo=None,
+        ),
+        _task("VOYN-W0-EXPORT-CONTROL", kind="gate"),
+        _task("VOYN-W0-EXPORT-PLAIN-G9", kind="task"),
+        _task("VOYN-W0-AICC-EXPORT4", repo=None),
+        _task("VOYN-OPS-EXPORT5", repo="ai-command-center"),
+    ]
+    for fixture in fixtures:
+        assert store.upsert_task(fixture)[0], fixture.task_id
+    before = {t["task_id"]: t for t in store.list_tasks(limit=500)[0]}
+
+    projection = store.export_markdown()
+    reimported = store.import_markdown(projection)
+
+    assert reimported.refused == [] and reimported.unparsed == []
+    assert reimported.changed == 0, "the projection must re-import as no change"
+    assert reimported.unchanged == len(before)
+
+    # Nothing moved, including the revisions: an "unchanged" upsert does not
+    # touch the row, so a field quietly rewritten to its inferred value would
+    # show up here as a revision bump even if the counters somehow did not.
+    after = {t["task_id"]: t for t in store.list_tasks(limit=500)[0]}
+    assert after == before
+
+    # And the contradicted fields specifically survived the trip.
+    assert after["VOYN-W0-EXPORT-CONTROL"]["kind"] == "gate"
+    assert after["VOYN-W0-EXPORT-PLAIN-G9"]["kind"] == "task"
+    assert after["VOYN-W0-AICC-EXPORT4"]["repo"] is None
+    assert after["VOYN-OPS-EXPORT5"]["repo"] == "ai-command-center"
+    assert after["VOYN-W0-EXPORT1"]["repo"] is None
+    exported = {t.task_id: t for t in store.export_tasks()}
+    assert exported["VOYN-W0-EXPORT1"].body == fixtures[0].body
+
+    # The same file also carries section 0B, which the console's Master
+    # Backlog panel parses out of this exact path (`AICC_MASTER_BACKLOG`).
+    # Rendering the master file without it would blind that panel, and the
+    # re-import above already proved those lines are inert to the records.
+    from command_center.backlog_client import parse_recommendations
+
+    console = parse_recommendations(projection)
+    assert console.errors == []
+    assert {r.issue_id for r in console.records} == set(before)
+
+
+def test_the_whole_imported_fixture_projects_back_unchanged(store) -> None:
+    """The same property over the incumbent file shape: import the authored
+    fixture, project the store, import the projection — the second import
+    changes nothing, so the migration period's two-way window cannot let a
+    render rewrite the store it was rendered from."""
+    first = store.import_markdown(FIXTURE.read_text(encoding="utf-8"))
+    assert first.inserted > 0
+
+    second = store.import_markdown(store.export_markdown())
+    assert second.refused == [] and second.unparsed == []
+    assert second.changed == 0
+    assert second.unchanged == first.inserted
+
+
 def test_record_provenance_refuses_an_unknown_task(store) -> None:
     assert store.record_provenance("VOYN-W0-GHOST", "markdown_import") is False
 

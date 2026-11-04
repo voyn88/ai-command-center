@@ -15,6 +15,12 @@ moves through ``backlog_transition`` and its machine model. Dependencies are
 NOT imported: the file records them as prose ("Связи: …"), and prose is
 exactly what the no-substring rule forbids acting on; edges enter through
 ``add_dependency`` (cycle-checked) as BO-S2 formalizes them.
+
+BO-S4 closes the loop the other way: ``export_markdown`` renders the store
+back into the master file. Import and export are inverses on purpose —
+``import_markdown(export_markdown())`` reports ``changed == 0`` — so the
+two-way migration period cannot let a projection write mutate the store it
+was rendered from.
 """
 
 from __future__ import annotations
@@ -23,6 +29,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
+from command_center.db import backlog_projection
 from command_center.db.backlog_parser import ParsedTask, parse_backlog
 
 __all__ = ["BacklogStore", "ImportReport"]
@@ -277,6 +284,31 @@ class BacklogStore:
                     (task_id,),
                 )
                 return [dict(zip(keys, row, strict=True)) for row in cur.fetchall()]
+
+    # -- the exporter (BO-S4) -------------------------------------------------
+
+    def export_tasks(self) -> list[ParsedTask]:
+        """Every stored row as a ``ParsedTask``, in the projection's order."""
+        with self._connection() as conn:
+            return backlog_projection.fetch_tasks(conn)
+
+    def export_markdown(self) -> str:
+        """The master Markdown projection of the whole store.
+
+        The inverse of ``import_markdown``, and measurably so: feeding this
+        text back through the importer reports ``changed == 0``, because
+        every stored field is rendered explicitly rather than left to be
+        re-derived by the parser's authored-file heuristics (the id's
+        family for ``repo``, the id's ``-G<n>`` suffix for ``kind``). A
+        projection that leaned on those would rewrite, on every import,
+        exactly the rows whose stored value disagreed with the guess.
+
+        Byte-for-byte the file ``aicc-db backlog-project`` writes: both go
+        through ``render_master_file``, so there is one answer to "what the
+        master projection is" rather than one per caller.
+        """
+        with self._connection() as conn:
+            return backlog_projection.render_master_file(conn)[0]
 
     # -- the importer ---------------------------------------------------------
 
