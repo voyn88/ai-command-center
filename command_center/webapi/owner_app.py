@@ -67,7 +67,7 @@ def read_backlog(path: Path) -> dict:
 
 
 def _read_team_artifact(root: Path | None, name: str) -> bytes | None:
-    """Read only a bounded, content-addressed release observation, without links."""
+    """Serve only allowlisted observation shapes; serving does not admit evidence."""
     if (root is None or not root.is_absolute()
             or not re.fullmatch(r'[a-f0-9]{64}\.json', name)
             or not hasattr(os, 'O_NOFOLLOW') or not hasattr(os, 'O_DIRECTORY')
@@ -101,9 +101,45 @@ def _read_team_artifact(root: Path | None, name: str) -> bytes | None:
             'version_url', 'health_url', 'health', 'criteria', 'started_at',
             'observed_at', 'business_acceptance',
         }
-        if (not isinstance(value, dict) or set(value) != fields
-                or value.get('schema') != 'delivery-release-observation/v1'
-                or value.get('business_acceptance') is not False):
+        if not isinstance(value, dict):
+            return None
+        schema = value.get('schema')
+        if schema == 'delivery-release-observation/v1':
+            if set(value) != fields or value.get('business_acceptance') is not False:
+                return None
+            return raw
+
+        # Exact shapes from deployment.delivery_receipts admission adapters.
+        # Producer trust and authoritative SQL scope remain operator decisions.
+        common = {'schema', 'revision', 'sha', 'criterion_id', 'check_id',
+                  'outcome', 'observed_at'}
+        if schema == 'delivery-acceptance-observation/v1':
+            fields = common | {'task_id', 'environment'}
+            identifiers = ('task_id', 'criterion_id', 'check_id')
+            revisions = ('revision',)
+            if value.get('environment') != 'production':
+                return None
+        elif schema == 'delivery-corrective-observation/v1':
+            fields = common | {'parent_task_id', 'incident_key',
+                               'corrective_task_id', 'corrective_revision'}
+            identifiers = ('parent_task_id', 'corrective_task_id', 'criterion_id', 'check_id')
+            revisions = ('revision', 'corrective_revision')
+            if (not isinstance(value.get('incident_key'), str)
+                    or not re.fullmatch(r'[a-f0-9]{64}', value['incident_key'])):
+                return None
+        else:
+            return None
+        if (set(value) != fields or value.get('outcome') != 'passed'
+                or any(not isinstance(value.get(key), str) or not value[key].strip()
+                       for key in identifiers)
+                or any(type(value.get(key)) is not int or value[key] < 1
+                       for key in revisions)
+                or not isinstance(value.get('sha'), str)
+                or not re.fullmatch(r'[a-f0-9]{40}', value['sha'])
+                or not isinstance(value.get('observed_at'), str)):
+            return None
+        observed_at = datetime.fromisoformat(value['observed_at'].replace('Z', '+00:00'))
+        if observed_at.tzinfo is None or observed_at.utcoffset() is None:
             return None
         return raw
     except (OSError, ValueError, UnicodeError, RecursionError):

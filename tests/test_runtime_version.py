@@ -212,3 +212,109 @@ def test_artifact_rejects_duplicate_schema(tmp_path):
     )
     path = artifact_file(tmp_path, raw)
     assert owner_app._read_team_artifact(tmp_path, path.name) is None
+
+
+def check_artifact_bytes(kind, **overrides):
+    import json
+    value = {
+        'schema': f'delivery-{kind}-observation/v1', 'revision': 1,
+        'sha': SHA, 'criterion_id': 'criterion-1', 'check_id': 'check-1',
+        'outcome': 'passed', 'observed_at': '2026-11-04T00:00:01Z',
+    }
+    if kind == 'acceptance':
+        value.update(task_id='task-1', environment='production')
+    else:
+        value.update(parent_task_id='task-1', incident_key='b' * 64,
+                     corrective_task_id='fix-1', corrective_revision=2)
+    value.update(overrides)
+    return (json.dumps(value) + '\n').encode()
+
+
+@pytest.mark.parametrize('kind', ['acceptance', 'corrective'])
+def test_check_artifact_authorized_read_is_byte_exact(tmp_path, monkeypatch, kind):
+    raw = check_artifact_bytes(kind)
+    path = artifact_file(tmp_path, raw)
+    monkeypatch.setenv('AICC_TEAM_ARTIFACT_DIR', str(tmp_path))
+    client = client_for(monkeypatch, tmp_path, release(tmp_path))
+    url = '/api/team/artifacts/' + path.name
+    assert client.get(url).status_code == 401
+    assert client.get(url, headers={'Authorization': 'Bearer wrong'}).status_code == 401
+    assert client.post(url, headers=HEADERS).status_code == 405
+    response = client.get(url, headers=HEADERS)
+    assert response.status_code == 200
+    assert response.content == raw
+    assert response.headers['cache-control'] == 'no-store'
+    assert response.headers['content-type'] == 'application/json'
+
+
+@pytest.mark.parametrize('kind', ['acceptance', 'corrective'])
+@pytest.mark.parametrize('overrides', [
+    {'revision': True}, {'revision': 0}, {'revision': '1'}, {'revision': 1.0},
+    {'sha': 'A' * 40}, {'sha': None}, {'criterion_id': []},
+    {'criterion_id': ' '}, {'check_id': None}, {'outcome': 'failed'},
+    {'observed_at': '2026-11-04T00:00:01'}, {'observed_at': []},
+    {'observed_at': 'invalid'}, {'secret': 'must not serve'},
+    {'repo': 'unexpected/field'}, {'business_acceptance': True},
+])
+def test_check_artifact_rejects_malformed_or_extra_fields(tmp_path, kind, overrides):
+    path = artifact_file(tmp_path, check_artifact_bytes(kind, **overrides))
+    assert owner_app._read_team_artifact(tmp_path, path.name) is None
+
+
+@pytest.mark.parametrize(('kind', 'overrides'), [
+    ('acceptance', {'task_id': []}), ('acceptance', {'environment': 'staging'}),
+    ('acceptance', {'parent_task_id': 'foreign'}),
+    ('corrective', {'parent_task_id': ' '}),
+    ('corrective', {'corrective_task_id': None}),
+    ('corrective', {'corrective_revision': True}),
+    ('corrective', {'corrective_revision': 0}),
+    ('corrective', {'incident_key': 'not-a-hash'}),
+    ('corrective', {'incident_key': []}),
+    ('corrective', {'environment': 'production'}),
+    ('corrective', {'task_id': 'foreign'}),
+])
+def test_check_artifact_schema_specific_scope(tmp_path, kind, overrides):
+    path = artifact_file(tmp_path, check_artifact_bytes(kind, **overrides))
+    assert owner_app._read_team_artifact(tmp_path, path.name) is None
+
+
+@pytest.mark.parametrize('kind', ['acceptance', 'corrective'])
+def test_check_artifact_requires_all_fields_and_unique_keys(tmp_path, kind):
+    import json
+    value = json.loads(check_artifact_bytes(kind))
+    for key in value:
+        missing = {k: v for k, v in value.items() if k != key}
+        path = artifact_file(tmp_path, json.dumps(missing).encode())
+        assert owner_app._read_team_artifact(tmp_path, path.name) is None, key
+    raw = check_artifact_bytes(kind).replace(b'{', b'{"revision":1,', 1)
+    path = artifact_file(tmp_path, raw)
+    assert owner_app._read_team_artifact(tmp_path, path.name) is None
+
+
+@pytest.mark.parametrize('kind', ['acceptance', 'corrective'])
+def test_check_artifact_hash_size_and_symlink_guards(tmp_path, kind):
+    raw = check_artifact_bytes(kind)
+    path = artifact_file(tmp_path, raw)
+    path.write_bytes(check_artifact_bytes(kind, check_id='changed'))
+    assert owner_app._read_team_artifact(tmp_path, path.name) is None
+    path.unlink()
+    target = tmp_path / 'target'
+    target.write_bytes(raw)
+    path.symlink_to(target)
+    assert owner_app._read_team_artifact(tmp_path, path.name) is None
+    oversized = artifact_file(tmp_path, check_artifact_bytes(kind, check_id='x' * 65536))
+    assert owner_app._read_team_artifact(tmp_path, oversized.name) is None
+
+
+@pytest.mark.parametrize('kind', ['acceptance', 'corrective'])
+def test_check_artifact_extra_field_is_not_exposed_by_endpoint(tmp_path, monkeypatch, kind):
+    raw = check_artifact_bytes(kind, secret='must not serve')
+    path = artifact_file(tmp_path, raw)
+    monkeypatch.setenv('AICC_TEAM_ARTIFACT_DIR', str(tmp_path))
+    client = client_for(monkeypatch, tmp_path, release(tmp_path))
+    url = '/api/team/artifacts/' + path.name
+    assert client.get(url).status_code == 401
+    response = client.get(url, headers=HEADERS)
+    assert response.status_code == 404
+    assert response.json() == {'detail': 'Artifact not found'}
+    assert b'must not serve' not in response.content
