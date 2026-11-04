@@ -18,6 +18,13 @@ from native_gateway.delivery_health import (
     AUTH_FAILURE_PATTERN,
     PipelineRows,
     PostgresPipelineHealthSource,
+    _AUTH_SQL,
+    _BACKLOG_SQL,
+    _ESCALATIONS_SQL,
+    _LANES_SQL,
+    _MONITOR_LAST_SQL,
+    _MONITOR_OPEN_SQL,
+    _QUEUE_SQL,
     build_pipeline_health,
 )
 from native_gateway.projection_producer import build_projection, write_projection
@@ -96,9 +103,9 @@ def test_block_shapes_rows_through_the_allowlist():
         "succeeded_last_hour": 9,
         "oldest_ready_age_seconds": 310,
     }
-    assert [lane["role"] for lane in block["active_lanes"]] == [
-        "aicc_worker",
-        "aicc_worker_2",
+    assert block["active_lanes"] == [
+        {"role": "aicc_worker", "attempts": 2, "heartbeat_age_seconds": 11},
+        {"role": "aicc_worker_2", "attempts": 1, "heartbeat_age_seconds": 40},
     ]
     assert block["executor_auth_failures_30m"] == 3
     # Only the closed backlog vocabulary is projected.
@@ -113,7 +120,9 @@ def test_block_shapes_rows_through_the_allowlist():
         "failures": ["active_workers", "dead_letter_growth"],
         "last_seen_at": "2026-10-30T11:59:00Z",
     }
-    assert "54>0" not in json.dumps(block)
+    serialized = json.dumps(block)
+    assert "54>0" not in serialized
+    assert "2<4" not in serialized
 
 
 def test_monitor_is_omitted_when_unavailable_and_unknown_when_clear():
@@ -149,7 +158,10 @@ def test_producer_adds_block_and_lanes_from_queue(tmp_path, monkeypatch):
 def test_run_journal_mode_keeps_journal_lanes(tmp_path, monkeypatch):
     """With the journal on (the default) nothing about lanes changes."""
     root = _seed_root(tmp_path, monkeypatch)
-    projection = build_projection(root, pipeline_source=_FakeSource())
+    source = _FakeSource()
+    projection = build_projection(root, pipeline_source=source)
+    assert source.reads == 1
+    assert projection["pipeline_health"]["queue"]["ready"] == 4
     assert projection["lanes"] == []
     assert projection["degraded"] is True  # no runtime.db, as before
 
@@ -209,6 +221,10 @@ def test_round_trip_reaches_the_snapshot_dto(tmp_path, monkeypatch):
         "aicc_worker",
         "aicc_worker_2",
     ]
+    assert [(lane.attempts, lane.heartbeatAgeSeconds) for lane in health.activeLanes] == [
+        (2, 11),
+        (1, 40),
+    ]
     assert health.executorAuthFailures30m == 3
     assert health.backlogByStatus["DEFER_TO_USER"] == 2
     assert health.ownerEscalations[0].taskID == "VOYN-W0-OWNER-A"
@@ -226,7 +242,11 @@ def test_snapshot_route_serves_pipeline_health(client, device_token):
         "succeededLastHour": 7,
         "oldestReadyAgeSeconds": 95,
     }
-    assert health["activeLanes"][0]["role"] == "aicc_worker"
+    assert health["activeLanes"][0] == {
+        "role": "aicc_worker",
+        "attempts": 2,
+        "heartbeatAgeSeconds": 14,
+    }
     assert health["executorAuthFailures30m"] == 0
     assert health["ownerEscalations"][0]["taskID"] == "VOYN-EXAMPLE-002"
     assert health["monitor"]["failures"] == ["dead_letter_growth"]
@@ -267,7 +287,7 @@ def test_hostile_pipeline_health_is_redacted(client, device_token, projection_pa
 
 
 class _Cursor:
-    """Answers each query by a marker substring; records what ran."""
+    """Answers only the exact statements in the read-only query contract."""
 
     def __init__(self, answers: dict[str, list[tuple]], log: list, fail_on: str | None):
         self._answers, self._log, self._fail_on = answers, log, fail_on
@@ -281,13 +301,11 @@ class _Cursor:
 
     def execute(self, sql: str, params: tuple = ()) -> None:
         self._log.append((sql, params))
-        if self._fail_on and self._fail_on in sql:
+        if self._fail_on == sql:
             raise RuntimeError("relation does not exist")
-        for marker, rows in self._answers.items():
-            if marker in sql:
-                self._rows = rows
-                return
-        raise AssertionError(f"unexpected query: {sql}")
+        if sql not in self._answers:
+            raise AssertionError(f"unexpected query: {sql}")
+        self._rows = self._answers[sql]
 
     def fetchone(self):
         return self._rows[0]
@@ -319,14 +337,14 @@ class _Conn:
 
 
 _ANSWERS = {
-    "FROM work_item_public": [(4, 2, 1, 9, 310.7)],
-    "GROUP BY claimed_by_role": [("aicc_worker", 2, 11.2)],
-    "outcome_reason ~*": [(3,)],
-    "GROUP BY status": [("OPEN", 5), ("DEFER_TO_USER", 1)],
-    "status = 'DEFER_TO_USER'": [
+    _QUEUE_SQL: [(4, 2, 1, 9, 310.7)],
+    _LANES_SQL: [("aicc_worker", 2, 11.2)],
+    _AUTH_SQL: [(3,)],
+    _BACKLOG_SQL: [("OPEN", 5), ("DEFER_TO_USER", 1)],
+    _ESCALATIONS_SQL: [
         ("VOYN-W0-X", "Решение", "P1", datetime(2026, 10, 30, 9, 0, tzinfo=UTC))
     ],
-    "WHERE state = 'open'": [
+    _MONITOR_OPEN_SQL: [
         (
             "voyn-queue-monitor",
             "dead_letter_growth",
@@ -334,7 +352,7 @@ _ANSWERS = {
             datetime(2026, 10, 30, 11, 0, tzinfo=UTC),
         )
     ],
-    "max(greatest": [(datetime(2026, 10, 30, 11, 0, tzinfo=UTC),)],
+    _MONITOR_LAST_SQL: [(datetime(2026, 10, 30, 11, 0, tzinfo=UTC),)],
 }
 
 
@@ -342,24 +360,73 @@ def test_postgres_source_reads_only_the_public_views():
     conn = _Conn(_ANSWERS)
     rows = PostgresPipelineHealthSource(lambda: conn).read()
 
-    assert rows.queue["oldest_ready_age_seconds"] == 310
+    assert rows.queue == {
+        "ready": 4,
+        "claimed": 2,
+        "dead": 1,
+        "succeeded_last_hour": 9,
+        "oldest_ready_age_seconds": 310,
+    }
     assert rows.lanes == [
         {"role": "aicc_worker", "attempts": 2, "heartbeat_age_seconds": 11}
     ]
     assert rows.auth_failures == 3
-    assert rows.escalations[0]["updated_at"] == "2026-10-30T09:00:00Z"
+    assert rows.backlog_counts == {"OPEN": 5, "DEFER_TO_USER": 1}
+    assert rows.escalations == [
+        {
+            "task_id": "VOYN-W0-X",
+            "title": "Решение",
+            "priority": "P1",
+            "updated_at": "2026-10-30T09:00:00Z",
+        }
+    ]
     assert rows.monitor["open"][0]["failure"] == "dead_letter_growth"
-    sql = " ".join(statement for statement, _ in conn.log)
-    # The redacted views only — `work_attempt` itself holds claim_token_hash.
-    assert not re.search(r"\b(work_attempt|work_item)\b", sql, re.I)
-    assert not re.search(
-        r"\b(INSERT|UPDATE|DELETE|TRUNCATE|DROP|ALTER|COPY|GRANT|MERGE|CREATE|REVOKE|CALL|DO)\b", sql, re.I
+    assert conn.log == [
+        (_QUEUE_SQL, ()),
+        (_LANES_SQL, ()),
+        (_AUTH_SQL, (AUTH_FAILURE_PATTERN,)),
+        (_BACKLOG_SQL, ()),
+        (_ESCALATIONS_SQL, (50,)),
+        (_MONITOR_OPEN_SQL, (20,)),
+        (_MONITOR_LAST_SQL, ()),
+    ]
+    relations = {
+        match.group(1).replace('"', "").removeprefix("public.")
+        for statement, _ in conn.log
+        for match in re.finditer(
+            r"\b(?:from|join)\s+([a-z_\"][a-z0-9_.\"]*)", statement, re.I
+        )
+    }
+    assert relations == {
+        "work_item_public",
+        "work_attempt_public",
+        "backlog_task",
+        "monitor_finding",
+    }
+    assert not any(
+        re.search(
+            r"\b(insert|update|delete|truncate|drop|alter|copy|grant|merge|create|revoke|call|do)\b",
+            statement,
+            re.I,
+        )
+        for statement, _ in conn.log
     )
-    assert (AUTH_FAILURE_PATTERN,) in [params for _, params in conn.log]
+    assert "interval '30 minutes'" in _AUTH_SQL.lower()
+
+
+def test_auth_failure_pattern_is_narrow_and_actionable():
+    for reason in (
+        "failed to authenticate with executor",
+        "OAuth session expired",
+        "refresh token rejected",
+    ):
+        assert re.search(AUTH_FAILURE_PATTERN, reason, re.I), reason
+    for reason in ("executor timed out", "rate limited", "tests failed"):
+        assert not re.search(AUTH_FAILURE_PATTERN, reason, re.I), reason
 
 
 def test_postgres_source_survives_missing_monitor_table():
-    conn = _Conn(_ANSWERS, fail_on="monitor_finding")
+    conn = _Conn(_ANSWERS, fail_on=_MONITOR_OPEN_SQL)
     rows = PostgresPipelineHealthSource(lambda: conn).read()
     assert rows.monitor is None
     assert conn.rolled_back
