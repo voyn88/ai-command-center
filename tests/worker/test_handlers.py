@@ -318,6 +318,43 @@ def test_principal_isolation_failure_is_retryable_not_a_task_result(
     assert not removed, "ambiguous launcher failure must preserve task-local work"
 
 
+def test_principal_isolation_failure_checkpoints_commit_before_retry(
+    handler, monkeypatch
+) -> None:
+    run_agent, _ = handler
+    candidate = "1" * 40
+    checkpoints: list[dict] = []
+    monkeypatch.setattr(
+        workspace_provisioning,
+        "task_workspace_candidate_sha",
+        lambda workspace, **kwargs: candidate,
+    )
+    monkeypatch.setattr(
+        workspace_provisioning,
+        "checkpoint_task_workspace",
+        lambda workspace, **kwargs: checkpoints.append(kwargs) or candidate,
+    )
+    monkeypatch.setattr(
+        agent_runner,
+        "run_claude_code",
+        lambda **kwargs: agent_runner.RunResult(
+            status="failed",
+            exit_code=125,
+            stdout="",
+            stderr="AICC_AGENT_LAUNCH_INFRA_FAILURE: broker reply lost",
+            duration_seconds=1.0,
+            started_at="2026-09-11T00:00:00+00:00",
+            completed_at="2026-09-11T00:00:01+00:00",
+        ),
+    )
+
+    outcome = run_agent(_payload(task_type="implementation"), _event(), 1)
+
+    assert not outcome.ok and outcome.retryable and outcome.infra_wait
+    assert len(checkpoints) == 1
+    assert checkpoints[0]["expected_candidate_sha"] == candidate
+
+
 def test_successful_review_may_quote_principal_failure_marker(
     handler, monkeypatch
 ) -> None:
@@ -1036,6 +1073,18 @@ def test_timed_out_run_is_ok_not_redelivered(handler, monkeypatch) -> None:
     never-started retryable path — pinned because the mutant
     `if run.exit_code is None:` survived review's mutation pass."""
     run_agent, _ = handler
+    candidate = "2" * 40
+    checkpoints: list[dict] = []
+    monkeypatch.setattr(
+        workspace_provisioning,
+        "task_workspace_candidate_sha",
+        lambda workspace, **kwargs: candidate,
+    )
+    monkeypatch.setattr(
+        workspace_provisioning,
+        "checkpoint_task_workspace",
+        lambda workspace, **kwargs: checkpoints.append(kwargs) or candidate,
+    )
 
     def timed_out(**kwargs):
         return agent_runner.RunResult(
@@ -1049,8 +1098,10 @@ def test_timed_out_run_is_ok_not_redelivered(handler, monkeypatch) -> None:
         )
 
     monkeypatch.setattr(agent_runner, "run_claude_code", timed_out)
-    outcome = run_agent(_payload(), _event(), 1)
+    outcome = run_agent(_payload(task_type="implementation"), _event(), 1)
     assert outcome.ok and outcome.result["status"] == "timed_out"
+    assert len(checkpoints) == 1
+    assert checkpoints[0]["expected_candidate_sha"] == candidate
 
 
 def test_every_payload_defect_is_non_retryable() -> None:

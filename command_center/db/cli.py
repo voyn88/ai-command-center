@@ -285,6 +285,11 @@ def build_parser() -> argparse.ArgumentParser:
     fleet_status.add_argument(
         "--limit", type=int, default=100, help="Rows to show (default 100)."
     )
+    fleet_status.add_argument(
+        "--workspace-root",
+        default=os.environ.get("AICC_AGENT_WORKSPACE_ROOT", "/srv/aicc-workspaces"),
+        help="Local task-clone root to probe for uncheckpointed workspaces.",
+    )
     fleet_suspend = sub.add_parser(
         "fleet-suspend",
         help="Suspend a worker-host device and revoke its live credential(s) "
@@ -463,9 +468,17 @@ def main(argv: list[str] | None = None) -> int:
 
             if args.command == "fleet-status":
                 from command_center.db.fleet_admin import FleetAdmin
+                from command_center.workspace_provisioning import (
+                    count_uncheckpointed_task_workspaces,
+                )
 
                 devices = FleetAdmin(lambda: nullcontext(conn)).list_devices(
                     state=args.state, limit=args.limit
+                )
+                print(
+                    "uncheckpointed_workspaces="
+                    f"{count_uncheckpointed_task_workspaces(args.workspace_root)}"
+                    f"  workspace_root={args.workspace_root}"
                 )
                 if not devices:
                     print("no worker-host devices enrolled")
