@@ -206,9 +206,11 @@ def test_0029_down_drops_exactly_the_functions_its_up_created() -> None:
     }
     dropped = {
         signature(name, args)
-        for name, args in re.findall(r"^DROP FUNCTION IF EXISTS (\w+)\(([^)]*)\);", down, re.MULTILINE)
+        for name, args in re.findall(r"^DROP FUNCTION (\w+)\(([^)]*)\);", down, re.MULTILINE)
     }
     assert created == dropped, (created ^ dropped)
+    assert "DROP FUNCTION IF EXISTS" not in down
+    assert "r.rolvaliduntil IS NULL OR r.rolvaliduntil > r.expires_at" in down
     # And nothing the up merely REPLACES is dropped by the down.
     replaced = set(re.findall(r"^CREATE OR REPLACE FUNCTION (\w+)\(", up, re.MULTILINE))
     assert not {d.split("(")[0] for d in dropped} & (replaced - {"identity_assert"}), replaced

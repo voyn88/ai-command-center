@@ -925,10 +925,11 @@ class RotationController:
     ) -> None:
         """Bound every later operation by the credential's usable lifetime.
 
-        ``renewal=True`` is the pre-mutation phase: the only thing the current
-        credential must still be able to do is call ``enroll_rotate_self``, so
-        the bound is the RENEWAL deadline -- which, for an expired credential
-        inside the grace, is the only positive one. ``renewal=False`` is
+        ``renewal=True`` is the pre-mutation phase. The worker role remains
+        login-capable through the same deadline, so readiness checks and the
+        final ``enroll_rotate_self`` call are both bounded by the RENEWAL
+        deadline -- which, for an expired credential inside the grace, is the
+        only positive one. ``renewal=False`` is
         every phase in which lanes must be able to WORK on the credential
         (activation on a new one, resume on a recovered one): the bound is
         the ledger expiry, exactly as before 0029.
@@ -1139,7 +1140,7 @@ class RotationController:
         )
 
     def _require_current_attempt_budget(
-        self, current: PostgresConfig, remaining: float, required: float
+        self, current: PostgresConfig, renewable: float, required: float
     ) -> None:
         available = self._bounded_timeout(
             required,
@@ -1149,7 +1150,7 @@ class RotationController:
         if available < required:
             self.audit.emit(
                 "rotation_deferred_current_expiry",
-                remaining=remaining,
+                renewable=renewable,
                 required=required + CREDENTIAL_SAFETY_MARGIN_SECONDS,
             )
             raise RotationError(
@@ -1518,6 +1519,20 @@ class RotationController:
                     error=str(error),
                 )
                 continue
+            # A successful renewal query only proves that this secret may
+            # replace itself. Recovery must reactivate lanes on the selected
+            # secret, so an expired-but-renewable candidate is not a working
+            # recovery candidate. Screen it before committing/removing either
+            # durable file; the old code discovered this only after mutation.
+            if proof.remaining <= CREDENTIAL_SAFETY_MARGIN_SECONDS:
+                self.audit.emit(
+                    "rotation_recovery_candidate_refused",
+                    source="environment"
+                    if path == self.config.env_file
+                    else "recovery",
+                    error="credential expires inside the safety margin",
+                )
+                continue
             working.append((path, config, proof))
         if len(working) != 1:
             raise RotationError(
@@ -1596,9 +1611,10 @@ class RotationController:
             current
         )
         authority_timeout = self._authority_timeout(current)
-        current_remaining = self._load_credential_deadline(
+        current_proof = self._load_credential_deadline(
             current, "current credential", renewal=True
-        ).remaining
+        )
+        current_remaining = current_proof.remaining
         minimum_rotation_threshold = (
             self._retry_lifetime_budget(current) + CREDENTIAL_SAFETY_MARGIN_SECONDS
         )
@@ -1630,7 +1646,7 @@ class RotationController:
         # independently covers activation plus rollback.
         self._require_current_attempt_budget(
             current,
-            current_remaining,
+            current_proof.renewable,
             self.config.prerequisite_timeout + 2 * authority_timeout,
         )
 
@@ -1647,12 +1663,12 @@ class RotationController:
         self._wait_workers_healthy()
         # Worker readiness may legitimately consume most of its bounded wait.
         # Refresh the server-clock proof immediately before the mutation.
-        current_remaining = self._load_credential_deadline(
+        current_proof = self._load_credential_deadline(
             current, "pre-mutation current credential", renewal=True
-        ).remaining
+        )
         self._require_current_attempt_budget(
             current,
-            current_remaining,
+            current_proof.renewable,
             authority_timeout,
         )
         self.audit.emit("rotation_preflight_ok", lanes=len(self._rotatable_units or ()))

@@ -1078,6 +1078,34 @@ def test_ambiguous_mutation_phase_promotes_only_working_secret_and_reopens_lanes
     assert not controller.config.circuit_file.exists()
 
 
+def test_interrupted_recovery_does_not_commit_expired_candidate_or_delete_alternative(
+    tmp_path: Path,
+) -> None:
+    """A renewable secret is not necessarily usable for lane recovery.
+
+    In particular, reject an expired environment candidate before touching
+    either durable file when the prepared candidate is not accepted by the
+    database. The old ordering deleted the prepared alternative and only then
+    discovered that the environment credential could not carry lane work.
+    """
+    events: list[tuple] = []
+    controller, _, authority = _controller(tmp_path, events)
+    prepared = prepare_password_update(controller.config.env_file, "b" * 64)
+    controller.phase_journal.write("mutation_started", prepared.temporary)
+    authority.current_expires_at = NOW - timedelta(minutes=1)
+
+    with pytest.raises(RotationError, match="no unique working credential"):
+        controller.recover_interrupted()
+
+    assert (
+        read_environment_file(controller.config.env_file)["AICC_PG_PASSWORD"]
+        == OLD_PASSWORD
+    )
+    assert prepared.temporary.exists()
+    assert controller.config.phase_file.exists()
+    assert not any(event[0] in {"reload", "restart"} for event in events)
+
+
 def test_interrupted_recovery_waits_through_tunnel_boot_race(
     tmp_path: Path,
 ) -> None:

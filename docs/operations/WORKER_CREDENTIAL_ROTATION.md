@@ -74,8 +74,10 @@ operator widened the ledger row and the role by hand. Since 0029:
   log in and do whatever the worker role can do without a ledger verdict
   (queue functions do not call `identity_assert`; the role writes run and
   completion rows directly), so lanes stay ready and keep claiming during that
-  hour while the rotator renews. It cannot pass `identity_assert`, and it can
-  RENEW only while unrevoked, active, inside the hour, used at least once
+  hour while the rotator renews. The grace-aware `identity_assert(text,
+  interval)` overload can grant only for the renewal query/rotation path;
+  ordinary one-argument `identity_assert` still refuses the expired secret.
+  It can RENEW only while unrevoked, active, inside the hour, used at least once
   while live, and from a connection whose address equals the one it was bound
   to (under the SSH-tunnel deployment that address is the loopback for every
   worker, so the confinement there is the tunnel key per host and pg_hba, not
@@ -91,8 +93,10 @@ operator widened the ledger row and the role by hand. Since 0029:
   `renewable_until` (exclusive); it bounds its pre-mutation attempt by the
   renewal deadline and rotates immediately. A renewal on an expired secret is
   `rotate/granted` with `expired_grace: true` in the ledger -- that row is the
-  "host limped on grace" signal; `assert/granted/expired_grace` is written by
-  every graced pass, including the read-only renewal query. The grace is not
+  completed self-heal signal. `assert/granted/expired_grace` is emitted by
+  each successful grace-aware assertion, including the read-only renewal
+  query, and is therefore an earlier "host entered grace" monitoring signal,
+  not proof that rotation completed. The grace is not
   consumed: a host that stalls twice inside the hour recovers twice. The bound
   is time, not count.
 * Narrowing the extra hour to renewal only would take a renewal-only login

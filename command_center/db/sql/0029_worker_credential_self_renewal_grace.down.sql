@@ -12,7 +12,7 @@
 -- `tests/db/test_migration_set.py` pins both halves of that claim: the three
 -- bodies below are byte-for-byte the 0003 bodies, and no other up migration
 -- defines any of the three.
-DROP FUNCTION IF EXISTS identity_current_credential(text, boolean);
+DROP FUNCTION identity_current_credential(text, boolean);
 
 CREATE OR REPLACE FUNCTION identity_assert(p_secret text)
     RETURNS identity_verdict
@@ -230,7 +230,7 @@ BEGIN
 END
 $$;
 
-DROP FUNCTION IF EXISTS identity_assert(text, interval);
+DROP FUNCTION identity_assert(text, interval);
 
 -- Roles of worker hosts were widened by the up and by every issuance since;
 -- restore the 0003 invariant "no worker role outlives the ledger expiry of its
@@ -239,8 +239,10 @@ DROP FUNCTION IF EXISTS identity_assert(text, interval);
 -- `issued_at` -- two issuances in one transaction -- break toward the EARLIER
 -- expiry, because a control that only narrows must never pick the wider
 -- deadline) and narrow the role to it when its validity is later. A validity
--- already earlier is left alone; a `NULL` validity (never expires) cannot
--- occur for a role this family issued and is left alone too. A credential
+-- already earlier is left alone; a `NULL` validity (never expires) is also
+-- narrowed. That state is not emitted by 0029, but rollback must restore the
+-- invariant even if an operator or a future implementation cleared the
+-- deadline. A credential
 -- revoked through `identity_revoke_principal` already has its role disabled
 -- (NOLOGIN, -infinity) and stays that way.
 --
@@ -257,11 +259,11 @@ BEGIN
               WHERE p.kind = 'worker_host'
               ORDER BY p.db_role, c.issued_at DESC, c.expires_at ASC
     LOOP
-        IF r.rolvaliduntil IS NOT NULL AND r.rolvaliduntil > r.expires_at THEN
+        IF r.rolvaliduntil IS NULL OR r.rolvaliduntil > r.expires_at THEN
             EXECUTE format('ALTER ROLE %I VALID UNTIL %L', r.db_role, r.expires_at::text);
         END IF;
     END LOOP;
 END
 $$;
 
-DROP FUNCTION IF EXISTS enroll_self_grace();
+DROP FUNCTION enroll_self_grace();
