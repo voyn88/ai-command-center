@@ -475,9 +475,16 @@ def test_findings_are_recorded_and_cleared_through_the_definer_functions(
         == infra_monitor.finding_key("dead_letter_growth:54>0")
         == "dead_letter_growth"
     )
+    cleared = [c for c in calls if "monitor_clear_resolved_findings" in c[0]]
+    assert cleared[0][1][0] == "worker-01:infra"
+    assert json.loads(cleared[0][1][1]) == ["active_workers"]
+    assert calls.index(recorded[0]) < calls.index(cleared[0])
     calls.clear()
-    infra_monitor.record_findings("worker-01:infra", (), {})
-    assert any("monitor_clear_finding" in c[0] for c in calls)
+    observed_at = "2026-11-04T06:00:00+00:00"
+    infra_monitor.record_findings("worker-01:infra", (), {"observed_at": observed_at})
+    cleared = [c for c in calls if "monitor_clear_resolved_findings" in c[0]]
+    assert cleared[0][1] == ("worker-01:infra", "[]", observed_at)
+    assert not any("monitor_record_finding" in c[0] for c in calls)
 
 
 def test_main_exits_non_zero_when_findings_cannot_be_recorded_even_if_healthy(

@@ -333,8 +333,9 @@ def test_migration_0032_is_paired_and_registers_table():
     assert "coordinator_cas_begin" in up
     assert "CREATE TABLE coordinator_state" in up
     found = migrations.discover()
-    assert found[-1].slug == "coordinator_v2"
-    assert found[-1].version == 32
+    coordinator = [migration for migration in found if migration.version == 32]
+    assert len(coordinator) == 1
+    assert coordinator[0].slug == "coordinator_v2"
 
 
 # ---------------------------------------------------------------------------

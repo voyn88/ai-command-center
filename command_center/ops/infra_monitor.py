@@ -1162,12 +1162,14 @@ def record_findings(
 ) -> None:
     """Write the measurement to the database through the SECURITY DEFINER
     functions of migration 0021 (granted to aicc_app and aicc_worker). A red
-    monitor becomes a task the fleet fixes; a healthy one clears its rows.
+    monitor becomes a task the fleet fixes; recovered symptoms clear even
+    when other symptoms remain. Newer evidence than this observation survives.
     Never lets a recording problem mask the measurement: raises, and main()
     reports monitor_error while still exiting non-zero."""
     from command_center.db import pool
     from command_center.db.config import load_config
 
+    observed_at = detail.get("observed_at") or datetime.now(timezone.utc).isoformat()
     pool.open_pool(load_config())
     try:
         with pool.connection() as conn, conn.cursor() as cur:
@@ -1187,8 +1189,10 @@ def record_findings(
                             json.dumps({**detail, "failure": failure}, sort_keys=True),
                         ),
                     )
-            else:
-                cur.execute("SELECT monitor_clear_finding(%s)", (source,))
+            cur.execute(
+                "SELECT monitor_clear_resolved_findings(%s, %s::jsonb, %s::timestamptz)",
+                (source, json.dumps(sorted({finding_key(f) for f in failures})), observed_at),
+            )
             conn.commit()
     finally:
         pool.close_pool()
@@ -1205,6 +1209,7 @@ def _json_report(report: MonitorReport) -> dict[str, Any]:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    observed_at = datetime.now(timezone.utc).isoformat()
     try:
         workers = {} if args.skip_workers else discover_worker_units()
         queue = None if args.skip_queue else read_queue_snapshot()
@@ -1254,6 +1259,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"ok": False, "failures": [f"monitor_error:{exc}"]}))
         return 1
     payload = _json_report(report)
+    payload["observed_at"] = observed_at
     recorded = True
     if args.record_findings:
         try:

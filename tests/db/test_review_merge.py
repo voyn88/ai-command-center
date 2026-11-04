@@ -1975,7 +1975,7 @@ def test_chunk_review_rows_is_empty_for_a_single_chunk_review(rig, monkeypatch):
     assert rows == []
 
 
-def test_verification_key_is_scoped_by_head_and_findings():
+def test_verification_key_is_scoped_by_head_findings_and_policy(monkeypatch):
     snap_a = _snapshot("a" * 40)
     key = review_merge._verification_key("T", "https://github.com/x/y/pull/1", snap_a, "f1")
     assert key.startswith("verify:T:1:" + "a" * 40)
@@ -1986,6 +1986,11 @@ def test_verification_key_is_scoped_by_head_and_findings():
         "T", "https://github.com/x/y/pull/1", _snapshot("b" * 40), "f1"
     )
     assert len({key, other_findings, other_head}) == 3
+    monkeypatch.setattr(review_merge, "_VERIFICATION_POLICY_VERSION", "verify-v3")
+    old_contract = review_merge._verification_key(
+        "T", "https://github.com/x/y/pull/1", snap_a, "f1"
+    )
+    assert old_contract != key  # old unavailable-tree verdicts are immutable history
     assert review_merge._verification_key("T", "not-a-pr-url", snap_a, "f1") is None
 
 
@@ -4287,14 +4292,12 @@ def test_queue_selected_prs_shed_stale_blocked_labels(monkeypatch):
     assert ("11", "add", "review-window:waiting") not in fake.labels
 
 
-def test_queue_selected_prs_shed_blocked_labels_even_with_block_reason(monkeypatch):
-    """Queue ownership is a stronger window signal than stale window evidence.
+def test_queue_active_with_stale_acceptance_releases_slot(monkeypatch):
+    """Queue selection cannot bypass a current eligibility block.
 
-    A queue-selected PR may still be old, missing an accept marker, or waiting
-    on stale checks. Those are still merge-gate concerns, but the PR-window
-    reconciler must not keep or re-add `review-window:blocked` next to
-    `queue-active`/`queue-waiting-review`; that contradictory label pair is
-    exactly what made review/merge ticks rescan the dirty tail."""
+    An active PR with stale acceptance leaves the active queue; a waiting
+    review retains its waiting ownership without contradictory window labels.
+    """
     active_head = "7" * 40
     waiting_head = "8" * 40
     prs = [
@@ -4318,10 +4321,11 @@ def test_queue_selected_prs_shed_blocked_labels_even_with_block_reason(monkeypat
         "/repo", PrWindowConfig(max_active=1, stale_seconds=1)
     )
 
-    assert report.blocked == []
-    assert report.active == [(12, active_head)]
+    assert report.blocked == [(12, "stale_exact_head_acceptance")]
+    assert report.active == []
     assert report.waiting == [(13, waiting_head)]
-    assert ("12", "remove", "review-window:blocked") in fake.labels
+    assert ("12", "remove", "queue-active") in fake.labels
+    assert ("12", "remove", "review-window:blocked") not in fake.labels
     assert ("12", "add", "review-window:active") not in fake.labels
     assert ("13", "remove", "review-window:blocked") in fake.labels
     assert ("13", "add", "review-window:waiting") not in fake.labels

@@ -550,6 +550,7 @@ _WORKER_FUNCTIONS = (
     # 0021: the worker-host fail-closed probe records what it measured.
     "monitor_record_finding(text, text, jsonb)",
     "monitor_clear_finding(text)",
+    "monitor_clear_resolved_findings(text, jsonb, timestamptz)",
     # A second, narrower fail path for a refusal that names no fault in the
     # work itself (VOYN-W0-AICC-PUBLISH-LEASE-CONTENTION-BURNS-ATTEMPT) --
     # see 0022_queue_fail_lease_wait.
@@ -606,6 +607,7 @@ _APP_BACKLOG_FUNCTIONS = (
     "backlog_set_task_class(text, text)",
     "monitor_record_finding(text, text, jsonb)",
     "monitor_clear_finding(text)",
+    "monitor_clear_resolved_findings(text, jsonb, timestamptz)",
     "monitor_link_task(bigint, text)",
     # Audit trail for where a record came from (0020); the importer's stamp
     # that a row was migrated rather than authored directly in the store.
