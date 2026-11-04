@@ -413,7 +413,7 @@ BEGIN
     OR p_observed_at IS NULL OR p_observed_at>clock_timestamp() THEN RETURN false;END IF;
  SELECT * INTO r FROM delivery_team_release_receipt rr WHERE rr.task_id=p_task_id
    AND rr.revision=p_revision AND rr.sha=p_sha AND rr.environment='production';
- IF NOT FOUND OR NOT (r.criteria ? p_criterion_id) OR NOT (v_scope->'criteria' ? p_criterion_id)
+ IF NOT FOUND OR (r.criteria ? p_criterion_id) IS NOT TRUE OR (v_scope->'criteria' ? p_criterion_id) IS NOT TRUE
     OR p_reference=r.reference OR p_observed_at<r.recorded_at THEN RETURN false;END IF;
  SELECT * INTO a FROM delivery_team_acceptance_check aa
    WHERE aa.receipt_id=r.receipt_id AND aa.criterion_id=p_criterion_id;
@@ -697,18 +697,20 @@ CREATE FUNCTION _delivery_team_implementation_gate() RETURNS trigger LANGUAGE pl
 SET search_path = pg_catalog, public AS $$
 DECLARE v_task text;v_revision bigint;
 BEGIN
- v_task:=coalesce(NEW.task_id,nullif(NEW.payload->>'backlog_task_id',''));
- IF v_task IS NULL THEN RETURN NEW;END IF;
  IF coalesce(NEW.payload->>'task_type','') NOT IN ('implementation','remediation')
     AND NOT EXISTS(SELECT 1 FROM jsonb_array_elements(CASE
       WHEN jsonb_typeof(NEW.payload->'cascade')='array' THEN NEW.payload->'cascade' ELSE '[]'::jsonb END) c
       WHERE c->>'task_type' IN ('implementation','remediation')) THEN RETURN NEW;END IF;
+ -- Both native queue identity and worker execution identity must be gated.
+ FOR v_task IN SELECT DISTINCT value FROM unnest(ARRAY[NEW.task_id,
+     nullif(NEW.payload->>'backlog_task_id','')]) value WHERE value IS NOT NULL LOOP
  IF EXISTS(SELECT 1 FROM delivery_team_stage s WHERE s.task_id=v_task) THEN
   SELECT t.revision INTO v_revision FROM backlog_task t WHERE t.task_id=v_task;
-  IF NOT delivery_team_ready(v_task,v_revision) THEN
+  IF delivery_team_ready(v_task,v_revision) IS NOT TRUE THEN
    RAISE EXCEPTION 'delivery_team_requirements_not_ready: %',v_task USING ERRCODE='check_violation';
   END IF;
  END IF;
+ END LOOP;
  RETURN NEW;
 END $$;
 CREATE TRIGGER delivery_team_implementation_gate BEFORE INSERT ON work_item

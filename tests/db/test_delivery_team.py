@@ -946,3 +946,47 @@ def test_real_gate_preserves_unenrolled_legacy_and_holds_enrolled(rig, monkeypat
     assert delivery_team.implementation_gate(factory, TASK + "-LEGACY", 1) == (True, "unenrolled")
     enroll(rig)
     assert delivery_team.implementation_gate(factory, TASK, 1)[0] is False
+
+
+@pytest.mark.parametrize("enrolled_location", ["payload", "queue"])
+def test_enrolled_target_cannot_be_hidden_by_other_queue_identity(rig, psycopg, enrolled_location):  # noqa: F811
+    from command_center.worker.payloads import AgentRunRequest, parse_agent_run
+    factory, _store, _queue = rig
+    enroll(rig)
+    queue_task, payload_task = ("VOYN-UNENROLLED", TASK) if enrolled_location == "payload" else (TASK, "VOYN-UNENROLLED")
+    body = {"kind": "agent_run", "v": 1, "project_id": "AIOS", "repository_path": "/repo",
+            "prompt": "Implement the canonical task", "task_type": "implementation", "untrusted": False,
+            "backlog_task_id": payload_task}
+    assert isinstance(parse_agent_run(body), AgentRunRequest)
+    with pytest.raises(psycopg.errors.CheckViolation, match="delivery_team_requirements_not_ready"):
+        rows(factory, "SELECT queue_enqueue('execution','mismatched-target',%s::jsonb,%s)", (json.dumps(body), queue_task))
+    assert rows(factory, "SELECT count(*) FROM work_item") == [(0,)]
+    # Same identities remain valid once the enrolled task has real prerequisites.
+    preflight(rig)
+    assert rows(factory, "SELECT queue_enqueue('execution','ready-target',%s::jsonb,%s)", (json.dumps(body), queue_task))[0][0]
+
+
+def test_null_acceptance_criterion_returns_false_without_insert(rig, connect_as):  # noqa: F811
+    factory, store, _queue = rig
+    enroll(rig)
+    preflight(rig)
+    assert store.record_evidence(TASK, "sha", SHA)[0]
+    def operator():
+        return connect_as(roles.OPERATOR_ROLE)
+    assert rows(operator, "SELECT delivery_team_record_release(%s,1,%s,'production','[\"C1\"]'::jsonb,'receipt:null-criterion')", (TASK, SHA)) == [(True,)]
+    observed = rows(factory, "SELECT clock_timestamp()")[0][0]
+    args = (TASK, SHA, None, "business-check-1", ACCEPTANCE_REF, observed)
+    assert rows(operator, ACCEPTANCE_SQL, args) == [(False,)]
+    assert rows(factory, "SELECT count(*) FROM delivery_team_acceptance_check") == [(0,)]
+    assert rows(operator, ACCEPTANCE_SQL, (TASK, SHA, "C1", "business-check-1", ACCEPTANCE_REF, observed)) == [(True,)]
+
+
+def test_app_and_worker_cannot_rewrite_queued_identity_or_payload(rig, psycopg):  # noqa: F811
+    factory, _store, queue = rig
+    enroll(rig)
+    work_id = rows(factory, "SELECT queue_enqueue('execution','readonly-mutation-proof',%s::jsonb,%s)",
+                   (json.dumps({"kind": "agent_run", "task_type": "review"}), TASK))[0][0]
+    for connection in (factory, queue._connection):
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            rows(connection, "UPDATE work_item SET task_id='VOYN-OTHER',payload=payload || '{\"task_type\":\"implementation\"}'::jsonb WHERE work_item_id=%s RETURNING work_item_id", (work_id,))
+    assert rows(factory, "SELECT task_id,payload->>'task_type' FROM work_item WHERE work_item_id=%s", (work_id,)) == [(TASK, "review")]
