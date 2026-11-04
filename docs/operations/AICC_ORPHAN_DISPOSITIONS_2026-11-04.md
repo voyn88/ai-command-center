@@ -9,8 +9,10 @@ contained **8 IN_PROGRESS tasks**. Seven had **zero work-item links** across
 all four inspected linkage forms: direct `work_item.task_id`, payload task ID,
 `dispatch:<task_id>:` idempotency prefix, and the work-item ID recorded by a
 `backlog_event` dispatch event. The follow-up at **12:25:55.732664 UTC** found
-zero recorded granted or rejected dispatch events and zero dependency-table
-edges for these seven. Both read-only queries exited 0.
+zero recorded granted or rejected dispatch events and zero outbound
+dependency-table edges from these seven to existing tasks. The inner join
+does not inspect incoming edges or edges whose target task is absent.
+Both read-only queries exited 0.
 
 Seven zero-link tasks do not imply seven lost enqueues: the evidence supports
 manual work, policy/measurement follow-up and umbrella programs. Recorded
@@ -107,7 +109,8 @@ The planner linkage contract is defined in
 `command_center/db/sql/0006_backlog_planner.up.sql`: dispatch uses the task ID
 and revision in its idempotency key, with the resulting work-item ID recorded
 in the dispatch event. The audit verified the relevant live columns before
-joining them.
+joining them: `work_item.work_item_id` is `text`, matching the text returned by
+`backlog_event.detail->>'work_item_id'` without a cast.
 
 ### Repository-scoped work linkage
 
@@ -132,6 +135,16 @@ COMMIT;
 ```
 
 ### Retained receipt integrity
+
+The disposition readback query is excluded from the exact SQL blocks above:
+the retained `orphan-dispositions-receipt.json` contains its output, but the
+exact query was not found in the retained SQL sources. The separate
+`record-orphan-dispositions.sql` is the write transaction, not that readback
+query, and must not be substituted for it. `disposition_recorded` is a field
+of the receipt, not a verified database column; its exact boolean predicate
+cannot be reproduced from the retained output alone. The statuses, revisions
+and boolean values above are transcribed historical receipt values, not a new
+independent verification of that predicate.
 
 - `orphan-audit.json` — SHA256 `6db782732b24b1944a3f05df29b49a4bc1811bb2dc652906a4c5330849b943b8`.
 - `orphan-audit.txt` — SHA256 `e580f2b4627a1e8acb4dab7f07cc29b80211176ea3e55e075b523e71c3b3a168`.
@@ -158,8 +171,10 @@ in the disposition receipt. No queue reset, bulk redrive, replacement service,
 model call or production-data mutation is part of this deliverable.
 
 These are temporal snapshots, not continuous monitoring. No recorded dispatch
-is not proof of all historical activity being absent. Zero dependency-table
-edges do not erase dependencies stated only in task prose. This report does
+is not proof of all historical activity being absent. Zero outbound
+dependency-table edges to existing tasks do not establish the absence of
+incoming edges, edges to missing tasks, or dependencies stated only in task
+prose. This report does
 not validate current runtime units, current workflow executions, or subsequent
 changes to any of these records. Re-read status/revision and ownership before
 later mutation; preserve newer evidence instead of replaying old dispositions.
