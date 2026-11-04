@@ -55,8 +55,36 @@ def test_backup_leaves_an_existing_directory_permissions_alone(tmp_path) -> None
     existing = tmp_path / "backups"
     existing.mkdir(mode=0o755)
     before = existing.stat().st_mode
-    _run(BACKUP, "--out-dir", str(existing))  # fails later, at pg_dump
+    _run(BACKUP, "--out-dir", str(existing))  # fails later, at psql/pg_dump
     assert existing.stat().st_mode == before
+
+
+def test_backup_refuses_client_older_than_server(tmp_path) -> None:
+    """A Homebrew pg15 host against a pg17 server must fail before pg_dump runs."""
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    log = tmp_path / "pg_dump.invoked"
+    _write_stub(
+        fake_bin / "pg_dump",
+        'if [[ "${1:-}" == "--version" ]]; then\n'
+        '    echo "pg_dump (PostgreSQL) 15.18"\n'
+        "    exit 0\n"
+        "fi\n"
+        f'touch "{log}"\n'
+        "exit 0\n",
+    )
+    _write_stub(fake_bin / "psql", 'echo "170006"\n')
+    env = {**os.environ, **_ENV, "PATH": f"{fake_bin}:{os.environ['PATH']}"}
+    result = subprocess.run(
+        [str(BACKUP), "--out-dir", str(tmp_path / "backups")],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 1
+    assert "15" in result.stderr and "17" in result.stderr
+    assert not log.exists()
 
 
 def test_restore_refuses_the_live_database_without_the_flag(tmp_path) -> None:
@@ -111,6 +139,10 @@ def test_backup_invokes_pg_dump_without_owner_or_privileges(tmp_path) -> None:
     log = tmp_path / "pg_dump.args"
     _write_stub(
         fake_bin / "pg_dump",
+        'if [[ "${1:-}" == "--version" ]]; then\n'
+        '    echo "pg_dump (PostgreSQL) 17.2"\n'
+        "    exit 0\n"
+        "fi\n"
         f'printf "%s\\n" "$@" > "{log}"\n'
         'for arg in "$@"; do\n'
         '    case "$arg" in\n'
@@ -118,6 +150,7 @@ def test_backup_invokes_pg_dump_without_owner_or_privileges(tmp_path) -> None:
         '    esac\n'
         'done\n',
     )
+    _write_stub(fake_bin / "psql", 'echo "170006"\n')
     env = {**os.environ, **_ENV, "PATH": f"{fake_bin}:{os.environ['PATH']}"}
     result = subprocess.run(
         [str(BACKUP), "--out-dir", str(tmp_path / "backups")],
