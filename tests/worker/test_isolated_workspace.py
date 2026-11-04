@@ -506,6 +506,54 @@ def test_dirty_no_commit_is_checkpointed_and_published(agent_with_publish, monke
     )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permissions model unreadable caches")
+def test_dirty_checkpoint_skips_unreadable_gitignored_pytest_cache(
+    agent_with_publish, monkeypatch
+):
+    run_agent, repo = agent_with_publish
+    cache_holder: list[Path] = []
+
+    def leave_work_and_unreadable_cache(**kwargs):
+        target = Path(kwargs["repository_path"])
+        (target / "uncommitted-agent-work.txt").write_text("preserve me\n")
+        cache = target / ".pytest_cache"
+        cache.mkdir()
+        cache_ignore = cache / ".gitignore"
+        cache_ignore.write_text("# Created by pytest automatically.\n*\n")
+        cache_ignore.chmod(0)
+        cache_holder.append(cache)
+        return _fake_run(commit=False)(**kwargs)
+
+    monkeypatch.setattr(
+        agent_runner, "run_claude_code", leave_work_and_unreadable_cache
+    )
+
+    try:
+        outcome = run_agent(_payload(), _event(), 1)
+    finally:
+        # Keep a failing assertion debuggable and tmp_path cleanup reliable.
+        for cache in cache_holder:
+            if cache.exists():
+                (cache / ".gitignore").chmod(0o600)
+
+    assert outcome.ok and outcome.result["publish"]["ok"] is True
+    assert outcome.result["publish"]["checkpointed_dirty_worktree"] is True
+    assert not _workspace(repo).exists()
+    _git(repo, "fetch", "-q", "origin", "backlog/VOYN-TASK-A")
+    assert (
+        _git(repo, "show", "FETCH_HEAD:uncommitted-agent-work.txt").stdout
+        == "preserve me\n"
+    )
+    absent = subprocess.run(
+        ["git", "cat-file", "-e", "FETCH_HEAD:.pytest_cache/.gitignore"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert absent.returncode != 0
+
+
 @pytest.mark.skipif(os.name == "nt", reason="secure dirty checkpoint runs on Linux workers")
 def test_dirty_checkpoint_captures_file_modes_without_agent_git_execution(
     agent_with_publish, monkeypatch, tmp_path
