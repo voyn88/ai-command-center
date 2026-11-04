@@ -27,6 +27,10 @@ DEFER_PROJECT_BUDGET = "project_budget_exceeded"
 DEFER_AGENT_CAPACITY = "agent_capacity_reached"
 DEFER_NO_ELIGIBLE_EXECUTOR = "no_eligible_executor"
 DEFER_NO_AVAILABLE_EXECUTOR = "no_available_executor"
+# VOYN-AGT-ATTEST: every eligible/available executor lacks certification for
+# the critical zone (see `CRITICAL_ZONE_PRIORITY` and `dispatch.attestation`).
+DEFER_NOT_CERTIFIED = "not_certified_for_critical_zone"
+
 # The task's business path (project) has a tail-risk scenario whose priced
 # expected cost of error (probability x impact) currently exceeds the
 # scenario's configured limit. Checked per task, before eligibility/budget.
@@ -42,6 +46,8 @@ DEFER_REASONS = frozenset(
         DEFER_AGENT_CAPACITY,
         DEFER_NO_ELIGIBLE_EXECUTOR,
         DEFER_NO_AVAILABLE_EXECUTOR,
+        DEFER_NOT_CERTIFIED,
+
         DEFER_TAIL_RISK,
     }
 )
@@ -82,6 +88,11 @@ REASON_EXPLANATIONS: dict[str, str] = {
         "No executor is permitted for this task by project/pin policy."
     ),
     DEFER_NO_AVAILABLE_EXECUTOR: "No permitted executor is currently available.",
+    DEFER_NOT_CERTIFIED: (
+        "Critical-priority task: every eligible executor lacks attestation "
+        "(certification test cases and a clean historical record) for the "
+        "critical zone."
+    ),
     DEFER_TAIL_RISK: (
         "This business path has a tail-risk scenario whose priced expected "
         "cost of error (probability x impact) exceeds its configured limit: "
@@ -110,6 +121,11 @@ DEFAULT_PRIORITY_WEIGHTS: dict[str, int] = {
     "Medium": 20,
     "Low": 10,
 }
+
+# The "critical zone" (VOYN-AGT-ATTEST): a task at this priority may only be
+# assigned to an executor `dispatch.attestation.evaluate_attestation` has
+# certified — see `DEFER_NOT_CERTIFIED` and `policy._eligible_executors`.
+CRITICAL_ZONE_PRIORITY = "Critical"
 
 # Executors treated as local (cost economy). Cloud executors are everything
 # else. The cost matrix is what actually drives selection; this set only marks
