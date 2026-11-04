@@ -327,6 +327,8 @@ def test_the_control_plane_cannot_claim() -> None:
         "delivery_team_accepted",
         "delivery_team_retry",
         "delivery_team_record_incident",
+        # 0036: read-only waiver view for the owner surface.
+        "delivery_team_stage_waived",
         # 0032: durable Grok↔Cursor coordination CAS surface.
         "coordinator_state_read",
         "coordinator_enqueue",

@@ -2,6 +2,10 @@ export type TeamAssignment = {
   stage: string; role: string; status: string; blocker: string | null
   next_action: string; due_at: string | null; updated_at: string
 }
+export type TeamCorrection = {
+  task_id: string; owner: string; action: string; due_at: string | null
+  assigned_by: 'cto_policy' | 'operator'; effectiveness_checked: boolean; overdue: boolean
+}
 export type DeliveryTeamSnapshot = {
   source: 'canonical_postgresql'; read_only: true; enabled: boolean; stopped: boolean
   available: boolean; reason: string | null; updated_at: string; limit: number; offset: number
@@ -9,7 +13,8 @@ export type DeliveryTeamSnapshot = {
   counts: { production_accepted: number; blocked: number; sha_recorded: number; merged: null } | null
   roles: { stage: string; name: string }[]
   tasks: { id: string; title: string; project: string; revision: number; backlog_status: string
-    merged: null; production_accepted: boolean; assignments: TeamAssignment[] }[]
+    merged: null; production_accepted: boolean; assignments: TeamAssignment[]
+    corrections?: TeamCorrection[] }[]
 }
 
 export async function fetchDeliveryTeam(offset = 0, signal?: AbortSignal): Promise<DeliveryTeamSnapshot> {

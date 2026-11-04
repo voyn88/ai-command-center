@@ -25,7 +25,7 @@ class Cursor:
 
     def fetchone(self):
         if 'to_regclass' in self.sql:
-            return ('delivery_team_stage', 'function', 'function') if self.ready else (None, None, None)
+            return ('delivery_team_stage', 'f', 'f', 'f') if self.ready else (None, None, None, None)
         return (42, 1, 2, 7)
 
     def fetchall(self):
@@ -33,7 +33,15 @@ class Cursor:
                  [{'stage': 'architect', 'status': 'blocked', 'reason': 'Bearer private',
                    'current': True, 'updated_at': '2026-11-04T00:00:00Z'},
                   {'stage': 'qa_plan', 'status': 'passed', 'reason': None,
-                   'current': False, 'updated_at': '2026-11-04T00:00:00Z'}])]
+                   'current': False, 'updated_at': '2026-11-04T00:00:00Z'},
+                  {'stage': 'security', 'status': 'pending', 'reason': None, 'waived': True,
+                   'current': True, 'updated_at': '2026-11-04T00:00:00Z'}],
+                 [{'task_id': 'VOYN-FIX-1', 'owner': 'developer', 'action': 'token=private',
+                   'due_at': '2026-11-01T00:00:00+00:00', 'policy': True, 'closed': False},
+                  {'task_id': 'VOYN-FIX-2', 'owner': 'devops', 'action': 'Fix deploy check',
+                   'due_at': '2026-11-01T00:00:00+00:00', 'policy': False, 'closed': True},
+                  {'task_id': 'VOYN-FIX-3', 'owner': 'qa', 'action': 'Add check',
+                   'due_at': None, 'policy': False, 'closed': False}])]
 
 
 def connection(cursor):
@@ -126,3 +134,13 @@ def test_absent_pool_and_database_failure_do_not_leak_details(client, monkeypatc
     response = client.get('/api/team', headers=HEADERS)
     assert response.status_code == 503
     assert 'private' not in response.text
+
+
+def test_waived_roles_and_corrective_due_dates_are_explicit(client, monkeypatch):
+    monkeypatch.setattr(team.pool, 'connection', lambda: connection(Cursor()))
+    task = client.get('/api/team', headers=HEADERS).json()['tasks'][0]
+    assert task['assignments'][2]['status'] == 'waived'
+    first, closed, unknown = task['corrections']
+    assert (first['assigned_by'], first['overdue'], first['action']) == ('cto_policy', True, '[REDACTED]')
+    assert (closed['assigned_by'], closed['overdue'], closed['effectiveness_checked']) == ('operator', False, True)
+    assert unknown['due_at'] is None and unknown['overdue'] is False

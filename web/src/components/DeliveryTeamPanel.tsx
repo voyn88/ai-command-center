@@ -3,7 +3,7 @@ import GlassPanel from './GlassPanel'
 import { fetchDeliveryTeam } from '../lib/deliveryTeamApi'
 import type { DeliveryTeamSnapshot } from '../lib/deliveryTeamApi'
 
-const states: Record<string, string> = { pending: 'Ожидает', queued: 'Назначено', passed: 'Этап пройден', blocked: 'Заблокировано', stale: 'Требует повторной оценки' }
+const states: Record<string, string> = { pending: 'Ожидает', queued: 'Назначено', passed: 'Этап пройден', blocked: 'Заблокировано', stale: 'Требует повторной оценки', waived: 'Не требуется по оценке архитектора' }
 const date = (value: string) => new Date(value).toLocaleString('ru-RU')
 
 export default function DeliveryTeamPanel({ refresh = 0 }: { refresh?: number }) {
@@ -55,6 +55,15 @@ export default function DeliveryTeamPanel({ refresh = 0 }: { refresh?: number })
               <p>{assignment.due_at ? `Срок: ${date(assignment.due_at)}` : 'Срок не назначен'}</p>
             </div>)}
           </details>
+          {!!task.corrections?.length && <details><summary>Корректирующие действия ({task.corrections.length}{task.corrections.some(c => c.overdue) ? ', есть просроченные' : ''})</summary>
+            {task.corrections.map(item => <div className="owner-task" key={item.task_id}>
+              <strong>{item.task_id} · {item.owner}</strong>
+              <p>{item.action === '[REDACTED]' ? 'Подробности скрыты' : item.action}</p>
+              <p>Назначил: {item.assigned_by === 'cto_policy' ? 'политика CTO' : 'оператор'}</p>
+              <p role={item.overdue ? 'alert' : undefined}>{item.due_at ? `${item.overdue ? 'Просрочено, срок' : 'Срок'}: ${date(item.due_at)}` : 'Срок неизвестен'}</p>
+              <p>{item.effectiveness_checked ? 'Проверка эффективности записана' : 'Эффективность не подтверждена'}</p>
+            </div>)}
+          </details>}
         </article>)}
         <div className="owner-filters">
           <button className="owner-button" disabled={loading || offset === 0} onClick={() => setOffset(n => Math.max(0, n - 30))}>Предыдущие</button>

@@ -1,6 +1,6 @@
 # Design: automatic CTO corrective assignment, due dates, risk-based roles
 
-Status: design accepted 2026-11-04 by the delivery-team lead (owner delegated decisions). NOT implemented yet.
+Status: design accepted 2026-11-04 by the delivery-team lead (owner delegated decisions). Implemented in migration 0036; see docs/delivery-team.md.
 Upstream main 945cb9e still has migration slots 0035/0036 free. Implement as a separate `0036_delivery_team_cto_policy`
 so reviewed 0035 bytes stay unchanged. No local PostgreSQL CLI; DB tests need Docker (29.9.2 available) and `AICC_TEST_PG_ADMIN_DSN`.
 

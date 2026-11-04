@@ -826,7 +826,9 @@ def test_auditor_cannot_use_unrelated_task_or_invent_owner(rig, linked):  # noqa
     sync_task(factory)
     audit = candidate(factory, "auditor")
     assert complete_stage(rig, audit, rca_result(audit)) == [
-        (TASK, "auditor", "unassigned_corrective_action" if linked else "unlinked_corrective_task")
+        # The fixture parent is P0: the CTO policy leaves that to the operator.
+        (TASK, "auditor", "unassigned_corrective_action:operator_confirmation_required"
+         if linked else "unlinked_corrective_task")
     ]
 
 
@@ -899,3 +901,183 @@ def test_one_correction_can_cover_two_related_incidents(rig, connect_as, psycopg
     c = candidate(factory, "auditor")
     value.update({k:c[k] for k in ("revision","input_digest")})
     assert complete_stage(rig, c, value) == [(TASK, "auditor", "pass")]
+
+
+# --- 0036: CTO corrective-assignment policy, due dates, optional roles ------
+
+OTHER = "VOYN-W0-TEAM-OTHER"
+ASSIGNMENTS = ("SELECT task_id,assignment->>'owner',recorded_by,source_work_item_id IS NOT NULL,"
+               "due_at-recorded_at FROM delivery_team_corrective_assignment ORDER BY task_id")
+
+
+def policy_rig(rig, priority="P2", incidents=1):
+    factory, store, _queue = rig
+    enroll(rig, priority=priority)
+    assert store.upsert_task(_task(CORRECTION, repo="repo-one"))[0]
+    assert store.record_remediation(CORRECTION, TASK, "https://github.com/example/repo/pull/1", SHA)[0]
+    for n in range(incidents):
+        assert rows(factory, INCIDENT_SQL, incident_args(run_ref=f"https://ci.example/runs/{17 + n}")) == [(True,)]
+    sync_task(factory)
+    return candidate(factory, "auditor")
+
+
+def team_rca(c, owner="developer"):
+    value = rca_result(c)
+    value["rca"][0]["actions"][0]["owner"] = owner
+    return value
+
+
+def test_cto_policy_assigns_canonical_role_with_due_date_and_keeps_audit_current(rig):  # noqa: F811
+    from datetime import timedelta
+    factory, _store, _queue = rig
+    audit = policy_rig(rig)
+    assert complete_stage(rig, audit, team_rca(audit)) == [(TASK, "auditor", "pass")]
+    assert rows(factory, ASSIGNMENTS) == [
+        (CORRECTION, "developer", "policy:delivery-team-cto/v1", True, timedelta(days=5))]
+    # The assignment is the audit's output, not its input: the audit stays current.
+    sync_task(factory)
+    assert rows(factory, "SELECT delivery_team_stage_current(%s,1,'auditor')", (TASK,)) == [(True,)]
+    cto = candidate(factory, "cto_rca")
+    assert [a["recorded_by"] for a in cto["context"]["corrective_assignments"]] == ["policy:delivery-team-cto/v1"]
+    # CTO-RCA closure still needs the independent effectiveness check.
+    closure = result(cto, sha=SHA, reference="https://ci.example/correction/18")
+    closure["rca"] = team_rca(audit)["rca"]
+    assert complete_stage(rig, cto, closure) == [(TASK, "cto_rca", "corrective_task_not_done")]
+
+
+@pytest.mark.parametrize("owner", ["fixture-owner", "auditor", "CTO"])
+def test_cto_policy_refuses_owner_outside_team_roles(rig, owner):  # noqa: F811
+    factory, _store, _queue = rig
+    audit = policy_rig(rig)
+    assert complete_stage(rig, audit, team_rca(audit, owner)) == [
+        (TASK, "auditor", "unassigned_corrective_action:owner_not_team_role")]
+    assert rows(factory, "SELECT count(*) FROM delivery_team_corrective_assignment") == [(0,)]
+
+
+def test_cto_policy_batch_is_all_or_nothing(rig):  # noqa: F811
+    factory, store, _queue = rig
+    audit = policy_rig(rig)
+    assert store.upsert_task(_task(OTHER, repo="repo-one"))[0]
+    value = team_rca(audit)
+    value["rca"][0]["actions"].append(dict(value["rca"][0]["actions"][0], task_id=OTHER))
+    assert complete_stage(rig, audit, value) == [
+        (TASK, "auditor", "unassigned_corrective_action:unlinked_corrective_task")]
+    assert rows(factory, "SELECT count(*) FROM delivery_team_corrective_assignment") == [(0,)]
+
+
+def test_cto_policy_rolls_back_when_revalidation_fails(rig):  # noqa: F811
+    factory, _store, _queue = rig
+    audit = policy_rig(rig, incidents=2)
+    value = team_rca(audit)  # covers only the first of two incidents
+    assert complete_stage(rig, audit, value) == [(TASK, "auditor", "incomplete_incident_coverage")]
+    assert rows(factory, "SELECT count(*) FROM delivery_team_corrective_assignment") == [(0,)]
+    assert rows(factory, "SELECT status FROM delivery_team_stage WHERE task_id=%s AND stage='auditor'",
+                (TASK,)) == [("blocked",)]
+
+
+def test_cto_policy_never_overrides_operator_assignment(rig, connect_as):  # noqa: F811
+    from datetime import timedelta
+    factory, _store, _queue = rig
+    audit = policy_rig(rig)
+    action = team_rca(audit, "developer")["rca"][0]["actions"][0]
+    assert rows(lambda: connect_as(roles.OPERATOR_ROLE),
+                "SELECT delivery_team_assign_correction(%s,1,%s,%s::jsonb,%s)",
+                (TASK, audit["context"]["incidents"][0]["incident_key"], json.dumps(action),
+                 "https://control.example/assignments/1")) == [(True,)]
+    sync_task(factory)
+    audit = candidate(factory, "auditor")
+    assert complete_stage(rig, audit, team_rca(audit, "devops")) == [
+        (TASK, "auditor", "unassigned_corrective_action:assignment_conflict")]
+    owner = rows(factory, ASSIGNMENTS)
+    assert [(r[1], r[2] == "policy:delivery-team-cto/v1", r[4]) for r in owner] == [
+        ("developer", False, timedelta(days=5))]
+
+
+def test_cto_policy_is_not_an_app_or_worker_entry_point(rig, psycopg):  # noqa: F811
+    factory, _store, queue = rig
+    for conn in (factory, queue._connection):
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            rows(conn, "SELECT _delivery_team_cto_assign(%s,1,'{}'::jsonb,'x')", (TASK,))
+    with pytest.raises(psycopg.errors.InsufficientPrivilege):
+        rows(factory, "INSERT INTO delivery_team_due_policy VALUES ('P3','1 hour')")
+
+
+def run_until(rig, stop, architect=None):
+    factory, _store, _queue = rig
+    for stage in ("ba", "business_technologist", "architect", "qa_plan"):
+        rows(factory, "SELECT * FROM delivery_team_sync(100)")
+        c = candidate(factory, stage)
+        output = result(c)
+        if stage == "architect" and architect is not None:
+            output["role_applicability"] = architect
+        verdict = complete_stage(rig, c, output)
+        if stage == stop:
+            return verdict
+        assert verdict == [(TASK, stage, "pass")]
+    rows(factory, "SELECT * FROM delivery_team_sync(100)")
+    return [r[0]["stage"] for r in rows(factory, "SELECT * FROM delivery_team_candidates(100)")]
+
+
+NOT_APPLICABLE = {"required": False, "reason": "Internal read-only report without users or secrets"}
+
+
+def test_architect_waiver_skips_optional_roles_for_low_risk_task(rig):  # noqa: F811
+    factory, _store, _queue = rig
+    enroll(rig, priority="P2")
+    assert run_until(rig, None, {"security": NOT_APPLICABLE, "ux": NOT_APPLICABLE}) == ["cto"]
+    assert rows(factory, "SELECT delivery_team_stage_waived(%s,1,'security'),"
+                "delivery_team_stage_waived(%s,1,'ux'),delivery_team_ready(%s,1)", (TASK, TASK, TASK)) == [
+        (True, True, False)]
+    assert complete_stage(rig, candidate(factory, "cto")) == [(TASK, "cto", "pass")]
+    assert rows(factory, "SELECT delivery_team_ready(%s,1)", (TASK,)) == [(True,)]
+
+
+def test_waiver_is_per_role_and_absent_means_required(rig):  # noqa: F811
+    enroll(rig, priority="P2")
+    assert run_until(rig, None, {"security": NOT_APPLICABLE}) == ["ux"]
+
+
+@pytest.mark.parametrize("priority", ["P0", "P1"])
+def test_waiver_is_refused_for_high_priority(rig, priority):  # noqa: F811
+    factory, _store, _queue = rig
+    enroll(rig, priority=priority)
+    assert run_until(rig, None, {"security": NOT_APPLICABLE, "ux": NOT_APPLICABLE}) == ["security"]
+    assert rows(factory, "SELECT delivery_team_ready(%s,1)", (TASK,)) == [(False,)]
+
+
+@pytest.mark.parametrize("value", [
+    {}, [], {"legal": NOT_APPLICABLE}, {"security": {"required": False}},
+    {"security": {"required": "no", "reason": "x"}}, {"security": {"required": False, "reason": " "}},
+    {"security": dict(NOT_APPLICABLE, extra=True)},
+])
+def test_invalid_role_applicability_blocks_architect(rig, value):  # noqa: F811
+    enroll(rig, priority="P2")
+    assert run_until(rig, "architect", value) == [(TASK, "architect", "invalid_role_applicability")]
+
+
+def test_role_applicability_is_architect_only(rig):  # noqa: F811
+    factory, _store, _queue = rig
+    enroll(rig, priority="P2")
+    c = candidate(factory, "ba")
+    output = dict(result(c), role_applicability={"security": NOT_APPLICABLE})
+    assert complete_stage(rig, c, output) == [(TASK, "ba", "invalid_schema")]
+
+
+def test_owner_read_model_runs_under_app_grants(rig, monkeypatch):  # noqa: F811
+    from contextlib import contextmanager
+    from command_center.api import delivery_team_routes as team_routes
+    factory, _store, _queue = rig
+    audit = policy_rig(rig)
+    assert complete_stage(rig, audit, team_rca(audit)) == [(TASK, "auditor", "pass")]
+
+    @contextmanager
+    def app_connection():
+        with factory() as conn:
+            yield conn
+    monkeypatch.setattr(team_routes.pool, "connection", app_connection)
+    data = team_routes.read_team()
+    assert data["available"] is True
+    task = next(t for t in data["tasks"] if t["id"] == TASK)
+    assert [(c["task_id"], c["owner"], c["assigned_by"], c["overdue"]) for c in task["corrections"]] == [
+        (CORRECTION, "developer", "cto_policy", False)]
+    assert task["corrections"][0]["due_at"]

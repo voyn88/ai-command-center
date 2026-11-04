@@ -28,7 +28,27 @@ RCA is a branch associated with an incident, not a recursively generated REM cha
 
 Synthetic incidents from blocked, rejected, malformed or dead role work are derived from durable append-only delivery evidence, including its recorded revision and work identity. They do not disappear when the current stage is reset or replaced. Auditor and CTO-RCA failures do not recursively become new incidents in this branch. This synthetic failure evidence is distinct from an external CI or deployment observation.
 
-An auditor distinguishes observations from hypotheses, identifies the missed control, and refers to existing canonical corrective tasks. `delivery_team_assign_correction` admits an operator-confirmed assignment linking parent task, incident, corrective task, owner, action and effectiveness criterion. It verifies the canonical remediation relationship and preserves the assignment. The current implementation does not let a CTO model automatically create that authoritative assignment.
+An auditor distinguishes observations from hypotheses, identifies the missed control, and refers to existing canonical corrective tasks. `delivery_team_assign_correction` admits an operator-confirmed assignment linking parent task, incident, corrective task, owner, action and effectiveness criterion. It verifies the canonical remediation relationship and preserves the assignment.
+
+Migration 0036 adds a SQL CTO policy, not model authority. Auditor actions are proposals. When a passing auditor result is otherwise valid and only lacks assignments, ingestion admits the whole batch as policy assignments (`recorded_by = policy:delivery-team-cto/v1`, reference `journal://delivery-team/<work item>`). This happens only if every action meets all of these conditions:
+- it names a canonical remediation child of the parent;
+- it covers an authoritative incident;
+- its owner is in the closed team-role set (`OWNER_ROLES`; the auditor is excluded);
+- the parent is not P0;
+- no prior assignment for the same parent, incident and task differs.
+
+The result is then revalidated. Any refusal or failed revalidation rolls the whole batch back, and the auditor stays blocked with `unassigned_corrective_action:<reason>`; an operator decision is then required. Policy rows are outputs of the audit, so they are excluded from the auditor's own input digest, while CTO-RCA sees them. Operator rows are never overridden.
+
+Every assignment gets `due_at` from `delivery_team_due_policy`, a recorded team SLA by parent priority: P0 1 day, P1 2 days, P2 5 days, default 10 days. A missing policy row leaves the due date unknown. The owner surface lists corrective actions with assigner, due date, overdue state and whether an effectiveness check is recorded. A recorded check is not CTO-RCA closure.
+
+## Risk-based optional roles
+
+A passed architect result may include `role_applicability` for `security` and/or `ux`, each `{required, reason}`. A role is waived only if all of these hold:
+- the current architect evidence says `required: false`;
+- the task is not P0/P1;
+- that stage is still pending.
+
+A stage that already ran keeps its result, including a block. The waiver is derived on every read, never stored, so a changed architect assessment re-enables the role. Waived stages are not dispatched and count as satisfied for readiness. The owner surface shows them as not required, not as passed reviews. An absent or malformed declaration means the role is required.
 
 `record_corrective_artifact` verifies the actual HTTPS bytes and hash of a separately produced `delivery-corrective-observation/v1` effectiveness check. Its expected scope includes parent task/revision, incident, corrective task/revision, correction SHA, effectiveness criterion and check ID. SQL requires the current parent revision, the admitted assignment, a completed canonical corrective task at the matching revision/SHA, and an observation no earlier than the assignment. CTO closure must retain the audited owner/action bindings and reference the independently admitted check. A DONE state or green CI link alone is insufficient evidence that the process correction was effective. Production acceptance and corrective-process closure remain distinct results.
 
@@ -39,7 +59,7 @@ This code does not yet establish a running autonomous delivery team. Remaining g
 - No caller or retained-artifact storage has been configured in an existing release chain for these receipt/check adapters. The local artifact endpoint and mandatory HTTPS readback are implemented, but shared access, retention and producer trust still need operational integration.
 - There are no direct CI-failure or deployment-failure producers beyond the existing review/merge hooks. Receiving every relevant incident and closing its RCA has not been demonstrated in a real pilot.
 - Release evidence requires the exact authoritative postmerge SHA. There is no implementation-SHA to later batch-release mapping; an included ancestor is not silently accepted as the deployed SHA.
-- Corrective assignments require operator confirmation. Automatic authoritative CTO assignment, due dates and risk-based omission of optional roles are not implemented. The present prerequisites must not be described as a completed risk-adaptive workflow.
+- The CTO policy, due dates and optional-role waivers (0036) are covered by PostgreSQL tests only. They have not run on a real incident or production task. P0 corrective assignments and any refused batch still require operator confirmation. Due-date breaches are shown, not escalated automatically.
 - A full real task through the team, production release, independent acceptance and corrective effectiveness has not been performed. Local tests or a roster do not prove operational acceptance.
 
 The existing repository integrator owns rollout. Before enabling a scoped pilot:

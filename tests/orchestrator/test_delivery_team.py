@@ -164,3 +164,33 @@ def test_incident_identity_uses_utf8_length_framing():
     assert team.incident_key(*parts) == hashlib.sha256(framed).hexdigest()
     with pytest.raises(team.TeamResultError):
         team.incident_key("repo", "run", None, "failure")
+
+
+NA = {"required": False, "reason": "No users, secrets or tenant data touched"}
+
+
+def test_role_applicability_is_architect_only_and_strict():
+    expected = dict(META, stage="architect")
+    parsed = team.parse_role_result(result(stage="architect", role_applicability={"security": NA}), expected)
+    assert parsed["role_applicability"] == {"security": NA}
+    with pytest.raises(team.TeamResultError):
+        team.parse_role_result(result(role_applicability={"security": NA}), META)
+    for invalid in [{}, [], {"legal": NA}, {"ux": {"required": 0, "reason": "x"}},
+                    {"ux": {"required": False, "reason": " "}}, {"ux": dict(NA, extra=1)}]:
+        with pytest.raises(team.TeamResultError):
+            team.parse_role_result(result(stage="architect", role_applicability=invalid), expected)
+
+
+def test_owner_roles_mirror_sql_policy_and_prompts():
+    from pathlib import Path
+    import re as _re
+    sql = (Path(team.__file__).parents[1] / "db/sql/0036_delivery_team_cto_policy.up.sql").read_text()
+    body = sql.split("FUNCTION _delivery_team_owner_roles()", 1)[1].split("$$", 2)[1]
+    assert tuple(_re.findall(r"'([a-z_]+)'", body)) == team.OWNER_ROLES
+    assert "auditor" not in team.OWNER_ROLES
+    route = ("aicc", "/repo")
+    audit = team.build_payload(dict(META, stage="auditor", title="t", body="b", context={}), route)
+    assert "developer" in audit["prompt"] and "operator must confirm" in audit["prompt"]
+    arch = team.build_payload(dict(META, stage="architect", title="t", body="b", context={}), route)
+    assert "role_applicability" in arch["prompt"]
+    assert "role_applicability" not in team.build_payload(dict(META, title="t", body="b", context={}), route)["prompt"]

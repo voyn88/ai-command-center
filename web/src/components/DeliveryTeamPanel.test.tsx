@@ -13,7 +13,10 @@ const snapshot: DeliveryTeamSnapshot = {
   tasks: [{ id: 'task-1', title: 'Проверить контракт', project: 'AICC', revision: 4,
     backlog_status: 'DONE', merged: null, production_accepted: false,
     assignments: [{ stage: 'architect', role: 'Главный архитектор', status: 'blocked',
-      blocker: 'Нужна совместимость', next_action: 'Уточнить контракт', due_at: null, updated_at: '-' }] }],
+      blocker: 'Нужна совместимость', next_action: 'Уточнить контракт', due_at: null, updated_at: '-' },
+    { stage: 'ux', role: 'UX/UI', status: 'waived', blocker: null, next_action: '-', due_at: null, updated_at: '-' }],
+    corrections: [{ task_id: 'VOYN-FIX-1', owner: 'developer', action: 'Исправить фикстуру',
+      due_at: '2026-11-01T00:00:00Z', assigned_by: 'cto_policy', effectiveness_checked: false, overdue: true }] }],
 }
 beforeEach(() => { vi.mocked(fetchDeliveryTeam).mockReset().mockResolvedValue(snapshot) })
 describe('native delivery team', () => {
@@ -23,7 +26,11 @@ describe('native delivery team', () => {
     expect(screen.getByText('Production: приёмка не подтверждена')).toBeInTheDocument()
     expect(screen.getByText('Главный архитектор · Заблокировано')).toBeInTheDocument()
     expect(screen.getByText('Блокер: Нужна совместимость')).toBeInTheDocument()
-    expect(screen.getByText('Срок не назначен')).toBeInTheDocument()
+    expect(screen.getAllByText('Срок не назначен')).toHaveLength(2)
+    expect(screen.getByText('UX/UI · Не требуется по оценке архитектора')).toBeInTheDocument()
+    expect(screen.getByText('Корректирующие действия (1, есть просроченные)')).toBeInTheDocument()
+    expect(screen.getByText('Назначил: политика CTO')).toBeInTheDocument()
+    expect(screen.getByText('Эффективность не подтверждена')).toBeInTheDocument()
     expect(screen.getByText('Показано 1 из 42, начиная с 1.')).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Следующие' }))
     await waitFor(() => expect(fetchDeliveryTeam).toHaveBeenLastCalledWith(30, expect.any(AbortSignal)))

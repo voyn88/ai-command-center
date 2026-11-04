@@ -138,6 +138,7 @@ ALL_TABLES: tuple[str, ...] = (
     "council_vote",
     "delivery_team_corrective_assignment",
     "delivery_team_corrective_check",
+    "delivery_team_due_policy",
     "delivery_team_acceptance_check",
     "delivery_team_incident",
     "delivery_team_stage",
@@ -323,6 +324,7 @@ _APP_BACKLOG_TABLES: dict[str, frozenset[str]] = {
     # Native delivery-team authority: app reads, functions own all writes.
     "delivery_team_corrective_assignment": _READ,
     "delivery_team_corrective_check": _READ,
+    "delivery_team_due_policy": _READ,
     "delivery_team_acceptance_check": _READ,
     "delivery_team_incident": _READ,
     "delivery_team_stage": _READ,
@@ -343,6 +345,7 @@ _APP_BACKLOG_TABLES: dict[str, frozenset[str]] = {
 _WORKER_BACKLOG_TABLES: dict[str, frozenset[str]] = {
     "delivery_team_corrective_assignment": _NONE,
     "delivery_team_corrective_check": _NONE,
+    "delivery_team_due_policy": _NONE,
     "delivery_team_acceptance_check": _NONE,
     "delivery_team_incident": _NONE,
     "delivery_team_stage": _NONE,
@@ -649,6 +652,7 @@ _APP_BACKLOG_FUNCTIONS = (
     "delivery_team_accepted(text, bigint)",
     "delivery_team_retry(text, bigint, text, text)",
     "delivery_team_record_incident(text, bigint, text, text, text, text, text, jsonb)",
+    "delivery_team_stage_waived(text, bigint, text)",
     # Coordination v2 (0031): durable snapshot/in-flight CAS; no DML path.
     "coordinator_state_read(text)",
     "coordinator_enqueue(text, text, text, text, text, jsonb)",
