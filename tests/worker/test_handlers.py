@@ -1030,7 +1030,7 @@ def test_long_output_travels_as_tails(handler, monkeypatch) -> None:
     assert len(outcome.result["stderr_tail"]) == 4000
 
 
-def test_timed_out_run_is_ok_not_redelivered(handler, monkeypatch) -> None:
+def test_timed_out_mutating_run_is_ok_not_redelivered(handler, monkeypatch) -> None:
     """A timed-out run may have half-executed its mutations; redelivery
     would re-apply them. It is a *result* (status timed_out), never the
     never-started retryable path — pinned because the mutant
@@ -1049,8 +1049,34 @@ def test_timed_out_run_is_ok_not_redelivered(handler, monkeypatch) -> None:
         )
 
     monkeypatch.setattr(agent_runner, "run_claude_code", timed_out)
-    outcome = run_agent(_payload(), _event(), 1)
+    outcome = run_agent(_payload(task_type="implementation"), _event(), 1)
     assert outcome.ok and outcome.result["status"] == "timed_out"
+
+
+def test_timed_out_review_retries_as_bounded_infrastructure_wait(
+    handler, monkeypatch
+) -> None:
+    """A read-only timeout has no verdict or side effects. It must not
+    succeed and permanently occupy the deterministic same-head review key."""
+    run_agent, _ = handler
+
+    def timed_out(**kwargs):
+        return agent_runner.RunResult(
+            status="timed_out",
+            exit_code=None,
+            stdout="",
+            stderr="agent exceeded 120 seconds",
+            duration_seconds=120.0,
+            started_at="2026-08-29T00:00:00+00:00",
+            completed_at="2026-08-29T00:02:00+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", timed_out)
+    outcome = run_agent(_payload(task_type="independent_review"), _event(), 1)
+
+    assert not outcome.ok
+    assert outcome.retryable and outcome.infra_wait
+    assert "review timeout" in outcome.reason
 
 
 def test_every_payload_defect_is_non_retryable() -> None:
