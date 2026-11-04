@@ -37,7 +37,8 @@ class Cursor:
                   {'stage': 'security', 'status': 'pending', 'reason': None, 'waived': True,
                    'current': True, 'updated_at': '2026-11-04T00:00:00Z'}],
                  [{'task_id': 'VOYN-FIX-1', 'owner': 'developer', 'action': 'token=private',
-                   'due_at': '2026-11-01T00:00:00+00:00', 'policy': True, 'closed': False},
+                   'due_at': '2026-11-01T00:00:00+00:00', 'policy': True, 'closed': False,
+                   'escalation_task_id': 'VOYN-FIX-1-OVERDUE-abc'},
                   {'task_id': 'VOYN-FIX-2', 'owner': 'devops', 'action': 'Fix deploy check',
                    'due_at': '2026-11-01T00:00:00+00:00', 'policy': False, 'closed': True},
                   {'task_id': 'VOYN-FIX-3', 'owner': 'qa', 'action': 'Add check',
@@ -142,5 +143,6 @@ def test_waived_roles_and_corrective_due_dates_are_explicit(client, monkeypatch)
     assert task['assignments'][2]['status'] == 'waived'
     first, closed, unknown = task['corrections']
     assert (first['assigned_by'], first['overdue'], first['action']) == ('cto_policy', True, '[REDACTED]')
+    assert first['escalation_task_id'] == 'VOYN-FIX-1-OVERDUE-abc' and closed['escalation_task_id'] is None
     assert (closed['assigned_by'], closed['overdue'], closed['effectiveness_checked']) == ('operator', False, True)
     assert unknown['due_at'] is None and unknown['overdue'] is False

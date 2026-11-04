@@ -1081,3 +1081,82 @@ def test_owner_read_model_runs_under_app_grants(rig, monkeypatch):  # noqa: F811
     assert [(c["task_id"], c["owner"], c["assigned_by"], c["overdue"]) for c in task["corrections"]] == [
         (CORRECTION, "developer", "cto_policy", False)]
     assert task["corrections"][0]["due_at"]
+
+
+def overdue_rig(rig, test_dsn, psycopg, sla="1 millisecond"):
+    import time
+    with psycopg.connect(test_dsn, autocommit=True) as admin:
+        admin.execute("UPDATE delivery_team_due_policy SET sla=%s::interval WHERE priority='P2'", (sla,))
+    audit = policy_rig(rig)
+    assert complete_stage(rig, audit, team_rca(audit)) == [(TASK, "auditor", "pass")]
+    time.sleep(0.01)
+    return audit
+
+
+def test_overdue_correction_escalates_once_to_cto_backlog_task(rig, test_dsn, psycopg):  # noqa: F811
+    from command_center.orchestrator.delivery_overdue import escalate_overdue, escalation_task_id
+    factory, store, _queue = rig
+    audit = overdue_rig(rig, test_dsn, psycopg)
+    incident = audit["context"]["incidents"][0]["incident_key"]
+    expected = escalation_task_id(TASK, incident, CORRECTION)
+    report = escalate_overdue(factory)
+    assert report.escalated == [(CORRECTION, expected)] and report.refused == []
+    filed = store.get_task(expected)
+    assert filed["status"] == "OPEN" and filed["priority"] == "P2" and filed["repo"] == "repo-one"
+    body = rows(factory, "SELECT body FROM backlog_task WHERE task_id=%s", (expected,))[0][0]
+    assert "escalated to the CTO" in body and "developer" in body
+    # Exactly once: a later tick neither re-lists nor re-files it.
+    assert escalate_overdue(factory).escalated == []
+    assert rows(factory, "SELECT count(*) FROM delivery_team_overdue_escalation") == [(1,)]
+    with pytest.raises(psycopg.errors.InsufficientPrivilege):
+        rows(factory, "DELETE FROM delivery_team_overdue_escalation")
+
+
+def test_assignment_within_due_date_is_not_escalated(rig, test_dsn, psycopg):  # noqa: F811
+    from command_center.orchestrator.delivery_overdue import escalate_overdue
+    factory, _store, _queue = rig
+    audit = overdue_rig(rig, test_dsn, psycopg, sla="5 days")
+    assert escalate_overdue(factory).escalated == []
+    incident = audit["context"]["incidents"][0]["incident_key"]
+    # The claim re-derives the condition; a caller cannot escalate early.
+    assert rows(factory, "SELECT delivery_team_claim_overdue(%s,%s,%s,%s)",
+                (TASK, incident, CORRECTION, "VOYN-EARLY")) == [(False,)]
+
+
+def test_recorded_effectiveness_check_stops_escalation(rig, test_dsn, psycopg, connect_as):  # noqa: F811
+    from command_center.orchestrator.delivery_overdue import escalate_overdue
+    factory, store, _queue = rig
+    audit = overdue_rig(rig, test_dsn, psycopg)
+    assert store.upsert_task(_task(CORRECTION, repo="repo-one", status="DONE"))[0]
+    assert store.record_evidence(CORRECTION, "sha", SHA)[0]
+    reference = "https://ci.example/correction/18#sha256=" + "d" * 64
+    assert rows(lambda: connect_as(roles.OPERATOR_ROLE),
+                "SELECT delivery_team_record_corrective_check(%s,1,%s,%s,%s,%s,'C1','effectiveness-check',%s,clock_timestamp())",
+                (TASK, audit["context"]["incidents"][0]["incident_key"], CORRECTION,
+                 store.get_task(CORRECTION)["revision"], SHA, reference)) == [(True,)]
+    assert escalate_overdue(factory).escalated == []
+
+
+def test_refused_escalation_task_rolls_back_the_claim(rig, test_dsn, psycopg, monkeypatch):  # noqa: F811
+    from command_center.db.backlog_store import BacklogStore
+    from command_center.orchestrator.delivery_overdue import escalate_overdue
+    factory, _store, _queue = rig
+    overdue_rig(rig, test_dsn, psycopg)
+    monkeypatch.setattr(BacklogStore, "upsert_task", lambda self, task: (False, "refused_for_test", False))
+    assert escalate_overdue(factory).refused == [(CORRECTION, "refused_for_test")]
+    assert rows(factory, "SELECT count(*) FROM delivery_team_overdue_escalation") == [(0,)]
+    monkeypatch.undo()
+    assert len(escalate_overdue(factory).escalated) == 1
+
+
+def test_team_tick_escalates_overdue_unless_stopped(rig, test_dsn, psycopg, monkeypatch):  # noqa: F811
+    from command_center.orchestrator import delivery_team as team
+    factory, _store, _queue = rig
+    overdue_rig(rig, test_dsn, psycopg)
+    monkeypatch.setenv("AICC_DELIVERY_TEAM_ENABLED", "1")
+    monkeypatch.setenv("AICC_DELIVERY_TEAM_TASK_IDS", json.dumps([TASK]))
+    monkeypatch.setenv("AICC_DELIVERY_TEAM_STOP", "1")
+    assert team.tick(factory).escalated == []
+    monkeypatch.delenv("AICC_DELIVERY_TEAM_STOP")
+    monkeypatch.setattr("command_center.orchestrator.planner.repo_route", lambda repo: None)
+    assert [task for task, _ in team.tick(factory).escalated] == [CORRECTION]

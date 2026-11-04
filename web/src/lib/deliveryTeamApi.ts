@@ -5,6 +5,7 @@ export type TeamAssignment = {
 export type TeamCorrection = {
   task_id: string; owner: string; action: string; due_at: string | null
   assigned_by: 'cto_policy' | 'operator'; effectiveness_checked: boolean; overdue: boolean
+  escalation_task_id?: string | null
 }
 export type DeliveryTeamSnapshot = {
   source: 'canonical_postgresql'; read_only: true; enabled: boolean; stopped: boolean

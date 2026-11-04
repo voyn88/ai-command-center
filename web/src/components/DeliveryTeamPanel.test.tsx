@@ -16,7 +16,7 @@ const snapshot: DeliveryTeamSnapshot = {
       blocker: 'Нужна совместимость', next_action: 'Уточнить контракт', due_at: null, updated_at: '-' },
     { stage: 'ux', role: 'UX/UI', status: 'waived', blocker: null, next_action: '-', due_at: null, updated_at: '-' }],
     corrections: [{ task_id: 'VOYN-FIX-1', owner: 'developer', action: 'Исправить фикстуру',
-      due_at: '2026-11-01T00:00:00Z', assigned_by: 'cto_policy', effectiveness_checked: false, overdue: true }] }],
+      due_at: '2026-11-01T00:00:00Z', assigned_by: 'cto_policy', effectiveness_checked: false, overdue: true, escalation_task_id: 'VOYN-FIX-1-OVERDUE-1' }] }],
 }
 beforeEach(() => { vi.mocked(fetchDeliveryTeam).mockReset().mockResolvedValue(snapshot) })
 describe('native delivery team', () => {
@@ -31,6 +31,7 @@ describe('native delivery team', () => {
     expect(screen.getByText('Корректирующие действия (1, есть просроченные)')).toBeInTheDocument()
     expect(screen.getByText('Назначил: политика CTO')).toBeInTheDocument()
     expect(screen.getByText('Эффективность не подтверждена')).toBeInTheDocument()
+    expect(screen.getByText('Эскалировано CTO: VOYN-FIX-1-OVERDUE-1')).toBeInTheDocument()
     expect(screen.getByText('Показано 1 из 42, начиная с 1.')).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Следующие' }))
     await waitFor(() => expect(fetchDeliveryTeam).toHaveBeenLastCalledWith(30, expect.any(AbortSignal)))

@@ -62,6 +62,7 @@ export default function DeliveryTeamPanel({ refresh = 0 }: { refresh?: number })
               <p>Назначил: {item.assigned_by === 'cto_policy' ? 'политика CTO' : 'оператор'}</p>
               <p role={item.overdue ? 'alert' : undefined}>{item.due_at ? `${item.overdue ? 'Просрочено, срок' : 'Срок'}: ${date(item.due_at)}` : 'Срок неизвестен'}</p>
               <p>{item.effectiveness_checked ? 'Проверка эффективности записана' : 'Эффективность не подтверждена'}</p>
+              {item.escalation_task_id && <p>Эскалировано CTO: {item.escalation_task_id}</p>}
             </div>)}
           </details>}
         </article>)}

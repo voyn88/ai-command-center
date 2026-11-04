@@ -281,6 +281,7 @@ class TeamTickReport:
     ingested: list = field(default_factory=list)
     dispatched: list = field(default_factory=list)
     refused: list = field(default_factory=list)
+    escalated: list = field(default_factory=list)
 
 
 def tick(connection_factory, *, limit: int = 4, timeout_seconds: int = 900) -> TeamTickReport:
@@ -304,6 +305,10 @@ def tick(connection_factory, *, limit: int = 4, timeout_seconds: int = 900) -> T
     report.ingested = rows("SELECT * FROM delivery_team_ingest(%s)", (limit,))
     if report.stopped:
         return report
+    from command_center.orchestrator.delivery_overdue import escalate_overdue
+    overdue = escalate_overdue(connection_factory, limit=limit)
+    report.escalated = overdue.escalated
+    report.refused.extend((task, "overdue_escalation", reason) for task, reason in overdue.refused)
     from command_center.orchestrator.planner import repo_route
     for (candidate,) in rows("SELECT * FROM delivery_team_candidates(%s,%s::jsonb)", (limit, scope_json)):
         try:

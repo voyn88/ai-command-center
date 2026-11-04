@@ -112,6 +112,9 @@ BEGIN
   task_id:=s.task_id;stage:=s.stage;action:=coalesce(v_reason,v_verdict);RETURN NEXT;
  END LOOP;
 END $$;
+DROP FUNCTION delivery_team_claim_overdue(text,text,text,text);
+DROP FUNCTION delivery_team_overdue(integer);
+DROP TABLE delivery_team_overdue_escalation;
 DROP FUNCTION _delivery_team_validate(text,bigint,text,text,jsonb);
 ALTER FUNCTION _delivery_team_validate_v1(text,bigint,text,text,jsonb) RENAME TO _delivery_team_validate;
 DROP FUNCTION delivery_team_stage_waived(text,bigint,text);

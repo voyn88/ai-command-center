@@ -271,9 +271,64 @@ BEGIN
  END LOOP;
 END $$;
 
+-- Overdue escalation, exactly once per assignment, as data: a ledger row and
+-- (in the same caller transaction) an OPEN canonical backlog task addressed to
+-- the CTO, the same inbox the tick-stall watchdog uses. The claim function
+-- re-derives "overdue and unproven" itself; a caller cannot escalate early.
+CREATE TABLE delivery_team_overdue_escalation (
+    parent_task_id text NOT NULL,
+    incident_key text NOT NULL,
+    task_id text NOT NULL,
+    due_at timestamptz NOT NULL,
+    escalation_task_id text NOT NULL UNIQUE CHECK (escalation_task_id ~ '^VOYN-[A-Za-z0-9][A-Za-z0-9._-]*$'),
+    recorded_by text NOT NULL,
+    escalated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (parent_task_id,incident_key,task_id),
+    FOREIGN KEY (parent_task_id,incident_key,task_id)
+      REFERENCES delivery_team_corrective_assignment(parent_task_id,incident_key,task_id)
+);
+CREATE TRIGGER delivery_team_overdue_escalation_append_only BEFORE UPDATE OR DELETE ON delivery_team_overdue_escalation
+    FOR EACH ROW EXECUTE FUNCTION _delivery_team_append_only();
+REVOKE ALL ON delivery_team_overdue_escalation FROM PUBLIC;
+
+CREATE FUNCTION delivery_team_overdue(p_limit integer DEFAULT 20)
+RETURNS TABLE(parent_task_id text,incident_key text,task_id text,owner text,action text,due_at timestamptz,
+              parent_priority text,parent_wave text,parent_repo text)
+LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+ SELECT a.parent_task_id,a.incident_key,a.task_id,a.assignment->>'owner',a.assignment->>'action',a.due_at,
+        p.priority,p.wave,p.repo
+ FROM delivery_team_corrective_assignment a JOIN backlog_task p ON p.task_id=a.parent_task_id
+ WHERE a.due_at IS NOT NULL AND a.due_at<clock_timestamp()
+   AND NOT EXISTS(SELECT 1 FROM delivery_team_corrective_check c WHERE c.parent_task_id=a.parent_task_id
+     AND c.incident_key=a.incident_key AND c.task_id=a.task_id)
+   AND NOT EXISTS(SELECT 1 FROM delivery_team_overdue_escalation o WHERE o.parent_task_id=a.parent_task_id
+     AND o.incident_key=a.incident_key AND o.task_id=a.task_id)
+ ORDER BY a.due_at,a.parent_task_id,a.task_id
+ LIMIT least(greatest(coalesce(p_limit,20),1),100)
+$$;
+
+CREATE FUNCTION delivery_team_claim_overdue(p_parent text,p_incident text,p_task text,p_escalation_task_id text)
+RETURNS boolean LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+DECLARE v_due timestamptz;
+BEGIN
+ PERFORM pg_advisory_xact_lock(73535001);
+ SELECT a.due_at INTO v_due FROM delivery_team_corrective_assignment a
+  WHERE a.parent_task_id=p_parent AND a.incident_key=p_incident AND a.task_id=p_task;
+ IF NOT FOUND OR v_due IS NULL OR v_due>=clock_timestamp()
+   OR coalesce(p_escalation_task_id,'')!~'^VOYN-[A-Za-z0-9][A-Za-z0-9._-]*$'
+   OR EXISTS(SELECT 1 FROM delivery_team_corrective_check c WHERE c.parent_task_id=p_parent
+     AND c.incident_key=p_incident AND c.task_id=p_task) THEN RETURN false;END IF;
+ INSERT INTO delivery_team_overdue_escalation(parent_task_id,incident_key,task_id,due_at,escalation_task_id,recorded_by)
+  VALUES(p_parent,p_incident,p_task,v_due,p_escalation_task_id,session_user)
+  ON CONFLICT DO NOTHING;
+ RETURN FOUND;
+END $$;
+
 REVOKE ALL ON FUNCTION _delivery_team_assignment_due() FROM PUBLIC;
 REVOKE ALL ON FUNCTION _delivery_team_owner_roles() FROM PUBLIC;
 REVOKE ALL ON FUNCTION _delivery_team_cto_assign(text,bigint,jsonb,text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION _delivery_team_role_waived(text,bigint,text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION delivery_team_stage_waived(text,bigint,text) FROM PUBLIC;
 REVOKE ALL ON FUNCTION _delivery_team_validate(text,bigint,text,text,jsonb) FROM PUBLIC;
+REVOKE ALL ON FUNCTION delivery_team_overdue(integer) FROM PUBLIC;
+REVOKE ALL ON FUNCTION delivery_team_claim_overdue(text,text,text,text) FROM PUBLIC;

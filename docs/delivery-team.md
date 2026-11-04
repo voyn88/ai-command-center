@@ -39,7 +39,7 @@ Migration 0036 adds a SQL CTO policy, not model authority. Auditor actions are p
 
 The result is then revalidated. Any refusal or failed revalidation rolls the whole batch back, and the auditor stays blocked with `unassigned_corrective_action:<reason>`; an operator decision is then required. Policy rows are outputs of the audit, so they are excluded from the auditor's own input digest, while CTO-RCA sees them. Operator rows are never overridden.
 
-Every assignment gets `due_at` from `delivery_team_due_policy`, a recorded team SLA by parent priority: P0 1 day, P1 2 days, P2 5 days, default 10 days. A missing policy row leaves the due date unknown. The owner surface lists corrective actions with assigner, due date, overdue state and whether an effectiveness check is recorded. A recorded check is not CTO-RCA closure.
+Every assignment gets `due_at` from `delivery_team_due_policy`, a recorded team SLA by parent priority: P0 1 day, P1 2 days, P2 5 days, default 10 days. A missing policy row leaves the due date unknown. Each planner tick that is not stopped escalates every overdue assignment without a recorded effectiveness check exactly once. `delivery_team_claim_overdue` re-derives the condition and writes the append-only `delivery_team_overdue_escalation` row. In the same transaction an OPEN canonical backlog task `<corrective task>-OVERDUE-<hash>`, addressed to the CTO, is filed through `upsert_task`, the watchdog's inbox. A refused task rolls the claim back. Escalation never reassigns, extends a due date or marks a correction effective. The owner surface lists corrective actions with assigner, due date, overdue state and whether an effectiveness check is recorded. A recorded check is not CTO-RCA closure.
 
 ## Risk-based optional roles
 
@@ -59,7 +59,7 @@ This code does not yet establish a running autonomous delivery team. Remaining g
 - No caller or retained-artifact storage has been configured in an existing release chain for these receipt/check adapters. The local artifact endpoint and mandatory HTTPS readback are implemented, but shared access, retention and producer trust still need operational integration.
 - There are no direct CI-failure or deployment-failure producers beyond the existing review/merge hooks. Receiving every relevant incident and closing its RCA has not been demonstrated in a real pilot.
 - Release evidence requires the exact authoritative postmerge SHA. There is no implementation-SHA to later batch-release mapping; an included ancestor is not silently accepted as the deployed SHA.
-- The CTO policy, due dates and optional-role waivers (0036) are covered by PostgreSQL tests only. They have not run on a real incident or production task. P0 corrective assignments and any refused batch still require operator confirmation. Due-date breaches are shown, not escalated automatically.
+- The CTO policy, due dates and optional-role waivers (0036) are covered by PostgreSQL tests only. They have not run on a real incident or production task. P0 corrective assignments and any refused batch still require operator confirmation. Overdue escalation files a CTO backlog task; it does not reassign work by itself.
 - A full real task through the team, production release, independent acceptance and corrective effectiveness has not been performed. Local tests or a roster do not prove operational acceptance.
 
 The existing repository integrator owns rollout. Before enabling a scoped pilot:

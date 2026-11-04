@@ -79,6 +79,11 @@ UNMIRRORED_SCHEMA_TABLES: dict[str, Exclusion] = {
                 "restore it with canonical remediation lineage and incident evidence."),
         task="VOYN-W0-AICC-DELIVERY-TEAM",
     ),
+    "delivery_team_overdue_escalation": Exclusion(
+        reason=("PostgreSQL-native append-only overdue escalation ledger from 0036; "
+                "restore it with its corrective assignments and escalation backlog tasks."),
+        task="VOYN-W0-AICC-DELIVERY-TEAM",
+    ),
     "delivery_team_due_policy": Exclusion(
         reason=("PostgreSQL-native corrective due-date policy seeded by migration 0036; "
                 "no SQLite source exists, restore it with the schema."),

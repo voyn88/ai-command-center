@@ -77,7 +77,10 @@ def read_team(*, limit: int = 30, offset: int = 0) -> dict:
                         'due_at',a.due_at,'policy',a.recorded_by LIKE 'policy:%%',
                         'closed',EXISTS (SELECT 1 FROM delivery_team_corrective_check c
                             WHERE c.parent_task_id=a.parent_task_id AND c.incident_key=a.incident_key
-                            AND c.task_id=a.task_id)) ORDER BY a.due_at NULLS LAST,a.task_id)
+                            AND c.task_id=a.task_id),
+                        'escalation_task_id',(SELECT o.escalation_task_id FROM delivery_team_overdue_escalation o
+                            WHERE o.parent_task_id=a.parent_task_id AND o.incident_key=a.incident_key
+                            AND o.task_id=a.task_id)) ORDER BY a.due_at NULLS LAST,a.task_id)
                      FROM delivery_team_corrective_assignment a WHERE a.parent_task_id=b.task_id)
                 FROM backlog_task b WHERE EXISTS (
                     SELECT 1 FROM delivery_team_stage s WHERE s.task_id=b.task_id AND s.revision=b.revision)
@@ -117,6 +120,7 @@ def read_team(*, limit: int = 30, offset: int = 0) -> dict:
                 'assigned_by': 'cto_policy' if item['policy'] else 'operator',
                 # A recorded effectiveness check, not proof that CTO-RCA closed.
                 'effectiveness_checked': bool(item['closed']), 'overdue': overdue,
+                'escalation_task_id': sanitize_value(item['escalation_task_id']) if item.get('escalation_task_id') else None,
             })
         tasks.append({'id': sanitize_value(task_id), 'title': sanitize_value(title or task_id),
                       'project': sanitize_value(repo or 'Не указан'), 'revision': revision,
