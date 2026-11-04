@@ -163,40 +163,64 @@ class ColumnCodec:
             return render_authority_timestamp(value)
         return value
 
-    def comparable(self, name: str, value: Any) -> Any:
+    def comparable(self, name: str, value: Any, *, side: str) -> Any:
         """One column's value reduced to what a comparison should look at.
 
-        Two reductions, and they are not symmetric by accident. Booleans are
-        normalised unconditionally — `True` and `1` mean the same thing in
-        every table this reconciles. JSON is normalised only for the columns a
-        table declared as `jsonb`, because parsing a string that merely looks
-        like JSON would make two rows agree on a column the target stores as
-        text, which is a false clean rather than a false difference.
+        `side` is `"authority"` or `"mirror"`, and the two are deliberately
+        not treated the same way for `jsonb` columns. The mirror's value has
+        already been through the driver, which parses `jsonb` on its own —
+        `to_authority` hands it over untouched — so it is never re-parsed
+        here; doing so a second time is where the previous version of this
+        method lost the one bit that mattered.
 
-        Unparseable text compares as itself, and the guarantee that follows is
-        narrower than it first appears. `to_column` refuses such text, so no
-        *unparseable* value reaches the mirror; but a `jsonb` column may hold a
-        JSON **string scalar**, which the driver returns as a plain `str`, and
-        this method cannot tell which side it is looking at. Mirror `"not
-        json"` — a perfectly valid `jsonb` string — therefore compares equal to
-        authority text `not json`, which is a false clean.
+        The authority's value is raw text and is always parsed. `to_column`
+        guarantees that unparseable text never reaches the mirror, so if the
+        authority's text fails to parse, *no* mirror value can be its
+        counterpart — not even one that happens to be the identical `str`.
+        That was the false clean this method used to produce: a `jsonb`
+        column may hold a JSON **string scalar**, which the driver returns as
+        a plain `str`, and comparing it against unparseable authority text of
+        the same characters — `not json` — with no parsing on either side
+        made the two indistinguishable. Returning a sentinel that never
+        compares equal, instead of the raw string, reports that row divergent
+        unconditionally rather than by accident of matching bytes. Found by
+        independent review, against the flat claim an earlier docstring made
+        that this could not happen; fixed as
+        `VOYN-W0-AICC-MIRROR-JSON-SCALAR-AMBIGUITY`.
 
-        Unreachable for every column mirrored today: all of them are written by
-        `json.dumps`, which never emits a bare scalar here. Stated rather than
-        fixed because the fix belongs where the sides are distinguishable, not
-        in a method that sees two values and no provenance —
-        `VOYN-W0-AICC-MIRROR-JSON-SCALAR-AMBIGUITY`. Found by independent
-        review, which produced the counterexample against the flat claim this
-        docstring used to make.
+        Booleans are normalised unconditionally, on either side — `True` and
+        `1` mean the same thing in every table this reconciles.
         """
         if isinstance(value, bool):
             return int(value)
-        if name in self.json_values and isinstance(value, str):
+        if name in self.json_values and side == "authority" and isinstance(value, str):
             try:
                 return json.loads(value)
             except json.JSONDecodeError:
-                return value
+                return _UnparseableJSON(value)
         return value
+
+
+class _UnparseableJSON:
+    """Sentinel for authority text a `jsonb` column declared but cannot parse.
+
+    `ColumnCodec.to_column` refuses such text before it can reach the mirror,
+    so by construction no mirror value is its counterpart — including a
+    mirror `str` that happens to share its characters (see `comparable`).
+    Comparing equal to nothing, ever, is what makes that row report divergent
+    instead of matching by accident.
+    """
+
+    __slots__ = ("raw",)
+
+    def __init__(self, raw: str) -> None:
+        self.raw = raw
+
+    def __eq__(self, other: object) -> bool:
+        return False
+
+    def __repr__(self) -> str:
+        return f"_UnparseableJSON({self.raw!r})"
 
 
 def divergence(
@@ -268,7 +292,8 @@ def divergence(
         fields = sorted(
             name
             for name in names
-            if compare(name, row.get(name)) != compare(name, counterpart.get(name))
+            if compare(name, row.get(name), side="authority")
+            != compare(name, counterpart.get(name), side="mirror")
         )
         if fields:
             differences.append(
@@ -292,14 +317,15 @@ def _reported(row_key: tuple) -> Any:
     return row_key[0] if len(row_key) == 1 else row_key
 
 
-def _comparable(_name: str, value: Any) -> Any:
+def _comparable(_name: str, value: Any, *, side: str) -> Any:
     """The comparison for a table that passed no codec: booleans only.
 
     SQLite hands back the integers it stores, so a correctly round-tripped
     boolean would otherwise read as a difference on every row. The column name
-    is accepted and ignored so this and `ColumnCodec.comparable` are the same
-    shape — the caller should not have two ways to compare.
+    and `side` are accepted and ignored so this and `ColumnCodec.comparable`
+    are the same shape — the caller should not have two ways to compare.
     """
+    del side
     if isinstance(value, bool):
         return int(value)
     return value
