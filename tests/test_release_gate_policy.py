@@ -603,3 +603,52 @@ def test_label_noise_never_cancels_or_reruns_the_head_gates():
         types = set(workflow["on"]["pull_request"]["types"])
         assert "labeled" in types
         assert "unlabeled" not in types
+
+
+def test_acceptance_review_bursts_preserve_running_exact_head_check():
+    workflow = _workflow(ROOT / ".github/workflows/acceptance-gate.yml")
+    concurrency = workflow["concurrency"]
+    assert concurrency["cancel-in-progress"] == "false"  # _workflow uses BaseLoader
+    prefix = (
+        "${{ github.workflow }}-"
+        "${{ github.event.pull_request.number || 'merge-group' }}-"
+        "${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}-"
+    )
+    group = concurrency["group"]
+    assert group == prefix + f"${{{{ ({LABEL_NOISE_GUARD}) && github.run_id || 'head' }}}}"
+    # Interpret only the identity prefix's simple || expressions, using fixture
+    # event contexts. The existing noise test pins the unchanged suffix/guards.
+    # This does not emulate GitHub's pending-run replacement policy.
+    def identity(event):
+        context = {"github": {"workflow": workflow["name"], "event": event}}
+
+        def expression(match):
+            for term in match.group(1).split("||"):
+                term = term.strip()
+                if term.startswith("'") and term.endswith("'"):
+                    value = term[1:-1]
+                else:
+                    value = context
+                    for part in term.split("."):
+                        value = value.get(part) if isinstance(value, dict) else None
+                if value:
+                    return str(value)
+            return ""
+
+        return re.sub(r"\$\{\{ (.*?) \}\}", expression, prefix)
+
+    def pr_event(head, action):
+        return {"pull_request": {"number": 23, "head": {"sha": head}}, "action": action}
+
+    same_head = [identity(pr_event("a" * 40, action)) for action in (
+        "opened", "synchronize", "submitted", "edited", "dismissed"
+    )]
+    assert len(set(same_head)) == 1
+    assert same_head[0] == f"{workflow['name']}-23-{'a' * 40}-"
+    assert identity(pr_event("b" * 40, "submitted")) != same_head[0]
+    merge_group = identity({"merge_group": {"head_sha": "c" * 40}})
+    assert merge_group == f"{workflow['name']}-merge-group-{'c' * 40}-"
+    assert merge_group != identity({"merge_group": {"head_sha": "d" * 40}})
+    assert identity({"merge_group": {"head_sha": "a" * 40}}) != same_head[0]
+    assert workflow["on"]["pull_request_review"]["types"] == ["submitted", "edited", "dismissed"]
+    assert workflow["on"]["merge_group"]["types"] == ["checks_requested"]
