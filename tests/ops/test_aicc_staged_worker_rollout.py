@@ -2115,6 +2115,43 @@ def test_preflight_reads_the_disk_when_the_units_are_not_loaded_yet(
         module.preflight_dropin_ordering(systemd, ("voyn-aicc-worker@1.service",))
 
 
+def test_preflight_disk_scan_does_not_reintroduce_generated_dropins(
+    tmp_path, monkeypatch
+):
+    module = _module()
+    roots = _preflight_roots(module, tmp_path, monkeypatch)
+    generated = tmp_path / "run/systemd/generator.early"
+    generated.mkdir(parents=True)
+    monkeypatch.setattr(module, "_GENERATED_DROPIN_PREFIXES", (str(generated),))
+    directory = roots[1] / "voyn-aicc-worker@.service.d"
+    directory.mkdir()
+    generated_dropin = generated / "90-aicc-recovery.conf"
+    generated_dropin.write_text("[Unit]\n", encoding="utf-8")
+    (directory / "90-aicc-recovery.conf").symlink_to(generated_dropin)
+    systemd = FakeSystemd(("voyn-aicc-worker@1.service",))
+    systemd.states["voyn-aicc-worker@1.service"]["DropInPaths"] = ""
+
+    module.preflight_dropin_ordering(systemd, ("voyn-aicc-worker@1.service",))
+
+
+def test_preflight_etc_dropin_shadows_same_named_vendor_copy(tmp_path, monkeypatch):
+    module = _module()
+    etc, _run = _preflight_roots(module, tmp_path, monkeypatch)
+    vendor = tmp_path / "usr/lib/systemd/system"
+    vendor.mkdir(parents=True)
+    monkeypatch.setattr(module, "DROPIN_SEARCH_ROOTS", (etc, vendor))
+    for root in (etc, vendor):
+        directory = root / "voyn-aicc-worker@.service.d"
+        directory.mkdir()
+        (directory / module.WORKER_DROPIN.name).write_text(
+            "[Service]\n", encoding="utf-8"
+        )
+    systemd = FakeSystemd(("voyn-aicc-worker@1.service",))
+    systemd.states["voyn-aicc-worker@1.service"]["DropInPaths"] = ""
+
+    module.preflight_dropin_ordering(systemd, ("voyn-aicc-worker@1.service",))
+
+
 def test_preflight_refuses_a_shadowing_copy_of_the_boundary_dropin(
     tmp_path, monkeypatch
 ):

@@ -6901,6 +6901,9 @@ def test_rollback_restores_a_model_credential_no_run_touched(tmp_path):
         (b"not json at all", 0o600),
         (b'["not", "an", "object"]', 0o600),
         (b"", 0o600),
+        (b"{}", 0o600),
+        (b'{"differentField": "rotated-by-the-run"}', 0o600),
+        (b'{"refreshToken": 123}', 0o600),
         (b'{"refreshToken": "rotated-by-the-run"}', 0o644),
     ],
 )

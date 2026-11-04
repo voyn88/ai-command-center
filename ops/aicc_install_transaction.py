@@ -324,8 +324,38 @@ MODEL_AUTH_RETENTION_JOURNAL = "model-auth-retention.json"
 MODEL_AUTH_RETENTION_VERSION = 1
 
 
+def _same_json_shape(candidate: object, staged: object) -> bool:
+    """Credential structure equality, including nested value types."""
+    if isinstance(staged, dict):
+        return (
+            isinstance(candidate, dict)
+            and set(candidate) == set(staged)
+            and all(_same_json_shape(candidate[key], staged[key]) for key in staged)
+        )
+    if isinstance(staged, list):
+        return (
+            isinstance(candidate, list)
+            and len(candidate) == len(staged)
+            and all(
+                _same_json_shape(candidate_value, staged_value)
+                for candidate_value, staged_value in zip(candidate, staged)
+            )
+        )
+    # bool is an int subclass in Python, but not the same JSON type.
+    if isinstance(staged, bool) or staged is None:
+        return type(candidate) is type(staged)
+    if isinstance(staged, (int, float)):
+        return type(candidate) in {int, float} and not isinstance(candidate, bool)
+    return type(candidate) is type(staged)
+
+
 def _credible_model_auth(
-    state: FileState, *, mode: int, uid: int, gid: int
+    state: FileState,
+    *,
+    staged_payload: bytes,
+    mode: int,
+    uid: int,
+    gid: int,
 ) -> bool:
     """Whether a runtime-owned store holds a credible refreshed credential.
 
@@ -345,9 +375,15 @@ def _credible_model_auth(
         return False
     try:
         document = json.loads(state.payload.decode("utf-8"))
+        staged_document = json.loads(staged_payload.decode("utf-8"))
     except (UnicodeDecodeError, ValueError):
         return False
-    return isinstance(document, dict) and bool(document)
+    return (
+        isinstance(document, dict)
+        and isinstance(staged_document, dict)
+        and bool(staged_document)
+        and _same_json_shape(document, staged_document)
+    )
 
 
 #: The publisher group owns `/etc/aicc/workspace-authority.env` (0640
@@ -4574,6 +4610,7 @@ class FileTransaction:
                             record,
                             target,
                             current,
+                            staged_payload=_read_regular(Path(record.staged)).payload,
                             expected_sha256=record.install_sha256,
                             mode=record.install_mode,
                             uid=record.install_uid,
@@ -4620,6 +4657,7 @@ class FileTransaction:
                         # closed either way.
                         if not _credible_model_auth(
                             current,
+                            staged_payload=_read_regular(Path(record.staged)).payload,
                             mode=record.install_mode,
                             uid=record.install_uid,
                             gid=record.install_gid,
@@ -4666,6 +4704,7 @@ class FileTransaction:
         target: Path,
         current: FileState,
         *,
+        staged_payload: bytes,
         expected_sha256: str,
         mode: int,
         uid: int,
@@ -4679,7 +4718,13 @@ class FileTransaction:
         actually wrong instead of the generic drift refusal an operator cannot
         act on.
         """
-        if not _credible_model_auth(current, mode=mode, uid=uid, gid=gid):
+        if not _credible_model_auth(
+            current,
+            staged_payload=staged_payload,
+            mode=mode,
+            uid=uid,
+            gid=gid,
+        ):
             raise RuntimeError(
                 f"runtime-owned credential store is not a credible refresh: {target}"
             )
@@ -4930,6 +4975,7 @@ class FileTransaction:
                     record,
                     target,
                     current,
+                    staged_payload=_read_regular(Path(record.backup)).payload,
                     expected_sha256=record.original_sha256,
                     mode=record.original_mode,
                     uid=record.original_uid,

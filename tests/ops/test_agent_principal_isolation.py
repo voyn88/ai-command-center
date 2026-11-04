@@ -2865,9 +2865,7 @@ def _run_rollback_trap(tmp_path, **environment):
     """
     text = _installer_text()
     block = text[
-        text.index("restore_snapshotted_units() {") : text.index(
-            "\ntrap rollback EXIT HUP INT TERM"
-        )
+        text.index("rollback() {") : text.index("\ntrap rollback EXIT HUP INT TERM")
     ]
     state = tmp_path / "state"
     state.mkdir()
@@ -2924,20 +2922,18 @@ release_lane_timers() {{ printf 'release_lane_timers\\n' >>"$LOG"; }}
     return result, log.read_text(encoding="utf-8").splitlines(), state
 
 
-def test_failed_rollback_restores_the_units_it_took_down(tmp_path):
-    """The trap disables the launcher socket before calling `recover`, and a
-    `recover` that raises returns without restoring anything: worker-01
-    (2026-09-09) was left with aicc-agent-launcher.socket stopped AND disabled,
-    so every later lane launch failed and each self-deploy tick walked into the
-    same retained WAL. The durable WAL still governs the FILES; the services
-    must not be left down with it."""
+def test_failed_rollback_leaves_all_units_quiesced(tmp_path):
+    """A failed file recovery may have restored only part of a generation.
+    The WAL and snapshot remain, and no service -- especially the launcher
+    socket -- may be restarted against that inconsistent file set."""
     result, log, state = _run_rollback_trap(tmp_path)
 
     assert "systemctl disable --now aicc-agent-launcher.socket" in log
     disable = log.index("systemctl disable --now aicc-agent-launcher.socket")
-    restore = log.index(f"run_rollout restore --state {state}/attempt-units.json")
     release = log.index("release_lane_timers")
-    assert disable < restore < release
+    assert disable < release
+    assert not [line for line in log if line.startswith("run_rollout restore")]
+    assert "systemctl enable --now aicc-agent-launcher.socket" not in log
     # The WAL and the snapshot it will be retried against are both retained.
     assert (state / "pending.json").exists()
     assert (state / "attempt-units.json").exists()
@@ -2956,37 +2952,9 @@ def test_successful_rollback_does_not_restore_units_twice(tmp_path):
     assert not (state / "attempt-units.json").exists()
 
 
-def test_failed_snapshot_restore_still_puts_the_launcher_socket_back(tmp_path):
-    """Last resort when even the snapshot restore cannot be proven safe: the
-    socket is the only path by which any lane can start at all, so it does not
-    stay disabled because a rollback failed."""
-    result, log, _state = _run_rollback_trap(tmp_path, ROLLOUT_RC="1")
-
-    assert "systemctl enable --now aicc-agent-launcher.socket" in log
-    assert "service snapshot restore failed" in result.stderr
-    assert result.returncode == 7
-
-
-def test_a_control_install_is_not_handed_back_the_agent_socket(tmp_path):
-    """The control profile removes the launcher socket on purpose. A failed
-    rollback must not re-enable the very unit the profile exists to remove."""
-    _result, log, _state = _run_rollback_trap(
-        tmp_path, INSTALL_PROFILE="control", ROLLOUT_RC="1"
-    )
-
+def test_failed_control_rollback_also_keeps_launcher_quiesced(tmp_path):
+    _result, log, _state = _run_rollback_trap(tmp_path, INSTALL_PROFILE="control")
     assert "systemctl enable --now aicc-agent-launcher.socket" not in log
-
-
-def test_an_absent_socket_unit_is_not_enabled_by_the_last_resort(tmp_path):
-    """Nothing is enabled on the strength of a name: if the unit file is not
-    on disk the fallback reports the failure instead of asking systemd to
-    enable a unit that does not exist."""
-    result, log, _state = _run_rollback_trap(
-        tmp_path, ROLLOUT_RC="1", SOCKET_UNIT_PRESENT="0", SOCKET_ENABLED="disabled"
-    )
-
-    assert "systemctl enable --now aicc-agent-launcher.socket" not in log
-    assert "no lane can launch until it is" in result.stderr
 
 
 def test_dropin_ordering_is_preflighted_before_the_generation_is_staged():

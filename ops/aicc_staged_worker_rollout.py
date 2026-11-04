@@ -1133,19 +1133,36 @@ def _dropin_files(unit: str) -> tuple[Path, ...]:
     directories = [f"{unit}.d"]
     if UNIT_RE.fullmatch(unit):
         directories.append(f"{WORKER_TEMPLATE.name}.d")
-    found: list[Path] = []
+    # systemd suppresses a lower-priority drop-in when a higher-priority
+    # directory contains the same file name. Roots are ordered by priority,
+    # so retain only the first occurrence of each name. Without this, a
+    # harmless /usr/lib copy is falsely reported as shadowing the /etc file
+    # that actually wins.
+    found: dict[str, Path] = {}
     for root in DROPIN_SEARCH_ROOTS:
         for directory in directories:
             try:
                 entries = sorted((root / directory).iterdir())
             except OSError:
                 continue
-            found.extend(
-                entry
-                for entry in entries
-                if entry.name.endswith(".conf") and entry.is_file()
-            )
-    return tuple(found)
+            for entry in entries:
+                try:
+                    resolved = entry.resolve(strict=True)
+                except OSError:
+                    continue
+                if (
+                    entry.name.endswith(".conf")
+                    and entry.is_file()
+                    and not str(entry).startswith(_GENERATED_DROPIN_PREFIXES)
+                    # /run/systemd/system commonly contains symlinks into a
+                    # generator tree. DropInPaths reports the resolved
+                    # generated path (and filters it above), while a lexical
+                    # filesystem scan sees the /run symlink. Check both names
+                    # so the scan cannot reintroduce that ignored drop-in.
+                    and not str(resolved).startswith(_GENERATED_DROPIN_PREFIXES)
+                ):
+                    found.setdefault(entry.name, entry)
+    return tuple(found.values())
 
 
 def preflight_dropin_ordering(systemd: Systemd, units: tuple[str, ...]) -> None:
@@ -1195,7 +1212,15 @@ def preflight_dropin_ordering(systemd: Systemd, units: tuple[str, ...]) -> None:
                     f"sort before {WORKER_DROPIN.name}, and run the bootstrap "
                     "again."
                 )
-            if path.name == WORKER_DROPIN.name and path != WORKER_DROPIN:
+            if (
+                path.name == WORKER_DROPIN.name
+                and path != WORKER_DROPIN
+                # An instance-specific copy beats the template drop-in even
+                # when both live below /etc. A same-named template copy from
+                # /run or a vendor directory does not: the installer-owned
+                # /etc template copy shadows it after installation.
+                and path.parent.name != WORKER_DROPIN.parent.name
+            ):
                 raise RolloutError(
                     f"{unit}: {path} carries the same file name as "
                     f"{WORKER_DROPIN} from a different drop-in directory, so "
