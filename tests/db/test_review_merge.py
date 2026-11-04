@@ -4287,14 +4287,12 @@ def test_queue_selected_prs_shed_stale_blocked_labels(monkeypatch):
     assert ("11", "add", "review-window:waiting") not in fake.labels
 
 
-def test_queue_selected_prs_shed_blocked_labels_even_with_block_reason(monkeypatch):
-    """Queue ownership is a stronger window signal than stale window evidence.
+def test_queue_active_with_stale_acceptance_releases_slot(monkeypatch):
+    """Queue selection cannot bypass a current eligibility block.
 
-    A queue-selected PR may still be old, missing an accept marker, or waiting
-    on stale checks. Those are still merge-gate concerns, but the PR-window
-    reconciler must not keep or re-add `review-window:blocked` next to
-    `queue-active`/`queue-waiting-review`; that contradictory label pair is
-    exactly what made review/merge ticks rescan the dirty tail."""
+    An active PR with stale acceptance leaves the active queue; a waiting
+    review retains its waiting ownership without contradictory window labels.
+    """
     active_head = "7" * 40
     waiting_head = "8" * 40
     prs = [
@@ -4318,10 +4316,11 @@ def test_queue_selected_prs_shed_blocked_labels_even_with_block_reason(monkeypat
         "/repo", PrWindowConfig(max_active=1, stale_seconds=1)
     )
 
-    assert report.blocked == []
-    assert report.active == [(12, active_head)]
+    assert report.blocked == [(12, "stale_exact_head_acceptance")]
+    assert report.active == []
     assert report.waiting == [(13, waiting_head)]
-    assert ("12", "remove", "review-window:blocked") in fake.labels
+    assert ("12", "remove", "queue-active") in fake.labels
+    assert ("12", "remove", "review-window:blocked") not in fake.labels
     assert ("12", "add", "review-window:active") not in fake.labels
     assert ("13", "remove", "review-window:blocked") in fake.labels
     assert ("13", "add", "review-window:waiting") not in fake.labels
