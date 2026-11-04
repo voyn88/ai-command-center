@@ -8,6 +8,23 @@ functional application milestones of `app.py`.
 
 ## [Unreleased]
 
+### Added — dependency proof before compensation (`VOYN-W0-AICC-SRV-04b-DEPENDENCY-FIRST`)
+- `docs/adr/0011-claim-does-not-depend-on-repository-lease.md`: proves, against
+  the current code and test suite, that the execution-attempt claim
+  (`0002_queue_claim`) has no dependency on the AIOS platform repository
+  lease — so no failure-compensation layer is needed in the claim protocol.
+  Records where a real dependency does exist (the worktree mutation site,
+  `worktree_lease`/`writer_lease`) and why it is correctly fail-closed there.
+- `tests/db/test_claim_lease_independence.py`: offline pin that the claim SQL,
+  `work_queue_store`, and the daemon claim call site never reference the
+  platform lease — so a later wiring fails CI instead of reopening a
+  cross-database node.
+- `command_center/db/sql/0002_queue_claim.up.sql`: corrected a stale header
+  comment — `principal` is no longer "a design proposal, not a deployed
+  table" (`0003_worker_enrollment` created it); the independence conclusion
+  is unaffected since `0002` still has no reference to it and no join exists
+  from `work_attempt.claimed_by_role`.
+
 ### Added — the one-button audit, wired into the web UI (`VOYN-W0-APP-CONTROL-S4`)
 
 - `web/src/screens/Tasks.tsx`: an `AuditLauncher` panel above the task list —
