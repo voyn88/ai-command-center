@@ -196,11 +196,12 @@ def test_normal_window_wait_and_completed_task_do_not_create_work(rig):  # noqa:
     assert _escalations(app_factory) == []
 
 
-def test_escalations_cannot_recursively_spawn_more_escalations(rig):  # noqa: F811
+@pytest.mark.parametrize("suffix", ["", "-REM", "-REM-REM"])
+def test_escalations_cannot_recursively_spawn_more_escalations(rig, suffix):  # noqa: F811
     app_factory, store, _queue = rig
     _stalled_task(store)
     _record_ticks(app_factory, 5)
-    child = watchdog_once(app_factory).escalated[0][1]
+    child = watchdog_once(app_factory).escalated[0][1] + suffix
     with app_factory() as conn:
         conn.execute("SELECT * FROM backlog_upsert_task(%s,'0','P1','READY_TO_REVIEW','task','Child','','repo-one')", (child,))
         for index in range(5):
