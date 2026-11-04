@@ -209,10 +209,20 @@ def test_codex_development_profile_runs_without_its_inner_sandbox_inside_the_uni
     assert command[-1] == "make one local commit"
 
 
-def test_codex_read_only_profile_keeps_the_read_only_sandbox(launcher, tmp_path):
-    command = launcher._provider_command(_manifest(tmp_path, profile="read_only"))
-    assert command[command.index("--sandbox") + 1] == "read-only"
-    assert "danger-full-access" not in command
+def test_codex_read_only_profile_keeps_the_kernel_filesystem_boundary(launcher, monkeypatch, tmp_path):
+    manifest = _manifest(tmp_path, profile="read_only")
+    command = launcher._provider_command(manifest)
+    assert command[command.index("--sandbox") + 1] == "danger-full-access"
+    monkeypatch.setattr(launcher, "_validate_environment_file", lambda *a, **kw: False)
+    unit = launcher._systemd_command(manifest, Path('/run/aicc-agent-homes/test'),
+        'aicc-agent-test.service', 'aicc-agent-launcher@test.service', tmp_path.parent, tmp_path)
+    assert f'--property=BindReadOnlyPaths={tmp_path}:/workspace' in unit
+    assert '--property=ReadWritePaths=/agent-home' in unit
+    assert not any(x.startswith('--property=BindPaths=') and x.endswith(':/workspace') for x in unit)
+    for property in ('ProtectSystem=strict', 'ProtectHome=tmpfs', 'ProtectProc=invisible',
+                     'ProcSubset=pid', 'ProtectKernelTunables=yes', 'NoNewPrivileges=yes',
+                     'DynamicUser=yes', 'CapabilityBoundingSet=', 'AmbientCapabilities='):
+        assert '--property=' + property in unit
 
 
 def test_copilot_is_fail_closed_until_auth_is_model_only(launcher, tmp_path):

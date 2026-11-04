@@ -978,7 +978,8 @@ def _render_review_prompt(
 # independently of _REVIEW_POLICY_VERSION, and is baked into the key below so
 # bumping it re-verifies under the new contract instead of reusing an old
 # verdict -- same rollout mechanism as the review policy version.
-_VERIFICATION_POLICY_VERSION = "verify-v3"
+# Fresh identities prevent reusing verdicts from the broken nested sandbox.
+_VERIFICATION_POLICY_VERSION = "verify-v4"
 
 # Findings larger than this are not auto-verified: the prompt wrapper plus
 # envelope must stay far under the executor argv/prompt limits the review
