@@ -2853,3 +2853,35 @@ def test_mac_transport_environment_is_root_private_not_shared_with_agents(launch
     env_file.write_text("GH_TOKEN=publisher-secret\n")
     with pytest.raises(launcher.LaunchRefused, match="not allowlisted"):
         launcher._validate_environment_file(env_file, "claude", allowed_keys=keys, root_private=True)
+
+
+@pytest.mark.parametrize("executor,profile", [
+    ("claude", "read_only"), ("claude", "trusted_development"),
+    ("claude", "model_only"), ("codex", "read_only"),
+    ("codex", "trusted_development"), ("grok", "read_only"),
+    ("grok", "model_only"), ("cursor", "read_only"),
+])
+def test_transient_prompt_argv_disables_systemd_expansion(
+    launcher, monkeypatch, tmp_path, executor, profile,
+):
+    # Only environment-file validation is stubbed: exercise the real envelope,
+    # provider argv and systemd builder. No provider or systemd process is run.
+    monkeypatch.setattr(launcher, "_validate_environment_file", lambda *a, **k: True)
+    prompt = 'SQL $$ body $$; offset=${offset}; $HOME; "quoted"; `literal`\nюникод'
+    manifest = _manifest(tmp_path, executor=executor, profile=profile, prompt=prompt)
+    admitted = launcher._load_manifest(json.dumps(manifest).encode())
+    command = launcher._systemd_command(
+        admitted, Path("/run/aicc-agent-homes/literal"), "aicc-agent-literal.service",
+        "aicc-agent-launcher@literal.service", tmp_path.parent, tmp_path,
+    )
+    boundary = command.index("--")
+    options, provider = command[:boundary], command[boundary + 1:]
+    assert [v for v in options if v.startswith("--expand-environment")] == [
+        "--expand-environment=no",
+    ]
+    assert provider == launcher._provider_command(admitted)
+    assert provider.count(prompt) == 1
+    assert provider[provider.index(prompt)].encode() == manifest["prompt"].encode()
+    assert "--property=NoNewPrivileges=yes" in options
+    if profile != "trusted_development":
+        assert f"--property=BindReadOnlyPaths={tmp_path}:/workspace" in options

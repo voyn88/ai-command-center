@@ -1135,6 +1135,9 @@ def _systemd_command(
         "--wait",
         "--pipe",
         "--collect",
+        # Prompts are literal argv, not systemd environment expressions: the
+        # default expansion rewrites $$ and ${name} after envelope validation.
+        "--expand-environment=no",
         "--service-type=exec",
         f"--unit={unit}",
         f"--property=BindsTo={broker_unit}",
