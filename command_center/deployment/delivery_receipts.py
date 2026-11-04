@@ -6,6 +6,7 @@ Target configuration and the artifact directory must be operator-controlled.
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import re
@@ -51,14 +52,33 @@ def _https_url(url: str):
     return parsed
 
 
-def fetch_artifact_bytes(url: str, *, bearer: str | None = None) -> bytes:
-    """Bounded private read; errors never echo endpoint, response or credentials."""
-    _https_url(url)
-    headers = {"Accept": "application/json", "Cache-Control": "no-cache"}
+def _auth_headers(*, bearer=None, basic=None):
+    if bearer is not None and basic is not None:
+        raise ValueError("conflicting observation credentials")
+    if basic is not None:
+        if (not isinstance(basic, tuple) or len(basic) != 2
+                or not all(isinstance(v, str) and v for v in basic)
+                or ":" in basic[0]
+                or any(ord(c) < 32 or ord(c) == 127 for v in basic for c in v)):
+            raise ValueError("invalid observation credential")
+        try:
+            encoded = base64.b64encode(":".join(basic).encode("utf-8")).decode("ascii")
+        except UnicodeError:
+            raise ValueError("invalid observation credential") from None
+        return {"Authorization": "Basic " + encoded}
     if bearer is not None:
         if not isinstance(bearer, str) or not re.fullmatch(r"[A-Za-z0-9._~+/=-]+", bearer):
             raise ValueError("invalid observation credential")
-        headers["Authorization"] = "Bearer " + bearer
+        return {"Authorization": "Bearer " + bearer}
+    return {}
+
+
+def fetch_artifact_bytes(url: str, *, bearer: str | None = None,
+                         basic: tuple[str, str] | None = None) -> bytes:
+    """Bounded private read; errors never echo endpoint, response or credentials."""
+    _https_url(url)
+    headers = {"Accept": "application/json", "Cache-Control": "no-cache"}
+    headers.update(_auth_headers(bearer=bearer, basic=basic))
     try:
         request = Request(url, headers=headers)
         with build_opener(_NoRedirect()).open(request, timeout=15) as response:
@@ -72,8 +92,11 @@ def fetch_artifact_bytes(url: str, *, bearer: str | None = None) -> bytes:
     return raw
 
 
-def fetch_observation(url: str, *, bearer: str | None = None) -> dict:
-    raw = fetch_artifact_bytes(url, bearer=bearer)
+def fetch_observation(url: str, *, bearer: str | None = None,
+                      basic: tuple[str, str] | None = None) -> dict:
+    auth = {"basic": basic} if basic is not None else {"bearer": bearer}
+    _auth_headers(bearer=bearer, basic=basic)
+    raw = fetch_artifact_bytes(url, **auth)
     try:
         value = json.loads(raw)
     except (ValueError, UnicodeError):
@@ -83,26 +106,32 @@ def fetch_observation(url: str, *, bearer: str | None = None) -> dict:
     return value
 
 
-def configured_observer(origin: str, *, bearer: str):
+def configured_observer(origin: str, *, bearer: str | None = None,
+                        basic: tuple[str, str] | None = None):
     """Private credential stays in this callable, pinned to one operator origin."""
     allowed = _https_url(origin).netloc
+    _auth_headers(bearer=bearer, basic=basic)
+    auth = {"basic": basic} if basic is not None else {"bearer": bearer}
 
     def observe(url: str) -> dict:
         if _https_url(url).netloc != allowed:
             raise ValueError("foreign observation origin")
-        return fetch_observation(url, bearer=bearer)
+        return fetch_observation(url, **auth)
 
     return observe
 
 
-def configured_artifact_reader(origin: str, *, bearer: str):
+def configured_artifact_reader(origin: str, *, bearer: str | None = None,
+                               basic: tuple[str, str] | None = None):
     """Byte-preserving variant for hashing retained check artifacts."""
     allowed = _https_url(origin).netloc
+    _auth_headers(bearer=bearer, basic=basic)
+    auth = {"basic": basic} if basic is not None else {"bearer": bearer}
 
     def read(url: str) -> bytes:
         if _https_url(url).netloc != allowed:
             raise ValueError("foreign observation origin")
-        return fetch_artifact_bytes(url, bearer=bearer)
+        return fetch_artifact_bytes(url, **auth)
 
     return read
 

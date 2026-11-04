@@ -2,12 +2,19 @@
 from datetime import UTC, datetime
 import hashlib
 import json
+import os
 
 import pytest
 
 from ops import aicc_delivery_team_operator as cli
 
 SHA = "a" * 40
+POSIX_PRIVATE_FILES = (os.name == "posix" and hasattr(os, "O_NOFOLLOW")
+                       and callable(getattr(os, "geteuid", None)))
+requires_private_files = pytest.mark.skipif(
+    not POSIX_PRIVATE_FILES,
+    reason="Private credential file security requires POSIX O_NOFOLLOW and geteuid",
+)
 
 
 class Connection:
@@ -152,8 +159,11 @@ def test_driver_error_does_not_echo_secret(credentials, monkeypatch, capsys):
 
 
 @pytest.mark.parametrize("readback_matches", [True, False])
+@pytest.mark.parametrize("auth_mode", [
+    "bearer", pytest.param("basic", marks=requires_private_files),
+])
 def test_release_real_adapter_readback_and_commit(
-        credentials, monkeypatch, tmp_path, readback_matches):
+        credentials, monkeypatch, tmp_path, readback_matches, auth_mode):
     args = ["release", "--task-id", "TASK", "--revision", "2", "--expected-sha", SHA,
             "--repo", "AICC", "--artifact-origin", "https://evidence.example",
             "--observation-origin", "https://runtime.example",
@@ -161,13 +171,28 @@ def test_release_real_adapter_readback_and_commit(
             "--health-url", "https://runtime.example/healthz",
             "--artifact-directory", str(tmp_path),
             "--artifact-base-url", "https://evidence.example/release"]
+    if auth_mode == "basic":
+        auth_path = tmp_path / "auth.json"
+        auth_path.write_text(json.dumps({"username": "operator", "password": "private-pass"}))
+        auth_path.chmod(0o600)
+        monkeypatch.setenv("AICC_TEAM_AUTH_MODE", "basic")
+        monkeypatch.setenv("AICC_TEAM_BASIC_CREDENTIALS_FILE", str(auth_path))
+        monkeypatch.delenv("AICC_TEAM_ARTIFACT_BEARER")
+        monkeypatch.delenv("AICC_TEAM_OBSERVATION_BEARER")
+        args = [v.replace("evidence.example", "runtime.example") for v in args]
     observations = []
-    def observe(url, *, bearer):
-        assert bearer == "private-observer-token"
+    def observe(url, *, bearer=None, basic=None):
+        if auth_mode == "basic":
+            assert basic == ("operator", "private-pass") and bearer is None
+        else:
+            assert bearer == "private-observer-token" and basic is None
         observations.append(url)
         return {"status": "ok"} if url.endswith("healthz") else {"sha": SHA}
-    def read(url, *, bearer):
-        assert bearer == "private-artifact-token"
+    def read(url, *, bearer=None, basic=None):
+        if auth_mode == "basic":
+            assert basic == ("operator", "private-pass") and bearer is None
+        else:
+            assert bearer == "private-artifact-token" and basic is None
         return (tmp_path / url.rsplit("/", 1)[1]).read_bytes() if readback_matches else b"wrong"
     monkeypatch.setattr(cli.receipts, "fetch_observation", observe)
     monkeypatch.setattr(cli.receipts, "fetch_artifact_bytes", read)
@@ -177,5 +202,97 @@ def test_release_real_adapter_readback_and_commit(
     assert connection.rolled_back is not readback_matches
     assert connection.writes == int(readback_matches)
     assert len(observations) == 3 and observations[0] == observations[2]
-    artifact, = tmp_path.iterdir()
+    artifact, = (p for p in tmp_path.iterdir() if p.name != "auth.json")
     assert json.loads(artifact.read_text())["business_acceptance"] is False
+
+
+@pytest.fixture
+def basic_credentials(credentials, monkeypatch, tmp_path):
+    path = tmp_path / 'credentials.json'
+    path.write_text(json.dumps({'username': 'operator', 'password': 'private-pass'}))
+    path.chmod(0o600)
+    monkeypatch.delenv('AICC_TEAM_ARTIFACT_BEARER')
+    monkeypatch.delenv('AICC_TEAM_OBSERVATION_BEARER')
+    monkeypatch.setenv('AICC_TEAM_AUTH_MODE', 'basic')
+    monkeypatch.setenv('AICC_TEAM_BASIC_CREDENTIALS_FILE', str(path))
+    return path
+
+
+@requires_private_files
+@pytest.mark.parametrize('accepted', [True, False])
+def test_basic_real_acceptance_adapter_transaction(basic_credentials, monkeypatch, capsys, accepted):
+    args = check_args(monkeypatch)
+    prior_fetch = cli.receipts.fetch_artifact_bytes
+    def fetch(url, *, basic):
+        assert basic == ('operator', 'private-pass')
+        return prior_fetch(url, bearer='private-artifact-token')
+    monkeypatch.setattr(cli.receipts, 'fetch_artifact_bytes', fetch)
+    connection = Connection(admit=accepted)
+    assert run(args, connection) == (0 if accepted else 1)
+    assert connection.committed is accepted
+    assert connection.rolled_back is not accepted
+    output = capsys.readouterr()
+    assert 'private-pass' not in output.out + output.err
+
+
+@requires_private_files
+@pytest.mark.parametrize('problem', ['public', 'symlink', 'directory', 'oversize', 'malformed',
+                                    'duplicate', 'missing', 'colon_username'])
+def test_private_basic_file_refusal(basic_credentials, monkeypatch, problem, tmp_path):
+    path = basic_credentials
+    if problem == 'public':
+        path.chmod(0o640)
+    elif problem == 'symlink':
+        link = tmp_path / 'link'
+        link.symlink_to(path)
+        path = link
+    elif problem == 'directory':
+        path = tmp_path
+    elif problem == 'oversize':
+        path.write_text('x' * 4097)
+    elif problem == 'malformed':
+        path.write_text('not-json-private-pass')
+    elif problem == 'duplicate':
+        path.write_text('{"username":"a","username":"b","password":"private-pass"}')
+    elif problem == 'missing':
+        path.unlink()
+    elif problem == 'colon_username':
+        path.write_text('{"username":"a:b","password":"private-pass"}')
+    with pytest.raises(ValueError, match='^invalid private authentication file$'):
+        cli._read_basic_credentials(path)
+
+
+@pytest.mark.parametrize('problem', ['bearer', 'observation_bearer', 'unknown_mode', 'bearer_file'])
+def test_conflicting_config_before_connection(basic_credentials, monkeypatch, problem):
+    args = check_args(monkeypatch)
+    key, value = {
+        'bearer': ('AICC_TEAM_ARTIFACT_BEARER', 'token'),
+        'observation_bearer': ('AICC_TEAM_OBSERVATION_BEARER', 'token'),
+        'unknown_mode': ('AICC_TEAM_AUTH_MODE', 'other'),
+        'bearer_file': ('AICC_TEAM_AUTH_MODE', 'bearer'),
+    }[problem]
+    monkeypatch.setenv(key, value)
+    assert cli.main(args, connect=lambda *a, **k: pytest.fail('must not connect')) == 1
+
+
+def test_basic_release_shared_origin_refusal(basic_credentials, monkeypatch):
+    from argparse import Namespace
+    args = Namespace(command='release', artifact_origin='https://one.example',
+                     observation_origin='https://other.example')
+    with pytest.raises(ValueError, match='same HTTPS origin'):
+        cli._authentication(args)
+    args.observation_origin = args.artifact_origin
+    monkeypatch.setattr(cli, "_read_basic_credentials",
+                        lambda path: ("operator", "private-pass"))
+    assert cli._authentication(args) == (None, None, ('operator', 'private-pass'))
+
+
+@pytest.mark.parametrize("capability", ["O_NOFOLLOW", "geteuid", "posix"])
+def test_missing_private_file_capability_fails_before_open(monkeypatch, capability):
+    if capability == "posix":
+        monkeypatch.setattr(cli.os, "name", "nt")
+    else:
+        monkeypatch.delattr(cli.os, capability, raising=False)
+    monkeypatch.setattr(cli.os, "open", lambda *a, **k: pytest.fail("must not read file"))
+    with pytest.raises(ValueError, match="require POSIX security capabilities"):
+        cli._read_basic_credentials("unused-private-credentials.json")

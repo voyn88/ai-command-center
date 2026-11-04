@@ -38,9 +38,8 @@ Configure and verify store access before invoking. The authenticated owner artif
 acceptance and corrective observations. Serving identifies bytes; it does not
 authenticate their producer or admit evidence. Keep independent check production
 and operator-selected provenance distinct from artifact storage. Collector files are private (0600, new directories 0700);
-prove authorized serving/reviewer access without broadening permissions. The
-standard owner edge uses Basic auth while these readers use Bearer: verify an
-already approved compatible HTTPS machine-read route. Do not bypass the edge.
+prove authorized serving/reviewer access without broadening permissions. The existing owner edge may retain its Basic authentication unchanged; use the
+explicit Basic mode below. Do not bypass the edge.
 
 After the existing release chain succeeds, verify the owner app actually restarted
 from the immutable exact release. A moved symlink is insufficient. Commit the
@@ -56,3 +55,24 @@ reconciliation through the canonical workflow, never forced receipt rewriting.
 Keep the pilot to one real eligible canonical AICC task using the existing planner
 and explicit delivery-team scope. No fake incidents, new producers, daemon, grants,
 queue writer or expanded scope are supplied by this command.
+
+## Existing Basic-auth edge
+
+Bearer remains the default (`AICC_TEAM_AUTH_MODE=bearer`). To use an existing
+Basic-auth HTTPS edge, set `AICC_TEAM_AUTH_MODE=basic` and
+`AICC_TEAM_BASIC_CREDENTIALS_FILE` to its existing private JSON file containing
+exactly `username` and `password` string keys. The file must be a regular file,
+not a symlink, owned by the invoking identity, with no group/other permissions
+(for example 0600), and at most 4096 bytes. No secret values belong on the CLI.
+The reader rejects malformed/duplicate fields and invalid Basic credentials.
+Private-file Basic mode requires POSIX `O_NOFOLLOW` and `geteuid`; unavailable
+capabilities fail closed before opening the file. Bearer transport remains portable.
+
+Unset both Bearer environment variables in Basic mode; even an empty conflicting
+variable is refused. A Basic credential file in Bearer mode or an unknown mode
+is refused. For `release`, observation and artifact origins must be the same
+explicit HTTPS origin because they share this credential. Each reader still
+refuses foreign origins, HTTP and redirects. Use existing edge authentication;
+this option grants no new access and does not provision a producer or artifact
+store. Acceptance/corrective origin selection must come from the operator's
+trusted producer plan, never a model response.

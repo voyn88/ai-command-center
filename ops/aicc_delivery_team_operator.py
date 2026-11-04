@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import sys
+import stat
 
 from command_center.deployment import delivery_receipts as receipts
 
@@ -83,16 +84,66 @@ def _pin_scope(connection, args):
         raise ValueError("operator scope mismatch")
 
 
-def admit(connection, args, *, artifact_bearer, observation_bearer=None):
+def _read_basic_credentials(path):
+    """Read only a bounded private regular file, refusing symlink substitution."""
+    if (os.name != "posix" or not hasattr(os, "O_NOFOLLOW")
+            or not callable(getattr(os, "geteuid", None))):
+        raise ValueError("private authentication files require POSIX security capabilities")
+    descriptor = None
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        info = os.fstat(descriptor)
+        if (not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077
+                or info.st_uid != os.geteuid() or info.st_size > 4096):
+            raise ValueError
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = None
+            raw = stream.read(4097)
+        if len(raw) > 4096:
+            raise ValueError
+        value = json.loads(raw, object_pairs_hook=receipts._unique_fields)
+        if not isinstance(value, dict) or set(value) != {"username", "password"}:
+            raise ValueError
+        basic = (value["username"], value["password"])
+        receipts._auth_headers(basic=basic)
+        return basic
+    except Exception:
+        raise ValueError("invalid private authentication file") from None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _authentication(args):
+    mode = os.environ.get("AICC_TEAM_AUTH_MODE", "bearer")
+    file = os.environ.get("AICC_TEAM_BASIC_CREDENTIALS_FILE")
+    bearer = os.environ.get("AICC_TEAM_ARTIFACT_BEARER")
+    observation = os.environ.get("AICC_TEAM_OBSERVATION_BEARER")
+    if mode == "basic":
+        if not file or bearer is not None or observation is not None:
+            raise ValueError("conflicting authentication configuration")
+        if (args.command == "release"
+                and receipts._https_url(args.artifact_origin).netloc
+                != receipts._https_url(args.observation_origin).netloc):
+            raise ValueError("shared authentication requires the same HTTPS origin")
+        return None, None, _read_basic_credentials(file)
+    if mode != "bearer" or file is not None or not bearer:
+        raise ValueError("invalid authentication configuration")
+    if args.command == "release" and not observation:
+        raise ValueError("missing observation credential")
+    return bearer, observation, None
+
+
+def admit(connection, args, *, artifact_bearer=None, observation_bearer=None, basic=None):
     """Caller owns the connection context/transaction; never emits credentials."""
     _authority(connection)
     read = receipts.configured_artifact_reader(
-        args.artifact_origin, bearer=artifact_bearer)
+        args.artifact_origin, bearer=artifact_bearer, basic=basic)
     if args.command != "corrective":
         _pin_scope(connection, args)
     if args.command == "release":
         observe = receipts.configured_observer(
-            args.observation_origin, bearer=observation_bearer)
+            args.observation_origin, bearer=observation_bearer, basic=basic)
         receipts.collect_release_receipt(
             connection, task_id=args.task_id, revision=args.revision,
             target=receipts.ReleaseTarget(args.repo, args.version_url, args.health_url),
@@ -123,12 +174,9 @@ def main(argv=None, *, connect=None):
         # Fixed env names avoid secret-bearing CLI arguments and accidental
         # fallback to an app/worker's default PG connection.
         dsn = os.environ["AICC_TEAM_OPERATOR_DSN"]
-        bearer = os.environ["AICC_TEAM_ARTIFACT_BEARER"]
-        observation = os.environ.get("AICC_TEAM_OBSERVATION_BEARER")
-        if not dsn.strip() or not bearer.strip():
+        bearer, observation, basic = _authentication(args)
+        if not dsn.strip():
             raise ValueError("missing operator configuration")
-        if args.command == "release" and not observation:
-            raise ValueError("missing observation credential")
         if connect is None:
             import psycopg
             connect = psycopg.connect
@@ -137,7 +185,7 @@ def main(argv=None, *, connect=None):
         with connect(dsn, autocommit=False, connect_timeout=10,
                      options="-c statement_timeout=15000 -c lock_timeout=5000") as connection:
             admit(connection, args, artifact_bearer=bearer,
-                  observation_bearer=observation)
+                  observation_bearer=observation, basic=basic)
     except Exception:
         # DSN, driver diagnostics and adapter exceptions may contain secrets.
         print("Operator admission failed; transaction not accepted.", file=sys.stderr)

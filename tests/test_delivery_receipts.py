@@ -362,3 +362,58 @@ def test_corrective_fetch_error_is_redacted():
     assert str(caught.value) == "corrective artifact fetch failed"
     assert caught.value.__suppress_context__
     assert connection.calls == []
+
+
+@pytest.mark.parametrize('basic,bearer,expected', [
+    (('operator', 'private-pass'), None, 'Basic b3BlcmF0b3I6cHJpdmF0ZS1wYXNz'),
+    (None, 'private-token', 'Bearer private-token'),
+])
+def test_transport_auth_header_and_redirect_refusal(monkeypatch, basic, bearer, expected):
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def read(self, bound):
+            assert bound == 65537
+            return b'{"status":"ok"}'
+
+    class Opener:
+        def open(self, request, timeout):
+            assert request.get_header('Authorization') == expected
+            assert timeout == 15
+            return Response()
+
+    def build(handler):
+        with pytest.raises(ValueError, match='must not follow redirects'):
+            handler.redirect_request(None, None, 302, 'Found', {}, 'https://other.example')
+        return Opener()
+    monkeypatch.setattr(receipts, 'build_opener', build)
+    assert receipts.fetch_observation('https://edge.example/healthz',
+                                      basic=basic, bearer=bearer) == {'status': 'ok'}
+
+
+@pytest.mark.parametrize('factory', [receipts.configured_observer, receipts.configured_artifact_reader])
+def test_basic_origin_pin_refuses_before_transport(monkeypatch, factory):
+    monkeypatch.setattr(receipts, 'build_opener', lambda *a: pytest.fail('no network'))
+    read = factory('https://edge.example', basic=('operator', 'private-pass'))
+    for url in ('https://other.example/check', 'http://edge.example/check'):
+        with pytest.raises(ValueError):
+            read(url)
+    with pytest.raises(ValueError, match='conflicting'):
+        factory('https://edge.example', basic=('operator', 'private-pass'), bearer='token')
+
+
+def test_basic_transport_failure_is_sanitized(monkeypatch):
+    def fail(*args):
+        raise RuntimeError('operator private-pass')
+    monkeypatch.setattr(receipts, 'build_opener', fail)
+    with pytest.raises(ValueError) as error:
+        receipts.fetch_artifact_bytes('https://edge.example/check',
+                                      basic=('operator', 'private-pass'))
+    assert str(error.value) == 'observation fetch failed'
+    assert error.value.__suppress_context__
