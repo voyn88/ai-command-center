@@ -44,6 +44,7 @@ _READY = "aicc-ready"
 #: fixes reach the socket-activated binary on the host.
 _ROOT_HELPERS: tuple[tuple[str, str], ...] = (
     ("ops/aicc_grok_agent.py", "aicc-grok-agent"),
+    ("ops/aicc_claude_mac_agent.py", "aicc-claude-mac-agent"),
     ("ops/aicc_agent_launcher.py", "aicc-agent-launcher"),
     ("ops/aicc_staged_worker_rollout.py", "aicc-staged-worker-rollout"),
     ("ops/aicc_release_deploy.py", "aicc-worker-release-deploy"),

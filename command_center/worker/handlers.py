@@ -671,6 +671,11 @@ def _executor_preflight(executor: str, task_type: str) -> tuple[bool, str, str]:
     if executor == "codex" and task_type in agent_runner.MUTATING_TASK_TYPES:
         available, detail = agent_runner.codex_workspace_write_preflight()
         return available, detail, "codex workspace-write sandbox unavailable"
+    if executor == "claude" and task_type in agent_runner.MODEL_ONLY_TASK_TYPES and os.environ.get("AICC_CLAUDE_MAC_ENABLED") == "1":
+        if not agent_runner.principal_isolation_required():
+            return False, "Claude Mac requires principal isolation", "model-only executor unavailable"
+        available, detail = agent_runner.claude_mac_preflight()
+        return available, detail, "Claude Mac inference adapter unavailable"
     if agent_runner.principal_isolation_required():
         available, detail = agent_runner.principal_executor_preflight(executor)
         return available, detail, f"isolated {executor} cli unavailable"
@@ -707,6 +712,7 @@ def _run_agent(
             )
             if requested_type not in agent_runner.MODEL_ONLY_TASK_TYPES
             or entry["executor"] == "grok"
+            or (entry["executor"] == "claude" and os.environ.get("AICC_CLAUDE_MAC_ENABLED") == "1")
         ))
 
     link = _cascade_link(request, attempt_no)
