@@ -1242,6 +1242,8 @@ def test_codex_development_sandbox_is_danger_full_access_only_under_principal_is
     assert _sandbox_argument(ar.build_codex_command("p", task_type="implementation")) == "workspace-write"
     monkeypatch.setenv(ar.PRINCIPAL_ISOLATION_REQUIRED_ENV, "required")
     assert _sandbox_argument(ar.build_codex_command("p", task_type="implementation")) == "danger-full-access"
+    assert _sandbox_argument(ar.build_codex_command("p", task_type="review")) == "danger-full-access"
+    monkeypatch.delenv(ar.PRINCIPAL_ISOLATION_REQUIRED_ENV)
     assert _sandbox_argument(ar.build_codex_command("p", task_type="review")) == "read-only"
 
 
