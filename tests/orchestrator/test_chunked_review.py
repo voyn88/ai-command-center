@@ -153,11 +153,110 @@ def test_reconcile_enqueues_only_fresh_chunk_retry(monkeypatch):
     assert report.retried == [(TASK, f"{target}:retry:1")]
 
 
+def test_untargeted_reconcile_uses_the_rotating_scan_window(monkeypatch):
+    """A LIMIT max_per_tick ORDER BY task_id page was always the same eight
+    earliest READY_TO_REVIEW rows (usually already marker_already_posted),
+    so later tasks sat on review_chunk_verdict_missing with no retry."""
+    snapshot = snap("diff --git a/a b/a\n" + "x\n" * 40_000)
+    seen = []
+    committed = []
+
+    def fake_scan_tasks(_factory, cursor_name, _sql, _params, scan_cap):
+        seen.append((cursor_name, scan_cap))
+        return [(TASK, PR)], "tok"
+
+    monkeypatch.setattr(review_merge, "_scan_tasks", fake_scan_tasks)
+    monkeypatch.setattr(
+        review_merge,
+        "_scan_commit",
+        lambda *args: committed.append(args),
+    )
+    monkeypatch.setattr(
+        review_merge, "_model_only_review_cascade", lambda: [{"executor": "codex"}]
+    )
+    monkeypatch.setattr(planner, "repo_route", lambda _: ("AICC", "/repo"))
+    monkeypatch.setattr(review_merge, "_pr_diff_and_head", lambda *_: snapshot)
+    monkeypatch.setattr(review_merge, "_has_accept_marker", lambda *_: (False, HEAD))
+    monkeypatch.setattr(review_merge, "_next_retry_key", lambda *_: None)
+
+    report = review_merge.reconcile_review_once(
+        None, lambda *_: None, "/repo"
+    )
+
+    assert seen == [
+        ("scan:reconcile_review_once", review_merge.ReviewConfig().scan_cap)
+    ]
+    assert committed == [
+        (None, "scan:reconcile_review_once", "tok", (TASK, PR))
+    ]
+    assert report.skipped == [(TASK, "no_malformed_review_result_eligible_for_retry")]
+
+
+@pytest.mark.parametrize("first_page_skipped", [True, False])
+def test_reconcile_cursor_advances_only_through_processed_rows(monkeypatch, first_page_skipped):
+    """Exercise real scan/CAS helpers across ticks, including wrap and caps."""
+    from types import SimpleNamespace
+
+    entries = [(f"TASK-{i}", PR[:-3] + str(380 + i)) for i in range(4)]
+    cursor = ""
+    commits = []
+    scans = []
+    snapshot = snap("diff --git a/a b/a\n-old\n+new\n")
+
+    def fake_rows(_factory, sql, params=()):
+        nonlocal cursor
+        if "SELECT position FROM backlog_scan_cursor" in sql:
+            assert params == ("scan:reconcile_review_once",)
+            return [(cursor,)]
+        if "SELECT backlog_scan_claim" in sql:
+            name, expected, new = params
+            assert name == "scan:reconcile_review_once" and expected == cursor
+            cursor = new
+            commits.append(new)
+            return [(True,)]
+        if "SELECT t.task_id" in sql:
+            assert "AND (t.task_id, e.value) > (%s, %s)" in sql
+            assert "ORDER BY t.task_id, e.value LIMIT %s" in sql
+            task, pr, limit = params
+            scans.append(limit)
+            return [row for row in entries if row > (task, pr)][:limit]
+        raise AssertionError(f"unexpected SQL: {sql}")
+
+    monkeypatch.setattr(review_merge, "_rows", fake_rows)
+    monkeypatch.setattr(review_merge, "_model_only_review_cascade", lambda: [{"executor": "codex"}])
+    monkeypatch.setattr(planner, "repo_route", lambda _: ("AICC", "/repo"))
+    monkeypatch.setattr(review_merge, "_review_window_read_decision", lambda *_: SimpleNamespace(allowed=True, pull=None, reason=""))
+    monkeypatch.setattr(review_merge, "_pr_diff_and_head_with_pull", lambda *_: snapshot)
+    monkeypatch.setattr(review_merge, "_has_accept_marker_with_pull", lambda _repo, pr, *_a, **_kw: (first_page_skipped and pr in {entries[0][1], entries[1][1]}, HEAD))
+    monkeypatch.setattr(review_merge, "_next_retry_key", lambda _f, _t, key, _h: key + ":retry:1")
+    monkeypatch.setattr(review_merge, "_latest_attempt_executor", lambda *_: None)
+    dispatched = []
+    cfg = review_merge.ReviewConfig(max_per_tick=1, scan_cap=2)
+    first = review_merge.reconcile_review_once(None, lambda *args: dispatched.append(args), "/repo", cfg)
+    expected_first = entries[1] if first_page_skipped else entries[0]
+    assert cursor == review_merge._SCAN_KEY_SEP.join(expected_first)
+    assert len(first.retried) == (0 if first_page_skipped else 1)
+    second = review_merge.reconcile_review_once(None, lambda *args: dispatched.append(args), "/repo", cfg)
+    expected_second = entries[2] if first_page_skipped else entries[1]
+    assert [task for task, _ in second.retried] == [expected_second[0]]
+    assert cursor == review_merge._SCAN_KEY_SEP.join(expected_second)
+    assert len(commits) == 2 and max(scans) == 2
+    assert len(dispatched) == (1 if first_page_skipped else 2)
+    # A cursor at the end wraps to the earliest eligible row; no permanent starvation.
+    cursor = review_merge._SCAN_KEY_SEP.join(entries[-1])
+    wrapped = review_merge.reconcile_review_once(None, lambda *args: dispatched.append(args), "/repo", cfg)
+    assert cursor == review_merge._SCAN_KEY_SEP.join(expected_first)
+    assert len(wrapped.retried) == (0 if first_page_skipped else 1)
+
+
 def test_reconcile_ignores_stale_marker_and_binds_empty_task_id(monkeypatch):
     snapshot = snap("diff --git a/a b/a\n-old\n+new\n")
     observed_params = []
 
     def fake_rows(_factory, sql, params=()):
+        assert "backlog_scan" not in sql
+        if "SELECT t.task_id" in sql:
+            assert "AND t.task_id = %s ORDER BY t.task_id LIMIT %s" in sql
         observed_params.append(params)
         return [(TASK, PR)] if "SELECT t.task_id" in sql else []
 
