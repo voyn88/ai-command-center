@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from contextlib import nullcontext
 from typing import Any
@@ -25,7 +26,12 @@ from command_center.db import migrations, pool, roles
 from command_center.db.config import ConfigError, load_config
 
 
-def _review_enqueue(store: Any, *, priority: int = 100) -> Any:
+_REVIEW_QUEUE_PRIORITY = 10
+
+
+def _review_enqueue(
+    store: Any, *, priority: int = _REVIEW_QUEUE_PRIORITY
+) -> Any:
     """Build the ``enqueue(queue, key, payload, task_id, max_attempts)``
     writer that ``review_once``/``publish_review_verdicts`` call.
 
@@ -125,6 +131,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     plan.add_argument("--wip-limit", type=int, default=4)
     plan.add_argument(
+        "--repo-path", default=os.environ.get("AICC_FLEET_REPO", ""),
+        help="Configured repository path for opt-in coordination (AICC_FLEET_REPO).",
+    )
+    plan.add_argument(
         "--dry-run",
         action="store_true",
         help="Report the eligible set without dispatching.",
@@ -147,6 +157,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--task-id",
         default=None,
         help="Review and publish a verdict only for this exact backlog task id.",
+    )
+    remediate = sub.add_parser(
+        "backlog-remediate",
+        help="One autonomy remediation tick: drain blocked READY_TO_REVIEW PRs "
+        "by refreshing stale exact-head review, rerunning bounded stale/red "
+        "checks, or spawning capped follow-up remediation tasks. Never merges "
+        "or posts acceptance directly. Needs --repo-path.",
+    )
+    remediate.add_argument("--repo-path", default=".", help="Local clone for gh calls.")
+    remediate.add_argument(
+        "--task-id",
+        default=None,
+        help="Remediate only this exact backlog task id.",
     )
     sub.add_parser(
         "backlog-merge",
@@ -174,6 +197,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Directory to run gh in. A clone, or any directory when GH_REPO "
         "names the repository (the deploy-managed unit uses the release tree).",
     )
+
+    watchdog = sub.add_parser(
+        "backlog-watchdog",
+        help="One watchdog tick (VOYN-W0-AICC-TICK-STALL-WATCHDOG): read the "
+        "persisted tick_skip_event history, detect any (task, reason) pair "
+        "skipped in N consecutive ticks of one kind, and escalate each stall "
+        "episode exactly once as a new OPEN backlog task "
+        "(also runs within existing review/merge ticks). Never mutates the stalled items.",
+    )
+    watchdog.add_argument(
+        "--threshold",
+        type=int,
+        default=5,
+        help="Consecutive same-reason ticks before a stall escalates (default 5).",
+    )
+
 
     self_deploy = sub.add_parser(
         "self-deploy",
@@ -581,12 +620,35 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"REFUSED   {task_id}: {reason}")
                 for task_id, reason in report.undispatchable:
                     print(f"NO-REPO   {task_id}: {reason}")
+                # Coordination v2 runs AFTER the planner lease is released so a
+                # model call never blocks planner:global. Opt-in / stop switches
+                # live in coordination.coordinate_once; default is no-op.
+                from command_center.orchestrator.coordination import (
+                    CoordinationLimits,
+                    coordinate_once,
+                )
+
+                coord = coordinate_once(
+                    lambda: _nc(conn), CoordinationLimits(repository_path=args.repo_path)
+                )
+                if coord.stopped:
+                    print(f"COORD     stopped ({coord.skipped})")
+                elif coord.enqueued:
+                    print(f"COORD     enqueued {coord.enqueued}")
+                elif coord.applied:
+                    print(f"COORD     applied order n={len(coord.applied)}")
+                elif coord.rejected:
+                    print(f"COORD     rejected: {coord.rejected}")
+                elif coord.skipped and coord.skipped != "disabled":
+                    print(f"COORD     skipped: {coord.skipped}")
                 return 0
 
             if args.command == "backlog-review":
                 from contextlib import nullcontext as _nc
 
                 from command_center.db.work_queue_store import WorkQueueStore
+                from command_center.ops import tick_stall_watchdog as _watchdog
+
                 from command_center.orchestrator import gh_access
                 from command_center.orchestrator.review_merge import (
                     publish_review_verdicts,
@@ -597,6 +659,7 @@ def main(argv: list[str] | None = None) -> int:
 
                 store = WorkQueueStore(lambda: _nc(conn))
                 enqueue = _review_enqueue(store)
+                tick_id = _watchdog.new_tick_id()
                 # One quota scope for the WHOLE tick: the four steps below
                 # all call `gh`, so counting them separately would tell an
                 # operator nothing about what the tick as a whole spent --
@@ -648,15 +711,49 @@ def main(argv: list[str] | None = None) -> int:
                         print(f"REMEDIATE {task_id} -> {new_task_id}")
                     for task_id, reason in marker_report.skipped:
                         print(f"SKIP      {task_id}: {reason}")
+                _watchdog.record_skips(conn, "pr_evidence", tick_id, evidence.skipped)
+                _watchdog.record_skips(conn, "review", tick_id, report.skipped)
+                _watchdog.record_skips(conn, "review_retry", tick_id, retry_report.skipped)
+                _watchdog.record_skips(conn, "review_marker", tick_id, marker_report.skipped)
+                stalls = _watchdog.watchdog_once(lambda: _nc(conn))
+                print(f"WATCHDOG  escalated={len(stalls.escalated)} refused={len(stalls.refused)}")
                 # Printed AFTER the scope closes: the remaining-budget half
                 # of the line is read on the way out (`gh api rate_limit`,
                 # which does not itself consume quota).
                 print(quota.line())
+                return 1 if stalls.refused else 0
+
+            if args.command == "backlog-remediate":
+                from contextlib import nullcontext as _nc
+
+                from command_center.db.work_queue_store import WorkQueueStore
+                from command_center.orchestrator.review_merge import (
+                    autonomy_remediate_once,
+                )
+
+                store = WorkQueueStore(lambda: _nc(conn))
+                report = autonomy_remediate_once(
+                    lambda: _nc(conn),
+                    _review_enqueue(store),
+                    args.repo_path,
+                    task_id=args.task_id,
+                )
+                for task_id, pr in report.refreshed:
+                    print(f"REFRESH   {task_id} -> {pr}")
+                for task_id, reason in report.rerun:
+                    print(f"RERUN     {task_id}: {reason}")
+                for task_id, new_task_id in report.remediated:
+                    print(f"REMEDIATE {task_id} -> {new_task_id}")
+                for task_id, reason in report.skipped:
+                    print(f"SKIP      {task_id}: {reason}")
+                if report.quota is not None:
+                    print(report.quota.line())
                 return 0
 
             if args.command == "backlog-merge":
                 from contextlib import nullcontext as _nc
 
+                from command_center.ops import tick_stall_watchdog as _watchdog
                 from command_center.orchestrator.review_merge import merge_once
 
                 report = merge_once(lambda: _nc(conn), args.repo_path)
@@ -664,9 +761,53 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"MERGED    {task_id} -> {head}")
                 for task_id, reason in report.skipped:
                     print(f"SKIP      {task_id}: {reason}")
+                _watchdog.record_skips(
+                    conn, "merge", _watchdog.new_tick_id(), report.skipped
+                )
+                stalls = _watchdog.watchdog_once(lambda: _nc(conn))
+                print(f"WATCHDOG  escalated={len(stalls.escalated)} refused={len(stalls.refused)}")
+                for task_id, reason in report.errors:
+                    print(f"ERROR     {task_id}: {reason}", file=sys.stderr)
                 if report.quota is not None:
                     print(report.quota.line())
-                return 0
+                # `errors` means the gateway could not even evaluate a
+                # merge (its identity is unconfigured, GitHub was
+                # unreachable) -- distinct from an ordinary `skipped` PR
+                # that simply isn't ready, and reported with a non-zero
+                # exit so a caller (timer, runbook) fails loudly instead of
+                # retrying forever unaware (VOYN-W0-AICC-MERGE-GATEWAY-
+                # REM-REM-REM).
+                return 1 if report.errors or stalls.refused else 0
+
+            if args.command == "backlog-watchdog":
+                from contextlib import nullcontext as _nc
+
+                from command_center.ops.tick_stall_watchdog import (
+                    WatchdogConfig,
+                    watchdog_once,
+                )
+
+                report = watchdog_once(
+                    lambda: _nc(conn),
+                    WatchdogConfig(threshold=args.threshold),
+                )
+                for episode, new_task_id in report.escalated:
+                    print(
+                        f"ESCALATE  {episode.task_id} -> {new_task_id}: "
+                        f"{episode.tick_kind} repeated {episode.reason!r} "
+                        f"x{episode.consecutive}"
+                    )
+                for episode in report.already_escalated:
+                    print(
+                        f"ALREADY   {episode.task_id}: {episode.tick_kind} "
+                        f"{episode.reason!r} x{episode.consecutive}"
+                    )
+                for task_id, reason in report.refused:
+                    print(f"REFUSED   {task_id}: {reason}")
+                # A refused escalation is a real finding: the stall is
+                # detected but could not reach the inbox. Non-zero so the
+                # timer run goes red for the operator.
+                return 1 if report.refused else 0
 
             if args.command == "backlog-merge-reconcile":
                 from contextlib import nullcontext as _nc

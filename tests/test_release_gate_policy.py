@@ -166,7 +166,6 @@ def test_release_context_names_and_workflow_coverage_are_exact() -> None:
             "synchronize",
             "reopened",
             "labeled",
-            "unlabeled",
         }
         if workflow is ci:
             assert workflow["permissions"] == {
@@ -551,7 +550,7 @@ def test_final_gate_is_fail_closed_for_every_upstream_result() -> None:
 
 
 def test_label_noise_never_cancels_or_reruns_the_head_gates():
-    """VOYN-W0-AICC-CI-SELF-CANCEL-SAME-SHA: `labeled`/`unlabeled` stay in the
+    """VOYN-W0-AICC-CI-SELF-CANCEL-SAME-SHA: `labeled` stays in the
     trigger set for the `release-gate-canary-*` labels, but the queue
     reconciler and operators move `queue-*` labels constantly. Reproduced
     3x on 2026-09-06 (PRs 649, 672, 762) and all night 2026-09-07/08: every
@@ -598,7 +597,9 @@ def test_label_noise_never_cancels_or_reruns_the_head_gates():
         assert required_name == (
             f"${{{{ ({LABEL_NOISE_GUARD}) && 'Gate not run (label noise or outside review window)' || '{real_name}' }}}}"
         ), (workflow_name, required_name)
-    # Never traded for dropping the canary triggers: the release-gate canaries
-    # still need a fresh event carrying the label.
-    ci = _workflow(CI_WORKFLOW)
-    assert {"labeled", "unlabeled"} <= set(ci["on"]["pull_request"]["types"])
+    # Canary additions still trigger; removals must not shadow the real suite.
+    for workflow_name in ("ci.yml", "acceptance-gate.yml", "arch-fitness.yml"):
+        workflow = _workflow(ROOT / ".github/workflows" / workflow_name)
+        types = set(workflow["on"]["pull_request"]["types"])
+        assert "labeled" in types
+        assert "unlabeled" not in types

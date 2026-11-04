@@ -51,6 +51,16 @@ pr/sha evidence, moving the task to READY_TO_REVIEW. This module is the rest:
 - ``merge_once``: for each PR that carries an ACCEPT marker AND whose required
   checks are green, ``gh pr merge`` it and move the task READY_TO_REVIEW→DONE
   with the merged sha as evidence (via the existing backlog_transition gate).
+  The merge itself runs under ``_merge_app_credentials``' own GitHub App
+  installation -- a third identity, distinct from both the ambient ``gh``
+  credential every read in this module uses and the acceptance identity that
+  posts the marker -- so worker and planner code, which never sees that
+  identity's secrets, has no path to executing ``gh pr merge`` at all
+  (VOYN-W0-AICC-MERGE-GATEWAY-REM-REM-REM). Anything that keeps this tick from
+  even evaluating a merge -- the identity unconfigured, its token failing to
+  mint, a readiness read that never reached the GitHub API -- lands in
+  ``LoopReport.errors``, kept apart from ``skipped`` so a caller can fail
+  loudly instead of it looking like an ordinary not-yet-accepted PR.
   A PR that is only BEHIND main gets `gh pr update-branch`, which mints a
   fresh head with no marker on it -- ``_carry_over_marker_if_patch_id_stable``
   then reposts the ACCEPT marker on that new head, with its own audited
@@ -82,6 +92,7 @@ module for the incident that forced it
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -105,6 +116,7 @@ __all__ = [
     "PrWindowReport",
     "ReconcileReport",
     "ReviewConfig",
+    "autonomy_remediate_once",
     "merge_once",
     "publish_review_verdicts",
     "reconcile_merge_evidence",
@@ -138,6 +150,9 @@ class ReviewConfig:
     #: with main). Bounded so a moving base cannot make the merge tick spend
     #: the whole tick re-updating branches that will just fall behind again.
     max_branch_updates_per_tick: int = 3
+    # Reuse #997: one durable attempt per exact head, at most two per tick.
+    max_gate_retriggers_per_tick: int = 2
+    gate_retrigger_label: str = "review-window:active"
     #: Per-tick cap on tasks EXAMINED (each examination costs gh API calls).
     #: Fairness across ticks comes from the rotating deterministic scan order
     #: below, not from unbounded scanning -- see the window-starvation note
@@ -167,10 +182,44 @@ class LoopReport:
     #: Fresh, bounded identities dispatched to replace succeeded review runs
     #: whose final result cannot be parsed for the current PR head.
     retried: list[tuple[str, str]] = field(default_factory=list)
+    #: (task_id, reason) the tick could not even evaluate, as opposed to
+    #: evaluated-and-not-ready: the merge identity is unconfigured or
+    #: misconfigured, its installation token could not be minted, or a
+    #: readiness lookup failed to reach the GitHub API at all. Kept apart
+    #: from `skipped` deliberately -- see `merge_once`'s docstring
+    #: (VOYN-W0-AICC-MERGE-GATEWAY-REM-REM-REM) -- so a caller can fail loudly
+    #: instead of this looking identical to a PR that just isn't accepted
+    #: yet.
+    errors: list[tuple[str, str]] = field(default_factory=list)
     #: What this tick spent at GitHub and under which identity -- see
     #: `gh_access.GhQuota`. None when the report was built outside a tick
     #: scope (a unit test constructing one by hand).
     quota: gh_access.GhQuota | None = None
+
+
+@dataclass
+class AutonomyRemediationReport:
+    """What the hands-off remediation tick did to blocked review PRs."""
+
+    #: (task_id, pr_url) whose current head was sent back through exact-head
+    #: review because the old acceptance evidence was stale or missing.
+    refreshed: list[tuple[str, str]] = field(default_factory=list)
+    #: (task_id, reason) whose failed/cancelled checks were rerun.
+    rerun: list[tuple[str, str]] = field(default_factory=list)
+    #: (blocked_task_id, new_remediation_task_id) whose accepted PR needed a
+    #: real follow-up implementation attempt (red checks after bounded rerun,
+    #: merge conflict, or another non-transient merge blocker).
+    remediated: list[tuple[str, str]] = field(default_factory=list)
+    #: (task_id, reason) deliberately left alone this tick.
+    skipped: list[tuple[str, str]] = field(default_factory=list)
+    quota: gh_access.GhQuota | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _PrWindowReadDecision:
+    allowed: bool
+    reason: str
+    pull: dict[str, Any] | None = None
 
 
 @dataclass
@@ -386,8 +435,8 @@ def _gh(argv: list[str], repo_path: str) -> subprocess.CompletedProcess[str]:
     already exceeded for user ID 297853521`) and all three ticks failed at
     once for an hour. `gh_access.run` sends the identical argv under the
     fleet App's installation token -- its own, separate quota -- whenever
-    the host has one, falls back to the ambient credential when it does
-    not, and counts the call either way."""
+    the host has one, falls back to the ambient credential when the enclosing
+    tick allows it, and counts the call either way."""
     return gh_access.run(argv, repo_path)
 
 
@@ -596,6 +645,61 @@ def _post_marker_as_bot(
     return True, ""
 
 
+def _merge_app_credentials() -> github_app_auth.GitHubAppCredentials | None:
+    """The merge identity's credentials -- a THIRD GitHub App installation,
+    distinct from both the ambient credential `_gh()` uses for every
+    read-only call in this module and the acceptance identity
+    `_acceptance_app_credentials` mints for posting the marker
+    (VOYN-W0-AICC-MERGE-GATEWAY-REM-REM-REM).
+
+    Before this identity existed, `merge_once` executed `gh pr merge`
+    under the same ambient `gh` credential every other call in this
+    module already shares -- confirmed by reading the code at f289127,
+    unchanged across #345-351: whichever token `gh` was configured with
+    on the host running the tick could both author a pull request and
+    merge it. Splitting the acceptance marker onto its own identity
+    (VOYN-W0-AICC-MARKER-REVIEWER-INDEPENDENCE) closed the self-approval
+    gap in *what gets posted*, but left the actual merge -- the
+    irreversible act -- on the same shared credential. This identity is
+    the sole holder of that capability: worker and planner code never
+    sees `VOYN_MERGE_APP_ID`/`_INSTALLATION_ID`/`_PRIVATE_KEY_PATH`, so
+    nothing outside this one call site in `merge_once` can ever execute
+    `gh pr merge`.
+
+    All three or none, exactly like `_acceptance_app_credentials`: a
+    partial set is a misconfiguration, and unlike that function's
+    same-tick fallback-free skip, an unconfigured or partially configured
+    merge identity here is reported to `LoopReport.errors`, not
+    `skipped` -- this tick's only job is merging, so failing to reach
+    that capability is never indistinguishable from "nothing to merge
+    yet." See `merge_once`."""
+    app_id = os.environ.get("VOYN_MERGE_APP_ID", "")
+    installation_id = os.environ.get("VOYN_MERGE_INSTALLATION_ID", "")
+    key_path = os.environ.get("VOYN_MERGE_PRIVATE_KEY_PATH", "")
+    if not (app_id and installation_id and key_path):
+        return None
+    return github_app_auth.GitHubAppCredentials(app_id, installation_id, Path(key_path))
+
+
+def _merge_pr_as_bot(
+    repo_path: str, pr_url: str, token: str
+) -> subprocess.CompletedProcess[str]:
+    """Run `gh pr merge` authenticated as the merge identity's freshly
+    minted installation token via `GH_TOKEN` -- which `gh` itself
+    prioritizes over any stored `gh auth login` credential for exactly
+    this one subprocess -- rather than switching to a raw REST call.
+    `gh pr merge` already knows how to enqueue a PR on a merge-queue-
+    protected repository instead of merging it synchronously (see
+    `_merged_target_sha`'s docstring); reimplementing that branch against
+    the REST/GraphQL merge endpoints directly would risk silently losing
+    it. The credential is what changes here, not the mechanism."""
+    return subprocess.run(
+        ["gh", "pr", "merge", pr_url, "--squash"],
+        cwd=repo_path, capture_output=True, text=True, check=False, timeout=120,
+        env={**os.environ, "GH_TOKEN": token},
+    )
+
+
 def _rows(factory: Any, sql: str, params: tuple = ()) -> list[tuple]:
     with factory() as conn, conn.cursor() as cur:
         cur.execute(sql, params)
@@ -641,7 +745,7 @@ _REVIEW_INPUT_MARKER = "\nINPUT_ENVELOPE_JSON:\n"
 _MAX_REVIEW_PROMPT_BYTES = 16_000
 _MAX_REVIEW_DIFF_BYTES = 8 * 1024 * 1024
 
-_PR_URL = re.compile(r"^https://github\.com/([^/]+)/([^/]+)/pull/(\d+)$")
+_PR_URL = re.compile(r"https://github\.com/([A-Za-z0-9][A-Za-z0-9-]*)/([A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)")
 
 # Bumped whenever _REVIEW_PROMPT's contract changes in a way that makes an
 # old verdict untrustworthy under the new policy (e.g. what the agent is
@@ -652,13 +756,20 @@ _PR_URL = re.compile(r"^https://github\.com/([^/]+)/([^/]+)/pull/(\d+)$")
 # looser policy.
 _REVIEW_POLICY_VERSION = "v8"
 
+# Cursor Ask is not a zero-tool reviewer. Grok and the opt-in Mac Claude
+# transport are the broker paths with an enforced zero-tool capability.
 _MODEL_ONLY_REVIEW_EXECUTORS = frozenset(
-    {"copilot", "claude", "codex", "openai_http"}
+    {"copilot", "claude", "codex", "openai_http", "grok"}
 )
 
 
 def _model_only_review_cascade() -> list[dict[str, Any]]:
     route = cascade_for("review")
+    # The Mac transport attests empty tool and MCP lists on every result.
+    # Keep it opt-in until the private inference tunnel is configured.
+    if os.environ.get("AICC_EXECUTOR_PROFILE") == "owner-cascade":
+        route = [link for link in route if link.get("executor") == "grok"
+                 or (link.get("executor") == "claude" and os.environ.get("AICC_CLAUDE_MAC_ENABLED") == "1")]
     return [
         {**link, "task_type": "independent_review", "capability": "model_only"}
         for link in route
@@ -682,7 +793,7 @@ def _verification_review_cascade() -> list[dict[str, Any]]:
 
 
 def _repo_from_pr_url(pr_url: str) -> str | None:
-    match = _PR_URL.match(pr_url)
+    match = _PR_URL.fullmatch(pr_url)
     return match.group(2) if match else None
 
 
@@ -690,10 +801,32 @@ def _owner_repo_number_from_pr_url(pr_url: str) -> tuple[str, str, str] | None:
     """(owner, repo, pr_number) for the GitHub REST API path -- unlike
     `_repo_from_pr_url` (only the repo name, for the review-cycle key), the
     bot-identity marker post below needs the owner too."""
-    match = _PR_URL.match(pr_url)
+    match = _PR_URL.fullmatch(pr_url)
     if match is None:
         return None
     return match.group(1), match.group(2), match.group(3)
+
+
+def _clear_pr_evidence(factory: Any, task_id: str, pr_url: str, reason: str) -> str:
+    """Remove a 'pr' evidence row this tick has already proven can never
+    resolve (VOYN-W0-AICC-REPO-ROUTE-AND-EVIDENCE-HYGIENE) -- e.g. not even
+    shaped like a GitHub PR URL. `backlog_clear_evidence` is idempotent (a
+    row another tick already cleared is `already_absent`, not an error) and,
+    if this was the task's last 'pr' row, sends a READY_TO_REVIEW task back
+    for a fresh attempt itself; the returned verdict reason is folded into
+    the caller's own skip line rather than re-derived here.
+
+    Transient GitHub lookup failures must never call this -- only values
+    proven unresolvable without a successful API response (malformed shape).
+    Merged PRs without acceptance evidence stay skipped as
+    `merged_without_acceptance_evidence` and are never cleared to DONE here.
+    """
+    rows = _rows(
+        factory,
+        "SELECT reason FROM backlog_clear_evidence(%s, 'pr', %s, %s)",
+        (task_id, pr_url, reason),
+    )
+    return rows[0][0] if rows else "unknown"
 
 
 @dataclass(frozen=True, slots=True)
@@ -726,7 +859,7 @@ def _review_key(task_id: str, pr_url: str, snapshot: _PRSnapshot) -> str | None:
     overwritten. Returns None if `pr_url` doesn't parse (caller already
     validates this via `_repo_from_pr_url` before reaching here in
     practice, but a malformed URL must never produce a malformed key)."""
-    match = _PR_URL.match(pr_url)
+    match = _PR_URL.fullmatch(pr_url)
     if (match is None or not re.fullmatch(r"[0-9a-f]{40}", snapshot.base)
             or not re.fullmatch(r"[0-9a-f]{40}", snapshot.head)
             or not re.fullmatch(r"[0-9a-f]{64}", snapshot.digest)):
@@ -848,7 +981,8 @@ def _render_review_prompt(
 # independently of _REVIEW_POLICY_VERSION, and is baked into the key below so
 # bumping it re-verifies under the new contract instead of reusing an old
 # verdict -- same rollout mechanism as the review policy version.
-_VERIFICATION_POLICY_VERSION = "verify-v3"
+# Fresh identities prevent reusing verdicts from the broken nested sandbox.
+_VERIFICATION_POLICY_VERSION = "verify-v4"
 
 # Findings larger than this are not auto-verified: the prompt wrapper plus
 # envelope must stay far under the executor argv/prompt limits the review
@@ -1165,7 +1299,7 @@ def _next_retry_key(
     if state != "succeeded" or attempt >= _MAX_RESULT_RETRY_ATTEMPTS:
         return None
     result = _json_object(payload_value)
-    parsed = _parse_verdict((result or {}).get("result_text") or "")
+    parsed = _parse_review_verdict((result or {}).get("result_text") or "")
     if parsed is not None and parsed[1] == expected_head:
         return None
     return f"{base_key}:retry:{attempt + 1}"
@@ -1216,7 +1350,9 @@ def _failover_cascade(
     return preferred + deprioritized
 
 
-def _pr_diff_and_head(repo_path: str, pr_url: str) -> _PRSnapshot | None:
+def _pr_diff_and_head(
+    repo_path: str, pr_url: str, pull: dict[str, Any] | None = None
+) -> _PRSnapshot | None:
     """The PR's diff and current head sha, fetched by the trusted
     orchestrator -- not the review agent itself. Embedding the diff in the
     prompt (rather than granting the agent its own `gh`/Bash access to fetch
@@ -1232,9 +1368,14 @@ def _pr_diff_and_head(repo_path: str, pr_url: str) -> _PRSnapshot | None:
     if parsed is None:
         return None
     owner, repo, number = parsed
-    view = _gh(["api", f"repos/{owner}/{repo}/pulls/{number}"], repo_path)
     try:
-        data = json.loads(view.stdout or "{}") if view.returncode == 0 else {}
+        if pull is None:
+            view = _gh(["api", f"repos/{owner}/{repo}/pulls/{number}"], repo_path)
+            data = json.loads(view.stdout or "{}") if view.returncode == 0 else {}
+        else:
+            data = pull
+        if data.get("state") != "open" or data.get("merged_at"):
+            return None
         base, head = data["base"], data["head"]
         base_sha, head_sha = base["sha"], head["sha"]
         same_repo = base["repo"]["full_name"].casefold() == f"{owner}/{repo}".casefold()
@@ -1262,7 +1403,44 @@ def _pr_diff_and_head(repo_path: str, pr_url: str) -> _PRSnapshot | None:
         sum(line.startswith("+") and not line.startswith("+++ ") for line in lines),
         sum(line.startswith("-") and not line.startswith("--- ") for line in lines),
     )
-    return _PRSnapshot.create(text, base_sha, head_sha) if observed == stats else None
+    if observed != stats:
+        return None
+    # A compare is immutable, but the PR can close or move while it is fetched.
+    # Revalidate before scheduling model work against that exact snapshot.
+    refreshed = _gh(["api", f"repos/{owner}/{repo}/pulls/{number}"], repo_path)
+    try:
+        current = json.loads(refreshed.stdout or "{}")
+        if (refreshed.returncode != 0 or current.get("state") != "open"
+                or current.get("merged_at")
+                or current["head"]["sha"] != head_sha
+                or current["base"]["sha"] != base_sha):
+            return None
+    except (KeyError, TypeError, AttributeError, json.JSONDecodeError):
+        return None
+    return _PRSnapshot.create(text, base_sha, head_sha)
+
+
+def _pr_diff_and_head_with_pull(
+    repo_path: str, pr_url: str, pull: dict[str, Any] | None
+) -> _PRSnapshot | None:
+    """Fetch a PR snapshot, reusing a window-gate pull body when available."""
+    if pull is None:
+        return _pr_diff_and_head(repo_path, pr_url)
+    try:
+        signature = inspect.signature(_pr_diff_and_head)
+    except (TypeError, ValueError):
+        signature = None
+    if signature is not None:
+        parameters = list(signature.parameters.values())
+        accepts_varargs = any(p.kind == p.VAR_POSITIONAL for p in parameters)
+        positional = [
+            p
+            for p in parameters
+            if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+        ]
+        if not accepts_varargs and len(positional) < 3:
+            return _pr_diff_and_head(repo_path, pr_url)
+    return _pr_diff_and_head(repo_path, pr_url, pull)
 
 
 _SCAN_KEY_SEP = "\x1f"
@@ -1382,6 +1560,7 @@ def _review_once(
 
     cfg = cfg or ReviewConfig()
     report = LoopReport()
+    recovery_budget = [3, 1]  # fresh lookups, stale-head PRs per tick
     action_limit = cfg.max_per_tick
     if task_id is None and callable(factory):
         active_rows = _rows(
@@ -1446,11 +1625,27 @@ def _review_once(
             report.skipped.append((task_id, "no_review_executor_route"))
             continue
         repo = _repo_from_pr_url(pr_url)
-        route = repo_route(repo) if repo else None
+        if repo is None:
+            # Not even shaped like a GitHub PR URL -- can never resolve
+            # through any gh call below, so there is nothing to retry
+            # (VOYN-W0-AICC-REPO-ROUTE-AND-EVIDENCE-HYGIENE). A shape-valid
+            # URL whose repo simply has no route table entry is left alone
+            # below: that is an operator fact (add the route), not bogus
+            # evidence.
+            verdict = _clear_pr_evidence(factory, task_id, pr_url, "malformed_pr_url")
+            report.skipped.append((task_id, f"malformed_pr_url:{verdict}: {pr_url!r}"))
+            continue
+        route = repo_route(repo)
         if route is None:
             report.skipped.append((task_id, f"no_repo_route: {pr_url!r}"))
             continue
-        fetched = _pr_diff_and_head(repo_path, pr_url)
+        window = _review_window_read_decision(
+            repo_path, pr_url, recovery_budget
+        )
+        if not window.allowed:
+            report.skipped.append((task_id, window.reason))
+            continue
+        fetched = _pr_diff_and_head_with_pull(repo_path, pr_url, window.pull)
         if fetched is None:
             report.skipped.append((task_id, f"pr_diff_fetch_failed: {pr_url!r}"))
             continue
@@ -1460,6 +1655,10 @@ def _review_once(
             report.skipped.append((task_id, f"no_repo_route: {pr_url!r}"))
             continue
         project_id, repository_path = route
+        parsed_url = _owner_repo_number_from_pr_url(pr_url)
+        if parsed_url is None:
+            report.skipped.append((task_id, f"no_repo_route: {pr_url!r}"))
+            continue
         try:
             chunks = _review_chunks(snapshot, task_id, pr_url)
         except (RuntimeError, ValueError) as exc:
@@ -1480,6 +1679,12 @@ def _review_once(
                 "timeout_seconds": cfg.review_timeout,
                 "untrusted": True,
                 "cascade": cascade,
+                # Worker re-checks open+exact head before any model call;
+                # scheduling's snapshot guard does not cover the queue delay.
+                "review_head": {
+                    "pr_number": parsed_url[2],
+                    "head_sha": snapshot.head,
+                },
             }
             if chunk.count == 1:
                 prepared.append((key, payload))
@@ -1545,13 +1750,14 @@ def reconcile_review_once(
 
     cfg = cfg or ReviewConfig()
     report = LoopReport()
+    recovery_budget = [3, 1]  # fresh lookups, stale-head PRs per tick
     if task_id is not None:
         tasks, scan_token = _rows(
             factory,
             "SELECT t.task_id, e.value FROM backlog_task t "
             "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
             "WHERE t.status = 'READY_TO_REVIEW' AND t.task_id = %s "
-            "ORDER BY e.value LIMIT %s",
+            "ORDER BY t.task_id LIMIT %s",
             (task_id, cfg.max_per_tick),
         ), None
     else:
@@ -1581,11 +1787,22 @@ def reconcile_review_once(
         if route is None:
             report.skipped.append((current_task_id, "no_repo_route"))
             continue
-        snapshot = _pr_diff_and_head(repo_path, pr_url)
+        window = _review_window_read_decision(
+            repo_path, pr_url, recovery_budget
+        )
+        if not window.allowed:
+            report.skipped.append((current_task_id, window.reason))
+            continue
+        snapshot = _pr_diff_and_head_with_pull(repo_path, pr_url, window.pull)
         if snapshot is None:
             report.skipped.append((current_task_id, "pr_diff_fetch_failed"))
             continue
-        marker, marker_head = _has_accept_marker(repo_path, pr_url)
+        marker, marker_head = _has_accept_marker_with_pull(
+            repo_path,
+            pr_url,
+            window.pull,
+            rest_allowed=window.reason != "review_window_lookup_failed",
+        )
         if marker and marker_head == snapshot.head:
             report.skipped.append((current_task_id, "marker_already_posted"))
             continue
@@ -1622,12 +1839,20 @@ def reconcile_review_once(
                 factory, current_task_id, base_key
             )
             retry_cascade = _failover_cascade(cascade, refusing_executor)
+            parsed_url = _owner_repo_number_from_pr_url(pr_url)
+            if parsed_url is None:
+                report.skipped.append((current_task_id, "review_key_invalid"))
+                continue
             payload: dict[str, Any] = {
                 "kind": "agent_run", "v": 1, "project_id": project_id,
                 "repository_path": repository_path,
                 "task_type": "independent_review", "prompt": prompt,
                 "timeout_seconds": cfg.review_timeout, "untrusted": True,
                 "cascade": retry_cascade,
+                "review_head": {
+                    "pr_number": parsed_url[2],
+                    "head_sha": snapshot.head,
+                },
             }
             if chunk.count > 1:
                 payload["review_chunk"] = {
@@ -1682,6 +1907,30 @@ def _parse_verdict(text: str) -> tuple[str, str] | None:
     return verdict_match.group(1), sha_match.group(1)
 
 
+def _review_has_findings(text: str) -> bool:
+    """Reject trailers/chunk headers alone are malformed, never evidence.
+
+    This validates presence, not the truth or quality of a finding. Nonempty
+    findings still undergo independent verification under the existing policy.
+    """
+    for line in text.splitlines():
+        line = line.strip()
+        if (not line or re.fullmatch(r"Chunk \d+/\d+:", line)
+                or re.fullmatch(r"VERDICT:\s*(?:ACCEPT|REJECT)", line)
+                or re.fullmatch(r"HEAD_SHA:\s*[0-9a-f]{7,40}", line)
+                or re.fullmatch(r"`{3}(?:[a-zA-Z]+)?|[-*_]{3,}", line)):
+            continue
+        return True
+    return False
+
+
+def _parse_review_verdict(text: str) -> tuple[str, str] | None:
+    parsed = _parse_verdict(text)
+    if parsed is not None and parsed[0] == "REJECT" and not _review_has_findings(text):
+        return None
+    return parsed
+
+
 def _latest_review_result(factory: Any, task_id: str, key: str) -> dict[str, Any] | None:
     """The succeeded review-class work result for this exact review-cycle
     key (task, PR, head sha, policy version), or None if no review has
@@ -1733,7 +1982,7 @@ def _chunk_review_rows(
         if current is None or attempt > current[0]:
             newest[base_key] = (attempt, (base_key, *row[1:]))
         result = _json_object(row[3])
-        parsed = _parse_verdict((result or {}).get("result_text") or "")
+        parsed = _parse_review_verdict((result or {}).get("result_text") or "")
         valid = first_valid.get(base_key)
         if parsed is not None and parsed[1] == snapshot.head and (
             valid is None or attempt < valid[0]
@@ -1813,7 +2062,7 @@ def _aggregate_chunk_verdict(
             waiting_reason = waiting_reason or f"review_chunk_not_succeeded:{index}:{state}"
             continue
         text = result.get("result_text") or ""
-        parsed = _parse_verdict(text)
+        parsed = _parse_review_verdict(text)
         if parsed is None:
             waiting_reason = waiting_reason or f"review_chunk_verdict_missing:{index}"
             continue
@@ -1914,22 +2163,54 @@ def _accept_marker_on_latest_review(
     live = [review for review in reviews if review.get("state") != "DISMISSED"]
     if not live:
         return False
-    latest = max(live, key=lambda r: r.get("submittedAt") or "")
+    latest = max(live, key=lambda r: r.get("submittedAt") or r.get("submitted_at") or "")
     if f"ACCEPTANCE: ACCEPT {head}" not in (latest.get("body") or ""):
         return False
     if pr_author_login is None:
         return True
-    reviewer_login = (latest.get("author") or {}).get("login")
+    reviewer_login = (
+        (latest.get("author") or {}).get("login")
+        or (latest.get("user") or {}).get("login")
+    )
     return (
         reviewer_login is not None
         and reviewer_login.casefold() != pr_author_login.casefold()
     )
 
 
-def _has_accept_marker(repo_path: str, pr_url: str) -> tuple[bool, str]:
+def _has_accept_marker(
+    repo_path: str,
+    pr_url: str,
+    pull: dict[str, Any] | None = None,
+    *,
+    rest_allowed: bool = True,
+) -> tuple[bool, str]:
     """Whether an ACCEPT marker already stands on the PR's current head --
     read-only, no gh pr merge/checks concern (that's _pr_is_mergeable's
     job). Returns (has_marker, head_sha)."""
+    parsed = _owner_repo_number_from_pr_url(pr_url)
+    if parsed is not None:
+        owner, repo, number = parsed
+        if pull is None and rest_allowed:
+            outcome, loaded = _rest_json(repo_path, f"repos/{owner}/{repo}/pulls/{number}")
+            pull = loaded if outcome == _REST_OK and isinstance(loaded, dict) else None
+        if pull is not None:
+            head = str(((pull.get("head") or {}).get("sha")) or "")
+            author_login = (pull.get("user") or {}).get("login")
+            ok, reviews = _rest_pages(
+                repo_path,
+                f"repos/{owner}/{repo}/pulls/{number}/reviews",
+                max_pages=5,
+            )
+            if (
+                ok
+                and re.fullmatch(r"[0-9a-f]{40}", head)
+                and isinstance(reviews, list)
+            ):
+                return (
+                    _accept_marker_on_latest_review(reviews, head, author_login),
+                    head,
+                )
     view = _gh(
         ["pr", "view", pr_url, "--json", "reviews,headRefOid,author"], repo_path
     )
@@ -1940,6 +2221,37 @@ def _has_accept_marker(repo_path: str, pr_url: str) -> tuple[bool, str]:
     author_login = (data.get("author") or {}).get("login")
     accept = _accept_marker_on_latest_review(data.get("reviews", []), head, author_login)
     return accept, head
+
+
+def _has_accept_marker_with_pull(
+    repo_path: str,
+    pr_url: str,
+    pull: dict[str, Any] | None,
+    *,
+    rest_allowed: bool,
+) -> tuple[bool, str]:
+    try:
+        signature = inspect.signature(_has_accept_marker)
+    except (TypeError, ValueError):
+        signature = None
+    if signature is None:
+        return _has_accept_marker(
+            repo_path, pr_url, pull, rest_allowed=rest_allowed
+        )
+    parameters = list(signature.parameters.values())
+    if any(p.kind == p.VAR_KEYWORD for p in parameters) or "rest_allowed" in signature.parameters:
+        return _has_accept_marker(
+            repo_path, pr_url, pull, rest_allowed=rest_allowed
+        )
+    accepts_varargs = any(p.kind == p.VAR_POSITIONAL for p in parameters)
+    positional = [
+        p
+        for p in parameters
+        if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+    ]
+    if accepts_varargs or len(positional) >= 3:
+        return _has_accept_marker(repo_path, pr_url, pull)
+    return _has_accept_marker(repo_path, pr_url)
 
 
 #: How many remediation links may stand above a task before the chain stops
@@ -2260,6 +2572,8 @@ def _verified_rejection_outcome(
       cleanly must never auto-accept, and parking the task forever would
       recreate exactly the stall this task exists to remove.
     """
+    if not _review_has_findings(findings):
+        return "WAIT", "review_reject_missing_findings"
     key = _verification_key(task_id, pr_url, snapshot, findings)
     if key is None or len(findings.encode("utf-8")) > _MAX_VERIFICATION_FINDINGS_BYTES:
         return "REMEDIATE", findings
@@ -2294,15 +2608,24 @@ def _verified_rejection_outcome(
         # Idempotency is scoped by (queue, idempotency_key) -- review of
         # 653963d: without the queue predicate, a same-key item in another
         # queue read as pending here and blocked this queue's enqueue.
-        "SELECT state FROM work_item "
+        "SELECT state, dead_reason FROM work_item "
         "WHERE queue = %s AND task_id = %s AND idempotency_key = %s",
         (cfg.queue, task_id, key),
     )
     if existing:
         state = str(existing[0][0])
+        dead_reason = existing[0][1]
         if state in ("ready", "claimed"):
             # Genuinely in flight: wait, costing the tick nothing.
             return "WAIT", "verification_pending"
+        # Worker refused a closed/moved pin before the model ran: never
+        # remediate or accept on that definitive staleness.
+        if (
+            state == "dead"
+            and isinstance(dead_reason, str)
+            and dead_reason.startswith("review_pin_stale:")
+        ):
+            return "WAIT", "review_pin_stale"
         # dead (retries exhausted -- review of 5443b6e) or a TERMINAL
         # succeeded/failed item whose result the lookup above could not
         # consume (missing or malformed output -- review of cadc595: a
@@ -2438,6 +2761,7 @@ def publish_review_verdicts(
     not errors."""
     cfg = cfg or ReviewConfig()
     report = LoopReport()
+    recovery_budget = [3, 1]  # fresh lookups, stale-head PRs per tick
     # Window fairness (VOYN-OPS-AICC-PUBLISH-WINDOW-STARVATION, two live
     # findings): a `LIMIT max_per_tick ORDER BY updated_at` window was
     # permanently filled by eternal skips (skips never bump updated_at --
@@ -2481,14 +2805,33 @@ def publish_review_verdicts(
             break
         prev_processed = last_processed
         last_processed = (task_id, pr_url)
-        already, current_head = _has_accept_marker(repo_path, pr_url)
+        if _repo_from_pr_url(pr_url) is None:
+            # Same shape gate as review_once -- a malformed pr_url would
+            # otherwise fail `gh pr view` and read as an ordinary
+            # `pr_view_failed`, retried forever alongside genuine transient
+            # lookup failures (VOYN-W0-AICC-REPO-ROUTE-AND-EVIDENCE-HYGIENE).
+            verdict = _clear_pr_evidence(factory, task_id, pr_url, "malformed_pr_url")
+            report.skipped.append((task_id, f"malformed_pr_url:{verdict}: {pr_url!r}"))
+            continue
+        window = _review_window_read_decision(
+            repo_path, pr_url, recovery_budget
+        )
+        if not window.allowed:
+            report.skipped.append((task_id, window.reason))
+            continue
+        already, current_head = _has_accept_marker_with_pull(
+            repo_path,
+            pr_url,
+            window.pull,
+            rest_allowed=window.reason != "review_window_lookup_failed",
+        )
         if already:
             report.skipped.append((task_id, "marker_already_posted"))
             continue
         if not current_head:
             report.skipped.append((task_id, "pr_view_failed"))
             continue
-        snapshot = _pr_diff_and_head(repo_path, pr_url)
+        snapshot = _pr_diff_and_head_with_pull(repo_path, pr_url, window.pull)
         if snapshot is None or snapshot.head != current_head:
             report.skipped.append((task_id, "pr_diff_snapshot_failed"))
             continue
@@ -2513,7 +2856,7 @@ def publish_review_verdicts(
                 report.skipped.append((task_id, "no_review_result_yet"))
                 continue
             text = result.get("result_text") or ""
-            parsed = _parse_verdict(text)
+            parsed = _parse_review_verdict(text)
             if parsed is None:
                 report.skipped.append((task_id, "verdict_or_head_sha_missing_in_review_result"))
                 continue
@@ -2650,6 +2993,30 @@ def _check_is_green(check: dict[str, Any]) -> bool:
     return False
 
 
+def _check_is_pending(check: dict[str, Any]) -> bool:
+    """A rollup entry that has not FINISHED yet: a CheckRun still QUEUED /
+    IN_PROGRESS / WAITING / PENDING / REQUESTED (no conclusion), or a legacy
+    StatusContext in state PENDING. A running check is not a verdict either
+    way -- it is not green (`_check_is_green` fails closed on it) and it is
+    not red. Live 2026-09-16 03:05 UTC: the merge tick read three checks
+    still running on an ACCEPTED head as `checks_not_green`, REJECTED the
+    task and opened an automatic remediation ("push a fix and open a new
+    pull request"); thirteen minutes later GitHub's queue merged that very
+    head (VOYN-W0-AICC-MERGE-TICK-REJECTS-ON-PENDING-CHECKS). Ambiguity
+    (`conclusion: AMBIGUOUS`, synthesised by `_latest_checks_by_name`) is
+    deliberately not pending: two disagreeing runs are a verdict problem,
+    not a timing one."""
+    # gh GraphQL serializes an unfinished CheckRun as either null or "".
+    if check.get("conclusion") not in (None, ""):
+        return False
+    status = check.get("status")
+    if status is not None:
+        return str(status).upper() in (
+            "QUEUED", "IN_PROGRESS", "WAITING", "PENDING", "REQUESTED"
+        )
+    return str(check.get("state") or "").upper() == "PENDING"
+
+
 def _latest_checks_by_name(rollup: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Return the latest run for every check name, failing closed on ambiguity.
 
@@ -2668,12 +3035,18 @@ def _latest_checks_by_name(rollup: list[dict[str, Any]]) -> list[dict[str, Any]]
             continue
         previous_at = previous.get("startedAt") or previous.get("completedAt")
         current_at = check.get("startedAt") or check.get("completedAt")
-        if not previous_at or not current_at:
-            ambiguous.add(name)
+        if not previous_at or not current_at or str(current_at) == str(previous_at):
+            # Two runs of one check that cannot be ordered are ambiguous only
+            # when they DISAGREE: a green and a red twin hide a verdict, and
+            # the tick must not guess which is newer. Twins that agree carry
+            # one verdict between them (live 2026-09-15, #974: the label-noise
+            # placeholder job -- one expression-shaped name shared by every
+            # skipped run -- had several SKIPPED runs started in the same
+            # second, and the ACCEPTED PR sat unmergeable on "AMBIGUOUS").
+            if _check_is_green(previous) != _check_is_green(check):
+                ambiguous.add(name)
             continue
-        if str(current_at) == str(previous_at):
-            ambiguous.add(name)
-        elif str(current_at) > str(previous_at):
+        if str(current_at) > str(previous_at):
             latest[name] = check
     for name in ambiguous:
         latest[name] = {"name": name, "conclusion": "AMBIGUOUS"}
@@ -2716,19 +3089,195 @@ def _pr_is_mergeable(
     accept = _accept_marker_on_latest_review(data.get("reviews", []), head, author_login)
     if not accept:
         return False, "no_accept_marker_on_head"
-    rollup = _latest_checks_by_name(data.get("statusCheckRollup") or [])
-    bad = [c.get("name", "?") for c in rollup if not _check_is_green(c)]
-    if bad:
-        rerun = _rerun_cancelled_latest_runs(repo_path, rollup)
+    raw_rollup = data.get("statusCheckRollup") or []
+    rollup = _latest_checks_by_name(raw_rollup)
+    # Three states, not two: a check that FAILED is a verdict (rerun a
+    # cancelled one, otherwise report it red -- the callers turn that into a
+    # bounded flake rerun and then a remediation); a check that is still
+    # RUNNING is a timing fact (report it pending -- the callers wait; no
+    # rerun, no remediation, no task transition); only a check that finished
+    # green counts toward mergeability. A red check beside a running one is
+    # still red: the verdict does not wait for the siblings.
+    red = [
+        c.get("name", "?")
+        for c in rollup
+        if not _check_is_green(c) and not _check_is_pending(c)
+    ]
+    if red:
+        rerun = _rerun_cancelled_latest_runs(repo_path, rollup, head)
         if rerun:
             return False, f"checks_cancelled_rerun_requested: {rerun[:3]}"
-        return False, f"checks_not_green: {bad[:3]}"
+        return False, f"checks_not_green: {red[:3]}"
+    pending = [c.get("name", "?") for c in rollup if _check_is_pending(c)]
+    if pending:
+        return False, f"checks_pending: {pending[:3]}"
     present = {str(c.get("name") or "") for c in rollup}
     missing = [name for name in required_checks if name not in present]
     if missing:
         return False, f"checks_missing: {missing[:3]}"
+    # Superseded failures are not retry candidates. Re-running them can
+    # cancel their successful or pending replacements through workflow
+    # concurrency. GitHub's native merge protection remains authoritative.
     return True, head
 
+
+# The live contents of one branch's merge queue. Deliberately the same query
+# shape `scripts/assert_independent_acceptance.py` runs on every `merge_group`
+# event, so the fleet reads the queue through a surface that is already
+# exercised against the live repository on every queued build.
+_MERGE_QUEUE_ENTRIES_QUERY = """
+query($owner: String!, $name: String!, $branch: String!) {
+  repository(owner: $owner, name: $name) {
+    mergeQueue(branch: $branch) {
+      entries(first: 100) {
+        nodes { position state pullRequest { number } }
+      }
+    }
+  }
+}
+"""
+
+
+def _pr_base_ref(repo_path: str, pr_url: str) -> str:
+    """The branch the PR targets -- i.e. WHICH merge queue it would sit in.
+    "" when the lookup fails or says nothing."""
+    view = _gh(
+        ["pr", "view", pr_url, "--json", "baseRefName", "--jq", ".baseRefName"],
+        repo_path,
+    )
+    if view.returncode != 0:
+        return ""
+    return view.stdout.strip()
+
+
+def _merge_queue_entries(
+    repo_path: str, owner: str, repo: str, branch: str
+) -> dict[int, tuple[str, int | None]] | None:
+    """``{pr_number: (state, position)}`` for `branch`'s merge queue, ``{}``
+    when the branch has no queue, and None when the answer is unknown (a
+    failed, unparseable or errored lookup).
+
+    Only the first 100 entries are read. A queue longer than that is far past
+    anything `maximumEntriesToBuild` builds at once, and a PR beyond the page
+    simply reads as "not queued", which is the pre-queue behaviour -- never a
+    wrong claim that something IS queued.
+    """
+    result = _gh(
+        [
+            "api", "graphql",
+            "-f", f"query={_MERGE_QUEUE_ENTRIES_QUERY}",
+            "-f", f"owner={owner}",
+            "-f", f"name={repo}",
+            "-f", f"branch={branch}",
+        ],
+        repo_path,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        payload = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError:
+        return None
+    # GraphQL reports a rejected query with HTTP 200 + `errors`, which `gh`
+    # may or may not turn into a non-zero exit. An errored response says
+    # nothing about queue membership: unknown, not "not queued".
+    if not isinstance(payload, dict) or payload.get("errors"):
+        return None
+    data = payload.get("data")
+    repository = data.get("repository") if isinstance(data, dict) else None
+    if not isinstance(repository, dict):
+        return None
+    queue = repository.get("mergeQueue")
+    if queue is None:
+        return {}  # no merge queue on this branch -- merge as before
+    connection = queue.get("entries") if isinstance(queue, dict) else None
+    nodes = connection.get("nodes") if isinstance(connection, dict) else None
+    if not isinstance(nodes, list):
+        return None
+    entries: dict[int, tuple[str, int | None]] = {}
+    for node in nodes:
+        if not isinstance(node, dict):
+            return None
+        pull = node.get("pullRequest")
+        number = pull.get("number") if isinstance(pull, dict) else None
+        if not isinstance(number, int):
+            continue
+        state = node.get("state")
+        position = node.get("position")
+        entries[number] = (
+            state if isinstance(state, str) else "",
+            position if isinstance(position, int) else None,
+        )
+    return entries
+
+
+def _merge_queue_wait(
+    repo_path: str,
+    pr_url: str,
+    cache: dict[tuple[str, str, str], dict[int, tuple[str, int | None]] | None]
+    | None = None,
+) -> str | None:
+    """A skip reason when the PR is ALREADY sitting in its base branch's merge
+    queue, else None -- meaning "not queued, or unknown; act on it as before"
+    (VOYN-W0-AICC-MERGE-QUEUE-ENABLE).
+
+    The queue landed on `main` on 2026-08-23 (squash, five entries built at
+    once). A queued entry is not idle work: GitHub is building the prospective
+    merged result of this PR on top of everything ahead of it, and the only
+    correct move is to wait. The merge tick could not tell that state apart
+    from "accepted, green, unmerged", so it treated every queued entry as work
+    on every tick, which costs two things this loop cannot afford:
+
+    * A merge action out of `max_per_tick` per queued PR per tick, spent on
+      `gh pr merge` for a PR already in the queue. With five entries building
+      and a budget of eight, most of a tick's mutation budget went on
+      re-enqueueing PRs that were already queued, starving the accepted PRs
+      behind them -- the merge stage idling while work waits.
+    * Worse, `gh pr update-branch` on a queued-but-BEHIND entry, which pushes
+      a new head. A new head evicts the entry from the queue AND invalidates
+      its head-keyed review (`review:<task>:<pr>:<head_sha>:<policy>`), so the
+      tick tore out entries the queue was already testing and paid for a full
+      re-review plus a full CI run to get back to where it started.
+
+    `cache` is one tick's queue snapshots keyed by (owner, repo, branch): with
+    several entries queued on the same branch, the queue is read once per tick
+    rather than once per PR.
+
+    Fail-open by construction: a failed lookup, an errored or malformed
+    response, and a branch with no merge queue at all all return None, which
+    is exactly the pre-queue behaviour -- merge as before. Queue awareness can
+    only ever remove redundant actions, never block a merge that would
+    otherwise happen.
+    """
+    parsed = _owner_repo_number_from_pr_url(pr_url)
+    if parsed is None:
+        return None
+    owner, repo, number = parsed
+    branch = _pr_base_ref(repo_path, pr_url)
+    if not branch:
+        return None
+    key = (owner, repo, branch)
+    if cache is not None and key in cache:
+        entries = cache[key]
+    else:
+        entries = _merge_queue_entries(repo_path, owner, repo, branch)
+        if cache is not None:
+            cache[key] = entries
+    if not entries:
+        return None
+    entry = entries.get(int(number))
+    if entry is None:
+        return None
+    state, position = entry
+    detail = ",".join(
+        part
+        for part in (
+            f"state={state}" if state else "",
+            f"position={position}" if position is not None else "",
+        )
+        if part
+    )
+    return f"awaiting_merge_queue:{detail}" if detail else "awaiting_merge_queue"
 
 #: A cancelled latest check is not a verdict on the code: it is what a
 #: superseded, pruned or label-noise run leaves behind (all three observed
@@ -2743,36 +3292,74 @@ _MAX_RUN_ATTEMPTS_FOR_RERUN = 3
 _RUN_ID_IN_DETAILS_URL = re.compile(r"/actions/runs/(\d+)(?:/|$)")
 
 
+def _latest_workflow_runs(repo_path: str, head: str) -> list[dict[str, Any]]:
+    """Select one newest run per workflow on this exact head before retrying.
+
+    A job rollup can still show an old cancelled check while a replacement
+    workflow has not emitted that job yet. Workflow-level state is therefore
+    needed even after `_latest_checks_by_name`. Missing metadata means no
+    retry, never permission to rerun an arbitrary historical failure. A
+    newer skipped label-noise run also suppresses old retries conservatively;
+    GitHub protection, not retrying history, decides whether merge can proceed.
+    """
+    if not re.fullmatch(r"[0-9a-f]{40}", head):
+        return []
+    listing = _gh(
+        ["run", "list", "--commit", head, "--limit", "100", "--json",
+         "databaseId,headSha,workflowName,createdAt,status,conclusion,attempt"],
+        repo_path,
+    )
+    if listing.returncode != 0:
+        return []
+    try:
+        runs = json.loads(listing.stdout or "[]")
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(runs, list):
+        return []
+    latest: dict[str, dict[str, Any]] = {}
+    for run in runs:
+        if not isinstance(run, dict):
+            return []
+        if run.get("headSha") != head:
+            continue
+        name, created = run.get("workflowName"), run.get("createdAt")
+        run_id = run.get("databaseId")
+        if (not isinstance(name, str) or not name
+                or not isinstance(created, str) or not created
+                or not isinstance(run_id, int) or isinstance(run_id, bool)):
+            return []
+        previous = latest.get(name)
+        if previous is None or (created, run_id) > (
+            previous["createdAt"], previous["databaseId"]
+        ):
+            latest[name] = run
+    return list(latest.values())
+
+
 def _rerun_cancelled_latest_runs(
-    repo_path: str, latest_checks: list[dict[str, Any]]
+    repo_path: str, latest_checks: list[dict[str, Any]], head: str
 ) -> list[str]:
-    """Ask GitHub to rerun every workflow run whose LATEST check on the head
-    ended `CANCELLED`, at most `_MAX_RERUNS_PER_PR_PER_TICK` runs and only
-    while the run has fewer than `_MAX_RUN_ATTEMPTS_FOR_RERUN` attempts.
-    Returns the run ids a rerun was requested for. Idempotent by
-    construction: after the request the latest check is queued, not
-    cancelled, so the next tick does not ask again."""
-    run_ids: list[str] = []
+    """Retry only cancelled latest workflows, never their obsolete jobs."""
+    candidates = set()
     for check in latest_checks:
         if str(check.get("conclusion") or "").upper() != "CANCELLED":
             continue
         match = _RUN_ID_IN_DETAILS_URL.search(str(check.get("detailsUrl") or ""))
-        if match is None or match.group(1) in run_ids:
-            continue
-        run_ids.append(match.group(1))
+        if match is not None:
+            candidates.add(match.group(1))
+    if not candidates:
+        return []
     requested: list[str] = []
-    for run_id in run_ids:
+    for run in _latest_workflow_runs(repo_path, head):
+        run_id, attempt = str(run["databaseId"]), run.get("attempt")
+        if (run_id not in candidates or run.get("status") != "completed"
+                or run.get("conclusion") != "cancelled"
+                or not isinstance(attempt, int)
+                or not 1 <= attempt < _MAX_RUN_ATTEMPTS_FOR_RERUN):
+            continue
         if len(requested) >= _MAX_RERUNS_PER_PR_PER_TICK:
             break
-        view = _gh(["run", "view", run_id, "--json", "attempt"], repo_path)
-        if view.returncode != 0:
-            continue
-        try:
-            attempt = int((json.loads(view.stdout or "{}") or {}).get("attempt") or 0)
-        except (ValueError, TypeError, json.JSONDecodeError):
-            continue
-        if attempt >= _MAX_RUN_ATTEMPTS_FOR_RERUN:
-            continue
         rerun = _gh(["run", "rerun", run_id], repo_path)
         if rerun.returncode == 0:
             requested.append(run_id)
@@ -2800,6 +3387,128 @@ def _merge_state(repo_path: str, pr_url: str) -> str:
     if not isinstance(data, dict) or data.get("state") != "OPEN":
         return ""
     return str(data.get("mergeStateStatus") or "")
+
+
+def _pr_window_expensive_read_decision(
+    repo_path: str, pr_url: str, *, prefix: str
+) -> _PrWindowReadDecision:
+    """Whether a hot loop should spend expensive PR detail reads.
+
+    The PR-window reconciler is the cheap, REST-backed backlog triage pass.
+    Review and merge ticks should honor that triage and spend heavier PR
+    detail reads only on the active merge/review window. If the lightweight
+    lookup fails, fail open: stranding a READY_TO_REVIEW task because labels
+    could not be read would be worse than one conservative expensive read.
+    """
+    parsed = _owner_repo_number_from_pr_url(pr_url)
+    if parsed is None:
+        return _PrWindowReadDecision(True, "pr_url_unparseable")
+    if not Path(repo_path).exists():
+        return _PrWindowReadDecision(True, f"{prefix}_lookup_failed")
+    owner, repo, number = parsed
+    outcome, pull = _rest_json(repo_path, f"repos/{owner}/{repo}/pulls/{number}")
+    if outcome != _REST_OK or not isinstance(pull, dict):
+        return _PrWindowReadDecision(True, f"{prefix}_lookup_failed")
+    if str(pull.get("state") or "").lower() != "open" or pull.get("merged_at"):
+        return _PrWindowReadDecision(True, "pr_not_open", pull)
+    raw_labels = pull.get("labels")
+    if not isinstance(raw_labels, list):
+        return _PrWindowReadDecision(True, f"{prefix}_labels_missing", pull)
+    labels = {
+        str(label.get("name") or "")
+        for label in raw_labels
+        if isinstance(label, dict)
+    }
+    if _QUEUE_ACTIVE_LABEL in labels or DEFAULT_PR_WINDOW_CONFIG.label_active in labels:
+        return _PrWindowReadDecision(True, f"{prefix}_active", pull)
+    return _PrWindowReadDecision(False, f"{prefix}_inactive", pull)
+
+
+def _review_window_read_decision(
+    repo_path: str, pr_url: str, budget: list[int]
+) -> _PrWindowReadDecision:
+    """Heal one missing exact-head review without granting a merge slot.
+
+    Age or the self-dependent acceptance job cannot permanently prevent
+    the independent review needed to leave the stale-acceptance state. This opt-in path is model-review only;
+    merge/window policy, exact-head checks and publication checks stay intact.
+    """
+    normal = _pr_window_expensive_read_decision(repo_path, pr_url, prefix="review_window")
+    if normal.allowed or os.environ.get("AICC_REVIEW_STALE_RECOVERY") != "1":
+        return normal
+    if budget[0] <= 0 or budget[1] <= 0:
+        return normal
+    pull = normal.pull or {}
+    labels = {x.get("name") for x in pull.get("labels", []) if isinstance(x, dict)}
+    if DEFAULT_PR_WINDOW_CONFIG.label_blocked not in labels:
+        return normal
+    budget[0] -= 1
+    view = _gh(["pr", "view", pr_url, "--json",
+                "state,headRefOid,author,reviews,statusCheckRollup,mergeStateStatus"], repo_path)
+    if view.returncode:
+        return normal
+    try:
+        data = json.loads(view.stdout)
+    except (ValueError, TypeError):
+        return normal
+    raw_head = pull.get("head")
+    head = raw_head.get("sha") if isinstance(raw_head, dict) else None
+    if not isinstance(data, dict) or data.get("state") != "OPEN" or not re.fullmatch(r"[0-9a-f]{40}", str(head or "")) or data.get("headRefOid") != head:
+        return normal
+    author = data.get("author")
+    reviews = data.get("reviews")
+    rollup = data.get("statusCheckRollup")
+    if not isinstance(author, dict) or not author.get("login") or not isinstance(reviews, list) or any(not isinstance(x, dict) for x in reviews) or not isinstance(rollup, list) or any(not isinstance(x, dict) for x in rollup):
+        return normal
+    if str(data.get("mergeStateStatus") or "").upper() == "DIRTY":
+        return normal
+    if _independent_latest_reject_marker(reviews, head, author["login"]):
+        return normal
+    if any(x.get("state") == "CHANGES_REQUESTED" and (x.get("commit") or {}).get("oid", head) == head for x in reviews):
+        return normal
+    if _accept_marker_on_latest_review(reviews, head, author["login"]):
+        return normal
+    checks = _latest_checks_by_name(rollup)
+    by_name = {str(x.get("name") or ""): x for x in checks}
+    acceptance = "Acceptance gate (independent verdict on exact SHA)"
+    # Acceptance depends on this review. All code/security gates must already
+    # succeed; the merge path still requires acceptance itself to succeed too.
+    required = [name for name in _DEFAULT_REQUIRED_MERGE_CHECKS if name != acceptance]
+    if any(name not in by_name or (by_name[name].get("conclusion") or by_name[name].get("state")) != "SUCCESS" for name in required):
+        return normal
+    if not checks or any(not _check_is_green(check) for check in checks if check.get("name") != acceptance):
+        return normal
+    budget[1] -= 1
+    # Preserve the REST snapshot: downstream diff and worker guards revalidate
+    # this open PR and exact head before inference, publication and merge.
+    return _PrWindowReadDecision(True, "review_stale_head_recovery", pull)
+
+
+def _merge_window_allows_expensive_read(repo_path: str, pr_url: str) -> tuple[bool, str]:
+    """Whether merge_once should spend GraphQL detail reads on this PR."""
+    decision = _pr_window_expensive_read_decision(
+        repo_path, pr_url, prefix="merge_window"
+    )
+    return decision.allowed, decision.reason
+
+
+def _merge_window_open_pr_snapshot(
+    repo_path: str,
+) -> tuple[dict[int, dict[str, Any]] | None, str | None]:
+    """Lightweight open-PR labels for one merge tick.
+
+    This is a cache, not an authority. If the listing fails, or a READY task
+    points at a PR not present in the open list, merge_once falls back to the
+    precise per-PR lookup so already-merged PRs can still be completed.
+    """
+    prs, failure = _list_open_pulls(repo_path, DEFAULT_PR_WINDOW_CONFIG)
+    if prs is None:
+        return None, failure
+    return {
+        int(pr["number"]): pr
+        for pr in prs
+        if isinstance(pr.get("number"), int)
+    }, None
 
 
 def _merged_target_sha(repo_path: str, pr_url: str) -> tuple[str | None, str]:
@@ -2854,9 +3563,146 @@ def _merged_target_sha(repo_path: str, pr_url: str) -> tuple[str | None, str]:
     return oid, ""
 
 
+_EXPECTED_CHECK_RE = re.compile(
+    r'required status checks?(?: "[^"]+")? (?:is|are) expected', re.IGNORECASE
+)
+
+
+def _ensure_merge_queue_entry(
+    repo_path: str, pr_url: str, head: str, merge_token: str
+) -> tuple[bool, str]:
+    """Verify/enqueue the accepted exact head using only the merge identity.
+
+    A successful ``gh pr merge`` can mean auto-merge enabled, not queued.
+    GitHub's enqueue error also exposes skipped-suite shadowing that a green
+    head check rollup hides. Unknown responses never claim queue membership.
+    """
+    parsed = _owner_repo_number_from_pr_url(pr_url)
+    if parsed is None or not re.fullmatch(r"[0-9a-f]{40}", head):
+        return False, "merge_queue_lookup_failed"
+    owner, repo, number = parsed
+    query = (
+        'query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo)'
+        '{pullRequest(number:$number){id state headRefOid isInMergeQueue}}}'
+    )
+    view = _gh(["api", "graphql", "-f", f"query={query}", "-F", f"owner={owner}",
+                "-F", f"repo={repo}", "-F", f"number={number}"], repo_path)
+    try:
+        pull = json.loads(view.stdout)["data"]["repository"]["pullRequest"]
+        if view.returncode or not isinstance(pull, dict) or not pull.get("id"):
+            return False, "merge_queue_lookup_failed"
+        if pull.get("state") != "OPEN" or pull.get("headRefOid") != head:
+            return False, "merge_queue_head_or_state_changed"
+        if pull.get("isInMergeQueue") is True:
+            return True, "merge_queued_awaiting_target"
+    except (ValueError, KeyError, TypeError):
+        return False, "merge_queue_lookup_failed"
+    mutation = (
+        'mutation($id:ID!,$head:GitObjectID!){enqueuePullRequest(input:'
+        '{pullRequestId:$id,expectedHeadOid:$head}){mergeQueueEntry{state}}}'
+    )
+    enqueue = subprocess.run(
+        ["gh", "api", "graphql", "-f", f"query={mutation}", "-F", f"id={pull['id']}",
+         "-F", f"head={head}"], cwd=repo_path, capture_output=True, text=True,
+        check=False, timeout=120, env={**os.environ, "GH_TOKEN": merge_token},
+    )
+    messages = []
+    try:
+        payload = json.loads(enqueue.stdout or "{}")
+        if not isinstance(payload, dict):
+            return False, "merge_enqueue_response_invalid"
+        messages = [str(e["message"]) for e in payload.get("errors", [])
+                    if isinstance(e, dict) and e.get("message")]
+        entry = ((payload.get("data") or {}).get("enqueuePullRequest") or {}).get("mergeQueueEntry")
+        if enqueue.returncode == 0 and not messages and isinstance(entry, dict) and entry.get("state"):
+            return True, "merge_enqueued_awaiting_target"
+    except (ValueError, TypeError, AttributeError):
+        pass
+    if not messages:
+        messages = [enqueue.stderr.strip() or "missing queue entry"]
+    expected = next((message for message in messages if _EXPECTED_CHECK_RE.search(message)), None)
+    if expected:
+        return False, f"required_check_expected: {expected[:160]}"
+    return False, f"enqueue_refused: {' | '.join(messages)[:160]}"
+
+
+def _claim_gate_retrigger(factory: Any, task_id: str, pr_url: str, head: str) -> bool:
+    """Durably reserve one attempt per PR/head before any label mutation.
+
+    The old #997 timeline heuristic confused initial window admission with a
+    retry. Provenance identifies this particular action; an advisory lock
+    serializes different tasks pointing at the same PR without table writes.
+    A crash or failed label write consumes the attempt rather than looping CI.
+    """
+    if not re.fullmatch(r"[0-9a-f]{40}", head):
+        return False
+    with factory() as conn:
+        conn.autocommit = False
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT pg_try_advisory_xact_lock(hashtextextended(%s,0))",
+                            (f"aicc:gate-retrigger:{pr_url}:{head}",))
+                if not cur.fetchone()[0]:
+                    return False
+                cur.execute(
+                    "SELECT EXISTS (SELECT 1 FROM backlog_event WHERE event='provenance' "
+                    "AND outcome='granted' AND reason='merge_gate_retrigger' "
+                    "AND detail->>'pr_url'=%s AND detail->>'head_sha'=%s)", (pr_url, head),
+                )
+                if cur.fetchone()[0]:
+                    return False
+                cur.execute("SELECT backlog_record_provenance(%s,'merge_gate_retrigger',%s::jsonb)",
+                            (task_id, json.dumps({"pr_url": pr_url, "head_sha": head, "attempt": 1})))
+                if not cur.fetchone()[0]:
+                    return False
+            conn.commit()
+            return True
+        finally:
+            # Also releases the advisory lock on every refusal/exception.
+            conn.rollback()
+
+
+def _recover_expected_gate(
+    factory: Any, repo_path: str, task_id: str, pr_url: str, head: str,
+    cfg: ReviewConfig, budget: list[int], reason: str,
+) -> str:
+    if budget[0] <= 0:
+        return reason + "; gate_retrigger_tick_capped"
+    if not _claim_gate_retrigger(factory, task_id, pr_url, head):
+        return reason + "; gate_retrigger_already_attempted"
+    budget[0] -= 1
+    retriggered = _retrigger_pr_gates(repo_path, pr_url, cfg.gate_retrigger_label, head)
+    return reason + ("; gates_retriggered" if retriggered else "; gate_retrigger_failed")
+
+
+def _retrigger_pr_gates(repo_path: str, pr_url: str, label: str, head: str) -> bool:
+    """Re-enter the window on the unchanged head; never invent a green check."""
+    parsed = _owner_repo_number_from_pr_url(pr_url)
+    if parsed is None:
+        return False
+    owner, repo, number = parsed
+    view = _gh(["api", f"repos/{owner}/{repo}/pulls/{number}"], repo_path)
+    try:
+        pull = json.loads(view.stdout)
+        if view.returncode or pull.get("state") != "open" or pull.get("head", {}).get("sha") != head:
+            return False
+        labels = pull.get("labels")
+        if not isinstance(labels, list):
+            return False
+    except (ValueError, AttributeError):
+        return False
+    endpoint = f"repos/{owner}/{repo}/issues/{number}/labels"
+    if any(isinstance(item, dict) and item.get("name") == label for item in labels):
+        removed = _gh(["api", "--method", "DELETE", f"{endpoint}/{urllib.parse.quote(label, safe='')}"], repo_path)
+        if removed.returncode:
+            return False
+    added = _gh(["api", "--method", "POST", endpoint, "-f", f"labels[]={label}"], repo_path)
+    return added.returncode == 0
+
+
 def _rerun_failed_ci_once(repo_path: str, pr_url: str) -> str:
     """Bounded flake retry (VOYN-W0-AICC-CI-FLAKE-AUTO-RERUN): rerun the
-    FAILED jobs of completed-and-failed workflow runs on the PR's current
+    FAILED jobs of the newest completed-and-failed workflow on the current
     head, at most once per run -- GitHub's own run ``attempt`` counter is
     the bound (a run already at attempt >= 2 is never touched again), so a
     genuinely red change costs exactly one extra bounded rerun and can
@@ -2874,19 +3720,10 @@ def _rerun_failed_ci_once(repo_path: str, pr_url: str) -> str:
     branch, head = data.get("headRefName"), data.get("headRefOid")
     if not branch or not head:
         return ""
-    listing = _gh(
-        ["run", "list", "--branch", str(branch), "--limit", "20",
-         "--json", "databaseId,headSha,status,conclusion,attempt"],
-        repo_path,
-    )
-    if listing.returncode != 0:
-        return ""
-    try:
-        runs = json.loads(listing.stdout or "[]")
-    except json.JSONDecodeError:
-        return ""
     dispatched = 0
-    for run in runs if isinstance(runs, list) else []:
+    for run in _latest_workflow_runs(repo_path, str(head)):
+        if dispatched >= _MAX_RERUNS_PER_PR_PER_TICK:
+            break
         if (
             isinstance(run, dict)
             and run.get("headSha") == head
@@ -3148,6 +3985,282 @@ def _carry_over_marker_if_patch_id_stable(
     return ok
 
 
+def _pull_for_pr_url(repo_path: str, pr_url: str) -> dict[str, Any] | None:
+    parsed = _owner_repo_number_from_pr_url(pr_url)
+    if parsed is None:
+        return None
+    owner, repo, number = parsed
+    outcome, pull = _rest_json(repo_path, f"repos/{owner}/{repo}/pulls/{number}")
+    return pull if outcome == _REST_OK and isinstance(pull, dict) else None
+
+
+def _enqueue_review_refresh(
+    enqueue: Any,
+    repo_path: str,
+    task_id: str,
+    pr_url: str,
+    pull: dict[str, Any] | None,
+    cfg: ReviewConfig,
+) -> str | None:
+    """Enqueue exact-head review even when the PR-window label is blocked.
+
+    This is the hands-off equivalent of an operator saying "the old ACCEPT is
+    stale; review the current head again". It deliberately reuses the normal
+    review payload, review key, chunking, model-only cascade and repo routing,
+    but skips the active-window gate because stale blocked tails are exactly
+    what this remediation tick exists to drain.
+    """
+    if enqueue is None:
+        return "review_enqueue_unavailable"
+    cascade = _model_only_review_cascade()
+    if not cascade:
+        return "no_review_executor_route"
+    from command_center.orchestrator.planner import repo_route
+
+    repo = _repo_from_pr_url(pr_url)
+    route = repo_route(repo) if repo else None
+    if route is None:
+        return f"no_repo_route: {pr_url!r}"
+    snapshot = _pr_diff_and_head_with_pull(repo_path, pr_url, pull)
+    if snapshot is None:
+        return "pr_diff_fetch_failed"
+    key = _review_key(task_id, pr_url, snapshot)
+    if key is None:
+        return "review_key_invalid"
+    try:
+        chunks = _review_chunks(snapshot, task_id, pr_url)
+    except (RuntimeError, ValueError) as exc:
+        return f"review_prompt_budget_invalid: {exc}"
+    project_id, repository_path = route
+    parsed_url = _owner_repo_number_from_pr_url(pr_url)
+    if parsed_url is None:
+        return "review_key_invalid"
+    for chunk in chunks:
+        prompt = _render_review_prompt(task_id, pr_url, snapshot, chunk)
+        payload = {
+            "kind": "agent_run",
+            "v": 1,
+            "project_id": project_id,
+            "repository_path": repository_path,
+            "task_type": "independent_review",
+            "prompt": prompt,
+            "timeout_seconds": cfg.review_timeout,
+            "untrusted": True,
+            "cascade": cascade,
+            "review_head": {
+                "pr_number": parsed_url[2],
+                "head_sha": snapshot.head,
+            },
+        }
+        review_key = key
+        if chunk.count != 1:
+            chunk_key = _chunk_review_key(task_id, pr_url, snapshot, chunk)
+            if chunk_key is None:
+                return "review_key_invalid"
+            review_key = chunk_key
+            payload["review_chunk"] = {
+                "version": 3,
+                "index": chunk.index,
+                "count": chunk.count,
+                "content_bytes": len(chunk.text.encode("utf-8")),
+                "content_hash": chunk.content_hash,
+                "manifest_hash": chunk.manifest_hash,
+                "base_sha": snapshot.base,
+                "head_sha": snapshot.head,
+                "diff_hash": snapshot.digest,
+            }
+        enqueue(cfg.queue, review_key, payload, task_id, len(cascade))
+    return None
+
+
+def _remediate_merge_blocker(
+    factory: Any,
+    task_id: str,
+    pr_url: str,
+    head: str,
+    reason: str,
+) -> str | None:
+    body = (
+        "Automatic merge remediation requested.\n\n"
+        f"PR: {pr_url}\n"
+        f"HEAD_SHA: {head}\n"
+        f"BLOCKER: {reason}\n\n"
+        "Fix the blocker on a follow-up branch and open a new pull request. "
+        "The original accepted PR is left as evidence and superseded by this "
+        "remediation task; the normal review, acceptance and merge gates still "
+        "apply to the follow-up."
+    )
+    return _remediate_rejection(factory, task_id, pr_url, head, body)
+
+
+def _autonomy_window_config(cfg: ReviewConfig) -> PrWindowConfig:
+    base = DEFAULT_PR_WINDOW_CONFIG
+    return PrWindowConfig(
+        label_active=base.label_active,
+        label_waiting=base.label_waiting,
+        label_blocked=base.label_blocked,
+        max_active=base.max_active,
+        scan_limit=base.scan_limit,
+        scan_hard_cap=base.scan_hard_cap,
+        detail_budget=base.detail_budget,
+        blocked_refresh_budget=base.blocked_refresh_budget,
+        stale_seconds=base.stale_seconds,
+        required_checks=cfg.required_checks,
+    )
+
+
+def autonomy_remediate_once(
+    factory: Any,
+    enqueue: Any,
+    repo_path: str,
+    cfg: ReviewConfig | None = None,
+    *,
+    task_id: str | None = None,
+) -> AutonomyRemediationReport:
+    """Drain blocked review PRs without weakening merge gates.
+
+    The ordinary PR-window tick labels blocked tails, review ticks only process
+    active PRs, and merge ticks intentionally refuse red/conflicted accepted
+    PRs. This tick is the bounded hygiene loop between them:
+
+    * stale/missing exact-head acceptance -> enqueue a normal review for the
+      current head, bypassing only the active-window label;
+    * accepted red/cancelled checks -> ask GitHub for one bounded rerun;
+    * accepted red checks after the bounded rerun, or merge conflicts -> spawn
+      the existing capped remediation task chain.
+
+    It never posts an ACCEPT marker directly and never merges a PR.
+    """
+    cfg = cfg or ReviewConfig()
+    report = AutonomyRemediationReport()
+    with gh_access.tick(repo_path, allow_ambient_fallback=False) as quota:
+        report.quota = quota
+        if task_id is not None:
+            tasks, scan_token = _rows(
+                factory,
+                "SELECT t.task_id, e.value FROM backlog_task t "
+                "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
+                "WHERE t.status = 'READY_TO_REVIEW' AND t.task_id = %s "
+                "ORDER BY e.value LIMIT %s",
+                (task_id, cfg.max_per_tick),
+            ), None
+        else:
+            tasks, scan_token = _scan_tasks(
+                factory,
+                "scan:autonomy_remediate_once",
+                "SELECT t.task_id, e.value FROM backlog_task t "
+                "JOIN backlog_evidence e ON e.task_id = t.task_id AND e.kind = 'pr' "
+                "WHERE t.status = 'READY_TO_REVIEW' "
+                "AND (t.task_id, e.value) > (%s, %s) "
+                "ORDER BY t.task_id, e.value LIMIT %s",
+                (),
+                cfg.scan_cap,
+            )
+        window_cfg = _autonomy_window_config(cfg)
+        cache = gh_access.detail_cache()
+        actions = 0
+        last_processed = None
+        for current_task_id, pr_url in tasks:
+            if actions >= cfg.max_per_tick:
+                break
+            last_processed = (current_task_id, pr_url)
+            pull = _pull_for_pr_url(repo_path, pr_url)
+            light = _light_pr_from_rest(pull)
+            if pull is None or light is None:
+                report.skipped.append((current_task_id, "pr_lookup_failed"))
+                continue
+            detailed = _pr_window_details(
+                repo_path, light, cache, refresh=True, include_reviews=True
+            )
+            if detailed is None:
+                report.skipped.append((current_task_id, "pr_detail_lookup_failed"))
+                continue
+            parsed = _owner_repo_number_from_pr_url(pr_url)
+            if parsed is not None:
+                merge_state = _rest_merge_state(
+                    repo_path, parsed[0], parsed[1], int(parsed[2])
+                )
+                if merge_state:
+                    detailed["mergeStateStatus"] = merge_state
+            age_seconds, _fell_back = _pr_age_seconds(repo_path, detailed, now=time.time())
+            window_reason = _window_block_reason(
+                detailed, window_cfg, age_seconds=age_seconds
+            )
+            accepted, head = _has_accept_marker_with_pull(
+                repo_path, pr_url, pull, rest_allowed=True
+            )
+            if not head:
+                head = str(detailed.get("headRefOid") or "")
+            if not accepted:
+                if window_reason in (
+                    "stale_exact_head_acceptance",
+                    "checks_stale",
+                    "checks_missing",
+                    None,
+                ):
+                    reason = _enqueue_review_refresh(
+                        enqueue, repo_path, current_task_id, pr_url, pull, cfg
+                    )
+                    if reason is None:
+                        report.refreshed.append((current_task_id, pr_url))
+                        actions += 1
+                    else:
+                        report.skipped.append((current_task_id, reason))
+                    continue
+                report.skipped.append((current_task_id, window_reason or "not_blocked"))
+                continue
+            ready, merge_detail = _pr_is_mergeable(
+                repo_path, pr_url, cfg.required_checks
+            )
+            if ready:
+                report.skipped.append((current_task_id, "merge_ready"))
+                continue
+            if merge_detail.startswith(("checks_not_green", "checks_cancelled")):
+                rerun = _rerun_failed_ci_once(repo_path, pr_url)
+                if rerun:
+                    report.rerun.append((current_task_id, rerun))
+                    actions += 1
+                    continue
+                if head:
+                    new_task_id = _remediate_merge_blocker(
+                        factory, current_task_id, pr_url, head, merge_detail
+                    )
+                    if new_task_id:
+                        report.remediated.append((current_task_id, new_task_id))
+                        actions += 1
+                    else:
+                        report.skipped.append(
+                            (current_task_id, "merge_blocker_remediation_already_dispatched")
+                        )
+                    continue
+            if (
+                head
+                and (
+                    window_reason == "merge_conflict"
+                    or merge_detail == "branch_dirty_needs_rebase"
+                )
+            ):
+                new_task_id = _remediate_merge_blocker(
+                    factory,
+                    current_task_id,
+                    pr_url,
+                    head,
+                    window_reason or merge_detail,
+                )
+                if new_task_id:
+                    report.remediated.append((current_task_id, new_task_id))
+                    actions += 1
+                else:
+                    report.skipped.append(
+                        (current_task_id, "merge_conflict_remediation_already_dispatched")
+                    )
+                continue
+            report.skipped.append((current_task_id, merge_detail))
+        if scan_token is not None:
+            _scan_commit(factory, "scan:autonomy_remediate_once", scan_token, last_processed)
+    return report
+
+
 def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -> LoopReport:
     """One merge tick, scoped to one GitHub identity and one quota counter
     (`gh_access.tick`) exactly as `review_once` is; `_merge_once` is the
@@ -3164,9 +4277,11 @@ def merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) ->
     one `pr view` answers state, reviews, rollup and `mergeStateStatus`
     together -- rewriting it in REST would cost MORE requests for the same
     decision. What it needed was a quota nobody else spends, and that is what
-    the fleet App's identity gives it
+    the fleet App's identity gives it. Merge additionally disables ambient
+    fallback for its tick, so missing App permissions surface as merge skips
+    instead of spending a human identity.
     (VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS)."""
-    with gh_access.tick(repo_path) as quota:
+    with gh_access.tick(repo_path, allow_ambient_fallback=False) as quota:
         report = _merge_once(factory, repo_path, cfg)
         report.quota = quota
     return report
@@ -3176,7 +4291,33 @@ def _merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -
     """Merge every READY_TO_REVIEW task whose PR carries an ACCEPT marker and
     green checks, then close it DONE -- with the TARGET-BRANCH merge commit
     as evidence, only once GitHub reports the PR actually MERGED (see
-    `_merged_target_sha`; a queued merge is a wait, not a completion)."""
+    `_merged_target_sha`; a queued merge is a wait, not a completion).
+
+    A PR the merge queue is already building is a free wait: it spends no
+    merge action and is never branch-updated, so the queue can serialize
+    integration without the tick fighting it (`_merge_queue_wait`).
+
+    This is the gateway VOYN-W0-AICC-MERGE-GATEWAY-REM-REM-REM asks for: the
+    only call site anywhere in this codebase that executes `gh pr merge`,
+    and it does so under `_merge_app_credentials`'s dedicated identity --
+    never the ambient credential `_gh()` uses for everything else here,
+    and never the acceptance identity that posts the marker. Every
+    precondition below is re-read from GitHub on this tick, not trusted
+    from whatever produced the task's `READY_TO_REVIEW` status: PR still
+    OPEN, an ACCEPT marker from a reviewer login that is not the PR's own
+    author standing on the EXACT current head (`_pr_is_mergeable`), every
+    required check terminal-success rather than merely absent-of-failure
+    (`_check_is_green`), and -- on the merged head itself, after the
+    call -- that the marker and checks still hold (`_merged_target_sha`),
+    so an externally merged PR can never be silently blessed DONE.
+
+    Anything that keeps this tick from even EVALUATING those preconditions
+    -- the merge identity unconfigured or partially configured, its
+    installation token failing to mint, or a readiness lookup that never
+    reached the GitHub API at all -- is `errors`, not `skipped`: an
+    ordinary "not accepted yet" PR and "GitHub is unreachable" must never
+    look the same to whatever is watching this loop. See `LoopReport.
+    errors` and `_merge_app_credentials`."""
     cfg = cfg or ReviewConfig()
     report = LoopReport()
     # Window fairness (VOYN-OPS-AICC-PUBLISH-WINDOW-STARVATION, two live
@@ -3203,11 +4344,28 @@ def _merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -
     )
     last_processed = None
     branch_updates = 0
+    gate_retrigger_budget = [cfg.max_gate_retriggers_per_tick]
     actions = 0
+    # One tick's merge-queue snapshots, keyed by (owner, repo, base branch):
+    # several entries queued on the same branch read the queue once, not once
+    # each. Tick-local on purpose -- queue membership changes between ticks.
+    queue_snapshots: dict[
+        tuple[str, str, str], dict[int, tuple[str, int | None]] | None
+    ] = {}
+
+    open_pr_snapshot, _snapshot_failure = _merge_window_open_pr_snapshot(repo_path)
+    origin = _origin_owner_repo(repo_path) if open_pr_snapshot is not None else None
     for task_id, pr_url in tasks:
         if actions >= cfg.max_per_tick:
             break
         last_processed = (task_id, pr_url)
+        if _repo_from_pr_url(pr_url) is None:
+            # Same shape gate as review_once/publish_review_verdicts -- a
+            # malformed pr_url fails every `gh pr view` below identically
+            # forever otherwise (VOYN-W0-AICC-REPO-ROUTE-AND-EVIDENCE-HYGIENE).
+            verdict = _clear_pr_evidence(factory, task_id, pr_url, "malformed_pr_url")
+            report.skipped.append((task_id, f"malformed_pr_url:{verdict}: {pr_url!r}"))
+            continue
         # Readiness FIRST: only a PR that already carries an independent ACCEPT
         # marker on its head with green required checks is the merge tick's
         # business. An un-accepted or failing PR is reviewed by the review tick
@@ -3224,13 +4382,59 @@ def _merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -
         # otherwise strand the task in READY_TO_REVIEW forever. A merged PR
         # WITHOUT acceptance evidence (external/bypass merge) is an incident
         # for the operator, never a silent DONE.
-        merge_sha, merge_reason = _merged_target_sha(repo_path, pr_url)
+        window = None
+        parsed = _owner_repo_number_from_pr_url(pr_url)
+        if open_pr_snapshot is not None and origin is not None and parsed is not None:
+            owner, repo, raw_number = parsed
+            try:
+                number = int(raw_number)
+            except ValueError:
+                number = 0
+            if (owner, repo) == origin and number in open_pr_snapshot:
+                snapshot_pr = open_pr_snapshot[number]
+                labels = _pr_window_labels(snapshot_pr)
+                if (
+                    _QUEUE_ACTIVE_LABEL in labels
+                    or DEFAULT_PR_WINDOW_CONFIG.label_active in labels
+                ):
+                    window = _PrWindowReadDecision(
+                        True,
+                        "merge_window_active",
+                        {"state": "open", "merged_at": None},
+                    )
+                else:
+                    window = _PrWindowReadDecision(
+                        False,
+                        "merge_window_inactive",
+                        {"state": "open", "merged_at": None},
+                    )
+        if window is None:
+            window = _pr_window_expensive_read_decision(
+                repo_path, pr_url, prefix="merge_window"
+            )
+        if not window.allowed:
+            report.skipped.append((task_id, window.reason))
+            continue
+        window_state = str((window.pull or {}).get("state") or "").lower()
+        window_merged = bool((window.pull or {}).get("merged_at"))
+        if window_state == "open" and not window_merged:
+            merge_sha, merge_reason = None, "not_merged"
+        else:
+            merge_sha, merge_reason = _merged_target_sha(repo_path, pr_url)
         if merge_sha is None and merge_reason == "merged_without_acceptance_evidence":
             report.skipped.append((task_id, merge_reason))
             continue
         if merge_sha is None:
             ready, detail = _pr_is_mergeable(repo_path, pr_url, cfg.required_checks)
             if not ready:
+                if detail.startswith("gh_view_failed"):
+                    # The GitHub API itself was unreachable for this
+                    # readiness read -- not "not accepted yet." Fail
+                    # closed and say so loudly (VOYN-W0-AICC-MERGE-
+                    # GATEWAY-REM-REM-REM): a caller must be able to tell this
+                    # apart from an ordinary skip.
+                    report.errors.append((task_id, detail))
+                    continue
                 if detail.startswith("checks_not_green"):
                     # A failed required check on an ACCEPTED head is the flake
                     # window: retry the failed jobs once (attempt-bounded)
@@ -3242,7 +4446,19 @@ def _merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -
                         detail = f"{detail}; {rerun}"
                 report.skipped.append((task_id, detail))
                 continue
-            # Merge-ready. If it has merely fallen BEHIND main since it was
+            # Merge-ready -- but an entry the merge queue is ALREADY building
+            # is not this tick's work. It costs no action and, above all, no
+            # branch update: updating a queued branch pushes a new head, which
+            # evicts the entry from the queue and invalidates its head-keyed
+            # review. Checked before the BEHIND handling below for exactly that
+            # reason -- a queued entry is routinely BEHIND, because the queue,
+            # not the branch, is where it is being tested against the
+            # prospective merged result (VOYN-W0-AICC-MERGE-QUEUE-ENABLE).
+            queue_wait = _merge_queue_wait(repo_path, pr_url, queue_snapshots)
+            if queue_wait is not None:
+                report.skipped.append((task_id, queue_wait))
+                continue
+            # If it has merely fallen BEHIND main since it was
             # accepted, bring its branch current with a GitHub-side base merge
             # (no local writer lease) so it can land; the new head re-runs CI
             # and review head-keyed. The cap counts ATTEMPTS -- incremented
@@ -3284,7 +4500,25 @@ def _merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -
                     )
                 continue
             actions += 1
-            merged = _gh(["pr", "merge", pr_url, "--squash"], repo_path)
+            # The one privileged mutation this whole module exists to
+            # gate: executed under the dedicated merge identity, never the
+            # ambient `_gh()` credential every read above used, and never
+            # the acceptance identity that posted the marker being relied
+            # on (VOYN-W0-AICC-MERGE-GATEWAY-REM-REM-REM). Unconfigured or
+            # partially configured is a misconfiguration of the gateway
+            # itself, not "nothing to do" -- `errors`, not `skipped`, and
+            # it fails closed rather than silently falling back to a
+            # shared credential.
+            merge_creds = _merge_app_credentials()
+            if merge_creds is None:
+                report.errors.append((task_id, "merge_bot_not_configured"))
+                continue
+            try:
+                merge_token = github_app_auth.installation_token(merge_creds)
+            except github_app_auth.AppAuthError as exc:
+                report.errors.append((task_id, f"merge_bot_auth_failed: {exc}"))
+                continue
+            merged = _merge_pr_as_bot(repo_path, pr_url, merge_token)
             # On a merge-queue-protected repo a zero exit only ENQUEUED the
             # PR; on a plain repo it merged synchronously. Either way the
             # target branch, not the exit code, is the authority: DONE only
@@ -3294,8 +4528,17 @@ def _merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -
             if merge_sha is None:
                 if merge_reason == "merged_without_acceptance_evidence":
                     reason = merge_reason
+                elif merged.returncode == 0 and merge_reason == "not_merged":
+                    queued, reason = _ensure_merge_queue_entry(repo_path, pr_url, detail, merge_token)
+                    if not queued and reason.startswith("required_check_expected:"):
+                        prior_budget = gate_retrigger_budget[0]
+                        reason = _recover_expected_gate(
+                            factory, repo_path, task_id, pr_url, detail,
+                            cfg, gate_retrigger_budget, reason,
+                        )
+                        actions += prior_budget - gate_retrigger_budget[0]
                 elif merged.returncode == 0:
-                    reason = "merge_queued_awaiting_target"
+                    reason = f"merge_state_unverified: {merge_reason}"
                 else:
                     reason = f"merge_failed: {merged.stderr.strip()[:100]}"
                 report.skipped.append((task_id, reason))
@@ -3336,6 +4579,16 @@ def _merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -
                 else:
                     conn.rollback()
                     report.skipped.append((task_id, f"transition:{reason}"))
+            except Exception:
+                # Roll back WHILE the transaction is still open -- the
+                # `finally` below flips `autocommit` back to `True`, which
+                # is only valid once no transaction is in progress. Without
+                # this, an exception raised before either explicit
+                # commit/rollback above (e.g. a driver error mid-`execute`)
+                # would hit that `autocommit = True` on an open transaction
+                # and replace the real error with a secondary one.
+                conn.rollback()
+                raise
             finally:
                 conn.autocommit = True
     _scan_commit(factory, "scan:merge_once", scan_token, last_processed)
@@ -3695,7 +4948,7 @@ def _check_is_red_for_window(check: dict[str, Any]) -> bool:
     a check has actually completed red.
     """
     conclusion = check.get("conclusion")
-    if conclusion is not None:
+    if conclusion not in (None, ""):
         return str(conclusion).upper() not in ("SUCCESS", "NEUTRAL", "SKIPPED")
     state = check.get("state")
     if state is not None:
@@ -3776,6 +5029,35 @@ def _set_pr_window_labels(
     return ok
 
 
+def _remove_pr_window_labels(
+    repo_path: str, pr: dict[str, Any], cfg: PrWindowConfig, remove: set[str]
+) -> bool:
+    """Remove contradictory window labels or explicitly invalid queue selection.
+
+    Eligible queue-selected PRs retain their selection without a redundant
+    active label event. Explicit removal of queue-active is reserved for a
+    proven block or capacity overflow; an unreadable candidate keeps its
+    labels and reserves capacity until eligibility can be established.
+    """
+    parsed = _owner_repo_number_from_pr_url(str(pr.get("url") or ""))
+    if parsed is None:
+        return False
+    owner, repo, number = parsed
+    window_labels = {cfg.label_active, cfg.label_waiting, cfg.label_blocked, _QUEUE_ACTIVE_LABEL}
+    current = _pr_window_labels(pr) & window_labels & remove
+    if not current:
+        return True
+    issues = f"repos/{owner}/{repo}/issues/{number}/labels"
+    ok = True
+    for name in sorted(current):
+        removed = _gh(
+            ["api", "--method", "DELETE", f"{issues}/{urllib.parse.quote(name)}"],
+            repo_path,
+        )
+        ok = ok and removed.returncode == 0
+    return ok
+
+
 def reconcile_pr_window(
     repo_path: str, cfg: PrWindowConfig | None = None
 ) -> PrWindowReport:
@@ -3836,13 +5118,21 @@ def _reconcile_pr_window(
         head = str(pr.get("headRefOid") or "")
         labels = _pr_window_labels(pr)
         active_now = cfg.label_active in labels or _QUEUE_ACTIVE_LABEL in labels
+        queue_active_now = _QUEUE_ACTIVE_LABEL in labels
+        queue_waiting_now = _QUEUE_WAITING_REVIEW_LABEL in labels
         blocked_now = (
             cfg.label_blocked in labels
             and not active_now
-            and not _pr_is_queue_selected(labels)
+            and not (queue_active_now or queue_waiting_now)
         )
         window_full = selected >= cfg.max_active
         needs_merge_state = active_now or not window_full
+        if queue_waiting_now:
+            report.waiting.append((number, head))
+            _remove_pr_window_labels(
+                repo_path, pr, cfg, {cfg.label_active, cfg.label_blocked}
+            )
+            continue
         # A cache hit costs no API call, so it costs no detail budget
         # either: the budget exists to bound this tick's GitHub traffic, and
         # a PR whose head has not moved since the last tick generates none.
@@ -3854,6 +5144,7 @@ def _reconcile_pr_window(
             and detailed is None
             and blocked_refreshes_used >= blocked_refresh_budget
         ):
+            selected += int(queue_active_now)
             report.unchecked.append((number, head))
             continue
         if detailed is None and details_used >= max(cfg.detail_budget, 0):
@@ -3862,6 +5153,7 @@ def _reconcile_pr_window(
             # blocked, nothing) stays. Writing `waiting` here demoted an
             # active PR on no real change whenever the active set outgrew
             # the budget (review of 5dec6322). Re-examined on a later tick.
+            selected += int(queue_active_now)
             report.unchecked.append((number, head))
             continue
         if detailed is None:
@@ -3876,6 +5168,7 @@ def _reconcile_pr_window(
             # reported unreadable for this tick (review of d16dc0e4: stamping
             # `waiting` here could demote an active or blocked PR on a
             # transient GitHub error). Re-examined next tick.
+            selected += int(queue_active_now)
             report.unreadable.append((number, head))
             continue
         age_seconds, fell_back = _pr_age_seconds(repo_path, detailed, now=now)
@@ -3885,6 +5178,7 @@ def _reconcile_pr_window(
         if reason in (None, "stale_exact_head_acceptance"):
             detailed_with_reviews = _pr_window_with_reviews(repo_path, detailed, cache)
             if detailed_with_reviews is None:
+                selected += int(queue_active_now)
                 report.unreadable.append((number, head))
                 continue
             detailed = detailed_with_reviews
@@ -3907,6 +5201,7 @@ def _reconcile_pr_window(
                 repo_path, pr, cache, refresh=True, include_reviews=False
             )
             if fresh is None:
+                selected += int(queue_active_now)
                 report.unreadable.append((number, head))
                 continue
             detailed = fresh
@@ -3917,6 +5212,7 @@ def _reconcile_pr_window(
             if reason in (None, "stale_exact_head_acceptance"):
                 detailed_with_reviews = _pr_window_with_reviews(repo_path, detailed, cache)
                 if detailed_with_reviews is None:
+                    selected += int(queue_active_now)
                     report.unreadable.append((number, head))
                     continue
                 detailed = detailed_with_reviews
@@ -3927,26 +5223,47 @@ def _reconcile_pr_window(
                 origin = _origin_owner_repo(repo_path)
                 parsed = (*origin, number) if origin is not None else None
             if parsed is None:
+                selected += int(queue_active_now)
                 report.unreadable.append((number, head))
                 continue
             merge_state = _rest_merge_state(repo_path, parsed[0], parsed[1], number)
             if merge_state is None:
+                selected += int(queue_active_now)
                 report.unreadable.append((number, head))
                 continue
             detailed = dict(detailed)
             detailed["mergeStateStatus"] = merge_state
             reason = _window_block_reason(detailed, cfg, age_seconds=age_seconds)
         if reason is not None:
+            if queue_active_now and not _remove_pr_window_labels(
+                repo_path, pr, cfg, {_QUEUE_ACTIVE_LABEL}
+            ):
+                selected += 1
+                report.unreadable.append((number, head))
+                continue
             report.blocked.append((number, reason))
             _set_pr_window_labels(repo_path, detailed, cfg, cfg.label_blocked)
             continue
         if window_full:
+            if queue_active_now and not _remove_pr_window_labels(
+                repo_path, pr, cfg, {_QUEUE_ACTIVE_LABEL}
+            ):
+                selected += 1
+                report.unreadable.append((number, head))
+                continue
             report.waiting.append((number, head))
             _set_pr_window_labels(repo_path, detailed, cfg, cfg.label_waiting)
             continue
         selected += 1
         report.active.append((number, head))
-        _set_pr_window_labels(repo_path, detailed, cfg, cfg.label_active)
+        if queue_active_now:
+            # Queue selection is priority, never proof of eligibility. Keep
+            # its label only after the same checks every candidate passes.
+            _remove_pr_window_labels(
+                repo_path, pr, cfg, {cfg.label_waiting, cfg.label_blocked}
+            )
+        else:
+            _set_pr_window_labels(repo_path, detailed, cfg, cfg.label_active)
 
 
 #: One REST page of pull requests. GitHub's ceiling for `per_page`, so a

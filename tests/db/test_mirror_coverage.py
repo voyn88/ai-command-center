@@ -33,7 +33,6 @@ from pathlib import Path
 import pytest
 
 from command_center.db import roles
-
 from tests.db.mirror_discovery import mirror_classes
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -70,6 +69,17 @@ class Exclusion:
 # ---------------------------------------------------------------------------
 
 UNMIRRORED_SCHEMA_TABLES: dict[str, Exclusion] = {
+    "coordinator_state": Exclusion(
+        reason=(
+            "PostgreSQL-native durable control-plane authority from birth (0032): "
+            "snapshot dedup, retry budgets and in-flight queue references have no "
+            "SQLite source to dual-write. This is not disposable state or a backup "
+            "exclusion: restore it consistently with work_item/work_result in the "
+            "same PostgreSQL recovery point; do not reset it to reconstruct an "
+            "advisory order, which would lose paid-call dedup and retry history."
+        ),
+        task="VOYN-W0-BACKLOG-ORCHESTRATOR",
+    ),
     "run_finalization_claim": Exclusion(
         reason=(
             "The PostgreSQL target is reserved for a future native authority, "
@@ -103,6 +113,27 @@ UNMIRRORED_SCHEMA_TABLES: dict[str, Exclusion] = {
             "SQLite incumbent and nothing to dual-write."
         ),
         task="VOYN-OPS-AICC-PUBLISH-WINDOW-STARVATION",
+    ),
+    "tick_observation": Exclusion(
+        reason="PostgreSQL-native observations include empty ticks to break stale failure streaks; no SQLite database ever owned these records, so there is no source to mirror.",
+        task="VOYN-W0-AICC-TICK-STALL-WATCHDOG",
+    ),
+    "tick_skip_event": Exclusion(
+        reason=(
+            "PostgreSQL-native observability ledger from birth (0034): the "
+            "per-tick skip reasons the watchdog reads were previously only "
+            "journal lines; no SQLite authority ever held them, so there is "
+            "nothing for a mirror to copy from."
+        ),
+        task="VOYN-W0-AICC-TICK-STALL-WATCHDOG",
+    ),
+    "tick_stall_escalation": Exclusion(
+        reason=(
+            "PostgreSQL-native (0034): the watchdog's episode ledger exists "
+            "only to make 'exactly one escalation per stall episode' a "
+            "schema property; born in PostgreSQL with no SQLite counterpart."
+        ),
+        task="VOYN-W0-AICC-TICK-STALL-WATCHDOG",
     ),
     "backlog_task": Exclusion(
         reason=(
@@ -492,3 +523,17 @@ def test_every_exclusion_is_signed(registry: dict[str, Exclusion]) -> None:
         assert re.fullmatch(r"VOYN-[A-Z0-9-]+[a-z]?", exclusion.task), (
             f"{table}: {exclusion.task!r} is not a central backlog task id"
         )
+
+
+def test_coordinator_exclusion_requires_no_runtime_source() -> None:
+    """A future SQLite source invalidates this native-authority decision.
+
+    This ledger excludes dual-writing, never persistence or PostgreSQL backup.
+    A second runtime source must get a real mirror/cutover decision instead of
+    silently inheriting the native-only exemption.
+    """
+    assert "coordinator_state" in _schema_tables()
+    assert "coordinator_state" in roles.ALL_TABLES
+    assert "coordinator_state" not in _runtime_tables()
+    assert "coordinator_state" not in _mirrored_tables()
+    assert "coordinator_state" in UNMIRRORED_SCHEMA_TABLES

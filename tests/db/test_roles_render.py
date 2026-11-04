@@ -244,6 +244,7 @@ def test_the_worker_reaches_the_queue_only_through_the_six_protocol_steps() -> N
         # -- turns a finding into a task.
         "monitor_record_finding",
         "monitor_clear_finding",
+        "monitor_clear_resolved_findings",
     }
     assert roles.VIEW_PRIVILEGES[roles.WORKER_ROLE] == {}
 
@@ -299,6 +300,8 @@ def test_the_control_plane_cannot_claim() -> None:
         # scan cursor for the tick windows.
         "backlog_scan_claim",
         "backlog_triage",
+        # 0030: clear proven malformed evidence through the audited function.
+        "backlog_clear_evidence",
         # 0021: read-only deploy preflight with dispatch's privileges; the
         # task-class setter (split children, monitor tasks); and the
         # monitor-finding pair the control-host probe uses.
@@ -306,10 +309,20 @@ def test_the_control_plane_cannot_claim() -> None:
         "backlog_set_task_class",
         "monitor_record_finding",
         "monitor_clear_finding",
+        "monitor_clear_resolved_findings",
         "monitor_link_task",
         # VOYN-W0-AICC-BACKLOG-PG-CANONICAL-GATE (0020): the importer's stamp
         # of where a migrated row came from.
         "backlog_record_provenance",
+        # 0029: bounded row lock and audited owner decision, no table UPDATE.
+        "backlog_owner_lock",
+        "backlog_owner_decision",
+        # 0032: durable Grok↔Cursor coordination CAS surface.
+        "coordinator_state_read",
+        "coordinator_enqueue",
+        "coordinator_cas_begin",
+        "coordinator_cas_finish",
+        "coordinator_cas_clear_inflight",
     }
 
 

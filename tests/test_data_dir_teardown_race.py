@@ -36,7 +36,6 @@ so it is a live demonstration that waiting, not retrying, is what fixes this.
 from __future__ import annotations
 
 import errno
-import os
 import shutil
 import threading
 import time
@@ -145,42 +144,37 @@ def data_dir_writer(tmp_path):
 def test_removing_the_data_dir_without_waiting_fails_and_names_the_writer(
     data_dir_writer, monkeypatch
 ):
-    """`quiesce_timeout=0.0` is the pre-fix teardown: remove, retry, give up.
-
-    The race is pinned rather than raced for, in the spirit of
-    `tests/fixtures/finalization_window.py`: `os.rmdir` is the last call of an
-    `rmtree` pass, so hooking it lands the live writer's write in exactly the
-    gap production hits — after the directory has been walked and emptied,
-    before it can be removed. Nothing about the writer is faked; only *when*
-    its write arrives is made certain, so this fails every time instead of two
-    runs in forty.
-
-    It also pins the diagnostic. The point of the error is that it identifies
-    *which* writer, which is what the raw `OSError` on `main` never did.
-    """
+    """Refuse before touching files, even if rmtree could beat the live writer."""
     writer = data_dir_writer()
-    real_rmdir = os.rmdir
-
-    def rmdir_losing_the_race(path, *args, **kwargs):
-        writer.write_now()
-        return real_rmdir(path, *args, **kwargs)
-
-    monkeypatch.setattr(os, "rmdir", rmdir_losing_the_race)
-    try:
+    removals = []
+    with monkeypatch.context() as patch:
+        patch.setattr(conftest.shutil, "rmtree", lambda path: removals.append(path))
         with pytest.raises(AssertionError) as raised:
             conftest.remove_data_dir_when_quiet(writer.directory, quiesce_timeout=0.0)
-    finally:
-        # `isolated_data_dir` removes the session's real data dir after this
-        # test, through the same functions patched here. Undo before then.
-        monkeypatch.undo()
+    assert f"run:{writer.run_id}" in str(raised.value)
+    assert f"thread:run-supervisor-{writer.run_id}" in str(raised.value)
+    assert removals == []
+    assert writer.directory.exists()
 
-    message = str(raised.value)
-    assert f"run:{writer.run_id}" in message
-    assert f"thread:run-supervisor-{writer.run_id}" in message
-    assert "runtime.db-wal" in message  # the leftover that broke the rmdir
-    assert isinstance(raised.value.__cause__, OSError)
-    assert raised.value.__cause__.errno == errno.ENOTEMPTY
-    assert writer.directory.exists(), "a failed removal must not half-delete the dir away silently"
+
+def test_retained_ownership_without_a_thread_must_not_be_silently_discarded(tmp_path):
+    """A failed report can retain ownership after its supervising thread exits."""
+    from command_center.runtime import supervisor
+
+    directory = tmp_path / "retained"
+    directory.mkdir()
+    sentinel = directory / "runtime.db"
+    sentinel.write_bytes(b"unfinished-finalization")
+    run_id = "retained-report-failure-regression"
+    with supervisor._PROCESS_OWNED_RUNS_GUARD:
+        supervisor._PROCESS_OWNED_RUNS.add(run_id)
+    try:
+        with pytest.raises(AssertionError, match=run_id):
+            conftest.remove_data_dir_when_quiet(directory, quiesce_timeout=0.0)
+        assert sentinel.read_bytes() == b"unfinished-finalization"
+    finally:
+        with supervisor._PROCESS_OWNED_RUNS_GUARD:
+            supervisor._PROCESS_OWNED_RUNS.discard(run_id)
 
 
 # --------------------------------------------------------------------------

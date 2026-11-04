@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from command_center.orchestrator import review_merge
 from command_center.orchestrator.review_merge import PrWindowConfig, reconcile_pr_window
 
@@ -17,6 +19,55 @@ def _pr(number: int, head: str, *, label: str | None = None, merge_state: str = 
         "commits": [{"oid": head, "committedDate": "2099-01-01T00:00:00Z"}],
         "mergeStateStatus": merge_state,
     }
+
+
+@pytest.mark.parametrize("block", ["merge_conflict", "checks_stale", "acceptance_rejected"])
+def test_queue_active_block_cannot_hold_slot_ahead_of_eligible_pr(monkeypatch, block):
+    selected = _pr(1, "a" * 40, label="queue-active")
+    if block == "merge_conflict":
+        selected["mergeStateStatus"] = "DIRTY"
+    elif block == "checks_stale":
+        selected["statusCheckRollup"] = [{"name": "Final merge gate", "conclusion": "FAILURE"}]
+    else:
+        selected["reviews"] = [{"author": {"login": "reviewer"}, "state": "COMMENTED",
+                                "body": "ACCEPTANCE: REJECT " + "a" * 40}]
+    clean = _pr(2, "b" * 40)
+    writes = []
+    monkeypatch.setattr(review_merge, "_list_open_pulls", lambda *_: ([selected, clean], None))
+    monkeypatch.setattr(review_merge, "_remove_pr_window_labels",
+                        lambda _, pr, cfg, remove: writes.append((pr["number"], remove)) or True)
+    monkeypatch.setattr(review_merge, "_set_pr_window_labels",
+                        lambda _, pr, cfg, label: writes.append((pr["number"], label)) or True)
+    report = reconcile_pr_window("/repo", PrWindowConfig(max_active=1, stale_seconds=10**12))
+    assert report.blocked == [(1, block)]
+    assert report.active == [(2, "b" * 40)]
+    assert writes[:2] == [(1, {"queue-active"}), (1, "review-window:blocked")]
+
+
+def test_failed_queue_label_removal_reserves_slot_and_is_not_reported_blocked(monkeypatch):
+    selected = _pr(1, "a" * 40, label="queue-active", merge_state="DIRTY")
+    clean = _pr(2, "b" * 40)
+    monkeypatch.setattr(review_merge, "_list_open_pulls", lambda *_: ([selected, clean], None))
+    monkeypatch.setattr(review_merge, "_remove_pr_window_labels", lambda *_: False)
+    monkeypatch.setattr(review_merge, "_set_pr_window_labels", lambda *_: True)
+    report = reconcile_pr_window("/repo", PrWindowConfig(max_active=1, stale_seconds=10**12))
+    assert report.unreadable == [(1, "a" * 40)]
+    assert report.active == []
+    assert report.blocked == []
+    assert report.waiting == [(2, "b" * 40)]
+
+
+def test_two_eligible_queue_active_labels_cannot_exceed_window_capacity(monkeypatch):
+    prs = [_pr(1, "a" * 40, label="queue-active"), _pr(2, "b" * 40, label="queue-active")]
+    removed = []
+    monkeypatch.setattr(review_merge, "_list_open_pulls", lambda *_: (prs, None))
+    monkeypatch.setattr(review_merge, "_remove_pr_window_labels",
+                        lambda _, pr, cfg, remove: removed.append((pr["number"], remove)) or True)
+    monkeypatch.setattr(review_merge, "_set_pr_window_labels", lambda *_: True)
+    report = reconcile_pr_window("/repo", PrWindowConfig(max_active=1, stale_seconds=10**12))
+    assert report.active == [(1, "a" * 40)]
+    assert report.waiting == [(2, "b" * 40)]
+    assert (2, {"queue-active"}) in removed
 
 
 def test_conflicted_active_pr_does_not_hold_the_window(monkeypatch):

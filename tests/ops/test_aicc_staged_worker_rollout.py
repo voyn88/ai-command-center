@@ -142,7 +142,7 @@ class FakeSystemd:
         # fd5de6b, same rationale as the legacy units above).
         for timer in (
             "voyn-aicc-credential-rotation.timer",
-            "voyn-aicc-self-deploy.timer",
+            "voyn-aicc-worker-release-deploy.timer",
             "voyn-aicc-source-clone-refresh.timer",
         ):
             self.states.setdefault(
@@ -191,7 +191,14 @@ class FakeSystemd:
                 return "inactive"
             # Mutating a unit this fake never declared is a typo'd rollout
             # target, not a no-op (review on fd5de6b).
-            if action in {"start", "stop", "enable", "disable", "restart"}:
+            if action in {
+                "start",
+                "stop",
+                "enable",
+                "disable",
+                "restart",
+                "reset-failed",
+            }:
                 raise KeyError(unit)
             return ""
         state = self.states[unit]
@@ -211,6 +218,13 @@ class FakeSystemd:
             state["ActiveState"] = "active"
             state["SubState"] = "running"
             state["MainPID"] = "3000"
+        elif action == "reset-failed":
+            # systemd's `failed` is a latch; reset-failed is the ONLY thing
+            # that clears it without a successful run. On anything not
+            # latched it is a no-op that succeeds.
+            if state["ActiveState"] == "failed":
+                state["ActiveState"] = "inactive"
+                state["SubState"] = "dead"
         return ""
 
     def probe(self, *args: str) -> tuple[int, str, str]:
@@ -481,44 +495,124 @@ def test_versioned_restore_refuses_property_drift_before_restart():
     assert ("start", unit) not in systemd.calls
 
 
-def test_restore_accepts_activating_notify_worker_with_live_main_pid():
+class _FakeClock:
+    """A monotonic clock that only advances when the code under test sleeps.
+
+    Keeps the bounded-wait tests deterministic and instant: the timeout is
+    measured in simulated seconds, so a test can prove the wait both happens
+    and terminates without spending wall-clock time on it.
+    """
+
+    def __init__(self):
+        self.now = 0.0
+        self.slept: list[float] = []
+
+    def sleep(self, seconds: float) -> None:
+        self.slept.append(seconds)
+        self.now += seconds
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+class _NotifyStartSystemd(FakeSystemd):
+    """A Type=notify lane that forks its MainPID before sending READY=1.
+
+    `start` leaves it "activating" with a live MainPID; it flips to "active"
+    only once `is-active` has been read `ready_after` times -- i.e. only if
+    the caller actually waits. `ready_after=None` never becomes ready, which
+    is the hung-lane case a rollback must refuse.
+    """
+
+    def __init__(self, units: tuple[str, ...], unit: str, *, ready_after):
+        super().__init__(units)
+        self.unit = unit
+        self.ready_after = ready_after
+        self.is_active_reads = 0
+
+    def run(self, *args: str, check: bool = True) -> str:
+        if args == ("start", self.unit):
+            self.calls.append(args)
+            state = self.states[self.unit]
+            state["ActiveState"] = "activating"
+            state["SubState"] = "start"
+            state["MainPID"] = "4242"
+            return ""
+        if args == ("is-active", self.unit):
+            self.is_active_reads += 1
+            if self.ready_after is not None and self.is_active_reads > self.ready_after:
+                state = self.states[self.unit]
+                state["ActiveState"] = "active"
+                state["SubState"] = "running"
+        return super().run(*args, check=check)
+
+
+def test_restore_waits_out_the_notify_handshake_instead_of_failing_it():
     """A Type=notify unit forks its MainPID before sending READY=1.
 
     `restore` reading `is-active` as "activating" with a nonzero MainPID
     right after `start` is the service coming up normally, not one that
     failed to go inactive (same shape as the live worker-01 install-recovery
-    wedge, 2026-09-07/08).
+    wedge, 2026-09-07/08). The restore waits for that handshake and then
+    proves the lane active -- it does not accept "activating" as restored.
     """
     module = _module()
     unit = "voyn-aicc-worker@blue.service"
-
-    class NotifyStartingSystemd(FakeSystemd):
-        def run(self, *args: str, check: bool = True) -> str:
-            if args == ("start", unit):
-                self.calls.append(args)
-                state = self.states[unit]
-                state["ActiveState"] = "activating"
-                state["SubState"] = "start"
-                state["MainPID"] = "4242"
-                return ""
-            return super().run(*args, check=check)
-
-    systemd = NotifyStartingSystemd((unit,))
+    systemd = _NotifyStartSystemd((unit,), unit, ready_after=2)
     state = module.snapshot(systemd, (unit,))
     state["units"][unit]["active"] = True
+    systemd.is_active_reads = 0
+    clock = _FakeClock()
 
-    module.restore(systemd, state)
+    module.restore(systemd, state, sleep=clock.sleep, monotonic=clock.monotonic)
 
-    assert systemd.states[unit]["ActiveState"] == "activating"
+    # It waited, rather than either failing the handshake window or waving it
+    # through: the lane is proven active by the time restore returns.
+    assert clock.slept
+    assert sum(clock.slept) < module.RESTORE_ACTIVATION_TIMEOUT_SECONDS
+    assert systemd.states[unit]["ActiveState"] == "active"
     assert systemd.states[unit]["MainPID"] == "4242"
 
 
+def test_restore_refuses_a_lane_that_never_leaves_activating():
+    """A unit stuck "activating" is refused, not accepted as restored.
+
+    A staged rollout proves each lane before advancing to the next, so a unit
+    whose start never completes -- hung readiness handshake, failing
+    dependency, bad health check -- must fail this restore rather than be
+    recorded as restored while the rollout moves on. The wait is bounded, so
+    the refusal arrives instead of hanging.
+    """
+    module = _module()
+    unit = "voyn-aicc-worker@blue.service"
+    systemd = _NotifyStartSystemd((unit,), unit, ready_after=None)
+    state = module.snapshot(systemd, (unit,))
+    state["units"][unit]["active"] = True
+    systemd.is_active_reads = 0
+    clock = _FakeClock()
+
+    with pytest.raises(module.RolloutError, match="did not finish starting"):
+        module.restore(systemd, state, sleep=clock.sleep, monotonic=clock.monotonic)
+
+    # Bounded on both sides: it gave the handshake its full window, and it
+    # stopped there rather than polling a hung unit forever.
+    assert sum(clock.slept) >= module.RESTORE_ACTIVATION_TIMEOUT_SECONDS
+    polls = (
+        module.RESTORE_ACTIVATION_TIMEOUT_SECONDS
+        / module.RESTORE_ACTIVATION_POLL_SECONDS
+    )
+    assert len(clock.slept) <= polls + 1
+    assert systemd.states[unit]["ActiveState"] == "activating"
+
+
 def test_restore_still_refuses_deactivating_expected_inactive_main_pid():
-    """The activating exemption must not paper over a real stuck unit.
+    """Tolerating a starting unit must not soften a stopping one.
 
     An expected-inactive unit still "deactivating" with a live MainPID after
     `stop` is exactly the leftover-process case the assertion exists to
-    catch.
+    catch. Nothing waits for it either: `stop` is synchronous, so a unit
+    still holding a main process when it returns has already failed to go
+    away.
     """
     module = _module()
     unit = "voyn-aicc-worker@blue.service"
@@ -587,12 +681,12 @@ def test_staged_rollout_drains_and_proves_each_lane_before_next(tmp_path, monkey
     stops = [call for call in systemd.calls if call[0] == "stop"]
     assert stops[:3] == [
         ("stop", "voyn-aicc-credential-rotation.timer"),
-        ("stop", "voyn-aicc-self-deploy.timer"),
+        ("stop", "voyn-aicc-worker-release-deploy.timer"),
         ("stop", "voyn-aicc-source-clone-refresh.timer"),
     ]
     assert systemd.calls[-3:] == [
         ("start", "voyn-aicc-credential-rotation.timer"),
-        ("start", "voyn-aicc-self-deploy.timer"),
+        ("start", "voyn-aicc-worker-release-deploy.timer"),
         ("start", "voyn-aicc-source-clone-refresh.timer"),
     ]
     # The shared lock a tick honours even if it fires anyway is gone once the
@@ -883,16 +977,16 @@ def test_rollout_restores_timers_and_lock_on_failure(tmp_path, monkeypatch):
     assert systemd.states["voyn-aicc-credential-rotation.timer"]["ActiveState"] == (
         "active"
     )
-    assert systemd.states["voyn-aicc-self-deploy.timer"]["ActiveState"] == "active"
+    assert systemd.states["voyn-aicc-worker-release-deploy.timer"]["ActiveState"] == "active"
     timer_calls = [
         call for call in systemd.calls if call[-1] in module.LANE_MUTATING_TIMERS
     ]
     assert timer_calls == [
         ("stop", "voyn-aicc-credential-rotation.timer"),
-        ("stop", "voyn-aicc-self-deploy.timer"),
+        ("stop", "voyn-aicc-worker-release-deploy.timer"),
         ("stop", "voyn-aicc-source-clone-refresh.timer"),
         ("start", "voyn-aicc-credential-rotation.timer"),
-        ("start", "voyn-aicc-self-deploy.timer"),
+        ("start", "voyn-aicc-worker-release-deploy.timer"),
         ("start", "voyn-aicc-source-clone-refresh.timer"),
     ]
 
@@ -936,6 +1030,15 @@ def test_write_and_remove_rollout_lock_round_trip(tmp_path, monkeypatch):
     assert not lock_path.exists()
     # Idempotent: removing an already-absent lock is not an error.
     module.remove_rollout_lock()
+
+
+def test_remove_rollout_lock_preserves_foreign_owner(tmp_path, monkeypatch):
+    module = _module()
+    lock_path = tmp_path / "aicc-staged-rollout.lock"
+    monkeypatch.setattr(module, "ROLLOUT_LOCK_PATH", lock_path)
+    lock_path.write_text(f"{os.getpid() + 1}\n", encoding="utf-8")
+    module.remove_rollout_lock()
+    assert lock_path.read_text(encoding="utf-8") == f"{os.getpid() + 1}\n"
 
 
 def test_rollout_with_timers_already_held_does_not_touch_timers_or_lock(
@@ -1791,9 +1894,125 @@ def test_hold_skips_timers_that_are_not_installed_on_the_host():
     module = _module()
     systemd = FakeSystemd(("voyn-aicc-worker@1.service",))
     systemd.states.pop("voyn-aicc-credential-rotation.timer", None)
-    systemd.states.pop("voyn-aicc-self-deploy.timer", None)
+    systemd.states.pop("voyn-aicc-worker-release-deploy.timer", None)
     systemd.states.pop("voyn-aicc-source-clone-refresh.timer", None)
 
     module.hold_lane_mutating_timers(systemd)
 
     assert [call for call in systemd.calls if call[0] == "stop"] == []
+
+
+def test_rollout_lock_does_not_overwrite_existing_owner(tmp_path, monkeypatch):
+    module = _module()
+    lock = tmp_path / "rollout.lock"
+    monkeypatch.setattr(module, "ROLLOUT_LOCK_PATH", lock)
+    lock.write_text("other-owner")
+    with pytest.raises(FileExistsError):
+        module.write_rollout_lock()
+    assert lock.read_text() == "other-owner"
+
+
+# ---------------------------------------------------------------------------
+# Retirement must not leave an unreapable corpse in PID 1's unit table.
+#
+# VOYN-MON-WORKER-01-INFRA-FAILED-UNITS. Retiring the pre-template workers
+# stops and *disables* them, and disabling removes the symlink that was their
+# fragment -- so they are deliberately gone from the host for good. A `stop`
+# that reaches its timeout (a worker daemon holding a task does) latches
+# `failed` on the way out, and a unit with no fragment can never run again, so
+# nothing will ever clear that latch: systemd keeps the unit loaded for no
+# other reason than to remember it. The host unit-health probe then counted
+# those corpses as broken infrastructure every two minutes on a host whose
+# retirement had succeeded -- a `failed_units` finding no repair could clear,
+# because the units it named no longer existed.
+# ---------------------------------------------------------------------------
+
+
+LEGACY = (
+    "voyn-aicc-worker.service",
+    "voyn-aicc-worker-2.service",
+    "aicc-worker.service",
+)
+
+
+class _TimedOutLegacyStop(FakeSystemd):
+    """A legacy `stop` that reaches TimeoutStopSec: systemd latches `failed`."""
+
+    def run(self, *args: str, check: bool = True) -> str:
+        if args[0] == "stop" and args[-1] in LEGACY:
+            self.calls.append(args)
+            state = self.states[args[-1]]
+            state["ActiveState"] = "failed"
+            state["SubState"] = "failed"
+            state["MainPID"] = "0"
+            return ""
+        return super().run(*args, check=check)
+
+
+def test_a_timed_out_legacy_stop_is_not_left_latched_failed():
+    """The defect, with the live exit shape: every retired unit ends
+    un-latched, and the clear is issued after the disable that removes its
+    fragment -- so what is cleared is final."""
+    module = _module()
+    systemd = _TimedOutLegacyStop(("voyn-aicc-worker@1.service",))
+
+    module.retire_legacy_units(systemd)
+
+    for unit in LEGACY:
+        assert systemd.states[unit]["ActiveState"] != "failed"
+        # Order is part of the contract: stop, disable, then clear.
+        assert systemd.calls.index(("reset-failed", unit)) > systemd.calls.index(
+            ("disable", unit)
+        )
+
+
+def test_retirement_refuses_a_unit_whose_latch_it_could_not_clear():
+    """Proving the latch is gone, not that a clear was issued: a reaping rule
+    that was merely WRITTEN did nothing on any host for a whole finding cycle
+    (7570626c). `reset-failed` here is a no-op, as it is for an unprivileged
+    caller, and the rollout must refuse rather than advance."""
+    module = _module()
+
+    class _ClearDoesNothing(_TimedOutLegacyStop):
+        def run(self, *args: str, check: bool = True) -> str:
+            if args[0] == "reset-failed":
+                self.calls.append(args)
+                return ""
+            return super().run(*args, check=check)
+
+    systemd = _ClearDoesNothing(("voyn-aicc-worker@1.service",))
+    with pytest.raises(module.RolloutError, match="still latched failed"):
+        module.retire_legacy_units(systemd)
+
+
+def test_an_abandoned_rollout_does_not_leave_a_legacy_corpse_behind():
+    """worker-01, 2026-08-31: four consecutive attempts failed, and each one
+    stopped and disabled the legacy units again on the way out. That path is
+    how the corpses were produced as much as the success path is."""
+    module = _module()
+    unit = "voyn-aicc-worker@1.service"
+
+    class _LaneWillNotVerify(_TimedOutLegacyStop):
+        def run(self, *args: str, check: bool = True) -> str:
+            value = super().run(*args, check=check)
+            if args == ("start", unit):
+                self.states[unit]["DropInPaths"] = ""
+            return value
+
+    systemd = _LaneWillNotVerify((unit,))
+    with pytest.raises(module.RolloutError):
+        module.rollout(
+            systemd,
+            (unit,),
+            agent_user="aicc-agent",
+            privileged_users=("root", "voynadmin"),
+            uid_for_user=_uid,
+            process_uid=lambda pid: 1002,
+            process_environment=lambda pid: (
+                "AICC_AGENT_PRINCIPAL_ISOLATION=required",
+                "AICC_DATA_DIR=/var/lib/aicc/data",
+            ),
+        )
+
+    for legacy in LEGACY:
+        assert systemd.states[legacy]["ActiveState"] != "failed"

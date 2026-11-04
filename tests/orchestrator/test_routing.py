@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from command_center import agent_runner
-from command_center.orchestrator.planner import PlanLimits, _payload_for
+from command_center.orchestrator.planner import PlanLimits, _payload_for, repo_route
 from command_center.orchestrator.routing import ROUTING_MATRIX, cascade_for
 
 #: The executors the worker can actually run, read from the SAME table the
@@ -22,6 +22,33 @@ def test_no_phantom_executors_in_the_matrix():
     for task_class, cascade in ROUTING_MATRIX.items():
         for link in cascade:
             assert link["executor"] in PROVEN_EXECUTORS, (task_class, link)
+
+
+def test_owner_profile_avoids_exhausted_subscription_and_preserves_class(monkeypatch):
+    monkeypatch.setenv('AICC_EXECUTOR_PROFILE', 'owner-alternatives')
+    for task_class, task_type in [('implementation', 'implementation'), ('review', 'review')]:
+        links = cascade_for(task_class)
+        assert [link['executor'] for link in links] == ['cursor', 'grok']
+        assert [link.get('model') for link in links] == ['auto', 'grok-4.6']
+        assert all(link['task_type'] == task_type for link in links)
+        assert all(link['executor'] in agent_runner.PRINCIPAL_EXECUTOR_BINARIES for link in links)
+
+
+def test_owner_alternatives_selects_grok_4_6_and_keeps_cursor_auto(monkeypatch):
+    """Permanent owner-alternatives roster pin: Grok 4.6, Cursor auto unchanged."""
+    monkeypatch.setenv('AICC_EXECUTOR_PROFILE', 'owner-alternatives')
+    impl = cascade_for('implementation')
+    review = cascade_for('review')
+    assert impl[0] == {"executor": "cursor", "task_type": "implementation", "model": "auto"}
+    assert impl[1] == {"executor": "grok", "task_type": "implementation", "model": "grok-4.6"}
+    assert review[0]["model"] == "auto" and review[0]["executor"] == "cursor"
+    assert review[1]["model"] == "grok-4.6" and review[1]["executor"] == "grok"
+    # Default matrix must stay on the subscription cascade (not globally replaced).
+    monkeypatch.delenv('AICC_EXECUTOR_PROFILE', raising=False)
+    assert [link["executor"] for link in cascade_for("implementation")] == [
+        "claude",
+        "codex",
+    ]
 
 
 def test_the_implementation_escalation_link_is_a_different_account():
@@ -75,6 +102,20 @@ def test_unknown_task_class_falls_back_to_implementation():
     assert cascade_for("martian") == cascade_for("implementation")
 
 
+def test_default_repo_routes_include_crm_lane(monkeypatch) -> None:
+    """CRM backlog tasks must be dispatchable without a per-host override.
+
+    This is deliberately hermetic rather than in the database planner suite:
+    the route table is a static planner contract and must be checked even
+    where the PostgreSQL integration fixtures are unavailable.
+    """
+    monkeypatch.delenv("AICC_PLANNER_REPO_ROUTES", raising=False)
+    assert repo_route("voyn-logistics-crm") == (
+        "CRM",
+        "/home/voynadmin/Projects/voyn-logistics-crm",
+    )
+
+
 def test_dispatch_prompt_asks_for_the_commit_and_not_for_a_pull_request() -> None:
     """VOYN-W0-AICC-AGENT-COMMIT-CONTRACT-GAP (found live 2026-08-30).
 
@@ -110,3 +151,47 @@ def test_dispatch_prompt_asks_for_the_commit_and_not_for_a_pull_request() -> Non
     assert "HEAD_SHA: <the branch head commit sha>" in prompt
     # The instruction that asked the agent to publish its own work is gone.
     assert "When you open or update a pull request" not in prompt
+
+
+def test_owner_cascade_orders_all_isolated_providers_by_task_class(monkeypatch):
+    monkeypatch.setenv("AICC_EXECUTOR_PROFILE", "owner-cascade")
+    assert [x["executor"] for x in cascade_for("implementation")] == [
+        "claude", "codex", "cursor", "grok",
+    ]
+    assert [x["executor"] for x in cascade_for("review")] == [
+        "codex", "claude", "cursor", "grok",
+    ]
+    assert all(x["executor"] in agent_runner.PRINCIPAL_EXECUTOR_BINARIES
+               for x in cascade_for("review"))
+    changed = cascade_for("review")
+    changed[0]["model"] = "wrong-provider-model"
+    assert cascade_for("review")[0]["model"] is None
+
+
+def test_owner_cascade_model_only_route_matches_broker_capability(monkeypatch):
+    from command_center.orchestrator import review_merge
+    monkeypatch.setenv("AICC_EXECUTOR_PROFILE", "owner-cascade")
+    route = review_merge._model_only_review_cascade()
+    assert [x["executor"] for x in route] == ["grok"]
+    assert route[0]["task_type"] == "independent_review"
+    assert route[0]["capability"] == "model_only"
+
+
+def test_owner_cascade_cursor_model_override(monkeypatch):
+    monkeypatch.setenv("AICC_EXECUTOR_PROFILE", "owner-cascade")
+    monkeypatch.setenv("AICC_CURSOR_MODEL", "composer-2.5")
+    link = next(x for x in cascade_for("review") if x["executor"] == "cursor")
+    assert link["model"] == "composer-2.5"
+
+
+def test_mac_subscription_is_opt_in_model_only_not_a_writer(monkeypatch):
+    from command_center.orchestrator import review_merge
+    monkeypatch.setenv('AICC_EXECUTOR_PROFILE','owner-cascade')
+    monkeypatch.setenv('AICC_CLAUDE_MAC_ENABLED','1')
+    assert [x['executor'] for x in review_merge._model_only_review_cascade()]==['claude','grok']
+    assert all(x['capability']=='model_only' for x in review_merge._model_only_review_cascade())
+    assert cascade_for('implementation')[0]['executor']=='claude'
+    # Implementation still uses the existing server broker development profile,
+    # never the Mac's zero-tool inference transport.
+    manifest=agent_runner.build_principal_isolation_manifest(repository_path=__import__('pathlib').Path.cwd(),prompt='text',task_type='implementation',timeout_seconds=60,executor='claude',model=None)
+    assert manifest['profile']=='trusted_development'

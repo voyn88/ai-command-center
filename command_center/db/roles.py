@@ -66,27 +66,27 @@ from __future__ import annotations
 from types import MappingProxyType
 
 __all__ = [
-    "APP_ROLE",
-    "MIGRATOR_ROLE",
-    "OPERATOR_ROLE",
-    "WORKER_ROLE",
     "ALL_ROLES",
     "ALL_TABLES",
     "ALL_VIEWS",
+    "APP_ROLE",
     "COLUMN_PRIVILEGES",
     "FUNCTION_PRIVILEGES",
-    "merge_column_privileges",
-    "merge_privileges",
+    "IDENTITY_SEQUENCES",
+    "MIGRATOR_ROLE",
+    "OPERATOR_ROLE",
+    "PRIVILEGES",
     "VIEW_PRIVILEGES",
+    "WORKER_ROLE",
     "apply_bootstrap",
     "apply_table_grants",
-    "IDENTITY_SEQUENCES",
-    "PRIVILEGES",
+    "merge_column_privileges",
+    "merge_privileges",
     "render_bootstrap",
-    "render_worker_host_role",
     "render_grants",
-    "render_table_grants",
     "render_role_creation",
+    "render_table_grants",
+    "render_worker_host_role",
 ]
 
 MIGRATOR_ROLE = "aicc_migrator"
@@ -127,6 +127,7 @@ ALL_TABLES: tuple[str, ...] = (
     "backlog_task_remediation",
     "backlog_scan_cursor",
     "backlog_writer_lease",
+    "coordinator_state",
     "completion",
     "completion_event",
     "completion_validation",
@@ -163,6 +164,12 @@ ALL_TABLES: tuple[str, ...] = (
     "schema_migration",
     "session",
     "task",
+    # The tick-stall watchdog's observability ledgers (0034): plain
+    # append-only data with no state machine to defend, so they take the
+    # blanket app-role default below rather than the function-only idiom.
+    "tick_observation",
+    "tick_skip_event",
+    "tick_stall_escalation",
     "work_attempt",
     "work_event",
     "work_item",
@@ -197,6 +204,9 @@ IDENTITY_SEQUENCES: MappingProxyType[str, str] = MappingProxyType(
         "proposal_event": "proposal_event_id_seq",
         "proposal_evidence": "proposal_evidence_id_seq",
         "run_event": "run_event_id_seq",
+        "tick_observation": "tick_observation_id_seq",
+        "tick_skip_event": "tick_skip_event_id_seq",
+        "tick_stall_escalation": "tick_stall_escalation_id_seq",
         "work_event": "work_event_id_seq",
         "worker_host_fingerprint": "worker_host_fingerprint_id_seq",
     }
@@ -308,6 +318,8 @@ _APP_BACKLOG_TABLES: dict[str, frozenset[str]] = {
     "backlog_writer_lease": _READ,
     "backlog_task_remediation": _READ,
     "backlog_scan_cursor": _READ,
+    # Coordination v2: reads only; every write is a SECURITY DEFINER CAS.
+    "coordinator_state": _READ,
 }
 
 _WORKER_BACKLOG_TABLES: dict[str, frozenset[str]] = {
@@ -318,6 +330,7 @@ _WORKER_BACKLOG_TABLES: dict[str, frozenset[str]] = {
     "backlog_writer_lease": _NONE,
     "backlog_task_remediation": _NONE,
     "backlog_scan_cursor": _NONE,
+    "coordinator_state": _NONE,
 }
 
 # The enrolment tables (0003), for the control plane. Read-only, and two of them
@@ -537,6 +550,7 @@ _WORKER_FUNCTIONS = (
     # 0021: the worker-host fail-closed probe records what it measured.
     "monitor_record_finding(text, text, jsonb)",
     "monitor_clear_finding(text)",
+    "monitor_clear_resolved_findings(text, jsonb, timestamptz)",
     # A second, narrower fail path for a refusal that names no fault in the
     # work itself (VOYN-W0-AICC-PUBLISH-LEASE-CONTENTION-BURNS-ATTEMPT) --
     # see 0022_queue_fail_lease_wait.
@@ -583,6 +597,8 @@ _APP_BACKLOG_FUNCTIONS = (
     "backlog_scan_claim(text, text, text)",
     # Triage of raw findings (0008): UNTRIAGED -> OPEN/NEEDS_REFINEMENT/DONE/DECIDED.
     "backlog_triage(text, text, text)",
+    # Evidence hygiene (0030): remove proven malformed PR evidence.
+    "backlog_clear_evidence(text, text, text, text)",
     # 0021: read-only deploy preflight with dispatch's privileges; the task
     # class setter the planner uses for split children and monitor tasks; the
     # monitor-finding record/clear pair (shared with worker hosts, see
@@ -591,10 +607,19 @@ _APP_BACKLOG_FUNCTIONS = (
     "backlog_set_task_class(text, text)",
     "monitor_record_finding(text, text, jsonb)",
     "monitor_clear_finding(text)",
+    "monitor_clear_resolved_findings(text, jsonb, timestamptz)",
     "monitor_link_task(bigint, text)",
     # Audit trail for where a record came from (0020); the importer's stamp
     # that a row was migrated rather than authored directly in the store.
     "backlog_record_provenance(text, text, jsonb)",
+    "backlog_owner_decision(text, bigint, text, text)",
+    "backlog_owner_lock(text)",
+    # Coordination v2 (0031): durable snapshot/in-flight CAS; no DML path.
+    "coordinator_state_read(text)",
+    "coordinator_enqueue(text, text, text, text, text, jsonb)",
+    "coordinator_cas_begin(text, text, text, text, timestamptz)",
+    "coordinator_cas_finish(text, text, text, jsonb, text, jsonb, integer, timestamptz)",
+    "coordinator_cas_clear_inflight(text, text, text, timestamptz)",
 )
 
 # The enrolment surface (0003), split by who may do what.
@@ -984,14 +1009,14 @@ def render_worker_host_role(role: str) -> list[str]:
     """
     _require_identifier(role)
     return [
-        "DO $$\n"
+        ("DO $$\n"
         "BEGIN\n"
         "    PERFORM pg_advisory_xact_lock(7823649102);\n"
         f"    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role}') THEN\n"
         f"        CREATE ROLE {role} LOGIN IN ROLE {WORKER_ROLE};\n"
         "    END IF;\n"
         "END\n"
-        "$$;"
+        "$$;")
     ]
 
 
@@ -1039,10 +1064,9 @@ def apply_table_grants(conn, schema: str = "public") -> int:
 
 
 def _execute(conn, statements: list[str]) -> int:
-    with conn.transaction():
-        with conn.cursor() as cur:
-            for statement in statements:
-                cur.execute(statement)
+    with conn.transaction(), conn.cursor() as cur:
+        for statement in statements:
+            cur.execute(statement)
     return len(statements)
 
 

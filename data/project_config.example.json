@@ -1,5 +1,8 @@
 {
   "AIOS": {
     "repository_path": "/path/to/your/aios/checkout"
+  },
+  "CRM": {
+    "repository_path": "/path/to/your/voyn-logistics-crm/checkout"
   }
 }

@@ -13,6 +13,7 @@ import shlex
 import stat
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -71,14 +72,14 @@ RELEASE_ROOT = Path("/opt/aicc/releases")
 # Timers that mutate worker lane units on their own schedule, independent of
 # this rollout. Both must be held for the rollout's entire duration: a
 # credential-rotation tick's reload-then-restart fallback cannot tell "this
-# lane crashed" from "this lane is mid-drain", and a self-deploy tick
-# unconditionally restarts every service in its list. Left running, either
-# can race this script's own stop/start of a lane -- live on worker-01
+# lane crashed" from "this lane is mid-drain", and the worker release-deploy
+# tick drain-restarts every currently-active registered lane. Left running,
+# either can race this script's own stop/start of a lane -- live on worker-01
 # (2026-09-08), self-deploy's restart of the canary collided with this
 # script's own `stop`, and systemd canceled one of the two jobs.
 LANE_MUTATING_TIMERS = (
     "voyn-aicc-credential-rotation.timer",
-    "voyn-aicc-self-deploy.timer",
+    "voyn-aicc-worker-release-deploy.timer",
     "voyn-aicc-source-clone-refresh.timer",
 )
 
@@ -91,6 +92,18 @@ LANE_MUTATING_TIMERS = (
 # a tick already in flight when the timers are stopped, or one started
 # directly rather than through its timer, still sees this file and defers.
 ROLLOUT_LOCK_PATH = Path("/run/aicc-staged-rollout.lock")
+
+#: How long `restore` lets an expected-active unit finish coming up before it
+#: refuses the restore. A `Type=notify` service forks its MainPID and only
+#: then sends `READY=1`, so systemd can legitimately report it "activating"
+#: with a live MainPID for a short window (~170 ms for a worker lane, live on
+#: worker-01 2026-09-07/08). That window is a race to wait out, not a state
+#: to accept: a unit that never leaves "activating" -- hung start, failing
+#: dependency, bad readiness handshake -- is exactly what this rollback has
+#: to catch, so the wait is bounded and its expiry is a failure.
+RESTORE_ACTIVATION_TIMEOUT_SECONDS = 30.0
+#: Interval between `is-active` reads while waiting out that window.
+RESTORE_ACTIVATION_POLL_SECONDS = 0.25
 
 
 class RolloutError(RuntimeError):
@@ -488,15 +501,26 @@ def hold_lane_mutating_timers(systemd: Systemd) -> None:
         raise
 
 
-def release_lane_mutating_timers(systemd: Systemd) -> None:
+def release_lane_mutating_timers(systemd: Systemd, *, strict: bool = False) -> None:
     """Best-effort restart of every timer `hold_lane_mutating_timers` stopped.
 
     Always called from a `finally`, on both the success and failure path, so
     a rollout can never exit leaving rotation or self-deploy permanently
     paused.
     """
+    failed = []
     for timer in LANE_MUTATING_TIMERS:
-        systemd.run("start", timer, check=False)
+        if not strict:
+            systemd.run("start", timer, check=False)
+            continue
+        try:
+            if systemd.run("show", timer, "--property=LoadState", "--value") == "not-found":
+                continue
+            systemd.run("start", timer)
+        except Exception:  # noqa: BLE001 - try every timer before reporting cleanup failure
+            failed.append(timer)
+    if failed:
+        raise RolloutError("timer_restore_failed:" + ",".join(failed))
 
 
 def write_rollout_lock() -> None:
@@ -504,30 +528,67 @@ def write_rollout_lock() -> None:
 
     World-readable by design: the rotator and self-deploy run as unprivileged
     service users and only need to observe that the file exists, never its
-    contents. Written via temp-then-rename so a concurrent reader never
-    observes a partially written file.
+    contents. Created exclusively: readers only need existence, and concurrent
+    writers must never replace another rollout marker.
     """
     ROLLOUT_LOCK_PATH.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
-    temporary = ROLLOUT_LOCK_PATH.with_name(f".{ROLLOUT_LOCK_PATH.name}.{os.getpid()}")
-    temporary.write_text(f"{os.getpid()}\n", encoding="utf-8")
-    temporary.chmod(0o644)
-    os.replace(temporary, ROLLOUT_LOCK_PATH)
+    # Exclusive creation prevents another rollout's ownership being overwritten.
+    fd = os.open(ROLLOUT_LOCK_PATH, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(f"{os.getpid()}\n")
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 def remove_rollout_lock() -> None:
-    ROLLOUT_LOCK_PATH.unlink(missing_ok=True)
+    try:
+        owner = ROLLOUT_LOCK_PATH.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return
+    if owner == str(os.getpid()):
+        ROLLOUT_LOCK_PATH.unlink(missing_ok=True)
 
 
 def retire_legacy_units(systemd: Systemd) -> None:
-    """Drain and disable every pre-template worker before lane startup."""
+    """Drain, disable and un-latch every pre-template worker before lane startup.
+
+    `disable` removes the symlink that was these units' fragment, so after
+    this they are deliberately gone from the host for good (see
+    `RETIRED_LEGACY_UNITS` in ops/aicc_install_transaction.py, which exists
+    because quiesce has to tolerate exactly that absence). `reset-failed` is
+    the third step and not a tidy-up: a `stop` that reached its timeout --
+    which a worker daemon holding a task does -- latches `failed` on the way
+    out, and a unit with no fragment can never run again, so it can never
+    reach a successful state that clears the latch. systemd keeps such a
+    unit loaded for no other reason than to remember that latch, which is why
+    the corpses, and only the corpses, outlive a retirement.
+
+    That is what the host unit-health probe then counted, every two minutes,
+    as broken infrastructure on a host whose retirement had in fact succeeded
+    (worker-01 `failed_units`, monitor_finding 2051 and its three
+    successors) -- a finding no repair could clear, because the units it
+    named did not exist. The probe no longer treats a fragment-less unit as a
+    fault (`infra_monitor.evaluate_unit_health`); this is the other half:
+    stop producing them. Clearing the latch here is also what retires the
+    corpses already on hosts that were rolled out before this landed, since
+    every rollout runs this.
+    """
     for unit in LEGACY_WORKER_UNITS:
         systemd.run("stop", unit, check=False)
         systemd.run("disable", unit, check=False)
+        systemd.run("reset-failed", unit, check=False)
     verify_legacy_units_retired(systemd)
 
 
 def verify_legacy_units_retired(systemd: Systemd) -> None:
-    """Prove old claimers cannot coexist with templated worker lanes."""
+    """Prove old claimers cannot coexist with templated worker lanes.
+
+    `failed` is refused alongside `active`/`activating`: a retired unit is
+    expected to be drained AND un-latched, and asserting it proves the
+    `reset-failed` above actually took effect on this host rather than
+    trusting that it was issued -- the lesson of a reaping rule that was
+    written in a section systemd ignores and silently did nothing.
+    """
     for unit in LEGACY_WORKER_UNITS:
         active = systemd.run("is-active", unit, check=False)
         enabled = systemd.run("is-enabled", unit, check=False)
@@ -540,6 +601,10 @@ def verify_legacy_units_retired(systemd: Systemd) -> None:
             or main_pid not in {"", "0"}
         ):
             raise RolloutError(f"legacy worker was not drained and disabled: {unit}")
+        if active == "failed":
+            raise RolloutError(
+                f"legacy worker is retired but still latched failed: {unit}"
+            )
 
 
 def snapshot(systemd: Systemd, units: tuple[str, ...]) -> dict[str, object]:
@@ -567,7 +632,37 @@ def snapshot(systemd: Systemd, units: tuple[str, ...]) -> dict[str, object]:
     }
 
 
-def restore(systemd: Systemd, state: dict[str, object]) -> None:
+def _settle_activating(
+    systemd: Systemd,
+    unit: str,
+    *,
+    sleep=time.sleep,
+    monotonic=time.monotonic,
+) -> str:
+    """Re-read `is-active` until a starting unit leaves "activating".
+
+    Returns the last state observed -- "active" once the `Type=notify`
+    handshake lands, whatever terminal state a failed start produced, or
+    "activating" itself if the unit is still not up when the bound expires.
+    The caller applies exactly the same checks to that answer as it would to
+    an immediate one, so waiting can only ever turn a transient race into a
+    proven state; it never converts an unproven unit into an accepted one.
+    """
+    deadline = monotonic() + RESTORE_ACTIVATION_TIMEOUT_SECONDS
+    active = "activating"
+    while active == "activating" and monotonic() < deadline:
+        sleep(RESTORE_ACTIVATION_POLL_SECONDS)
+        active = systemd.run("is-active", unit, check=False)
+    return active
+
+
+def restore(
+    systemd: Systemd,
+    state: dict[str, object],
+    *,
+    sleep=time.sleep,
+    monotonic=time.monotonic,
+) -> None:
     raw_units = state.get("units")
     version = state.get("version")
     if version not in {2, 3} or not isinstance(raw_units, dict):
@@ -660,6 +755,33 @@ def restore(systemd: Systemd, state: dict[str, object]) -> None:
         systemd.run("enable" if raw.get("enabled") is True else "disable", unit)
         systemd.run("start" if expected_active else "stop", unit)
         active = systemd.run("is-active", unit, check=False)
+        if expected_active and active == "activating":
+            # A Type=notify unit forks its MainPID before it sends READY=1,
+            # so a lane can read "activating" with a live MainPID while its
+            # readiness handshake is still in flight -- the service coming up
+            # normally, not one that failed to go inactive (the shape that
+            # wedged install recovery on worker-01, 2026-09-07/08).
+            #
+            # Waiting is the only safe way to tell that window apart from a
+            # lane that never comes up, and this restore CAN wait: its start
+            # is synchronous, unlike the deliberately queued `--no-block`
+            # start in aicc_install_transaction.restore_service_snapshot,
+            # which is ordered before sysinit and would deadlock if it
+            # blocked. So where that one must accept "activating" as
+            # possible-not-yet-run, this one gives it a bounded chance to
+            # finish and then judges the result. "activating" is never a
+            # terminal state a rollback accepts here: a staged rollout's
+            # whole safety model is proving each lane before the next.
+            active = _settle_activating(systemd, unit, sleep=sleep, monotonic=monotonic)
+            if active == "activating":
+                # The generic refusal below would catch this too. It is
+                # named separately because the two are different operator
+                # problems: "the snapshot and the host disagree" versus
+                # "this lane has been starting for
+                # RESTORE_ACTIVATION_TIMEOUT_SECONDS and is not up".
+                raise RolloutError(
+                    f"service did not finish starting after restore: {unit}"
+                )
         enabled = systemd.run("is-enabled", unit, check=False)
         load_state = systemd.run(
             "show", unit, "--property=LoadState", "--value", check=False
@@ -667,22 +789,11 @@ def restore(systemd: Systemd, state: dict[str, object]) -> None:
         main_pid = systemd.run(
             "show", unit, "--property=MainPID", "--value", check=False
         )
-        # A Type=notify unit forks its MainPID before it sends READY=1, so a
-        # start that completes in that window is legitimately reported
-        # "activating" with a live MainPID -- not a service that failed to go
-        # inactive. Only exempt that transitional state when the unit is
-        # actually expected active; an expected-inactive unit stuck
-        # deactivating with a MainPID is still refused below.
-        activating_start = expected_active and active == "activating"
         if (
             load_state in {"", "not-found"}
-            or ((active == "active") is not expected_active and not activating_start)
+            or ((active == "active") is not expected_active)
             or ((enabled == "enabled") is not (raw.get("enabled") is True))
-            or (
-                active != "active"
-                and not activating_start
-                and main_pid not in {"", "0"}
-            )
+            or (active != "active" and main_pid not in {"", "0"})
         ):
             raise RolloutError(f"service snapshot did not restore exactly: {unit}")
         if version == 3:
@@ -1090,7 +1201,7 @@ _environment_file_exists = os.path.exists
 
 
 def verify_required_environment_files(
-    systemd: "Systemd", units: tuple[str, ...]
+    systemd: Systemd, units: tuple[str, ...]
 ) -> None:
     """Refuse before the first mutation if a required environment file is
     absent from the host.
@@ -1222,6 +1333,18 @@ def rollout(
             for unit in (*units, *LEGACY_WORKER_UNITS):
                 systemd.run("stop", unit, check=False)
                 systemd.run("disable", unit, check=False)
+            # Four consecutive attempts failed here on worker-01 (2026-08-31)
+            # and each one disabled the legacy units again, removing their
+            # fragment while a timed-out stop had latched `failed` on them.
+            # The latch is not the evidence of this failure -- the raised
+            # RolloutError and the journal are -- but it is permanent host
+            # state nothing can clear once the fragment is gone, so the
+            # abandoned path must not leave it behind either. Only the legacy
+            # units: a lane's fragment is the template file, which the outer
+            # transaction restores, so a failed lane can still clear its own
+            # latch by running.
+            for unit in LEGACY_WORKER_UNITS:
+                systemd.run("reset-failed", unit, check=False)
             raise
     finally:
         # Restored on both the success and failure path -- a rollout must

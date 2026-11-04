@@ -225,6 +225,62 @@ section below for why it exists at all):
   cascade. Every atomic decision is a SQL function of the store; the package
   owns candidate iteration, the static routing matrix and the plan report,
   and adds no engine capability of its own.
+  `command_center/orchestrator/coordination.py`
+  (VOYN-W0-BACKLOG-ORCHESTRATOR, PR #1077) is a reviewed extension of this
+  same SRV composition exception: it requests a bounded advisory ordering of
+  already eligible backlog candidates through the existing queue and consumes
+  the existing worker result. It does not acquire work, run providers, spawn
+  processes, create a scheduler, or bypass the planner's dependency and lease
+  checks. Atomic snapshot deduplication, enqueue, and bounded pre-enqueue retry
+  decisions belong to PostgreSQL functions in migration 0032; queue claiming
+  and execution remain the accepted queue and worker's responsibility.
+  Python renders calls on a caller-owned connection, validates candidate IDs,
+  and applies only advisory order behind explicit enable/stop switches.
+  The orchestration classification comes from the package name; this single
+  baseline entry records its reviewed SRV placement, not permission for a new
+  general orchestration engine or a weakening of ADR-0008. The scanner remains
+  unchanged, and convergence follows the SRV exception below.
+  `command_center/worker/simple_tasks.py` and `worker/admission.py`
+  (PR #1080) extend this same SRV composition boundary. The simple-task
+  handler consumes one work item and its existing cancellation event; it
+  performs one bounded loopback HTTP completion, validates a closed JSON
+  contract, and delegates remote fallback to the existing runner and its
+  read-only sandbox. It owns no claim, heartbeat, retry scheduling, task
+  completion authority, process lifecycle, database or new queue. The
+  PostgreSQL queue remains responsible for attempts and infrastructure-wait.
+  Candidate ordering is advisory over already eligible IDs; it cannot grant
+  execution, publish, mutate a repository or supply acceptance evidence.
+  The admission helper only narrows the existing worker's mutating path via
+  operator configuration and an OS file lock shared by this host's lanes.
+  It neither issues identities nor replaces/acquires the existing database
+  task/publisher leases. A process exit releases the OS lock; no second lease
+  store or scheduler is introduced. The locks are local serialization, not a
+  claim of multi-host exclusion; existing authority fences remain required.
+  Both files classify as orchestration because of their worker package path.
+  Their explicit baseline entries record this reviewed SRV placement, not
+  an exception for arbitrary local engines. The scanner and legacy freeze
+  are unchanged. Convergence follows the same accepted AIOS dispatch contract
+  as the enclosing SRV worker; provider execution and admission must move
+  with that worker rather than survive as a parallel scheduler.
+  The opt-in `ops/aicc_claude_mac_server.py` extends this SRV provider
+  execution seam to the owner's Mac subscription. Its `subprocess.Popen`
+  call deliberately classifies as orchestration, so the module is recorded
+  explicitly in the baseline rather than exempted from detection. This is
+  a reviewed SRV host adapter: one bounded text-inference request invokes
+  the vendor's CLI with zero tools, empty MCP, disabled customizations and
+  consumer-auth verification. It manages only that invocation's private
+  process group and cancellation. It receives no task ID, queue identity,
+  repository, publisher authority, command or configurable executable from
+  the caller; it owns no task lifecycle, retries, durable state or scheduling.
+  Fixed TLS and inference-only connection credentials authenticate this
+  private provider channel; they introduce no platform principal/tenant
+  registry, roles or credential-issuance API. All task leases, review-head
+  validation, publication and completion stay in the accepted SRV control
+  plane. The adapter is deployed as model-serving infrastructure on the Mac,
+  while the immutable worker helper is only its fixed HTTPS client. This
+  baseline addition neither reopens legacy runtime growth nor changes the
+  scanner. Convergence must move this provider adapter with the enclosing
+  SRV worker to the accepted AIOS execution contract.
   `command_center/orchestrator/gh_access.py`
   (VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS) is a baseline addition
   of the same shape as `github_app_auth.py`: a transport adapter that chooses

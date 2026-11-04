@@ -27,6 +27,14 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def isolated_executor_quota_circuits():
+    from command_center import agent_runner
+    agent_runner.clear_executor_exhaustion()
+    yield
+    agent_runner.clear_executor_exhaustion()
+
+
+@pytest.fixture(autouse=True)
 def restore_main_module_after_streamlit_apptest():
     """Keep AppTest's temporary ``__main__`` from poisoning spawn workers.
 
@@ -218,6 +226,12 @@ def remove_data_dir_when_quiet(
 ) -> None:
     """`shutil.rmtree(directory)`, but not while a runtime writer is still live."""
     stragglers = quiesce_background_writers(quiesce_timeout)
+    if stragglers:
+        raise AssertionError(
+            f"Refusing to remove the isolated data dir {directory}: "
+            f"known background writers still live: {stragglers}. "
+            "Finish or recover retained runs before resetting test data."
+        )
     last_error: OSError | None = None
     for _ in range(_RMTREE_ATTEMPTS):
         if not directory.exists():
