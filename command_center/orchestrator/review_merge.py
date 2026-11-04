@@ -61,7 +61,7 @@ pr/sha evidence, moving the task to READY_TO_REVIEW. This module is the rest:
   mint, a readiness read that never reached the GitHub API -- lands in
   ``LoopReport.errors``, kept apart from ``skipped`` so a caller can fail
   loudly instead of it looking like an ordinary not-yet-accepted PR.
-  A PR that is only BEHIND main gets `gh pr update-branch`, which mints a
+  A PR that is only BEHIND main gets a pinned REST branch update, which mints a
   fresh head with no marker on it -- ``_carry_over_marker_if_patch_id_stable``
   then reposts the ACCEPT marker on that new head, with its own audited
   comment, iff `git patch-id --stable` proves the PR's own diff is
@@ -3381,6 +3381,61 @@ def _merge_state(repo_path: str, pr_url: str) -> str:
     return str(data.get("mergeStateStatus") or "")
 
 
+
+def _update_behind_branch(
+    repo_path: str, pr_url: str, expected_head: str
+) -> tuple[str | None, str]:
+    """Request one pinned base merge and confirm its resulting commit.
+
+    HTTP 202 only acknowledges queued work. A pending or ambiguous result
+    never authorizes acceptance carry-over; a later tick may re-review it.
+    """
+    parsed = _owner_repo_number_from_pr_url(pr_url)
+    if parsed is None or not isinstance(expected_head, str) or not re.fullmatch(r"[0-9a-f]{40}", expected_head):
+        return None, "branch_update_failed: invalid_target"
+    owner, repo, number = parsed
+    endpoint = f"repos/{owner}/{repo}/pulls/{number}"
+    before = _pull_for_pr_url(repo_path, pr_url)
+    if not isinstance(before, dict) or before.get("state") != "open" or before.get("merged_at"):
+        return None, "branch_update_failed: snapshot_unavailable_or_closed"
+    before_head = before.get("head")
+    base = before.get("base")
+    if not isinstance(before_head, dict) or before_head.get("sha") != expected_head:
+        return None, "branch_update_failed: head_changed"
+    base_sha = base.get("sha") if isinstance(base, dict) else None
+    if not isinstance(base_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", base_sha):
+        return None, "branch_update_failed: invalid_base"
+    update = _gh([
+        "api", "--method", "PUT", f"{endpoint}/update-branch",
+        "-f", f"expected_head_sha={expected_head}", "--include",
+    ], repo_path)
+    if update.returncode != 0:
+        return None, "branch_update_failed: request_refused"
+    # gh api --include emits an HTTP status line, headers, then the body.
+    status = re.match(r"HTTP/\S+\s+(\d{3})(?:\s|$)", update.stdout or "")
+    if status is None or status.group(1) != "202":
+        return None, "branch_update_failed: unexpected_response"
+    after = _pull_for_pr_url(repo_path, pr_url)
+    if not isinstance(after, dict) or after.get("state") != "open" or after.get("merged_at"):
+        return None, "branch_update_failed: confirmation_unavailable_or_closed"
+    after_head = after.get("head")
+    head = after_head.get("sha") if isinstance(after_head, dict) else None
+    if head == expected_head:
+        return None, "branch_update_pending"
+    if not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head):
+        return None, "branch_update_failed: invalid_updated_head"
+    outcome, commit = _rest_json(repo_path, f"repos/{owner}/{repo}/commits/{head}")
+    parents = commit.get("parents") if isinstance(commit, dict) else None
+    if (
+        outcome != _REST_OK or not isinstance(commit, dict) or commit.get("sha") != head
+        or not isinstance(parents, list) or len(parents) != 2
+        or any(not isinstance(parent, dict) or not isinstance(parent.get("sha"), str) for parent in parents)
+        or {parent.get("sha") for parent in parents} != {expected_head, base_sha}
+    ):
+        return None, "branch_update_failed: update_not_confirmed"
+    return head, "branch_updated_behind_main"
+
+
 def _pr_window_expensive_read_decision(
     repo_path: str, pr_url: str, *, prefix: str
 ) -> _PrWindowReadDecision:
@@ -3890,9 +3945,9 @@ def _accept_marker_churn_count(comments: list[dict[str, Any]]) -> int:
 
 
 def _carry_over_marker_if_patch_id_stable(
-    repo_path: str, pr_url: str, task_id: str
+    repo_path: str, pr_url: str, task_id: str, *, expected_head: str | None = None
 ) -> bool:
-    """After a `gh pr update-branch` call has already succeeded (the
+    """After a REST branch update has been confirmed (the
     caller's job, not this function's), post a fresh ACCEPT marker on the
     new head WITHOUT a full re-review, iff the PR's own diff is
     byte-identical in content to the diff a prior standing ACCEPT marker
@@ -3923,6 +3978,9 @@ def _carry_over_marker_if_patch_id_stable(
     except (KeyError, TypeError, json.JSONDecodeError):
         return False
     if not re.fullmatch(r"[0-9a-f]{40}", head) or not re.fullmatch(r"[0-9a-f]{40}", base):
+        return False
+
+    if expected_head is not None and head != expected_head:
         return False
 
     meta = _gh(["pr", "view", pr_url, "--json", "reviews,comments"], repo_path)
@@ -3965,7 +4023,7 @@ def _carry_over_marker_if_patch_id_stable(
             f"Task: {task_id}\n"
             f"The ACCEPT marker for {prior_sha} carried over to {head} without "
             "a new review: `git patch-id --stable` is identical before and "
-            "after `gh pr update-branch` brought this branch current with its "
+            "after the pinned REST branch update brought this branch current with its "
             "base, so the reviewed diff itself did not change. CI and the "
             "acceptance gate remain required for merge.\n"
         )
@@ -4493,8 +4551,8 @@ def _merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -
                     continue
                 branch_updates += 1
                 actions += 1
-                updated = _gh(["pr", "update-branch", pr_url], repo_path)
-                if updated.returncode == 0:
+                updated_head, update_reason = _update_behind_branch(repo_path, pr_url, detail)
+                if updated_head is not None:
                     # The new head is a fresh, unmarked commit even though
                     # the PR's own diff may not have changed at all -- see
                     # the section comment above `_carry_over_marker_if_
@@ -4505,7 +4563,7 @@ def _merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -
                     # real re-review on a later tick, exactly as before
                     # this existed.
                     carried = _carry_over_marker_if_patch_id_stable(
-                        repo_path, pr_url, task_id
+                        repo_path, pr_url, task_id, expected_head=updated_head
                     )
                     report.skipped.append((
                         task_id,
@@ -4514,7 +4572,7 @@ def _merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -
                     ))
                 else:
                     report.skipped.append(
-                        (task_id, f"branch_update_failed: {updated.stderr.strip()[:80]}")
+                        (task_id, update_reason)
                     )
                 continue
             actions += 1

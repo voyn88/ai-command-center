@@ -579,6 +579,10 @@ class JSONTasksRepository:
     def load_all(self) -> list[dict]:
         return load_tasks(self._root)
 
+    def mutate(self, mutator: Callable[[list[dict]], T], *, timeout: float = TASKS_LOCK_TIMEOUT_SECONDS) -> T:
+        """Validate and commit a local batch against one locked fresh snapshot."""
+        return mutate_tasks(self._root, mutator, timeout=timeout)
+
     def create(self, task_dict: dict, *, timeout: float = TASKS_LOCK_TIMEOUT_SECONDS) -> dict:
         task_id = task_dict.get("id")
         if not task_id:

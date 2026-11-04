@@ -39,8 +39,8 @@ Pipeline
 `build_import_preview` — `(root, parsed, validation)` -> `ImportPreview`: reads
     the current store once (read-only) to classify each valid task as new or
     an id-duplicate. Never writes.
-`apply_task_package` — `(root, parsed, validation)` -> `ImportResult`: the
-    entire load -> re-derive duplicates/dependencies -> merge -> save cycle
+`apply_task_package` — `(root, parsed, validation)` -> `ImportResult`: for
+    the local JSON backend, the entire load -> re-derive duplicates/dependencies -> merge -> save cycle
     runs inside `tasks_repository.mutate_tasks` — the *same* shared lock
     (`tasks_repository.tasks_lock`, never a second, import-specific one)
     every other write path in this application holds for its own
@@ -474,6 +474,45 @@ def _find_unresolved_dependencies(new_items: list[dict], resolvable_ids: set[str
     return issues
 
 
+def _find_dependency_cycle(new_items: list[dict], existing: list[dict]) -> ImportIssue | None:
+    """Find a cycle reachable from an imported task in the effective graph.
+
+    Existing records win over duplicate package definitions. Unrelated legacy
+    cycles do not block an import, but a new task must not depend on a cycle.
+    Iterative DFS handles deep packages without a recursion-limit failure.
+    """
+    by_id = {item["id"]: item for item in existing if item.get("id")}
+    by_id.update({item["id"]: item for item in new_items})
+    edges = {task_id: [dep for dep in item.get("depends_on") or [] if dep in by_id]
+             for task_id, item in by_id.items()}
+    colour: dict[str, int] = {}
+    for item in new_items:
+        root = item["id"]
+        if colour.get(root) == 2:
+            continue
+        path = [root]
+        positions = {root: 0}
+        colour[root] = 1
+        stack = [(root, iter(edges[root]))]
+        while stack:
+            node, children = stack[-1]
+            dep = next(children, None)
+            if dep is None:
+                colour[node] = 2
+                stack.pop()
+                positions.pop(node)
+                path.pop()
+            elif colour.get(dep) == 1:
+                cycle = path[positions[dep]:] + [dep]
+                return ImportIssue(root, "Обнаружен цикл зависимостей: " + " → ".join(cycle))
+            elif colour.get(dep, 0) == 0:
+                colour[dep] = 1
+                positions[dep] = len(path)
+                path.append(dep)
+                stack.append((dep, iter(edges[dep])))
+    return None
+
+
 def build_import_preview(
     root: Path,
     parsed: ParsedPackage,
@@ -499,7 +538,8 @@ def build_import_preview(
     Nothing here is written to `tasks.json` — the caller (UI/CLI) must call
     `apply_task_package` separately, after explicit user confirmation.
     """
-    existing_ids = {t["id"] for t in tasks_repository.get_repository(root).load_all() if t.get("id")}
+    existing = tasks_repository.get_repository(root).load_all()
+    existing_ids = {t["id"] for t in existing if t.get("id")}
     package_ids = {item["id"] for item in validation.items}
 
     new_items: list[dict] = []
@@ -522,6 +562,9 @@ def build_import_preview(
     dependency_issues = _find_unresolved_dependencies(new_items, existing_ids | package_ids)
     errors = list(validation.errors)
     warnings = list(validation.warnings)
+    cycle = _find_dependency_cycle(new_items, existing)
+    if cycle is not None:
+        errors.append(cycle)
     if allow_unresolved_dependencies:
         warnings.extend(dependency_issues)
     else:
@@ -584,18 +627,12 @@ def apply_task_package(
     lock_timeout: float = IMPORT_LOCK_TIMEOUT_SECONDS,
     allow_unresolved_dependencies: bool = False,
 ) -> ImportResult:
-    """Load the store, re-derive duplicates and unmet dependencies against
-    that fresh read, build every new task's full record, then persist each
-    new task with a separate `get_repository(root).create()` call. Each
-    `create()` acquires and releases the tasks-store lock independently, so
-    concurrent writers may interleave between individual task creates — this
-    is the accepted trade-off that enables the AIOS backend (which has no
-    batch-write primitive). The dependency and duplicate checks are still
-    computed against a single up-front `load_all()` snapshot, so the
-    pre-flight validation is consistent within one import run.
+    """Re-derive duplicates and dependencies against the current store.
 
-    Never trusts any `ImportPreview` the caller may be holding — duplicates
-    and dependency constraints are recomputed from the fresh `load_all()` read.
+    JSON validates and commits one batch inside the repository's shared lock.
+    A remote backend performs preflight on its fresh snapshot, then retains
+    its existing per-create semantics (partial import remains possible).
+    No caller-held preview authorizes a write.
 
     By default (`allow_unresolved_dependencies=False`) a new task whose
     `depends_on` points outside both the package and the current store —
@@ -607,21 +644,11 @@ def apply_task_package(
     import proceeds) — never the default, so a typo'd dependency id can
     never silently import a task that will stay blocked forever.
 
-    Every new task's full record is built via `tasks_repository.
-    new_task_record` (so it gets the same `created_at`/`updated_at`/
-    timeline/workflow/execution defaults every other task gets). One
-    `create()` call is made per new task; N tasks → N separate lock
-    cycles and N writes. A package that already has blocking
-    `validation.errors` is refused outright before any write is attempted.
-    Re-importing already-imported ids is a no-op for those ids
-    (`skipped_duplicate_ids`), not a second copy.
-
-    **Partial-import on lock timeout:** if `storage.LockTimeoutError` is
-    raised during the create loop (i.e. after at least one successful
-    `create()` but before all tasks are written), the tasks already
-    persisted remain in the store. The `TaskImportError` that is raised
-    does not carry a count of how many tasks succeeded — the caller should
-    reload the store to determine actual state.
+    JSON imports validate the combined graph and commit the whole package
+    under the shared store lock. A cycle (including self-dependency) is always
+    blocking, even when unresolved dependencies are explicitly allowed.
+    The remote backend retains its per-create contract and preflight graph
+    check; this function does not claim a remote batch transaction.
 
     Raises `TaskImportError` if a lock cannot be acquired within
     `lock_timeout` seconds (default 30s) — surfaced to the UI/CLI as an
@@ -630,27 +657,36 @@ def apply_task_package(
     if validation.errors:
         raise TaskImportError("Невозможно применить пакет: обнаружены ошибки валидации.")
 
-    skipped: list[str] = []
-    warnings = list(validation.warnings)
-
-    try:
-        _repo = tasks_repository.get_repository(root)
-        existing_ids = {t["id"] for t in _repo.load_all() if t.get("id")}
+    def prepare(existing: list[dict]) -> tuple[list[dict], list[str], list[ImportIssue]]:
+        existing_ids = {t["id"] for t in existing if t.get("id")}
         package_ids = {item["id"] for item in validation.items}
-
         new_items = [item for item in validation.items if item["id"] not in existing_ids]
-        skipped[:] = [item["id"] for item in validation.items if item["id"] in existing_ids]
-
+        skipped = [item["id"] for item in validation.items if item["id"] in existing_ids]
+        warnings = list(validation.warnings)
         dependency_issues = _find_unresolved_dependencies(new_items, existing_ids | package_ids)
         if dependency_issues:
             if not allow_unresolved_dependencies:
                 details = "; ".join(f"{issue.task_ref}: {issue.message}" for issue in dependency_issues)
                 raise TaskImportError(f"Невозможно применить пакет: не разрешены зависимости — {details}")
             warnings.extend(dependency_issues)
-
+        cycle = _find_dependency_cycle(new_items, existing)
+        if cycle is not None:
+            raise TaskImportError(f"Невозможно применить пакет: {cycle.message}")
         now = models.iso_now()
-        new_records = [_build_task_record(item, parsed, now) for item in new_items]
-        imported = [_repo.create(task_dict, timeout=lock_timeout) for task_dict in new_records]
+        return [_build_task_record(item, parsed, now) for item in new_items], skipped, warnings
+
+    try:
+        repo = tasks_repository.get_repository(root)
+        if isinstance(repo, tasks_repository.JSONTasksRepository):
+            def commit(existing: list[dict]) -> tuple[list[dict], list[str], list[ImportIssue]]:
+                prepared = prepare(existing)
+                existing.extend(prepared[0])
+                return prepared
+
+            imported, skipped, warnings = repo.mutate(commit, timeout=lock_timeout)
+        else:
+            new_records, skipped, warnings = prepare(repo.load_all())
+            imported = [repo.create(task_dict, timeout=lock_timeout) for task_dict in new_records]
     except storage.LockTimeoutError as exc:
         raise TaskImportError(
             f"не удалось получить блокировку импорта задач за {lock_timeout:.0f}с: {tasks_repository.tasks_lock_path(root)}"

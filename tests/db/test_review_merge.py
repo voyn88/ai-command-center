@@ -2162,7 +2162,7 @@ def test_review_once_no_longer_enqueues_an_eager_adjudication(rig, _test_repo_ro
 
 def test_merge_train_updates_a_behind_pr(rig, monkeypatch):  # noqa: F811
     """A PR only BEHIND main (base advanced after it branched) is brought
-    current with `gh pr update-branch` so it re-enters the merge path instead
+    current with a pinned REST branch update so it re-enters the merge path instead
     of gridlocking; nothing is merged this tick."""
     app_factory, store, _ = rig
     _ready(store, app_factory, "VOYN-W0-MT1", "https://github.com/x/y/pull/41")
@@ -2181,13 +2181,16 @@ def test_merge_train_updates_a_behind_pr(rig, monkeypatch):  # noqa: F811
                 "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}, {"name": "Final merge gate", "conclusion": "SUCCESS"}, {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS"}],
             })
             return subprocess.CompletedProcess(argv, 0, body, "")
-        if argv[:2] == ["pr", "update-branch"]:
-            return subprocess.CompletedProcess(argv, 0, "updated", "")
         return subprocess.CompletedProcess(argv, 1, "", "?")
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    updated_heads = []
+    def update(repo, url, expected_head):
+        updated_heads.append(expected_head)
+        return "d" * 40, "branch_updated_behind_main"
+    monkeypatch.setattr(review_merge, "_update_behind_branch", update)
     report = merge_once(app_factory, "/tmp")
-    assert ["pr", "update-branch"] in calls
+    assert updated_heads == [head]
     assert ("VOYN-W0-MT1", "branch_updated_behind_main") in report.skipped
     assert not report.merged
 
@@ -2216,7 +2219,7 @@ def test_merge_train_does_not_update_an_unaccepted_behind_pr(rig, monkeypatch): 
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     report = merge_once(app_factory, "/tmp")
-    assert ["pr", "update-branch"] not in calls
+    assert not any(call[:2] == ["api", "--method"] for call in calls)
     assert ("VOYN-W0-MT3", "no_accept_marker_on_head") in report.skipped
     assert not report.merged
 
@@ -2258,7 +2261,7 @@ def test_merge_train_leaves_a_dirty_pr_for_rebase(rig, monkeypatch):  # noqa: F8
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     report = merge_once(app_factory, "/tmp")
-    assert ["pr", "update-branch"] not in calls
+    assert not any(call[:2] == ["api", "--method"] for call in calls)
     assert ("VOYN-W0-MT2", "branch_dirty_needs_rebase") in report.skipped
 
 
@@ -2282,12 +2285,13 @@ def test_merge_train_update_cap_is_bounded(rig, monkeypatch):  # noqa: F811
                 "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}, {"name": "Final merge gate", "conclusion": "SUCCESS"}, {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS"}],
             })
             return subprocess.CompletedProcess(argv, 0, body, "")
-        if argv[:2] == ["pr", "update-branch"]:
-            updates.append(argv)
-            return subprocess.CompletedProcess(argv, 0, "updated", "")
         return subprocess.CompletedProcess(argv, 1, "", "?")
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    def update(repo, url, expected_head):
+        updates.append((url, expected_head))
+        return "d" * 40, "branch_updated_behind_main"
+    monkeypatch.setattr(review_merge, "_update_behind_branch", update)
     report = merge_once(app_factory, "/tmp", review_merge.ReviewConfig(max_branch_updates_per_tick=2))
     assert len(updates) == 2
     assert sum(1 for _, r in report.skipped if r == "branch_updated_behind_main") == 2
