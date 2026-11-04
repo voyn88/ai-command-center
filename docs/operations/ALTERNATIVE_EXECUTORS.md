@@ -101,3 +101,40 @@ keep inference private to the host. Downloading a model alone enables no routing
 Roll out the new profile only after the normal release review and isolated
 canaries. Applying it to live queues can immediately make mutating tasks runnable;
 do not activate it while writer execution is paused by the owner.
+
+
+## Local structured tasks
+
+With `AICC_LOCAL_SIMPLE_ENABLED=1` on both control and worker, the existing
+asynchronous coordination producer emits `simple_task` advisory ordering for
+up to eight eligible candidates. Bodies and prompts are excluded, the response
+must be an exact permutation of supplied IDs, and the planner retains every
+lease, WIP, wave and acceptance decision. Route-versioned fingerprints preserve
+deduplication without inheriting a stale remote-provider blocker.
+
+The same queue handler supports `classify_incident` (closed category enum) and
+`extract_log_fields` (grounded service/state fields). Payload version is 1;
+`operation`, `input`, configured `project_id` and `repository_path` are required.
+Repository editing and acceptance are not simple-task operations. The local
+model is pinned to the already-installed `qwen2.5-coder:14b`; no downloads,
+model-selected tools, shell commands or external URLs are accepted.
+
+Inference goes directly to 127.0.0.1:11434 with environment proxies disabled,
+2 CPU threads, 8192 context tokens, at most 512 generated tokens and a 120-second
+HTTP timeout. A worker-owned shared file lock serializes both lanes. A busy
+local model waits without paid fallback; unavailable, malformed or partial
+output falls through the compatible read-only remote roster under the same
+queue lease. Results are validated again after every fallback. Exhaustion
+returns infrastructure-wait rather than a false successful completion. Model
+residency expires after two minutes. The native service remains private.
+
+
+Mutation admission flags apply after the actual selected task type is resolved,
+before any task workspace is provisioned. `AICC_SINGLE_MUTATING_WRITER=1`
+serializes all native mutating tasks across the existing lanes using a shared
+worker-owned lock held through publication and cleanup. Read-only work remains
+concurrent. `AICC_MUTATING_EXECUTION_PAUSED=1` closes admission for rollout;
+`AICC_MUTATING_PROJECT_ALLOWLIST=AICC` excludes CRM and other project writers.
+These checks supplement the existing task and publisher leases; they do not
+replace them or create a second authority. Contention uses lease-wait, while
+an operator pause or infrastructure refusal uses infrastructure-wait.

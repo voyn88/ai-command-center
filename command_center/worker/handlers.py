@@ -53,7 +53,7 @@ from command_center.ops.source_clone_refresh import refresh_source_clone
 from command_center.orchestrator import gh_access
 from command_center.orchestrator.publish import PublishConfig, publish_run
 from command_center.orchestrator.routing import cascade_for
-from command_center.worker import writer_lease
+from command_center.worker import admission, writer_lease
 from command_center.worker.daemon import Handler, HandlerOutcome
 from command_center.worker.payloads import PayloadError, parse_agent_run
 from command_center.worker.worktree_lease import blocking_lease
@@ -687,7 +687,8 @@ def _executor_preflight(executor: str, task_type: str) -> tuple[bool, str, str]:
 
 
 def _run_agent(
-    payload: dict[str, Any], lease_lost: threading.Event, attempt_no: int = 1
+    payload: dict[str, Any], lease_lost: threading.Event, attempt_no: int = 1,
+    *, apply_operator_profile: bool = True,
 ) -> HandlerOutcome:
     request = parse_agent_run(payload)
     if isinstance(request, PayloadError):
@@ -697,7 +698,7 @@ def _run_agent(
 
     # Explicit operator profile also covers already queued subscription work.
     # Preserve the requested capability class, prompt, task and idempotency key.
-    if os.environ.get("AICC_EXECUTOR_PROFILE") in {"owner-alternatives", "owner-cascade"}:
+    if apply_operator_profile and os.environ.get("AICC_EXECUTOR_PROFILE") in {"owner-alternatives", "owner-cascade"}:
         requested_type = request.task_type
         request = replace(request, cascade=tuple(
             {**entry, "task_type": requested_type}
@@ -992,6 +993,13 @@ def _run_agent(
             stack.callback(_remove_read_only_isolated_checkout, checkout)
             run_repository = checkout
         if task_type in agent_runner.MUTATING_TASK_TYPES:
+            try:
+                stack.enter_context(admission.hold(request.project_id))
+            except admission.AdmissionRefused as exc:
+                return HandlerOutcome(
+                    ok=False, reason=str(exc), retryable=True,
+                    lease_wait=exc.contention, infra_wait=not exc.contention,
+                )
             expected_branch = f"backlog/{backlog_task}"
             try:
                 isolated_workspace = _isolated_workspace_path(
@@ -1852,4 +1860,9 @@ def _run_agent(
 
 
 def build_handlers() -> dict[str, Handler]:
-    return {"agent_run": _run_agent}
+    from command_center.worker.simple_tasks import run_simple_task
+
+    def simple_task(payload, lease_lost, attempt_no=1):
+        return run_simple_task(payload, lease_lost, attempt_no, remote_run=_run_agent)
+
+    return {"agent_run": _run_agent, "simple_task": simple_task}

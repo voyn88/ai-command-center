@@ -536,3 +536,21 @@ def test_missing_repository_path_is_checked_only_when_enabled():
     assert _coordinate_once(
         forbidden_factory, environ={"AICC_COORDINATOR_V2": "1"},
     ).rejected == "repository_path_required"
+
+
+def test_local_flag_enqueues_bounded_schema_task_without_bodies():
+    store = _FakeCoordinatorStore()
+    captured = []
+    rows = [{'task_id':f'VOYN-T-{i}', 'title':'short', 'body':'SECRET',
+             'priority':'P1','wave':'1','task_class':'functional'} for i in range(12)]
+    out = coordinate_once(store.factory,lambda *a:captured.append(a) or 'wki_local',
+                          environ={'AICC_COORDINATOR_V2':'1','AICC_LOCAL_SIMPLE_ENABLED':'1'},
+                          load_candidates=lambda:rows)
+    assert out.enqueued
+    payload=captured[0][2]
+    assert payload['kind']=='simple_task' and payload['operation']=='order_tasks'
+    assert len(payload['input'])==8
+    assert 'SECRET' not in json.dumps(payload)
+    assert 'backlog_task_id' not in payload
+    assert 'task_type' not in payload
+    assert all('body' not in row for row in payload['input'])

@@ -3102,3 +3102,12 @@ def test_provider_wrap_never_repeats_failed_provider_within_delivery(handler, mo
     outcome = run_agent(payload, _event(), 2)
     assert not outcome.ok and outcome.infra_wait
     assert called == ["grok", "cursor"]
+
+
+def test_operator_pause_refuses_before_mutating_agent_launch(handler, monkeypatch):
+    run_agent, runs = handler
+    monkeypatch.setenv('AICC_MUTATING_EXECUTION_PAUSED','1')
+    outcome=run_agent(_payload(task_type='implementation',untrusted=False),_event(),1)
+    assert not outcome.ok and outcome.infra_wait
+    assert outcome.reason=='mutating execution paused by operator'
+    assert runs==[]
