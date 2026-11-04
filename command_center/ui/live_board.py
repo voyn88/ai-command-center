@@ -26,7 +26,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from command_center import models
+from command_center import models, tasks_repository
 from command_center.runtime import session_view
 
 # The board's four buckets, in the order an operator reads them. "What is
@@ -140,6 +140,7 @@ def split_board(sessions: list[dict], *, display_status: str = "status") -> dict
 # --------------------------------------------------------------------------
 
 GATE_OK = "ok"
+GATE_READ_ONLY = "read_only_master_task"
 GATE_ALREADY_DONE = "already_done"
 GATE_WAITING_DEPENDENCY = "waiting_dependency"
 GATE_DUPLICATE = "duplicate_task_assignment"
@@ -149,6 +150,7 @@ GATE_WORKSPACE_NOT_CONFIGURED = "workspace_not_configured"
 # What the operator should *do*, per code. Kept beside the codes so the
 # button's tooltip and the planner's wave give the same advice.
 GATE_ACTIONS: dict[str, str] = {
+    GATE_READ_ONLY: "Задача центрального бэклога — управление через конвейер, не через консоль.",
     GATE_ALREADY_DONE: "Задача уже завершена — запускать нечего.",
     GATE_WAITING_DEPENDENCY: "Сначала завершите зависимости: «Done» требует подтверждённого merge.",
     GATE_DUPLICATE: "У задачи уже есть активная попытка — дождитесь её или отмените.",
@@ -205,7 +207,23 @@ def launch_gate(
     Checks run cheapest-and-most-final first: a `Done` task and an unmet
     dependency are properties of the task itself, while the two conflict checks
     depend on what happens to be running this second.
+
+    A master-projection record (the read-only backlog fallback view, stamped
+    `source: "master"` by `backlog_client.projection_board_tasks`) is refused
+    before any other check: `save_tasks` already drops such records
+    structurally on write, so allowing this gate to say "launchable" would be
+    a promise the write path cannot keep — the operator would see a run start
+    and then watch its task-state update vanish into a warning log instead of
+    landing on the task it was meant to update.
     """
+    if tasks_repository.is_master_projection_task(task):
+        return LaunchGate(
+            False,
+            GATE_READ_ONLY,
+            "Задача центрального бэклога (read-only) — запуск с консоли недоступен.",
+            GATE_ACTIONS[GATE_READ_ONLY],
+        )
+
     if (task.get("status") or "") == "Done":
         return LaunchGate(False, GATE_ALREADY_DONE, "Задача уже в статусе Done.", GATE_ACTIONS[GATE_ALREADY_DONE])
 
