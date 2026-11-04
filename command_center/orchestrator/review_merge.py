@@ -150,6 +150,9 @@ class ReviewConfig:
     #: with main). Bounded so a moving base cannot make the merge tick spend
     #: the whole tick re-updating branches that will just fall behind again.
     max_branch_updates_per_tick: int = 3
+    # Reuse #997: one durable attempt per exact head, at most two per tick.
+    max_gate_retriggers_per_tick: int = 2
+    gate_retrigger_label: str = "review-window:active"
     #: Per-tick cap on tasks EXAMINED (each examination costs gh API calls).
     #: Fairness across ticks comes from the rotating deterministic scan order
     #: below, not from unbounded scanning -- see the window-starvation note
@@ -3383,6 +3386,143 @@ def _merged_target_sha(repo_path: str, pr_url: str) -> tuple[str | None, str]:
     return oid, ""
 
 
+_EXPECTED_CHECK_RE = re.compile(
+    r'required status checks?(?: "[^"]+")? (?:is|are) expected', re.IGNORECASE
+)
+
+
+def _ensure_merge_queue_entry(
+    repo_path: str, pr_url: str, head: str, merge_token: str
+) -> tuple[bool, str]:
+    """Verify/enqueue the accepted exact head using only the merge identity.
+
+    A successful ``gh pr merge`` can mean auto-merge enabled, not queued.
+    GitHub's enqueue error also exposes skipped-suite shadowing that a green
+    head check rollup hides. Unknown responses never claim queue membership.
+    """
+    parsed = _owner_repo_number_from_pr_url(pr_url)
+    if parsed is None or not re.fullmatch(r"[0-9a-f]{40}", head):
+        return False, "merge_queue_lookup_failed"
+    owner, repo, number = parsed
+    query = (
+        'query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo)'
+        '{pullRequest(number:$number){id state headRefOid isInMergeQueue}}}'
+    )
+    view = _gh(["api", "graphql", "-f", f"query={query}", "-F", f"owner={owner}",
+                "-F", f"repo={repo}", "-F", f"number={number}"], repo_path)
+    try:
+        pull = json.loads(view.stdout)["data"]["repository"]["pullRequest"]
+        if view.returncode or not isinstance(pull, dict) or not pull.get("id"):
+            return False, "merge_queue_lookup_failed"
+        if pull.get("state") != "OPEN" or pull.get("headRefOid") != head:
+            return False, "merge_queue_head_or_state_changed"
+        if pull.get("isInMergeQueue") is True:
+            return True, "merge_queued_awaiting_target"
+    except (ValueError, KeyError, TypeError):
+        return False, "merge_queue_lookup_failed"
+    mutation = (
+        'mutation($id:ID!,$head:GitObjectID!){enqueuePullRequest(input:'
+        '{pullRequestId:$id,expectedHeadOid:$head}){mergeQueueEntry{state}}}'
+    )
+    enqueue = subprocess.run(
+        ["gh", "api", "graphql", "-f", f"query={mutation}", "-F", f"id={pull['id']}",
+         "-F", f"head={head}"], cwd=repo_path, capture_output=True, text=True,
+        check=False, timeout=120, env={**os.environ, "GH_TOKEN": merge_token},
+    )
+    messages = []
+    try:
+        payload = json.loads(enqueue.stdout or "{}")
+        if not isinstance(payload, dict):
+            return False, "merge_enqueue_response_invalid"
+        messages = [str(e["message"]) for e in payload.get("errors", [])
+                    if isinstance(e, dict) and e.get("message")]
+        entry = ((payload.get("data") or {}).get("enqueuePullRequest") or {}).get("mergeQueueEntry")
+        if enqueue.returncode == 0 and not messages and isinstance(entry, dict) and entry.get("state"):
+            return True, "merge_enqueued_awaiting_target"
+    except (ValueError, TypeError, AttributeError):
+        pass
+    if not messages:
+        messages = [enqueue.stderr.strip() or "missing queue entry"]
+    expected = next((message for message in messages if _EXPECTED_CHECK_RE.search(message)), None)
+    if expected:
+        return False, f"required_check_expected: {expected[:160]}"
+    return False, f"enqueue_refused: {' | '.join(messages)[:160]}"
+
+
+def _claim_gate_retrigger(factory: Any, task_id: str, pr_url: str, head: str) -> bool:
+    """Durably reserve one attempt per PR/head before any label mutation.
+
+    The old #997 timeline heuristic confused initial window admission with a
+    retry. Provenance identifies this particular action; an advisory lock
+    serializes different tasks pointing at the same PR without table writes.
+    A crash or failed label write consumes the attempt rather than looping CI.
+    """
+    if not re.fullmatch(r"[0-9a-f]{40}", head):
+        return False
+    with factory() as conn:
+        conn.autocommit = False
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT pg_try_advisory_xact_lock(hashtextextended(%s,0))",
+                            (f"aicc:gate-retrigger:{pr_url}:{head}",))
+                if not cur.fetchone()[0]:
+                    return False
+                cur.execute(
+                    "SELECT EXISTS (SELECT 1 FROM backlog_event WHERE event='provenance' "
+                    "AND outcome='granted' AND reason='merge_gate_retrigger' "
+                    "AND detail->>'pr_url'=%s AND detail->>'head_sha'=%s)", (pr_url, head),
+                )
+                if cur.fetchone()[0]:
+                    return False
+                cur.execute("SELECT backlog_record_provenance(%s,'merge_gate_retrigger',%s::jsonb)",
+                            (task_id, json.dumps({"pr_url": pr_url, "head_sha": head, "attempt": 1})))
+                if not cur.fetchone()[0]:
+                    return False
+            conn.commit()
+            return True
+        finally:
+            # Also releases the advisory lock on every refusal/exception.
+            conn.rollback()
+
+
+def _recover_expected_gate(
+    factory: Any, repo_path: str, task_id: str, pr_url: str, head: str,
+    cfg: ReviewConfig, budget: list[int], reason: str,
+) -> str:
+    if budget[0] <= 0:
+        return reason + "; gate_retrigger_tick_capped"
+    if not _claim_gate_retrigger(factory, task_id, pr_url, head):
+        return reason + "; gate_retrigger_already_attempted"
+    budget[0] -= 1
+    retriggered = _retrigger_pr_gates(repo_path, pr_url, cfg.gate_retrigger_label, head)
+    return reason + ("; gates_retriggered" if retriggered else "; gate_retrigger_failed")
+
+
+def _retrigger_pr_gates(repo_path: str, pr_url: str, label: str, head: str) -> bool:
+    """Re-enter the window on the unchanged head; never invent a green check."""
+    parsed = _owner_repo_number_from_pr_url(pr_url)
+    if parsed is None:
+        return False
+    owner, repo, number = parsed
+    view = _gh(["api", f"repos/{owner}/{repo}/pulls/{number}"], repo_path)
+    try:
+        pull = json.loads(view.stdout)
+        if view.returncode or pull.get("state") != "open" or pull.get("head", {}).get("sha") != head:
+            return False
+        labels = pull.get("labels")
+        if not isinstance(labels, list):
+            return False
+    except (ValueError, AttributeError):
+        return False
+    endpoint = f"repos/{owner}/{repo}/issues/{number}/labels"
+    if any(isinstance(item, dict) and item.get("name") == label for item in labels):
+        removed = _gh(["api", "--method", "DELETE", f"{endpoint}/{urllib.parse.quote(label, safe='')}"], repo_path)
+        if removed.returncode:
+            return False
+    added = _gh(["api", "--method", "POST", endpoint, "-f", f"labels[]={label}"], repo_path)
+    return added.returncode == 0
+
+
 def _rerun_failed_ci_once(repo_path: str, pr_url: str) -> str:
     """Bounded flake retry (VOYN-W0-AICC-CI-FLAKE-AUTO-RERUN): rerun the
     FAILED jobs of the newest completed-and-failed workflow on the current
@@ -4023,6 +4163,7 @@ def _merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -
     )
     last_processed = None
     branch_updates = 0
+    gate_retrigger_budget = [cfg.max_gate_retriggers_per_tick]
     actions = 0
     open_pr_snapshot, _snapshot_failure = _merge_window_open_pr_snapshot(repo_path)
     origin = _origin_owner_repo(repo_path) if open_pr_snapshot is not None else None
@@ -4187,8 +4328,17 @@ def _merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -
             if merge_sha is None:
                 if merge_reason == "merged_without_acceptance_evidence":
                     reason = merge_reason
+                elif merged.returncode == 0 and merge_reason == "not_merged":
+                    queued, reason = _ensure_merge_queue_entry(repo_path, pr_url, detail, merge_token)
+                    if not queued and reason.startswith("required_check_expected:"):
+                        prior_budget = gate_retrigger_budget[0]
+                        reason = _recover_expected_gate(
+                            factory, repo_path, task_id, pr_url, detail,
+                            cfg, gate_retrigger_budget, reason,
+                        )
+                        actions += prior_budget - gate_retrigger_budget[0]
                 elif merged.returncode == 0:
-                    reason = "merge_queued_awaiting_target"
+                    reason = f"merge_state_unverified: {merge_reason}"
                 else:
                     reason = f"merge_failed: {merged.stderr.strip()[:100]}"
                 report.skipped.append((task_id, reason))

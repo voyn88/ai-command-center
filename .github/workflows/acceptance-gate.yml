@@ -7,7 +7,9 @@ name: Acceptance gate
 on:
   pull_request:
     branches: [main]
-    types: [opened, synchronize, reopened, labeled, unlabeled]
+    # Label removals run no gate and must not create a newer skipped suite.
+    # Window entry/canary additions still run the unchanged quality gates.
+    types: [opened, synchronize, reopened, labeled]
   pull_request_review:
     types: [submitted, edited, dismissed]
   merge_group:

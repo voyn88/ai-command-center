@@ -2481,6 +2481,10 @@ def test_a_queued_merge_is_a_wait_not_a_done(rig, monkeypatch):  # noqa: F811
     merge_calls = []
 
     def fake_gh(argv, repo):
+        if argv[:2] == ["api", "graphql"]:
+            return sp.CompletedProcess(argv, 0, json.dumps({"data": {"repository": {
+                "pullRequest": {"id": "PR_node", "state": "OPEN", "headRefOid": head,
+                                "isInMergeQueue": True}}}}), "")
         if argv[:2] == ["pr", "view"]:
             if queue_state["merged"]:
                 body = json.dumps({
