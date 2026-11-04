@@ -38,6 +38,29 @@ def test_legit_values_are_preserved(tmp_path, monkeypatch):
     assert path.suffix == ".md"
 
 
+def test_known_project_name_uses_canonical_directory(tmp_path, monkeypatch):
+    monkeypatch.setattr(reports, "REPORTS_ROOT", tmp_path)
+    run = {
+        "id": "run-abc123",
+        "project": "  ai   command center ",
+        "started_at": "2026-07-29T12:00:00",
+    }
+
+    assert reports.report_path_for(run).parent == tmp_path / "AICC"
+
+
+def test_historical_noncanonical_reference_remains_resolvable(tmp_path, monkeypatch):
+    monkeypatch.setattr(reports, "REPORTS_ROOT", tmp_path)
+    historical = tmp_path / "AI_Command_Center" / "old.md"
+    historical.parent.mkdir()
+    historical.write_text("legacy", encoding="utf-8")
+
+    assert (
+        reports.resolve_report_path("reports/AI_Command_Center/old.md")
+        == historical.resolve()
+    )
+
+
 def test_split_root_reference_survives_restart(tmp_path, monkeypatch):
     reports_root = tmp_path / "external-artifacts" / "reports"
     monkeypatch.setattr(reports, "REPORTS_ROOT", reports_root)
