@@ -152,6 +152,7 @@ PRINCIPAL_EXECUTOR_BINARIES: dict[str, str] = {
     # closed in handlers instead: an unavailable executor falls through the
     # cascade to the next link rather than respinning forever.
 }
+CLAUDE_MAC_AGENT_BINARY = "/usr/libexec/aicc-claude-mac-agent"
 _PRINCIPAL_ISOLATION_FAILURE = "AICC_AGENT_LAUNCH_INFRA_FAILURE"
 
 # Codex 0.149.0 on worker-01 can exit zero after its vendor bwrap fails to
@@ -504,7 +505,7 @@ def build_principal_isolation_manifest(
         "workspace": str(repository_path.resolve(strict=True)),
         "executor": executor,
         "profile": (
-            "model_only" if executor == "grok" and task_type in MODEL_ONLY_TASK_TYPES
+            "model_only" if executor in {"grok", "claude"} and task_type in MODEL_ONLY_TASK_TYPES
             else profile_for_task_type(task_type)
         ),
         "prompt": prompt,
@@ -549,6 +550,14 @@ def principal_executor_preflight(executor: str) -> tuple[bool, str]:
     if Path(binary).is_file() and os.access(binary, os.X_OK):
         return True, ""
     return False, f"isolated executor binary is unavailable: {binary}"
+
+
+def claude_mac_preflight() -> tuple[bool, str]:
+    """A missing immutable adapter is an unavailable route during rollout."""
+    path = Path(CLAUDE_MAC_AGENT_BINARY)
+    if path.is_file() and os.access(path, os.X_OK):
+        return True, ""
+    return False, "Claude Mac inference adapter unavailable"
 
 
 def _principal_launcher_environment() -> dict[str, str]:
