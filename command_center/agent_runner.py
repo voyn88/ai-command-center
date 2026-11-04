@@ -1327,7 +1327,12 @@ class RunResult:
         if self.status != "failed" or not self.exit_code:
             return None
         if executor == "grok":
-            return "HTTP 429" if self.stderr.strip() == "provider HTTP 429" else None
+            # Billing refusal must cool down the same account as rate limiting.
+            # Match only the broker's fixed stderr diagnostic, never task prose.
+            return {
+                "provider HTTP 402": "HTTP 402",
+                "provider HTTP 429": "HTTP 429",
+            }.get(self.stderr.strip())
         signatures = {
             "claude": ("hit your session limit", "hit your usage limit", "usage limit reached"),
             "codex": ("hit your usage limit", "usage limit reached"),
