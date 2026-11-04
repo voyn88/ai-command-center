@@ -1257,7 +1257,7 @@ def _provider_error_run(status="failed", exit_code=1, stdout="", stderr=""):
     )
 
 
-@pytest.mark.parametrize("code", [401, 403, 429, 500, 502, 503, 504])
+@pytest.mark.parametrize("code", [401, 402, 403, 429, 500, 502, 503, 504])
 def test_grok_provider_refusal_allows_bounded_fallback(code):
     run = _provider_error_run(stderr=f"provider HTTP {code}\n")
     assert run.is_executor_provider_error("grok")
@@ -1335,3 +1335,9 @@ def test_a_codex_task_failure_without_a_signature_stays_a_task_failure():
 def test_an_unknown_executor_never_matches_free_text_signatures():
     run = _provider_error_run(stderr="unauthorized")
     assert run.is_executor_provider_error("claude") is False
+
+
+def test_cursor_unavailable_model_is_provider_refusal():
+    diagnostic = "Cannot use this model: auto. Available models: composer-2.5"
+    assert _provider_error_run(stderr=diagnostic).is_executor_provider_error("cursor")
+    assert not _provider_error_run(status="completed", exit_code=0, stdout=diagnostic).is_executor_provider_error("cursor")

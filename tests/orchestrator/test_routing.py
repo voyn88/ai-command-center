@@ -175,3 +175,10 @@ def test_owner_cascade_model_only_route_matches_broker_capability(monkeypatch):
     assert [x["executor"] for x in route] == ["grok"]
     assert route[0]["task_type"] == "independent_review"
     assert route[0]["capability"] == "model_only"
+
+
+def test_owner_cascade_cursor_model_override(monkeypatch):
+    monkeypatch.setenv("AICC_EXECUTOR_PROFILE", "owner-cascade")
+    monkeypatch.setenv("AICC_CURSOR_MODEL", "composer-2.5")
+    link = next(x for x in cascade_for("review") if x["executor"] == "cursor")
+    assert link["model"] == "composer-2.5"

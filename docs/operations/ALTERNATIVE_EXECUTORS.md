@@ -138,3 +138,9 @@ concurrent. `AICC_MUTATING_EXECUTION_PAUSED=1` closes admission for rollout;
 These checks supplement the existing task and publisher leases; they do not
 replace them or create a second authority. Contention uses lease-wait, while
 an operator pause or infrastructure refusal uses infrastructure-wait.
+
+The owner-cascade profile accepts `AICC_CURSOR_MODEL` (default `auto`). Set it
+to an available model returned by the exact server account's CLI, for example
+`composer-2.5`; subscription changes can remove `auto`. A failed Cursor model
+refusal and the xAI driver's exact HTTP 402 diagnostic advance the bounded
+cascade, subject to the unchanged-workspace fence. They are not task success.

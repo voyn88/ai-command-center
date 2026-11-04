@@ -91,7 +91,7 @@ def cascade_for(task_class: str) -> list[dict[str, Any]]:
             {"executor": executor, "task_type": task_type, "model": None}
             for executor in subscriptions
         ] + [
-            {"executor": "cursor", "task_type": task_type, "model": "auto"},
+            {"executor": "cursor", "task_type": task_type, "model": os.environ.get("AICC_CURSOR_MODEL", "auto")},
             {"executor": "grok", "task_type": task_type, "model": "grok-4.6"},
         ]
     if profile == "owner-alternatives":

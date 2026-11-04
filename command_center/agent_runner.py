@@ -1297,10 +1297,10 @@ class RunResult:
             # A report discussing HTTP errors must not trigger another run.
             return self.stderr.strip() in {
                 f"provider HTTP {code}"
-                for code in (401, 403, 429, 500, 502, 503, 504)
+                for code in (401, 402, 403, 429, 500, 502, 503, 504)
             }
         signatures = {
-            "cursor": _CODEX_RETRYABLE_FAILURE_SIGNATURES + _COPILOT_RETRYABLE_FAILURE_SIGNATURES,
+            "cursor": _CODEX_RETRYABLE_FAILURE_SIGNATURES + _COPILOT_RETRYABLE_FAILURE_SIGNATURES + ("cannot use this model:",),
             "copilot": _COPILOT_RETRYABLE_FAILURE_SIGNATURES,
             "codex": _CODEX_RETRYABLE_FAILURE_SIGNATURES,
         }.get(executor)
