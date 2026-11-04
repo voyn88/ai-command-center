@@ -87,6 +87,7 @@ def prepare_merge_tick(monkeypatch, count=1, ready=True, state="BEHIND"):
     monkeypatch.setattr(r, "_scan_tasks", lambda *a: (tasks, "token"))
     monkeypatch.setattr(r, "_scan_commit", lambda *a: None)
     monkeypatch.setattr(r, "_merge_window_open_pr_snapshot", lambda *a: (None, None))
+    monkeypatch.setattr(r, "_merge_queue_wait", lambda *a: None)
     monkeypatch.setattr(r, "_pr_window_expensive_read_decision", lambda *a, **kw:
                         r._PrWindowReadDecision(True, "active", {"state": "open"}))
     monkeypatch.setattr(r, "_pr_is_mergeable", lambda *a: (ready, OLD if ready else "no_accept_marker_on_head"))
@@ -116,6 +117,17 @@ def test_failed_updates_still_consume_existing_per_tick_cap(monkeypatch):
     report = r._merge_once(lambda: None, "/repo", r.ReviewConfig(max_branch_updates_per_tick=2))
     assert len(updates) == 2 and all(args[2] == OLD for args in updates)
     assert sum(reason == "branch_behind_update_capped" for _, reason in report.skipped) == 2
+
+
+def test_queued_behind_pr_keeps_its_head_and_spends_no_update(monkeypatch):
+    prepare_merge_tick(monkeypatch)
+    monkeypatch.setattr(r, "_merge_queue_wait", lambda *a: "awaiting_merge_queue:state=AWAITING_CHECKS,position=1")
+    def forbidden(*args):
+        raise AssertionError("queued PR must not be branch-updated")
+    monkeypatch.setattr(r, "_update_behind_branch", forbidden)
+    report = r._merge_once(lambda: None, "/repo")
+    assert not report.merged
+    assert report.skipped == [("VOYN-W0-UPDATE-0", "awaiting_merge_queue:state=AWAITING_CHECKS,position=1")]
 
 
 @pytest.mark.parametrize("ready,state", [(False, "BEHIND"), (True, "DIRTY")])
