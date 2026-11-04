@@ -39,7 +39,7 @@ The synchronous `ops.aicc_delivery_team_operator` CLI invokes the existing adapt
 This code does not yet establish a running autonomous delivery team. Remaining gaps include:
 
 - No caller or retained-artifact storage has been configured in an existing release chain for these receipt/check adapters. The local artifact endpoint and mandatory HTTPS readback are implemented, but shared access, retention and producer trust still need operational integration.
-- There are no direct CI-failure or deployment-failure producers beyond the existing review/merge hooks. Receiving every relevant incident and closing its RCA has not been demonstrated in a real pilot.
+- Bounded CI-attempt and retained deployment-journal collectors are implemented in `delivery_failure_collector`; they still require an existing trusted observation caller and retained source mapping. Receiving relevant incidents and closing RCA has not been demonstrated in a real pilot.
 - Release evidence requires the exact authoritative postmerge SHA. There is no implementation-SHA to later batch-release mapping; an included ancestor is not silently accepted as the deployed SHA.
 - Corrective assignments require operator confirmation. Automatic authoritative CTO assignment, due dates and risk-based omission of optional roles are not implemented. The present prerequisites must not be described as a completed risk-adaptive workflow.
 - A full real task through the team, production release, independent acceptance and corrective effectiveness has not been performed. Local tests or a roster do not prove operational acceptance.
