@@ -26,7 +26,12 @@ from command_center.db import migrations, pool, roles
 from command_center.db.config import ConfigError, load_config
 
 
-def _review_enqueue(store: Any, *, priority: int = 100) -> Any:
+_REVIEW_QUEUE_PRIORITY = 10
+
+
+def _review_enqueue(
+    store: Any, *, priority: int = _REVIEW_QUEUE_PRIORITY
+) -> Any:
     """Build the ``enqueue(queue, key, payload, task_id, max_attempts)``
     writer that ``review_once``/``publish_review_verdicts`` call.
 

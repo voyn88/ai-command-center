@@ -115,7 +115,9 @@ def test_backlog_review_enqueues_ahead_of_implementation_dispatch() -> None:
         "payload": {"kind": "review"},
         "task_id": "VOYN-W0-X",
         "max_attempts": 1,
-        "priority": 100,
+        # Assert the task's specified lane, not merely a positive value: a
+        # wrong hard-coded priority must fail this starvation regression.
+        "priority": 10,
     }]
     assert calls[0]["priority"] > 0
 
