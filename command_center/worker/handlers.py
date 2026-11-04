@@ -1559,6 +1559,28 @@ def _run_agent(
                 retryable=True,
                 infra_wait=True,
             )
+        if (
+            run.status == "timed_out"
+            and task_type not in agent_runner.MUTATING_TASK_TYPES
+        ):
+            # A read-only review timeout has produced no verdict and has no
+            # side effects to protect. Completing it would permanently
+            # occupy the deterministic (task, PR, head, policy) review key
+            # with an unusable result. Retry it through the independently
+            # bounded infrastructure-wait path. Mutating timeouts remain
+            # results because repeating them can duplicate side effects.
+            checkpoint_failure = checkpoint_preserved_candidate()
+            if checkpoint_failure is not None:
+                return checkpoint_failure
+            return HandlerOutcome(
+                ok=False,
+                reason=(
+                    "executor infrastructure failure (review timeout): "
+                    f"{_tail(result_text or run.stderr) or 'agent timed out'}"
+                ),
+                retryable=True,
+                infra_wait=True,
+            )
         non_mutating_copilot_failure = (
             executor == "copilot"
             and task_type not in agent_runner.MUTATING_TASK_TYPES

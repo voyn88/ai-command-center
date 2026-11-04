@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 
 from command_center import agent_runner, workspace_provisioning
+from command_center.orchestrator import review_merge
 from command_center.orchestrator.publish import PublishResult
 from command_center.worker import handlers as handlers_for_pin
 from command_center.worker.handlers import build_handlers
@@ -1030,7 +1031,7 @@ def test_long_output_travels_as_tails(handler, monkeypatch) -> None:
     assert len(outcome.result["stderr_tail"]) == 4000
 
 
-def test_timed_out_run_is_ok_not_redelivered(handler, monkeypatch) -> None:
+def test_timed_out_mutating_run_is_ok_not_redelivered(handler, monkeypatch) -> None:
     """A timed-out run may have half-executed its mutations; redelivery
     would re-apply them. It is a *result* (status timed_out), never the
     never-started retryable path — pinned because the mutant
@@ -1049,8 +1050,122 @@ def test_timed_out_run_is_ok_not_redelivered(handler, monkeypatch) -> None:
         )
 
     monkeypatch.setattr(agent_runner, "run_claude_code", timed_out)
-    outcome = run_agent(_payload(), _event(), 1)
+    outcome = run_agent(_payload(task_type="implementation"), _event(), 1)
     assert outcome.ok and outcome.result["status"] == "timed_out"
+
+
+def test_timed_out_review_retries_as_bounded_infrastructure_wait(
+    handler, monkeypatch
+) -> None:
+    """A read-only timeout has no verdict or side effects. It must not
+    succeed and permanently occupy the deterministic same-head review key."""
+    run_agent, _ = handler
+
+    def timed_out(**kwargs):
+        return agent_runner.RunResult(
+            status="timed_out",
+            exit_code=None,
+            stdout="",
+            stderr="agent exceeded 120 seconds",
+            duration_seconds=120.0,
+            started_at="2026-08-29T00:00:00+00:00",
+            completed_at="2026-08-29T00:02:00+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", timed_out)
+    outcome = run_agent(_payload(task_type="independent_review"), _event(), 1)
+
+    assert not outcome.ok
+    assert outcome.retryable and outcome.infra_wait
+    assert "review timeout" in outcome.reason
+
+
+@pytest.mark.parametrize("failure_kind", ["quota", "timeout", "network"])
+def test_same_head_review_transient_failure_cycle_is_non_terminal_and_bounded(
+    handler, monkeypatch, failure_kind
+) -> None:
+    """Exercise the whole unchanged-head contract across orchestrator and worker.
+
+    A transient model failure must leave the one deterministic review item
+    retryable, never create a succeeded result without a verdict, and never
+    escape the queue's independent, bounded infrastructure-wait budget by
+    minting another item on the next review tick.
+    """
+    run_agent, _ = handler
+    task_id = "VOYN-W0-SAME-HEAD-TRANSIENT"
+    pr_url = "https://github.com/o/ai-command-center/pull/7"
+    head_sha = "a" * 40
+    monkeypatch.setattr(review_merge, "_rows", lambda *args: [(task_id, pr_url)])
+    monkeypatch.setattr(
+        review_merge,
+        "_pr_diff_and_head",
+        lambda *args: review_merge._PRSnapshot.create("diff", "b" * 40, head_sha),
+    )
+    monkeypatch.setattr(
+        "command_center.orchestrator.planner.repo_route",
+        lambda repo: ("AICC", "/srv/aicc"),
+    )
+
+    if failure_kind == "quota":
+        stdout = json.dumps(
+            {
+                "is_error": True,
+                "terminal_reason": "api_error",
+                "api_error_status": 429,
+                "result": "You've hit your session limit",
+            }
+        )
+        failed_run = agent_runner.RunResult(
+            status="failed", exit_code=1, stdout=stdout, stderr="",
+            duration_seconds=0.1, started_at="t0", completed_at="t1",
+        )
+    elif failure_kind == "timeout":
+        failed_run = agent_runner.RunResult(
+            status="timed_out", exit_code=None, stdout="", stderr="agent timed out",
+            duration_seconds=120.0, started_at="t0", completed_at="t1",
+        )
+    else:
+        failed_run = agent_runner.RunResult(
+            status="failed", exit_code=None, stdout="",
+            stderr="network error: connection refused",
+            duration_seconds=0.1, started_at="t0", completed_at="t1",
+        )
+    monkeypatch.setattr(agent_runner, "run_claude_code", lambda **kwargs: failed_run)
+
+    items: dict[str, dict] = {}
+
+    def enqueue(_queue, key, payload, queued_task_id, max_attempts):
+        items.setdefault(
+            key,
+            {
+                "payload": payload,
+                "task_id": queued_task_id,
+                "max_attempts": max_attempts,
+                "state": "ready",
+                "infra_wait_count": 0,
+            },
+        )
+
+    infra_wait_cap = 2
+    observed_states = []
+    for _ in range(infra_wait_cap + 1):
+        review_merge.review_once(object(), enqueue, "/srv/aicc")
+        assert len(items) == 1
+        item = next(iter(items.values()))
+        outcome = run_agent(item["payload"], _event(), 1)
+        assert not outcome.ok and outcome.retryable and outcome.infra_wait
+        assert outcome.result == {}, "transient failure must not publish a verdict result"
+        item["infra_wait_count"] += 1
+        item["state"] = (
+            "dead" if item["infra_wait_count"] > infra_wait_cap else "ready"
+        )
+        observed_states.append(item["state"])
+
+    key, item = next(iter(items.items()))
+    assert f":7:{head_sha}:{review_merge._REVIEW_POLICY_VERSION}:" in key
+    assert item["task_id"] == task_id
+    assert item["state"] == "dead"
+    assert observed_states == ["ready", "ready", "dead"]
 
 
 def test_every_payload_defect_is_non_retryable() -> None:
