@@ -34,9 +34,10 @@ or effectiveness results. SQL refusal or errors roll back the transaction; exit 
 means committed admission, not completed native team acceptance. Output excludes
 connection diagnostics and credentials. Retained files after failure are not receipts.
 
-Configure and verify store access before invoking. The existing owner artifact route
-serves release observations only; acceptance/corrective artifacts need an approved
-independent HTTPS store. Collector files are private (0600, new directories 0700);
+Configure and verify store access before invoking. The authenticated owner artifact route serves strictly allowlisted release,
+acceptance and corrective observations. Serving identifies bytes; it does not
+authenticate their producer or admit evidence. Keep independent check production
+and operator-selected provenance distinct from artifact storage. Collector files are private (0600, new directories 0700);
 prove authorized serving/reviewer access without broadening permissions. The
 standard owner edge uses Basic auth while these readers use Bearer: verify an
 already approved compatible HTTPS machine-read route. Do not bypass the edge.
