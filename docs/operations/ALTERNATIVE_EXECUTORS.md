@@ -64,3 +64,40 @@ alone does not establish that isolation or execution works.
 Track useful completed tasks, provider calls, quota skips, elapsed time and
 actual token usage. Do not retry unchanged provider failures blindly, weaken
 acceptance gates, or mark a task complete merely because a model returned text.
+
+
+## Capability-ranked full cascade
+
+`AICC_EXECUTOR_PROFILE=owner-cascade` keeps every currently isolated coding
+provider in the roster. Implementation/remediation order is Claude, Codex,
+Cursor (`auto`), Grok (`grok-4.6`). Read-only review order is Codex, Claude,
+Cursor, Grok. Availability and quota circuits select the first runnable entry;
+provider refusal walks the remaining entries, including entries before the
+initial queue-attempt position, without retrying the same route entry within
+one delivery. Provider-specific model selection is reset at each switch.
+
+The same profile rewrites already queued payloads while retaining task type,
+provenance, prompt, lease and idempotency. A mutating provider may hand off only
+when the existing workspace-integrity check proves it made no changes. If all
+providers are unavailable, the existing bounded infrastructure-wait path keeps
+the task pending; task failures do not trigger blind provider retries.
+
+All means all **compatible** providers. The principal-isolation broker currently
+supports a zero-tool model-only profile only for Grok. Independent model-only
+reviews therefore retain Grok alone in this profile; Codex/Cursor read-only
+sandboxes must not be relabelled as zero-tool execution. Copilot remains excluded
+under ADR-0010, and Ollama is not a distributed-worker executor merely because
+the separate runtime provider registry supports it.
+
+Local-first execution belongs to the AICC planner, never to a second autonomous
+scheduler. Before enabling it in the distributed queue, add an explicit local
+capability adapter and validated task classes (for example structured log
+classification and field extraction). A local text completion cannot satisfy a
+repository-editing task or replace a required independent acceptance review.
+Validate output schemas and task-specific checks, then escalate failures through
+the compatible remote roster. Limit context, concurrency and CPU/memory usage;
+keep inference private to the host. Downloading a model alone enables no routing.
+
+Roll out the new profile only after the normal release review and isolated
+canaries. Applying it to live queues can immediately make mutating tasks runnable;
+do not activate it while writer execution is paused by the owner.

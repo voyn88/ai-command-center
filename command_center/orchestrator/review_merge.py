@@ -762,6 +762,10 @@ _MODEL_ONLY_REVIEW_EXECUTORS = frozenset(
 
 def _model_only_review_cascade() -> list[dict[str, Any]]:
     route = cascade_for("review")
+    # The isolated broker currently enforces zero tools only for Grok.
+    # A read-only sandbox is not equivalent to a zero-tool review.
+    if os.environ.get("AICC_EXECUTOR_PROFILE") == "owner-cascade":
+        route = [link for link in route if link.get("executor") == "grok"]
     return [
         {**link, "task_type": "independent_review", "capability": "model_only"}
         for link in route

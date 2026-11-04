@@ -151,3 +151,27 @@ def test_dispatch_prompt_asks_for_the_commit_and_not_for_a_pull_request() -> Non
     assert "HEAD_SHA: <the branch head commit sha>" in prompt
     # The instruction that asked the agent to publish its own work is gone.
     assert "When you open or update a pull request" not in prompt
+
+
+def test_owner_cascade_orders_all_isolated_providers_by_task_class(monkeypatch):
+    monkeypatch.setenv("AICC_EXECUTOR_PROFILE", "owner-cascade")
+    assert [x["executor"] for x in cascade_for("implementation")] == [
+        "claude", "codex", "cursor", "grok",
+    ]
+    assert [x["executor"] for x in cascade_for("review")] == [
+        "codex", "claude", "cursor", "grok",
+    ]
+    assert all(x["executor"] in agent_runner.PRINCIPAL_EXECUTOR_BINARIES
+               for x in cascade_for("review"))
+    changed = cascade_for("review")
+    changed[0]["model"] = "wrong-provider-model"
+    assert cascade_for("review")[0]["model"] is None
+
+
+def test_owner_cascade_model_only_route_matches_broker_capability(monkeypatch):
+    from command_center.orchestrator import review_merge
+    monkeypatch.setenv("AICC_EXECUTOR_PROFILE", "owner-cascade")
+    route = review_merge._model_only_review_cascade()
+    assert [x["executor"] for x in route] == ["grok"]
+    assert route[0]["task_type"] == "independent_review"
+    assert route[0]["capability"] == "model_only"

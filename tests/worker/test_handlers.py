@@ -3047,3 +3047,58 @@ def test_read_only_isolated_checkout_packs_refs_after_a_wholesale_pr_fetch(
     loose_dirs = [p for p in loose.iterdir() if p.is_dir()] if loose.exists() else []
     assert loose_dirs == [], loose_dirs
     handlers_module._remove_read_only_isolated_checkout(target)
+
+
+def test_owner_cascade_rewrites_queued_review_and_clears_old_model(handler, monkeypatch):
+    run_agent, runs = handler
+    monkeypatch.setenv("AICC_EXECUTOR_PROFILE", "owner-cascade")
+    monkeypatch.setattr(agent_runner, "codex_workspace_write_preflight", lambda: (True, "ok"))
+    result = run_agent(_payload(model="old-claude-model"), _event(), 1)
+    assert result.ok
+    assert runs[0]["executor"] == "codex"
+    assert runs[0]["model"] is None
+    assert runs[0]["task_type"] == "review"
+
+
+def test_provider_failure_at_tail_wraps_to_untried_provider(handler, monkeypatch):
+    run_agent, _ = handler
+    called = []
+    def run(**kwargs):
+        executor = kwargs["executor"]
+        called.append(executor)
+        return agent_runner.RunResult(
+            status="failed" if executor == "grok" else "completed",
+            exit_code=1 if executor == "grok" else 0,
+            stdout="" if executor == "grok" else '{"result":"done"}',
+            stderr="provider HTTP 403" if executor == "grok" else "",
+            duration_seconds=.1, started_at="t0", completed_at="t1",
+        )
+    monkeypatch.setattr(agent_runner, "run_claude_code", run)
+    payload = _payload(cascade=[
+        {"executor":"cursor", "task_type":"review", "model":"auto"},
+        {"executor":"grok", "task_type":"review", "model":"grok-4.6"},
+    ])
+    outcome = run_agent(payload, _event(), 2)
+    assert outcome.ok
+    assert called == ["grok", "cursor"]
+
+
+def test_provider_wrap_never_repeats_failed_provider_within_delivery(handler, monkeypatch):
+    run_agent, _ = handler
+    called = []
+    def run(**kwargs):
+        executor = kwargs["executor"]
+        called.append(executor)
+        return agent_runner.RunResult(
+            status="failed", exit_code=1, stdout="",
+            stderr="provider HTTP 403" if executor == "grok" else "usage limit reached",
+            duration_seconds=.1, started_at="t0", completed_at="t1",
+        )
+    monkeypatch.setattr(agent_runner, "run_claude_code", run)
+    payload = _payload(cascade=[
+        {"executor":"cursor", "task_type":"review", "model":"auto"},
+        {"executor":"grok", "task_type":"review", "model":"grok-4.6"},
+    ])
+    outcome = run_agent(payload, _event(), 2)
+    assert not outcome.ok and outcome.infra_wait
+    assert called == ["grok", "cursor"]
