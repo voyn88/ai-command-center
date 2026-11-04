@@ -7,6 +7,11 @@ how fresh it is, the totals and wave/priority/status/domain breakdown, the
 executable queue derived from approved records, and a searchable/filterable table
 of every record.
 
+"How fresh" is read from the file's own render stamp when it has one (BO-S4:
+`backlog-export` writes the projection every 5 minutes and stamps each render),
+falling back to `mtime` for a hand-authored file. See `_render_freshness` for why
+the two are not interchangeable.
+
 It is emphatically read-only. There are no create/edit/delete widgets here — a
 banner and per-surface captions say so, and the page never imports
 `tasks_repository`, so browsing the master backlog can never touch ACC's local
@@ -32,6 +37,52 @@ def _format_freshness(mtime: float | None) -> str:
         return "—"
     stamp = datetime.fromtimestamp(mtime, tz=timezone.utc).astimezone()
     return stamp.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _format_local(moment: datetime) -> str:
+    return moment.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _render_freshness(column, projection: backlog_client.Projection) -> None:
+    """The freshness metric, read from the file's own render stamp when it has
+    one and from ``mtime`` when it does not.
+
+    Which clock this shows is not cosmetic. ``mtime`` answers "when did *this
+    host* last write these bytes", which any ``cp``/``scp``/checkout/container
+    build resets to now — so a projection whose export tick died a week ago
+    reads as seconds fresh as soon as it is copied anywhere, which is the
+    silent staleness BO-S4 exists to end (the console booted 2026-09-03 on a
+    file that stopped being true 2026-08-20). The stamp in the header answers
+    "when was the store actually read", travels with the text, and is therefore
+    what an owner is shown whenever it exists. A hand-authored backlog carries
+    no stamp and no tick, so it keeps the mtime reading — there is no cadence
+    for it to be late against — and the label says which of the two is on
+    screen rather than letting them look alike.
+    """
+    stamp = projection.stamp
+    if stamp is None:
+        column.metric(
+            "Актуальность (mtime)", _format_freshness(projection.source_mtime)
+        )
+        column.caption(
+            "Файл без штампа рендера — вероятно, авторский. Показано время "
+            "изменения файла; оно сбрасывается при любом копировании."
+        )
+        return
+
+    column.metric("Актуальность (рендер)", _format_local(stamp.rendered_at))
+    if stamp.is_stale(datetime.now(timezone.utc)):
+        column.error(
+            ":material/error: Проекция устарела: тик экспорта "
+            "(`aicc-backlog-export.timer`, каждые 5 минут) молчит дольше "
+            f"{int(backlog_client.PROJECTION_STALE_AFTER.total_seconds() // 60)} "
+            "мин. Всё ниже — снимок на момент штампа, а не состояние стора."
+        )
+    else:
+        column.caption(
+            "Штамп в самом файле, не mtime. Записей в сторе на момент "
+            f"рендера: {stamp.row_count}. Тик экспорта жив."
+        )
 
 
 def _facet(label: str, counts: dict[str, int], key: str) -> str | None:
@@ -82,8 +133,7 @@ def render_master_backlog_page(path: str | None = None) -> None:
     src_col, fresh_col = st.columns(2)
     src_col.metric("Источник", "master store")
     src_col.caption(f"`{projection.source_path}`")
-    fresh_col.metric("Актуальность (mtime)", _format_freshness(projection.source_mtime))
-    fresh_col.caption("Читается заново при каждом открытии — проекция живая.")
+    _render_freshness(fresh_col, projection)
 
     # --- Totals -------------------------------------------------------------
     m_total, m_approved, m_queue, m_errors = st.columns(4)
@@ -91,6 +141,20 @@ def render_master_backlog_page(path: str | None = None) -> None:
     m_approved.metric("Approved", summary.approved)
     m_queue.metric("В очереди исполнения", len(queue))
     m_errors.metric("Ошибок парсинга", summary.errors)
+
+    # A generated file holds exactly as many record lines as its header says it
+    # was rendered from, so a mismatch means lines were added or removed after
+    # the render — i.e. someone edited the projection instead of the backlog.
+    # Those edits are erased by the next tick and would otherwise leave no
+    # trace at all (ADR-0011 files this as convention-only); the counts make
+    # the line-count half of it visible.
+    if backlog_client.stamp_matches_content(projection) is False:
+        st.warning(
+            ":material/edit_off: Файл изменён после рендера — число записей не "
+            f"совпадает со штампом: в заголовке {projection.stamp.row_count}, "
+            f"в файле {summary.total + summary.errors}. Это **проекция**: правки "
+            "здесь исчезнут со следующим тиком экспорта, менять надо стор."
+        )
 
     if summary.errors:
         with st.expander(f":material/warning: Непрочитанные строки ({summary.errors})"):
