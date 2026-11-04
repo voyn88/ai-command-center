@@ -1031,9 +1031,12 @@ def _provider_command(manifest: dict[str, Any]) -> list[str]:
             # The development profile therefore runs Codex without its inner
             # sandbox HERE ONLY (owner decision 2026-09-09); outside the
             # broker, agent_runner.build_codex_command keeps workspace-write.
-            # The read-only profile keeps Codex's read-only sandbox: it is a
-            # second, cheaper enforcement of the same promise.
-            "read-only" if profile == "read_only" else "danger-full-access",
+            # The read-only profile has the same external boundary, with a
+            # read-only /workspace bind and ONLY /agent-home writable. Its
+            # nested bwrap cannot read /proc/sys/kernel/overflowuid under
+            # ProcSubset=pid, so even `pwd` fails before inspecting the tree.
+            # Keep the kernel boundary intact and use it for both profiles.
+            "danger-full-access",
             "--color",
             "never",
         ]
