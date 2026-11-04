@@ -785,6 +785,49 @@ def _read_task_local_marker(workspace: Path) -> dict | None:
     return value
 
 
+def count_uncheckpointed_task_workspaces(root_path: str | Path) -> int:
+    """Count saved task clones whose HEAD outran signed retry authority.
+
+    This is intentionally a local, credential-free fleet probe.  Only valid
+    signed markers participate, so an unrelated directory (or an attacker-
+    supplied marker) cannot create a false incident.  Unreadable/racing
+    entries are skipped: provisioning remains the fail-closed enforcement
+    point, while this function is an availability-oriented status signal.
+    """
+    root = Path(os.path.abspath(Path(root_path).expanduser()))
+    try:
+        parents = (root, *(path for path in root.iterdir() if path.is_dir()))
+    except OSError:
+        return 0
+    suffix = f".{_TASK_LOCAL_MARKER}"
+    count = 0
+    marker_paths: list[Path] = []
+    for parent in parents:
+        try:
+            marker_paths.extend((parent / ".aicc-task-metadata").iterdir())
+        except OSError:
+            continue
+    for marker_path in marker_paths:
+        if not marker_path.name.endswith(suffix):
+            continue
+        workspace = marker_path.parent.parent / marker_path.name[: -len(suffix)]
+        try:
+            if workspace.is_symlink() or not workspace.is_dir():
+                continue
+            marker = _read_task_local_marker(workspace)
+            if marker is None:
+                continue
+            branch = marker.get("expected_branch")
+            start_sha = str(marker.get("start_sha") or "").lower()
+            if not isinstance(branch, str) or not _FULL_SHA1.fullmatch(start_sha):
+                continue
+            if _read_agent_head(workspace, branch) != start_sha:
+                count += 1
+        except (OSError, WorkspaceVerificationError):
+            continue
+    return count
+
+
 def _provision_task_local_clone(
     spec: WorkspaceSpec, repo: Path, workspace: Path
 ) -> str:

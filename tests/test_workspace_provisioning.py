@@ -52,6 +52,54 @@ def test_workspace_authority_accepts_explicit_32_byte_key(monkeypatch):
     assert wp._workspace_authority_key() == bytes.fromhex("ab" * 32)
 
 
+def test_uncheckpointed_workspace_probe_counts_only_signed_head_mismatches(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("AICC_WORKSPACE_AUTHORITY_KEY", "hex:" + "ab" * 32)
+    root = tmp_path / "aicc-workspaces"
+    workspace = root / "ai-command-center-1" / "backlog-task-1"
+    workspace.mkdir(parents=True)
+    _git(workspace, "init", "-q")
+    _git(workspace, "config", "user.email", "test@test.com")
+    _git(workspace, "config", "user.name", "test")
+    (workspace / "result.txt").write_text("start\n")
+    _git(workspace, "add", "result.txt")
+    _git(workspace, "commit", "-q", "-m", "start")
+    _git(workspace, "branch", "-M", "backlog/task-1")
+    start_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=workspace, capture_output=True,
+        text=True, check=True,
+    ).stdout.strip()
+    marker = {
+        "version": 1,
+        "source_repository": "/srv/ai-command-center",
+        "remote_url": "/srv/ai-command-center",
+        "expected_branch": "backlog/task-1",
+        "base_branch": "main",
+        "base_sha": start_sha,
+        "start_sha": start_sha,
+    }
+    marker["authority_hmac"] = wp._marker_signature(marker)
+    wp._atomic_write_private(
+        wp._task_local_marker_path(workspace),
+        (__import__("json").dumps(marker, sort_keys=True) + "\n").encode(),
+    )
+
+    assert wp.count_uncheckpointed_task_workspaces(root) == 0
+    (workspace / "result.txt").write_text("agent commit\n")
+    _git(workspace, "add", "result.txt")
+    _git(workspace, "commit", "-q", "-m", "agent")
+    assert wp.count_uncheckpointed_task_workspaces(root) == 1
+
+    # A copied/forged marker is not fleet evidence.
+    marker["authority_hmac"] = "0" * 64
+    wp._atomic_write_private(
+        wp._task_local_marker_path(workspace),
+        (__import__("json").dumps(marker, sort_keys=True) + "\n").encode(),
+    )
+    assert wp.count_uncheckpointed_task_workspaces(root) == 0
+
+
 def test_workspace_authority_short_read_cannot_hide_trailing_assignment(
     tmp_path, monkeypatch
 ):
