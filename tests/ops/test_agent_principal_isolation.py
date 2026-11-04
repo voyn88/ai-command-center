@@ -2867,7 +2867,10 @@ def test_transient_prompt_argv_disables_systemd_expansion(
     # Only environment-file validation is stubbed: exercise the real envelope,
     # provider argv and systemd builder. No provider or systemd process is run.
     monkeypatch.setattr(launcher, "_validate_environment_file", lambda *a, **k: True)
-    prompt = 'SQL $$ body $$; offset=${offset}; $HOME; "quoted"; `literal`\nюникод'
+    # Construct dollar syntax so this bootstrap fix's own review diff stays
+    # byte-invariant even when reviewed through the old expanding launcher.
+    dollar = chr(36)
+    prompt = f'SQL {dollar}{dollar} body {dollar}{dollar}; offset={dollar}{{offset}}; {dollar}HOME; "quoted"; `literal`\nюникод'
     manifest = _manifest(tmp_path, executor=executor, profile=profile, prompt=prompt)
     admitted = launcher._load_manifest(json.dumps(manifest).encode())
     command = launcher._systemd_command(
