@@ -23,7 +23,7 @@ def main() -> int:
     from command_center.db.config import ConfigError, load_config
     from command_center.db.work_queue_store import WorkQueueStore
     from command_center.worker.credential_file import read_environment_file
-    from command_center.worker.daemon import WorkerDaemon
+    from command_center.worker.daemon import WorkerConfig, WorkerDaemon
     from command_center.worker.handlers import build_handlers
 
     try:
@@ -45,9 +45,19 @@ def main() -> int:
         values.update(read_environment_file(path))
         pool.replace_pool(load_config(values))
 
+    review_types = ("independent_review", "verification_review")
+    claim_mode = os.environ.get("AICC_WORKER_CLAIM_MODE", "")
+    if claim_mode == "review":
+        worker_config = WorkerConfig(task_types=review_types, include_task_types=True)
+    elif claim_mode:
+        worker_config = WorkerConfig(task_types=review_types, include_task_types=False)
+    else:
+        worker_config = WorkerConfig()
+
     daemon = WorkerDaemon(
         WorkQueueStore(),
         handlers=build_handlers(),
+        config=worker_config,
         reload_credentials=reload_credentials,
     )
     daemon.install_signal_handlers()

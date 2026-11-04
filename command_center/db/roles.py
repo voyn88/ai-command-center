@@ -535,6 +535,7 @@ VIEW_PRIVILEGES: MappingProxyType[str, MappingProxyType[str, frozenset[str]]] = 
 # overload appeared.
 _WORKER_FUNCTIONS = (
     "queue_claim(text, text, integer)",
+    "queue_claim_by_task_types(text, text, integer, jsonb, boolean)",
     "queue_heartbeat(text, text)",
     "queue_complete(text, text, jsonb)",
     "queue_fail(text, text, text, boolean)",

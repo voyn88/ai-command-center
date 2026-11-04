@@ -1,4 +1,5 @@
-# Versioned two-lane worker template for VOYN pre-production.
+# Versioned worker template for VOYN pre-production. Instances 1 and 2 are
+# implementation lanes; the named review instance is reserved for reviews.
 [Unit]
 Description=AICC preprod worker lane %i
 After=network-online.target voyn-aicc-pgtunnel.service
@@ -50,6 +51,10 @@ Environment=GIT_CONFIG_SYSTEM=/etc/aicc/gitconfig
 Environment=GH_CONFIG_DIR=/var/lib/aicc/github/gh
 Environment=GIT_TERMINAL_PROMPT=0
 Environment=AICC_WORKER_ENV_FILE=/var/lib/voyn-aicc-credential-rotation/worker.env
+# The named review instance gets the dedicated read-only verdict lane. Every
+# other fleet instance excludes those task types, so adding implementation
+# capacity cannot accidentally consume review capacity.
+Environment=AICC_WORKER_CLAIM_MODE=%i
 EnvironmentFile=/etc/aicc/lease.env
 EnvironmentFile=/var/lib/voyn-aicc-credential-rotation/worker.env
 EnvironmentFile=-/etc/aicc/executors.env

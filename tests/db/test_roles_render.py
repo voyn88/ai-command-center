@@ -202,10 +202,10 @@ def test_no_role_holds_a_table_privilege_on_the_claim_protocol() -> None:
         assert roles.PRIVILEGES[role]["work_attempt"] == frozenset()
 
 
-def test_the_worker_reaches_the_queue_only_through_the_six_protocol_steps() -> None:
+def test_the_worker_reaches_the_queue_only_through_the_seven_protocol_steps() -> None:
     """Two assertions rather than one, because the role now carries two layers.
 
-    The queue half must stay exactly six steps, and the whole set must stay
+    The queue half must stay exactly seven steps, and the whole set must stay
     exactly what both tasks declared. A single equality would have to be edited
     by every later task that adds a function, and editing it is indistinguishable
     from widening it.
@@ -219,6 +219,7 @@ def test_the_worker_reaches_the_queue_only_through_the_six_protocol_steps() -> N
     granted = {s.split("(")[0] for s in roles.FUNCTION_PRIVILEGES[roles.WORKER_ROLE]}
     assert {name for name in granted if name.startswith("queue_")} == {
         "queue_claim",
+        "queue_claim_by_task_types",
         "queue_heartbeat",
         "queue_complete",
         "queue_fail",
@@ -230,6 +231,7 @@ def test_the_worker_reaches_the_queue_only_through_the_six_protocol_steps() -> N
     # secret, and nothing else — a worker cannot mint or redeem an enrolment.
     assert granted == {
         "queue_claim",
+        "queue_claim_by_task_types",
         "queue_heartbeat",
         "queue_complete",
         "queue_fail",
