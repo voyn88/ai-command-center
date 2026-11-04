@@ -114,6 +114,27 @@ UNMIRRORED_SCHEMA_TABLES: dict[str, Exclusion] = {
         ),
         task="VOYN-OPS-AICC-PUBLISH-WINDOW-STARVATION",
     ),
+    "tick_observation": Exclusion(
+        reason="PostgreSQL-native observations include empty ticks to break stale failure streaks; no SQLite database ever owned these records, so there is no source to mirror.",
+        task="VOYN-W0-AICC-TICK-STALL-WATCHDOG",
+    ),
+    "tick_skip_event": Exclusion(
+        reason=(
+            "PostgreSQL-native observability ledger from birth (0034): the "
+            "per-tick skip reasons the watchdog reads were previously only "
+            "journal lines; no SQLite authority ever held them, so there is "
+            "nothing for a mirror to copy from."
+        ),
+        task="VOYN-W0-AICC-TICK-STALL-WATCHDOG",
+    ),
+    "tick_stall_escalation": Exclusion(
+        reason=(
+            "PostgreSQL-native (0034): the watchdog's episode ledger exists "
+            "only to make 'exactly one escalation per stall episode' a "
+            "schema property; born in PostgreSQL with no SQLite counterpart."
+        ),
+        task="VOYN-W0-AICC-TICK-STALL-WATCHDOG",
+    ),
     "backlog_task": Exclusion(
         reason=(
             "PostgreSQL-native authority from birth (BO-S1): the incumbent it "
