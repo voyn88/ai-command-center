@@ -23,6 +23,17 @@ EnvironmentFile=/home/voynadmin/aicc-preprod/.env
 # remote. The finding reaches the planner through this unit's
 # --record-findings source, exactly like every other failure class.
 Environment=AICC_PR_WINDOW_REPO=.
+# Recording is what the comment above means by "reaches the planner": without
+# a --record-findings source this probe measures, prints, and exits non-zero
+# into a oneshot nobody reads. Set here as the flag's environment default
+# (AICC_MONITOR_FINDING_SOURCE) for the same reason AICC_PR_WINDOW_REPO is: the
+# ExecStart line below names an absolute home path and a public repository
+# cannot restate it in an added line (scripts/ci/prepush/leak_guard.sh). The
+# value is `<host>:<probe>`, the identity control-01's findings already carry
+# (monitor_finding #41637 was recorded under `control-01:queue`): the live unit
+# has passed it by hand since then and this file passed nothing, so a rebuilt
+# control host would install a queue monitor that records nothing at all.
+Environment=AICC_MONITOR_FINDING_SOURCE=control-01:queue
 ExecStart=/home/voynadmin/aicc-preprod/repo/.venv/bin/python -m command_center.ops.infra_monitor --skip-workers --minimum-active-workers 0 --max-stalled-seconds 900 --max-recent-dead 0 --prometheus-url http://100.114.209.119:9090/-/ready
 NoNewPrivileges=true
 PrivateTmp=true

@@ -5426,6 +5426,15 @@ CONTROL_ONLY_UNITS = (
     "voyn-aicc-remediate.timer",
     "voyn-aicc-pr-window.service",
     "voyn-aicc-pr-window.timer",
+    # The outer retry for the control host's Prometheus. Its triggered unit
+    # is the distro's own prometheus.service, so there is no paired
+    # `.service` here; what shapes that vendor unit is the drop-in below.
+    # Same lesson as the PR-window tick, one directory over: this timer sat
+    # in deploy/systemd from 2026-09-05 (#614) and nothing ever installed
+    # it, so the Tailscale-listener race it was written for had no recovery
+    # path on the live host and control-01 measured `prometheus_unready`
+    # (monitor_finding #41637) with nothing retrying behind the measurement.
+    "voyn-prometheus-recovery.timer",
 )
 #: The timers of `CONTROL_ONLY_UNITS` the installer enables after commit, so
 #: installed units are *running* ticks and not just files on disk.
@@ -5435,8 +5444,20 @@ CONTROL_ONLY_TIMERS = (
     "voyn-aicc-remediate.timer",
     "voyn-aicc-credential-rescue.timer",
     "voyn-aicc-pr-window.timer",
+    "voyn-prometheus-recovery.timer",
 )
 CONTROL_ONLY_TIMER = "voyn-aicc-pr-window.timer"
+
+#: Ordering and restart policy for the distro's prometheus.service, as a
+#: drop-in: the vendor unit stays byte-for-byte the package's (and keeps
+#: whatever the package changes next), while the control host gets the two
+#: things its listener needs -- an order after tailscaled, and a retry of the
+#: ordinary exit(1) that Restart=on-abnormal refuses. See the file itself for
+#: why the budget is bounded and the timer above is not.
+PROMETHEUS_DROPIN_SOURCE = "deploy/systemd/prometheus-tailscale-recovery.conf"
+PROMETHEUS_DROPIN_TARGET = (
+    "/etc/systemd/system/prometheus.service.d/10-voyn-tailscale-recovery.conf"
+)
 
 
 def _runtime_target(target: str) -> bool:
@@ -5807,6 +5828,18 @@ def default_specs(
                 root_gid,
             )
             for unit in CONTROL_ONLY_UNITS
+        ) + (
+            # A drop-in, not a unit: the target is the vendor unit's
+            # `.d` directory, which the generation creates like any other
+            # missing parent, and the package's prometheus.service is never
+            # edited (same shape as the worker principal-isolation drop-ins).
+            FileSpec(
+                repo_root / PROMETHEUS_DROPIN_SOURCE,
+                PROMETHEUS_DROPIN_TARGET,
+                0o644,
+                root_uid,
+                root_gid,
+            ),
         )
         purge = tuple(
             removal_spec(target, sensitive=target in SENSITIVE_TARGETS)

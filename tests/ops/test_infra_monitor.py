@@ -2,18 +2,27 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
 
 from command_center.ops import infra_monitor
 from command_center.ops.infra_monitor import (
+    PrometheusSnapshot,
     QueueSnapshot,
     SourceCloneSnapshot,
     evaluate,
     parse_worker_units,
     prometheus_is_ready,
 )
+
+
+def _ready_snapshot(_url: str, **_kwargs: object) -> PrometheusSnapshot:
+    """A measured-ready metrics endpoint, for tests about everything else."""
+    return PrometheusSnapshot(ready=True, status=200)
 
 
 def test_worker_discovery_uses_current_templated_lanes_only() -> None:
@@ -227,6 +236,227 @@ def test_prometheus_probe_rejects_non_http_urls() -> None:
     assert not prometheus_is_ready("http://user@example.invalid/-/ready")
 
 
+# ---------------------------------------------------------------------------
+# The metrics endpoint: why it is unready, and how many samples say so.
+#
+# VOYN-MON-CONTROL-01-QUEUE-PROMETHEUS-UNREADY: control-01's Prometheus binds
+# the host's Tailscale address, the distro unit starts before that address
+# exists and exits 1, Restart=on-abnormal does not retry an ordinary exit --
+# and the recovery timer written for exactly that race was a file in
+# deploy/systemd that nothing installed (fixed in the install transaction, and
+# pinned by tests/ops/test_agent_principal_isolation.py). The monitor's half:
+# `prometheus_unready` was a bare word, so a dead listener and one dropped
+# packet on the tailnet were the same finding, and neither carried a status
+# code, an errno or a sample count.
+# ---------------------------------------------------------------------------
+
+
+class _ReadinessHandler(BaseHTTPRequestHandler):
+    """A readiness endpoint that answers from its server's `replies` queue."""
+
+    protocol_version = "HTTP/1.1"
+
+    def do_GET(self) -> None:  # BaseHTTPRequestHandler's spelling
+        self.server.paths.append(self.path)
+        status, body = self.server.replies.pop(0)
+        payload = body.encode()
+        self.send_response(status)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, *_args: object) -> None:
+        """Keep the test output clean."""
+
+
+@contextmanager
+def _readiness_server(replies):
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _ReadinessHandler)
+    server.replies = list(replies)
+    server.paths = []
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address[:2]
+        yield f"http://{host}:{port}/-/ready", server
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_prometheus_probe_reads_the_real_readiness_endpoint() -> None:
+    """The happy path over actual HTTP, which nothing exercised before: a
+    ready Prometheus answers 200 with a body that says so, on the path the
+    deployed units pass (`/-/ready`)."""
+    with _readiness_server([(200, "Prometheus Server is Ready.\n")]) as (url, server):
+        snapshot = infra_monitor.read_prometheus_snapshot(url, retry_seconds=0)
+
+    assert snapshot == PrometheusSnapshot(ready=True, status=200, attempts=1)
+    assert snapshot.reason == ""
+    assert server.paths == ["/-/ready"]
+
+
+def test_prometheus_unready_carries_the_status_it_measured() -> None:
+    """A Prometheus that is up but replaying its WAL answers 503. The finding
+    says which, over how many samples, and stays ONE finding: the identity is
+    the code before the first ':'."""
+    with _readiness_server([(503, "Service Unavailable")] * 3) as (url, server):
+        snapshot = infra_monitor.read_prometheus_snapshot(url, retry_seconds=0)
+
+    assert snapshot.ready is False
+    assert (snapshot.status, snapshot.attempts) == (503, 3)
+    assert len(server.paths) == 3
+
+    report = evaluate(
+        {},
+        None,
+        minimum_active_workers=0,
+        max_stalled_seconds=900,
+        prometheus_ready=snapshot,
+    )
+
+    assert report.failures == ("prometheus_unready:http_503:3_attempts",)
+    assert infra_monitor.finding_key(report.failures[0]) == "prometheus_unready"
+    assert report.prometheus_ready is False
+
+
+def test_prometheus_200_from_something_that_is_not_the_probe_is_not_ready() -> None:
+    """A proxy error page, or another service on the port, answers 200 with a
+    body that never says ready. Fail closed, and say which it was."""
+    with _readiness_server([(200, "<html>nope</html>")] * 2) as (url, _server):
+        snapshot = infra_monitor.read_prometheus_snapshot(
+            url, attempts=2, retry_seconds=0
+        )
+
+    assert snapshot.ready is False
+    assert snapshot.reason == "body_not_ready:http_200:2_attempts"
+
+
+def test_prometheus_refused_connection_names_the_errno_not_just_unready() -> None:
+    """Nothing listening is the live cause (a Prometheus that exited 1 at
+    boot), and it is now distinguishable from every other way to be unready."""
+    with _readiness_server([]) as (url, _server):
+        pass  # the port is bound, then released: connections are refused.
+
+    snapshot = infra_monitor.read_prometheus_snapshot(url, retry_seconds=0)
+
+    assert snapshot.ready is False
+    assert snapshot.status is None
+    assert snapshot.error is not None and snapshot.error.startswith(
+        ("ConnectionRefusedError", "ConnectionResetError")
+    )
+    assert snapshot.attempts == 3
+    assert snapshot.reason == f"{snapshot.error}:3_attempts"
+
+
+def test_one_lost_sample_is_not_an_outage() -> None:
+    """The flap this probe used to turn into a finding and a task: Prometheus
+    is reached across the tailnet, and a single dropped packet (or one 503 on
+    the way up) answered for the whole two-minute tick. An unready sample is
+    now confirmed before it is believed."""
+    with _readiness_server(
+        [(503, "Starting Up"), (200, "Prometheus Server is Ready.\n")]
+    ) as (url, server):
+        snapshot = infra_monitor.read_prometheus_snapshot(url, retry_seconds=0)
+
+    assert snapshot.ready is True
+    assert snapshot.attempts == 2
+    assert len(server.paths) == 2
+
+    report = evaluate(
+        {},
+        None,
+        minimum_active_workers=0,
+        max_stalled_seconds=900,
+        prometheus_ready=snapshot,
+    )
+
+    assert report.ok and report.failures == ()
+
+
+def test_confirmation_is_an_attempt_budget_and_can_be_switched_off() -> None:
+    """Fail-closed is unchanged: the loop ends on the budget, never on a
+    timer, and a single-sample probe is one flag away."""
+    with _readiness_server([(503, "Starting Up")]) as (url, server):
+        snapshot = infra_monitor.read_prometheus_snapshot(
+            url, attempts=1, retry_seconds=0
+        )
+
+    assert snapshot.ready is False
+    assert snapshot.attempts == 1
+    assert len(server.paths) == 1
+    assert (
+        infra_monitor.build_parser()
+        .parse_args(["--prometheus-url", "http://m/ready"])
+        .prometheus_attempts
+        == infra_monitor.PROMETHEUS_ATTEMPTS
+    )
+    with pytest.raises(SystemExit):
+        infra_monitor.build_parser().parse_args(
+            ["--prometheus-url", "http://m/ready", "--prometheus-attempts", "0"]
+        )
+
+
+def test_an_unprobeable_url_is_a_configuration_fault_and_is_not_retried() -> None:
+    """Re-probing a URL this probe will not fetch cannot change the answer,
+    so the confirmation loop does not spend its budget (or its sleeps) on it."""
+    snapshot = infra_monitor.read_prometheus_snapshot("file:///etc/passwd")
+
+    assert snapshot == PrometheusSnapshot(
+        ready=False, error=infra_monitor.PROMETHEUS_UNSUPPORTED_URL, attempts=1
+    )
+    assert snapshot.reason == "unsupported_url"
+
+
+def test_a_bare_boolean_verdict_still_evaluates_unchanged() -> None:
+    """Callers that only have a verdict (the worker probe's report, every
+    pre-existing test) keep the bare failure code and no detail."""
+    report = evaluate(
+        {},
+        None,
+        minimum_active_workers=0,
+        max_stalled_seconds=900,
+        prometheus_ready=False,
+    )
+
+    assert report.failures == ("prometheus_unready",)
+    assert report.prometheus_ready is False
+
+
+def test_main_measures_the_endpoint_with_confirmation_and_reports_the_reason(
+    monkeypatch, capsys
+) -> None:
+    """End to end: the unit's `--prometheus-attempts` reaches the probe, and
+    the printed measurement (what --record-findings stores) carries why."""
+    seen: dict[str, object] = {}
+
+    def _measure(url, *, attempts=infra_monitor.PROMETHEUS_ATTEMPTS):
+        seen.update(url=url, attempts=attempts)
+        return PrometheusSnapshot(ready=False, status=503, attempts=attempts)
+
+    monkeypatch.setattr(infra_monitor, "read_prometheus_snapshot", _measure)
+
+    result = infra_monitor.main(
+        [
+            "--skip-workers",
+            "--skip-queue",
+            "--minimum-active-workers",
+            "0",
+            "--prometheus-url",
+            "http://metrics.invalid/-/ready",
+            "--prometheus-attempts",
+            "2",
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert seen == {"url": "http://metrics.invalid/-/ready", "attempts": 2}
+    assert payload["failures"] == ["prometheus_unready:http_503:2_attempts"]
+    assert payload["prometheus_ready"] is False
+    assert result == 1
+
+
 def test_systemd_probes_keep_database_access_off_the_worker_host() -> None:
     worker_unit = Path("deploy/systemd/voyn-infra-monitor.service").read_text()
     queue_unit = Path("deploy/systemd/voyn-queue-monitor.service").read_text()
@@ -284,7 +514,7 @@ def test_main_skip_queue_serializes_null_without_reading_database(
         "read_queue_snapshot",
         lambda: (_ for _ in ()).throw(AssertionError("queue must stay unread")),
     )
-    monkeypatch.setattr(infra_monitor, "prometheus_is_ready", lambda _url: True)
+    monkeypatch.setattr(infra_monitor, "read_prometheus_snapshot", _ready_snapshot)
 
     result = infra_monitor.main(
         [
@@ -310,7 +540,7 @@ def test_main_skip_workers_reads_queue_without_inspecting_systemd(
         lambda: (_ for _ in ()).throw(AssertionError("workers must stay unread")),
     )
     monkeypatch.setattr(infra_monitor, "read_queue_snapshot", lambda: queue)
-    monkeypatch.setattr(infra_monitor, "prometheus_is_ready", lambda _url: True)
+    monkeypatch.setattr(infra_monitor, "read_prometheus_snapshot", _ready_snapshot)
 
     result = infra_monitor.main(
         [
@@ -490,7 +720,7 @@ def test_main_exits_non_zero_when_findings_cannot_be_recorded_even_if_healthy(
         "discover_worker_units",
         lambda: {"voyn-aicc-worker@1.service": "active"},
     )
-    monkeypatch.setattr(infra_monitor, "prometheus_is_ready", lambda _url: True)
+    monkeypatch.setattr(infra_monitor, "read_prometheus_snapshot", _ready_snapshot)
     monkeypatch.setattr(
         infra_monitor,
         "record_findings",
@@ -689,7 +919,7 @@ def test_the_probe_costs_one_github_request_and_is_off_by_default(monkeypatch) -
 def test_main_skips_the_pr_window_probe_unless_a_repo_is_given(
     monkeypatch, capsys
 ) -> None:
-    monkeypatch.setattr(infra_monitor, "prometheus_is_ready", lambda _url: True)
+    monkeypatch.setattr(infra_monitor, "read_prometheus_snapshot", _ready_snapshot)
     monkeypatch.setattr(
         infra_monitor,
         "read_pr_window_snapshot",
@@ -714,7 +944,7 @@ def test_main_skips_the_pr_window_probe_unless_a_repo_is_given(
 def test_main_reports_the_pr_window_probe_when_a_repo_is_given(
     monkeypatch, capsys
 ) -> None:
-    monkeypatch.setattr(infra_monitor, "prometheus_is_ready", lambda _url: True)
+    monkeypatch.setattr(infra_monitor, "read_prometheus_snapshot", _ready_snapshot)
     monkeypatch.setattr(
         infra_monitor,
         "read_pr_window_snapshot",
@@ -746,6 +976,28 @@ def test_main_reports_the_pr_window_probe_when_a_repo_is_given(
     assert result == 1
 
 
+def test_the_finding_source_can_be_given_by_environment(monkeypatch) -> None:
+    """How the control unit turns recording on without touching its own
+    ExecStart (leak_guard.sh): the same shape as AICC_PR_WINDOW_REPO."""
+    monkeypatch.setenv("AICC_MONITOR_FINDING_SOURCE", "control-01:queue")
+    with_env = infra_monitor.build_parser().parse_args(
+        ["--prometheus-url", "http://m/ready"]
+    )
+    overridden = infra_monitor.build_parser().parse_args(
+        ["--prometheus-url", "http://m/ready", "--record-findings", "control-01:other"]
+    )
+    monkeypatch.delenv("AICC_MONITOR_FINDING_SOURCE")
+    without_env = infra_monitor.build_parser().parse_args(
+        ["--prometheus-url", "http://m/ready"]
+    )
+
+    assert with_env.record_findings == "control-01:queue"
+    assert overridden.record_findings == "control-01:other"
+    # Unset records nothing: a host that does not want a finding store is
+    # unaffected, exactly as before.
+    assert without_env.record_findings == ""
+
+
 def test_the_control_probe_watches_the_pr_window_and_records_its_findings() -> None:
     """The probe rides the control-host unit because that is where the
     backlog database (the `pr` evidence) and the fleet's gh identity are; the
@@ -758,7 +1010,14 @@ def test_the_control_probe_watches_the_pr_window_and_records_its_findings() -> N
     worker_unit = Path("deploy/systemd/voyn-infra-monitor.service").read_text()
 
     assert "Environment=AICC_PR_WINDOW_REPO=." in queue_unit
+    # "Reaches the planner" is a source, not a hope: with none, the probe
+    # measures, prints, and exits non-zero into a oneshot nobody reads. Set
+    # by environment for the same reason the PR-window repo is -- this unit's
+    # ExecStart may not be restated in an added line -- and carrying the
+    # identity control-01's own findings already use.
+    assert "Environment=AICC_MONITOR_FINDING_SOURCE=control-01:queue" in queue_unit
     assert "--record-findings" not in worker_unit
+    assert "AICC_MONITOR_FINDING_SOURCE" not in worker_unit
     assert "AICC_PR_WINDOW_REPO" not in worker_unit
 
 
@@ -846,7 +1105,7 @@ def test_source_clone_snapshot_uses_git_and_never_raises(monkeypatch) -> None:
 def test_main_reports_the_source_clone_probe_when_a_repo_is_given(
     monkeypatch, capsys
 ) -> None:
-    monkeypatch.setattr(infra_monitor, "prometheus_is_ready", lambda _url: True)
+    monkeypatch.setattr(infra_monitor, "read_prometheus_snapshot", _ready_snapshot)
     monkeypatch.setattr(
         infra_monitor,
         "read_source_clone_snapshot",
@@ -1596,7 +1855,7 @@ def test_a_half_configured_deploy_lag_probe_is_a_usage_error() -> None:
 
 
 def test_main_reports_the_host_probes_when_enabled(monkeypatch, capsys) -> None:
-    monkeypatch.setattr(infra_monitor, "prometheus_is_ready", lambda _url: True)
+    monkeypatch.setattr(infra_monitor, "read_prometheus_snapshot", _ready_snapshot)
     monkeypatch.setattr(
         infra_monitor, "read_unit_health_snapshot",
         lambda crash_loop_restarts: infra_monitor.UnitHealthSnapshot(

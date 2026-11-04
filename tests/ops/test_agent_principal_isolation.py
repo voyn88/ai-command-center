@@ -2604,6 +2604,7 @@ def test_the_control_profile_installs_the_pr_window_tick(tmp_path):
         "voyn-aicc-remediate.timer",
         "voyn-aicc-pr-window.service",
         "voyn-aicc-pr-window.timer",
+        "voyn-prometheus-recovery.timer",
     )
     for unit in tx.CONTROL_ONLY_UNITS:
         assert f"/etc/systemd/system/{unit}" in control
@@ -2611,7 +2612,7 @@ def test_the_control_profile_installs_the_pr_window_tick(tmp_path):
     # it nor is expected to, and the worker-only drop set is unchanged by it.
     assert control - worker == {
         f"/etc/systemd/system/{unit}" for unit in tx.CONTROL_ONLY_UNITS
-    }
+    } | {tx.PROMETHEUS_DROPIN_TARGET}
     assert worker - control == tx.WORKER_ONLY_TARGETS
 
 
@@ -2698,6 +2699,84 @@ def test_the_pr_window_unit_carries_no_host_layout_of_its_own(tmp_path):
     # calls, and OnUnitActiveSec would queue a second one behind a slow first.
     assert "OnUnitInactiveSec=5min" in timer
     assert "OnUnitActiveSec" not in timer
+    assert "WantedBy=timers.target" in timer
+
+
+# ---------------------------------------------------------------------------
+# The control host's Prometheus.
+#
+# VOYN-MON-CONTROL-01-QUEUE-PROMETHEUS-UNREADY (monitor_finding #41637):
+# Prometheus binds control-01's Tailscale address because the fleet scrapes
+# and probes it across the tailnet; the distro unit starts before that address
+# exists, a Prometheus that cannot bind exits 1, and the vendor
+# Restart=on-abnormal does not retry an ordinary exit. The recovery timer
+# written for exactly that race (#614, 2026-09-05) was never installed by
+# anything -- a file in deploy/systemd is not a recovery mechanism -- so the
+# service lost its single start at boot and every queue-monitor tick measured
+# `prometheus_unready` with nothing on the host retrying behind it. Same shape
+# as the PR-window tick above, which is why it is fixed the same way.
+# ---------------------------------------------------------------------------
+
+
+def test_the_control_profile_installs_the_prometheus_recovery_path(tmp_path):
+    """Both halves, in the control generation: the drop-in that makes the
+    vendor unit survive the race, and the timer that retries regardless."""
+    tx, control = _specs("control", tmp_path)
+    _tx, worker = _specs("worker", tmp_path)
+
+    assert "voyn-prometheus-recovery.timer" in tx.CONTROL_ONLY_UNITS
+    assert "/etc/systemd/system/voyn-prometheus-recovery.timer" in control
+    assert tx.PROMETHEUS_DROPIN_TARGET in control
+    # A drop-in under the vendor unit's own `.d` directory: the package's
+    # prometheus.service is never edited or replaced.
+    assert tx.PROMETHEUS_DROPIN_TARGET.startswith(
+        "/etc/systemd/system/prometheus.service.d/"
+    )
+    assert "/etc/systemd/system/prometheus.service" not in control
+    # Prometheus runs on the control plane; a worker host installs neither.
+    assert tx.PROMETHEUS_DROPIN_TARGET not in worker
+    assert "/etc/systemd/system/voyn-prometheus-recovery.timer" not in worker
+
+
+def test_the_installer_enables_the_prometheus_recovery_timer(tmp_path):
+    """Installed and enabled, or it is the same undeployed file it was."""
+    tx, _control = _specs("control", tmp_path)
+
+    assert "voyn-prometheus-recovery.timer" in tx.CONTROL_ONLY_TIMERS
+    assert "voyn-prometheus-recovery.timer" in _installer_text()
+
+
+def test_the_prometheus_dropin_orders_the_listener_and_retries_a_plain_exit():
+    """The two things the vendor unit lacks, and the one thing it must not
+    grow: ordering after tailscaled, a retry of the ordinary exit(1), and a
+    BOUNDED budget -- an every-few-seconds forever loop is how
+    ollama.service stayed invisible for twelve days (UnitHealthSnapshot), and
+    a Prometheus that can never bind must stay a dead unit the monitors
+    report. The unbounded-but-slow retry is the timer, not the service."""
+    root = Path(__file__).parents[2]
+    dropin = (
+        root / "deploy/systemd/prometheus-tailscale-recovery.conf"
+    ).read_text()
+    timer = (root / "deploy/systemd/voyn-prometheus-recovery.timer").read_text()
+    directives = [
+        line for line in dropin.splitlines() if line and not line.startswith("#")
+    ]
+
+    assert "After=network-online.target tailscaled.service" in directives
+    assert "Wants=network-online.target tailscaled.service" in directives
+    assert "Restart=always" in directives
+    assert any(line.startswith("RestartSec=") for line in directives)
+    assert "StartLimitIntervalSec=5min" in directives
+    assert "StartLimitBurst=10" in directives
+    assert "StartLimitIntervalSec=0" not in directives
+    # A drop-in is not a unit: nothing to enable, and no ExecStart of its own
+    # (the vendor unit's command, user and flags stay the package's).
+    assert "[Install]" not in dropin
+    assert "ExecStart" not in dropin
+    # The outer retry: it triggers the vendor unit, and it rearms from the
+    # unit going INACTIVE, so a spent restart budget is still recovered.
+    assert "Unit=prometheus.service" in timer
+    assert "OnUnitInactiveSec=1min" in timer
     assert "WantedBy=timers.target" in timer
 
 
