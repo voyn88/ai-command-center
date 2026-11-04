@@ -512,5 +512,9 @@ Roadmap statements in that directory beyond D1 must not be read as current capab
 - [`docs/adr/0009-canonical-project-registry-and-validating-task-import.md`](docs/adr/0009-canonical-project-registry-and-validating-task-import.md)
   — the 9-id `PROJECT_IDS` registry, the sensitive subset, the alias folding rule, and the rule that
   registry changes require an ADR
+- [`docs/adr/0011-streamlit-console-identity-boundary.md`](docs/adr/0011-streamlit-console-identity-boundary.md)
+  — external deployment of the Streamlit console requires an identity-aware reverse proxy consuming
+  the accepted AIOS identity surface (or retirement in favor of a parity-reaching authenticated
+  client); loopback-only remains mandatory until then
 - [`docs/completion-pipeline.md`](docs/completion-pipeline.md)
 - [`CURRENT_STATE.md`](CURRENT_STATE.md)
