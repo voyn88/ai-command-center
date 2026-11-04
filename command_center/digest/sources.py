@@ -21,7 +21,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from command_center import read_model
+from command_center import models, read_model
 from command_center.project_config import is_sensitive
 from command_center.runtime.db.core import resolve_db_path
 from command_center.runtime.runs_read import list_unified_runs
@@ -52,9 +52,11 @@ def _not_sensitive(project: str | None) -> bool:
 
 
 def overnight_cutoff(*, now: datetime | None = None) -> str:
-    """The ISO cutoff below which activity is *not* "overnight" — naive-local
-    to match every other timestamp in the app (:func:`models.iso_now`)."""
-    now = now or datetime.now()
+    """The ISO cutoff below which activity is *not* "overnight" — naive UTC to
+    match the `created_at` strings it is compared against, and every other
+    timestamp in the app (:func:`models.iso_now`). An explicit `now` must be on
+    the same clock (`models.utc_now()`)."""
+    now = now or models.utc_now()
     return (now - timedelta(hours=OVERNIGHT_WINDOW_HOURS)).isoformat(timespec="seconds")
 
 

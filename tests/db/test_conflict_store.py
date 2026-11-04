@@ -45,7 +45,7 @@ def _row(conflict_id: str, **overrides: object) -> dict:
         "owner": None,
         "mitigation": None,
         "project_ref": None,
-        "opened_at": "2026-08-13T00:00:00",  # naive local, what `models.iso_now()` emits
+        "opened_at": "2026-08-13T00:00:00",  # naive UTC, what `models.iso_now()` emits
         "resolved_at": None,
         "version": 0,
         "created_at": "2026-08-13T00:00:00",

@@ -343,8 +343,8 @@ def _parse_iso(ts: str) -> datetime | None:
 
 def evidence_age_seconds(evidence: Evidence, *, now: str | None = None) -> float | None:
     """Age of an evidence item in seconds relative to `now` (default
-    `iso_now()`), both read as naive local time (the project-wide convention —
-    see `models.iso_now`). None if either timestamp is unparseable."""
+    `iso_now()`), both read as naive UTC (the project-wide convention — see
+    `models.iso_now`). None if either timestamp is unparseable."""
     now_dt = _parse_iso(now or iso_now())
     obs_dt = _parse_iso(evidence.observed_at)
     if now_dt is None or obs_dt is None:

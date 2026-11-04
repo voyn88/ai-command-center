@@ -21,6 +21,7 @@ from __future__ import annotations
 import hashlib
 import os
 import secrets
+import time
 
 import pytest
 
@@ -199,3 +200,28 @@ def pg_connection_factory(admin_conn, psycopg, test_dsn, role_passwords):  # noq
         yield admin_conn
 
     return factory
+
+
+@pytest.fixture
+def process_tz():
+    """Run a test under an explicit process timezone.
+
+    Needs no PostgreSQL, and lives here because three files in this package
+    need it: the timestamp conversion's whole job is to be independent of the
+    mirroring process's zone (`VOYN-W0-AICC-ISO-NOW-NAIVE-LOCAL` made the
+    authority's scale UTC), and on a UTC host a zone-dependent implementation
+    is indistinguishable from a correct one. The tests that pin the scale
+    therefore set a non-UTC zone rather than trusting the machine they run on.
+    """
+    original = os.environ.get("TZ")
+
+    def _set(name: str) -> None:
+        os.environ["TZ"] = name
+        time.tzset()
+
+    yield _set
+    if original is None:
+        os.environ.pop("TZ", None)
+    else:
+        os.environ["TZ"] = original
+    time.tzset()

@@ -8,12 +8,8 @@ import KpiCard from '../components/KpiCard'
 import LangToggle from '../components/LangToggle'
 import NavItem from '../components/NavItem'
 import { ExecutionIcon, HomeIcon, TasksIcon } from '../components/NavIcons'
+import { formatAppTimestamp } from '../lib/time'
 
-function formatDate(value: string | null, language: string, fallback: string) {
-  if (!value) return fallback
-  const date = new Date(value)
-  return Number.isNaN(date.getTime()) ? value : new Intl.DateTimeFormat(language, { dateStyle: 'medium', timeStyle: 'short' }).format(date)
-}
 
 function formatDuration(value: number | null, fallback: string) {
   if (value === null || value === undefined) return fallback
@@ -40,7 +36,7 @@ function RunRow({ run, fallback, language, resultLabel, exitLabel }: { run: Exec
         <span>{run.project_name}</span>
       </div>
       <div className="execution-meta">
-        <span>{formatDate(run.started_at || run.created_at, language, fallback)}</span>
+        <span>{formatAppTimestamp(run.started_at || run.created_at, language, fallback)}</span>
         <span>{formatDuration(run.duration_seconds, fallback)}</span>
         <span title={resultLabel}>{result}</span>
       </div>

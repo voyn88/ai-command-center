@@ -96,12 +96,17 @@ def archive_and_prune(
     backup_path = archive_dir / f"runtime-backup-{stamp}.db"
     _backup_database(db_path, backup_path)
 
-    # Rendered in the zone the database says its naive timestamps are on, not
-    # in this process's zone — otherwise the same database at the same instant
-    # yields a different set of deleted rows depending on how the prune was
-    # started (VOYN-W0-AICC-RETENTION-TZ). The zone and where it came from go
-    # into the report: an irreversible delete has to be able to say which clock
-    # it judged the rows against.
+    # Rendered on the clock the rows were written on, not in this process's
+    # zone — otherwise the same database at the same instant yields a different
+    # set of deleted rows depending on how the prune was started
+    # (VOYN-W0-AICC-RETENTION-TZ). A file that was already in use before
+    # VOYN-W0-AICC-ISO-NOW-NAIVE-LOCAL holds rows on two clocks — naive local
+    # ones written then, naive UTC ones since — and `retention_cutoff` answers
+    # with the earlier of the two bounds rather than pruning either set early.
+    # Which reading it applied, and where that reading came from, go into the
+    # report; `utc-floor` there means UTC's own bound was the earlier one, so a
+    # declared legacy zone did not render the string. An irreversible delete
+    # has to be able to say which clock it judged the rows against.
     cutoff, cutoff_zone, cutoff_zone_source = retention_cutoff(
         db_path, retention_days=retention_days
     )

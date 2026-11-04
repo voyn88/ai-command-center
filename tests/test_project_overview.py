@@ -1,6 +1,33 @@
+import os
+import time
 from datetime import datetime
 
+import pytest
+
 from command_center.runtime import project_overview, session_view
+
+
+@pytest.fixture
+def process_tz():
+    """Pin the process timezone for a test, then restore it.
+
+    `completed_today_count` buckets by the *operator's* calendar day
+    (`project_overview._is_today`), so it is a function of the reading host's
+    zone by design. A test that asserts on it has to say which host it is
+    reading from, or it is asserting on the machine it happens to run on.
+    """
+    original = os.environ.get("TZ")
+
+    def _set(name: str) -> None:
+        os.environ["TZ"] = name
+        time.tzset()
+
+    yield _set
+    if original is None:
+        os.environ.pop("TZ", None)
+    else:
+        os.environ["TZ"] = original
+    time.tzset()
 
 
 def _session(**overrides) -> dict:
@@ -31,7 +58,16 @@ def test_build_project_overview_counts_running_and_waiting():
     assert overview["waiting_count"] == 2  # Waiting + Requires Attention
 
 
-def test_build_project_overview_completed_today_only_counts_todays_completions():
+@pytest.mark.parametrize("reader_tz", ["UTC", "Europe/Moscow", "America/Los_Angeles"])
+def test_build_project_overview_completed_today_only_counts_todays_completions(
+    process_tz, reader_tz
+):
+    """`now` and the stored `finished_at` are both naive UTC
+    (`models.utc_now`/`models.iso_now`); the bucket is the reader's local day.
+    Midday UTC is the same local day in every zone under test, so the count is
+    the same from all three — the point being that the two sides are localised
+    *together*, never one against the other."""
+    process_tz(reader_tz)
     now = datetime(2026, 1, 2, 12, 0, 0)
     sessions = [
         _session(run_id="r1", status=session_view.STATUS_COMPLETED, finished_at="2026-01-02T09:00:00"),
@@ -40,6 +76,31 @@ def test_build_project_overview_completed_today_only_counts_todays_completions()
     ]
     overview = project_overview.build_project_overview("AIOS", sessions=sessions, project_cfg=None, now=now)
     assert overview["completed_today_count"] == 1
+
+
+def test_completed_today_is_the_readers_day_not_the_utc_one(process_tz):
+    """The reason `_is_today` localises at all: a run finished at 21:00 UTC is
+    already "tomorrow" for a reader in Moscow, and was "today" for one in
+    Los Angeles. Comparing the raw UTC dates would answer the same in both,
+    which is the wrong answer in one of them."""
+    now = datetime(2026, 1, 2, 21, 30, 0)  # 00:30 Jan 3 in MSK, 13:30 Jan 2 in PT
+    sessions = [
+        _session(run_id="r1", status=session_view.STATUS_COMPLETED, finished_at="2026-01-02T21:00:00"),
+    ]
+
+    process_tz("America/Los_Angeles")
+    pacific = project_overview.build_project_overview(
+        "AIOS", sessions=sessions, project_cfg=None, now=now
+    )
+    process_tz("Europe/Moscow")
+    moscow = project_overview.build_project_overview(
+        "AIOS", sessions=sessions, project_cfg=None, now=now
+    )
+
+    # Same instant, same rows, both readers see their own day: still "today"
+    # in Los Angeles, and also "today" in Moscow, where that day is Jan 3.
+    assert pacific["completed_today_count"] == 1
+    assert moscow["completed_today_count"] == 1
 
 
 def test_build_project_overview_current_fields_from_most_recent_active_session():

@@ -115,7 +115,7 @@ class PostgresQueueMirror:
 
 
 #: Queue columns PostgreSQL stores as `timestamptz` while the JSON store holds
-#: naive local-time strings.
+#: naive UTC strings.
 #:
 #: The conversion itself moved to `mirror_support` at slice 3, when a third
 #: table would have made a third copy of it. What it does and why it is not
@@ -132,7 +132,7 @@ def _as_json_value(value: Any) -> Any:
 
     Column-name-independent, unlike the row stores': every `datetime` this
     mirror reads back comes from one of the three timestamp columns, and the
-    JSON queue holds them as the naive local strings `models.iso_now()` writes.
+    JSON queue holds them as the naive UTC strings `models.iso_now()` writes.
     So the renderer is called directly rather than through the codec, which
     would need a column name this function has no reason to know.
     """

@@ -45,7 +45,7 @@ def _contact(contact_id: str, **overrides: object) -> dict:
         "note": None,
         "project_ref": None,
         "version": 0,
-        "created_at": "2026-08-14T00:00:00",  # naive local, what `models.iso_now()` emits
+        "created_at": "2026-08-14T00:00:00",  # naive UTC, what `models.iso_now()` emits
         "updated_at": "2026-08-14T00:00:00",
     }
     row.update(overrides)  # type: ignore[arg-type]

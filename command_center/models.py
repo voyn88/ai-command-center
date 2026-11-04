@@ -9,7 +9,7 @@ not dataclasses/ORM models. This keeps every record trivially compatible with
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
 # --------------------------------------------------------------------------
 # Projects
@@ -137,16 +137,78 @@ def is_passing_verdict(verdict: str | None) -> bool:
 SEVERITIES: list[str] = ["Blocker", "High", "Medium", "Low"]
 
 
+def utc_now() -> datetime:
+    """The clock every timestamp in this application is written on: UTC, as a
+    *naive* `datetime` (no `tzinfo`).
+
+    The one reference for "now" that may be compared against a stored
+    timestamp. A bare `datetime.now()` must not be: it is on the local clock,
+    which this app no longer writes, so every such comparison is off by the
+    host's UTC offset (see `iso_now`).
+    """
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
 def iso_now() -> str:
-    """Naive local time, second precision, no timezone offset — deliberately matches
-    `app.py`'s pre-existing v1.1 `new_task_record` convention (`datetime.now().isoformat
-    (timespec="seconds")`), so every timestamp in this app (`created_at`/`updated_at`
-    on tasks, and every v1.2 run/chat/activity timestamp) is directly comparable
-    without conversion. Not migrated to a timezone-aware format for v1.2, to avoid a
-    mixed-format backward-compatibility hazard against existing `data/tasks.json`
-    records — all timestamps in this app should be read as "local time on the machine
-    that wrote them," never assumed to be UTC."""
-    return datetime.now().isoformat(timespec="seconds")
+    """Naive **UTC**, second precision, no timezone offset.
+
+    The textual shape is unchanged from the v1.1 `new_task_record` convention
+    (`datetime.now().isoformat(timespec="seconds")`), so every timestamp in
+    this app (`created_at`/`updated_at` on tasks, and every run/chat/activity
+    timestamp) stays directly string-comparable with no conversion and no
+    mixed-format hazard against existing `data/tasks.json` records. What
+    changed is the *scale*, not the format: the digits are UTC rather than the
+    writing machine's local wall clock.
+
+    Why (`VOYN-W0-AICC-ISO-NOW-NAIVE-LOCAL`): local time is not monotonic. At
+    the autumn DST fall-back the same wall clock is replayed, so a run started
+    *later* gets a strictly *smaller* string — reproduced as `03:50` against a
+    truly-later `03:10` — and every `ORDER BY created_at DESC` then answers
+    with the *earlier* row. Nothing downstream can repair that: the defect is
+    in the recorded scale, and raising precision to microseconds does not help
+    (verified), because the collision is an hour wide, not a microsecond wide.
+    UTC never repeats a wall clock, so the strings are monotonic and their
+    lexicographic order is chronological order. (The remaining same-second tie
+    is a *tiebreak* question, deliberately left to the insertion-sequence
+    column — `VOYN-W0-AICC-INSERT-SEQ` — which is a different record.)
+
+    Two consequences worth stating plainly, because both are observable:
+
+    * **Rows written before this change are naive local time.** The format is
+      identical, so no reader can tell them apart by inspection, and anything
+      that must be exact about pre-existing rows has to say so explicitly. The
+      one place where that matters — because it *deletes* — is
+      `runtime.db.retention_cutoff`, which keeps honouring the legacy zone a
+      database recorded for itself (`VOYN-W0-AICC-RETENTION-TZ`).
+    * **Crossing over is a one-time ordering artifact bounded by the host's
+      UTC offset**, and only on hosts east of UTC: for up to `offset` hours
+      after the upgrade, pre-upgrade local strings sort above the first UTC
+      ones. One bounded window, once — against an inversion that otherwise
+      recurs every autumn and lasts a full hour each time.
+
+    Read a naive timestamp from this app as UTC. `utc_now()` is the matching
+    "now"; never compare one of these against a bare `datetime.now()`.
+    """
+    return utc_now().isoformat(timespec="seconds")
+
+
+def to_local(value: datetime) -> datetime:
+    """One of this app's naive-UTC timestamps as the reader's *local* wall
+    clock, still naive.
+
+    For the two things an operator reads on their own clock rather than as a
+    duration: an absolute time shown in the UI, and a calendar-day bucket
+    ("runs today"). Everything else — ages, windows, cutoffs, ordering — stays
+    on the UTC scale the values are stored on and must not go through here.
+
+    An already-aware input is *converted* rather than re-stamped, the same way
+    `format_age` treats one: some stores do write aware timestamps, and
+    overriding a real offset with UTC would move the instant before localising
+    it.
+    """
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone().replace(tzinfo=None)
 
 
 def new_id() -> str:
@@ -280,9 +342,17 @@ def format_duration(seconds: int | float | None) -> str:
 
 
 def format_age(iso_str: str | None, *, now: datetime | None = None) -> str:
-    """Age of an `iso_now()`-style timestamp as a compact duration. Timestamps
-    in this app are naive local time (see `iso_now`), so an aware input is
-    demoted to naive rather than converted. Missing/unparseable → ``"—"``."""
+    """Age of an `iso_now()`-style timestamp as a compact duration.
+
+    Timestamps in this app are naive UTC (see `iso_now`), so an aware input is
+    *converted* to UTC before its offset is dropped — demoting it by discarding
+    `tzinfo`, which is what this did while the app wrote local time, would now
+    report an age wrong by that offset. `now` defaults to `utc_now()`; a caller
+    passing its own reference must pass one on the same clock, never a bare
+    `datetime.now()`. An aware `now` is converted the same way rather than
+    raising, so a caller that already holds an aware clock stays correct.
+    Missing/unparseable → ``"—"``.
+    """
     if not iso_str:
         return "—"
     try:
@@ -290,8 +360,10 @@ def format_age(iso_str: str | None, *, now: datetime | None = None) -> str:
     except (ValueError, TypeError):
         return "—"
     if then.tzinfo is not None:
-        then = then.replace(tzinfo=None)
-    reference = now if now is not None else datetime.now()
+        then = then.astimezone(timezone.utc).replace(tzinfo=None)
+    reference = now if now is not None else utc_now()
+    if reference.tzinfo is not None:
+        reference = reference.astimezone(timezone.utc).replace(tzinfo=None)
     return format_duration((reference - then).total_seconds())
 
 
