@@ -52,6 +52,9 @@ TRANSIENT_STOP_TIMEOUT_SECONDS = 20
 SOCKET_PATH = "/run/aicc-agent-launcher/control.sock"
 ROOTS_FILE = Path("/etc/aicc/agent-workspace-roots")
 COMMON_ENV_FILE = Path("/etc/aicc/agent.env")
+CLAUDE_MAC_BINARY = "/usr/libexec/aicc-claude-mac-agent"
+CLAUDE_MAC_ENV_FILE = Path("/etc/aicc/agent-claude-mac.env")
+
 PROVIDER_ENV_FILES = {
     "grok": Path("/etc/aicc/agent-grok.env"),
     "cursor": Path("/etc/aicc/agent-cursor.env"),
@@ -240,8 +243,10 @@ def _load_manifest(raw: bytes) -> dict[str, Any]:
         raise LaunchRefused("executor is not allowlisted")
     if value["profile"] not in PROFILES:
         raise LaunchRefused("profile is not allowlisted")
-    if value["profile"] == "model_only" and value["executor"] != "grok":
+    if value["profile"] == "model_only" and value["executor"] not in {"grok", "claude"}:
         raise LaunchRefused("executor does not support the model-only profile")
+    if value["profile"] == "model_only" and value["executor"] == "claude" and value["model"] is not None:
+        raise LaunchRefused("Claude Mac model is managed on the Mac")
     prompt = value["prompt"]
     if not isinstance(prompt, str) or not prompt or "\x00" in prompt:
         raise LaunchRefused("prompt must be a non-empty NUL-free string")
@@ -402,10 +407,10 @@ def _validated_workspace(value: str, roots: tuple[Path, ...]) -> Path:
     return resolved
 
 
-def _validate_environment_file(path: Path, executor: str) -> bool:
+def _validate_environment_file(path: Path, executor: str, *, allowed_keys: frozenset[str] | None = None) -> bool:
     if not _private_agent_environment(path, optional=True):
         return False
-    allowed = COMMON_AGENT_ENV_KEYS | PROVIDER_AGENT_ENV_KEYS[executor]
+    allowed = COMMON_AGENT_ENV_KEYS | (PROVIDER_AGENT_ENV_KEYS[executor] if allowed_keys is None else allowed_keys)
     for line_no, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         stripped = raw.strip()
         if not stripped or stripped.startswith("#"):
@@ -570,7 +575,7 @@ def _write_back_model_auth(executor: str, home: Path, staged: bytes | None) -> b
     return True
 
 
-def _prepare_agent_home(executor: str, run_id: str) -> tuple[Path, bytes | None]:
+def _prepare_agent_home(executor: str, run_id: str, *, profile: str | None = None) -> tuple[Path, bytes | None]:
     """Create one non-persistent provider home with a private auth copy.
 
     The model process necessarily reads its provider credential, but it must
@@ -591,7 +596,7 @@ def _prepare_agent_home(executor: str, run_id: str) -> tuple[Path, bytes | None]
     except KeyError as exc:
         raise LaunchRefused("aicc-agent-auth group does not exist") from exc
     source = MODEL_AUTH_SOURCES.get(executor)
-    if executor in {"grok", "cursor"}:
+    if executor in {"grok", "cursor"} or (executor == "claude" and profile == "model_only"):
         home = EPHEMERAL_HOME_ROOT / run_id
         home.mkdir(mode=0o770)
         os.chown(home, 0, auth_gid)
@@ -992,6 +997,8 @@ def _provider_command(manifest: dict[str, Any]) -> list[str]:
     prompt = manifest["prompt"]
     model = manifest["model"]
     binary = EXECUTOR_BINARIES[executor]
+    if executor == "claude" and profile == "model_only":
+        return [CLAUDE_MAC_BINARY, "--", prompt]
     if executor == "claude":
         command = [
             binary,
@@ -1196,9 +1203,14 @@ def _systemd_command(
             else "--property=ReadWritePaths=/agent-home"
         ),
     ]
-    for env_file in (COMMON_ENV_FILE, PROVIDER_ENV_FILES[executor]):
-        if _validate_environment_file(env_file, executor):
-            command.append(f"--property=EnvironmentFile={env_file}")
+    if executor == "claude" and manifest["profile"] == "model_only":
+        if not _validate_environment_file(CLAUDE_MAC_ENV_FILE, executor, allowed_keys=frozenset({"AICC_CLAUDE_MAC_TOKEN", "AICC_CLAUDE_MAC_CA_B64"})):
+            raise LaunchRefused("Claude Mac inference transport is not configured")
+        command.append(f"--property=EnvironmentFile={CLAUDE_MAC_ENV_FILE}")
+    else:
+        for env_file in (COMMON_ENV_FILE, PROVIDER_ENV_FILES[executor]):
+            if _validate_environment_file(env_file, executor):
+                command.append(f"--property=EnvironmentFile={env_file}")
     command += ["--", *_provider_command(manifest)]
     return command
 
@@ -1885,8 +1897,11 @@ def _serve_connected_socket(sock: socket.socket) -> int:
         if _workspace_is_quarantined(workspace):
             raise LaunchRefused("workspace is quarantined after an unsealed agent")
         _prepare_reusable_workspace(workspace, workspace_fd)
-        _validate_binary(EXECUTOR_BINARIES[manifest["executor"]])
-        agent_home, staged_auth = _prepare_agent_home(manifest["executor"], manifest["run_id"])
+        _validate_binary(CLAUDE_MAC_BINARY if manifest["executor"] == "claude" and manifest["profile"] == "model_only" else EXECUTOR_BINARIES[manifest["executor"]])
+        if manifest["executor"] == "claude" and manifest["profile"] == "model_only":
+            agent_home, staged_auth = _prepare_agent_home("claude", manifest["run_id"], profile="model_only")
+        else:
+            agent_home, staged_auth = _prepare_agent_home(manifest["executor"], manifest["run_id"])
         unit = f"aicc-agent-{manifest['run_id']}-{os.getpid()}.service"
         workspace_bind = _prepare_workspace_bind(workspace_fd, manifest["run_id"])
         _write_active_workspace_unit(workspace, unit)

@@ -2784,3 +2784,28 @@ def test_workspace_walk_names_descriptor_exhaustion_honestly(
     with pytest.raises(launcher.LaunchRefused) as refused:
         launcher._prepare_workspace_permissions(workspace)
     assert "ran out of file descriptors" in str(refused.value)
+
+
+def test_mac_model_only_claude_has_no_local_auth_or_writable_workspace(launcher, monkeypatch, tmp_path):
+    manifest = _manifest(tmp_path, executor='claude', profile='model_only')
+    manifest['model'] = None
+    launcher._load_manifest(json.dumps(manifest).encode())
+    checked=[]
+    def validate(path, executor, **kw):
+        checked.append((path, executor, kw))
+        return True
+    monkeypatch.setattr(launcher,'_validate_environment_file',validate)
+    command=launcher._systemd_command(manifest,Path('/run/aicc-agent-homes/test'),'aicc-agent-test.service','aicc-agent-launcher@test.service',tmp_path.parent,tmp_path)
+    assert command[-3:]==[launcher.CLAUDE_MAC_BINARY,'--',manifest['prompt']]
+    assert f'--property=BindReadOnlyPaths={tmp_path}:/workspace' in command
+    assert '--property=ReadWritePaths=/agent-home' in command
+    assert len(checked)==1 and checked[0][0]==launcher.CLAUDE_MAC_ENV_FILE
+    assert checked[0][2]['allowed_keys']==frozenset({'AICC_CLAUDE_MAC_TOKEN', 'AICC_CLAUDE_MAC_CA_B64'})
+    assert not any('agent-claude.env' in x for x in command)
+    manifest['model']='untrusted-model'
+    with pytest.raises(launcher.LaunchRefused,match='managed on the Mac'):
+        launcher._load_manifest(json.dumps(manifest).encode())
+
+
+def test_mac_adapter_preflight_uses_the_brokers_fixed_binary(launcher):
+    assert agent_runner.CLAUDE_MAC_AGENT_BINARY == launcher.CLAUDE_MAC_BINARY

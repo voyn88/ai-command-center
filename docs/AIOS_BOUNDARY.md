@@ -262,6 +262,25 @@ section below for why it exists at all):
   are unchanged. Convergence follows the same accepted AIOS dispatch contract
   as the enclosing SRV worker; provider execution and admission must move
   with that worker rather than survive as a parallel scheduler.
+  The opt-in `ops/aicc_claude_mac_server.py` extends this SRV provider
+  execution seam to the owner's Mac subscription. Its `subprocess.Popen`
+  call deliberately classifies as orchestration, so the module is recorded
+  explicitly in the baseline rather than exempted from detection. This is
+  a reviewed SRV host adapter: one bounded text-inference request invokes
+  the vendor's CLI with zero tools, empty MCP, disabled customizations and
+  consumer-auth verification. It manages only that invocation's private
+  process group and cancellation. It receives no task ID, queue identity,
+  repository, publisher authority, command or configurable executable from
+  the caller; it owns no task lifecycle, retries, durable state or scheduling.
+  Fixed TLS and inference-only connection credentials authenticate this
+  private provider channel; they introduce no platform principal/tenant
+  registry, roles or credential-issuance API. All task leases, review-head
+  validation, publication and completion stay in the accepted SRV control
+  plane. The adapter is deployed as model-serving infrastructure on the Mac,
+  while the immutable worker helper is only its fixed HTTPS client. This
+  baseline addition neither reopens legacy runtime growth nor changes the
+  scanner. Convergence must move this provider adapter with the enclosing
+  SRV worker to the accepted AIOS execution contract.
   `command_center/orchestrator/gh_access.py`
   (VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS) is a baseline addition
   of the same shape as `github_app_auth.py`: a transport adapter that chooses
