@@ -753,8 +753,8 @@ _PR_URL = re.compile(r"https://github\.com/([A-Za-z0-9][A-Za-z0-9-]*)/([A-Za-z0-
 # looser policy.
 _REVIEW_POLICY_VERSION = "v8"
 
-# Cursor Ask is not a zero-tool / model-only reviewer; Grok is the only
-# principal-isolation executor that actually supports model_only reviews.
+# Cursor Ask is not a zero-tool reviewer. Grok and the opt-in Mac Claude
+# transport are the broker paths with an enforced zero-tool capability.
 _MODEL_ONLY_REVIEW_EXECUTORS = frozenset(
     {"copilot", "claude", "codex", "openai_http", "grok"}
 )
@@ -762,10 +762,11 @@ _MODEL_ONLY_REVIEW_EXECUTORS = frozenset(
 
 def _model_only_review_cascade() -> list[dict[str, Any]]:
     route = cascade_for("review")
-    # The isolated broker currently enforces zero tools only for Grok.
-    # A read-only sandbox is not equivalent to a zero-tool review.
+    # The Mac transport attests empty tool and MCP lists on every result.
+    # Keep it opt-in until the private inference tunnel is configured.
     if os.environ.get("AICC_EXECUTOR_PROFILE") == "owner-cascade":
-        route = [link for link in route if link.get("executor") == "grok"]
+        route = [link for link in route if link.get("executor") == "grok"
+                 or (link.get("executor") == "claude" and os.environ.get("AICC_CLAUDE_MAC_ENABLED") == "1")]
     return [
         {**link, "task_type": "independent_review", "capability": "model_only"}
         for link in route
@@ -1555,6 +1556,7 @@ def _review_once(
 
     cfg = cfg or ReviewConfig()
     report = LoopReport()
+    recovery_budget = [3, 1]  # fresh lookups, stale-head PRs per tick
     action_limit = cfg.max_per_tick
     if task_id is None and callable(factory):
         active_rows = _rows(
@@ -1633,8 +1635,8 @@ def _review_once(
         if route is None:
             report.skipped.append((task_id, f"no_repo_route: {pr_url!r}"))
             continue
-        window = _pr_window_expensive_read_decision(
-            repo_path, pr_url, prefix="review_window"
+        window = _review_window_read_decision(
+            repo_path, pr_url, recovery_budget
         )
         if not window.allowed:
             report.skipped.append((task_id, window.reason))
@@ -1738,6 +1740,7 @@ def reconcile_review_once(
 
     cfg = cfg or ReviewConfig()
     report = LoopReport()
+    recovery_budget = [3, 1]  # fresh lookups, stale-head PRs per tick
     where = " AND t.task_id = %s" if task_id is not None else ""
     params: tuple[Any, ...] = (
         (task_id, cfg.max_per_tick)
@@ -1764,8 +1767,8 @@ def reconcile_review_once(
         if route is None:
             report.skipped.append((current_task_id, "no_repo_route"))
             continue
-        window = _pr_window_expensive_read_decision(
-            repo_path, pr_url, prefix="review_window"
+        window = _review_window_read_decision(
+            repo_path, pr_url, recovery_budget
         )
         if not window.allowed:
             report.skipped.append((current_task_id, window.reason))
@@ -2736,6 +2739,7 @@ def publish_review_verdicts(
     not errors."""
     cfg = cfg or ReviewConfig()
     report = LoopReport()
+    recovery_budget = [3, 1]  # fresh lookups, stale-head PRs per tick
     # Window fairness (VOYN-OPS-AICC-PUBLISH-WINDOW-STARVATION, two live
     # findings): a `LIMIT max_per_tick ORDER BY updated_at` window was
     # permanently filled by eternal skips (skips never bump updated_at --
@@ -2787,8 +2791,8 @@ def publish_review_verdicts(
             verdict = _clear_pr_evidence(factory, task_id, pr_url, "malformed_pr_url")
             report.skipped.append((task_id, f"malformed_pr_url:{verdict}: {pr_url!r}"))
             continue
-        window = _pr_window_expensive_read_decision(
-            repo_path, pr_url, prefix="review_window"
+        window = _review_window_read_decision(
+            repo_path, pr_url, recovery_budget
         )
         if not window.allowed:
             report.skipped.append((task_id, window.reason))
@@ -3238,6 +3242,66 @@ def _pr_window_expensive_read_decision(
     if _QUEUE_ACTIVE_LABEL in labels or DEFAULT_PR_WINDOW_CONFIG.label_active in labels:
         return _PrWindowReadDecision(True, f"{prefix}_active", pull)
     return _PrWindowReadDecision(False, f"{prefix}_inactive", pull)
+
+
+def _review_window_read_decision(
+    repo_path: str, pr_url: str, budget: list[int]
+) -> _PrWindowReadDecision:
+    """Heal one missing exact-head review without granting a merge slot.
+
+    Age or the self-dependent acceptance job cannot permanently prevent
+    the independent review needed to leave the stale-acceptance state. This opt-in path is model-review only;
+    merge/window policy, exact-head checks and publication checks stay intact.
+    """
+    normal = _pr_window_expensive_read_decision(repo_path, pr_url, prefix="review_window")
+    if normal.allowed or os.environ.get("AICC_REVIEW_STALE_RECOVERY") != "1":
+        return normal
+    if budget[0] <= 0 or budget[1] <= 0:
+        return normal
+    pull = normal.pull or {}
+    labels = {x.get("name") for x in pull.get("labels", []) if isinstance(x, dict)}
+    if DEFAULT_PR_WINDOW_CONFIG.label_blocked not in labels:
+        return normal
+    budget[0] -= 1
+    view = _gh(["pr", "view", pr_url, "--json",
+                "state,headRefOid,author,reviews,statusCheckRollup,mergeStateStatus"], repo_path)
+    if view.returncode:
+        return normal
+    try:
+        data = json.loads(view.stdout)
+    except (ValueError, TypeError):
+        return normal
+    raw_head = pull.get("head")
+    head = raw_head.get("sha") if isinstance(raw_head, dict) else None
+    if not isinstance(data, dict) or data.get("state") != "OPEN" or not re.fullmatch(r"[0-9a-f]{40}", str(head or "")) or data.get("headRefOid") != head:
+        return normal
+    author = data.get("author")
+    reviews = data.get("reviews")
+    rollup = data.get("statusCheckRollup")
+    if not isinstance(author, dict) or not author.get("login") or not isinstance(reviews, list) or any(not isinstance(x, dict) for x in reviews) or not isinstance(rollup, list) or any(not isinstance(x, dict) for x in rollup):
+        return normal
+    if str(data.get("mergeStateStatus") or "").upper() == "DIRTY":
+        return normal
+    if _independent_latest_reject_marker(reviews, head, author["login"]):
+        return normal
+    if any(x.get("state") == "CHANGES_REQUESTED" and (x.get("commit") or {}).get("oid", head) == head for x in reviews):
+        return normal
+    if _accept_marker_on_latest_review(reviews, head, author["login"]):
+        return normal
+    checks = _latest_checks_by_name(rollup)
+    by_name = {str(x.get("name") or ""): x for x in checks}
+    acceptance = "Acceptance gate (independent verdict on exact SHA)"
+    # Acceptance depends on this review. All code/security gates must already
+    # succeed; the merge path still requires acceptance itself to succeed too.
+    required = [name for name in _DEFAULT_REQUIRED_MERGE_CHECKS if name != acceptance]
+    if any(name not in by_name or (by_name[name].get("conclusion") or by_name[name].get("state")) != "SUCCESS" for name in required):
+        return normal
+    if not checks or any(not _check_is_green(check) for check in checks if check.get("name") != acceptance):
+        return normal
+    budget[1] -= 1
+    # Preserve the REST snapshot: downstream diff and worker guards revalidate
+    # this open PR and exact head before inference, publication and merge.
+    return _PrWindowReadDecision(True, "review_stale_head_recovery", pull)
 
 
 def _merge_window_allows_expensive_read(repo_path: str, pr_url: str) -> tuple[bool, str]:

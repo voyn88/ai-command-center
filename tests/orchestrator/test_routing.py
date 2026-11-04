@@ -182,3 +182,16 @@ def test_owner_cascade_cursor_model_override(monkeypatch):
     monkeypatch.setenv("AICC_CURSOR_MODEL", "composer-2.5")
     link = next(x for x in cascade_for("review") if x["executor"] == "cursor")
     assert link["model"] == "composer-2.5"
+
+
+def test_mac_subscription_is_opt_in_model_only_not_a_writer(monkeypatch):
+    from command_center.orchestrator import review_merge
+    monkeypatch.setenv('AICC_EXECUTOR_PROFILE','owner-cascade')
+    monkeypatch.setenv('AICC_CLAUDE_MAC_ENABLED','1')
+    assert [x['executor'] for x in review_merge._model_only_review_cascade()]==['claude','grok']
+    assert all(x['capability']=='model_only' for x in review_merge._model_only_review_cascade())
+    assert cascade_for('implementation')[0]['executor']=='claude'
+    # Implementation still uses the existing server broker development profile,
+    # never the Mac's zero-tool inference transport.
+    manifest=agent_runner.build_principal_isolation_manifest(repository_path=__import__('pathlib').Path.cwd(),prompt='text',task_type='implementation',timeout_seconds=60,executor='claude',model=None)
+    assert manifest['profile']=='trusted_development'
