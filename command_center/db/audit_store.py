@@ -22,22 +22,22 @@ point?" is a per-table check rather than a per-slice one.
 **Why this file is not in the AIOS boundary baseline.** The frozen-engine
 detector's `audit` name signature used to classify on the name alone, which
 made this module — two `MirroredTable`s and two mirror classes over tables
-that already exist, with no statement of its own — the false positive
-`docs/AIOS_BOUNDARY.md` calls Direction 2. Renaming, the usual remedy, was
+that already exist, with no statement of its own — the false positive that
+blocked `VOYN-W0-AICC-MIRROR-AUDIT-BOUNDARY`. Renaming, the usual remedy, was
 unavailable: any name keeping the token still trips, and a name without it
 would be wrong for a module about `audit_run` and `audit_finding`.
 
 `VOYN-W0-AICC-AUDIT-CATEGORY-CORROBORATION` closed that gap the way `memory`
-and `queue` already had one: `_behaves_like_an_audit_engine` in
-`tests/architecture/aios_boundary.py` corroborates the `audit` name against a
-single, positively-validated shape — a module that is nothing but imports,
-constant table declarations and well-formed `PostgresTableMirror` subclasses.
-This file matches it, so it dropped out of
-`tests/architecture/AIOS_BOUNDARY_BASELINE.json` instead of carrying a
-justified entry in it. A module that adds so much as a bare function call, a
-lambda, or a mirror subclass with anything beyond `spec = ...` in its body
-does not match the shape and keeps classifying, so the exemption cannot be
-used to smuggle an actual audit engine past the gate.
+and `queue` already had one, and closed the blocking ticket with it:
+`_behaves_like_an_audit_engine` in `tests/architecture/aios_boundary.py`
+corroborates the `audit` name against a single, positively-validated shape —
+a module that is nothing but imports, constant table declarations and
+well-formed `PostgresTableMirror` subclasses. This file matches it, so it
+dropped out of `tests/architecture/AIOS_BOUNDARY_BASELINE.json` instead of
+carrying a justified entry in it. A module that adds so much as a bare
+function call, a lambda, or a mirror subclass with anything beyond
+`spec = ...` in its body does not match the shape and keeps classifying, so
+the exemption cannot be used to smuggle an actual audit engine past the gate.
 """
 
 from __future__ import annotations
