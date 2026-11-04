@@ -384,7 +384,12 @@ def isolated_generated_dir(isolated_data_dir, monkeypatch):
     does not. No streamlit means no `app`, means nothing here to isolate."""
     try:
         import app
-    except ImportError:
+    except Exception:
+        # ImportError on headless hosts without streamlit, and also any
+        # side-effect failure while constructing ExecutionCenterAPI (e.g.
+        # supervisor process-identity capture when `ps` cannot read boot
+        # time in a sandboxed agent). Either way there is nothing here to
+        # isolate — the worker/orchestrator tests must still run.
         yield
         return
     from command_center import workspace_home
