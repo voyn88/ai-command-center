@@ -90,3 +90,5 @@ CREATE TABLE tick_stall_escalation (
 -- nobody else reaches these rows.
 REVOKE ALL ON tick_skip_event FROM PUBLIC;
 REVOKE ALL ON tick_stall_escalation FROM PUBLIC;
+-- An escalation that itself stalls must not spawn an unbounded task chain.
+CREATE INDEX idx_tick_stall_escalation_task ON tick_stall_escalation(escalation_task_id);

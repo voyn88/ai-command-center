@@ -211,6 +211,8 @@ def _load_episodes(conn: Any, threshold: int) -> list[StallEpisode]:
             "JOIN tick_skip_event s USING(tick_kind,tick_id) "
             "JOIN backlog_task b ON b.task_id=s.task_id "
             "WHERE b.status IN ('IN_PROGRESS','READY_TO_REVIEW') "
+            "AND NOT EXISTS (SELECT 1 FROM tick_stall_escalation e "
+            "WHERE e.escalation_task_id=s.task_id) "
             "AND s.consecutive_ticks >= %s ORDER BY s.tick_kind,s.task_id,s.reason",
             (threshold,),
         )
