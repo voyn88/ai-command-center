@@ -30,6 +30,8 @@ def _flags() -> tuple[bool, bool]:
 
 def read_team(*, limit: int = 30, offset: int = 0) -> dict:
     """Read a bounded task page and whole-ledger counts in one DB snapshot."""
+    if type(limit) is not int or type(offset) is not int or not 1 <= limit <= 100 or offset < 0:
+        raise HTTPException(422, 'Invalid team page bounds')
     enabled, stopped = _flags()
     base = {'source': 'canonical_postgresql', 'read_only': True,
             'enabled': enabled, 'stopped': stopped,
@@ -57,6 +59,7 @@ def read_team(*, limit: int = 30, offset: int = 0) -> dict:
                         SELECT 1 FROM delivery_team_stage s WHERE s.task_id=t.task_id
                         AND s.revision=t.revision AND s.status='blocked'
                         AND delivery_team_stage_current(s.task_id,s.revision,s.stage))),
+                    -- Evidence is task-scoped, including historical SHAs; this is not revision acceptance.
                     count(*) FILTER (WHERE EXISTS (
                         SELECT 1 FROM backlog_evidence e WHERE e.task_id=t.task_id AND e.kind='sha'))
                 FROM current_tasks t

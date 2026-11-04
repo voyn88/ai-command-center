@@ -97,6 +97,16 @@ def test_page_bounds(client, path):
     assert client.get(path, headers=HEADERS).status_code == 422
 
 
+@pytest.mark.parametrize(('limit', 'offset'), [(0, 0), (101, 0), (30, -1), (True, 0), (30, None)])
+def test_direct_read_rejects_invalid_bounds_before_database(monkeypatch, limit, offset):
+    def forbidden():
+        raise AssertionError('invalid page reached database')
+    monkeypatch.setattr(team.pool, 'connection', forbidden)
+    with pytest.raises(team.HTTPException) as exc:
+        team.read_team(limit=limit, offset=offset)
+    assert exc.value.status_code == 422
+
+
 def test_absent_ledger_and_disabled_flags_are_explicit(client, monkeypatch):
     monkeypatch.setenv('AICC_DELIVERY_TEAM_ENABLED', '0')
     monkeypatch.setenv('AICC_DELIVERY_TEAM_STOP', '1')
