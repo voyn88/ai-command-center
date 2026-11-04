@@ -4683,18 +4683,18 @@ def _set_pr_window_labels(
 def _remove_pr_window_labels(
     repo_path: str, pr: dict[str, Any], cfg: PrWindowConfig, remove: set[str]
 ) -> bool:
-    """Remove only contradictory PR-window labels.
+    """Remove contradictory window labels or explicitly invalid queue selection.
 
-    Queue-owned labels (`queue-active`, `queue-waiting-review`) are a stronger
-    state signal than the review-window labels and already drive the expensive
-    read gates. For those PRs the reconciler should clean stale contradictions
-    without adding another window label and creating an avoidable label event.
+    Eligible queue-selected PRs retain their selection without a redundant
+    active label event. Explicit removal of queue-active is reserved for a
+    proven block or capacity overflow; an unreadable candidate keeps its
+    labels and reserves capacity until eligibility can be established.
     """
     parsed = _owner_repo_number_from_pr_url(str(pr.get("url") or ""))
     if parsed is None:
         return False
     owner, repo, number = parsed
-    window_labels = {cfg.label_active, cfg.label_waiting, cfg.label_blocked}
+    window_labels = {cfg.label_active, cfg.label_waiting, cfg.label_blocked, _QUEUE_ACTIVE_LABEL}
     current = _pr_window_labels(pr) & window_labels & remove
     if not current:
         return True
@@ -4778,13 +4778,6 @@ def _reconcile_pr_window(
         )
         window_full = selected >= cfg.max_active
         needs_merge_state = active_now or not window_full
-        if queue_active_now:
-            selected += 1
-            report.active.append((number, head))
-            _remove_pr_window_labels(
-                repo_path, pr, cfg, {cfg.label_waiting, cfg.label_blocked}
-            )
-            continue
         if queue_waiting_now:
             report.waiting.append((number, head))
             _remove_pr_window_labels(
@@ -4802,6 +4795,7 @@ def _reconcile_pr_window(
             and detailed is None
             and blocked_refreshes_used >= blocked_refresh_budget
         ):
+            selected += int(queue_active_now)
             report.unchecked.append((number, head))
             continue
         if detailed is None and details_used >= max(cfg.detail_budget, 0):
@@ -4810,6 +4804,7 @@ def _reconcile_pr_window(
             # blocked, nothing) stays. Writing `waiting` here demoted an
             # active PR on no real change whenever the active set outgrew
             # the budget (review of 5dec6322). Re-examined on a later tick.
+            selected += int(queue_active_now)
             report.unchecked.append((number, head))
             continue
         if detailed is None:
@@ -4824,6 +4819,7 @@ def _reconcile_pr_window(
             # reported unreadable for this tick (review of d16dc0e4: stamping
             # `waiting` here could demote an active or blocked PR on a
             # transient GitHub error). Re-examined next tick.
+            selected += int(queue_active_now)
             report.unreadable.append((number, head))
             continue
         age_seconds, fell_back = _pr_age_seconds(repo_path, detailed, now=now)
@@ -4833,6 +4829,7 @@ def _reconcile_pr_window(
         if reason in (None, "stale_exact_head_acceptance"):
             detailed_with_reviews = _pr_window_with_reviews(repo_path, detailed, cache)
             if detailed_with_reviews is None:
+                selected += int(queue_active_now)
                 report.unreadable.append((number, head))
                 continue
             detailed = detailed_with_reviews
@@ -4855,6 +4852,7 @@ def _reconcile_pr_window(
                 repo_path, pr, cache, refresh=True, include_reviews=False
             )
             if fresh is None:
+                selected += int(queue_active_now)
                 report.unreadable.append((number, head))
                 continue
             detailed = fresh
@@ -4865,6 +4863,7 @@ def _reconcile_pr_window(
             if reason in (None, "stale_exact_head_acceptance"):
                 detailed_with_reviews = _pr_window_with_reviews(repo_path, detailed, cache)
                 if detailed_with_reviews is None:
+                    selected += int(queue_active_now)
                     report.unreadable.append((number, head))
                     continue
                 detailed = detailed_with_reviews
@@ -4875,26 +4874,47 @@ def _reconcile_pr_window(
                 origin = _origin_owner_repo(repo_path)
                 parsed = (*origin, number) if origin is not None else None
             if parsed is None:
+                selected += int(queue_active_now)
                 report.unreadable.append((number, head))
                 continue
             merge_state = _rest_merge_state(repo_path, parsed[0], parsed[1], number)
             if merge_state is None:
+                selected += int(queue_active_now)
                 report.unreadable.append((number, head))
                 continue
             detailed = dict(detailed)
             detailed["mergeStateStatus"] = merge_state
             reason = _window_block_reason(detailed, cfg, age_seconds=age_seconds)
         if reason is not None:
+            if queue_active_now and not _remove_pr_window_labels(
+                repo_path, pr, cfg, {_QUEUE_ACTIVE_LABEL}
+            ):
+                selected += 1
+                report.unreadable.append((number, head))
+                continue
             report.blocked.append((number, reason))
             _set_pr_window_labels(repo_path, detailed, cfg, cfg.label_blocked)
             continue
         if window_full:
+            if queue_active_now and not _remove_pr_window_labels(
+                repo_path, pr, cfg, {_QUEUE_ACTIVE_LABEL}
+            ):
+                selected += 1
+                report.unreadable.append((number, head))
+                continue
             report.waiting.append((number, head))
             _set_pr_window_labels(repo_path, detailed, cfg, cfg.label_waiting)
             continue
         selected += 1
         report.active.append((number, head))
-        _set_pr_window_labels(repo_path, detailed, cfg, cfg.label_active)
+        if queue_active_now:
+            # Queue selection is priority, never proof of eligibility. Keep
+            # its label only after the same checks every candidate passes.
+            _remove_pr_window_labels(
+                repo_path, pr, cfg, {cfg.label_waiting, cfg.label_blocked}
+            )
+        else:
+            _set_pr_window_labels(repo_path, detailed, cfg, cfg.label_active)
 
 
 #: One REST page of pull requests. GitHub's ceiling for `per_page`, so a

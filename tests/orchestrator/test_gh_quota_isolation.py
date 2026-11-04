@@ -478,83 +478,47 @@ def test_queue_active_pr_sheds_stale_blocked_label(
     )
 
 
-def test_queue_active_pr_sheds_blocked_label_even_with_block_reason(
+def test_queue_active_pr_loses_selection_when_stale_acceptance_blocks_it(
     fake_gh, checkout, fleet_store, monkeypatch
 ):
-    """Queue-selected PRs may still have stale window evidence. That must not
-    recreate the contradictory `queue-active` + `review-window:blocked` pair."""
     monkeypatch.setenv("FAKE_GH_PR_LABELS", "queue-active,review-window:blocked")
     monkeypatch.setenv("FAKE_GH_NO_REVIEWS", "1")
-
     report = reconcile_pr_window(str(checkout), PrWindowConfig(stale_seconds=1))
-
     assert report.error is None
-    assert report.blocked == []
-    assert report.active == [(42, HEAD)]
+    assert report.blocked == [(42, "stale_exact_head_acceptance")]
+    assert report.active == []
     calls = [call["argv"] for call in _calls(fake_gh)]
-    assert any(
-        argv[:3] == ["api", "--method", "DELETE"]
-        and argv[3].endswith("/issues/42/labels/review-window%3Ablocked")
-        for argv in calls
-    )
-    assert not any(
-        argv[:3] == ["api", "--method", "POST"]
-        and argv[3].endswith("/issues/42/labels")
-        and argv[-1] == "labels[]=review-window:blocked"
-        for argv in calls
-    )
+    assert any(argv[:3] == ["api", "--method", "DELETE"]
+               and argv[3].endswith("/issues/42/labels/queue-active") for argv in calls)
+    assert not any(argv[:3] == ["api", "--method", "DELETE"]
+                   and argv[3].endswith("/issues/42/labels/review-window%3Ablocked") for argv in calls)
 
 
-def test_queue_active_pr_sheds_blocked_label_before_detail_budget(
+def test_queue_active_pr_is_unchecked_without_detail_budget(
     fake_gh, checkout, fleet_store, monkeypatch
 ):
-    """Backlog hygiene cannot depend on the per-PR detail budget. Queue state
-    is already present in the listing, so contradictory window labels are
-    normalized before any detail lookup is attempted."""
+    """A label is not evidence; unknown eligibility must not mutate labels."""
     monkeypatch.setenv("FAKE_GH_PR_LABELS", "queue-active,review-window:blocked")
-
     report = reconcile_pr_window(str(checkout), PrWindowConfig(detail_budget=0))
-
     assert report.error is None
-    assert report.active == [(42, HEAD)]
+    assert report.active == []
+    assert report.unchecked == [(42, HEAD)]
     calls = [call["argv"] for call in _calls(fake_gh)]
-    assert not any("/reviews" in argv[-1] for argv in calls)
-    assert any(
-        argv[:3] == ["api", "--method", "DELETE"]
-        and argv[3].endswith("/issues/42/labels/review-window%3Ablocked")
-        for argv in calls
-    )
-    assert not any(
-        argv[:3] == ["api", "--method", "POST"]
-        and argv[3].endswith("/issues/42/labels")
-        and argv[-1] == "labels[]=review-window:active"
-        for argv in calls
-    )
+    assert not any("--method" in argv for argv in calls)
 
 
-def test_queue_active_pr_sheds_stale_waiting_label_without_adding_active(
+def test_eligible_queue_active_pr_sheds_waiting_without_adding_active(
     fake_gh, checkout, fleet_store, monkeypatch
 ):
-    """A queued PR already has the active queue signal. The window tick should
-    remove stale waiting state without adding a redundant active label event."""
     monkeypatch.setenv("FAKE_GH_PR_LABELS", "queue-active,review-window:waiting")
-
-    report = reconcile_pr_window(str(checkout), PrWindowConfig(detail_budget=0))
-
+    report = reconcile_pr_window(str(checkout), PrWindowConfig(stale_seconds=10**12))
     assert report.error is None
     assert report.active == [(42, HEAD)]
     calls = [call["argv"] for call in _calls(fake_gh)]
-    assert any(
-        argv[:3] == ["api", "--method", "DELETE"]
-        and argv[3].endswith("/issues/42/labels/review-window%3Awaiting")
-        for argv in calls
-    )
-    assert not any(
-        argv[:3] == ["api", "--method", "POST"]
-        and argv[3].endswith("/issues/42/labels")
-        and argv[-1] == "labels[]=review-window:active"
-        for argv in calls
-    )
+    assert any(argv[:3] == ["api", "--method", "DELETE"]
+               and argv[3].endswith("/issues/42/labels/review-window%3Awaiting") for argv in calls)
+    assert not any(argv[:3] == ["api", "--method", "POST"]
+                   and argv[-1] == "labels[]=review-window:active" for argv in calls)
 
 
 def test_queue_waiting_pr_sheds_blocked_label_before_detail_budget(
