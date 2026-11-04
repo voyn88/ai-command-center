@@ -2294,8 +2294,8 @@ def _remediate_rejection(
     addressable by its own task_id.
 
     Idempotent: if a remediation task already exists for this parent (an
-    earlier tick already handled this exact rejection), returns None and
-    does nothing -- publish_review_verdicts' caller treats that the same as
+    earlier tick already handled this exact rejection), returns None without
+    creating another task; enrolled work still records each distinct incident -- publish_review_verdicts' caller treats that the same as
     "already handled," not as a fresh event to report."""
     from command_center.db.backlog_parser import ParsedTask
     from command_center.db.backlog_store import BacklogStore
@@ -2316,9 +2316,7 @@ def _remediate_rejection(
                     "SELECT 1 FROM backlog_task_remediation WHERE parent_task_id = %s",
                     (task_id,),
                 )
-                if cur.fetchone() is not None:
-                    conn.rollback()
-                    return None
+                already_remediated = cur.fetchone() is not None
 
                 depth = _remediation_depth(cur, task_id)
 
@@ -2337,6 +2335,12 @@ def _remediate_rejection(
                 conn, task_id=task_id, revision=revision, repo=repo,
                 pr_url=pr_url, sha=head_sha, detail=review_text, kind=incident_kind,
             )
+
+            # A linked correction prevents another task, not observation of a
+            # later distinct failure. Keep actual incident evidence durable.
+            if already_remediated:
+                conn.commit()
+                return None
 
             if depth + 1 > MAX_REMEDIATION_DEPTH:
                 # Stop the chain rather than extend it, using the state
