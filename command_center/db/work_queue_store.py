@@ -30,10 +30,16 @@ from dataclasses import dataclass
 from typing import Any
 
 __all__ = [
+    "DEFAULT_MAX_CAPACITY_WAITS",
     "ClaimedWork",
     "QueueRefusal",
     "WorkQueueStore",
 ]
+
+# 15m + 30m + 24 × 60m = 24h45m before the next capacity refusal can
+# dead-letter work.  This deliberately exceeds control-01:queue's 24-hour
+# health acceptance window; 24 waits reached only 22h45m.
+DEFAULT_MAX_CAPACITY_WAITS = 26
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,15 +170,20 @@ class WorkQueueStore:
         return bool(row["ok"])
 
     def fail_capacity_wait(
-        self, work: ClaimedWork, *, reason: str, max_capacity_waits: int = 24
+        self,
+        work: ClaimedWork,
+        *,
+        reason: str,
+        max_capacity_waits: int = DEFAULT_MAX_CAPACITY_WAITS,
     ) -> bool:
         """Report an executor CAPACITY refusal: the account/spend window is
         exhausted, not the host (``agent_runner.is_capacity_refusal``).
 
         Refunds the claimed attempt like the other two no-fault families, and
         bounds retries against its own budget -- but on a capacity clock: the
-        requeue waits 15 minutes growing to an hour, so the default 24 waits
-        is roughly a day of patience rather than the infra family's hour (see
+        requeue waits 15 minutes growing to an hour, so the default 26 waits
+        keeps a quota exhaustion from dead-lettering work during the monitor's
+        full 24-hour health window, rather than the infra family's hour (see
         ``0029_queue_fail_capacity_wait``). An exhausted subscription window
         closes on the provider's schedule; asking it every five minutes only
         spends the host-recovery budget and dead-letters good work.
