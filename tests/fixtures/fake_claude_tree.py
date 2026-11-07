@@ -21,6 +21,10 @@ Env vars:
 - `FAKE_CLAUDE_TREE_PARENT_EXIT_AFTER_START`: if "1", the parent exits
   naturally after reporting the tree, leaving its descendants alive unless
   the Supervisor drains the process group before reaping the leader.
+- `FAKE_CLAUDE_TREE_GRANDCHILD_SETSID`: if "1", the grandchild calls
+  `os.setsid()` before sleeping, making it the leader of a brand-new session
+  and process group of its own. `killpg(parent_pgid, ...)` can then never
+  reach it — regression coverage for setsid-escaped descendant cancellation.
 """
 
 from __future__ import annotations
@@ -49,10 +53,15 @@ def _run_grandchild() -> None:
 def _run_child(pidfile_base: str) -> None:
     if os.environ.get("FAKE_CLAUDE_TREE_DESCENDANTS_IGNORE_SIGTERM") == "1":
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    grandchild_setsid = os.environ.get("FAKE_CLAUDE_TREE_GRANDCHILD_SETSID") == "1"
     grandchild = subprocess.Popen(
         [sys.executable, THIS_FILE, "--grandchild"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        # `preexec_fn=os.setsid` runs in the forked grandchild before exec,
+        # detaching it into its own session/pgid before it can ever be a
+        # member of the parent's process group.
+        preexec_fn=os.setsid if grandchild_setsid else None,
     )
     _write_pid(pidfile_base, "grandchild", grandchild.pid)
     time.sleep(60)
