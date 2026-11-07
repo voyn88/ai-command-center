@@ -28,6 +28,7 @@ from command_center import pipeline_settings, project_config, tasks_repository
 from command_center import task_pipeline
 from command_center.project_config import is_sensitive
 from command_center.dispatch import policy_config
+from command_center.dispatch.degradation import DegradationVerdict
 from command_center.dispatch.models import (
     DispatchPlan,
     DispatchPolicy,
@@ -269,6 +270,32 @@ def assign(
         "assigned_task_ids": applied_ids,
         "plan": computed.as_dict(),
     }
+
+
+# --------------------------------------------------------------------------
+# Quality degradation -> quarantine
+# --------------------------------------------------------------------------
+
+
+def apply_degradation_verdict(
+    root: Path, verdict: DegradationVerdict, *, actor: str | None = None
+) -> DispatchPolicy | None:
+    """Persist `verdict` as a quarantine, if (and only if) it confirms
+    degradation. A non-quarantining verdict (insufficient data, or within
+    threshold) is a no-op — it never clears an *existing* quarantine either,
+    since "this window looked fine" is not the same claim as "retraining is
+    done, let this executor back in" (that is `policy_config.clear_quarantine`,
+    an explicit operator action).
+
+    Returns the updated `DispatchPolicy` when a quarantine was recorded, or
+    `None` when there was nothing to persist — so a caller driving many
+    executors through this can tell "already quarantined / not degraded"
+    apart from "just quarantined" without inspecting the policy itself.
+    """
+    record = verdict.to_quarantine_record(quarantined_at=_now())
+    if record is None:
+        return None
+    return policy_config.record_quarantine(root, record, actor=actor)
 
 
 def _now() -> str:
