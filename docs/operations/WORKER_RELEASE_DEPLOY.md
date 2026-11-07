@@ -78,8 +78,11 @@ readlink -f /opt/aicc/current
 # ожидается /opt/aicc/releases/<40-hex origin/main>
 stat -c '%A %U:%G' /opt/aicc/current /opt/aicc/releases/*
 systemctl show voyn-aicc-worker@1.service -p ActiveState -p SubState -p StatusText
+systemctl show voyn-aicc-worker@review.service -p ActiveState -p SubState -p StatusText
 ```
 
 Первый успешный tick после отставания создаст bare mirror (если его ещё нет),
-опубликует SHA и перезапустит только **активные** lanes (`@1`/`@2` на
-worker-01; остановленные `@3`/`@4` не трогает).
+опубликует SHA и перезапустит только **активные** lanes (`@1`/`@2` и
+выделенный review-only `@review` на worker-01; остановленные дополнительные
+lanes не трогает). `@review` атомарно выбирает только `independent_review` и
+`verification_review`; обычные lanes атомарно исключают эти типы.

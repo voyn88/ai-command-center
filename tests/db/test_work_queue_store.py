@@ -125,6 +125,32 @@ def test_empty_queue_is_a_refusal_not_an_error(worker_store) -> None:
     assert verdict.reason == "no_work"
 
 
+def test_claim_task_type_filters_create_disjoint_worker_lanes(worker_store) -> None:
+    store, psycopg, app_dsn = worker_store
+    review_types = ("independent_review", "verification_review")
+    _enqueue(
+        psycopg, app_dsn, "impl", {"kind": "agent_run", "task_type": "implementation"}
+    )
+    _enqueue(
+        psycopg,
+        app_dsn,
+        "review",
+        {"kind": "agent_run", "task_type": "independent_review"},
+    )
+
+    review = store.claim(
+        QUEUE, visibility_seconds=60, task_types=review_types, include_task_types=True
+    )
+    assert isinstance(review, ClaimedWork)
+    assert review.payload["task_type"] == "independent_review"
+
+    implementation = store.claim(
+        QUEUE, visibility_seconds=60, task_types=review_types, include_task_types=False
+    )
+    assert isinstance(implementation, ClaimedWork)
+    assert implementation.payload["task_type"] == "implementation"
+
+
 def test_fail_retryable_makes_the_item_claimable_again(worker_store) -> None:
     store, psycopg, app_dsn = worker_store
     _enqueue(psycopg, app_dsn, "retry-1", {"kind": "flaky"})
