@@ -248,9 +248,18 @@ only opens a confirmation: it sets `st.session_state[f"{key_prefix}_delete_confi
 explicit "Я подтверждаю удаление этой задачи" checkbox (app.py:1450-1472). Two deliberate actions,
 no silent delete — the DoD.
 Git: `1eb942a`; PR #87 merged 2026-08-06.
-**Coverage gap, recorded not hidden:** no test under `tests/` exercises this dialog — grepping the
-suite for `delete_confirm` / "Подтвердить удаление" returns nothing. The behaviour is correct by
-inspection but is an untested UI path, so a refactor could silently restore the one-click delete.
+**Executable gate added (VOYN-W0-AICC-CLOSURE-WITHOUT-A-GATE-RETRY).** This closure originally
+shipped with only a behavioural AppTest (and for a while a stale "coverage gap" note), so a new
+UI surface that wired "Удалить" straight to `delete_task` would never trip the known-surface
+tests. Behavioural coverage now lives in
+`tests/test_app_streamlit.py::test_kanban_task_delete_requires_explicit_confirmation` and
+`tests/test_backlog_reconcile_panel.py::test_duplicate_of_done_requires_explicit_confirmation_before_deleting`
+(both drive the shared `confirm_dialog`). The architecture half —
+`tests/architecture/test_task_delete_confirmation_fitness.py` (scanner in
+`tests/architecture/task_delete_confirmation.py`) — statically requires every
+`command_center/ui` "Удалить" click path to call `confirm_dialog.open_confirmation` and every
+`delete_task` call there to sit behind `render_destructive_confirmation(on_confirm=...)`, with
+mutation checks for a one-click button and an unconfirmed `_delete_*` helper.
 
 ### AUDIT-W1-008 — Фоновая синхронизация run→task — **Done (opt-in by design)**
 
@@ -364,6 +373,9 @@ on any import that resolves onto `command_center.workspace_context`,
 `command_center.workspace_service` or `command_center.ui.panel_registry`, in every import form
 `ast` can express — including the alias form (`from command_center import workspace_context`)
 that an earlier draft of this same gate missed by reading only `ast.ImportFrom.module`.
+**Hardened (VOYN-W0-AICC-CLOSURE-WITHOUT-A-GATE-RETRY):** the same gate now also asserts the three
+module paths stay deleted on disk — recreating a removed file without importing it used to leave
+the import-only half green.
 
 ### AUDIT-W2-006 — ahead/behind и `git fetch` в `git_info.py` — **Still Open**
 
