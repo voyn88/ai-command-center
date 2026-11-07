@@ -876,13 +876,18 @@ def test_the_cidr_declared_at_enrolment_is_enforced_for_a_worker_host(
 ):
     """`expected_cidr` is what an operator declared in advance, so it is checked
     before `bound_addr`, which is only where the credential happened to be used
-    first.
+    first (VOYN-W0-AICC-SRV-02d).
 
     Stated as a limit rather than a guarantee: this measures the ENFORCEMENT
     path against a real `inet_client_addr()`. It does not measure two physical
     hosts — a single-host test cluster cannot produce two client addresses — and
     the control it implements is spoofable at the network layer regardless.
     Closing that needs `pg_hba` host restrictions or client certificates.
+
+    The audit discriminator must name `expected_cidr`, not `bound_addr`: on
+    first use `bound_addr` is still NULL, so a regression that dropped the
+    declared-CIDR branch would succeed here, bind the address, and leave the
+    ticket's CIDR inert while the column still looked like a control.
     """
     with _cluster(admin_conn, psycopg, test_dsn, role_passwords):
         with psycopg.connect(
@@ -900,6 +905,32 @@ def test_the_cidr_declared_at_enrolment_is_enforced_for_a_worker_host(
             cur.execute("SELECT ok, reason FROM identity_assert(%s)", (host_secret,))
             assert cur.fetchone() == (False, "addr_mismatch")
         assert _count_events(admin_conn) > before
+
+        with admin_conn.cursor() as cur:
+            cur.execute(
+                "SELECT metadata_json->>'check', metadata_json ? 'expected_cidr', "
+                "metadata_json ? 'bound' "
+                "FROM principal_event "
+                "WHERE event_type = 'assert' AND outcome = 'rejected' "
+                "AND reason = 'addr_mismatch' "
+                "ORDER BY id DESC LIMIT 1"
+            )
+            check, has_expected, has_bound = cur.fetchone()
+        assert check == "expected_cidr", check
+        assert has_expected is True
+        assert has_bound is False
+
+        with admin_conn.cursor() as cur:
+            cur.execute(
+                "SELECT bound_addr FROM principal_credential "
+                "WHERE principal_id = %s AND revoked_at IS NULL",
+                (row[0],),
+            )
+            assert cur.fetchone()[0] is None, (
+                "a refused assert must not bind the address — otherwise the "
+                "next attempt from the same wrong network would look like a "
+                "bound_addr mismatch and hide the expected_cidr gate"
+            )
 
 
 # ---------------------------------------------------------------------------
