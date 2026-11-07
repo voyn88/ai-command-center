@@ -5,7 +5,10 @@ from __future__ import annotations
 import gzip
 import hashlib
 import json
+import os
 import sqlite3
+import zlib
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -61,6 +64,31 @@ def _event_count(db_path: Path, run_id: str) -> int:
             "SELECT COUNT(*) AS c FROM run_event WHERE run_id=?", (run_id,)
         ).fetchone()
         return int(row["c"])
+
+
+def _count_gzip_members(path: Path) -> int:
+    """Count concatenated gzip members by decompressing each in turn.
+
+    A magic-byte scan over ``\\x1f\\x8b\\x08`` is only an upper bound — those
+    three bytes can also appear inside deflate payloads or CRC/ISIZE footers —
+    so this walks the file with ``zlib.decompressobj`` and advances by the
+    exact number of bytes each member consumed.
+    """
+    data = Path(path).read_bytes()
+    count = 0
+    offset = 0
+    while offset < len(data):
+        decoder = zlib.decompressobj(wbits=16 + zlib.MAX_WBITS)
+        decoder.decompress(data[offset:])
+        if not decoder.eof:
+            raise AssertionError(f"truncated gzip member at offset {offset}")
+        unused = len(decoder.unused_data)
+        consumed = len(data) - offset - unused
+        if consumed <= 0:
+            raise AssertionError(f"gzip member made no progress at offset {offset}")
+        offset += consumed
+        count += 1
+    return count
 
 
 def test_archive_and_prune_archives_exactly_what_it_deletes(tmp_path):
@@ -134,3 +162,261 @@ def test_restore_refuses_missing_or_corrupt_backup(tmp_path):
     corrupt.write_bytes(b"not a database")
     with pytest.raises((maintenance.MaintenanceError, sqlite3.DatabaseError)):
         maintenance.restore_backup(corrupt, db_path)
+
+
+def test_archive_and_prune_batches_across_multiple_transactions(tmp_path, monkeypatch):
+    db_path = tmp_path / "runtime.db"
+    old_run, fresh_run = _seed(db_path, old_events=13, fresh_events=2)
+
+    transaction_calls = []
+    real_transaction = maintenance.transaction
+
+    @contextmanager
+    def spy_transaction(conn):
+        transaction_calls.append(1)
+        with real_transaction(conn) as c:
+            yield c
+
+    monkeypatch.setattr(maintenance, "transaction", spy_transaction)
+
+    report = maintenance.archive_and_prune(
+        db_path, retention_days=30, archive_dir=tmp_path / "cold", batch_size=5
+    )
+
+    # 13 rows at 5/batch: three batches of data (5, 5, 3), each its own
+    # committed transaction — never one unbounded delete.
+    assert len(transaction_calls) == 3
+    assert report["archived_events"] == report["pruned_events"] == 13
+    assert _event_count(db_path, old_run) == 0
+    assert _event_count(db_path, fresh_run) == 2
+
+    # Each batch wrote its own independently finalized gzip member; the
+    # archive is a concatenation of them, not one member built in memory.
+    assert _count_gzip_members(Path(report["archive_path"])) == 3
+    with gzip.open(report["archive_path"], "rt", encoding="utf-8") as handle:
+        lines = [json.loads(line) for line in handle]
+    assert len(lines) == 13
+
+
+def test_apply_runtime_retention_batches_across_multiple_transactions(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "runtime.db"
+    old_run, fresh_run = _seed(db_path, old_events=13, fresh_events=2)
+
+    transaction_calls = []
+    real_transaction = db.transaction
+
+    @contextmanager
+    def spy_transaction(conn):
+        transaction_calls.append(1)
+        with real_transaction(conn) as c:
+            yield c
+
+    monkeypatch.setattr(db, "transaction", spy_transaction)
+
+    removed = db.apply_runtime_retention(db_path, retention_days=30, batch_size=5)
+
+    assert len(transaction_calls) == 3
+    assert removed == 13
+    assert _event_count(db_path, old_run) == 0
+    assert _event_count(db_path, fresh_run) == 2
+
+
+def test_archive_directory_is_fsynced_before_the_first_batch_commits(
+    tmp_path, monkeypatch
+):
+    """VOYN-W0-AICC-RETENTION-UNBOUNDED-DELETE-REM-REM: a power loss must not
+    be able to drop the archive file's own directory entry after its paired
+    deletion has already committed, so the directory fsync has to happen
+    *after* the archive file is created and *before* any batch transaction is
+    allowed to commit."""
+    db_path = tmp_path / "runtime.db"
+    _seed(db_path, old_events=4, fresh_events=0)
+
+    order = []
+    real_fsync_directory = maintenance._fsync_directory
+    real_create_exclusive = maintenance._create_exclusive
+
+    def spy_fsync_directory(path):
+        order.append("fsync_directory")
+        return real_fsync_directory(path)
+
+    def spy_create_exclusive(directory, build_name):
+        path, fd = real_create_exclusive(directory, build_name)
+        if path.name.startswith("run-events-"):
+            order.append("archive_created")
+        return path, fd
+
+    real_transaction = maintenance.transaction
+
+    @contextmanager
+    def spy_transaction(conn):
+        order.append("transaction_begin")
+        with real_transaction(conn) as c:
+            yield c
+        order.append("transaction_commit")
+
+    monkeypatch.setattr(maintenance, "_fsync_directory", spy_fsync_directory)
+    monkeypatch.setattr(maintenance, "_create_exclusive", spy_create_exclusive)
+    monkeypatch.setattr(maintenance, "transaction", spy_transaction)
+
+    maintenance.archive_and_prune(
+        db_path, retention_days=30, archive_dir=tmp_path / "cold", batch_size=2
+    )
+
+    assert "archive_created" in order
+    assert "fsync_directory" in order
+    first_commit = order.index("transaction_commit")
+    assert (
+        order.index("archive_created")
+        < order.index("fsync_directory")
+        < first_commit
+    )
+
+
+def test_each_batch_archive_data_is_fsynced_before_its_delete_commits(
+    tmp_path, monkeypatch
+):
+    """Gzip member finalization is a userspace flush; durability requires the
+    archive fd itself to be fsynced before that batch's DELETE commits."""
+    db_path = tmp_path / "runtime.db"
+    _seed(db_path, old_events=5, fresh_events=0)
+
+    order = []
+    archive_fileno = {"n": None}
+    real_fsync = os.fsync
+    real_fdopen = os.fdopen
+
+    def spy_fdopen(fd, *args, **kwargs):
+        handle = real_fdopen(fd, *args, **kwargs)
+        # archive_and_prune is the only caller that fdopen()s the exclusive
+        # archive descriptor; capture that fileno so we can tell archive
+        # data fsyncs apart from directory fsyncs.
+        archive_fileno["n"] = handle.fileno()
+        return handle
+
+    def spy_fsync(fd):
+        if archive_fileno["n"] is not None and fd == archive_fileno["n"]:
+            order.append("archive_fsync")
+        return real_fsync(fd)
+
+    real_transaction = maintenance.transaction
+
+    @contextmanager
+    def spy_transaction(conn):
+        with real_transaction(conn) as c:
+            yield c
+        order.append("transaction_commit")
+
+    monkeypatch.setattr(maintenance.os, "fdopen", spy_fdopen)
+    monkeypatch.setattr(maintenance.os, "fsync", spy_fsync)
+    monkeypatch.setattr(maintenance, "transaction", spy_transaction)
+
+    maintenance.archive_and_prune(
+        db_path, retention_days=30, archive_dir=tmp_path / "cold", batch_size=2
+    )
+
+    # 5 rows at batch_size=2 → three data batches, each must fsync archive
+    # data before its transaction commits.
+    assert order.count("archive_fsync") == 3
+    assert order.count("transaction_commit") == 3
+    for i in range(3):
+        fsync_at = [idx for idx, ev in enumerate(order) if ev == "archive_fsync"][i]
+        commit_at = [
+            idx for idx, ev in enumerate(order) if ev == "transaction_commit"
+        ][i]
+        assert fsync_at < commit_at
+
+
+def test_archive_creation_never_appends_to_a_same_second_leftover_file(
+    tmp_path, monkeypatch
+):
+    """VOYN-W0-AICC-RETENTION-UNBOUNDED-DELETE-REM-REM: a same-second retry
+    (e.g. after the previous run crashed mid-finalization) must claim a fresh
+    file rather than opening the existing timestamped name in append mode,
+    which would splice new data onto a possibly truncated, possibly
+    unrelated prior file."""
+    db_path = tmp_path / "runtime.db"
+    old_run, _ = _seed(db_path, old_events=3, fresh_events=0)
+    cold = tmp_path / "cold"
+    cold.mkdir()
+
+    monkeypatch.setattr(maintenance, "_timestamp", lambda: "20260101T000000")
+
+    stale_archive = cold / "run-events-20260101T000000.jsonl.gz"
+    stale_archive.write_bytes(b"leftover-truncated-member-from-a-crashed-run")
+    stale_backup = cold / "runtime-backup-20260101T000000.db"
+    stale_backup.write_bytes(b"leftover-backup-from-a-crashed-run")
+
+    report = maintenance.archive_and_prune(
+        db_path, retention_days=30, archive_dir=cold
+    )
+
+    assert Path(report["archive_path"]) != stale_archive
+    assert Path(report["backup_path"]) != stale_backup
+    # The leftover files were never opened for append or overwritten.
+    assert stale_archive.read_bytes() == b"leftover-truncated-member-from-a-crashed-run"
+    assert stale_backup.read_bytes() == b"leftover-backup-from-a-crashed-run"
+
+    with gzip.open(report["archive_path"], "rt", encoding="utf-8") as handle:
+        lines = [json.loads(line) for line in handle]
+    assert len(lines) == 3
+    assert _event_count(db_path, old_run) == 0
+
+
+def test_finalization_failure_leaves_that_batchs_delete_uncommitted(
+    tmp_path, monkeypatch
+):
+    """VOYN-W0-AICC-RETENTION-UNBOUNDED-DELETE-REM: failure must be tested
+    from the wrapped gzip handle's finalization (`close()`, where the footer
+    is written), not just from a failing `write()` — a footer failure is
+    exactly the "archive volume fills while writing the footer" scenario
+    that must never leave a committed deletion with no durable archive."""
+    db_path = tmp_path / "runtime.db"
+    old_run, _ = _seed(db_path, old_events=8, fresh_events=0)
+    cold = tmp_path / "cold"
+
+    real_gzip_file = gzip.GzipFile
+    seen_handles: list[int] = []
+
+    class FailOnSecondDistinctHandle(real_gzip_file):
+        def close(self):
+            # GzipFile.close() is idempotent and is routinely invoked more
+            # than once per handle (explicit close inside a with, or a
+            # wrapping TextIOWrapper.close plus context-manager exit). Key
+            # on the first close of each distinct handle so a redundant
+            # no-op close of batch 1 cannot steal the injected failure
+            # meant for batch 2's finalization.
+            handle_id = id(self)
+            if handle_id not in seen_handles:
+                seen_handles.append(handle_id)
+                if len(seen_handles) == 2:
+                    raise OSError("simulated disk-full while writing gzip footer")
+            return super().close()
+
+    monkeypatch.setattr(maintenance.gzip, "GzipFile", FailOnSecondDistinctHandle)
+
+    with pytest.raises(OSError, match="simulated disk-full"):
+        maintenance.archive_and_prune(
+            db_path, retention_days=30, archive_dir=cold, batch_size=3
+        )
+
+    # Batch 1 (3 rows) finalized durably before its delete committed.
+    # Batch 2's finalization failed *before* its delete ran, so those rows
+    # must still be present — never deleted with no durable archive.
+    assert _event_count(db_path, old_run) == 8 - 3
+
+    # The archive file itself has a trailing truncated member (batch 2's
+    # header and compressed data, written before its footer failed) — that's
+    # fine, since batch 2's rows were never deleted. The complete leading
+    # member for batch 1's *deleted* rows must still be fully decompressible.
+    [archive_path] = list(cold.glob("run-events-*.jsonl.gz"))
+    lines = []
+    with gzip.open(archive_path, "rt", encoding="utf-8") as handle:
+        try:
+            for line in handle:
+                lines.append(json.loads(line))
+        except EOFError:
+            pass
+    assert len(lines) == 3
