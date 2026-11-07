@@ -1,0 +1,25 @@
+---
+description: AI Command Center — как работать с проектом
+alwaysApply: true
+---
+
+# Проект AI Command Center
+
+- Все команды запускай из корня репозитория: пути к данным и настройки инструментов считаются от него.
+- Python — только `.venv/bin/python` (это ссылка на `.venv-desktop`). Не используй системный Python и `uv run`: он меняет `uv.lock`.
+- Не меняй `uv.lock` и `requirements-*.lock` без прямой просьбы.
+- Перед большими изменениями прочитай `ARCHITECTURE.md` и `CURRENT_STATE.md`.
+
+## Проверки
+
+- Быстрая проверка (whitespace, ruff, компиляция): `make preflight`.
+- Тесты одной области: `.venv/bin/python -m pytest tests/<папка> -q`.
+- Все тесты быстро, параллельно: `make test-fast`. Последовательно: `make test`.
+- Перед отправкой в git: `make prepush`.
+
+## Десктоп-приложение (PySide6)
+
+- Запуск: `.venv/bin/python -m command_center.desktop`.
+- Тесты: `.venv/bin/python -m pytest tests/desktop -q`. Смотри на число `passed`: если PySide6 не установлен, весь набор молча пропускается, и отсутствие красного ничего не значит.
+- Не задавай `QT_QPA_PLATFORM` вручную: с `offscreen` окно невидимо, с пустой строкой Qt падает.
+- Для пробных запусков задавай `AICC_DATA_DIR` на временную папку, чтобы не трогать настоящие данные в `./data`.
