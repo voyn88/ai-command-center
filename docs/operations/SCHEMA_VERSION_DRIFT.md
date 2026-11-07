@@ -139,15 +139,24 @@ SRV-07 parity gate" directly in two places, `command_center/db/roles.py` and
 `tests/db/test_queue_claim.py` — asserts that the live SQLite `runtime.db`
 schema and the live PostgreSQL `aicc` schema stay in 1:1 correspondence
 (tables, columns, primary keys, index column-sets, `UNIQUE`/`CHECK`
-constraints) for every table the eventual SRV-01b cutover has to carry
-across. `queue_entry` is the one declared exception — it is a
-PostgreSQL-native queue mirror that migration `0002` never touches, so it
-"sits outside the parity gate" by design. The gate does not read either
-`SCHEMA_VERSION` out of source: it derives both schemas live, by running the
-real `command_center.runtime.db.migrate()` into a throwaway SQLite file and
-applying the real PostgreSQL migrations (`0001_initial.up.sql` plus the
-`CORRESPONDING_MIGRATIONS` list — currently `0004_run_finalized_at.up.sql`
-and `0016_run_finalization_claim.up.sql`) to a throwaway database, on every
+constraints) for every domain table the eventual SRV-01b cutover has to
+carry across. That set includes `queue_entry`: the fixtures load every
+non-ledger SQLite table and every table created by `0001_initial.up.sql`
+plus `CORRESPONDING_MIGRATIONS`, and the table / column / primary-key /
+index comparisons run with no exclusion list. A prior draft of this
+document (and older comments at those two call sites) called `queue_entry`
+an exception that "sits outside the parity gate"; that was wrong — the
+gate has never excluded it. What those call sites actually pin is a
+different fact: migration `0002`'s claim protocol deliberately does not
+reshape the mirror (pinned by
+`test_the_queue_mirror_is_untouched_by_this_migration` in
+`tests/db/test_queue_claim.py`). The gate does not
+read either `SCHEMA_VERSION` out of source: it derives both schemas live,
+by running the real `command_center.runtime.db.migrate()` into a throwaway
+SQLite file and applying the real PostgreSQL migrations
+(`0001_initial.up.sql` plus the `CORRESPONDING_MIGRATIONS` list —
+currently `0004_run_finalized_at.up.sql` and
+`0016_run_finalization_claim.up.sql`) to a throwaway database, on every
 CI run. It has no version pin of its own — it checks whatever the two
 schemas happen to be when it runs.
 
@@ -189,9 +198,10 @@ to pass on every CI run since.
    whichever tree it was read from, rather than assuming either.
 3. The SRV-07 parity gate (`tests/db/test_schema_correspondence.py`) has never
    been removed, disabled, or version-pinned at 16 or any other number. It
-   re-derives both schemas live on every run and currently passes against
-   whatever `SCHEMA_VERSION`/`EXPECTED_SCHEMA_VERSION` pair the checkout it
-   runs in actually has.
+   re-derives both schemas live on every run, compares every non-ledger
+   SQLite domain table — including `queue_entry` — with no exclusion list,
+   and currently passes against whatever `SCHEMA_VERSION`/
+   `EXPECTED_SCHEMA_VERSION` pair the checkout it runs in actually has.
 4. SQLite's `migrate()` only ever applies migrations above the file's
    recorded version — never backward, and never past what the calling
    binary's `MIGRATIONS` list knows. A binary older than the file it opens

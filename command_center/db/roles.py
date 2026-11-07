@@ -471,9 +471,11 @@ _WORKER_TABLES: dict[str, frozenset[str]] = {
     # and the worker has no `DELETE` privilege with which to observe the loss.
     # Claims live in `work_item` and are taken through `queue_claim()`.
     #
-    # The grant changes; the table does not. `queue_entry` sits outside the
-    # SRV-07 parity gate, so altering its shape would be an uncovered data
-    # migration — 0002 does not touch it.
+    # The grant changes; the table does not. Migration 0002's claim protocol
+    # deliberately leaves `queue_entry` alone (the mirror is rebuilt from the
+    # JSON queue, so a claim written here is lost on the next sync). The
+    # SRV-07 parity gate (`tests/db/test_schema_correspondence.py`) still
+    # compares `queue_entry`'s shape on both sides — there is no exclusion.
     "queue_entry": _READ,
     "run": _WORKER_WRITE,
     "run_event": _WORKER_WRITE,
