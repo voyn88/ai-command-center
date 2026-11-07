@@ -341,10 +341,46 @@ def test_unfinished_uninstall_blocks_before_authority_mutation(monkeypatch, tmp_
     module = _module()
     journal = tmp_path / "uninstall.json"
     journal.write_text("{}", encoding="utf-8")
-    mutated = []
     with pytest.raises(module.BootstrapRefused, match="unfinished uninstall"):
         module._refuse_unfinished_uninstall(journal)
-    assert mutated == []
+
+    # The check above only proves the helper raises in isolation. Prove the
+    # same journal actually blocks `main()`'s install path *before* it reaches
+    # `_prepare_authority_file` -- by driving install far enough (fetch,
+    # attestation, lock) that authority mutation is the very next step, and
+    # failing the test if that step is ever reached.
+    monkeypatch.setattr(module._refuse_unfinished_uninstall, "__defaults__", (journal,))
+    monkeypatch.setattr(module.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(module.os, "chown", lambda *a, **k: None)
+    monkeypatch.setattr(
+        module, "_install_lock_fd", lambda *a, **k: os.open("/dev/null", os.O_RDONLY)
+    )
+    (tmp_path / "attempts").mkdir(mode=0o700, exist_ok=True)
+    monkeypatch.setattr(module, "_require_private_root_directory", lambda *a, **k: None)
+    sha = "a" * 40
+    repo = tmp_path / "attempt" / "repo"
+    repo.mkdir(parents=True)
+    attestation = module.TreeAttestation(
+        expected_sha=sha,
+        remote_main_sha=sha,
+        tree_manifest_sha256="b" * 64,
+        file_count=1,
+        repository=module.TRUSTED_REMOTE,
+        attempt_id="attempt-test",
+    )
+    monkeypatch.setattr(module, "_fetch_exact_checkout", lambda *a, **k: repo)
+    monkeypatch.setattr(module, "_verify_checkout", lambda *a, **k: attestation)
+    monkeypatch.setattr(module, "_atomic_write", lambda *a, **k: None)
+    monkeypatch.setattr(
+        module,
+        "_prepare_authority_file",
+        lambda *a, **k: pytest.fail("blocked install must not reach authority mutation"),
+    )
+
+    with pytest.raises(module.BootstrapRefused, match="unfinished uninstall"):
+        module.main(
+            ["install", "--expected-sha", sha, "--state-root", str(tmp_path)],
+        )
 
 
 def test_poisoned_repository_config_cannot_run_code_during_verification(tmp_path):

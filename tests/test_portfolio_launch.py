@@ -663,7 +663,45 @@ def test_create_worktree_raises_portfolio_launch_error_on_git_failure(git_repo, 
         )
 
 
+def _branch_exists(repo_root, branch: str) -> bool:
+    return subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"],
+        cwd=repo_root,
+        capture_output=True,
+    ).returncode == 0
+
+
 def test_remove_worktree_and_delete_branch_are_best_effort_and_never_raise(git_repo, tmp_path):
+    """Both halves of the name, because only the second half used to be here.
+
+    Calling the two rollback helpers on things that do not exist proves
+    "never raise" and nothing else: a `remove_worktree` and a `delete_branch`
+    whose bodies were `return None` pass that check exactly as well as the
+    real ones do. The "best effort" half is the half that has to see the
+    command -- so the effort is made against a worktree and a branch that
+    really exist, and the absent case follows on the same helpers afterwards.
+    """
+    worktree = tmp_path / "rollback-worktree"
+    branch = "task/rollback-me"
+    portfolio_launch.create_worktree(
+        git_repo, branch=branch, worktree_path=worktree, base_branch="main"
+    )
+    assert worktree.is_dir()
+    assert _branch_exists(git_repo, branch)
+
+    # Effort: on something that exists, both helpers must actually remove it.
+    portfolio_launch.remove_worktree(git_repo, worktree)
+    assert not worktree.exists()
+    assert "rollback-worktree" not in subprocess.run(
+        ["git", "worktree", "list"], cwd=git_repo, capture_output=True, text=True
+    ).stdout
+    portfolio_launch.delete_branch(git_repo, branch)
+    assert not _branch_exists(git_repo, branch)
+
+    # Best effort: on something that is already gone -- including the pair
+    # just removed -- neither helper raises.
+    portfolio_launch.remove_worktree(git_repo, worktree)
+    portfolio_launch.delete_branch(git_repo, branch)
     portfolio_launch.remove_worktree(git_repo, tmp_path / "nonexistent-worktree")
     portfolio_launch.delete_branch(git_repo, "no-such-branch")
 

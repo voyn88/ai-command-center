@@ -161,6 +161,25 @@ def test_the_sweep_leaves_the_tree_untouched(tmp_path) -> None:
     assert target.read_text(encoding="utf-8") == before
 
 
+def test_the_sweep_leaves_the_tree_untouched_after_actually_perturbing_it(tmp_path) -> None:
+    """The red-suite version above never reaches the write: `cmd_sweep` returns
+    before its `try`/`finally` when the baseline is already failing, so it
+    cannot see whether the restore that follows a real perturbation works. A
+    green baseline is the only path that ever calls `target.write_text(...)`,
+    so it is the only path that can prove the `finally` restore holds.
+    """
+    suite = _write_suite(tmp_path / "green", green=True)
+    target = ROOT / "command_center/runtime/db/completion.py"
+    before = target.read_text(encoding="utf-8")
+
+    result = _run(
+        SLICE_CHECKS, "sweep", "command_center/runtime/db/completion.py", "--suite", str(suite)
+    )
+    assert "baseline green" in result.stdout, result.stdout
+
+    assert target.read_text(encoding="utf-8") == before
+
+
 def test_measure_emits_a_line_check_can_read_back(tmp_path) -> None:
     """The documented workflow is measure, paste, check — so it must round-trip.
 
@@ -468,3 +487,60 @@ def test_the_slice_sweep_resolves_pytest_the_same_way_the_evidence_tool_does() -
     # defect it was named for: review restored the buggy source wholesale and
     # watched it go green. Asserting on the command makes that impossible.
     assert "pytest" in pinned, command
+
+
+def test_the_slice_sweep_pins_the_driver_the_suite_it_sweeps_needs() -> None:
+    """`cmd_sweep`'s own baseline could read green while covering nothing.
+
+    `_pytest_command` pinned `psycopg-pool` for its `uv` branch but not
+    `psycopg` itself, while `tests/db/conftest.py` gates every PostgreSQL test
+    on `pytest.importorskip("psycopg")` — a driver `psycopg-pool` does not
+    depend on. Under `uv`, with no project-level psycopg installed, every
+    database-backed test would skip silently: baseline exits 0, every
+    perturbation also exits 0, and `cmd_sweep` reports every hook UNNOTICED —
+    not because nothing covers it, but because the sweep's own command could
+    never have reached a covering test in the first place. `evidence.py`
+    pins both `psycopg[binary]` and `psycopg-pool` for exactly this suite, in
+    a list named `_DB_EXTRAS` specifically so a second, independent copy
+    could not drift from it — and this file was that second copy.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("slice_checks_under_test", SLICE_CHECKS)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    evidence = _evidence_module()
+
+    with _forced_uv(module, present=True):
+        command = module._pytest_command("tests/db")
+    pinned = [command[i + 1] for i, token in enumerate(command) if token == "--with"]
+
+    # Every extra `evidence.py` pins for this exact suite, not just the one
+    # that happens to share a name with what this file already had.
+    expected = [
+        token for i, token in enumerate(evidence._DB_EXTRAS) if evidence._DB_EXTRAS[i - 1] == "--with"
+    ]
+    for extra in expected:
+        assert extra in pinned, f"{extra!r} missing from the sweep's pytest command: {command}"
+
+
+def test_the_statements_probe_finds_a_delete_by_the_capability_not_the_name() -> None:
+    """`collect_statements` claimed to probe whole-predicate deletes "wherever
+    a store exposes it rather than naming it", while the code named exactly
+    one: `for extra in ("delete_day",):`. `PostgresTaskMirror.delete_task`
+    existed the whole time, was never in that tuple, and so `cmd_statements`'s
+    diff had zero signal for changes to its generated SQL — a second,
+    unnamed instance of the same defect this file's own docstring calls out
+    for `--root` inference. `task` mirroring only `upsert` and `list_records`
+    (2 statements, not 3) is exactly what that blind spot looked like.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("slice_checks_under_test", SLICE_CHECKS)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    statements = module.collect_statements()
+    assert len(statements["task"]) == 3, (
+        f"expected upsert + list_records + delete_task, got {statements['task']}"
+    )
