@@ -9,10 +9,15 @@ module adds the W4 retention contract (NIGHT-W4-AICC-RETENTION):
 * **cold archive** — every row that will be pruned is exported to a
   compressed JSONL archive (with a SHA-256 digest and row count) *in the
   same transaction scope* that deletes it, so the archive and the deletion
-  can never disagree;
-* **integrity** — `PRAGMA integrity_check` must return ``ok`` and the
-  archived row count must equal the deleted row count, else the transaction
-  is rolled back and the report says so;
+  can never disagree. That scope is one bounded batch rather than the whole
+  sweep (`VOYN-W0-AICC-RETENTION-UNBOUNDED-DELETE`), so the invariant is
+  re-earned at every commit point — but the sweep as a whole is no longer
+  all-or-nothing: a failure part-way through leaves the batches that already
+  committed committed, and `restore_backup` is the way back;
+* **integrity** — `PRAGMA integrity_check` must return ``ok`` and each
+  batch's archived row count must equal its deleted row count, else that
+  batch is rolled back and the raised error says how many rows earlier
+  batches had already pruned and which backup undoes them;
 * **optional VACUUM** — only after a clean prune, and only when asked;
 * **rehearsal** — `rehearse()` runs the identical sequence against a copy
   of the database and proves the original is byte-identical afterwards.
@@ -26,6 +31,7 @@ from __future__ import annotations
 import gzip
 import hashlib
 import json
+import os
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -37,7 +43,12 @@ from command_center.runtime.db import (
     transaction,
 )
 
-_ARCHIVE_SELECT = """
+#: One batch's worth of doomed `run_event` rows: bounded so a single batch
+#: never `fetchall()`s more than this many full rows into memory, and never
+#: holds the write lock for longer than it takes to archive+delete this many.
+DEFAULT_ARCHIVE_BATCH_SIZE = 500
+
+_ARCHIVE_SELECT_BATCH = """
     SELECT run_event.* FROM run_event
      WHERE run_id IN (
         SELECT id FROM run
@@ -45,22 +56,21 @@ _ARCHIVE_SELECT = """
            AND completed_at IS NOT NULL
            AND completed_at < ?
      )
-     ORDER BY run_id, seq
-"""
-
-_ARCHIVE_DELETE = """
-    DELETE FROM run_event
-     WHERE run_id IN (
-        SELECT id FROM run
-         WHERE state IN ({placeholders})
-           AND completed_at IS NOT NULL
-           AND completed_at < ?
-     )
+     ORDER BY run_event.id
+     LIMIT ?
 """
 
 
 class MaintenanceError(RuntimeError):
-    """A retention step failed; the database was left unmodified."""
+    """A retention step failed.
+
+    The failing batch itself is always rolled back, but pruning runs in
+    bounded batches rather than one transaction, so batches that already
+    committed stay committed. Any message raised once pruning has begun
+    therefore names how many rows were already pruned, the archive that holds
+    them, and the pre-maintenance backup that undoes the entire run
+    (`restore_backup`) — a failure here is recoverable, not a no-op.
+    """
 
 
 def _timestamp() -> str:
@@ -85,10 +95,19 @@ def archive_and_prune(
     retention_days: int,
     archive_dir: Path,
     vacuum: bool = False,
+    batch_size: int = DEFAULT_ARCHIVE_BATCH_SIZE,
 ) -> dict:
-    """Run the full sequence against `db_path` and return a truthful report."""
+    """Run the full sequence against `db_path` and return a truthful report.
+
+    Pruning proceeds `batch_size` rows at a time, each batch its own
+    transaction, so a failure mid-sweep does not undo the batches that already
+    committed; `MaintenanceError` names them and `restore_backup` reverses the
+    whole run from the backup this function took first.
+    """
     if retention_days <= 0:
         raise MaintenanceError("retention_days must be positive")
+    if batch_size <= 0:
+        raise MaintenanceError("batch_size must be positive")
     db_path = Path(db_path)
     archive_dir = Path(archive_dir)
     stamp = _timestamp()
@@ -110,30 +129,70 @@ def archive_and_prune(
     digest = hashlib.sha256()
     archived = 0
 
+    # Streamed and batched: each iteration selects at most `batch_size` full
+    # rows (never the entire doomed set via `fetchall()`), writes them to the
+    # gzip stream as it goes, then deletes exactly those rows by id — so no
+    # single transaction holds the write lock for longer than one batch takes,
+    # no matter how large the accumulated backlog is
+    # (`VOYN-W0-AICC-RETENTION-UNBOUNDED-DELETE`). Deleting by the exact ids
+    # just archived (rather than re-running the doomed-row predicate) keeps
+    # each batch's archive/delete counts trivially equal to compare.
     with connect(db_path) as conn:
-        with transaction(conn):
-            rows = conn.execute(
-                _ARCHIVE_SELECT.format(placeholders=placeholders),
-                (*TERMINAL_STATES, cutoff),
-            ).fetchall()
-            with gzip.open(archive_path, "wt", encoding="utf-8") as handle:
-                for row in rows:
-                    line = json.dumps(dict(row), ensure_ascii=False, sort_keys=True)
-                    handle.write(line + "\n")
-                    digest.update(line.encode("utf-8"))
-                    archived += 1
-            deleted = conn.execute(
-                _ARCHIVE_DELETE.format(placeholders=placeholders),
-                (*TERMINAL_STATES, cutoff),
-            ).rowcount
-            if deleted != archived:
-                # Roll the deletion back rather than lose unarchived history.
-                raise MaintenanceError(
-                    f"archived {archived} rows but deletion matched {deleted}"
-                )
+        with gzip.open(archive_path, "wt", encoding="utf-8") as handle:
+            while True:
+                with transaction(conn):
+                    rows = conn.execute(
+                        _ARCHIVE_SELECT_BATCH.format(placeholders=placeholders),
+                        (*TERMINAL_STATES, cutoff, batch_size),
+                    ).fetchall()
+                    if not rows:
+                        break
+                    batch_archived = 0
+                    for row in rows:
+                        line = json.dumps(dict(row), ensure_ascii=False, sort_keys=True)
+                        handle.write(line + "\n")
+                        digest.update(line.encode("utf-8"))
+                        batch_archived += 1
+                    # Force this batch's archive bytes down to disk *before* the
+                    # COMMIT that erases the rows. Batching split the one
+                    # all-or-nothing transaction into many, so "the archive and
+                    # the deletion can never disagree" now has to be re-earned
+                    # per batch: without this, a hard kill after a batch commits
+                    # loses whatever was still sitting in the gzip/text buffers,
+                    # leaving rows deleted that no archive holds. `flush()` on
+                    # the gzip stream emits a Z_SYNC_FLUSH marker, so even a
+                    # trailer-less archive left by a kill decompresses up to the
+                    # last committed batch.
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                    ids = [row["id"] for row in rows]
+                    id_placeholders = ",".join("?" for _ in ids)
+                    batch_deleted = conn.execute(
+                        f"DELETE FROM run_event WHERE id IN ({id_placeholders})",
+                        ids,
+                    ).rowcount
+                    if batch_deleted != batch_archived:
+                        # Roll this batch back rather than lose unarchived
+                        # history. Earlier batches are already committed, so
+                        # say so instead of letting the caller assume the
+                        # pre-batching all-or-nothing contract still holds.
+                        raise MaintenanceError(
+                            f"archived {batch_archived} rows but deletion matched "
+                            f"{batch_deleted}; this batch is rolled back, but "
+                            f"{archived} rows pruned by earlier batches stay pruned "
+                            f"(archive {archive_path}); restore {backup_path} to "
+                            f"undo the whole run"
+                        )
+                archived += batch_archived
         integrity = _integrity_ok(conn)
     if not integrity:
-        raise MaintenanceError("integrity_check failed after prune")
+        # Every batch has committed by now; there is nothing left to roll back
+        # here, so the message has to carry the operator's actual route out.
+        raise MaintenanceError(
+            f"integrity_check failed after prune; {archived} rows were already "
+            f"pruned and committed (archive {archive_path}); restore "
+            f"{backup_path} to undo the whole run"
+        )
 
     if vacuum:
         with sqlite3.connect(db_path) as conn:
@@ -161,6 +220,7 @@ def rehearse(
     retention_days: int,
     archive_dir: Path,
     vacuum: bool = False,
+    batch_size: int = DEFAULT_ARCHIVE_BATCH_SIZE,
 ) -> dict:
     """Run the identical sequence against a copy; prove the original intact."""
     db_path = Path(db_path)
@@ -175,6 +235,7 @@ def rehearse(
             retention_days=retention_days,
             archive_dir=archive_dir,
             vacuum=vacuum,
+            batch_size=batch_size,
         )
     finally:
         after = hashlib.sha256(db_path.read_bytes()).hexdigest()
