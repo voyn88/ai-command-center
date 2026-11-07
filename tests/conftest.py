@@ -390,7 +390,11 @@ def isolated_generated_dir(isolated_data_dir, monkeypatch):
     does not. No streamlit means no `app`, means nothing here to isolate."""
     try:
         import app
-    except ImportError:
+    except Exception:
+        # ImportError when streamlit is absent; SupervisorError (and kin) when
+        # the host cannot establish a process identity (e.g. no
+        # /proc/sys/kernel/random/boot_id). Either way there is no usable
+        # app.GENERATED_DIR to isolate.
         yield
         return
     from command_center import workspace_home
