@@ -39,6 +39,7 @@ from command_center.api import (
     backlog_routes,
     conflict_routes,
     council_routes,
+    counterfactual_ledger_routes,
     marketplace_routes,
     model_registry_routes,
     networking_routes,
@@ -162,6 +163,7 @@ def create_app() -> FastAPI:
     app.include_router(model_registry_routes.router, dependencies=guard)
     app.include_router(networking_routes.router, dependencies=guard)
     app.include_router(backlog_routes.router, dependencies=guard)
+    app.include_router(counterfactual_ledger_routes.router, dependencies=guard)
 
     # Fail closed at boot, not only in CI: a mutating route this build does not
     # route to an operation stops the process here.

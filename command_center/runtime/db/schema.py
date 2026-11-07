@@ -22,7 +22,7 @@ import command_center.runtime.db as db  # facade (late-bound; see docstring)
 # full script after a partially-applied migration is always safe)
 # --------------------------------------------------------------------------
 
-SCHEMA_VERSION = 25
+SCHEMA_VERSION = 26
 
 _SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS task (
@@ -1360,6 +1360,66 @@ CREATE INDEX IF NOT EXISTS idx_networking_invitation_project ON networking_invit
 """
 
 
+# Counterfactual Ledger (VOYN-MIN-COMP): the persistence tier behind the
+# "attention and decisions" surface's alternatives record (routes → service →
+# repository → db). Two additive, standalone tables, wholly distinct from every
+# family above.
+#
+#   counterfactual_decision    -- one mutable current-state row per decision
+#                                 being (or already) made. `criticality` marks
+#                                 whether the acceptance rule (a `critical`
+#                                 decision needs at least 3 recorded
+#                                 alternatives before it can move to
+#                                 `finalized`) applies; that rule is policy,
+#                                 enforced one tier up in the service, never
+#                                 here. `chosen_option`/`rationale` are filled
+#                                 when the decision is finalized — the record of
+#                                 what was picked and why, sitting next to the
+#                                 alternatives that explain what was not.
+#                                 `project_ref` (nullable) is the redaction key.
+#   counterfactual_alternative -- append-only: one row per alternative path
+#                                 considered for a decision, carrying the reason
+#                                 it was not the one chosen. No update path —
+#                                 the ledger is a record of what was weighed,
+#                                 not a mutable scratchpad.
+#
+# Statuses/criticalities are stored as their stable string *values* (never a
+# Python enum member name), so a column round-trips to exactly the Literal the
+# API contract (`api/models.py`) declares — the enum-name lesson carried
+# forward from the earlier migration renumbering.
+_SCHEMA_V26 = """
+CREATE TABLE IF NOT EXISTS counterfactual_decision (
+    id             TEXT PRIMARY KEY,
+    title          TEXT NOT NULL,
+    description    TEXT NOT NULL DEFAULT '',
+    criticality    TEXT NOT NULL DEFAULT 'normal',
+    status         TEXT NOT NULL DEFAULT 'draft',
+    chosen_option  TEXT NOT NULL DEFAULT '',
+    rationale      TEXT NOT NULL DEFAULT '',
+    owner          TEXT,
+    project_ref    TEXT,
+    decided_at     TEXT,
+    version        INTEGER NOT NULL DEFAULT 0,
+    created_at     TEXT NOT NULL,
+    updated_at     TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_counterfactual_decision_project ON counterfactual_decision(project_ref);
+CREATE INDEX IF NOT EXISTS idx_counterfactual_decision_status ON counterfactual_decision(status);
+CREATE INDEX IF NOT EXISTS idx_counterfactual_decision_criticality ON counterfactual_decision(criticality);
+
+CREATE TABLE IF NOT EXISTS counterfactual_alternative (
+    id                TEXT PRIMARY KEY,
+    decision_id       TEXT NOT NULL REFERENCES counterfactual_decision(id) ON DELETE CASCADE,
+    option            TEXT NOT NULL,
+    rejection_reason  TEXT NOT NULL DEFAULT '',
+    created_at        TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_counterfactual_alternative_decision ON counterfactual_alternative(decision_id);
+"""
+
+
 # Each migration is either a raw SQL script (applied via `executescript`, every
 # statement `IF NOT EXISTS`) or a callable(conn) for changes — like `ALTER
 # TABLE ADD COLUMN` — that need their own idempotency check.
@@ -1394,4 +1454,5 @@ MIGRATIONS: list[tuple[int, str | Callable[[sqlite3.Connection], None]]] = [
     (23, _SCHEMA_V23),
     (24, _migration_24_add_finalized_at),
     (25, _migration_25_add_finalization_claim),
+    (26, _SCHEMA_V26),
 ]
