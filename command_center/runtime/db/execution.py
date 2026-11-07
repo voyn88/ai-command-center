@@ -417,7 +417,7 @@ def create_run(
                         now,
                     ),
                 )
-            provenance_table = db._table_exists(conn, "run_provenance")
+            provenance_table = db.table_exists(conn, "run_provenance")
             if provenance_table:
                 conn.execute(
                     """INSERT INTO run_provenance (
@@ -437,7 +437,7 @@ def create_run(
                         now,
                     ),
                 )
-            provider_route_table = db._table_exists(conn, "run_provider_route")
+            provider_route_table = db.table_exists(conn, "run_provider_route")
             if provider_route_table and provider_route is not None:
                 conn.execute(
                     """INSERT INTO run_provider_route (
@@ -459,7 +459,7 @@ def create_run(
             # mirror's correctness a property of this function's parameter
             # list rather than of the table.
             #
-            # Guarded by the same `sqlite_master` results as the inserts above,
+            # Guarded by the same `table_exists` results as the inserts above,
             # and for the same reason. On a database migrated only part-way —
             # what the historical-schema tests build — these tables do not
             # exist, and an unguarded `SELECT` raises *inside* the
