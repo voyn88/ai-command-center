@@ -439,6 +439,16 @@ def test_the_probe_asks_about_the_driver_the_tests_actually_need(tmp_path) -> No
         )
 
 
+def _slice_checks_module():
+    """Load `mirror_slice_checks.py` by path — same reason as `_evidence_module`."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("slice_checks_under_test", SLICE_CHECKS)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def test_the_slice_sweep_resolves_pytest_the_same_way_the_evidence_tool_does() -> None:
     """The one change in this PR that review found had no test at all.
 
@@ -446,11 +456,7 @@ def test_the_slice_sweep_resolves_pytest_the_same_way_the_evidence_tool_does() -
     pointed at `evidence.py` "for why the hard-coded form was a defect". The
     code now matches the comment; this is what holds it there.
     """
-    import importlib.util
-
-    spec = importlib.util.spec_from_file_location("slice_checks_under_test", SLICE_CHECKS)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    module = _slice_checks_module()
 
     with _forced_uv(module, present=True):
         command = module._pytest_command("tests/db")
@@ -468,3 +474,100 @@ def test_the_slice_sweep_resolves_pytest_the_same_way_the_evidence_tool_does() -
     # defect it was named for: review restored the buggy source wholesale and
     # watched it go green. Asserting on the command makes that impossible.
     assert "pytest" in pinned, command
+
+
+def test_the_preflight_battery_names_sweep_alongside_statements_and_counts() -> None:
+    """The finding was closed in the slices; the acceptance is that the probe
+    that found it is in the pre-flight set, not a side command nobody runs.
+
+    Asserted on the module docstring rather than `--help`: help text is easy
+    to keep while the battery description quietly drops the third probe.
+    """
+    doc = _slice_checks_module().__doc__ or ""
+    for probe in ("statements", "counts", "sweep"):
+        assert f"**{probe}**" in doc, f"pre-flight set lost `{probe}`"
+
+
+def test_store_test_paths_resolve_to_the_family_authority_modules() -> None:
+    """`all` without `--module` must still sweep the hooks the path covers.
+
+    The three paths below are the ones the hook-sweep task measured; if any
+    of them resolves to the wrong module (or to nothing), `all` would either
+    sweep the wrong file or refuse and look broken while the gap is open.
+    """
+    module = _slice_checks_module()
+    assert module.modules_for_store_paths(["tests/db/test_completion_store.py"]) == [
+        "command_center/runtime/db/completion.py"
+    ]
+    assert module.modules_for_store_paths(["tests/db/test_proposal_store.py"]) == [
+        "command_center/runtime/db/proposal.py"
+    ]
+    assert module.modules_for_store_paths(["tests/db/test_provenance_store.py"]) == [
+        "command_center/runtime/db/provenance.py"
+    ]
+    # An unknown store test that has no authority file must not invent one.
+    assert module.modules_for_store_paths(["tests/db/test_no_such_family_store.py"]) == []
+
+
+def test_all_refuses_when_nothing_resolves_to_a_sweep_module(tmp_path) -> None:
+    """A battery that skipped the sweep would print a reassuring statements
+    half and look complete — the exact shape that shipped hooks with no test.
+    """
+    result = _run(
+        SLICE_CHECKS,
+        "all",
+        "--base",
+        "HEAD",
+        str(tmp_path / "not_a_store_test.py"),
+    )
+    assert result.returncode != 0, result.stdout
+    assert "no authority module to sweep" in result.stdout
+    # And it must not have claimed to sweep anything.
+    assert "== sweep ==" not in result.stdout
+
+
+def test_all_runs_statements_counts_and_sweep_before_returning(monkeypatch) -> None:
+    """Order and completeness, not the probes themselves — each has its own tests.
+
+    The first version of `all` that only ran statements+counts would satisfy
+    every other assertion in this file while dropping the probe this task
+    exists to keep in the set. The call log is what makes that impossible.
+    """
+    from types import SimpleNamespace
+
+    module = _slice_checks_module()
+    calls: list[str] = []
+
+    def _statements(args):
+        calls.append("statements")
+        assert args.base == "origin/main"
+        return 0
+
+    def _counts(args):
+        calls.append("counts")
+        assert args.paths == ["tests/db/test_completion_store.py"]
+        return 0
+
+    def _sweep(args):
+        calls.append(f"sweep:{args.module}")
+        assert args.suite == "tests/db"
+        return 0
+
+    monkeypatch.setattr(module, "cmd_statements", _statements)
+    monkeypatch.setattr(module, "cmd_counts", _counts)
+    monkeypatch.setattr(module, "cmd_sweep", _sweep)
+
+    rc = module.cmd_all(
+        SimpleNamespace(
+            base="origin/main",
+            module=[],
+            suite="tests/db",
+            paths=["tests/db/test_completion_store.py"],
+        )
+    )
+    assert rc == 0
+    assert calls == [
+        "statements",
+        "counts",
+        "sweep:command_center/runtime/db/completion.py",
+    ]
