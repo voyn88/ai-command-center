@@ -26,6 +26,39 @@ CollectMode=inactive-or-failed
 [Service]
 Type=exec
 ExecStart=/usr/libexec/aicc-agent-launcher --serve-socket
+# CollectMode= above governs only instances STARTED after it reaches a host.
+# A corpse latched before that is outside it forever, and one is enough to
+# hold `failed_units` open: the instance names a connection that has been
+# consumed, so systemd will never start that name again, no run can ever
+# clear the latch, and PID 1 keeps the unit loaded for no other reason than
+# to remember it. The repository's only clear is a one-time `reset-failed` in
+# deploy/install-agent-principal-isolation.sh, which runs on a full install
+# -- so a host that receives a new broker any other way (a generation
+# committed by `aicc-install-transaction`, boot recovery, an out-of-band
+# replacement of /usr/libexec/aicc-agent-launcher) keeps every corpse it
+# already had. worker-01 is exactly that host: after its 2026-10-30 15:15
+# reboot it latched 16 of these in the five minutes before its broker was
+# replaced at 15:20, then accepted 96 more connections (the socket's
+# per-connection counter had reached 111) without a single failure,
+# and the monitor has reported those 16 as broken infrastructure ever since
+# with nothing left to repair (monitor_finding 41104).
+#
+# This broker runs as root on every connection, so it is the one thing on the
+# host that can clear them in steady state -- and it runs even when ExecStart
+# never did, which is the 226/NAMESPACE class that produces corpses in the
+# first place. The glob is deliberate: what an instance clears is its dead
+# SIBLINGS, since a corpse cannot clear itself. `reset-failed` only touches
+# units that are failed right now, so a sibling still serving a connection is
+# untouched, and so is this instance, which is merely deactivating. Prefixed
+# `-`: tidying PID 1's table must never fail a connection that was served.
+# Nothing becomes less visible than CollectMode= already makes it -- on a host
+# where that rule is in effect PID 1 reaps the same instance immediately, so
+# this only ever drains the backlog that predates it. That first drain is the
+# only large one (worker-01 was carrying 7366 of these before its reboot) and
+# it is bounded by TimeoutStopSec= below; were it ever to overrun, systemd
+# marks THIS instance failed and CollectMode= above reaps it, so the tidy-up
+# cannot leave behind the thing it exists to remove.
+ExecStopPost=-/usr/bin/systemctl reset-failed aicc-agent-launcher@*.service
 StandardInput=socket
 StandardOutput=socket
 StandardError=journal

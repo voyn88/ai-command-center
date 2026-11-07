@@ -263,6 +263,71 @@ rm -rf /etc/systemd/system/aicc-launcher-reap-control@.service /etc/systemd/syst
   /etc/systemd/system/aicc-agent-launcher@.service.d
 systemctl daemon-reload
 
+log "a corpse latched before the reaping rule is cleared by the next served connection"
+# VOYN-MON-WORKER-01-INFRA-FAILED-UNITS (monitor_finding 41104). CollectMode=
+# governs only instances STARTED after it reaches a host, and the only clear
+# for the ones already latched is a one-time `reset-failed` in the installer
+# -- a step worker-01 has not run since 2026-09-15. So the 16 corpses it
+# latched in the five minutes after its 2026-10-30 15:15 reboot, before its
+# broker was replaced out of band, are still the finding on a host that has
+# served every connection since without a failure. The shipped template
+# therefore makes every served connection clear its dead SIBLINGS.
+#
+# Only PID 1 can say whether that happens: "the unit file says ExecStopPost="
+# is exactly the class of claim that was already wrong once here, in a section
+# systemd ignores. The corpse is pinned OUT of CollectMode's reach by a
+# PER-INSTANCE drop-in (CollectMode=inactive), so what clears it can only be
+# the connection served afterwards and not PID 1 reaping it on the reload.
+# The control is the same corpse under a template name the glob cannot match:
+# if the control goes too, something else cleared both and this proves nothing.
+sed '/^ExecStopPost=/d' "$REPO/deploy/systemd/aicc-agent-launcher@.service" \
+  > /etc/systemd/system/aicc-launcher-clear-control@.service
+clear_harness_dropin() { # <instance unit> <ExecStart> <CollectMode>
+  install -d -m 0755 "/etc/systemd/system/$1.d"
+  cat > "/etc/systemd/system/$1.d/10-clear-harness.conf" <<DROPIN
+[Unit]
+CollectMode=$3
+[Service]
+ExecStart=
+ExecStart=$2
+StandardInput=null
+StandardOutput=journal
+DROPIN
+}
+# The corpse, the connection served after it, and the out-of-glob control.
+clear_harness_dropin aicc-agent-launcher@stale.service /bin/false inactive
+clear_harness_dropin aicc-agent-launcher@served.service /bin/true inactive-or-failed
+clear_harness_dropin aicc-launcher-clear-control@corpse.service /bin/false inactive
+systemctl daemon-reload
+for unit in aicc-agent-launcher@stale.service aicc-launcher-clear-control@corpse.service; do
+  systemctl start "$unit" >/dev/null 2>&1 || true
+  [ "$(systemctl is-active "$unit")" = failed ] \
+    || fail "$unit did not latch failed (test shape: a failing ExecStart under CollectMode=inactive must)"
+done
+# One connection, served successfully: the corpse above is cleared by the
+# teardown of a DIFFERENT instance or not at all. A start that does not
+# succeed says so HERE: ExecStopPost= runs inside the same namespace, so a
+# 226/NAMESPACE refusal would skip the clear under test and the assertion
+# below would blame the directive for an unbuilt mount namespace.
+systemctl start aicc-agent-launcher@served.service \
+  || fail "the shipped per-connection namespace would not build here; the clear under test never ran"
+for _ in $(seq 1 20); do
+  [ "$(systemctl is-active aicc-agent-launcher@stale.service)" = failed ] || break
+  sleep 0.5
+done
+[ "$(systemctl is-active aicc-launcher-clear-control@corpse.service)" = failed ] \
+  || fail "the out-of-glob control corpse was cleared too -- this check cannot see the defect it exists for"
+# `is-active`, not the unit table: `failed` is the exact property the host
+# unit-health probe reads and counts.
+[ "$(systemctl is-active aicc-agent-launcher@stale.service)" != failed ] \
+  || fail "a corpse latched before the reaping rule survived a served connection; the host probe counts it as failed_units"
+systemctl reset-failed 'aicc-launcher-clear-control@*.service' >/dev/null 2>&1 || true
+rm -rf /etc/systemd/system/aicc-launcher-clear-control@.service \
+  /etc/systemd/system/aicc-launcher-clear-control@corpse.service.d \
+  /etc/systemd/system/aicc-agent-launcher@stale.service.d \
+  /etc/systemd/system/aicc-agent-launcher@served.service.d
+systemctl daemon-reload
+
 log "a retired legacy unit does not survive as an unreapable failed_units corpse"
 # VOYN-MON-WORKER-01-INFRA-FAILED-UNITS. Retirement stops and *disables* the
 # pre-template workers, and disabling removes the symlink that was their
