@@ -1958,6 +1958,9 @@ def trusted_publish_clone(
             failed_step="checkout_trusted_candidate",
             env=trusted_git_environment,
         )
+        cache_exclusions = _safe_untracked_cache_exclusions(
+            publisher, workspace, expected_branch=expected_branch
+        )
         clean = subprocess.run(
             [
                 "git",
@@ -1970,6 +1973,9 @@ def trusted_publish_clone(
                 "status",
                 "--porcelain",
                 "--untracked-files=all",
+                "--",
+                ".",
+                *cache_exclusions,
             ],
             cwd=publisher,
             capture_output=True,
@@ -2067,6 +2073,7 @@ def _run_trusted_worktree_git(
     expected_branch: str,
     failed_step: str,
     input_text: str | None = None,
+    allowed_returncodes: tuple[int, ...] = (0,),
 ) -> subprocess.CompletedProcess[str]:
     """Run Git with only the fresh publisher's metadata and the task tree as data."""
     try:
@@ -2098,7 +2105,7 @@ def _run_trusted_worktree_git(
             expected_branch=expected_branch,
             detail=f"trusted Git operation could not run: {exc}",
         ) from exc
-    if result.returncode != 0:
+    if result.returncode not in allowed_returncodes:
         raise WorkspaceVerificationError(
             failed_step=failed_step,
             remediation="Preserve the dirty task clone and retry checkpointing.",
@@ -2108,6 +2115,83 @@ def _run_trusted_worktree_git(
             detail=(result.stderr or result.stdout).strip() or "trusted Git operation failed",
         )
     return result
+
+
+_DISPOSABLE_CACHE_DIRS = frozenset({".pytest_cache", ".ruff_cache", "__pycache__"})
+
+
+def _safe_untracked_cache_exclusions(
+    publisher: Path, workspace: Path, *, expected_branch: str
+) -> list[str]:
+    """Return pathspec exclusions for known disposable, untracked caches.
+
+    Agent processes can leave cache directories which their isolated principal
+    can read but the lane worker cannot. Git normally descends far enough to
+    inspect an ignored cache's own ``.gitignore`` during ``git add -A`` and can
+    therefore abort the durable checkpoint. Discover cache directory names
+    without descending into them, then let the trusted index prove that each
+    contains no tracked path before excluding it.  The fixed name allowlist is
+    the cache safety boundary: an unreadable cache-local ``.gitignore`` cannot
+    itself be consulted to prove ignoredness. Unknown or tracked unreadable
+    paths remain fail-closed.
+    """
+    candidates: list[str] = []
+
+    def visit(directory: Path) -> None:
+        try:
+            entries = list(os.scandir(directory))
+        except OSError:
+            # A non-cache unreadable directory is deliberately left for Git to
+            # reject. We cannot safely classify anything below it.
+            return
+        for entry in entries:
+            if entry.name == ".git":
+                continue
+            try:
+                is_directory = entry.is_dir(follow_symlinks=False)
+            except OSError:
+                continue
+            if not is_directory:
+                continue
+            path = Path(entry.path)
+            if entry.name in _DISPOSABLE_CACHE_DIRS:
+                candidates.append(path.relative_to(workspace).as_posix())
+            else:
+                visit(path)
+
+    visit(workspace)
+    if not candidates:
+        return []
+
+    tracked = _run_trusted_worktree_git(
+        publisher,
+        workspace,
+        ["ls-files", "-z", "--", *candidates],
+        expected_branch=expected_branch,
+        failed_step="dirty_checkpoint_cache_classification",
+    ).stdout.split("\0")
+    tracked_paths = [path for path in tracked if path]
+    safe = [
+        path
+        for path in candidates
+        if not any(item == path or item.startswith(f"{path}/") for item in tracked_paths)
+    ]
+    exclusions: list[str] = []
+    for path in safe:
+        ignored = _run_trusted_worktree_git(
+            publisher,
+            workspace,
+            ["check-ignore", "--no-index", "-q", "--", f"{path}/"],
+            expected_branch=expected_branch,
+            failed_step="dirty_checkpoint_cache_classification",
+            allowed_returncodes=(0, 1),
+        )
+        # An outer ignore rule already prevents traversal and needs no
+        # pathspec. An internally ignored cache with an unreadable local
+        # .gitignore returns 1 and must be excluded as one literal directory.
+        if ignored.returncode == 1:
+            exclusions.append(f":(exclude,top,literal){path}")
+    return exclusions
 
 
 def _open_standalone_agent_git_dir(
@@ -2446,10 +2530,20 @@ def checkpoint_dirty_task_workspace(
         expected_candidate_sha=candidate_sha,
         require_clean=False,
     ) as publisher:
+        cache_exclusions = _safe_untracked_cache_exclusions(
+            publisher, workspace, expected_branch=expected_branch
+        )
         status = _run_trusted_worktree_git(
             publisher,
             workspace,
-            ["status", "--porcelain", "--untracked-files=all"],
+            [
+                "status",
+                "--porcelain",
+                "--untracked-files=all",
+                "--",
+                ".",
+                *cache_exclusions,
+            ],
             expected_branch=expected_branch,
             failed_step="dirty_checkpoint_status",
         )
@@ -2458,7 +2552,7 @@ def checkpoint_dirty_task_workspace(
         _run_trusted_worktree_git(
             publisher,
             workspace,
-            ["add", "-A"],
+            ["add", "-A", "--", ".", *cache_exclusions],
             expected_branch=expected_branch,
             failed_step="dirty_checkpoint_stage",
         )
