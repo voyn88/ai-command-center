@@ -35,6 +35,7 @@ import os
 import secrets
 import threading
 from contextlib import contextmanager
+from datetime import timedelta
 
 import pytest
 
@@ -867,6 +868,468 @@ def test_rotating_with_a_superseded_secret_is_refused_and_audited(
 
 
 # ---------------------------------------------------------------------------
+# Self-renewal after expiry (0029)
+# ---------------------------------------------------------------------------
+
+
+def _grace(admin_conn) -> timedelta:
+    with admin_conn.cursor() as cur:
+        cur.execute("SELECT enroll_self_grace()")
+        return cur.fetchone()[0]
+
+
+def _expire_credential(admin_conn, secret: str, *, ago: timedelta, keep_login=False) -> str:
+    """Move a credential's ledger expiry `ago` into the past and lapse the ROLE
+    the way production would.
+
+    `issued_at` shifts by the same amount, so the credential keeps its real
+    TTL: a grace check mistakenly written against `issued_at` would then
+    diverge from one written against `expires_at`. The role's `VALID UNTIL`
+    becomes the new expiry plus the grace for a worker host and the new expiry
+    itself for any other kind -- exactly what 0029's issuance writes -- so a
+    "fresh connection with the expired secret" in these tests is the
+    production shape, not a ledger-only approximation. `keep_login` leaves the
+    role loginable so a LEDGER refusal past the grace can be observed (the
+    connection layer would otherwise refuse first; that layer has its own test).
+    """
+    from psycopg import sql
+
+    secret_hash = hashlib.sha256(secret.encode("utf-8")).hexdigest()
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "UPDATE principal_credential c "
+            "SET issued_at = c.issued_at - (c.expires_at - (now() - %s::interval)), "
+            "    expires_at = now() - %s::interval "
+            "FROM principal p WHERE p.principal_id = c.principal_id AND c.secret_hash = %s "
+            "RETURNING c.credential_id, p.db_role, p.kind, c.expires_at",
+            (ago, ago, secret_hash),
+        )
+        rows = cur.fetchall()
+        assert len(rows) == 1, rows
+        credential_id, db_role, kind, expires_at = rows[0]
+        if keep_login:
+            valid_until = "infinity"
+        elif kind == "worker_host":
+            valid_until = (expires_at + _grace(admin_conn)).isoformat()
+        else:
+            valid_until = expires_at.isoformat()
+        cur.execute(
+            sql.SQL("ALTER ROLE {} VALID UNTIL {}").format(
+                sql.Identifier(db_role), sql.Literal(valid_until)
+            )
+        )
+    return credential_id
+
+
+def _renewal_view(conn, secret: str):
+    """What the rotator asks first: `identity_current_credential(secret, true)`."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT * FROM identity_current_credential(%s, true)", (secret,))
+        return cur.fetchone()
+
+
+def _rotate_over_fresh_connection(psycopg, test_dsn, role: str, old_secret: str):
+    """What the rotator does once its pool is gone: a NEW connection with the
+    expired secret, then `enroll_rotate_self` over it."""
+    new_secret, new_hash = _secret()
+    with (
+        psycopg.connect(_as_role(test_dsn, role, old_secret), autocommit=True) as fresh,
+        fresh.cursor() as cur,
+    ):
+        cur.execute(
+            "SELECT * FROM enroll_rotate_self(%s, %s, %s)",
+            (old_secret, new_hash, _scram_verifier(new_secret)),
+        )
+        return cur.fetchone(), new_secret
+
+
+def _principal_events(admin_conn, principal_id: str, event_type: str, outcome: str):
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "SELECT reason, metadata_json FROM principal_event "
+            "WHERE principal_id = %s AND event_type = %s AND outcome = %s ORDER BY seq",
+            (principal_id, event_type, outcome),
+        )
+        return cur.fetchall()
+
+
+def _graced_passes(admin_conn, principal_id: str) -> int:
+    return len(
+        [e for e in _principal_events(admin_conn, principal_id, "assert", "granted")
+         if e[0] == "expired_grace"]
+    )
+
+
+def _role_validity_gap(admin_conn, secret: str) -> timedelta:
+    """`rolvaliduntil - expires_at` for the credential `secret` names."""
+    secret_hash = hashlib.sha256(secret.encode("utf-8")).hexdigest()
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "SELECT r.rolvaliduntil - c.expires_at FROM principal_credential c "
+            "JOIN principal p ON p.principal_id = c.principal_id "
+            "JOIN pg_roles r ON r.rolname = p.db_role WHERE c.secret_hash = %s",
+            (secret_hash,),
+        )
+        (gap,) = cur.fetchone()
+    return gap
+
+
+def _enrol_worker(psycopg, test_dsn, role_passwords, *, bind: bool = True):
+    """Enrol a worker host and, as in production, use the credential once
+    while it is live (the first `identity_assert` binds it to the host's
+    address). A never-used credential is deliberately not renewable after
+    expiry; `bind=False` produces that shape."""
+    with psycopg.connect(
+        _dsn_for(test_dsn, roles.APP_ROLE, role_passwords), autocommit=True
+    ) as app:
+        # A distinct machine per host: two hosts reporting one fingerprint is
+        # the clone case, refused by design.
+        row, secret = _enrol(app, _unique(), {**DESCRIPTOR, "machine_id": secrets.token_hex(4)})
+    assert row[4] is None, row
+    if bind:
+        _use_once(psycopg, test_dsn, row[1], secret)
+    return row, secret
+
+
+def _use_once(psycopg, test_dsn, role: str, secret: str) -> None:
+    """One live `identity_assert` as the host: what every worker does on its
+    first claim, and what binds the credential to the host's address."""
+    with (
+        psycopg.connect(_as_role(test_dsn, role, secret), autocommit=True) as host,
+        host.cursor() as cur,
+    ):
+        cur.execute("SELECT ok, reason FROM identity_assert(%s)", (secret,))
+        assert cur.fetchone() == (True, None)
+
+
+def test_an_expired_credential_that_was_never_used_is_not_renewable(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """The bound address is what confines a graced renewal to the host that
+    earned it; a credential with no bound address has nothing to be confined
+    to, so it is refused even inside the grace."""
+    with _cluster(admin_conn, psycopg, test_dsn, role_passwords):
+        row, secret = _enrol_worker(psycopg, test_dsn, role_passwords, bind=False)
+        _expire_credential(admin_conn, secret, ago=timedelta(minutes=1))
+        with psycopg.connect(_as_role(test_dsn, row[1], secret), autocommit=True) as c:
+            assert _renewal_view(c, secret)[2] == "credential_expired"
+        rotated, _ = _rotate_over_fresh_connection(psycopg, test_dsn, row[1], secret)
+        assert rotated == (None, "credential_expired")
+        denials = [
+            e for e in _principal_events(admin_conn, row[0], "assert", "rejected")
+            if e[0] == "credential_expired"
+        ]
+        assert denials and all(d[1].get("bound") is False for d in denials)
+
+
+def test_an_expired_worker_credential_renews_itself_over_a_fresh_connection_within_grace(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """VOYN-W0-AICC-CREDENTIAL-ROTATION-DEADLOCKS-AFTER-EXPIRY (0029).
+
+    Live 2026-09-15 the rotator's pool was gone by the time it retried, so the
+    only path that matters is a NEW connection with the expired secret, the
+    role lapsed the way issuance lapses it. Inside the grace that connection
+    reaches the database, learns its (negative) remaining lifetime and its
+    renewal deadline, and rotates -- and nothing else: the ordinary assert and
+    the ordinary expiry query still refuse it for work, and the graced passes
+    are `granted` rows, not denials.
+    """
+    with _cluster(admin_conn, psycopg, test_dsn, role_passwords):
+        row, old_secret = _enrol_worker(psycopg, test_dsn, role_passwords)
+        _expire_credential(admin_conn, old_secret, ago=timedelta(minutes=1))
+        grace = _grace(admin_conn)
+
+        with (
+            psycopg.connect(_as_role(test_dsn, row[1], old_secret), autocommit=True) as c,
+            c.cursor() as cur,
+        ):
+            cur.execute("SELECT ok, reason FROM identity_assert(%s)", (old_secret,))
+            assert cur.fetchone() == (False, "credential_expired"), "work is refused"
+            cur.execute("SELECT refuse_reason FROM identity_current_credential(%s)", (old_secret,))
+            assert cur.fetchone() == ("credential_expired",), "the 0013 question is unchanged"
+            expires, server_now, refusal, renewable_until = _renewal_view(c, old_secret)
+        assert refusal is None
+        assert expires <= server_now < renewable_until, (expires, server_now, renewable_until)
+        assert renewable_until - expires == grace
+
+        rotated, new_secret = _rotate_over_fresh_connection(psycopg, test_dsn, row[1], old_secret)
+        assert rotated[1] is None, rotated
+        with (
+            psycopg.connect(_as_role(test_dsn, row[1], new_secret), autocommit=True) as c,
+            c.cursor() as cur,
+        ):
+            cur.execute("SELECT ok, reason FROM identity_assert(%s)", (new_secret,))
+            assert cur.fetchone() == (True, None)
+            cur.execute("SELECT ok, reason FROM identity_assert(%s)", (old_secret,))
+            assert cur.fetchone() == (False, "credential_revoked")
+        assert _role_validity_gap(admin_conn, new_secret) == grace
+
+        granted = _principal_events(admin_conn, row[0], "rotate", "granted")
+        assert [g[1].get("expired_grace") for g in granted] == [True]
+        # Two graced passes, one per graced call: the renewal query and the
+        # rotation. Each is a row of its own, filtered by reason so the count
+        # pins the grace bookkeeping and not the audit policy for other passes.
+        assert _graced_passes(admin_conn, row[0]) == 2
+        denials = [
+            e for e in _principal_events(admin_conn, row[0], "assert", "rejected")
+            if e[0] == "credential_expired"
+        ]
+        assert len(denials) == 2, "only the two explicit work-shaped questions were denied"
+
+
+def test_an_expired_credential_past_the_grace_is_refused_by_the_ledger(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """Ledger layer only: the role is deliberately kept loginable so the
+    refusal observed is `identity_assert`'s and not the connection layer's
+    (which has the next test)."""
+    with _cluster(admin_conn, psycopg, test_dsn, role_passwords):
+        row, old_secret = _enrol_worker(psycopg, test_dsn, role_passwords)
+        past = _grace(admin_conn) + timedelta(minutes=1)
+        _expire_credential(admin_conn, old_secret, ago=past, keep_login=True)
+        with psycopg.connect(_as_role(test_dsn, row[1], old_secret), autocommit=True) as c:
+            assert _renewal_view(c, old_secret)[2] == "credential_expired"
+        rotated, _ = _rotate_over_fresh_connection(psycopg, test_dsn, row[1], old_secret)
+        assert rotated == (None, "credential_expired")
+        assert _graced_passes(admin_conn, row[0]) == 0
+
+
+def test_past_the_grace_the_worker_role_cannot_log_in_at_all(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """Connection layer: the role's validity is the ledger expiry plus the
+    grace and not a minute more, so past it the expired secret does not reach
+    the database. (Fails under `trust` authentication, like every other
+    negative-login test in this module; CI authenticates by password.)"""
+    with _cluster(admin_conn, psycopg, test_dsn, role_passwords):
+        row, old_secret = _enrol_worker(psycopg, test_dsn, role_passwords)
+        past = _grace(admin_conn) + timedelta(minutes=1)
+        _expire_credential(admin_conn, old_secret, ago=past)
+        with pytest.raises(psycopg.OperationalError):
+            psycopg.connect(_as_role(test_dsn, row[1], old_secret), connect_timeout=5)
+
+
+@pytest.mark.parametrize(
+    ("prepare", "expected"),
+    [
+        (
+            (
+                "UPDATE principal_credential SET revoked_at = now(), revoke_reason = 'test' "
+                "WHERE principal_id = %s"
+            ),
+            "credential_revoked",
+        ),
+        ("UPDATE principal SET state = 'suspended' WHERE principal_id = %s", "principal_inactive"),
+        ("UPDATE principal SET expected_cidr = '10.99.0.0/24' WHERE principal_id = %s", "addr_mismatch"),
+        ("UPDATE principal_credential SET bound_addr = '10.99.0.9' WHERE principal_id = %s", "addr_mismatch"),
+    ],
+    ids=["revoked", "suspended", "out-of-cidr", "bound-elsewhere"],
+)
+def test_every_other_guard_still_applies_to_an_expired_credential_within_grace(
+    admin_conn, psycopg, test_dsn, role_passwords, prepare, expected
+):
+    """Deleting any guard from the graced path must fail one of these; each
+    pins its exact reason, so a guard misfiled as a grace refusal fails too."""
+    with _cluster(admin_conn, psycopg, test_dsn, role_passwords):
+        row, old_secret = _enrol_worker(psycopg, test_dsn, role_passwords)
+        _expire_credential(admin_conn, old_secret, ago=timedelta(minutes=1))
+        with admin_conn.cursor() as cur:
+            cur.execute(prepare, (row[0],))
+        with psycopg.connect(_as_role(test_dsn, row[1], old_secret), autocommit=True) as c:
+            assert _renewal_view(c, old_secret)[2] == expected
+        rotated, _ = _rotate_over_fresh_connection(psycopg, test_dsn, row[1], old_secret)
+        assert rotated == (None, expected)
+        assert _graced_passes(admin_conn, row[0]) == 0
+
+
+def test_the_grace_is_for_worker_hosts_only(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """An operator or control-plane credential gets no grace, at either layer:
+    its role validity stays the ledger expiry, and an expired one is refused
+    for renewal exactly as 0003 refused it. Their address guards only audit,
+    so a grace for them would make an expired secret replayable from anywhere.
+    """
+    with _cluster(admin_conn, psycopg, test_dsn, role_passwords):
+        row, secret = _enrol_worker(psycopg, test_dsn, role_passwords)
+        with admin_conn.cursor() as cur:
+            # The same principal and role, re-labelled: the trust tier is
+            # constrained to follow the kind.
+            cur.execute(
+                "UPDATE principal SET kind = 'control_plane', trust_tier = 1 "
+                "WHERE principal_id = %s",
+                (row[0],),
+            )
+        rotated, live = _rotate_over_fresh_connection(psycopg, test_dsn, row[1], secret)
+        assert rotated[1] is None, rotated
+        assert _role_validity_gap(admin_conn, live) == timedelta(0), "no widening"
+
+        _expire_credential(admin_conn, live, ago=timedelta(minutes=1), keep_login=True)
+        with psycopg.connect(_as_role(test_dsn, row[1], live), autocommit=True) as c:
+            assert _renewal_view(c, live)[2] == "credential_expired"
+        rotated, _ = _rotate_over_fresh_connection(psycopg, test_dsn, row[1], live)
+        assert rotated == (None, "credential_expired")
+        assert _graced_passes(admin_conn, row[0]) == 0
+
+
+def test_graced_renewals_are_bounded_by_time_not_count(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """A host that stalls twice recovers twice. The grace is not consumed by
+    use: each credential is renewable until its own `expires_at + grace`, from
+    its bound address, and nothing counts recoveries. A stall longer than that
+    still needs an operator -- by design, that is the stall worth paging for.
+    """
+    with _cluster(admin_conn, psycopg, test_dsn, role_passwords):
+        row, first = _enrol_worker(psycopg, test_dsn, role_passwords)
+        grace = _grace(admin_conn)
+        _expire_credential(admin_conn, first, ago=timedelta(minutes=1))
+        rotated, second = _rotate_over_fresh_connection(psycopg, test_dsn, row[1], first)
+        assert rotated[1] is None, rotated
+        assert _role_validity_gap(admin_conn, second) == grace
+        _use_once(psycopg, test_dsn, row[1], second)  # the lanes claim on it, as always
+        _expire_credential(admin_conn, second, ago=timedelta(minutes=1))
+        rotated, third = _rotate_over_fresh_connection(psycopg, test_dsn, row[1], second)
+        assert rotated[1] is None, "a credential issued under grace is renewable under grace"
+        assert _role_validity_gap(admin_conn, third) == grace
+        graced = [
+            g[1].get("expired_grace")
+            for g in _principal_events(admin_conn, row[0], "rotate", "granted")
+        ]
+        assert graced == [True, True]
+
+
+def test_the_rotator_authority_recovers_an_expired_credential_without_an_operator(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """The real client, end to end: `PsycopgCredentialAuthority` over a fresh
+    connection with an expired secret (role lapsed as in production) proves a
+    negative remaining lifetime and a positive renewal window, rotates, and
+    the successor authenticates. Live 2026-09-15 the first of those three
+    steps raised `credential expiry refused: credential_expired` 164 times.
+    """
+    from psycopg.conninfo import conninfo_to_dict
+
+    from command_center.ops.credential_rotation import (
+        PsycopgCredentialAuthority,
+        RotationError,
+        _postgres_config,
+        scram_verifier,
+    )
+
+    def config_for(secret: str):
+        params = conninfo_to_dict(test_dsn)
+        return _postgres_config({
+            "AICC_PG_HOST": params["host"],
+            "AICC_PG_PORT": str(params.get("port", 5432)),
+            "AICC_PG_DB": params["dbname"],
+            "AICC_PG_USER": row[1],
+            "AICC_PG_PASSWORD": secret,
+            "AICC_PG_SSLMODE": "disable",
+        })
+
+    with _cluster(admin_conn, psycopg, test_dsn, role_passwords):
+        row, old_secret = _enrol_worker(psycopg, test_dsn, role_passwords)
+        grace = _grace(admin_conn)
+        _expire_credential(admin_conn, old_secret, ago=timedelta(minutes=1))
+        authority = PsycopgCredentialAuthority()
+
+        proof = authority.current_expiry(config_for(old_secret))
+        assert proof.remaining < 0 < proof.renewable
+        assert abs((proof.renewable - proof.remaining) - grace.total_seconds()) < 1
+
+        new_secret = secrets.token_hex(32)
+        expires = authority.rotate(config_for(old_secret), new_secret, scram_verifier(new_secret))
+        assert expires > proof.expires
+
+        authority.probe(config_for(new_secret))
+        renewed = authority.current_expiry(config_for(new_secret))
+        assert renewed.remaining > 0
+        assert abs((renewed.renewable - renewed.remaining) - grace.total_seconds()) < 1
+
+        # Past the grace, the same client is refused by the ledger (role kept
+        # loginable here; the connection-layer refusal has its own test).
+        _expire_credential(admin_conn, new_secret, ago=grace + timedelta(minutes=1), keep_login=True)
+        with pytest.raises(RotationError, match="credential_expired"):
+            authority.current_expiry(config_for(new_secret))
+
+
+def test_the_role_may_log_in_for_the_grace_after_the_ledger_expiry(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """0003 set `rolvaliduntil` to the ledger expiry, which made any
+    ledger-side grace unreachable over a fresh connection (review of #977);
+    0029 issues a worker role with exactly the grace on top, no more."""
+    with _cluster(admin_conn, psycopg, test_dsn, role_passwords):
+        _row, secret = _enrol_worker(psycopg, test_dsn, role_passwords)
+        assert _role_validity_gap(admin_conn, secret) == _grace(admin_conn)
+
+
+def _set_role_validity(admin_conn, role: str, value: str) -> None:
+    from psycopg import sql
+
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            sql.SQL("ALTER ROLE {} VALID UNTIL {}").format(sql.Identifier(role), sql.Literal(value))
+        )
+
+
+def test_downgrading_0029_narrows_worker_roles_and_upgrading_only_ever_widens_them(
+    admin_conn, psycopg, test_dsn, role_passwords
+):
+    """The down does not only restore the 0003 functions: EVERY worker role
+    agrees with the ledger again afterwards (a suspended host's too), and the
+    up on the way back widens from the LATEST credential only, never narrows
+    (an operator's hand extension survives), and leaves a suspended host alone.
+    The stale unrevoked row planted on the first host is the pre-invariant data
+    that made the naive backfill a lockout (review of #989)."""
+    with _cluster(admin_conn, psycopg, test_dsn, role_passwords):
+        plain, plain_secret = _enrol_worker(psycopg, test_dsn, role_passwords)
+        extended, extended_secret = _enrol_worker(psycopg, test_dsn, role_passwords)
+        suspended, suspended_secret = _enrol_worker(psycopg, test_dsn, role_passwords)
+        grace = _grace(admin_conn)
+        for secret in (plain_secret, extended_secret, suspended_secret):
+            assert _role_validity_gap(admin_conn, secret) == grace
+        with admin_conn.cursor() as cur:
+            # A stale, older, still-unrevoked row for the first host: the
+            # backfill must follow the latest credential, not scan order.
+            cur.execute(
+                "INSERT INTO principal_credential (credential_id, principal_id, secret_hash, "
+                "issued_at, expires_at, created_at, updated_at) "
+                "VALUES (%s, %s, %s, now() - interval '3 hours', now() - interval '2 hours', "
+                "now() - interval '3 hours', now() - interval '3 hours')",
+                ("cred_stale_test", plain[0], hashlib.sha256(b"stale").hexdigest()),
+            )
+            cur.execute(
+                "UPDATE principal SET state = 'suspended' WHERE principal_id = %s",
+                (suspended[0],),
+            )
+        with psycopg.connect(
+            _as_role(test_dsn, roles.MIGRATOR_ROLE, role_passwords[roles.MIGRATOR_ROLE]),
+            autocommit=True,
+        ) as migrator:
+            migrations.downgrade(migrator, target=28)
+            try:
+                for secret in (plain_secret, extended_secret, suspended_secret):
+                    assert _role_validity_gap(admin_conn, secret) == timedelta(0), secret
+                _set_role_validity(admin_conn, extended[1], "2099-01-01 00:00:00+00")
+            finally:
+                migrations.upgrade(migrator)
+                roles.apply_table_grants(migrator)
+        assert _role_validity_gap(admin_conn, plain_secret) == grace, "latest row, widened"
+        with admin_conn.cursor() as cur:
+            cur.execute(
+                "SELECT rolvaliduntil FROM pg_roles WHERE rolname = %s", (extended[1],)
+            )
+            (kept,) = cur.fetchone()
+        assert kept.year == 2099, "an operator's hand extension is never narrowed"
+        assert _role_validity_gap(admin_conn, suspended_secret) == timedelta(0), (
+            "a suspended host is not widened"
+        )
+
+
+# ---------------------------------------------------------------------------
 # The network expectation declared at enrolment
 # ---------------------------------------------------------------------------
 
@@ -1181,6 +1644,10 @@ REQUIRED_AUDIT_SITES = (
     ("assert", "rejected", "credential_revoked"),
     ("assert", "rejected", "principal_inactive"),
     ("assert", "rejected", "addr_mismatch"),
+    ("assert", "rejected", "credential_expired"),
+    # 0029: an expired worker credential passing the graced assert, for
+    # self-renewal only.
+    ("assert", "granted", "expired_grace"),
     ("act_as", "rejected", "principal_role_mismatch"),
 )
 
@@ -1197,10 +1664,6 @@ UNREACHABLE_AUDIT_SITES = (
     # just proved the principal active and are issuing to themselves or downward.
     ("issue", "rejected", "principal_inactive"),
     ("issue", "rejected", "tier_violation"),
-    # A credential outliving its own expiry needs the sweeper not to have run;
-    # the sweeper revokes it first, and `credential_revoked` is what is then
-    # observed. Kept because a change to the sweep interval makes it reachable.
-    ("assert", "rejected", "credential_expired"),
     # `identity_sweep_expired()` closes out an expired credential with this
     # reason; the enrolment suite drives revocation through the incident lever
     # and rotation instead.
@@ -1289,6 +1752,25 @@ def test_every_reachable_audit_site_writes_a_row(
         ) as host, host.cursor() as cur:
             cur.execute("SELECT ok, reason FROM identity_assert(%s)", ("nothing-matches",))
             assert cur.fetchone() == (False, "unknown_credential")
+
+            # assert: rejected/credential_expired for work, granted/expired_grace
+            # for renewal (0029) -- on this established session, whose
+            # authentication happened before the ledger expiry.
+            cur.execute("SELECT ok FROM identity_assert(%s)", (host_secret,))
+            assert cur.fetchone() == (True,), "bound while live, as every worker is"
+            with admin_conn.cursor() as admin:
+                admin.execute(
+                    "UPDATE principal_credential SET issued_at = now() - interval '61 minutes', "
+                    "expires_at = now() - interval '1 minute' WHERE principal_id = %s",
+                    (row[0],),
+                )
+            cur.execute("SELECT ok, reason FROM identity_assert(%s)", (host_secret,))
+            assert cur.fetchone() == (False, "credential_expired")
+            cur.execute(
+                "SELECT refuse_reason FROM identity_current_credential(%s, true)",
+                (host_secret,),
+            )
+            assert cur.fetchone() == (None,)
 
             rotated_secret, rotated_hash = _secret()
             cur.execute(
