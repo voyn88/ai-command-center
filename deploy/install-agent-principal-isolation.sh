@@ -120,9 +120,29 @@ hold_lane_timers() {
   if [ "$timers_held" -eq 1 ]; then
     return 0
   fi
-  # Acquire before touching timers; never replace a running deploy's lock.
+  # Acquire before touching timers. Exclusive create never replaces a
+  # running deploy's lock. A proven-dead holder is rewritten in place under
+  # flock; a temp-file rename would let the loser unlink the winner.
   if ! (set -C; umask 022; printf '%s\n' "$$" >/run/aicc-staged-rollout.lock); then
-    return 1
+    holder=$(cat /run/aicc-staged-rollout.lock 2>/dev/null) || return 1
+    case "$holder" in
+      ''|*[!0-9]*|0*) return 1 ;;
+    esac
+    [ -d /proc ] || return 1
+    [ -d "/proc/$holder" ] && return 1
+    command -v flock >/dev/null 2>&1 || return 1
+    exec 9<>/run/aicc-staged-rollout.lock || return 1
+    flock -x 9 || { exec 9<&-; return 1; }
+    IFS= read -r current <&9 || current=""
+    if [ "$current" != "$holder" ] || [ -d "/proc/$current" ]; then
+      exec 9<&-
+      return 1
+    fi
+    /usr/bin/python3 -c 'import os,sys; os.lseek(9,0,os.SEEK_SET); os.ftruncate(9,0); os.write(9,(sys.argv[1]+"\n").encode())' "$$" || {
+      exec 9<&-
+      return 1
+    }
+    exec 9<&-
   fi
   timers_held=1
   # Refuse overlap with an older deploy already running before this lock.
@@ -147,6 +167,16 @@ hold_lane_timers() {
       return 1
     fi
   fi
+  # #917 added this timer to LANE_MUTATING_TIMERS. A refresh left running
+  # can still move the checkout while a rollout believes the host is quiet.
+  if systemctl show voyn-aicc-source-clone-refresh.timer --property=LoadState --value 2>/dev/null | grep -qx loaded; then
+    if ! systemctl stop voyn-aicc-source-clone-refresh.timer; then
+      systemctl start voyn-aicc-credential-rotation.timer >/dev/null 2>&1 || true
+      systemctl start voyn-aicc-worker-release-deploy.timer >/dev/null 2>&1 || true
+      systemctl start voyn-aicc-self-deploy.timer >/dev/null 2>&1 || true
+      return 1
+    fi
+  fi
 }
 
 release_lane_timers() {
@@ -156,7 +186,7 @@ release_lane_timers() {
   if [ "$(cat /run/aicc-staged-rollout.lock 2>/dev/null)" = "$$" ]; then
     rm -f -- /run/aicc-staged-rollout.lock
   fi
-  for timer in voyn-aicc-credential-rotation.timer voyn-aicc-worker-release-deploy.timer voyn-aicc-self-deploy.timer; do
+  for timer in voyn-aicc-credential-rotation.timer voyn-aicc-worker-release-deploy.timer voyn-aicc-self-deploy.timer voyn-aicc-source-clone-refresh.timer; do
     if systemctl is-enabled --quiet "$timer"; then
       systemctl start "$timer" >/dev/null 2>&1 || true
     fi

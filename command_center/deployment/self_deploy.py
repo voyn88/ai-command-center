@@ -46,6 +46,8 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from command_center.ops.rollout_lock import ROLLOUT_LOCK_PATH, rollout_lock_is_held
+
 __all__ = ["SelfDeployConfig", "SelfDeployReport", "self_deploy_once"]
 
 _DEPENDENCY_MANIFESTS = re.compile(
@@ -73,7 +75,7 @@ class SelfDeployConfig:
     #: the canary lane on worker-01 (live 2026-09-08); refusing while the
     #: marker exists means the next tick (5 minutes later, after the rollout
     #: has finished and removed it) picks the deploy back up instead.
-    rollout_lock_path: str = "/run/aicc-staged-rollout.lock"
+    rollout_lock_path: str = str(ROLLOUT_LOCK_PATH)
     #: Optional immutable release root. When set, self-deploy stages tracked
     #: files into `<release_root>/releases/<sha>` and atomically points
     #: `<release_root>/current` at that release instead of asking systemd units
@@ -304,7 +306,7 @@ def self_deploy_once(
                 pass
         return report
 
-    if cfg.rollout_lock_path and Path(cfg.rollout_lock_path).expanduser().exists():
+    if cfg.rollout_lock_path and rollout_lock_is_held(cfg.rollout_lock_path):
         return finish("refused", "staged_rollout_in_progress")
 
     fetched = _git(repo_path, ["fetch", cfg.remote, cfg.branch], timeout)

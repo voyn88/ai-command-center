@@ -6,6 +6,7 @@ substance under test and runs for real."""
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -105,7 +106,7 @@ def test_refuses_while_a_staged_rollout_holds_the_lock(pair, calls, tmp_path):
     origin, clone, first = pair
     _commit(origin, "advance")  # a real fast-forward is available and skipped
     lock = tmp_path / "aicc-staged-rollout.lock"
-    lock.write_text("12345\n", encoding="utf-8")
+    lock.write_text(f"{os.getpid()}\n", encoding="utf-8")
     cfg = _cfg(
         tmp_path,
         services=("voyn-aicc-worker.service",),
