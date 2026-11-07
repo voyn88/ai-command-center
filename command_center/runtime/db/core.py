@@ -475,10 +475,16 @@ def _migrate_unlocked(db_path: Path) -> None:
             raise RuntimeError(
                 f"runtime schema v{current} is newer than supported v{db.SCHEMA_VERSION}"
             )
-        if current == 25:
+        if current >= 25:
             # The ledger row is not enough: a partially restored or manually
             # drifted DB must never let Supervisor startup proceed without the
             # one-claim-per-run fencing constraints it relies on.
+            #
+            # `>=`, not `==`: claim fencing is a property of every schema from
+            # v25 onward, and pinning the check to the exact version that
+            # introduced it silently switched it off the moment v26 landed —
+            # the failure mode being a Supervisor starting against a drifted
+            # claim table with nothing left to notice.
             db._validate_finalization_claim_schema(conn)
         # Stamp the zone this file's naive timestamps are on, from a process
         # that also writes them. Retention reads it back instead of trusting
