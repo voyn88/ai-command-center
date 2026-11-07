@@ -1246,6 +1246,27 @@ def test_environment_update_preserves_unrelated_lines_and_mode(tmp_path: Path) -
     assert path.stat().st_mode & 0o777 == 0o600
 
 
+def test_rotation_refuses_lease_secret_path_as_env_file(tmp_path: Path) -> None:
+    """VOYN-W0-AICC-LEASE-PGPASS-OVERWRITTEN-ON-WORKER-01: rotator must never
+    treat the lease pgpass as worker.env, even when the basename is pointed
+    at by a misconfigured --env-file."""
+    from command_center.ops import credential_rotation as rotation_module
+
+    with pytest.raises(RotationError, match="lease secret path"):
+        rotation_module._refuse_lease_secret_as_env_file(
+            tmp_path / "voyn_lease_pgpass"
+        )
+    events: list[tuple] = []
+    controller = RotationController(
+        _config(tmp_path, env_file=tmp_path / "voyn_lease_pgpass"),
+        FakeSystemd(events),
+        FakeAuthority(events),
+        Audit(),
+    )
+    with pytest.raises(RotationError, match="lease secret path"):
+        controller.rotate()
+
+
 def test_environment_parser_rejects_duplicate_password(tmp_path: Path) -> None:
     path = _environment(tmp_path / "worker.env")
     with path.open("a", encoding="utf-8") as stream:

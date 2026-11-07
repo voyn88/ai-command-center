@@ -325,6 +325,14 @@ while IFS= read -r secret_path; do
   fi
 done < "$secret_manifest"
 
+# Lease secret provenance: the LoadCredential= source must be the
+# voyn_lease_client line for voyn_control, never a worker-DB aicc_w_* line
+# (VOYN-W0-AICC-LEASE-PGPASS-OVERWRITTEN-ON-WORKER-01). Checked before the
+# lane probe so a bad secret fails closed with a legible LEASE_SECRET_FAIL
+# rather than a lane that looks ready and then burns every attempt.
+python3 "$repo_root/ops/aicc_lease_secret.py" verify || \
+  fail "lease secret provenance check failed"
+
 python3 "$repo_root/ops/aicc_staged_worker_rollout.py" verify \
   --lanes "$lane_registry" || fail "worker lane readiness or UID isolation failed"
 

@@ -50,6 +50,18 @@ from command_center.worker.credential_file import (
     read_environment_file,
 )
 
+# The lease-authority pgpass is a distinct secret from worker.env. Rotation
+# must never open or rewrite it: the 2026-09-10 overwrite that put
+# aicc_w_wrk_voyn_worker_01 into /etc/voyn/secrets/voyn_lease_pgpass killed
+# every mutating dispatch until the lease secret was restored
+# (VOYN-W0-AICC-LEASE-PGPASS-OVERWRITTEN-ON-WORKER-01). Basename match is
+# deliberate -- a mis-pointed --env-file named like the lease secret is the
+# same bug regardless of parent directory. Keep in sync with
+# ops/aicc_lease_secret.py (LEASE_PGPASS_PATH / provenance sidecar).
+_LEASE_SECRET_BASENAMES = frozenset(
+    {"voyn_lease_pgpass", "voyn_lease_pgpass.provenance"}
+)
+
 _READY = "aicc-ready"
 
 # Shared with ROLLOUT_LOCK_PATH in ops/aicc_staged_worker_rollout.py -- both
@@ -79,6 +91,14 @@ AUDIT_MAX_RECORD_BYTES = 64 * 1024
 
 class RotationError(RuntimeError):
     """A fail-closed operational error safe to show in an audit event."""
+
+
+def _refuse_lease_secret_as_env_file(path: Path) -> None:
+    if path.name in _LEASE_SECRET_BASENAMES:
+        raise RotationError(
+            f"credential rotation must not use lease secret path {path} as "
+            "worker.env (VOYN-W0-AICC-LEASE-PGPASS-OVERWRITTEN-ON-WORKER-01)"
+        )
 
 
 class CircuitOpen(RotationError):
@@ -1434,6 +1454,7 @@ class RotationController:
 
     def recover_interrupted(self) -> bool:
         """Reopen claim gates from a durable interrupted-rotation phase."""
+        _refuse_lease_secret_as_env_file(self.config.env_file)
         if self._controller_deadline is None:
             self._controller_deadline = (
                 self.monotonic() + self.config.controller_timeout
@@ -1497,6 +1518,7 @@ class RotationController:
         return True
 
     def rotate(self) -> None:
+        _refuse_lease_secret_as_env_file(self.config.env_file)
         if not self.config.worker_units:
             raise RotationError("at least one worker lane is required")
         if len(set(self.config.worker_units)) != len(self.config.worker_units):
@@ -1808,6 +1830,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.recover_only
         else args.controller_timeout
     )
+    try:
+        _refuse_lease_secret_as_env_file(args.env_file)
+    except RotationError as error:
+        Audit(args.audit_file).emit("rotation_refused", error=str(error))
+        return 78
     config = RotationConfig(
         env_file=args.env_file,
         lock_file=args.lock_file,
