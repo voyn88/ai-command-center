@@ -240,12 +240,15 @@ class ReconcileReport:
 
 @dataclass
 class PrEvidenceReport:
-    """See `reconcile_pr_evidence`. Records evidence; never changes a status."""
+    """See `reconcile_pr_evidence`."""
 
     #: (task_id, pr_url) newly recorded from the task's own branch.
     recorded: list[tuple[str, str]] = field(default_factory=list)
     #: (task_id, reason) examined and deliberately left alone.
     skipped: list[tuple[str, str]] = field(default_factory=list)
+    #: (task_id, landing_status) returned to the pool via
+    #: ``backlog_recover_stuck_ready_to_review`` when no open PR exists.
+    recovered: list[tuple[str, str]] = field(default_factory=list)
 
 
 #: Branch naming contract. `publish_run` pushes `backlog/<task id>` and nothing
@@ -253,6 +256,27 @@ class PrEvidenceReport:
 #: convention this function invents.
 def _task_branch(task_id: str) -> str:
     return f"backlog/{task_id}"
+
+
+def _recover_ready_to_review_without_open_pr(
+    factory: Any, task_id: str
+) -> str | None:
+    """Use 0018's sanctioned path when pr_evidence finds no open PR to adopt.
+
+    A READY_TO_REVIEW row with no ``pr`` evidence and no open pull request on
+    ``backlog/<task>`` cannot reach review or DONE; ``reconcile_pr_evidence``
+    cannot invent a PR. Returning the task to OPEN gives ``publish_run`` another
+    bounded attempt instead of looping ``no_open_pr_on_task_branch`` forever
+    (VOYN-W0-AICC-TICK-STALL-WATCHDOG / pr_evidence stalls).
+    """
+    with factory() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT * FROM backlog_recover_stuck_ready_to_review(%s)", (task_id,)
+        )
+        verdict = cur.fetchone()
+    if verdict and verdict[0]:
+        return (verdict[1] if len(verdict) > 1 else "") or "OPEN"
+    return None
 
 
 def reconcile_pr_evidence(
@@ -296,9 +320,10 @@ def reconcile_pr_evidence(
     origin of that checkout and nothing else, so a task can never be attached
     to a pull request in another repository.
 
-    Reporting only: no status is changed here. A task becomes reviewable
-    because it is `READY_TO_REVIEW` and now has evidence, through the same
-    path it always did.
+    When no open PR matches, calls ``backlog_recover_stuck_ready_to_review``
+    (0018) so evidence-free READY_TO_REVIEW rows do not stall pr_evidence
+    indefinitely; a successful recovery is reported in ``recovered`` rather
+    than ``skipped``.
     """
     # Imported here, as  does, so this module keeps its
     # import-time independence from the planner.
@@ -348,7 +373,11 @@ def reconcile_pr_evidence(
             and entry["url"]
         ]
         if not matches:
-            report.skipped.append((row_task_id, "no_open_pr_on_task_branch"))
+            landing = _recover_ready_to_review_without_open_pr(factory, row_task_id)
+            if landing is not None:
+                report.recovered.append((row_task_id, landing))
+            else:
+                report.skipped.append((row_task_id, "no_open_pr_on_task_branch"))
             continue
         if len(matches) > 1:
             report.skipped.append((row_task_id, "ambiguous_open_prs_on_branch"))

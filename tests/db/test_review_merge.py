@@ -4014,7 +4014,24 @@ def test_a_task_adopts_only_its_own_branch_never_a_prefix_match(rig, _test_repo_
     report = reconcile_pr_evidence(app_factory, REPO)
 
     assert _pr_rows(app_factory, task_id) == []
-    assert (task_id, "no_open_pr_on_task_branch") in report.skipped
+    assert report.skipped == []
+    assert (task_id, "OPEN") in report.recovered
+    assert store.get_task(task_id)["status"] == "OPEN"
+
+
+def test_no_open_pr_returns_evidence_free_ready_to_review_to_open(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+    """When pr_evidence finds no open PR, 0018's recovery runs instead of
+    looping ``no_open_pr_on_task_branch`` forever."""
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE2B"
+    _ready_without_pr(store, app_factory, task_id)
+    monkeypatch.setattr(review_merge, "_gh", _fake_pr_list([]))
+
+    report = reconcile_pr_evidence(app_factory, REPO)
+
+    assert (task_id, "OPEN") in report.recovered
+    assert (task_id, "no_open_pr_on_task_branch") not in report.skipped
+    assert store.get_task(task_id)["status"] == "OPEN"
 
 
 def test_two_open_prs_on_one_branch_are_refused_rather_than_guessed(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
