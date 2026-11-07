@@ -3045,7 +3045,7 @@ def test_a_closed_unmerged_pr_leaves_ready_to_review_via_rejected_without_remedi
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     report = merge_once(app_factory, "/tmp")
-    assert ("VOYN-W0-MC", "pr_closed_unmerged") in report.skipped
+    assert ("VOYN-W0-MC", "rejected_pr_closed_unmerged") in report.skipped
     assert not report.merged
 
     with app_factory() as c, c.cursor() as cur:
@@ -3077,7 +3077,7 @@ def test_closed_plus_open_pr_leaves_ready_to_review_untouched(rig, monkeypatch):
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     report = merge_once(app_factory, "/tmp")
-    assert ("VOYN-W0-MCO", "pr_closed_unmerged") in report.skipped
+    assert ("VOYN-W0-MCO", "pr_closed_unmerged_sibling_pending") in report.skipped
     assert len(report.skipped) == 1
     assert not report.merged
     with app_factory() as c, c.cursor() as cur:
@@ -3127,13 +3127,40 @@ def test_closed_unmerged_repeat_tick_is_idempotent(rig, monkeypatch):  # noqa: F
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     first = merge_once(app_factory, "/tmp")
     second = merge_once(app_factory, "/tmp")
-    assert ("VOYN-W0-MCI", "pr_closed_unmerged") in first.skipped
+    assert ("VOYN-W0-MCI", "rejected_pr_closed_unmerged") in first.skipped
     assert second.skipped == []
     assert second.merged == []
     with app_factory() as c, c.cursor() as cur:
         cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-MCI",))
         assert cur.fetchone()[0] == "REJECTED"
         cur.execute("SELECT count(*) FROM backlog_task WHERE task_id=%s", ("VOYN-W0-MCI-REM",))
+        assert cur.fetchone()[0] == 0
+
+
+def test_two_closed_unmerged_prs_reject_without_remediation(rig, monkeypatch):  # noqa: F811
+    import subprocess as sp
+
+    app_factory, store, _ = rig
+    first_pr = "https://github.com/x/y/pull/323"
+    second_pr = "https://github.com/x/y/pull/324"
+    _ready(store, app_factory, "VOYN-W0-MC2", first_pr)
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT backlog_record_evidence(%s,'pr',%s)", ("VOYN-W0-MC2", second_pr))
+        c.commit()
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["pr", "view"] and argv[2] in (first_pr, second_pr):
+            return sp.CompletedProcess(argv, 0, json.dumps({"state": "CLOSED", "mergedAt": None}), "")
+        return sp.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    assert ("VOYN-W0-MC2", "rejected_pr_closed_unmerged") in report.skipped
+    assert not report.merged
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-MC2",))
+        assert cur.fetchone()[0] == "REJECTED"
+        cur.execute("SELECT count(*) FROM backlog_task WHERE task_id=%s", ("VOYN-W0-MC2-REM",))
         assert cur.fetchone()[0] == 0
 
 

@@ -4485,13 +4485,19 @@ def _merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -
         else:
             merge_sha, merge_reason = _merged_target_sha(repo_path, pr_url)
         if merge_sha is None and merge_reason == "pr_closed_unmerged":
-            other_pr_rows = _rows(
+            sibling_pr_rows = _rows(
                 factory,
-                "SELECT 1 FROM backlog_evidence WHERE task_id = %s AND kind = 'pr' AND value <> %s LIMIT 1",
+                "SELECT value FROM backlog_evidence WHERE task_id = %s AND kind = 'pr' AND value <> %s ORDER BY evidence_id",
                 (task_id, pr_url),
             )
-            if other_pr_rows:
-                report.skipped.append((task_id, merge_reason))
+            sibling_pending = False
+            for sibling_pr_url, in sibling_pr_rows:
+                _sibling_sha, sibling_reason = _merged_target_sha(repo_path, sibling_pr_url)
+                if sibling_reason != "pr_closed_unmerged":
+                    sibling_pending = True
+                    break
+            if sibling_pending:
+                report.skipped.append((task_id, "pr_closed_unmerged_sibling_pending"))
                 continue
             with factory() as conn:
                 conn.autocommit = False
@@ -4514,13 +4520,10 @@ def _merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -
                         ok, reason = cur.fetchone()
                     if ok:
                         conn.commit()
-                        report.skipped.append((task_id, merge_reason))
+                        report.skipped.append((task_id, "rejected_pr_closed_unmerged"))
                     else:
                         conn.rollback()
-                        if reason == "illegal_transition":
-                            report.skipped.append((task_id, merge_reason))
-                        else:
-                            report.skipped.append((task_id, f"transition:{reason}"))
+                        report.skipped.append((task_id, f"transition:{reason}"))
                 except Exception:
                     conn.rollback()
                     raise
