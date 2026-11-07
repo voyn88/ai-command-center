@@ -656,9 +656,15 @@ if [ "$install_profile" = "worker" ]; then
   systemctl reset-failed 'aicc-agent-launcher@*.service' >/dev/null 2>&1 || true
   systemctl enable --now aicc-agent-launcher.socket
   systemctl enable --now voyn-aicc-source-clone-refresh.timer
+  # Worker lanes Require= the tunnel; enable it before the staged rollout
+  # starts any lane. /etc/aicc/pgtunnel.env is host-local and must already
+  # exist (VOYN-W0-AICC-UNMANAGED-LIVE-UNITS).
+  systemctl enable --now voyn-aicc-pgtunnel.service
   # Retire the voynadmin worker self-deploy variant (hard-coded lane list,
   # cannot write root-owned releases) and enable the root-owned release
-  # deploy that stages immutable /opt/aicc/releases/<sha>.
+  # deploy that stages immutable /opt/aicc/releases/<sha>. Justified
+  # removal: worker self-deploy is replaced, not left "works but nobody
+  # installs it".
   systemctl disable --now voyn-aicc-self-deploy.timer >/dev/null 2>&1 || true
   systemctl disable voyn-aicc-self-deploy.service >/dev/null 2>&1 || true
   systemctl enable --now voyn-aicc-worker-release-deploy.timer
@@ -701,6 +707,6 @@ trap - EXIT HUP INT TERM
 # review-window labeller instead of "someone typed it once on 2026-09-09"
 # (VOYN-W0-AICC-PR-WINDOW-RECONCILER-NOT-DEPLOYED-ON-CONTROL).
 if [ "$install_profile" = "control" ]; then
-  systemctl enable --now voyn-aicc-review.timer voyn-aicc-merge.timer voyn-aicc-remediate.timer voyn-aicc-credential-rescue.timer voyn-aicc-pr-window.timer
+  systemctl enable --now voyn-aicc-review.timer voyn-aicc-merge.timer voyn-aicc-remediate.timer voyn-aicc-credential-rescue.timer voyn-aicc-pr-window.timer voyn-aicc-self-deploy.timer
 fi
 echo "AICC_AGENT_PRINCIPAL_ISOLATION_INSTALLED"
