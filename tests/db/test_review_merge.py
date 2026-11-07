@@ -3155,7 +3155,7 @@ def test_two_closed_unmerged_prs_reject_without_remediation(rig, monkeypatch):  
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     report = merge_once(app_factory, "/tmp")
-    assert ("VOYN-W0-MC2", "rejected_pr_closed_unmerged") in report.skipped
+    assert report.skipped == [("VOYN-W0-MC2", "rejected_pr_closed_unmerged")]
     assert not report.merged
     with app_factory() as c, c.cursor() as cur:
         cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-MC2",))

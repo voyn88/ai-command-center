@@ -4418,10 +4418,14 @@ def _merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -
 
     open_pr_snapshot, _snapshot_failure = _merge_window_open_pr_snapshot(repo_path)
     origin = _origin_owner_repo(repo_path) if open_pr_snapshot is not None else None
+    processed_tasks: set[str] = set()
     for task_id, pr_url in tasks:
         if actions >= cfg.max_per_tick:
             break
         last_processed = (task_id, pr_url)
+        if task_id in processed_tasks:
+            continue
+        processed_tasks.add(task_id)
         if _repo_from_pr_url(pr_url) is None:
             # Same shape gate as review_once/publish_review_verdicts -- a
             # malformed pr_url fails every `gh pr view` below identically
