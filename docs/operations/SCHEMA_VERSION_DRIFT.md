@@ -174,6 +174,24 @@ taken years of migrations earlier). Nothing about the gate was lifted to
 produce that pair; it passed, checked, on the wider table set, and continues
 to pass on every CI run since.
 
+## `VOYN-W0-AICC-SQLITE-SCHEMA-16-TO-23` (deployed-schema-behind-code) — closed
+
+Same reconcile pass that produced the three-number confusion above also
+opened a sibling task titled `deployed-schema-behind-code`, framed as
+"bring the live `runtime.db` from migration 16 up to the code's 23." That
+framing inherited the false reading: there was never a deployed file stuck
+at 16 waiting for an operator bump. Inside the window the task *named*,
+the real contract for a file whose ledger lagged the binary is already
+migrate-on-open — the next process that opens it applies migrations
+17..23 in place. That contract is pinned by
+`test_deployed_schema_behind_code_upgrades_16_to_23` in
+`tests/test_runtime_db.py` (VOYN-W0-AICC-SQLITE-SCHEMA-16-TO-23-RETRY, the
+clean retry after the unrelated writer-lease refusal that had parked the
+original dispatch was fixed in PR #358). Do not reopen this as a one-shot
+schema bump; if a future binary is ahead of a file, the engine's own
+`migrate()` path is the acceptance target (and, past v24, the explicit
+offline finalization cutover — a separate, later gate).
+
 ## Takeaways for whoever reads this next
 
 1. `runtime.db`'s `SCHEMA_VERSION` and the PostgreSQL `aicc` schema's
