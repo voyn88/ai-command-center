@@ -712,6 +712,13 @@ def main(argv: list[str] | None = None) -> int:
                     for task_id, reason in marker_report.skipped:
                         print(f"SKIP      {task_id}: {reason}")
                 _watchdog.record_skips(conn, "pr_evidence", tick_id, evidence.skipped)
+                pr_recover = _watchdog.recover_ready_without_open_pr_streaks(
+                    conn, threshold=_watchdog.WatchdogConfig().threshold
+                )
+                for recover_task_id in pr_recover.recovered:
+                    print(f"PR-RECOVER {recover_task_id} -> OPEN")
+                for recover_task_id, reason in pr_recover.refused:
+                    print(f"PR-RECOVER-SKIP {recover_task_id}: {reason}")
                 _watchdog.record_skips(conn, "review", tick_id, report.skipped)
                 _watchdog.record_skips(conn, "review_retry", tick_id, retry_report.skipped)
                 _watchdog.record_skips(conn, "review_marker", tick_id, marker_report.skipped)

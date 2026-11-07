@@ -37,6 +37,14 @@ Three pieces, all data:
   mutates the stalled items themselves: its whole write surface is the
   ledger and the new escalation task. Existing review/merge timers invoke
   it after recording each observation; no extra daemon or unit is needed.
+- :func:`recover_ready_without_open_pr_streaks` — after ``pr_evidence`` has
+  skipped a task with ``no_open_pr_on_task_branch`` for the same consecutive
+  threshold, returns the task to OPEN through
+  ``backlog_recover_stuck_ready_to_review``. That skip means GitHub already
+  has no open PR on the task branch, so the reconciler cannot succeed on the
+  next tick; READY_TO_REVIEW without ``pr`` evidence is the stuck shape 0018
+  was written for. Recovery stops the pr_evidence loop and gives the task a
+  fresh publish attempt instead of paging forever.
 """
 
 from __future__ import annotations
@@ -47,7 +55,11 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+PR_EVIDENCE_NO_OPEN_PR = "no_open_pr_on_task_branch"
+
 __all__ = [
+    "PR_EVIDENCE_NO_OPEN_PR",
+    "PrEvidenceRecoveryReport",
     "StallEpisode",
     "TickSnapshot",
     "WatchdogConfig",
@@ -56,6 +68,7 @@ __all__ = [
     "escalation_task_id",
     "new_tick_id",
     "record_skips",
+    "recover_ready_without_open_pr_streaks",
     "watchdog_once",
 ]
 
@@ -132,6 +145,12 @@ class StallEpisode:
     last_seen_at: datetime
 
 
+@dataclass(slots=True)
+class PrEvidenceRecoveryReport:
+    recovered: list[str] = field(default_factory=list)
+    refused: list[tuple[str, str]] = field(default_factory=list)
+
+
 @dataclass(frozen=True, slots=True)
 class WatchdogConfig:
     #: Consecutive same-reason ticks before a stall is escalated.
@@ -201,6 +220,42 @@ def escalation_task_id(episode: StallEpisode) -> str:
 
     identity = "\0".join((episode.tick_kind,episode.task_id,episode.reason,episode.first_tick_id))
     return f"{episode.task_id}-STALL-{hashlib.sha256(identity.encode()).hexdigest()[:16]}"
+
+
+def recover_ready_without_open_pr_streaks(
+    conn: Any, *, threshold: int = 5
+) -> PrEvidenceRecoveryReport:
+    """Return evidence-free READY_TO_REVIEW tasks to OPEN after a sustained
+    ``no_open_pr_on_task_branch`` streak on the ``pr_evidence`` tick."""
+    if threshold < 1:
+        raise ValueError("threshold must be >= 1")
+    report = PrEvidenceRecoveryReport()
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT DISTINCT s.task_id "
+            "FROM (SELECT DISTINCT ON (tick_kind) tick_kind, tick_id "
+            "        FROM tick_observation "
+            "       WHERE tick_kind = 'pr_evidence' "
+            "       ORDER BY tick_kind, id DESC) latest "
+            "JOIN tick_skip_event s USING (tick_kind, tick_id) "
+            "WHERE s.reason = %s AND s.consecutive_ticks >= %s "
+            "ORDER BY s.task_id",
+            (PR_EVIDENCE_NO_OPEN_PR, threshold),
+        )
+        task_ids = [row[0] for row in cur.fetchall()]
+    for task_id in task_ids:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM backlog_recover_stuck_ready_to_review(%s)",
+                (task_id,),
+            )
+            verdict = cur.fetchone()
+        if verdict and verdict[0]:
+            report.recovered.append(task_id)
+        else:
+            reason = (verdict[1] if verdict and len(verdict) > 1 else "") or "unknown"
+            report.refused.append((task_id, str(reason)))
+    return report
 
 
 def _load_episodes(conn: Any, threshold: int) -> list[StallEpisode]:
