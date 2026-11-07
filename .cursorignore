@@ -1,0 +1,16 @@
+# Cursor indexing exclusions for local environments, caches, and generated output
+.venv/
+.venv-*/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.cache/
+build/
+dist/
+coverage/
+node_modules/
+web/dist/
+web/node_modules/
