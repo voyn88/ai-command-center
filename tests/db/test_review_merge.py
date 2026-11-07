@@ -4017,6 +4017,47 @@ def test_a_task_adopts_only_its_own_branch_never_a_prefix_match(rig, _test_repo_
     assert (task_id, "no_open_pr_on_task_branch") in report.skipped
 
 
+def test_no_open_pr_and_no_remote_branch_recovers_to_open(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+    """READY_TO_REVIEW without `pr` evidence and no origin branch is not
+    reviewable — 0018 returns it to OPEN instead of skipping forever."""
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE2R"
+    _ready_without_pr(store, app_factory, task_id)
+    monkeypatch.setattr(review_merge, "_gh", _fake_pr_list([]))
+    monkeypatch.setattr(
+        review_merge, "_remote_task_branch_sha", lambda _repo, _branch: ("ok", "")
+    )
+
+    report = reconcile_pr_evidence(app_factory, REPO)
+
+    assert report.recovered == [(task_id, "OPEN")]
+    assert store.get_task(task_id)["status"] == "OPEN"
+    assert (task_id, "no_open_pr_on_task_branch") not in report.skipped
+
+
+def test_no_open_pr_but_remote_branch_opens_pr_and_records(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE2P"
+    _ready_without_pr(store, app_factory, task_id)
+    url = "https://github.com/x/repo-d2/pull/910"
+    head = "a" * 40
+    monkeypatch.setattr(review_merge, "_gh", _fake_pr_list([]))
+    monkeypatch.setattr(
+        review_merge, "_remote_task_branch_sha", lambda _repo, _branch: ("ok", head)
+    )
+    monkeypatch.setattr(
+        review_merge,
+        "_create_open_pr_for_task_branch",
+        lambda _repo, _task, _branch, _sha, **_: (url, ""),
+    )
+
+    report = reconcile_pr_evidence(app_factory, REPO)
+
+    assert report.recorded == [(task_id, url)]
+    assert _pr_rows(app_factory, task_id) == [url]
+    assert not report.skipped
+
+
 def test_two_open_prs_on_one_branch_are_refused_rather_than_guessed(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
     app_factory, store, _ = rig
     task_id = "VOYN-W0-PRE3"
