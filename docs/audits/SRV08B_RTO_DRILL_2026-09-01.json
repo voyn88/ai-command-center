@@ -1,0 +1,50 @@
+{
+  "task": "VOYN-W0-AICC-SRV-08B-RTO-UNVERIFIED",
+  "drill_date_utc": "2026-09-01",
+  "purpose": "Independent re-reproduction of the SRV08B_RTO_DRILL_2026-08-27 measurement, run by a second agent from a cold checkout, to confirm the earlier figure was a real measurement rather than an unverifiable claim.",
+  "environment": {
+    "postgresql_version": "PostgreSQL 16.15 (Ubuntu 16.15-0ubuntu0.24.04.1)",
+    "pg_dump_version": "16.15",
+    "pg_restore_version": "16.15",
+    "server_kind": "unprivileged single-user cluster (initdb + pg_ctl, no root, no Docker) via voyn-artifacts/VOYN-W0-AICC-HOSTS-LACK-DB-AND-DOCKER/pg_test_harness.sh, SCRAM auth, loopback only",
+    "repo_head_sha": "ab80048ad3b9a13efdeefaccba483d0e800cfce3"
+  },
+  "dataset": {
+    "description": "Synthetic production-shaped dataset seeded through the aicc_app role after a full bootstrap + migrate provisioning pass (all 14 migrations applied, 55 relations incl. views), bulk-loaded with generate_series rather than row-by-row.",
+    "task_rows": 50000,
+    "session_rows": 50000,
+    "run_rows": 50000,
+    "run_event_rows": 250000,
+    "total_rows_approx": 400000,
+    "live_database_size": "91 MB"
+  },
+  "procedure": {
+    "backup_command": "scripts/aicc_pg_backup.sh --out-dir <dir> --verify",
+    "restore_command": "scripts/aicc_pg_restore.sh --archive <archive> --target-db <side_by_side_db> --measure-out <path>",
+    "restore_jobs": 1,
+    "timed_window": "target database creation (CREATE DATABASE) through the post-restore information_schema.tables count -- the wait an operator experiences during a real recovery. Excludes argument parsing and checksum verification, which precede the timer."
+  },
+  "runs": [
+    {"archive_bytes": 3499436, "restore_elapsed_seconds": 3, "tables_restored": 55},
+    {"archive_bytes": 3499436, "restore_elapsed_seconds": 2, "tables_restored": 55},
+    {"archive_bytes": 3499436, "restore_elapsed_seconds": 3, "tables_restored": 55},
+    {"archive_bytes": 3499436, "restore_elapsed_seconds": 3, "tables_restored": 55}
+  ],
+  "result": {
+    "measured_restore_rto_seconds_range": [2, 3],
+    "variance": "2-3s across 4 consecutive runs at this dataset size, single restore job, single backup archive reused for all 4 restores",
+    "conclusion": "Confirms SRV08B_RTO_DRILL_2026-08-27 order of magnitude (there: 2s flat; here: 2-3s, bash's SECONDS has 1s granularity and this run sat closer to a bucket boundary). Same script, same schema, a different seeded dataset and a different, unprivileged PostgreSQL instance. The restore step is real and reproducible by a second, independent run, not just claimed by the first one."
+  },
+  "reproduction": {
+    "seed_note": "Seeded with a scratch script (not checked into the repository, per the same disposition as the 2026-08-27 drill) bulk-inserting via generate_series as the aicc_app role.",
+    "harness_note": "PostgreSQL provisioned without root or Docker access via voyn-artifacts/VOYN-W0-AICC-HOSTS-LACK-DB-AND-DOCKER/pg_test_harness.sh (start/stop an unprivileged initdb+pg_ctl cluster on a high port), the same harness tests/db/conftest.py assumes via AICC_TEST_PG_ADMIN_DSN.",
+    "steps": [
+      "eval \"$(pg_test_harness.sh start)\"  # exports AICC_TEST_PG_ADMIN_DSN",
+      "bootstrap as the harness superuser, upgrade as aicc_migrator, grant LOGIN passwords",
+      "seed task/session/run/run_event as aicc_app via generate_series bulk inserts",
+      "scripts/aicc_pg_backup.sh --out-dir <dir> --verify",
+      "scripts/aicc_pg_restore.sh --archive <archive> --target-db <side_by_side_db> --measure-out <path>  (x4)",
+      "read elapsed_seconds from each --measure-out JSON"
+    ]
+  }
+}

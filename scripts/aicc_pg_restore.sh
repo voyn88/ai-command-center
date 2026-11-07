@@ -11,9 +11,16 @@
 # The checksum written by aicc_pg_backup.sh is verified before any writes, so a
 # corrupted archive fails while the target database is still empty.
 #
+# The recovery-time window (target creation through the post-restore table
+# count, i.e. the work an operator actually waits on) is timed. `--measure-out`
+# writes that measurement to a JSON file instead of leaving it to scroll off a
+# terminal — an RTO figure nobody can point to an artifact for is a guess, not
+# a measurement.
+#
 # Usage:
 #   scripts/aicc_pg_restore.sh --archive /var/backups/aicc/aicc-...dump \
-#       --target-db aicc_restore_check [--allow-overwrite] [--jobs 4]
+#       --target-db aicc_restore_check [--allow-overwrite] [--jobs 4] \
+#       [--measure-out /path/to/rto.json]
 
 set -euo pipefail
 
@@ -21,9 +28,10 @@ ARCHIVE=""
 TARGET_DB=""
 JOBS="1"
 ALLOW_OVERWRITE=0
+MEASURE_OUT=""
 
 usage() {
-    sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'
     exit "${1:-0}"
 }
 
@@ -33,6 +41,7 @@ while [[ $# -gt 0 ]]; do
         --target-db)       TARGET_DB="${2:?--target-db needs a name}"; shift 2 ;;
         --jobs)            JOBS="${2:?--jobs needs a count}"; shift 2 ;;
         --allow-overwrite) ALLOW_OVERWRITE=1; shift ;;
+        --measure-out)     MEASURE_OUT="${2:?--measure-out needs a path}"; shift 2 ;;
         -h|--help) usage 0 ;;
         *) echo "unknown argument: $1" >&2; usage 1 ;;
     esac
@@ -79,6 +88,11 @@ run_psql() {
         --dbname=postgres --quiet --no-psqlrc --set=ON_ERROR_STOP=1 "$@"
 }
 
+# Timed from here: this is the wait an operator actually experiences during a
+# recovery, not the argument parsing and checksum check before it.
+RTO_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+SECONDS=0
+
 echo "preparing target database ${TARGET_DB}"
 if [[ "$ALLOW_OVERWRITE" == "1" ]]; then
     run_psql --command="DROP DATABASE IF EXISTS \"${TARGET_DB}\" WITH (FORCE);"
@@ -104,10 +118,30 @@ ROWS="$(PGPASSWORD="$AICC_PG_PASSWORD" psql \
     --dbname="$TARGET_DB" --tuples-only --no-align --no-psqlrc \
     --command="SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public';")"
 
+RTO_ELAPSED_SECONDS="$SECONDS"
+
 echo "restore complete: ${TARGET_DB} has ${ROWS} tables in schema public"
 if [[ "$ROWS" -lt 1 ]]; then
     echo "restore produced no tables — treating as failure" >&2
     exit 4
+fi
+
+echo "RTO: ${RTO_ELAPSED_SECONDS}s (target database creation through table-count verification)"
+
+if [[ -n "$MEASURE_OUT" ]]; then
+    cat > "$MEASURE_OUT" <<JSON
+{
+  "started_at": "${RTO_STARTED_AT}",
+  "archive": "${ARCHIVE}",
+  "target_db": "${TARGET_DB}",
+  "host": "${AICC_PG_HOST}",
+  "port": "${PGPORT_VALUE}",
+  "jobs": "${JOBS}",
+  "elapsed_seconds": ${RTO_ELAPSED_SECONDS},
+  "tables_restored": ${ROWS}
+}
+JSON
+    echo "RTO measurement written: ${MEASURE_OUT}"
 fi
 
 # `--no-owner --no-privileges` is what makes the archive portable between

@@ -1,0 +1,49 @@
+{
+  "task": "VOYN-W0-AICC-SRV-08B-RTO-UNVERIFIED",
+  "drill_date_utc": "2026-08-27",
+  "purpose": "Reproduce and measure the recovery time for the aicc_pg_restore.sh drill, which the SRV-07 design cited as ~5.4s without a run artifact.",
+  "environment": {
+    "postgresql_version": "PostgreSQL 16.15 (Ubuntu 16.15-0ubuntu0.24.04.1)",
+    "pg_dump_version": "16.15",
+    "pg_restore_version": "16.15",
+    "server_kind": "standalone cluster (initdb + pg_ctl), scram-sha-256 auth, loopback only",
+    "repo_head_sha": "67a996be26482b6579edc337c75af9e1913c7d56"
+  },
+  "dataset": {
+    "description": "Synthetic production-shaped dataset seeded through the aicc_app role after a full bootstrap + migrate provisioning pass (all 14 migrations applied, 55 relations incl. views).",
+    "task_rows": 50000,
+    "session_rows": 50000,
+    "run_rows": 50000,
+    "run_event_rows": 250000,
+    "total_rows_approx": 400000,
+    "live_database_size": "102 MB"
+  },
+  "procedure": {
+    "backup_command": "scripts/aicc_pg_backup.sh --out-dir <dir> --verify",
+    "restore_command": "scripts/aicc_pg_restore.sh --archive <archive> --target-db <side_by_side_db> --measure-out <path>",
+    "restore_jobs": 1,
+    "timed_window": "target database creation (CREATE DATABASE) through the post-restore information_schema.tables count -- the wait an operator experiences during a real recovery. Excludes argument parsing and checksum verification, which precede the timer."
+  },
+  "runs": [
+    {"archive_bytes": 2514737, "backup_wall_seconds": 0.48, "restore_elapsed_seconds": 2, "tables_restored": 55},
+    {"archive_bytes": 2514756, "backup_wall_seconds": null, "restore_elapsed_seconds": 2, "tables_restored": 55},
+    {"archive_bytes": 2514783, "backup_wall_seconds": null, "restore_elapsed_seconds": 2, "tables_restored": 55},
+    {"archive_bytes": 2514742, "backup_wall_seconds": null, "restore_elapsed_seconds": 2, "tables_restored": 55}
+  ],
+  "result": {
+    "measured_restore_rto_seconds": 2,
+    "variance": "0s across 4 consecutive runs at this dataset size, single restore job",
+    "conclusion": "The restore step of the documented drill is real, reproducible, and completes in ~2s for a ~400k-row / 102MB live database on commodity hardware. This is a measurement at a specific, stated dataset size, not a universal constant -- RTO scales with data volume and pg_restore --jobs. It supersedes the previously unverified ~5.4s figure cited in the SRV-07 design, which had no run artifact behind it."
+  },
+  "reproduction": {
+    "seed_note": "The seeding script used to generate this dataset is a one-off (not checked into the repository); reproduce with any generator that fills task/session/run/run_event via the aicc_app role, or substitute a real staging snapshot.",
+    "steps": [
+      "AICC_PG_USER=postgres ... python -m command_center.db bootstrap",
+      "AICC_PG_USER=aicc_migrator ... python -m command_center.db upgrade",
+      "seed representative data as aicc_app",
+      "scripts/aicc_pg_backup.sh --out-dir <dir> --verify",
+      "scripts/aicc_pg_restore.sh --archive <archive> --target-db <side_by_side_db> --measure-out <path>",
+      "read elapsed_seconds from the JSON written to --measure-out"
+    ]
+  }
+}
