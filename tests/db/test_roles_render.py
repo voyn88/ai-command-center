@@ -317,6 +317,16 @@ def test_the_control_plane_cannot_claim() -> None:
         # 0029: bounded row lock and audited owner decision, no table UPDATE.
         "backlog_owner_lock",
         "backlog_owner_decision",
+        # Native team controls cannot claim work or mint deployment receipts.
+        "delivery_team_sync",
+        "delivery_team_candidates",
+        "delivery_team_dispatch",
+        "delivery_team_ingest",
+        "delivery_team_stage_current",
+        "delivery_team_ready",
+        "delivery_team_accepted",
+        "delivery_team_retry",
+        "delivery_team_record_incident",
         # 0032: durable Grok↔Cursor coordination CAS surface.
         "coordinator_state_read",
         "coordinator_enqueue",
@@ -405,3 +415,10 @@ def test_identity_sequences_match_the_ddl() -> None:
 def test_identifier_guard_rejects_injection(bad: str) -> None:
     with pytest.raises(ValueError, match="not a safe"):
         roles.render_grants(bad)
+
+
+def test_only_operator_can_attest_delivery_release() -> None:
+    release = "delivery_team_record_release(text, bigint, text, text, jsonb, text)"
+    assert release in roles.FUNCTION_PRIVILEGES[roles.OPERATOR_ROLE]
+    assert release not in roles.FUNCTION_PRIVILEGES[roles.APP_ROLE]
+    assert release not in roles.FUNCTION_PRIVILEGES[roles.WORKER_ROLE]

@@ -2295,7 +2295,8 @@ def _remediation_depth(cur: Any, task_id: str) -> int:
 
 
 def _remediate_rejection(
-    factory: Any, task_id: str, pr_url: str, head_sha: str, review_text: str
+    factory: Any, task_id: str, pr_url: str, head_sha: str, review_text: str,
+    *, incident_kind: str = "review_rejection",
 ) -> str | None:
     """On a REJECT verdict: create a new, linked follow-up task instead of
     cycling the rejected task back into its own state machine (0010's
@@ -2311,8 +2312,8 @@ def _remediate_rejection(
     addressable by its own task_id.
 
     Idempotent: if a remediation task already exists for this parent (an
-    earlier tick already handled this exact rejection), returns None and
-    does nothing -- publish_review_verdicts' caller treats that the same as
+    earlier tick already handled this exact rejection), returns None without
+    creating another task; enrolled work still records each distinct incident -- publish_review_verdicts' caller treats that the same as
     "already handled," not as a fresh event to report."""
     from command_center.db.backlog_parser import ParsedTask
     from command_center.db.backlog_store import BacklogStore
@@ -2333,9 +2334,7 @@ def _remediate_rejection(
                     "SELECT 1 FROM backlog_task_remediation WHERE parent_task_id = %s",
                     (task_id,),
                 )
-                if cur.fetchone() is not None:
-                    conn.rollback()
-                    return None
+                already_remediated = cur.fetchone() is not None
 
                 depth = _remediation_depth(cur, task_id)
 
@@ -2349,6 +2348,17 @@ def _remediate_rejection(
                     conn.rollback()
                     return None
                 wave, priority, title, body, repo, revision = row
+
+            _record_delivery_incident(
+                conn, task_id=task_id, revision=revision, repo=repo,
+                pr_url=pr_url, sha=head_sha, detail=review_text, kind=incident_kind,
+            )
+
+            # A linked correction prevents another task, not observation of a
+            # later distinct failure. Keep actual incident evidence durable.
+            if already_remediated:
+                conn.commit()
+                return None
 
             if depth + 1 > MAX_REMEDIATION_DEPTH:
                 # Stop the chain rather than extend it, using the state
@@ -4131,6 +4141,32 @@ def _enqueue_review_refresh(
     return None
 
 
+def _record_delivery_incident(
+    conn: Any, *, task_id: str, revision: int, repo: str,
+    pr_url: str, sha: str, detail: str, kind: str,
+) -> None:
+    """Attach an actual failure to enrolled work in the caller's transaction."""
+    from datetime import UTC
+
+    from command_center.orchestrator.delivery_incidents import record_incident
+    from command_center.orchestrator.delivery_team import enabled
+
+    if not enabled():
+        return
+    with conn.cursor() as cur:
+        cur.execute("SELECT EXISTS(SELECT 1 FROM delivery_team_stage WHERE task_id=%s)", (task_id,))
+        if not cur.fetchone()[0]:
+            return
+    signature = kind + ":" + hashlib.sha256(detail.encode()).hexdigest()
+    if not record_incident(
+        conn, task_id=task_id, revision=revision, repo=repo,
+        run_ref=pr_url, sha=sha, signature=signature, kind=kind,
+        reference=pr_url, observed_at=datetime.now(UTC).isoformat(),
+        detail=detail[:4000],
+    ):
+        raise RuntimeError("delivery incident refused; remediation transaction not committed")
+
+
 def _remediate_merge_blocker(
     factory: Any,
     task_id: str,
@@ -4148,7 +4184,7 @@ def _remediate_merge_blocker(
         "remediation task; the normal review, acceptance and merge gates still "
         "apply to the follow-up."
     )
-    return _remediate_rejection(factory, task_id, pr_url, head, body)
+    return _remediate_rejection(factory, task_id, pr_url, head, body, incident_kind="merge_failure")
 
 
 def _autonomy_window_config(cfg: ReviewConfig) -> PrWindowConfig:

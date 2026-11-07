@@ -116,6 +116,7 @@ class PlanReport:
     idle_trickle: bool = False
     #: Functional candidates held back by the fence this tick (count only).
     fenced: int = 0
+    delivery_team: dict[str, Any] | None = None
 
 
 # Repo → (canonical project_id, worker-host repository path). The worker's
@@ -312,6 +313,16 @@ class Planner:
             report.planner_busy = True
             return report
         try:
+            # The team shares the existing planner lease and execution queue.
+            # Owner-scoped dispatch must never launch unrelated role work.
+            from dataclasses import asdict
+            from command_center.orchestrator import delivery_team
+
+            if delivery_team.enabled() and limits.only_task_id is None:
+                report.delivery_team = asdict(delivery_team.tick(
+                    self._factory, limit=max(1, min(limits.wip_limit, 4)),
+                    timeout_seconds=limits.timeout_seconds,
+                ))
             # Owner dispatch is narrowly scoped; periodic ticks own fleet maintenance.
             if limits.only_task_id is None:
                 # Ingest finished work first (BO-S3): evidence + READY_TO_REVIEW
@@ -492,6 +503,17 @@ class Planner:
                     report.undispatchable.append((task_id, "unknown_repo_route"))
                     continue
                 mode = "split" if _split_requested(self._rows, task_id) else "implement"
+                if delivery_team.enabled():
+                    (revision,) = self._row(
+                        "SELECT revision FROM backlog_task WHERE task_id = %s",
+                        (task_id,),
+                    )
+                    ready, reason = delivery_team.implementation_gate(
+                        self._factory, task_id, revision
+                    )
+                    if not ready:
+                        report.refused.append((task_id, reason))
+                        continue
                 payload, budget = _payload_for(task, limits, route, mode=mode)
                 if mode == "split":
                     report.split_dispatched.append(task_id)

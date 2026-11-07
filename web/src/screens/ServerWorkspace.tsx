@@ -5,13 +5,14 @@ import GlassPanel from '../components/GlassPanel'
 import KpiCard from '../components/KpiCard'
 import NavItem from '../components/NavItem'
 import OwnerTaskActions from '../components/OwnerTaskActions'
+import DeliveryTeamPanel from '../components/DeliveryTeamPanel'
 import { HomeIcon, TasksIcon, ExecutionIcon } from '../components/NavIcons'
 import { fetchBacklog, statusName } from '../lib/backlogApi'
 import type { BacklogSnapshot, BacklogTask } from '../lib/backlogApi'
 import '../theme/serverWorkspace.css'
 
-type Screen = 'home' | 'tasks' | 'execution'
-const initialScreen = (): Screen => window.location.hash === '#tasks' || window.location.search.includes('master_backlog') ? 'tasks' : window.location.hash === '#execution' ? 'execution' : 'home'
+type Screen = 'home' | 'tasks' | 'execution' | 'team'
+const initialScreen = (): Screen => window.location.hash === '#team' ? 'team' : window.location.hash === '#tasks' || window.location.search.includes('master_backlog') ? 'tasks' : window.location.hash === '#execution' ? 'execution' : 'home'
 const priorities: Record<string, string> = { P0: 'Критический', P1: 'Высокий', P2: 'Обычный', P3: 'Низкий' }
 const order: Record<string, number> = { DEFER_TO_USER: 0, IN_PROGRESS: 1, READY_TO_REVIEW: 2, NEEDS_REFINEMENT: 3, OPEN: 4 }
 const displayDate = (value: string) => {
@@ -82,12 +83,14 @@ export default function ServerWorkspace() {
       <NavItem label="Обзор" icon={<HomeIcon />} active={screen === 'home'} onClick={() => navigate('home')} />
       <NavItem label="Задачи" icon={<TasksIcon />} active={screen === 'tasks'} onClick={() => navigate('tasks')} />
       <NavItem label="В работе" icon={<ExecutionIcon />} active={screen === 'execution'} onClick={() => navigate('execution')} />
+      <NavItem label="Команда" icon={<ExecutionIcon />} active={screen === 'team'} onClick={() => navigate('team')} />
     </nav>
     <main>
-      {error && <div role="alert" className="owner-notice">Не удалось обновить данные. {data ? 'Показан последний полученный список.' : 'Попробуйте обновить страницу.'}</div>}
-      {data?.stale && <div role="alert" className="owner-notice">Список давно не обновлялся. Статусы могут быть неактуальны.</div>}
-      {!data && !error && <p role="status">Загружаем серверные задачи…</p>}
-      {data && <>
+      {screen === 'team' && <DeliveryTeamPanel refresh={refresh} />}
+      {screen !== 'team' && error && <div role="alert" className="owner-notice">Не удалось обновить данные. {data ? 'Показан последний полученный список.' : 'Попробуйте обновить страницу.'}</div>}
+      {screen !== 'team' && data?.stale && <div role="alert" className="owner-notice">Список давно не обновлялся. Статусы могут быть неактуальны.</div>}
+      {screen !== 'team' && !data && !error && <p role="status">Загружаем серверные задачи…</p>}
+      {screen !== 'team' && data && <>
         <div className="owner-page-heading"><h1>{screen === 'home' ? 'Обзор разработки' : screen === 'tasks' ? 'Задачи' : 'В работе и на проверке'}</h1><p>Обновлено {displayDate(data.updated_at)} · {data.commands_enabled ? 'Действия доступны в карточках' : 'Только просмотр'}</p></div>
         {screen === 'home' ? <>
           <div className="owner-kpis">

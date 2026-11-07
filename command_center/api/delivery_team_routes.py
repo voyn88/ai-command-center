@@ -1,0 +1,103 @@
+"""Read model for the authenticated owner surface; no public API router.
+
+Only canonical PostgreSQL rows leave this boundary, with an explicit allowlist.
+Role routing is not a completed review, and a recorded SHA is not a merge receipt.
+"""
+from __future__ import annotations
+
+import os
+from datetime import datetime, timezone
+
+from fastapi import HTTPException
+
+from command_center.db import pool
+from native_gateway.redaction import sanitize_value
+
+STAGE_ROLES = {
+    'ba': 'Бизнес-аналитик', 'business_technologist': 'Технолог бизнеса',
+    'architect': 'Главный архитектор', 'qa_plan': 'QA: план проверок',
+    'security': 'Безопасность', 'ux': 'UX/UI', 'cto': 'CTO',
+    'independent_reviewer': 'Независимый ревьюер', 'devops': 'DevOps / SRE',
+    'production_qa': 'QA: production', 'auditor': 'Аудитор процесса',
+    'cto_rca': 'CTO: устранение причин',
+}
+
+
+def _flags() -> tuple[bool, bool]:
+    return (os.environ.get('AICC_DELIVERY_TEAM_ENABLED', '') == '1',
+            os.environ.get('AICC_DELIVERY_TEAM_STOP', '') == '1')
+
+
+def read_team(*, limit: int = 30, offset: int = 0) -> dict:
+    """Read a bounded task page and whole-ledger counts in one DB snapshot."""
+    enabled, stopped = _flags()
+    base = {'source': 'canonical_postgresql', 'read_only': True,
+            'enabled': enabled, 'stopped': stopped,
+            'updated_at': datetime.now(timezone.utc).isoformat(),
+            'limit': limit, 'offset': offset,
+            'roles': [{'stage': stage, 'name': name} for stage, name in STAGE_ROLES.items()]}
+    try:
+        with pool.connection() as conn, conn.transaction(), conn.cursor() as cur:
+            cur.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY')
+            cur.execute("SELECT to_regclass('delivery_team_stage'), "
+                        "to_regprocedure('delivery_team_accepted(text,bigint)'), "
+                        "to_regprocedure('delivery_team_stage_current(text,bigint,text)')")
+            ready = cur.fetchone()
+            if not ready or not all(ready):
+                return {**base, 'available': False, 'reason': 'ledger_unavailable',
+                        'total': None, 'counts': None, 'tasks': []}
+            cur.execute("""
+                WITH current_tasks AS (
+                    SELECT b.task_id, b.revision FROM backlog_task b
+                    WHERE EXISTS (SELECT 1 FROM delivery_team_stage s
+                                  WHERE s.task_id=b.task_id AND s.revision=b.revision)
+                )
+                SELECT count(*), count(*) FILTER (WHERE delivery_team_accepted(t.task_id,t.revision)),
+                    count(*) FILTER (WHERE EXISTS (
+                        SELECT 1 FROM delivery_team_stage s WHERE s.task_id=t.task_id
+                        AND s.revision=t.revision AND s.status='blocked'
+                        AND delivery_team_stage_current(s.task_id,s.revision,s.stage))),
+                    count(*) FILTER (WHERE EXISTS (
+                        SELECT 1 FROM backlog_evidence e WHERE e.task_id=t.task_id AND e.kind='sha'))
+                FROM current_tasks t
+            """)
+            total, accepted, blocked, sha_recorded = cur.fetchone()
+            cur.execute("""
+                SELECT b.task_id,b.title,b.repo,b.revision,b.status,
+                    delivery_team_accepted(b.task_id,b.revision),
+                    (SELECT jsonb_agg(jsonb_build_object(
+                        'stage',s.stage,'status',s.status,'reason',s.reason,
+                        'current',delivery_team_stage_current(s.task_id,s.revision,s.stage),
+                        'updated_at',s.updated_at) ORDER BY s.ordinal)
+                     FROM delivery_team_stage s WHERE s.task_id=b.task_id AND s.revision=b.revision)
+                FROM backlog_task b WHERE EXISTS (
+                    SELECT 1 FROM delivery_team_stage s WHERE s.task_id=b.task_id AND s.revision=b.revision)
+                ORDER BY b.task_id LIMIT %s OFFSET %s
+            """, (limit, offset))
+            rows = cur.fetchall()
+    except pool.PoolNotOpenError:
+        return {**base, 'available': False, 'reason': 'database_unavailable',
+                'total': None, 'counts': None, 'tasks': []}
+    except Exception:
+        # Do not expose SQL, host details, credentials or driver traces.
+        raise HTTPException(503, 'Данные команды временно недоступны') from None
+    tasks = []
+    for task_id, title, repo, revision, backlog_status, is_accepted, stages in rows:
+        assignments = []
+        for stage in stages or []:
+            state = stage['status'] if stage['current'] else 'stale'
+            assignments.append({
+                'stage': stage['stage'], 'role': STAGE_ROLES.get(stage['stage'], 'Неизвестная роль'),
+                'status': state, 'blocker': sanitize_value(str(stage['reason'] or '')) if state == 'blocked' else None,
+                'next_action': {'pending': 'Ожидает назначения', 'queued': 'Ожидает результата исполнителя',
+                                'blocked': 'Разобрать блокер и назначить исправление', 'passed': 'Результат этапа записан',
+                                'stale': 'Повторить оценку изменившихся входных данных'}.get(state, 'Уточнить состояние'),
+                'due_at': None, 'updated_at': stage['updated_at'],
+            })
+        tasks.append({'id': sanitize_value(task_id), 'title': sanitize_value(title or task_id),
+                      'project': sanitize_value(repo or 'Не указан'), 'revision': revision,
+                      'backlog_status': backlog_status, 'merged': None,
+                      'production_accepted': bool(is_accepted), 'assignments': assignments})
+    return {**base, 'available': True, 'reason': None if enabled else 'not_enabled',
+            'total': total, 'counts': {'production_accepted': accepted, 'blocked': blocked,
+                                     'sha_recorded': sha_recorded, 'merged': None}, 'tasks': tasks}
