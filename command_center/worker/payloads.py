@@ -64,6 +64,10 @@ class AgentRunRequest:
     #: BO-S2a: the ordered executor cascade. Empty means "no cascade" — the
     #: pre-cascade single-executor behaviour, byte-for-byte.
     cascade: tuple[dict[str, Any], ...] = ()
+    #: Planner-side FinOps B1 exclusions carried to the worker as data.
+    #: Absent means legacy payload shape (`()`), preserving historical
+    #: override behaviour byte-for-byte.
+    finops_excluded_executors: tuple[str, ...] = ()
     #: The canonical backlog task_id, when the planner sent one (optional so
     #: an older enqueued payload -- pre-dating this field -- still parses).
     #: Threaded through to the publish branch name (`publish.py`:
@@ -164,6 +168,25 @@ def parse_agent_run(payload: dict[str, Any]) -> AgentRunRequest | PayloadError:
             )
         cascade.append(dict(link))
 
+    raw_finops_excluded = payload.get("finops_excluded_executors", [])
+    if not isinstance(raw_finops_excluded, list):
+        return PayloadError(
+            reason=(
+                "finops_excluded_executors must be a list, got "
+                f"{type(raw_finops_excluded).__name__}"
+            )
+        )
+    finops_excluded_executors: list[str] = []
+    for index, executor in enumerate(raw_finops_excluded):
+        if not isinstance(executor, str):
+            return PayloadError(
+                reason=(
+                    "finops_excluded_executors["
+                    f"{index}] must be a string, got {executor!r}"
+                )
+            )
+        finops_excluded_executors.append(executor)
+
     backlog_task_id = _string(payload, "backlog_task_id")
     if backlog_task_id is not None and not _BACKLOG_TASK_ID.fullmatch(backlog_task_id):
         return PayloadError(
@@ -203,6 +226,7 @@ def parse_agent_run(payload: dict[str, Any]) -> AgentRunRequest | PayloadError:
         model=model,
         untrusted=untrusted,
         cascade=tuple(cascade),
+        finops_excluded_executors=tuple(finops_excluded_executors),
         backlog_task_id=backlog_task_id,
         review_head_pr_number=review_head_pr_number,
         review_head_sha=review_head_sha,

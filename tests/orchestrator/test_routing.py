@@ -4,7 +4,15 @@ from __future__ import annotations
 
 from command_center import agent_runner
 from command_center.orchestrator.planner import PlanLimits, _payload_for, repo_route
-from command_center.orchestrator.routing import ROUTING_MATRIX, cascade_for
+from command_center.orchestrator.routing import (
+    BILLING_MODE_API_METERED,
+    BILLING_MODE_SUBSCRIPTION,
+    BILLING_MODE_UNKNOWN,
+    ROUTING_MATRIX,
+    billing_mode_for_executor,
+    cascade_for,
+    metered_executors,
+)
 
 #: The executors the worker can actually run, read from the SAME table the
 #: worker itself gates on (`handlers._run_agent` refuses any executor absent
@@ -100,6 +108,16 @@ def test_every_link_is_an_executor_the_isolated_worker_will_launch():
 
 def test_unknown_task_class_falls_back_to_implementation():
     assert cascade_for("martian") == cascade_for("implementation")
+
+
+def test_owner_billing_mode_table_is_pinned() -> None:
+    assert billing_mode_for_executor("grok") == BILLING_MODE_API_METERED
+    assert billing_mode_for_executor("cursor") == BILLING_MODE_API_METERED
+    assert billing_mode_for_executor("openai_http") == BILLING_MODE_API_METERED
+    assert billing_mode_for_executor("codex") == BILLING_MODE_SUBSCRIPTION
+    assert billing_mode_for_executor("claude") == BILLING_MODE_SUBSCRIPTION
+    assert billing_mode_for_executor("copilot") == BILLING_MODE_UNKNOWN
+    assert list(metered_executors()) == ["cursor", "grok", "openai_http"]
 
 
 def test_default_repo_routes_include_crm_lane(monkeypatch) -> None:

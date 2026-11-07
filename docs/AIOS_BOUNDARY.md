@@ -225,6 +225,23 @@ section below for why it exists at all):
   cascade. Every atomic decision is a SQL function of the store; the package
   owns candidate iteration, the static routing matrix and the plan report,
   and adds no engine capability of its own.
+  `command_center/orchestrator/planner.py` FinOps Budget Gate (owner decision
+  2026-11-07, VOYN-FINOPS-B1; refined in R2/R3) is a recorded exception inside
+  this same SRV orchestration boundary. In this phase it does not read a
+  metered-cost ledger from `run`/`run_event` (that wiring is B2/B3): spend is
+  treated as unknown and the gate fail-closes by filtering metered links from
+  the outgoing planner `cascade`, not by globally rejecting every task.
+  `command_center/worker/handlers.py` applies the same filter only when the
+  planner explicitly marks exclusions in payload
+  `finops_excluded_executors`; legacy payloads without that marker keep the
+  historical owner-profile override behavior unchanged.
+  Why AICC: the current planner/queue/worker dispatch authority is here, and
+  owner decision explicitly fixed Budget Gate placement in AICC for this phase.
+  Boundaries: no new scheduler loop, no provider-credential store, no bypass
+  of `backlog_dispatch`; this is dispatch policy over existing authorities.
+  Convergence condition: move this gate with the same dispatch authority once
+  AIOS exposes the accepted cross-product budget/ledger contract for server
+  orchestration.
   `command_center/orchestrator/coordination.py`
   (VOYN-W0-BACKLOG-ORCHESTRATOR, PR #1077) is a reviewed extension of this
   same SRV composition exception: it requests a bounded advisory ordering of
