@@ -3596,7 +3596,12 @@ def _merged_target_sha(repo_path: str, pr_url: str) -> tuple[str | None, str]:
         data = json.loads(view.stdout or "{}")
     except json.JSONDecodeError:
         return None, "pr_view_failed"
-    if not isinstance(data, dict) or data.get("state") != "MERGED":
+    if not isinstance(data, dict):
+        return None, "pr_view_failed"
+    state = str(data.get("state") or "")
+    if state == "CLOSED":
+        return None, "pr_closed_unmerged"
+    if state != "MERGED":
         return None, "not_merged"
     oid = str((data.get("mergeCommit") or {}).get("oid") or "")
     if not re.fullmatch(r"[0-9a-f]{40}", oid):
@@ -4479,6 +4484,49 @@ def _merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -
             merge_sha, merge_reason = None, "not_merged"
         else:
             merge_sha, merge_reason = _merged_target_sha(repo_path, pr_url)
+        if merge_sha is None and merge_reason == "pr_closed_unmerged":
+            other_pr_rows = _rows(
+                factory,
+                "SELECT 1 FROM backlog_evidence WHERE task_id = %s AND kind = 'pr' AND value <> %s LIMIT 1",
+                (task_id, pr_url),
+            )
+            if other_pr_rows:
+                report.skipped.append((task_id, merge_reason))
+                continue
+            with factory() as conn:
+                conn.autocommit = False
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT revision FROM backlog_task WHERE task_id = %s",
+                            (task_id,),
+                        )
+                        row = cur.fetchone()
+                        if row is None:
+                            conn.rollback()
+                            report.skipped.append((task_id, "task_vanished"))
+                            continue
+                        revision = row[0]
+                        cur.execute(
+                            "SELECT ok, reason FROM backlog_transition(%s, 'REJECTED', %s)",
+                            (task_id, revision),
+                        )
+                        ok, reason = cur.fetchone()
+                    if ok:
+                        conn.commit()
+                        report.skipped.append((task_id, merge_reason))
+                    else:
+                        conn.rollback()
+                        if reason == "illegal_transition":
+                            report.skipped.append((task_id, merge_reason))
+                        else:
+                            report.skipped.append((task_id, f"transition:{reason}"))
+                except Exception:
+                    conn.rollback()
+                    raise
+                finally:
+                    conn.autocommit = True
+            continue
         if merge_sha is None and merge_reason == "merged_without_acceptance_evidence":
             report.skipped.append((task_id, merge_reason))
             continue

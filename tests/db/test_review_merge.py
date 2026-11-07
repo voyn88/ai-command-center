@@ -3028,6 +3028,115 @@ def test_reconcile_skips_an_unresolvable_lookup_instead_of_flagging(rig, monkeyp
     assert report.suspect == []
 
 
+def test_a_closed_unmerged_pr_leaves_ready_to_review_via_rejected_without_remediation(rig, monkeypatch):  # noqa: F811, E501
+    """A PR that is closed without merge is terminal for the parent task: it must
+    leave READY_TO_REVIEW via REJECTED and must not spawn remediation work."""
+    import subprocess as sp
+
+    app_factory, store, _ = rig
+    pr_url = "https://github.com/x/y/pull/32"
+    _ready(store, app_factory, "VOYN-W0-MC", pr_url)
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["pr", "view"]:
+            body = json.dumps({"state": "CLOSED", "mergedAt": None})
+            return sp.CompletedProcess(argv, 0, body, "")
+        return sp.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    assert ("VOYN-W0-MC", "pr_closed_unmerged") in report.skipped
+    assert not report.merged
+
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-MC",))
+        assert cur.fetchone()[0] == "REJECTED"
+        cur.execute("SELECT count(*) FROM backlog_task WHERE task_id=%s", ("VOYN-W0-MC-REM",))
+        assert cur.fetchone()[0] == 0
+
+
+def test_closed_plus_open_pr_leaves_ready_to_review_untouched(rig, monkeypatch):  # noqa: F811
+    import subprocess as sp
+
+    app_factory, store, _ = rig
+    closed_pr = "https://github.com/x/y/pull/320"
+    open_pr = "https://github.com/x/y/pull/321"
+    _ready(store, app_factory, "VOYN-W0-MCO", closed_pr)
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT backlog_record_evidence(%s,'pr',%s)", ("VOYN-W0-MCO", open_pr))
+        c.commit()
+
+    def fake_gh(argv, repo):
+        if argv[:3] == ["api", "repos/x/y/pulls/320"]:
+            return sp.CompletedProcess(argv, 0, json.dumps({"state": "closed", "merged_at": None, "labels": [{"name": "review-window:active"}] }), "")
+        if argv[:3] == ["api", "repos/x/y/pulls/321"]:
+            return sp.CompletedProcess(argv, 0, json.dumps({"state": "open", "merged_at": None, "labels": [{"name": "review-window:active"}] }), "")
+        if argv[:2] == ["pr", "view"] and argv[2] == closed_pr:
+            return sp.CompletedProcess(argv, 0, json.dumps({"state": "CLOSED", "mergedAt": None}), "")
+        return sp.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    assert ("VOYN-W0-MCO", "pr_closed_unmerged") in report.skipped
+    assert len(report.skipped) == 1
+    assert not report.merged
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-MCO",))
+        assert cur.fetchone()[0] == "READY_TO_REVIEW"
+
+
+def test_merged_without_acceptance_leaves_ready_to_review_untouched(rig, monkeypatch):  # noqa: F811
+    import subprocess as sp
+
+    app_factory, store, _ = rig
+    head, merge_oid = "a1" * 20, "b2" * 20
+    pr_url = "https://github.com/x/y/pull/33"
+    _ready(store, app_factory, "VOYN-W0-MX", pr_url)
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["pr", "view"]:
+            body = json.dumps({
+                "state": "MERGED", "mergeCommit": {"oid": merge_oid},
+                "headRefOid": head, "reviews": [],
+                "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}, {"name": "Final merge gate", "conclusion": "SUCCESS"}, {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS"}],
+            })
+            return sp.CompletedProcess(argv, 0, body, "")
+        return sp.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    assert ("VOYN-W0-MX", "merged_without_acceptance_evidence") in report.skipped
+    assert not report.merged
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-MX",))
+        assert cur.fetchone()[0] == "READY_TO_REVIEW"
+
+
+def test_closed_unmerged_repeat_tick_is_idempotent(rig, monkeypatch):  # noqa: F811
+    import subprocess as sp
+
+    app_factory, store, _ = rig
+    pr_url = "https://github.com/x/y/pull/322"
+    _ready(store, app_factory, "VOYN-W0-MCI", pr_url)
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["pr", "view"]:
+            return sp.CompletedProcess(argv, 0, json.dumps({"state": "CLOSED", "mergedAt": None}), "")
+        return sp.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    first = merge_once(app_factory, "/tmp")
+    second = merge_once(app_factory, "/tmp")
+    assert ("VOYN-W0-MCI", "pr_closed_unmerged") in first.skipped
+    assert second.skipped == []
+    assert second.merged == []
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-MCI",))
+        assert cur.fetchone()[0] == "REJECTED"
+        cur.execute("SELECT count(*) FROM backlog_task WHERE task_id=%s", ("VOYN-W0-MCI-REM",))
+        assert cur.fetchone()[0] == 0
+
+
 def test_an_externally_merged_pr_without_acceptance_never_goes_done(rig, monkeypatch):  # noqa: F811, E501
     """Verification of 53c7b52 (CONFIRMED): a PR merged around the queue --
     admin bypass, hand merge -- with no acceptance marker on its merged head
