@@ -533,151 +533,213 @@ def test_daily_spend_budget_gates_new_launches_only(tmp_path, api, fake_claude):
     assert [d.task_id for d in ungated.launched()] == ["s"]
 
 
-def test_daily_spend_usd_tolerates_dict_and_malformed_payloads(tmp_path, monkeypatch, caplog):
+# --------------------------------------------------------------------------
+# `daily_spend_usd`: what it measures, and what it refuses to guess
+# --------------------------------------------------------------------------
+
+
+def _spend_rows(monkeypatch, rows):
+    """Drive `daily_spend_usd` off a fixed row set, bypassing the DB."""
+
+    class _FakeCursor:
+        def fetchall(self):
+            return rows
+
+    class _FakeConn:
+        def execute(self, *_args, **_kwargs):
+            return _FakeCursor()
+
+    @contextlib.contextmanager
+    def _fake_connect(_db_path):
+        yield _FakeConn()
+
+    monkeypatch.setattr(task_pipeline.runtime_db, "connect", _fake_connect)
+
+
+def test_daily_spend_usd_sums_dict_and_text_payloads(tmp_path, monkeypatch):
     """A `jsonb`-backed read (the PostgreSQL mirror, VOYN-W0-AICC-SRV-01B) hands
     back a `payload` that is already a decoded `dict`, not JSON text, and
     `json.loads(dict)` raises `TypeError`. A prior version caught `TypeError`
     alongside `ValueError` and silently `continue`d — every row in the batch
     was dropped with no error and no log line, so the spend cap read 0 and
-    stopped gating without ever saying so. A dict-shaped row must be summed
-    like any other, and a genuinely malformed JSON-text row must be skipped
-    *and logged*, without knocking out the well-formed rows around it."""
-
-    class _FakeCursor:
-        def __init__(self, rows):
-            self._rows = rows
-
-        def fetchall(self):
-            return self._rows
-
-    class _FakeConn:
-        def __init__(self, rows):
-            self._rows = rows
-
-        def execute(self, *_args, **_kwargs):
-            return _FakeCursor(self._rows)
-
-    rows = [
+    stopped gating without ever saying so (VOYN-W0-AICC-SPEND-CAP-ZERO). Both
+    shapes must be summed, and a row that merely mentions the column without
+    carrying a cost of its own contributes nothing rather than blowing up."""
+    _spend_rows(
+        monkeypatch,
+        [
         {"payload": '{"type": "result", "total_cost_usd": 2.0}'},
         {"payload": {"type": "result", "total_cost_usd": 3.5}},
+        {"payload": __import__("types").MappingProxyType(
+            {"type": "result", "total_cost_usd": 0.25}
+        )},
+        {"payload": {"type": "log", "text": "total_cost_usd not reported yet"}},
+        ],
+    )
+
+    assert task_pipeline.daily_spend_usd(tmp_path / "runtime.db") == pytest.approx(5.75)
+
+
+def test_daily_spend_usd_returns_zero_for_an_empty_window(tmp_path, monkeypatch):
+    """"No cost data" is NOT an exception: a migrated/empty database measures
+    `0.0` — nothing was spent. This is the state the old caller's `except
+    Exception: spend = ceiling` comment claimed to be handling, and it does
+    not reach the caller at all."""
+    _spend_rows(monkeypatch, [])
+
+    assert task_pipeline.daily_spend_usd(tmp_path / "runtime.db") == 0.0
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
         {"payload": "{not valid json"},
-    ]
-
-    @contextlib.contextmanager
-    def _fake_connect(_db_path):
-        yield _FakeConn(rows)
-
-    monkeypatch.setattr(task_pipeline.runtime_db, "connect", _fake_connect)
-
-    with caplog.at_level("WARNING"):
-        total = task_pipeline.daily_spend_usd(tmp_path / "runtime.db")
-
-    assert total == pytest.approx(5.5)
-    assert "unparseable" in caplog.text
-
-
-def test_daily_spend_usd_skips_valid_json_that_is_not_an_object(tmp_path, monkeypatch, caplog):
-    """Regression for VOYN-W0-AICC-SPEND-CAP-NONDICT-JSON: `.get` must not run
-    on a non-dict payload.
-
-    Two realistic sources of non-dict values reach this loop:
-
-    * SQLite JSON *text* that still matches `LIKE '%total_cost_usd%'` — e.g.
-      `'[{"total_cost_usd": 1}]'` or `'"…total_cost_usd…"'`. Bare scalars like
-      `'42'` / `'true'` / `'null'` are *not* selected by that predicate; they
-      are exercised here as already-decoded jsonb values instead.
-    * A `jsonb` read that hands back a decoded list/str/int/bool/null
-      directly (no `json.loads` step).
-
-    The `isinstance(payload, dict)` guard from #418 (SPEND-CAP-ZERO) skips
-    each of those shapes with a "not an object" warning; a well-formed object
-    row in the same batch must still contribute to the sum.
-    """
-
-    class _FakeCursor:
-        def __init__(self, rows):
-            self._rows = rows
-
-        def fetchall(self):
-            return self._rows
-
-    class _FakeConn:
-        def __init__(self, rows):
-            self._rows = rows
-
-        def execute(self, *_args, **_kwargs):
-            return _FakeCursor(self._rows)
-
-    rows = [
-        # LIKE-matching JSON text → list / str after loads
+        {"payload": "[1, 2, 3]"},
         {"payload": '[{"total_cost_usd": 1}]'},
         {"payload": '"total_cost_usd"'},
-        # Already-decoded jsonb scalars/collections (no LIKE text involved)
         {"payload": [{"total_cost_usd": 9}]},
-        {"payload": 42},
         {"payload": True},
         {"payload": False},
         {"payload": None},
-        {"payload": '{"type": "result", "total_cost_usd": 2.0}'},
-    ]
-
-    @contextlib.contextmanager
-    def _fake_connect(_db_path):
-        yield _FakeConn(rows)
-
-    monkeypatch.setattr(task_pipeline.runtime_db, "connect", _fake_connect)
-
-    with caplog.at_level("WARNING"):
-        total = task_pipeline.daily_spend_usd(tmp_path / "runtime.db")
-
-    assert total == pytest.approx(2.0)
-    assert caplog.text.count("not an object") == 7
-    for shape in ("list", "str", "int", "bool", "NoneType"):
-        assert shape in caplog.text
-
-
-def test_daily_spend_usd_skips_like_matching_list_payload_in_sqlite(tmp_path, api, caplog):
-    """End-to-end on the live SQLite path: one `run_event` whose payload_json
-    is the LIKE-matching array `[{"total_cost_usd": 1}]` must be skipped (and
-    logged), not raise AttributeError, while a sibling object row still sums.
-    """
-    task = runtime_db.create_task(
-        api.db_path, project="AIOS", title="nondict-payload", task_type="implementation"
+        {"payload": 17},
+        {"payload": {"type": "result", "total_cost_usd": "1.50"}},
+        {"payload": {"type": "result", "total_cost_usd": None}},
+        {"payload": {"type": "result", "total_cost_usd": True}},
+        {"payload": {"type": "result", "total_cost_usd": float("nan")}},
+        {"payload": {"type": "result", "total_cost_usd": float("inf")}},
+    ],
+)
+def test_daily_spend_usd_raises_on_a_cost_event_it_cannot_read(tmp_path, monkeypatch, row):
+    """A row that claims a cost but cannot be read as one makes the whole sum
+    an undercount of unknown size. Skipping it returns a number the caller
+    cannot distinguish from a cheap day — in a money gate that is real money.
+    NaN is the worst of them: `(projected + nan) > ceiling` is False, i.e. a
+    silent fail-*open* inside the cap itself."""
+    _spend_rows(
+        monkeypatch,
+        [{"payload": '{"type": "result", "total_cost_usd": 2.0}'}, row],
     )
-    session = runtime_db.create_session(
-        api.db_path, task_id=task["id"], project="AIOS", repository_path="/tmp/x"
-    )
-    odd = runtime_db.create_run(
-        api.db_path, session_id=session["id"], task_id=task["id"],
-        project="AIOS", task_type="implementation", repository_path="/tmp/x",
-        prompt="odd", is_resume=False,
-    )
-    good = runtime_db.create_run(
-        api.db_path, session_id=session["id"], task_id=task["id"],
-        project="AIOS", task_type="implementation", repository_path="/tmp/x",
-        prompt="good", is_resume=False,
-    )
-    now = models.iso_now()
-    with runtime_db.connect(api.db_path) as conn:
-        with runtime_db.transaction(conn):
-            conn.execute(
-                """INSERT INTO run_event (run_id, seq, event_type, payload_json, created_at)
-                   VALUES (?, 1, 'stream_event', ?, ?)""",
-                (odd["id"], '[{"total_cost_usd": 1}]', now),
-            )
-            conn.execute(
-                """INSERT INTO run_event (run_id, seq, event_type, payload_json, created_at)
-                   VALUES (?, 1, 'stream_event', ?, ?)""",
-                (good["id"], '{"type": "result", "total_cost_usd": 2.0}', now),
-            )
-            conn.execute(
-                "UPDATE run SET state='COMPLETED', completed_at=? WHERE id IN (?, ?)",
-                (now, odd["id"], good["id"]),
-            )
 
-    with caplog.at_level("WARNING"):
-        total = task_pipeline.daily_spend_usd(api.db_path)
+    with pytest.raises(task_pipeline.SpendUnknownError) as excinfo:
+        task_pipeline.daily_spend_usd(tmp_path / "runtime.db")
 
-    assert total == pytest.approx(2.0)
-    assert "not an object" in caplog.text
-    assert "list" in caplog.text
+    assert excinfo.value.kind == task_pipeline.SPEND_UNKNOWN_CORRUPT_COST_EVENT
+
+
+def test_daily_spend_usd_raises_when_the_store_is_unavailable(tmp_path, monkeypatch):
+    """A DB outage yields no sum at all — and says so with its own kind, so a
+    caller can tell "the store is down" from "a row is corrupt"."""
+
+    def _boom(_db_path):
+        raise OSError("database is locked")
+
+    monkeypatch.setattr(task_pipeline.runtime_db, "connect", _boom)
+
+    with pytest.raises(task_pipeline.SpendUnknownError) as excinfo:
+        task_pipeline.daily_spend_usd(tmp_path / "runtime.db")
+
+    assert excinfo.value.kind == task_pipeline.SPEND_UNKNOWN_STORAGE_UNAVAILABLE
+    assert isinstance(excinfo.value.__cause__, OSError)
+
+
+def test_tick_reports_an_unreadable_spend_as_unknown_not_as_the_cap_being_hit(
+    tmp_path, api, fake_claude, monkeypatch
+):
+    """The defect this task exists for: `except Exception: spend = ceiling`
+    turned one corrupt row into `daily_spend_budget_exhausted` — "the cap was
+    reached", a measurement nobody took — and stopped the whole dispatcher
+    under a label that reads as normal, expected operation. The tick must
+    still refuse to launch (fail closed: an overspend is irreversible), but
+    under its own reason, with the failure recorded."""
+    pipeline_settings.save_settings(
+        tmp_path,
+        PipelineSettings(
+            enabled=True, auto_launch=True, max_daily_spend_usd=1.0,
+            max_global_concurrency=2, max_agent_concurrency=2,
+        ),
+    )
+    _remote, _work = _project_repo(tmp_path, "AIOS", "proj-u")
+    wt = tmp_path / "wt" / "u"
+    task = _task("u", "AIOS", wt, branch="task/u")
+    tasks_repository.save_tasks(tmp_path, [task])
+    execution_queue.enqueue_and_persist(tmp_path, task, {"u": task})
+    configs = project_config.load_project_configs()
+
+    def _corrupt(*_a, **_k):
+        raise task_pipeline.SpendUnknownError(
+            task_pipeline.SPEND_UNKNOWN_CORRUPT_COST_EVENT, "unparseable payload_json"
+        )
+
+    monkeypatch.setattr(task_pipeline, "daily_spend_usd", _corrupt)
+
+    result = task_pipeline.tick(
+        tmp_path, api, configs, github=FakeGitHubClient(), advance_wait_seconds=60
+    )
+
+    assert result.launched() == []
+    assert result.launch_status == task_pipeline.LAUNCH_SPEND_UNKNOWN
+    assert result.launch_status != task_pipeline.LAUNCH_BUDGET_EXHAUSTED
+    assert any("daily_spend_budget" in err for err in result.errors)
+
+
+def test_tick_lets_a_bug_in_the_spend_read_fly_rather_than_calling_it_a_budget_verdict(
+    tmp_path, api, fake_claude, monkeypatch
+):
+    """`except Exception` also caught `AttributeError`, `KeyError` and a typo
+    in the call — bugs, silently converted into "budget exhausted". Only the
+    typed signal is handled now; anything else propagates."""
+    pipeline_settings.save_settings(
+        tmp_path,
+        PipelineSettings(
+            enabled=True, auto_launch=True, max_daily_spend_usd=1.0,
+            max_global_concurrency=2, max_agent_concurrency=2,
+        ),
+    )
+    _remote, _work = _project_repo(tmp_path, "AIOS", "proj-b")
+    wt = tmp_path / "wt" / "b"
+    task = _task("b", "AIOS", wt, branch="task/b")
+    tasks_repository.save_tasks(tmp_path, [task])
+    execution_queue.enqueue_and_persist(tmp_path, task, {"b": task})
+    configs = project_config.load_project_configs()
+
+    def _bug(*_a, **_k):
+        raise AttributeError("'NoneType' object has no attribute 'db_path'")
+
+    monkeypatch.setattr(task_pipeline, "daily_spend_usd", _bug)
+
+    with pytest.raises(AttributeError):
+        task_pipeline.tick(
+            tmp_path, api, configs, github=FakeGitHubClient(), advance_wait_seconds=60
+        )
+
+
+def test_tick_never_measures_the_spend_when_no_ceiling_is_configured(
+    tmp_path, api, fake_claude, monkeypatch
+):
+    """With `max_daily_spend_usd <= 0` (the default) there is no ceiling, so
+    the spend is not read at all — a DB outage or a corrupt cost event cannot
+    stop dispatch in a configuration where nothing would gate on the figure."""
+    pipeline_settings.save_settings(
+        tmp_path,
+        PipelineSettings(
+            enabled=True, auto_launch=True, max_daily_spend_usd=0.0,
+            max_global_concurrency=2, max_agent_concurrency=2,
+        ),
+    )
+    _remote, _work = _project_repo(tmp_path, "AIOS", "proj-n")
+    wt = tmp_path / "wt" / "n"
+    task = _task("n", "AIOS", wt, branch="task/n")
+    tasks_repository.save_tasks(tmp_path, [task])
+    execution_queue.enqueue_and_persist(tmp_path, task, {"n": task})
+    configs = project_config.load_project_configs()
+
+    def _never(*_a, **_k):
+        raise AssertionError("the spend must not be measured without a ceiling")
+
+    monkeypatch.setattr(task_pipeline, "daily_spend_usd", _never)
+
+    result = task_pipeline.tick(
+        tmp_path, api, configs, github=FakeGitHubClient(), advance_wait_seconds=60
+    )
+
+    assert [d.task_id for d in result.launched()] == ["n"]
