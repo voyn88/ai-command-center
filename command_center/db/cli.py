@@ -653,6 +653,7 @@ def main(argv: list[str] | None = None) -> int:
                 from command_center.orchestrator.review_merge import (
                     publish_review_verdicts,
                     reconcile_pr_evidence,
+                    recover_ready_without_open_pr,
                     reconcile_review_once,
                     review_once,
                 )
@@ -666,6 +667,16 @@ def main(argv: list[str] | None = None) -> int:
                 # and the identity is resolved once, here, rather than four
                 # times (VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS).
                 with gh_access.tick(args.repo_path) as quota:
+                    # Evidence-free READY_TO_REVIEW with no open PR on the task
+                    # branch cannot be adopted and will never review; 0018 sends
+                    # them back to OPEN for publish before this tick stalls.
+                    recovered = recover_ready_without_open_pr(
+                        lambda: _nc(conn), args.repo_path, task_id=args.task_id
+                    )
+                    for recover_task_id, reason in recovered.recovered:
+                        print(f"PR-RECOVER {recover_task_id}: {reason}")
+                    for recover_task_id, reason in recovered.skipped:
+                        print(f"PR-RECOVER-SKIP {recover_task_id}: {reason}")
                     # Before selecting anything: a task whose PR exists but
                     # was never recorded is invisible to every gate
                     # downstream. This derives that evidence from the task's

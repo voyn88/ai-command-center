@@ -19,6 +19,7 @@ from command_center.orchestrator.review_merge import (
     reconcile_merge_evidence,
     reconcile_pr_evidence,
     reconcile_pr_window,
+    recover_ready_without_open_pr,
     review_once,
 )
 from tests.db.test_backlog_planner import (  # noqa: F401 — pytest fixtures
@@ -3976,6 +3977,39 @@ def _fake_pr_list(entries, *, returncode=0, stdout=None):
         return sp.CompletedProcess(argv, 1, "", "unexpected gh call")
 
     return fake_gh
+
+
+def test_recover_ready_without_open_pr_returns_task_to_open(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE-RECOVER"
+    _ready_without_pr(store, app_factory, task_id)
+    monkeypatch.setattr(review_merge, "_gh", _fake_pr_list([]))
+
+    recover = recover_ready_without_open_pr(app_factory, REPO)
+
+    assert recover.recovered == [(task_id, "OPEN")]
+    assert store.get_task(task_id)["status"] == "OPEN"
+    evidence = reconcile_pr_evidence(app_factory, REPO)
+    assert all(entry[0] != task_id for entry in evidence.skipped)
+
+
+def test_recover_ready_without_open_pr_leaves_adoptable_prs_alone(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE-KEEP"
+    _ready_without_pr(store, app_factory, task_id)
+    url = "https://github.com/x/repo-d2/pull/910"
+    monkeypatch.setattr(
+        review_merge,
+        "_gh",
+        _fake_pr_list([{"url": url, "headRefName": f"backlog/{task_id}"}]),
+    )
+
+    recover = recover_ready_without_open_pr(app_factory, REPO)
+
+    assert recover.recovered == []
+    assert store.get_task(task_id)["status"] == "READY_TO_REVIEW"
+    evidence = reconcile_pr_evidence(app_factory, REPO)
+    assert (task_id, url) in evidence.recorded
 
 
 def test_an_open_pr_on_the_task_branch_becomes_evidence(rig, _test_repo_routes, monkeypatch):  # noqa: F811

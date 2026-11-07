@@ -248,11 +248,113 @@ class PrEvidenceReport:
     skipped: list[tuple[str, str]] = field(default_factory=list)
 
 
+@dataclass
+class RecoverReadyWithoutOpenPrReport:
+    """See `recover_ready_without_open_pr`."""
+
+    #: (task_id, recover_verdict_reason) moved READY_TO_REVIEW -> OPEN via 0018.
+    recovered: list[tuple[str, str]] = field(default_factory=list)
+    #: (task_id, reason) examined but left READY_TO_REVIEW (refused or lookup failed).
+    skipped: list[tuple[str, str]] = field(default_factory=list)
+
+
 #: Branch naming contract. `publish_run` pushes `backlog/<task id>` and nothing
 #: else does, so the branch name is a derivable fact about a task rather than a
 #: convention this function invents.
 def _task_branch(task_id: str) -> str:
     return f"backlog/{task_id}"
+
+
+def _ready_without_pr_rows(
+    factory: Any, *, task_id: str | None, limit: int
+) -> list[tuple[str, str | None]]:
+    if task_id is not None:
+        return _rows(
+            factory,
+            "SELECT t.task_id, t.repo FROM backlog_task t "
+            "WHERE t.status = 'READY_TO_REVIEW' AND t.task_id = %s "
+            "AND NOT EXISTS (SELECT 1 FROM backlog_evidence e "
+            "WHERE e.task_id = t.task_id AND e.kind = 'pr')",
+            (task_id,),
+        )
+    return _rows(
+        factory,
+        "SELECT t.task_id, t.repo FROM backlog_task t "
+        "WHERE t.status = 'READY_TO_REVIEW' "
+        "AND NOT EXISTS (SELECT 1 FROM backlog_evidence e "
+        "WHERE e.task_id = t.task_id AND e.kind = 'pr') "
+        "ORDER BY t.task_id LIMIT %s",
+        (limit,),
+    )
+
+
+def recover_ready_without_open_pr(
+    factory: Any,
+    repo_path: str,
+    *,
+    task_id: str | None = None,
+    limit: int = 25,
+) -> RecoverReadyWithoutOpenPrReport:
+    """Return evidence-free READY_TO_REVIEW tasks with no adoptable open PR to OPEN.
+
+    `reconcile_pr_evidence` is reporting-only: when GitHub has no open pull
+    request whose head is exactly `backlog/<task id>`, it skips with
+    `no_open_pr_on_task_branch` forever. That skip is correct — there is
+    nothing to adopt — but a task sitting in READY_TO_REVIEW without `pr`
+    evidence is not reviewable either (0011 / every downstream gate). The
+    sanctioned exit is `backlog_recover_stuck_ready_to_review` (0018): move
+    the task to OPEN so dispatch and `publish_run` can run again.
+
+    Measured live 2026-11-04: `VOYN-W0-AICC-PARITY-QUERY-EQUIVALENCE` repeated
+    that skip for five consecutive pr_evidence ticks until the tick-stall
+    watchdog escalated — not because adoption was wrong, but because nothing
+    in the tick ever moved the task back onto the publish path. This runs
+    immediately before `reconcile_pr_evidence` on the same candidate set and
+    the same branch lookup, so a task about to stall is recovered in the same
+    tick rather than after five identical skips.
+
+    Transient `pr_list_failed` skips are not recovered: without a successful
+    lookup the absence of an open PR is not proven.
+    """
+    from command_center.orchestrator.planner import repo_route
+
+    report = RecoverReadyWithoutOpenPrReport()
+    for row_task_id, repo in _ready_without_pr_rows(
+        factory, task_id=task_id, limit=limit
+    ):
+        if not repo:
+            report.skipped.append((row_task_id, "no_repo_on_task"))
+            continue
+        if repo_route(repo) is None:
+            report.skipped.append((row_task_id, f"no_repo_route: {repo!r}"))
+            continue
+        branch = _task_branch(row_task_id)
+        decoded, failure = _open_pulls_for_branch(repo_path, branch)
+        if decoded is None:
+            report.skipped.append((row_task_id, failure))
+            continue
+        matches = [
+            entry
+            for entry in decoded
+            if isinstance(entry, dict)
+            and entry.get("headRefName") == branch
+            and isinstance(entry.get("url"), str)
+            and entry["url"]
+        ]
+        if matches:
+            continue
+        with factory() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM backlog_recover_stuck_ready_to_review(%s)",
+                (row_task_id,),
+            )
+            verdict = cur.fetchone()
+        if verdict and verdict[0]:
+            report.recovered.append((row_task_id, str(verdict[1] or "granted")))
+        else:
+            reason = (verdict[1] if verdict and len(verdict) > 1 else "") or "unknown"
+            report.skipped.append((row_task_id, f"recover_refused: {reason}"))
+    return report
 
 
 def reconcile_pr_evidence(
@@ -305,26 +407,9 @@ def reconcile_pr_evidence(
     from command_center.orchestrator.planner import repo_route
 
     report = PrEvidenceReport()
-    if task_id is not None:
-        rows = _rows(
-            factory,
-            "SELECT t.task_id, t.repo FROM backlog_task t "
-            "WHERE t.status = 'READY_TO_REVIEW' AND t.task_id = %s "
-            "AND NOT EXISTS (SELECT 1 FROM backlog_evidence e "
-            "WHERE e.task_id = t.task_id AND e.kind = 'pr')",
-            (task_id,),
-        )
-    else:
-        rows = _rows(
-            factory,
-            "SELECT t.task_id, t.repo FROM backlog_task t "
-            "WHERE t.status = 'READY_TO_REVIEW' "
-            "AND NOT EXISTS (SELECT 1 FROM backlog_evidence e "
-            "WHERE e.task_id = t.task_id AND e.kind = 'pr') "
-            "ORDER BY t.task_id LIMIT %s",
-            (limit,),
-        )
-    for row_task_id, repo in rows:
+    for row_task_id, repo in _ready_without_pr_rows(
+        factory, task_id=task_id, limit=limit
+    ):
         if not repo:
             report.skipped.append((row_task_id, "no_repo_on_task"))
             continue
