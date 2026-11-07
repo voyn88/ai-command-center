@@ -21,10 +21,6 @@ from command_center.orchestrator.review_merge import (
     reconcile_pr_window,
     review_once,
 )
-from tests.db.test_backlog_planner import (  # noqa: F401 — pytest fixtures
-    _test_repo_routes,
-    rig,
-)
 
 # `rig` provisions cluster-level roles (aicc_migrator, aicc_worker, ...) that
 # every xdist worker's database shares; running these tests under xdist
@@ -33,7 +29,10 @@ from tests.db.test_backlog_planner import (  # noqa: F401 — pytest fixtures
 # shared catalog rows (VOYN-W0-AICC-FLAKE-RIG-ROLE-SETUP-CONCURRENT-UPDATE).
 # `tests/db/test_backlog_planner.py`, `rig`'s home module, already opts out of
 # xdist this way; every other module that borrows `rig` must do the same.
-pytestmark = [pytest.mark.serial, pytest.mark.usefixtures("role_passwords")]
+pytestmark = [
+    pytest.mark.serial,
+    pytest.mark.usefixtures("role_passwords", "_test_repo_routes"),
+]
 
 BASE = "c" * 40
 DIFF = "diff --git a/x b/x\n+hi\n"
@@ -239,7 +238,7 @@ def _done(store, factory, task_id, pr, sha):
         c.commit()
 
 
-def test_review_enqueues_one_run_per_ready_task(rig, _test_repo_routes, monkeypatch):  # noqa: F811
+def test_review_enqueues_one_run_per_ready_task(rig, _test_repo_routes, monkeypatch):
 
     app_factory, store, _ = rig
     _ready(store, app_factory, "VOYN-W0-R1", "https://github.com/x/repo-d2/pull/7")
@@ -301,7 +300,7 @@ def test_review_enqueues_one_run_per_ready_task(rig, _test_repo_routes, monkeypa
     assert payload["repository_path"] == "/srv/repo-d2"
 
 
-def test_review_skips_a_pr_whose_repo_has_no_route(rig):  # noqa: F811
+def test_review_skips_a_pr_whose_repo_has_no_route(rig):
     app_factory, store, _ = rig
     _ready(store, app_factory, "VOYN-W0-R2", "https://github.com/x/unrouted-repo/pull/9")
     calls = []
@@ -317,7 +316,7 @@ def test_review_skips_a_pr_whose_repo_has_no_route(rig):  # noqa: F811
     )
 
 
-def test_review_skips_when_the_diff_fetch_fails(rig, _test_repo_routes, monkeypatch):  # noqa: F811
+def test_review_skips_when_the_diff_fetch_fails(rig, _test_repo_routes, monkeypatch):
     app_factory, store, _ = rig
     _ready(store, app_factory, "VOYN-W0-R3", "https://github.com/x/repo-d2/pull/12")
 
@@ -339,7 +338,7 @@ def test_review_skips_when_the_diff_fetch_fails(rig, _test_repo_routes, monkeypa
     )
 
 
-def test_review_skips_prs_outside_the_active_review_window(rig, _test_repo_routes, monkeypatch):  # noqa: F811,E501
+def test_review_skips_prs_outside_the_active_review_window(rig, _test_repo_routes, monkeypatch):  # noqa: E501
     """The review tick must honor the cheap PR-window triage before fetching
     diffs for the backlog tail."""
     app_factory, store, _ = rig
@@ -382,7 +381,7 @@ def test_review_skips_prs_outside_the_active_review_window(rig, _test_repo_route
     assert gh_calls == [["api", "repos/x/repo-d2/pulls/112"]]
 
 
-def test_review_chunks_a_diff_over_the_single_prompt_cap(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+def test_review_chunks_a_diff_over_the_single_prompt_cap(rig, _test_repo_routes, monkeypatch):  # noqa: E501
     app_factory, store, _ = rig
     _ready(store, app_factory, "VOYN-W0-R4", "https://github.com/x/repo-d2/pull/13")
     head = "e" * 40
@@ -426,7 +425,7 @@ def test_review_chunks_a_diff_over_the_single_prompt_cap(rig, _test_repo_routes,
     assert ("VOYN-W0-R4", "https://github.com/x/repo-d2/pull/13") in report.reviewed
 
 
-def test_merge_requires_accept_marker_and_green_checks(rig, monkeypatch):  # noqa: F811
+def test_merge_requires_accept_marker_and_green_checks(rig, monkeypatch):
 
     app_factory, store, _ = rig
     _ready(store, app_factory, "VOYN-W0-M1", "https://github.com/x/y/pull/8")
@@ -474,7 +473,7 @@ def test_merge_requires_accept_marker_and_green_checks(rig, monkeypatch):  # noq
         assert cur.fetchone()[0] == merge_oid
 
 
-def test_merge_skips_prs_outside_the_active_review_window(rig, monkeypatch):  # noqa: F811,E501
+def test_merge_skips_prs_outside_the_active_review_window(rig, monkeypatch):  # noqa: E501
     """The merge tick must honor the cheap PR-window triage before spending
     GraphQL detail reads on a READY_TO_REVIEW backlog tail."""
     import subprocess as sp
@@ -513,7 +512,7 @@ def test_merge_skips_prs_outside_the_active_review_window(rig, monkeypatch):  # 
         assert cur.fetchone()[0] == "READY_TO_REVIEW"
 
 
-def test_merge_skips_a_self_issued_marker_from_the_pr_author(rig, monkeypatch):  # noqa: F811
+def test_merge_skips_a_self_issued_marker_from_the_pr_author(rig, monkeypatch):
     """VOYN-W0-AICC-MARKER-REVIEWER-INDEPENDENCE: a marker whose reviewer
     login is the SAME as the PR's own author must not authorize merge --
     live-confirmed as a real gap on PRs #354/#355, both merged by the
@@ -540,7 +539,7 @@ def test_merge_skips_a_self_issued_marker_from_the_pr_author(rig, monkeypatch): 
         assert cur.fetchone()[0] == "READY_TO_REVIEW"
 
 
-def test_merge_skips_a_self_issued_marker_that_only_differs_by_login_case(rig, monkeypatch):  # noqa: F811, E501
+def test_merge_skips_a_self_issued_marker_that_only_differs_by_login_case(rig, monkeypatch):  # noqa: E501
     """GitHub logins are case-insensitive -- `Dimastov-Lab` and
     `dimastov-lab` are the same account. An exact-string comparison would
     let a same-account marker through whenever the PR author and the
@@ -569,7 +568,7 @@ def test_merge_skips_a_self_issued_marker_that_only_differs_by_login_case(rig, m
         assert cur.fetchone()[0] == "READY_TO_REVIEW"
 
 
-def test_merge_accepts_a_marker_from_a_reviewer_login_distinct_from_the_author(rig, monkeypatch):  # noqa: F811, E501
+def test_merge_accepts_a_marker_from_a_reviewer_login_distinct_from_the_author(rig, monkeypatch):  # noqa: E501
     """The positive case of the same check: a genuinely independent
     reviewer login (the acceptance bot's, in production) does authorize
     merge."""
@@ -619,7 +618,7 @@ def test_merge_accepts_a_marker_from_a_reviewer_login_distinct_from_the_author(r
     assert ("VOYN-W0-M1C", merge_oid) in report.merged
 
 
-def test_merge_now_requires_the_acceptance_check_itself_green(rig, monkeypatch):  # noqa: F811
+def test_merge_now_requires_the_acceptance_check_itself_green(rig, monkeypatch):
     """The `"cceptance" not in name` exclusion is gone: a red Acceptance
     gate check blocks merge like any other required check, now that the
     bot behind it is reconnected and the check can genuinely reflect an
@@ -652,7 +651,7 @@ def test_merge_now_requires_the_acceptance_check_itself_green(rig, monkeypatch):
     )
 
 
-def test_merge_skips_without_marker(rig, monkeypatch):  # noqa: F811
+def test_merge_skips_without_marker(rig, monkeypatch):
 
     app_factory, store, _ = rig
     _ready(store, app_factory, "VOYN-W0-M2", "https://github.com/x/y/pull/9")
@@ -674,7 +673,7 @@ def test_merge_skips_without_marker(rig, monkeypatch):  # noqa: F811
 
 
 def test_merge_reports_an_error_not_a_skip_when_the_merge_identity_is_unconfigured(
-    rig, monkeypatch,  # noqa: F811
+    rig, monkeypatch,
 ):
     """An unconfigured merge identity is a misconfiguration of the gateway
     itself -- this tick's only job is merging -- so it must surface in
@@ -698,7 +697,7 @@ def test_merge_reports_an_error_not_a_skip_when_the_merge_identity_is_unconfigur
 
 
 def test_merge_reports_an_error_when_the_merge_identitys_token_mint_fails(
-    rig, monkeypatch,  # noqa: F811
+    rig, monkeypatch,
 ):
     """A configured-but-unreachable merge identity (bad key, revoked
     installation, GitHub App API down) is exactly the "GitHub API
@@ -730,7 +729,7 @@ def test_merge_reports_an_error_when_the_merge_identitys_token_mint_fails(
 
 
 def test_merge_reports_an_error_not_a_skip_when_the_readiness_lookup_cannot_reach_github(
-    rig, monkeypatch,  # noqa: F811
+    rig, monkeypatch,
 ):
     """`gh pr view` itself failing (network, auth, rate limit) means the
     tick never learned whether the PR is ready -- distinct from a PR that
@@ -755,7 +754,7 @@ def test_merge_reports_an_error_not_a_skip_when_the_readiness_lookup_cannot_reac
         assert cur.fetchone()[0] == "READY_TO_REVIEW"
 
 
-def test_merge_uses_a_distinct_token_from_the_acceptance_identity(rig, monkeypatch):  # noqa: F811
+def test_merge_uses_a_distinct_token_from_the_acceptance_identity(rig, monkeypatch):
     """The merge identity is a THIRD credential, distinct from both the
     ambient `_gh()` credential and the acceptance identity that posts the
     marker -- `merge_once` must never fall back to either when its own
@@ -791,7 +790,7 @@ def test_merge_uses_a_distinct_token_from_the_acceptance_identity(rig, monkeypat
     assert tokens_used == ["merge-app"]
 
 
-def test_merge_skips_a_still_running_check_instead_of_waving_it_through(rig, monkeypatch):  # noqa: F811, E501
+def test_merge_skips_a_still_running_check_instead_of_waving_it_through(rig, monkeypatch):  # noqa: E501
     """VOYN-W0-AICC-DISABLE-UNSAFE-AUTOMERGE: a CheckRun with `conclusion:
     null` because it hasn't finished (`status` QUEUED/IN_PROGRESS) used to
     read identically to one that simply carries no conclusion key at all --
@@ -821,7 +820,7 @@ def test_merge_skips_a_still_running_check_instead_of_waving_it_through(rig, mon
         assert cur.fetchone()[0] == "READY_TO_REVIEW"
 
 
-def test_merge_skips_a_pending_legacy_status_context_too(rig, monkeypatch):  # noqa: F811
+def test_merge_skips_a_pending_legacy_status_context_too(rig, monkeypatch):
     """The rollup mixes CheckRun and legacy StatusContext shapes; a pending
     StatusContext (`state: PENDING`, no `conclusion`/`status` keys at all)
     must block merge the same as a running CheckRun does -- and, like one,
@@ -844,7 +843,7 @@ def test_merge_skips_a_pending_legacy_status_context_too(rig, monkeypatch):  # n
     assert ("VOYN-W0-M4", "checks_pending: ['legacy-ci']") in report.skipped
 
 
-def test_merge_only_the_most_recent_review_can_carry_the_marker(rig, monkeypatch):  # noqa: F811, E501
+def test_merge_only_the_most_recent_review_can_carry_the_marker(rig, monkeypatch):  # noqa: E501
     """VOYN-W0-AICC-DISABLE-UNSAFE-AUTOMERGE: an ACCEPT marker sitting in an
     OLDER review must not authorize merge once a NEWER review exists on the
     same head -- e.g. a stale ACCEPT from before a dismissed/superseded
@@ -870,7 +869,7 @@ def test_merge_only_the_most_recent_review_can_carry_the_marker(rig, monkeypatch
     assert ("VOYN-W0-M5", "no_accept_marker_on_head") in report.skipped
 
 
-def test_merge_skips_a_dismissed_review_even_when_it_is_the_only_one(rig, monkeypatch):  # noqa: F811, E501
+def test_merge_skips_a_dismissed_review_even_when_it_is_the_only_one(rig, monkeypatch):  # noqa: E501
     """VOYN-W0-AICC-REVIEWER-IDENTITY-INDEPENDENCE: a DISMISSED review no
     longer represents its author's position (matching
     `scripts/assert_independent_acceptance.py`'s `evaluate`, which drops
@@ -906,7 +905,7 @@ def test_merge_skips_a_dismissed_review_even_when_it_is_the_only_one(rig, monkey
         assert cur.fetchone()[0] == "READY_TO_REVIEW"
 
 
-def test_merge_falls_back_to_an_earlier_live_review_past_a_dismissed_one(rig, monkeypatch):  # noqa: F811, E501
+def test_merge_falls_back_to_an_earlier_live_review_past_a_dismissed_one(rig, monkeypatch):  # noqa: E501
     """A DISMISSED review is excluded from ranking entirely rather than
     merely losing to whatever is newest: an earlier, still-live ACCEPT from
     an independent reviewer authorizes merge even though a later review on
@@ -963,7 +962,7 @@ def test_merge_falls_back_to_an_earlier_live_review_past_a_dismissed_one(rig, mo
     assert ("VOYN-W0-M7", merge_oid) in report.merged
 
 
-def test_publish_verdict_posts_the_marker_under_the_acceptance_bot_identity(rig, monkeypatch):  # noqa: F811, E501
+def test_publish_verdict_posts_the_marker_under_the_acceptance_bot_identity(rig, monkeypatch):  # noqa: E501
     """VOYN-W0-AICC-MARKER-REVIEWER-INDEPENDENCE: the agent's own ACCEPT
     verdict must reach GitHub as the exact `ACCEPTANCE: ACCEPT <sha>`
     comment-review body, posted under the independent acceptance bot's
@@ -1004,7 +1003,7 @@ def test_publish_verdict_posts_the_marker_under_the_acceptance_bot_identity(rig,
     assert posted == [("https://github.com/x/y/pull/11", "ACCEPT", head)]
 
 
-def test_publish_verdict_skips_without_the_acceptance_bot_configured(rig, monkeypatch):  # noqa: F811, E501
+def test_publish_verdict_skips_without_the_acceptance_bot_configured(rig, monkeypatch):  # noqa: E501
     """A host with no acceptance-bot credentials must not fall back to the
     old same-identity marker -- that marker can never satisfy
     `_pr_is_mergeable`'s different-author check any more, so posting one
@@ -1032,7 +1031,7 @@ def test_publish_verdict_skips_without_the_acceptance_bot_configured(rig, monkey
     assert ("VOYN-W0-P1B", "acceptance_bot_not_configured") in report.skipped
 
 
-def test_publish_verdict_reject_dispatches_a_linked_remediation_task(rig, monkeypatch):  # noqa: F811
+def test_publish_verdict_reject_dispatches_a_linked_remediation_task(rig, monkeypatch):
     """VOYN-W0-AICC-REVIEW-REJECT-REMEDIATION-LOOP: a REJECT must not just be
     skipped forever -- it dispatches a new, linked follow-up task (0010's
     design: a new task, not a cycle back into the rejected task's own state
@@ -1092,7 +1091,7 @@ def test_publish_verdict_reject_dispatches_a_linked_remediation_task(rig, monkey
         assert linked_sha == head
 
 
-def test_publish_verdict_reject_remediation_is_idempotent(rig, monkeypatch):  # noqa: F811
+def test_publish_verdict_reject_remediation_is_idempotent(rig, monkeypatch):
     """The parent task leaves READY_TO_REVIEW the instant it is REJECTED, so
     a second publish_review_verdicts tick never even selects it again -- the
     state machine itself is the idempotency boundary, not a special skip
@@ -1159,7 +1158,7 @@ def _chain(store, factory, base, links, pr_url, head_sha):
     return ids
 
 
-def test_remediation_depth_counts_the_recorded_chain_not_the_name(rig):  # noqa: F811
+def test_remediation_depth_counts_the_recorded_chain_not_the_name(rig):
     """Depth walks the recorded parent links, not the `-REM` suffix. The suffix
     is a naming convention; a task named by hand would make a string count
     wrong in the direction that matters -- silently unbounded."""
@@ -1176,7 +1175,7 @@ def test_remediation_depth_counts_the_recorded_chain_not_the_name(rig):  # noqa:
         assert review_merge._remediation_depth(cur, "VOYN-W0-NOT-A-REMEDIATION") == 0
 
 
-def test_a_rejection_below_the_depth_limit_still_spawns_a_remediation(rig):  # noqa: F811
+def test_a_rejection_below_the_depth_limit_still_spawns_a_remediation(rig):
     """The boundary from below: the limit must not shorten the chain by one."""
     app_factory, store, _worker = rig
     pr_url = "https://github.com/x/y/pull/41"
@@ -1192,7 +1191,7 @@ def test_a_rejection_below_the_depth_limit_still_spawns_a_remediation(rig):  # n
     assert spawned == ids[-1] + "-REM"
 
 
-def test_the_remediation_chain_stops_at_the_depth_limit(rig):  # noqa: F811
+def test_the_remediation_chain_stops_at_the_depth_limit(rig):
     """Nothing bounded this chain: each rejected remediation spawned another
     task, branch, pull request and full CI run, and the live backlog reached
     158 `-REM` tasks with chains nine links deep. Past a few attempts the
@@ -1234,7 +1233,7 @@ def test_the_remediation_chain_stops_at_the_depth_limit(rig):  # noqa: F811
         assert status != "READY_TO_REVIEW"
 
 
-def test_publish_verdict_takes_the_last_verdict_not_the_first(rig, monkeypatch):  # noqa: F811
+def test_publish_verdict_takes_the_last_verdict_not_the_first(rig, monkeypatch):
     """Independent review, 2026-08-21: a reviewing agent reasoning aloud can
     draft a tentative ACCEPT, keep reading, find a real defect, and correct
     itself to REJECT further down the same transcript. .search() would have
@@ -1268,7 +1267,7 @@ def test_publish_verdict_takes_the_last_verdict_not_the_first(rig, monkeypatch):
     assert not any(a[:2] == ["pr", "review"] for a in posted)
 
 
-def test_publish_verdict_ignores_an_earlier_lookalike_block(rig, monkeypatch):  # noqa: F811
+def test_publish_verdict_ignores_an_earlier_lookalike_block(rig, monkeypatch):
     """Independent review, round 3 (2026-08-21): even a single co-located
     VERDICT+HEAD_SHA regex still matches wherever it occurs in the text --
     including a purely illustrative block ("a passing review would read
@@ -1307,7 +1306,7 @@ def test_publish_verdict_ignores_an_earlier_lookalike_block(rig, monkeypatch):  
     assert not any(a[:2] == ["pr", "review"] for a in posted)
 
 
-def test_publish_verdict_does_not_pair_mismatched_verdict_and_sha(rig, monkeypatch):  # noqa: F811
+def test_publish_verdict_does_not_pair_mismatched_verdict_and_sha(rig, monkeypatch):
     """Independent review, round 2 (2026-08-21): taking the last VERDICT and
     the last HEAD_SHA *independently* can still combine two unrelated lines
     -- e.g. the reviewer's real, final REJECT followed by incidental prose
@@ -1343,7 +1342,7 @@ def test_publish_verdict_does_not_pair_mismatched_verdict_and_sha(rig, monkeypat
     assert not any(a[:2] == ["pr", "review"] for a in posted)
 
 
-def test_publish_verdict_skips_without_a_completed_review_yet(rig, monkeypatch):  # noqa: F811
+def test_publish_verdict_skips_without_a_completed_review_yet(rig, monkeypatch):
     import subprocess as sp
 
     app_factory, store, _worker = rig
@@ -1362,7 +1361,7 @@ def test_publish_verdict_skips_without_a_completed_review_yet(rig, monkeypatch):
     assert ("VOYN-W0-P3", "no_review_result_yet") in report.skipped
 
 
-def test_publish_verdict_skips_when_already_posted(rig, monkeypatch):  # noqa: F811
+def test_publish_verdict_skips_when_already_posted(rig, monkeypatch):
     app_factory, store, worker = rig
     head = "f" * 40
     pr_url = "https://github.com/x/y/pull/14"
@@ -1391,7 +1390,7 @@ def test_publish_verdict_skips_when_already_posted(rig, monkeypatch):  # noqa: F
     assert posted == [["api", "repos/x/y/pulls/14"]]
 
 
-def test_publish_verdict_a_review_of_an_old_head_never_gets_read_as_current(rig, monkeypatch):  # noqa: F811
+def test_publish_verdict_a_review_of_an_old_head_never_gets_read_as_current(rig, monkeypatch):
     """VOYN-OPS-EVIDENCE-MEASURED-ON-A-STATE-THAT-NO-LONGER-EXISTS, same
     class at a new site: the review ran against a sha that is no longer the
     PR's head (a push landed after the review was dispatched). Posting the
@@ -1430,7 +1429,7 @@ def test_publish_verdict_a_review_of_an_old_head_never_gets_read_as_current(rig,
     assert posted == [["api", "repos/x/y/pulls/15"]]
 
 
-def test_merge_skips_when_a_check_is_red(rig, monkeypatch):  # noqa: F811
+def test_merge_skips_when_a_check_is_red(rig, monkeypatch):
 
     app_factory, store, _ = rig
     _ready(store, app_factory, "VOYN-W0-M3", "https://github.com/x/y/pull/10")
@@ -1663,7 +1662,7 @@ def test_review_key_scopes_by_pr_number_head_sha_and_policy_version():
     assert review_merge._review_key("VOYN-W0-X", "not a url", _snapshot(sha_a)) is None
 
 
-def test_review_once_gives_a_second_push_to_the_same_task_its_own_fresh_review(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+def test_review_once_gives_a_second_push_to_the_same_task_its_own_fresh_review(rig, _test_repo_routes, monkeypatch):  # noqa: E501
     """The general case the review-cycle key fixes, not just remediation: an
     ordinary task still IN_PROGRESS/READY_TO_REVIEW that gets a second push
     to its PR must be reviewable again, not permanently deduped against
@@ -1741,7 +1740,7 @@ def _fake_pr_view(head):
     return fake_gh
 
 
-def test_chunk_reject_overridden_by_verification_accept_with_audit(rig, monkeypatch):  # noqa: F811, E501
+def test_chunk_reject_overridden_by_verification_accept_with_audit(rig, monkeypatch):  # noqa: E501
     """A multi-chunk PR whose chunk aggregation REJECTs must still be accepted
     when the finding-verification run at the exact head ACCEPTs: the audit
     comment recording the overridden findings is posted FIRST, then the
@@ -1771,7 +1770,7 @@ def test_chunk_reject_overridden_by_verification_accept_with_audit(rig, monkeypa
     assert "ARTIFACT" in audit_body  # the verifier's classification
 
 
-def test_auto_accept_is_conditioned_on_the_audit_comment(rig, monkeypatch):  # noqa: F811, E501
+def test_auto_accept_is_conditioned_on_the_audit_comment(rig, monkeypatch):  # noqa: E501
     """No audit comment, no marker: if the audit post fails, the override is
     withheld this tick (skip, retried later) rather than merging with no
     trail of what was overridden."""
@@ -1803,7 +1802,7 @@ def test_auto_accept_is_conditioned_on_the_audit_comment(rig, monkeypatch):  # n
     assert not report.remediated
 
 
-def test_chunk_reject_confirmed_by_verification_reject_remediates(rig, monkeypatch):  # noqa: F811, E501
+def test_chunk_reject_confirmed_by_verification_reject_remediates(rig, monkeypatch):  # noqa: E501
     """When verification CONFIRMS a blocking finding, the REJECT stands:
     remediation is dispatched carrying the confirmation, no marker."""
     app_factory, store, _ = rig
@@ -1826,7 +1825,7 @@ def test_chunk_reject_confirmed_by_verification_reject_remediates(rig, monkeypat
     assert "CONFIRMED_BLOCKING" in body
 
 
-def test_chunk_reject_enqueues_verification_and_waits(rig, monkeypatch):  # noqa: F811, E501
+def test_chunk_reject_enqueues_verification_and_waits(rig, monkeypatch):  # noqa: E501
     """No verification result yet: ONE verification run is enqueued -- keyed
     to head + findings, task_type verification_review, head-pinned for the
     worker -- and the task skips as `verification_pending` with no
@@ -1868,7 +1867,7 @@ def test_chunk_reject_enqueues_verification_and_waits(rig, monkeypatch):  # noqa
     assert envelope["head_sha"] == head
 
 
-def test_chunk_reject_without_enqueue_falls_back_to_remediation(rig, monkeypatch):  # noqa: F811, E501
+def test_chunk_reject_without_enqueue_falls_back_to_remediation(rig, monkeypatch):  # noqa: E501
     """A caller that cannot enqueue (legacy signature) keeps the
     pre-AUTO-ACCEPT behavior: REJECT remediates on the original findings."""
     app_factory, store, _ = rig
@@ -1882,7 +1881,7 @@ def test_chunk_reject_without_enqueue_falls_back_to_remediation(rig, monkeypatch
     assert ("VOYN-W0-ADJ-F", "VOYN-W0-ADJ-F-REM") in report.remediated
 
 
-def test_oversized_findings_fall_closed_to_remediation(rig, monkeypatch):  # noqa: F811
+def test_oversized_findings_fall_closed_to_remediation(rig, monkeypatch):
     """Findings over the verification byte cap are never auto-verified --
     the REJECT remediates exactly as before AUTO-ACCEPT existed."""
     app_factory, store, _ = rig
@@ -1901,7 +1900,7 @@ def test_oversized_findings_fall_closed_to_remediation(rig, monkeypatch):  # noq
     assert enq == []
 
 
-def test_single_chunk_reject_is_also_verification_gated(rig, monkeypatch, _test_repo_routes):  # noqa: F811, E501
+def test_single_chunk_reject_is_also_verification_gated(rig, monkeypatch, _test_repo_routes):  # noqa: E501
     """The task's core acceptance: a SINGLE-chunk REJECT no longer remediates
     on the reviewer's word alone -- it enqueues the same finding
     verification, waits, and auto-accepts on verification ACCEPT."""
@@ -1949,7 +1948,7 @@ def test_single_chunk_reject_is_also_verification_gated(rig, monkeypatch, _test_
     assert any(f"AUTO-ACCEPT-AUDIT {head}" in argv[-1] for argv in fake_gh.posted_comments)
 
 
-def test_chunk_review_rows_is_empty_for_a_single_chunk_review(rig, monkeypatch):  # noqa: F811
+def test_chunk_review_rows_is_empty_for_a_single_chunk_review(rig, monkeypatch):
     """A single-chunk review is stored under the plain review-cycle key
     (`review_once` only mints a `:chunk:`-suffixed key when `chunk.count >
     1`), so `_chunk_review_rows`' prefix match against that suffix must come
@@ -1994,7 +1993,7 @@ def test_verification_key_is_scoped_by_head_findings_and_policy(monkeypatch):
     assert review_merge._verification_key("T", "not-a-pr-url", snap_a, "f1") is None
 
 
-def test_malformed_verifier_output_never_auto_accepts(rig, monkeypatch):  # noqa: F811
+def test_malformed_verifier_output_never_auto_accepts(rig, monkeypatch):
     """A verifier that cannot state its verdict/head cleanly (garbled text,
     or a HEAD_SHA that is not the current head) must fall to remediation on
     the ORIGINAL findings -- never to an override, and never to a permanent
@@ -2014,7 +2013,7 @@ def test_malformed_verifier_output_never_auto_accepts(rig, monkeypatch):  # noqa
     assert not posted
 
 
-def test_a_malformed_accept_never_auto_accepts(rig, monkeypatch):  # noqa: F811
+def test_a_malformed_accept_never_auto_accepts(rig, monkeypatch):
     """Independent review of this change (32bf893, then 6eb71aa): an ACCEPT
     that violates the verifier's machine-parsed output contract -- bare
     trailer, a classification token merely QUOTED mid-line from the
@@ -2102,7 +2101,7 @@ def test_disposition_numbering_must_be_sequential_without_gaps():
     )
 
 
-def test_partial_chunk_verification_coverage_remediates(rig, monkeypatch):  # noqa: F811, E501
+def test_partial_chunk_verification_coverage_remediates(rig, monkeypatch):  # noqa: E501
     """VOYN-OPS-AICC-VERIFY-DISPOSITION-FLOOR's core acceptance: two chunks
     REJECT, but the verifier's ACCEPT only classifies one of them -- one
     disposition against a two-section floor -- so the override is refused
@@ -2136,7 +2135,7 @@ def test_partial_chunk_verification_coverage_remediates(rig, monkeypatch):  # no
     assert "Chunk 1/2" in body and "Chunk 2/2" in body  # both chunks, not just the verified one
 
 
-def test_review_once_no_longer_enqueues_an_eager_adjudication(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+def test_review_once_no_longer_enqueues_an_eager_adjudication(rig, _test_repo_routes, monkeypatch):  # noqa: E501
     """The eager MODEL_ONLY full-context adjudication of VOYN-W0-AICC-REVIEW-
     ADJUDICATE is retired (it ran with zero tools and could gather no
     evidence): a multi-chunk PR enqueues its chunks and NOTHING else --
@@ -2160,7 +2159,7 @@ def test_review_once_no_longer_enqueues_an_eager_adjudication(rig, _test_repo_ro
 
 # --- VOYN-W0-AICC-MERGE-TRAIN-COORDINATOR: keep behind PRs from gridlocking --
 
-def test_merge_train_updates_a_behind_pr(rig, monkeypatch):  # noqa: F811
+def test_merge_train_updates_a_behind_pr(rig, monkeypatch):
     """A PR only BEHIND main (base advanced after it branched) is brought
     current with a pinned REST branch update so it re-enters the merge path instead
     of gridlocking; nothing is merged this tick."""
@@ -2195,7 +2194,7 @@ def test_merge_train_updates_a_behind_pr(rig, monkeypatch):  # noqa: F811
     assert not report.merged
 
 
-def test_merge_train_does_not_update_an_unaccepted_behind_pr(rig, monkeypatch):  # noqa: F811
+def test_merge_train_does_not_update_an_unaccepted_behind_pr(rig, monkeypatch):
     """A BEHIND PR with no ACCEPT marker is NOT branch-updated: the review tick
     reviews it from its own diff regardless of base distance, so the merge tick
     must not spend CI + the update quota on a PR that is not yet merge-ready
@@ -2237,7 +2236,7 @@ def test_merge_state_treats_malformed_gh_output_as_a_failed_lookup(monkeypatch):
     assert review_merge._merge_state("/tmp", "https://github.com/x/y/pull/9") == ""
 
 
-def test_merge_train_leaves_a_dirty_pr_for_rebase(rig, monkeypatch):  # noqa: F811
+def test_merge_train_leaves_a_dirty_pr_for_rebase(rig, monkeypatch):
     """A DIRTY (conflicting) PR is flagged for a rebase and never auto-updated
     -- update-branch cannot resolve a real conflict."""
     app_factory, store, _ = rig
@@ -2265,7 +2264,7 @@ def test_merge_train_leaves_a_dirty_pr_for_rebase(rig, monkeypatch):  # noqa: F8
     assert ("VOYN-W0-MT2", "branch_dirty_needs_rebase") in report.skipped
 
 
-def test_merge_train_update_cap_is_bounded(rig, monkeypatch):  # noqa: F811
+def test_merge_train_update_cap_is_bounded(rig, monkeypatch):
     """The per-tick branch-update count is bounded so a moving base cannot make
     one tick spend everything re-updating branches that will fall behind again."""
     app_factory, store, _ = rig
@@ -2473,7 +2472,7 @@ def test_out_of_band_rejection_posts_marker_without_rerun(monkeypatch):
 # --- VOYN-W0-AICC-MERGE-DONE-BEFORE-TARGET-VERIFY + CI-FLAKE-AUTO-RERUN -----
 
 
-def test_a_queued_merge_is_a_wait_not_a_done(rig, monkeypatch):  # noqa: F811
+def test_a_queued_merge_is_a_wait_not_a_done(rig, monkeypatch):
     """Live 2026-08-26 (PR #399): on a merge-queue-protected repo,
     `gh pr merge` exits 0 having only ENQUEUED the PR. The task must stay
     READY_TO_REVIEW (`merge_queued_awaiting_target`) until GitHub reports
@@ -2579,7 +2578,7 @@ def _merged(head, merge_oid):
     })
 
 
-def test_a_pr_the_queue_is_already_building_is_a_free_wait(rig, monkeypatch):  # noqa: F811, E501
+def test_a_pr_the_queue_is_already_building_is_a_free_wait(rig, monkeypatch):  # noqa: E501
     """VOYN-W0-AICC-MERGE-QUEUE-ENABLE: an entry already in the merge queue is
     being tested against the prospective merged result. The tick waits: no
     second `gh pr merge`, no branch update, no action spent -- and the task
@@ -2619,7 +2618,7 @@ def test_a_pr_the_queue_is_already_building_is_a_free_wait(rig, monkeypatch):  #
         assert cur.fetchone()[0] == "READY_TO_REVIEW"
 
 
-def test_a_queued_entry_is_never_torn_out_of_the_queue_by_a_branch_update(rig, monkeypatch):  # noqa: F811, E501
+def test_a_queued_entry_is_never_torn_out_of_the_queue_by_a_branch_update(rig, monkeypatch):  # noqa: E501
     """A queued entry is routinely BEHIND -- the queue, not the branch, is
     where it is tested against everything ahead of it. `gh pr update-branch`
     here would push a new head, evict it from the queue and invalidate its
@@ -2653,7 +2652,7 @@ def test_a_queued_entry_is_never_torn_out_of_the_queue_by_a_branch_update(rig, m
     )
 
 
-def test_a_queued_entry_leaves_the_merge_budget_to_the_next_task(rig, monkeypatch):  # noqa: F811, E501
+def test_a_queued_entry_leaves_the_merge_budget_to_the_next_task(rig, monkeypatch):  # noqa: E501
     """The anti-starvation half: waiting on the queue costs no action, so a
     one-action tick still lands the next merge-ready PR behind it. Before the
     queue check, each queued entry burned a `gh pr merge` out of
@@ -2701,7 +2700,7 @@ def test_a_queued_entry_leaves_the_merge_budget_to_the_next_task(rig, monkeypatc
     )
 
 
-def test_the_ejected_half_of_a_conflicting_pair_neither_lands_nor_completes(rig, monkeypatch):  # noqa: F811, E501
+def test_the_ejected_half_of_a_conflicting_pair_neither_lands_nor_completes(rig, monkeypatch):  # noqa: E501
     """The acceptance scenario for VOYN-W0-AICC-MERGE-QUEUE-ENABLE, as the
     fleet sees it.
 
@@ -2845,7 +2844,7 @@ def test_an_unparseable_pr_url_is_never_reported_as_queued(monkeypatch):
     assert review_merge._merge_queue_wait("/tmp", "not-a-pr-url") is None
 
 
-def test_failed_checks_on_an_accepted_head_get_one_bounded_rerun(rig, monkeypatch):  # noqa: F811, E501
+def test_failed_checks_on_an_accepted_head_get_one_bounded_rerun(rig, monkeypatch):  # noqa: E501
     """VOYN-W0-AICC-CI-FLAKE-AUTO-RERUN: a red required check on a PR that
     already carries the ACCEPT marker triggers `gh run rerun --failed` for
     completed-failed runs at attempt 1 on the current head -- and never for
@@ -2913,7 +2912,7 @@ def test_failed_checks_on_an_accepted_head_get_one_bounded_rerun(rig, monkeypatc
         assert cur.fetchone()[0] == "READY_TO_REVIEW"
 
 
-def test_no_rerun_without_an_accept_marker(rig, monkeypatch):  # noqa: F811
+def test_no_rerun_without_an_accept_marker(rig, monkeypatch):
     """An unaccepted PR's failures are the review path's business -- the
     flake retry must not spend reruns on a PR that may never be accepted."""
     import subprocess as sp
@@ -2960,7 +2959,7 @@ def _fake_reconcile_gh(default_branch, statuses):
     return fake_gh
 
 
-def test_reconcile_flags_a_sha_not_on_the_default_branch(rig, monkeypatch):  # noqa: F811
+def test_reconcile_flags_a_sha_not_on_the_default_branch(rig, monkeypatch):
     """VOYN-W0-AICC-MERGE-DONE-BEFORE-TARGET-VERIFY: a DONE task whose sha
     evidence predates the fix (a PR head that a squash merge never puts on
     main) is surfaced as suspect -- report-only."""
@@ -2978,7 +2977,7 @@ def test_reconcile_flags_a_sha_not_on_the_default_branch(rig, monkeypatch):  # n
         assert cur.fetchone()[0] == "DONE"  # report-only: never flipped
 
 
-def test_reconcile_verifies_a_sha_that_is_an_ancestor(rig, monkeypatch):  # noqa: F811
+def test_reconcile_verifies_a_sha_that_is_an_ancestor(rig, monkeypatch):
     """A post-fix DONE row, whose sha IS the target-branch merge commit,
     is verified rather than flagged."""
     app_factory, store, _ = rig
@@ -2992,7 +2991,7 @@ def test_reconcile_verifies_a_sha_that_is_an_ancestor(rig, monkeypatch):  # noqa
     assert report.suspect == []
 
 
-def test_reconcile_skips_without_pr_evidence_to_identify_the_repo(rig):  # noqa: F811
+def test_reconcile_skips_without_pr_evidence_to_identify_the_repo(rig):
     """A DONE task carrying sha evidence but no pr evidence cannot be
     checked -- an inconclusive skip, never a false suspect."""
     from tests.db.test_backlog_planner import _task
@@ -3010,7 +3009,7 @@ def test_reconcile_skips_without_pr_evidence_to_identify_the_repo(rig):  # noqa:
     assert report.verified == []
 
 
-def test_reconcile_skips_an_unresolvable_lookup_instead_of_flagging(rig, monkeypatch):  # noqa: F811, E501
+def test_reconcile_skips_an_unresolvable_lookup_instead_of_flagging(rig, monkeypatch):  # noqa: E501
     """A failed default-branch lookup (gh hiccup, auth issue) is inconclusive
     -- it must never be reported as a suspect sha, which would read as a
     confirmed defect rather than "the check itself didn't run"."""
@@ -3028,7 +3027,7 @@ def test_reconcile_skips_an_unresolvable_lookup_instead_of_flagging(rig, monkeyp
     assert report.suspect == []
 
 
-def test_an_externally_merged_pr_without_acceptance_never_goes_done(rig, monkeypatch):  # noqa: F811, E501
+def test_an_externally_merged_pr_without_acceptance_never_goes_done(rig, monkeypatch):  # noqa: E501
     """Verification of 53c7b52 (CONFIRMED): a PR merged around the queue --
     admin bypass, hand merge -- with no acceptance marker on its merged head
     must not be silently blessed DONE. It skips loudly for the operator."""
@@ -3058,7 +3057,7 @@ def test_an_externally_merged_pr_without_acceptance_never_goes_done(rig, monkeyp
         assert cur.fetchone()[0] == "READY_TO_REVIEW"
 
 
-def test_an_empty_check_rollup_on_a_merged_pr_is_inconclusive(rig, monkeypatch):  # noqa: F811, E501
+def test_an_empty_check_rollup_on_a_merged_pr_is_inconclusive(rig, monkeypatch):  # noqa: E501
     """Review of eabe0d3: `any()` over an empty rollup is False -- a merged
     PR whose check data is unavailable must fail closed as missing
     acceptance evidence, never be blessed DONE."""
@@ -3086,7 +3085,7 @@ def test_an_empty_check_rollup_on_a_merged_pr_is_inconclusive(rig, monkeypatch):
     assert not report.merged
 
 
-def test_permanent_skips_do_not_starve_the_publish_window(rig, monkeypatch):  # noqa: F811, E501
+def test_permanent_skips_do_not_starve_the_publish_window(rig, monkeypatch):  # noqa: E501
     """VOYN-OPS-AICC-PUBLISH-WINDOW-STARVATION (live 2026-08-26): with
     max_per_tick=N old code selected the N oldest-updated rows -- which were
     exactly the permanently-skipping ones (skips never bump updated_at), so
@@ -3130,7 +3129,7 @@ def test_permanent_skips_do_not_starve_the_publish_window(rig, monkeypatch):  # 
     assert len(report.skipped) == 10
 
 
-def test_permanent_skips_do_not_starve_the_review_window(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+def test_permanent_skips_do_not_starve_the_review_window(rig, _test_repo_routes, monkeypatch):  # noqa: E501
     """VOYN-W0-AICC-REVIEW-WINDOW-STARVATION (live 2026-08-27): with
     `ORDER BY t.task_id LIMIT max_per_tick`, the alphabetically-first
     READY_TO_REVIEW tasks -- here, ones with no routed repo, a permanent
@@ -3178,7 +3177,7 @@ def test_permanent_skips_do_not_starve_the_review_window(rig, _test_repo_routes,
     assert len(report.skipped) == 10
 
 
-def test_review_once_partition_schedule_guarantees_full_coverage(rig, monkeypatch):  # noqa: F811, E501
+def test_review_once_partition_schedule_guarantees_full_coverage(rig, monkeypatch):  # noqa: E501
     """Same GUARANTEE as test_partition_schedule_guarantees_full_coverage,
     for review_once's own scan window: with N tasks and scan_cap C,
     cycling through ceil(N/C) ticks examines every task exactly once per
@@ -3201,7 +3200,7 @@ def test_review_once_partition_schedule_guarantees_full_coverage(rig, monkeypatc
     assert sorted(examined) == sorted(ids)
 
 
-def test_the_action_cap_still_bounds_a_tick(rig, monkeypatch):  # noqa: F811
+def test_the_action_cap_still_bounds_a_tick(rig, monkeypatch):
     """The other half of the same change: mutations per tick stay bounded --
     with max_per_tick=1 and two acceptable tasks, exactly one marker posts
     this tick; the second lands next tick."""
@@ -3242,7 +3241,7 @@ def test_the_action_cap_still_bounds_a_tick(rig, monkeypatch):  # noqa: F811
     assert set(posted) == set(heads) and len(posted) == 2
 
 
-def test_a_pending_verification_costs_no_tick_action(rig, monkeypatch):  # noqa: F811
+def test_a_pending_verification_costs_no_tick_action(rig, monkeypatch):
     """Review of fd46584 (CONFIRMED): an already-pending verification WAIT
     must not consume the action cap -- otherwise pending tasks recreate the
     starvation. Two tasks with verifications already IN the queue, cap 1: a
@@ -3323,7 +3322,7 @@ def test_a_pending_verification_costs_no_tick_action(rig, monkeypatch):  # noqa:
     assert len(pending) == 2
 
 
-def test_a_dead_verification_falls_back_to_remediation(rig, monkeypatch):  # noqa: F811
+def test_a_dead_verification_falls_back_to_remediation(rig, monkeypatch):
     """Review of 5443b6e (CONFIRMED): a dead-lettered verification item
     (retries exhausted, unique key blocks re-enqueue) must not read as
     pending forever -- that is a permanent silent stall. It falls back to
@@ -3364,7 +3363,7 @@ def test_a_dead_verification_falls_back_to_remediation(rig, monkeypatch):  # noq
     assert ("VOYN-W0-DV", "VOYN-W0-DV-REM") in report.remediated
 
 
-def test_partition_schedule_guarantees_full_coverage(rig, monkeypatch):  # noqa: F811
+def test_partition_schedule_guarantees_full_coverage(rig, monkeypatch):
     """Review of 24c124b (CONFIRMED): per-minute pseudo-random sampling could
     leave a task unsampled indefinitely. The partition schedule is a
     GUARANTEE: with N tasks and scan_cap C, cycling through all
@@ -3394,7 +3393,7 @@ def test_partition_schedule_guarantees_full_coverage(rig, monkeypatch):  # noqa:
     assert sorted(examined) == sorted(ids)
 
 
-def test_action_hogs_at_the_window_head_cannot_starve_the_tail(rig, monkeypatch):  # noqa: F811, E501
+def test_action_hogs_at_the_window_head_cannot_starve_the_tail(rig, monkeypatch):  # noqa: E501
     """Review of 2199a56 (CONFIRMED): a FIXED page starved its own tail when
     its head rows consumed the action cap on every visit (persistently
     failing merges stay READY and stay first). The sliding window's start
@@ -3461,7 +3460,7 @@ def test_action_hogs_at_the_window_head_cannot_starve_the_tail(rig, monkeypatch)
     assert merged_tasks == ["VOYN-W0-ZVICTIM"]
 
 
-def test_stride_clamped_to_window_width_covers_every_position(rig, monkeypatch):  # noqa: F811, E501
+def test_stride_clamped_to_window_width_covers_every_position(rig, monkeypatch):  # noqa: E501
     """Review of cadc595 (CONFIRMED): step > scan_cap left permanent holes
     (N=12, step=4, cap=3 skipped positions 3/7/11 forever). The stride is
     clamped to the window width, so the pathological configuration now
@@ -3485,7 +3484,7 @@ def test_stride_clamped_to_window_width_covers_every_position(rig, monkeypatch):
     assert seen == set(ids)
 
 
-def test_a_resultless_terminal_verification_remediates(rig, monkeypatch):  # noqa: F811
+def test_a_resultless_terminal_verification_remediates(rig, monkeypatch):
     """Review of cadc595 (CONFIRMED): a succeeded verification item whose
     result cannot be consumed (missing output) must not WAIT forever --
     same fall-back as dead: remediation on the original findings."""
@@ -3519,7 +3518,7 @@ def test_a_resultless_terminal_verification_remediates(rig, monkeypatch):  # noq
     assert ("VOYN-W0-TR", "VOYN-W0-TR-REM") in report.remediated
 
 
-def test_a_failed_marker_post_attempt_still_consumes_the_cap(rig, monkeypatch):  # noqa: F811, E501
+def test_a_failed_marker_post_attempt_still_consumes_the_cap(rig, monkeypatch):  # noqa: E501
     """Review of cadc595 (CONFIRMED): counting only successful posts let a
     failing poster spend up to scan_cap write attempts per tick. The
     ATTEMPT is the action: with cap 1 and a failing poster, exactly one
@@ -3559,7 +3558,7 @@ def test_a_failed_marker_post_attempt_still_consumes_the_cap(rig, monkeypatch): 
     assert len(attempts) == 1  # the failed attempt consumed the only action
 
 
-def test_override_audit_and_marker_are_separate_write_budget_units(rig, monkeypatch):  # noqa: F811, E501
+def test_override_audit_and_marker_are_separate_write_budget_units(rig, monkeypatch):  # noqa: E501
     """Review of 2d1bc89 (CONFIRMED): audit+marker bundled under one action
     let cap=1 perform two external writes. Budgeted separately: at cap 1
     the audit posts on tick one (marker deferred, stated loudly) and the
@@ -3604,7 +3603,7 @@ def test_override_audit_and_marker_are_separate_write_budget_units(rig, monkeypa
     assert [k for k, _ in writes] == ["audit", "marker"]
 
 
-def test_churn_before_a_waiter_cannot_starve_it(rig, monkeypatch):  # noqa: F811
+def test_churn_before_a_waiter_cannot_starve_it(rig, monkeypatch):
     """Review of c725613 (CONFIRMED): a numeric offset's ordinal meaning
     shifts under membership churn -- tasks inserted BEFORE a waiter kept
     pushing it out from under the cursor. The keyset cursor stores the last
@@ -3634,7 +3633,7 @@ def test_churn_before_a_waiter_cannot_starve_it(rig, monkeypatch):  # noqa: F811
     assert "VOYN-W0-ZWAITER" in seen
 
 
-def test_a_failed_audit_lookup_does_not_burn_the_write_budget(rig, monkeypatch):  # noqa: F811, E501
+def test_a_failed_audit_lookup_does_not_burn_the_write_budget(rig, monkeypatch):  # noqa: E501
     """Review of 9098d44 (CONFIRMED): a failed comments READ before any
     write returned wrote=True and consumed max_per_tick, blocking later
     eligible tasks. A pure read failure now costs nothing: task A's audit
@@ -3695,7 +3694,7 @@ def test_a_failed_audit_lookup_does_not_burn_the_write_budget(rig, monkeypatch):
     assert posted == [pr_b]  # B's marker landed despite A's failed lookup
 
 
-def test_multiple_pr_rows_per_task_are_all_reached(rig, monkeypatch):  # noqa: F811
+def test_multiple_pr_rows_per_task_are_all_reached(rig, monkeypatch):
     """Review of aba471f (CONFIRMED, medium): a task_id-only keyset skipped a
     task's remaining pr evidence rows once the cursor passed its id. The
     composite (task_id, value) keyset reaches every row across ticks."""
@@ -3729,7 +3728,7 @@ def test_multiple_pr_rows_per_task_are_all_reached(rig, monkeypatch):  # noqa: F
             "https://github.com/x/y/pull/601"} <= set(examined)
 
 
-def test_cursor_advances_only_to_the_processed_boundary(rig, monkeypatch):  # noqa: F811, E501
+def test_cursor_advances_only_to_the_processed_boundary(rig, monkeypatch):  # noqa: E501
     """Review of aba471f (High, addressed to the achievable floor): the
     cursor moves exactly as far as the tick actually processed, so a
     budget break mid-window never jumps unexamined rows. With cap 1 and
@@ -3771,7 +3770,7 @@ def test_cursor_advances_only_to_the_processed_boundary(rig, monkeypatch):  # no
     assert sorted(posted) == sorted(heads)  # all three, none skipped
 
 
-def test_a_same_key_item_in_another_queue_is_not_pending_here(rig, monkeypatch):  # noqa: F811, E501
+def test_a_same_key_item_in_another_queue_is_not_pending_here(rig, monkeypatch):  # noqa: E501
     """Review of 653963d (CONFIRMED): idempotency is scoped by
     (queue, idempotency_key) -- an item with the same key parked in a
     DIFFERENT queue must not read as verification_pending and block this
@@ -3814,7 +3813,7 @@ def test_a_same_key_item_in_another_queue_is_not_pending_here(rig, monkeypatch):
     assert enq and enq[0][0] == "execution" and enq[0][1] == vkey
 
 
-def test_a_deferred_marker_keeps_the_cursor_before_its_task(rig, monkeypatch):  # noqa: F811, E501
+def test_a_deferred_marker_keeps_the_cursor_before_its_task(rig, monkeypatch):  # noqa: E501
     """Verification of c4426a4 (CONFIRMED_BLOCKING 1): advancing the cursor
     past a task whose marker was budget-deferred made the marker wait a
     full lap. The cursor stays BEFORE the task: the next tick re-enters it
@@ -3882,7 +3881,7 @@ def test_a_deferred_marker_keeps_the_cursor_before_its_task(rig, monkeypatch):  
     assert posted == [pr_a], second.skipped
 
 
-def test_targeted_invocations_leave_the_shared_cursor_alone(rig, monkeypatch):  # noqa: F811, E501
+def test_targeted_invocations_leave_the_shared_cursor_alone(rig, monkeypatch):  # noqa: E501
     """Verification of c4426a4 (CONFIRMED_BLOCKING 2): --task-id runs were
     repositioning the global cursor and starving unrelated rows. A targeted
     run must not create or move the cursor."""
@@ -3978,7 +3977,7 @@ def _fake_pr_list(entries, *, returncode=0, stdout=None):
     return fake_gh
 
 
-def test_an_open_pr_on_the_task_branch_becomes_evidence(rig, _test_repo_routes, monkeypatch):  # noqa: F811
+def test_an_open_pr_on_the_task_branch_becomes_evidence(rig, _test_repo_routes, monkeypatch):
     app_factory, store, _ = rig
     task_id = "VOYN-W0-PRE1"
     _ready_without_pr(store, app_factory, task_id)
@@ -3995,7 +3994,7 @@ def test_an_open_pr_on_the_task_branch_becomes_evidence(rig, _test_repo_routes, 
     assert _pr_rows(app_factory, task_id) == [url]
 
 
-def test_a_task_adopts_only_its_own_branch_never_a_prefix_match(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+def test_a_task_adopts_only_its_own_branch_never_a_prefix_match(rig, _test_repo_routes, monkeypatch):  # noqa: E501
     """`backlog/X` must not adopt `backlog/X-REM`'s pull request. `gh --head`
     is a filter, not a guarantee of exact equality, so the name is compared
     here too."""
@@ -4017,7 +4016,7 @@ def test_a_task_adopts_only_its_own_branch_never_a_prefix_match(rig, _test_repo_
     assert (task_id, "no_open_pr_on_task_branch") in report.skipped
 
 
-def test_two_open_prs_on_one_branch_are_refused_rather_than_guessed(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+def test_two_open_prs_on_one_branch_are_refused_rather_than_guessed(rig, _test_repo_routes, monkeypatch):  # noqa: E501
     app_factory, store, _ = rig
     task_id = "VOYN-W0-PRE3"
     _ready_without_pr(store, app_factory, task_id)
@@ -4037,7 +4036,7 @@ def test_two_open_prs_on_one_branch_are_refused_rather_than_guessed(rig, _test_r
     assert (task_id, "ambiguous_open_prs_on_branch") in report.skipped
 
 
-def test_an_existing_pr_evidence_row_is_never_touched(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+def test_an_existing_pr_evidence_row_is_never_touched(rig, _test_repo_routes, monkeypatch):  # noqa: E501
     """Whatever `publish_run` recorded stays authoritative; this can neither
     overwrite it nor add a competing row."""
     app_factory, store, _ = rig
@@ -4059,7 +4058,7 @@ def test_an_existing_pr_evidence_row_is_never_touched(rig, _test_repo_routes, mo
     assert all(entry[0] != task_id for entry in report.recorded)
 
 
-def test_a_failed_or_undecodable_lookup_records_nothing(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+def test_a_failed_or_undecodable_lookup_records_nothing(rig, _test_repo_routes, monkeypatch):  # noqa: E501
     app_factory, store, _ = rig
     failed, garbage = "VOYN-W0-PRE5", "VOYN-W0-PRE6"
     _ready_without_pr(store, app_factory, failed)
@@ -4075,7 +4074,7 @@ def test_a_failed_or_undecodable_lookup_records_nothing(rig, _test_repo_routes, 
     assert _pr_rows(app_factory, garbage) == []
 
 
-def test_only_ready_to_review_tasks_are_examined(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+def test_only_ready_to_review_tasks_are_examined(rig, _test_repo_routes, monkeypatch):  # noqa: E501
     """This records evidence; it never promotes anything. A task that is not
     yet ready stays untouched even when its branch already has a PR."""
     app_factory, store, _ = rig
@@ -4098,7 +4097,7 @@ def test_only_ready_to_review_tasks_are_examined(rig, _test_repo_routes, monkeyp
     assert all(entry[0] != task_id for entry in report.recorded)
 
 
-def test_the_lookup_runs_in_the_checkout_the_tick_was_given(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+def test_the_lookup_runs_in_the_checkout_the_tick_was_given(rig, _test_repo_routes, monkeypatch):  # noqa: E501
     """Not the route table's path. That second element is a worker's local
     directory and need not exist on the host running the tick — using it made
     the first live run die with `FileNotFoundError` on a path that exists only
