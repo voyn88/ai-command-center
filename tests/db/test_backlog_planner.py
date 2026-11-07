@@ -16,95 +16,14 @@ import secrets
 
 import pytest
 
-from command_center.db import roles
 from command_center.db.backlog_parser import ParsedTask
-from command_center.db.backlog_store import BacklogStore
-from command_center.db.work_queue_store import ClaimedWork, WorkQueueStore
+from command_center.db.work_queue_store import ClaimedWork
 from command_center.orchestrator.planner import PlanLimits, _payload_for, plan_once
 
-pytestmark = [pytest.mark.serial, pytest.mark.usefixtures("role_passwords")]
-
-
-def _as_role(dsn: str, role: str, password: str) -> str:
-    from psycopg.conninfo import conninfo_to_dict, make_conninfo
-
-    params = conninfo_to_dict(dsn)
-    params.update(user=role, password=password)
-    return make_conninfo(**params)
-
-
-def _provision(admin_conn, psycopg, test_dsn, role_passwords) -> None:
-    from command_center.db import migrations
-
-    roles.apply_bootstrap(admin_conn)
-    with psycopg.connect(
-        _as_role(test_dsn, roles.MIGRATOR_ROLE, role_passwords[roles.MIGRATOR_ROLE]),
-        autocommit=True,
-    ) as conn:
-        migrations.upgrade(conn)
-        roles.apply_table_grants(conn)
-
-
-@pytest.fixture
-def rig(admin_conn, psycopg, test_dsn, role_passwords):
-    """(app_factory, backlog_store, worker_queue_store) under real grants."""
-    from contextlib import contextmanager
-
-    from psycopg import sql
-
-    _provision(admin_conn, psycopg, test_dsn, role_passwords)
-    name = f"aicc_wh_plan_{secrets.token_hex(4)}"
-    password = secrets.token_urlsafe(24)
-    with admin_conn.cursor() as cur:
-        for statement in roles.render_worker_host_role(name):
-            cur.execute(statement)
-        cur.execute(
-            sql.SQL("ALTER ROLE {} PASSWORD {}").format(
-                sql.Identifier(name), sql.Literal(password)
-            )
-        )
-    app_dsn = _as_role(test_dsn, roles.APP_ROLE, role_passwords[roles.APP_ROLE])
-    worker_dsn = _as_role(test_dsn, name, password)
-
-    def factory_for(dsn):
-        @contextmanager
-        def factory():
-            with psycopg.connect(dsn, autocommit=True) as conn:
-                yield conn
-
-        return factory
-
-    app_factory = factory_for(app_dsn)
-    try:
-        yield (
-            app_factory,
-            BacklogStore(app_factory),
-            WorkQueueStore(factory_for(worker_dsn)),
-        )
-    finally:
-        with admin_conn.cursor() as cur:
-            try:
-                cur.execute(
-                    sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(name))
-                )
-            except Exception:  # noqa: BLE001 — cleanup must not mask a failure
-                admin_conn.rollback()
-
-
-@pytest.fixture(autouse=True)
-def _test_repo_routes(monkeypatch, request):
-    """Every synthetic repo-* used by this suite gets a route: the planner now
-    refuses unrouted repos (the first live tick's lesson), and these tests are
-    about dispatch mechanics, not the route table. The route tests below opt
-    out by overriding the variable themselves."""
-    import json
-
-    repos = ["repo-d2","repo-pipe","repo-ga","repo-gb","repo-gc","repo-in","repo-nm",
-             "repo-one","repo-p1","repo-p3","repo-pk","repo-shared","repo-tt"]
-    monkeypatch.setenv(
-        "AICC_PLANNER_REPO_ROUTES",
-        json.dumps({r: ["AICC", f"/srv/{r}"] for r in repos}),
-    )
+pytestmark = [
+    pytest.mark.serial,
+    pytest.mark.usefixtures("role_passwords", "_test_repo_routes"),
+]
 
 
 def _task(task_id: str, **overrides) -> ParsedTask:
