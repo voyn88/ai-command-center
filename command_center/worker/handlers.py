@@ -1550,6 +1550,27 @@ def _run_agent(
             # task as completed and never fall back to direct same-UID
             # execution. A later delivery may land after socket/systemd
             # recovery and safely inspect/reuse the workspace.
+            checkpoint_failure = checkpoint_preserved_candidate()
+            if checkpoint_failure is not None:
+                # A transport failure can happen after the launcher allowed
+                # the model to commit.  If that committed prefix cannot be
+                # authenticated and checkpointed, move the clone out of the
+                # retry path now; otherwise its divergent HEAD would poison
+                # every later delivery at preflight.
+                with _provision_lock(str(isolated_workspace)):
+                    quarantined = workspace_provisioning.quarantine_task_workspace(
+                        isolated_workspace
+                    )
+                if quarantined is not None:
+                    checkpoint_failure = replace(
+                        checkpoint_failure,
+                        reason=(
+                            checkpoint_failure.reason
+                            + f"; uncheckpointed clone quarantined at {quarantined}"
+                        ),
+                        infra_wait=True,
+                    )
+                return checkpoint_failure
             return HandlerOutcome(
                 ok=False,
                 reason=(
