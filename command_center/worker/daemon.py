@@ -73,12 +73,20 @@ class HandlerOutcome:
     # publish that lost that race used to fail through the ordinary
     # `retryable=True` path, which spends this item's `max_attempts` on
     # contention it had no part in causing and can dead-letter already
-    # -finished work; REM also closes the same burn on the dispatch-time
-    # acquire / blocking_lease door). Routes to `queue_fail_lease_wait`
-    # instead of `queue_fail`: it refunds the attempt `queue_claim` already
-    # spent for this delivery and counts the wait against its own bounded
-    # budget instead. Meaningless when `ok` is True and implies `retryable`
-    # -- there is no such thing as a non-retryable lease wait.
+    # -finished work). Routes to `queue_fail_lease_wait` instead of
+    # `queue_fail`: it refunds the attempt `queue_claim` already spent for
+    # this delivery and counts the wait against its own bounded budget
+    # instead. Meaningless when `ok` is True and implies `retryable` --
+    # there is no such thing as a non-retryable lease wait.
+    #
+    # The name is the DB exit it routes to (`lease_wait_count`), and the
+    # class it admits is "wait, do not spend an attempt": the second member
+    # is a launch refused by a concurrent write racing the broker's pre-bind
+    # workspace walk (VOYN-W0-AICC-LAUNCHER-WORKSPACE-WALK-RACES-VENV-WRITES,
+    # `agent_runner.RunResult.is_transient_principal_isolation_error`). Both
+    # are contention with another writer, neither is evidence about the work,
+    # and both stay bounded by the same lease-wait budget so pathological
+    # recurrence still dead-letters instead of retrying forever.
     lease_wait: bool = False
     # Same refund semantics for failures in the host/launcher/provider
     # substrate. These are not task attempts: a missing systemd socket, a
