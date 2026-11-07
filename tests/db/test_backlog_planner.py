@@ -17,6 +17,7 @@ import secrets
 import pytest
 
 from command_center.db import roles
+from command_center.dispatch.models import DEFER_COST_DATA_UNAVAILABLE, DEFER_DAILY_BUDGET
 from command_center.db.backlog_parser import ParsedTask
 from command_center.db.backlog_store import BacklogStore
 from command_center.db.work_queue_store import ClaimedWork, WorkQueueStore
@@ -783,6 +784,103 @@ def test_an_unrouted_repo_is_reported_not_dead_lettered(rig, monkeypatch) -> Non
     with app_factory() as conn, conn.cursor() as cur:
         cur.execute("SELECT count(*) FROM work_item WHERE task_id = %s", ("VOYN-W0-RR",))
         assert cur.fetchone()[0] == 0
+
+
+def test_metered_links_are_removed_for_owner_cascade_when_spend_unknown(rig, monkeypatch) -> None:
+    app_factory, store, _worker = rig
+    monkeypatch.setenv("AICC_EXECUTOR_PROFILE", "owner-cascade")
+    assert store.upsert_task(_task("VOYN-W0-FINOPS-CU", repo="repo-p1"))[0]
+
+    report = plan_once(app_factory, PlanLimits(planner="finops-b1"))
+
+    assert [task_id for task_id, _ in report.dispatched] == ["VOYN-W0-FINOPS-CU"]
+    assert report.links_excluded == [
+        ("VOYN-W0-FINOPS-CU", "cursor", DEFER_COST_DATA_UNAVAILABLE),
+        ("VOYN-W0-FINOPS-CU", "grok", DEFER_COST_DATA_UNAVAILABLE),
+    ]
+    with app_factory() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT payload, max_attempts FROM work_item WHERE task_id = %s "
+            "ORDER BY created_at DESC LIMIT 1",
+            ("VOYN-W0-FINOPS-CU",),
+        )
+        payload, max_attempts = cur.fetchone()
+    assert [link["executor"] for link in payload["cascade"]] == ["claude", "codex"]
+    assert payload["finops_excluded_executors"] == ["cursor", "grok", "openai_http"]
+    assert max_attempts == 2
+
+
+def test_finops_marker_is_emitted_without_owner_profile_when_spend_is_unknown(
+    rig, monkeypatch
+) -> None:
+    app_factory, store, _worker = rig
+    monkeypatch.delenv("AICC_EXECUTOR_PROFILE", raising=False)
+    assert store.upsert_task(_task("VOYN-W0-FINOPS-NP", repo="repo-p1"))[0]
+
+    report = plan_once(app_factory, PlanLimits(planner="finops-b1"))
+
+    assert [task_id for task_id, _ in report.dispatched] == ["VOYN-W0-FINOPS-NP"]
+    with app_factory() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT payload FROM work_item WHERE task_id = %s "
+            "ORDER BY created_at DESC LIMIT 1",
+            ("VOYN-W0-FINOPS-NP",),
+        )
+        payload = cur.fetchone()[0]
+    assert [link["executor"] for link in payload["cascade"]] == ["claude", "codex"]
+    assert payload["finops_excluded_executors"] == ["cursor", "grok", "openai_http"]
+
+
+def test_metered_links_are_removed_for_owner_cascade_when_budget_exhausted(rig, monkeypatch) -> None:
+    import command_center.orchestrator.planner as planner_module
+
+    app_factory, store, _worker = rig
+    monkeypatch.setenv("AICC_EXECUTOR_PROFILE", "owner-cascade")
+    monkeypatch.setattr(planner_module, "_metered_spend_24h_usd", lambda _rows: 3.5)
+    assert store.upsert_task(_task("VOYN-W0-FINOPS-CE", repo="repo-p1"))[0]
+
+    report = plan_once(app_factory, PlanLimits(planner="finops-b1", max_metered_spend_usd_24h=3.0))
+
+    assert [task_id for task_id, _ in report.dispatched] == ["VOYN-W0-FINOPS-CE"]
+    with app_factory() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT payload, max_attempts FROM work_item WHERE task_id = %s "
+            "ORDER BY created_at DESC LIMIT 1",
+            ("VOYN-W0-FINOPS-CE",),
+        )
+        payload, max_attempts = cur.fetchone()
+    assert [link["executor"] for link in payload["cascade"]] == ["claude", "codex"]
+    assert payload["finops_excluded_executors"] == ["cursor", "grok", "openai_http"]
+    assert max_attempts == 2
+
+
+def test_owner_alternatives_refuses_when_all_links_metered_and_budget_exhausted(
+    rig, monkeypatch
+) -> None:
+    import command_center.orchestrator.planner as planner_module
+
+    app_factory, store, _worker = rig
+    monkeypatch.setenv("AICC_EXECUTOR_PROFILE", "owner-alternatives")
+    monkeypatch.setattr(planner_module, "_metered_spend_24h_usd", lambda _rows: 3.5)
+    assert store.upsert_task(_task("VOYN-W0-FINOPS-AE", repo="repo-p1"))[0]
+
+    report = plan_once(app_factory, PlanLimits(planner="finops-b1", max_metered_spend_usd_24h=3.0))
+
+    assert report.dispatched == []
+    assert ("VOYN-W0-FINOPS-AE", DEFER_DAILY_BUDGET) in report.refused
+
+
+def test_owner_alternatives_refuses_when_all_links_metered_and_spend_unknown(
+    rig, monkeypatch
+) -> None:
+    app_factory, store, _worker = rig
+    monkeypatch.setenv("AICC_EXECUTOR_PROFILE", "owner-alternatives")
+    assert store.upsert_task(_task("VOYN-W0-FINOPS-AU", repo="repo-p1"))[0]
+
+    report = plan_once(app_factory, PlanLimits(planner="finops-b1"))
+
+    assert report.dispatched == []
+    assert ("VOYN-W0-FINOPS-AU", DEFER_COST_DATA_UNAVAILABLE) in report.refused
 
 
 # --- VOYN-W0-AICC-DEFER-AUTO-RESUME (0014): the machine exit from parks -----
