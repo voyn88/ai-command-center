@@ -1141,7 +1141,7 @@ def test_cli_defers_to_a_staged_rollout_without_touching_the_controller(
     must defer -- exit 0, audited, no controller mutation -- not race the
     rollout's own lane stop/start (live worker-01 2026-09-08)."""
     lock = tmp_path / "aicc-staged-rollout.lock"
-    lock.write_text("12345\n", encoding="utf-8")
+    lock.write_text(f"{os.getpid()}\n", encoding="utf-8")
 
     def fail(self) -> None:
         raise AssertionError("rotate() must not run while the rollout lock is held")
@@ -1170,6 +1170,41 @@ def test_cli_defers_to_a_staged_rollout_without_touching_the_controller(
     output = capsys.readouterr().out
     assert '"event":"rotation_deferred_staged_rollout"' in output
     assert str(lock) in output
+
+
+def test_cli_ignores_a_stale_staged_rollout_lock(tmp_path: Path, monkeypatch, capsys) -> None:
+    """A killed rollout must not suppress all later credential renewals."""
+    lock = tmp_path / "aicc-staged-rollout.lock"
+    lock.write_text("999999999\n", encoding="utf-8")
+    rotated = False
+
+    def rotate(self) -> None:
+        nonlocal rotated
+        rotated = True
+
+    monkeypatch.setattr(RotationController, "rotate", rotate)
+    result = main(
+        [
+            "--env-file",
+            str(_environment(tmp_path / "worker.env")),
+            "--lock-file",
+            str(tmp_path / "rotation.lock"),
+            "--phase-file",
+            str(tmp_path / "phase.json"),
+            "--circuit-file",
+            str(tmp_path / "circuit.json"),
+            "--tunnel-unit",
+            TUNNEL,
+            "--lane-registry",
+            str(_lane_registry(tmp_path, monkeypatch)),
+            "--rollout-lock",
+            str(lock),
+        ]
+    )
+
+    assert result == 0
+    assert rotated
+    assert "rotation_deferred_staged_rollout" not in capsys.readouterr().out
 
 
 def test_cli_recover_only_ignores_the_rollout_lock(
@@ -1303,6 +1338,7 @@ def test_versioned_units_pin_drain_shutdown_and_non_overlapping_timer(
     )
     assert "--lane-registry /etc/voyn/aicc-worker-lanes.conf" in rotation
     assert "ConditionPathExists" not in rotation
+    assert "ExecCondition=" not in rotation
     assert "OnFailure=voyn-aicc-credential-rotation-alert@%n.service" in rotation
     assert "ExecStopPost=" in rotation
     assert "--recover-only" in rotation

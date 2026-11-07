@@ -81,6 +81,39 @@ class RotationError(RuntimeError):
     """A fail-closed operational error safe to show in an audit event."""
 
 
+def rollout_lock_is_active(path: Path) -> bool:
+    """Whether a staged-rollout marker still belongs to a live process.
+
+    Rollout writers store their PID in the marker.  An existence-only check
+    turns a SIGKILLed rollout into a permanent rotation pause: ``/run``
+    survives for the rest of the boot while the owner process does not.  The
+    rotator must not remove a root-owned coordination file, but it can safely
+    ignore a well-formed marker whose owner no longer exists.
+
+    An unreadable or malformed marker remains an active hold.  That preserves
+    the fail-closed behavior for an unexpected coordination-file state.
+    """
+    try:
+        owner = path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    if not owner.isascii() or not owner.isdecimal():
+        return True
+    pid = int(owner)
+    if pid < 1:
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # A root-owned rollout is expected to be unsignalable by the rotator.
+        return True
+    return True
+
+
 class CircuitOpen(RotationError):
     """A non-mutating cooldown refusal that must not extend its own deadline."""
 
@@ -1791,8 +1824,8 @@ def main(argv: list[str] | None = None) -> int:
     # Recovery is exempt: it is cleaning up an ALREADY-interrupted rotation
     # (a durable phase journal), and leaving that fleet drained until the
     # rollout finishes is a worse outcome than finishing the recovery.
-    if not args.recover_only and args.rollout_lock is not None and (
-        args.rollout_lock.exists()
+    if not args.recover_only and args.rollout_lock is not None and rollout_lock_is_active(
+        args.rollout_lock
     ):
         Audit(args.audit_file).emit(
             "rotation_deferred_staged_rollout", lock=str(args.rollout_lock)
