@@ -28,6 +28,7 @@ for the latter.
 from __future__ import annotations
 
 import contextlib
+import math
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -99,6 +100,8 @@ def _bounded_float(value: object, default: float, minimum: float, maximum: float
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return default
     number = float(value)
+    if not math.isfinite(number):
+        return default
     if number < minimum or number > maximum:
         return default
     return number

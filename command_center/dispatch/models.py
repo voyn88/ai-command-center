@@ -553,8 +553,14 @@ class DispatchDecision:
 
 # The trailing-24h spend was actually read.
 SPEND_MEASURED = "measured"
-# The read failed (e.g. a DB outage): there is nothing to report.
+# The read failed (e.g. a DB outage, or a cost event that could not be read as
+# one): there is nothing to report.
 SPEND_UNAVAILABLE = "unavailable"
+# No ceiling is configured (`max_daily_spend_usd <= 0`), so the trailing-24h
+# spend was never read: there is nothing to gate on, and a read that cannot
+# affect any decision is a failure mode nobody needs to own. Distinct from
+# `unavailable` on purpose — "not asked" is not "asked and failed".
+SPEND_NOT_MEASURED = "not_measured"
 
 # `daily_spend_usd`/`projected_spend_usd` are backed by a real reading.
 SPEND_KIND_ACTUAL = "actual"
@@ -586,6 +592,7 @@ class SpendMeasurement:
 
 SPEND_MEASUREMENT_ACTUAL = SpendMeasurement(SPEND_MEASURED, SPEND_KIND_ACTUAL)
 SPEND_MEASUREMENT_UNAVAILABLE = SpendMeasurement(SPEND_UNAVAILABLE, SPEND_KIND_UNKNOWN)
+SPEND_MEASUREMENT_NOT_MEASURED = SpendMeasurement(SPEND_NOT_MEASURED, SPEND_KIND_UNKNOWN)
 
 
 @dataclass(frozen=True)
@@ -594,10 +601,12 @@ class DispatchPlan:
 
     decisions: tuple[DispatchDecision, ...]
     kill_switch_engaged: bool
-    # None exactly when `budget_unknown` is True: the trailing-24h spend could
-    # not be read, so there is no real figure to report. A caller that reads
-    # this field without checking `budget_unknown` must see "no data" (None),
-    # never a fabricated `0.0` that reads as "nothing spent today".
+    # None whenever no figure was actually read — either because the read
+    # failed (`budget_unknown` is True) or because no ceiling is configured
+    # and nothing was read at all (`spend_measurement.status` is
+    # `not_measured`). A caller that reads this field without checking
+    # `spend_measurement`/`budget_unknown` must see "no data" (None), never a
+    # fabricated `0.0` that reads as "nothing spent today".
     daily_spend_usd: float | None
     max_daily_spend_usd: float
     # None in lockstep with `daily_spend_usd`: whatever is unmeasured never
