@@ -1537,9 +1537,10 @@ def test_the_capacity_clock_waits_on_the_provider_not_the_host(
     `_queue_backoff` doubles from 2 s to a 300 s ceiling -- right for a
     launcher that comes back in minutes, and the reason 20 infra waits fit
     inside 1.1 hours. `_queue_capacity_backoff` starts at 15 minutes and
-    grows to an hour, so the default 24 waits is most of a day: long enough
-    to outlast the Claude Max 5-hour rolling cap and to keep polling cheap
-    while a weekly window drains.
+    grows to an hour, so the default 26 waits is ~24h45m: long enough to
+    outlast the Claude Max 5-hour rolling cap, to keep polling cheap while a
+    weekly window drains, and to outlast the monitor's own 24-hour health
+    acceptance window.
     """
     _provision(admin_conn, psycopg, test_dsn, role_passwords)
     with admin_conn.cursor() as cur:

@@ -34,11 +34,12 @@
 -- reasons, attempt refunded atomically on BOTH branches per 0028 -- and
 -- changes only the clock: the delay starts at 15 minutes and grows to an
 -- hour, because a pool that is empty now is not refilled in 300 seconds and
--- polling it is pure waste. 24 waits is then ~22.75 hours of patience, so an
--- item survives every rolling window the fleet actually meets, and a
--- capacity outage that outlasts a FULL DAY still ends in a dead letter the
--- monitor reports -- a day with no capacity at all is an operator's problem,
--- not a work item's.
+-- polling it is pure waste. 26 waits (15m + 30m + 24 x 60m) is then ~24h45m
+-- of patience -- longer than control-01:queue's 24-hour health acceptance
+-- window, so an item survives every rolling window the fleet actually meets,
+-- and a capacity outage that outlasts a FULL DAY still ends in a dead letter
+-- the monitor reports -- a day with no capacity at all is an operator's
+-- problem, not a work item's.
 --
 -- The infra-wait budget is deliberately NOT touched by a capacity wait: the
 -- two measure different substrates, and spending one on the other is exactly
@@ -63,7 +64,7 @@ $$;
 
 CREATE FUNCTION queue_fail_capacity_wait(
     p_attempt_id text, p_claim_token text, p_reason text,
-    p_max_capacity_waits integer DEFAULT 24
+    p_max_capacity_waits integer DEFAULT 26
 ) RETURNS queue_verdict
     LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, public AS $$
 DECLARE o record; v queue_verdict; i work_item%ROWTYPE;
