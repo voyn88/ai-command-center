@@ -111,6 +111,7 @@ from command_center.orchestrator import gh_access, github_app_auth
 from command_center.orchestrator.routing import cascade_for
 
 __all__ = [
+    "EvidenceFreeRecoveryReport",
     "LoopReport",
     "PrWindowConfig",
     "PrWindowReport",
@@ -119,6 +120,7 @@ __all__ = [
     "autonomy_remediate_once",
     "merge_once",
     "publish_review_verdicts",
+    "recover_evidence_free_ready_to_review",
     "reconcile_merge_evidence",
     "reconcile_pr_window",
     "reconcile_review_once",
@@ -374,6 +376,63 @@ def reconcile_pr_evidence(
             report.skipped.append((row_task_id, f"evidence_refused: {reason}"))
             continue
         report.recorded.append((row_task_id, pr_url))
+    return report
+
+
+@dataclass
+class EvidenceFreeRecoveryReport:
+    """See `recover_evidence_free_ready_to_review`."""
+
+    #: (task_id, revision) sent back to OPEN for a fresh dispatch attempt.
+    recovered: list[tuple[str, int | None]] = field(default_factory=list)
+    #: (task_id, reason) the sanctioned 0018 recovery function itself refused.
+    refused: list[tuple[str, str]] = field(default_factory=list)
+
+
+def recover_evidence_free_ready_to_review(
+    factory: Any, evidence_report: PrEvidenceReport
+) -> EvidenceFreeRecoveryReport:
+    """Send back to OPEN every task `reconcile_pr_evidence` just confirmed is
+    READY_TO_REVIEW with no `pr` evidence and no open PR on its branch.
+
+    `backlog_ingest_results` only ever reaches READY_TO_REVIEW together with
+    recording `pr` evidence in the same transaction (0011, then 0021 and
+    0030 which re-derive the same function), so that combination is never
+    the ordinary case. It is exactly the residue 0018's
+    `backlog_recover_stuck_ready_to_review` was written to repair -- a
+    completed-but-unpublished run from before 0011 shipped, or some future
+    bug in a different corner of the same pipeline reintroducing it. That
+    function had no caller anywhere outside its own tests: a task landing in
+    this state had a sanctioned way out on paper and no tick that ever used
+    it, which is how VOYN-W0-AICC-SRV-08-CLEAN-HOST sat reporting the
+    identical `no_open_pr_on_task_branch` skip for 5 consecutive ticks until
+    the watchdog escalated it (VOYN-W0-AICC-TICK-STALL-WATCHDOG) -- nothing
+    in the pipeline was ever going to move it again on its own.
+
+    Scoped to `no_open_pr_on_task_branch` specifically, never to
+    `reconcile_pr_evidence`'s other skip reasons: that one reason means the
+    GitHub lookup itself succeeded and found no open PR live right now, as
+    opposed to `pr_list_failed` / `pr_list_undecodable` / a route gap, which
+    are inconclusive checks that deserve another look next tick, not a
+    recovery. Called with the SAME report `reconcile_pr_evidence` just
+    produced, so a PR this very tick found and attached evidence for is
+    already absent from it -- recovery never races that attachment.
+
+    `backlog_recover_stuck_ready_to_review` re-verifies both the status and
+    the absence of `pr` evidence itself before acting, so calling it here is
+    idempotent against a task that moved on between the two reads."""
+    from command_center.db.backlog_store import BacklogStore
+
+    report = EvidenceFreeRecoveryReport()
+    store = BacklogStore(factory)
+    for task_id, reason in evidence_report.skipped:
+        if reason != "no_open_pr_on_task_branch":
+            continue
+        ok, verdict_reason, revision = store.recover_stuck_ready_to_review(task_id)
+        if ok:
+            report.recovered.append((task_id, revision))
+        else:
+            report.refused.append((task_id, verdict_reason))
     return report
 
 

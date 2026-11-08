@@ -654,6 +654,7 @@ def main(argv: list[str] | None = None) -> int:
                     publish_review_verdicts,
                     reconcile_pr_evidence,
                     reconcile_review_once,
+                    recover_evidence_free_ready_to_review,
                     review_once,
                 )
 
@@ -678,6 +679,23 @@ def main(argv: list[str] | None = None) -> int:
                         print(f"PR-FOUND  {evidence_task_id} -> {pr}")
                     for evidence_task_id, reason in evidence.skipped:
                         print(f"PR-SKIP   {evidence_task_id}: {reason}")
+                    # A READY_TO_REVIEW task with no `pr` evidence and
+                    # confirmed (not merely unchecked) no open PR on its
+                    # branch is residue, never the ordinary case -- ingest
+                    # only reaches READY_TO_REVIEW together with recording
+                    # `pr` evidence. Left alone it skips with the identical
+                    # reason every tick forever, since nothing else in this
+                    # pipeline ever revisits it (VOYN-W0-AICC-SRV-08-CLEAN-
+                    # HOST-STALL, caught by the tick-stall watchdog). The
+                    # 0018 recovery function exists exactly for this and had
+                    # no caller until now.
+                    recovery = recover_evidence_free_ready_to_review(
+                        lambda: _nc(conn), evidence
+                    )
+                    for recovered_task_id, revision in recovery.recovered:
+                        print(f"PR-RECOVER {recovered_task_id} -> OPEN (rev {revision})")
+                    for recovered_task_id, reason in recovery.refused:
+                        print(f"PR-RECOVER-SKIP {recovered_task_id}: {reason}")
                     report = review_once(
                         lambda: _nc(conn),
                         enqueue,

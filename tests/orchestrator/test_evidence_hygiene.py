@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+from command_center.db.backlog_store import BacklogStore
 from command_center.orchestrator import planner, review_merge
 
 BAD_PR = "not-a-github-pr-url"
@@ -260,3 +261,71 @@ def test_migration_0030_keeps_shape_gate_and_does_not_reuse_0017():
 def test_pr_shape_rejects_unresolvable_urls(url):
     assert review_merge._repo_from_pr_url(url) is None
     assert review_merge._owner_repo_number_from_pr_url(url) is None
+
+
+# recover_evidence_free_ready_to_review: VOYN-W0-AICC-SRV-08-CLEAN-HOST-STALL.
+#
+# `backlog_recover_stuck_ready_to_review` (0018) had been the sanctioned way
+# out of "READY_TO_REVIEW with no `pr` evidence" since it shipped, but no
+# tick ever called it -- only its own tests did. A task that reached that
+# state (residue from before 0011, or any future bug reintroducing it) sat
+# reporting `no_open_pr_on_task_branch` identically forever, which is what
+# the tick-stall watchdog caught live on VOYN-W0-AICC-SRV-08-CLEAN-HOST.
+
+
+def test_recovers_only_the_no_open_pr_on_task_branch_reason(monkeypatch):
+    calls: list[str] = []
+
+    def fake_recover(self, task_id):
+        calls.append(task_id)
+        return True, "OPEN", 3
+
+    monkeypatch.setattr(BacklogStore, "recover_stuck_ready_to_review", fake_recover)
+
+    evidence = review_merge.PrEvidenceReport(
+        recorded=[],
+        skipped=[
+            ("VOYN-W0-AICC-SRV-08-CLEAN-HOST", "no_open_pr_on_task_branch"),
+            ("VOYN-W0-FLAKY", "pr_list_failed"),
+            ("VOYN-W0-NOROUTE", "no_repo_route: 'ghost'"),
+            ("VOYN-W0-AMBIGUOUS", "ambiguous_open_prs_on_branch"),
+        ],
+    )
+    report = review_merge.recover_evidence_free_ready_to_review(object(), evidence)
+
+    assert calls == ["VOYN-W0-AICC-SRV-08-CLEAN-HOST"]
+    assert report.recovered == [("VOYN-W0-AICC-SRV-08-CLEAN-HOST", 3)]
+    assert report.refused == []
+
+
+def test_a_refusal_from_the_sanctioned_recovery_function_is_surfaced(monkeypatch):
+    """A task that gained `pr` evidence between the two reads (a real PR
+    attached by this same tick, or by a concurrent one) is left alone --
+    the 0018 function's own `has_pr_evidence` refusal, not silently eaten."""
+    monkeypatch.setattr(
+        BacklogStore,
+        "recover_stuck_ready_to_review",
+        lambda self, task_id: (False, "has_pr_evidence", 5),
+    )
+    evidence = review_merge.PrEvidenceReport(
+        skipped=[("VOYN-W0-RACY", "no_open_pr_on_task_branch")]
+    )
+    report = review_merge.recover_evidence_free_ready_to_review(object(), evidence)
+
+    assert report.recovered == []
+    assert report.refused == [("VOYN-W0-RACY", "has_pr_evidence")]
+
+
+def test_no_candidates_never_touches_the_store(monkeypatch):
+    def fail(self, task_id):
+        raise AssertionError("must not be called with no matching skip reason")
+
+    monkeypatch.setattr(BacklogStore, "recover_stuck_ready_to_review", fail)
+
+    evidence = review_merge.PrEvidenceReport(
+        skipped=[("VOYN-W0-FLAKY", "pr_list_failed")]
+    )
+    report = review_merge.recover_evidence_free_ready_to_review(object(), evidence)
+
+    assert report.recovered == []
+    assert report.refused == []
