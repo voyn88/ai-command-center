@@ -3596,7 +3596,12 @@ def _merged_target_sha(repo_path: str, pr_url: str) -> tuple[str | None, str]:
         data = json.loads(view.stdout or "{}")
     except json.JSONDecodeError:
         return None, "pr_view_failed"
-    if not isinstance(data, dict) or data.get("state") != "MERGED":
+    if not isinstance(data, dict):
+        return None, "pr_view_failed"
+    state = str(data.get("state") or "")
+    if state == "CLOSED":
+        return None, "pr_closed_unmerged"
+    if state != "MERGED":
         return None, "not_merged"
     oid = str((data.get("mergeCommit") or {}).get("oid") or "")
     if not re.fullmatch(r"[0-9a-f]{40}", oid):
@@ -4413,10 +4418,20 @@ def _merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -
 
     open_pr_snapshot, _snapshot_failure = _merge_window_open_pr_snapshot(repo_path)
     origin = _origin_owner_repo(repo_path) if open_pr_snapshot is not None else None
+    # Tasks this tick already moved out of READY_TO_REVIEW (REJECTED or DONE).
+    # The scan yields one row per (task, pr), so a multi-PR task's later rows
+    # must not re-run a transition that already happened. Only a COMMITTED
+    # transition marks a task: a row that merely skips (closed PR with a
+    # pending sibling, not ready, window inactive, ...) must leave the task's
+    # remaining PR rows to be examined -- otherwise a task whose first PR is
+    # closed and whose second PR merged with acceptance never reaches DONE.
+    finished_tasks: set[str] = set()
     for task_id, pr_url in tasks:
         if actions >= cfg.max_per_tick:
             break
         last_processed = (task_id, pr_url)
+        if task_id in finished_tasks:
+            continue
         if _repo_from_pr_url(pr_url) is None:
             # Same shape gate as review_once/publish_review_verdicts -- a
             # malformed pr_url fails every `gh pr view` below identically
@@ -4479,6 +4494,53 @@ def _merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -
             merge_sha, merge_reason = None, "not_merged"
         else:
             merge_sha, merge_reason = _merged_target_sha(repo_path, pr_url)
+        if merge_sha is None and merge_reason == "pr_closed_unmerged":
+            sibling_pr_rows = _rows(
+                factory,
+                "SELECT value FROM backlog_evidence WHERE task_id = %s AND kind = 'pr' AND value <> %s ORDER BY evidence_id",
+                (task_id, pr_url),
+            )
+            sibling_pending = False
+            for sibling_pr_url, in sibling_pr_rows:
+                _sibling_sha, sibling_reason = _merged_target_sha(repo_path, sibling_pr_url)
+                if sibling_reason != "pr_closed_unmerged":
+                    sibling_pending = True
+                    break
+            if sibling_pending:
+                report.skipped.append((task_id, "pr_closed_unmerged_sibling_pending"))
+                continue
+            with factory() as conn:
+                conn.autocommit = False
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT revision FROM backlog_task WHERE task_id = %s",
+                            (task_id,),
+                        )
+                        row = cur.fetchone()
+                        if row is None:
+                            conn.rollback()
+                            report.skipped.append((task_id, "task_vanished"))
+                            continue
+                        revision = row[0]
+                        cur.execute(
+                            "SELECT ok, reason FROM backlog_transition(%s, 'REJECTED', %s)",
+                            (task_id, revision),
+                        )
+                        ok, reason = cur.fetchone()
+                    if ok:
+                        conn.commit()
+                        finished_tasks.add(task_id)
+                        report.skipped.append((task_id, "rejected_pr_closed_unmerged"))
+                    else:
+                        conn.rollback()
+                        report.skipped.append((task_id, f"transition:{reason}"))
+                except Exception:
+                    conn.rollback()
+                    raise
+                finally:
+                    conn.autocommit = True
+            continue
         if merge_sha is None and merge_reason == "merged_without_acceptance_evidence":
             report.skipped.append((task_id, merge_reason))
             continue
@@ -4633,6 +4695,7 @@ def _merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -
                     ok, reason = cur.fetchone()
                 if ok:
                     conn.commit()
+                    finished_tasks.add(task_id)
                     report.merged.append((task_id, head))
                 else:
                     conn.rollback()
