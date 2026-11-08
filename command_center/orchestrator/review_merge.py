@@ -240,10 +240,13 @@ class ReconcileReport:
 
 @dataclass
 class PrEvidenceReport:
-    """See `reconcile_pr_evidence`. Records evidence; never changes a status."""
+    """See `reconcile_pr_evidence`."""
 
     #: (task_id, pr_url) newly recorded from the task's own branch.
     recorded: list[tuple[str, str]] = field(default_factory=list)
+    #: task ids returned to OPEN after GitHub proved their canonical branch
+    #: has no open PR and the evidence-free recovery gate accepted them.
+    recovered: list[str] = field(default_factory=list)
     #: (task_id, reason) examined and deliberately left alone.
     skipped: list[tuple[str, str]] = field(default_factory=list)
 
@@ -296,9 +299,11 @@ def reconcile_pr_evidence(
     origin of that checkout and nothing else, so a task can never be attached
     to a pull request in another repository.
 
-    Reporting only: no status is changed here. A task becomes reviewable
-    because it is `READY_TO_REVIEW` and now has evidence, through the same
-    path it always did.
+    When GitHub successfully proves that the canonical branch has no open PR,
+    the task cannot become reviewable. In that one conclusive case the narrow,
+    audited ``backlog_recover_stuck_ready_to_review`` gate returns the
+    evidence-free task to OPEN for a fresh publication attempt. Lookup
+    failures and ambiguous matches remain report-only.
     """
     # Imported here, as  does, so this module keeps its
     # import-time independence from the planner.
@@ -348,7 +353,17 @@ def reconcile_pr_evidence(
             and entry["url"]
         ]
         if not matches:
-            report.skipped.append((row_task_id, "no_open_pr_on_task_branch"))
+            with factory() as conn, conn.cursor() as cur:
+                cur.execute(
+                    "SELECT * FROM backlog_recover_stuck_ready_to_review(%s)",
+                    (row_task_id,),
+                )
+                verdict = cur.fetchone()
+            if verdict and verdict[0]:
+                report.recovered.append(row_task_id)
+            else:
+                reason = (verdict[1] if verdict and len(verdict) > 1 else "") or "unknown"
+                report.skipped.append((row_task_id, f"recovery_refused: {reason}"))
             continue
         if len(matches) > 1:
             report.skipped.append((row_task_id, "ambiguous_open_prs_on_branch"))
