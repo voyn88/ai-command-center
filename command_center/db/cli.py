@@ -25,7 +25,6 @@ from typing import Any
 from command_center.db import migrations, pool, roles
 from command_center.db.config import ConfigError, load_config
 
-
 _REVIEW_QUEUE_PRIORITY = 10
 
 
@@ -648,12 +647,12 @@ def main(argv: list[str] | None = None) -> int:
 
                 from command_center.db.work_queue_store import WorkQueueStore
                 from command_center.ops import tick_stall_watchdog as _watchdog
-
                 from command_center.orchestrator import gh_access
                 from command_center.orchestrator.review_merge import (
                     publish_review_verdicts,
                     reconcile_pr_evidence,
                     reconcile_review_once,
+                    recover_stalled_pr_evidence,
                     review_once,
                 )
 
@@ -717,6 +716,17 @@ def main(argv: list[str] | None = None) -> int:
                 _watchdog.record_skips(conn, "review_marker", tick_id, marker_report.skipped)
                 stalls = _watchdog.watchdog_once(lambda: _nc(conn))
                 print(f"WATCHDOG  escalated={len(stalls.escalated)} refused={len(stalls.refused)}")
+                # After the watchdog, never before it: this only acts on
+                # episodes the ledger already escalated, so an operator
+                # always sees the escalation at least as early as the fix
+                # (VOYN-W0-AICC-SRV-08-PITR-STALL: `backlog_recover_stuck_
+                # ready_to_review`, 0018, shipped with no caller and left a
+                # `no_open_pr_on_task_branch` stall unresolvable forever).
+                recovery = recover_stalled_pr_evidence(lambda: _nc(conn))
+                for recovered_task_id, new_status in recovery.recovered:
+                    print(f"RECOVER   {recovered_task_id} -> {new_status}")
+                for recovered_task_id, reason in recovery.skipped:
+                    print(f"RECOVER-SKIP {recovered_task_id}: {reason}")
                 # Printed AFTER the scope closes: the remaining-budget half
                 # of the line is read on the way out (`gh api rate_limit`,
                 # which does not itself consume quota).
