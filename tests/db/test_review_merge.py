@@ -4338,9 +4338,9 @@ def test_a_task_adopts_only_its_own_branch_never_a_prefix_match(rig, _test_repo_
         assert cur.fetchone()[0] == "OPEN"
 
 
-def test_a_conclusive_empty_lookup_recovers_an_evidence_free_ready_task(
-    rig, _test_repo_routes, monkeypatch
-):  # noqa: F811
+def test_a_conclusive_empty_lookup_recovers_an_evidence_free_ready_task(  # noqa: F811
+    rig, _test_repo_routes, monkeypatch  # noqa: F811
+):
     app_factory, store, _ = rig
     task_id = "VOYN-W0-PRE2B"
     _ready_without_pr(store, app_factory, task_id)
