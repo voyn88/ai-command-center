@@ -361,6 +361,15 @@ def test_blocked_refresh_budget_leaves_old_blocked_tail_untouched(monkeypatch):
         lambda _repo_path, pr, _cfg, desired: labels.append((pr["number"], desired))
         or True,
     )
+    cursor_moves: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        review_merge, "_add_single_label",
+        lambda _repo_path, pr, _name: cursor_moves.append(("add", pr["number"])) or True,
+    )
+    monkeypatch.setattr(
+        review_merge, "_remove_single_label",
+        lambda _repo_path, pr, _name: cursor_moves.append(("remove", pr["number"])) or True,
+    )
 
     report = reconcile_pr_window(
         "/repo",
@@ -377,6 +386,11 @@ def test_blocked_refresh_budget_leaves_old_blocked_tail_untouched(monkeypatch):
     assert report.blocked == [(1, "checks_stale")]
     assert report.unchecked == [(2, "2" * 40), (3, "3" * 40)]
     assert labels == [(4, "review-window:active"), (1, "review-window:blocked")]
+    # VOYN-W0-AICC-PNG-REVIEW-BLOCKED-REFRESH: the cursor moves onto the ONE
+    # blocked PR that actually spent this tick's budget (1), so the next
+    # tick's rotation starts at 2 -- #2 and #3 are no longer starved behind
+    # #1 forever.
+    assert cursor_moves == [("add", 1)]
 
 
 def test_in_progress_checks_keep_the_active_window_label(monkeypatch):

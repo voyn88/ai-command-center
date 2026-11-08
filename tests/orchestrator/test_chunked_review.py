@@ -517,11 +517,41 @@ def test_pr_snapshot_rejects_oversize(monkeypatch):
     assert review_merge._pr_diff_and_head("/repo", PR) is None
 
 
-def test_pr_snapshot_rejects_binary_diff_even_when_stats_match(monkeypatch):
+def test_pr_snapshot_rejects_non_png_binary_diff_even_when_stats_match(monkeypatch):
+    body = {"state": "open", "base": {"sha": BASE, "repo": {
+        "full_name": "voyn88/ai-command-center"}}, "head": {"sha": HEAD},
+        "changed_files": 1, "additions": 0, "deletions": 0}
+    binary = "diff --git a/data.bin b/data.bin\nBinary files a/data.bin and b/data.bin differ\n"
+    monkeypatch.setattr(review_merge, "_gh", lambda argv, _repo: subprocess.CompletedProcess(
+        argv, 0, json.dumps(body) if "/pulls/" in argv[1] else binary, ""))
+    assert review_merge._pr_diff_and_head("/repo", PR) is None
+
+
+def test_pr_snapshot_accepts_png_only_binary_diff_when_stats_match(monkeypatch):
+    # VOYN-W0-AICC-PNG-REVIEW-BLOCKED-REFRESH: a PNG-only binary diff must
+    # no longer refuse a snapshot outright -- `publish_review_verdicts`
+    # gates its ACCEPT on `_media_review_outcome`'s own ground-truth
+    # receipts instead (see test_media_review.py).
     body = {"state": "open", "base": {"sha": BASE, "repo": {
         "full_name": "voyn88/ai-command-center"}}, "head": {"sha": HEAD},
         "changed_files": 1, "additions": 0, "deletions": 0}
     binary = "diff --git a/image.png b/image.png\nBinary files a/image.png and b/image.png differ\n"
+    monkeypatch.setattr(review_merge, "_gh", lambda argv, _repo: subprocess.CompletedProcess(
+        argv, 0, json.dumps(body) if "/pulls/" in argv[1] else binary, ""))
+    snapshot = review_merge._pr_diff_and_head("/repo", PR)
+    assert snapshot is not None
+    assert snapshot.text == binary
+    assert review_merge._png_diff_paths(snapshot.text) == ("image.png",)
+
+
+def test_pr_snapshot_rejects_mixed_png_and_other_binary_diff(monkeypatch):
+    body = {"state": "open", "base": {"sha": BASE, "repo": {
+        "full_name": "voyn88/ai-command-center"}}, "head": {"sha": HEAD},
+        "changed_files": 2, "additions": 0, "deletions": 0}
+    binary = (
+        "diff --git a/image.png b/image.png\nBinary files a/image.png and b/image.png differ\n"
+        "diff --git a/data.bin b/data.bin\nBinary files a/data.bin and b/data.bin differ\n"
+    )
     monkeypatch.setattr(review_merge, "_gh", lambda argv, _repo: subprocess.CompletedProcess(
         argv, 0, json.dumps(body) if "/pulls/" in argv[1] else binary, ""))
     assert review_merge._pr_diff_and_head("/repo", PR) is None
