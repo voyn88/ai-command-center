@@ -676,6 +676,8 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     for evidence_task_id, pr in evidence.recorded:
                         print(f"PR-FOUND  {evidence_task_id} -> {pr}")
+                    for evidence_task_id in evidence.recovered:
+                        print(f"PR-RECOVER {evidence_task_id} -> OPEN")
                     for evidence_task_id, reason in evidence.skipped:
                         print(f"PR-SKIP   {evidence_task_id}: {reason}")
                     report = review_once(
