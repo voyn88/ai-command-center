@@ -246,6 +246,11 @@ class PrEvidenceReport:
     recorded: list[tuple[str, str]] = field(default_factory=list)
     #: (task_id, reason) examined and deliberately left alone.
     skipped: list[tuple[str, str]] = field(default_factory=list)
+    #: (task_id, reason) returned READY_TO_REVIEW -> OPEN this tick through
+    #: `backlog_recover_stuck_ready_to_review` (0018) because no branch, no
+    #: open PR, and no grace period left any other explanation. See this
+    #: function's docstring (VOYN-W0-AICC-SRV-09-REVERSE-MIRROR-STALL).
+    recovered: list[tuple[str, str]] = field(default_factory=list)
 
 
 #: Branch naming contract. `publish_run` pushes `backlog/<task id>` and nothing
@@ -255,12 +260,28 @@ def _task_branch(task_id: str) -> str:
     return f"backlog/{task_id}"
 
 
+#: How long a READY_TO_REVIEW task may sit with no `pr` evidence and no open
+#: PR on its own branch before this tick concludes none is coming and bounces
+#: it back to OPEN for a fresh attempt, rather than reporting the identical
+#: `no_open_pr_on_task_branch` skip forever. Short enough that a genuinely
+#: stuck task (publish_run failed outright, or never ran) gets a real retry
+#: within a handful of tick cycles; long enough that a push/PR-open still in
+#: flight when one tick happens to run is never mistaken for abandoned.
+#: Default 1h -- see VOYN-W0-AICC-SRV-09-REVERSE-MIRROR-STALL: the sanctioned
+#: 0018 recovery path existed but nothing ever called it automatically, so a
+#: task that reached READY_TO_REVIEW with neither a branch push nor a PR had
+#: no way out except a human (or an escalated agent) invoking it by hand --
+#: this tick repeated the exact same skip, tick after tick, forever.
+_NO_PR_RECOVERY_AFTER_SECONDS: int = 3_600
+
+
 def reconcile_pr_evidence(
     factory: Any,
     repo_path: str,
     *,
     task_id: str | None = None,
     limit: int = 25,
+    recover_after_seconds: int = _NO_PR_RECOVERY_AFTER_SECONDS,
 ) -> PrEvidenceReport:
     """Record the PR a READY_TO_REVIEW task already has, when only the branch
     proves it.
@@ -296,9 +317,23 @@ def reconcile_pr_evidence(
     origin of that checkout and nothing else, so a task can never be attached
     to a pull request in another repository.
 
-    Reporting only: no status is changed here. A task becomes reviewable
-    because it is `READY_TO_REVIEW` and now has evidence, through the same
-    path it always did.
+    Reporting only for a task that DOES have a PR: no status is changed for
+    it here. A task becomes reviewable because it is `READY_TO_REVIEW` and now
+    has evidence, through the same path it always did.
+
+    A task with neither `pr` evidence NOR an open PR on its branch is a
+    different animal: there is nothing here to derive. Rather than report
+    `no_open_pr_on_task_branch` every tick forever -- which is exactly what
+    happened live to VOYN-W0-AICC-SRV-09-REVERSE-MIRROR until the tick-stall
+    watchdog escalated it -- a task past `recover_after_seconds` in that
+    state is bounced READY_TO_REVIEW -> OPEN through the sanctioned 0018
+    recovery function (`backlog_recover_stuck_ready_to_review`), the same
+    path `backlog_return_to_pool`'s IN_PROGRESS case already uses for a
+    technical dead end. That function's own gate (READY_TO_REVIEW, zero `pr`
+    evidence rows) is what actually decides; this tick only adds the "give up
+    waiting" timer and the call, so a fresh dispatch gets a real second
+    attempt at publishing a PR instead of a human needing to run it by hand
+    for every occurrence.
     """
     # Imported here, as  does, so this module keeps its
     # import-time independence from the planner.
@@ -308,7 +343,8 @@ def reconcile_pr_evidence(
     if task_id is not None:
         rows = _rows(
             factory,
-            "SELECT t.task_id, t.repo FROM backlog_task t "
+            "SELECT t.task_id, t.repo, "
+            "extract(epoch FROM (now() - t.updated_at)) FROM backlog_task t "
             "WHERE t.status = 'READY_TO_REVIEW' AND t.task_id = %s "
             "AND NOT EXISTS (SELECT 1 FROM backlog_evidence e "
             "WHERE e.task_id = t.task_id AND e.kind = 'pr')",
@@ -317,14 +353,15 @@ def reconcile_pr_evidence(
     else:
         rows = _rows(
             factory,
-            "SELECT t.task_id, t.repo FROM backlog_task t "
+            "SELECT t.task_id, t.repo, "
+            "extract(epoch FROM (now() - t.updated_at)) FROM backlog_task t "
             "WHERE t.status = 'READY_TO_REVIEW' "
             "AND NOT EXISTS (SELECT 1 FROM backlog_evidence e "
             "WHERE e.task_id = t.task_id AND e.kind = 'pr') "
             "ORDER BY t.task_id LIMIT %s",
             (limit,),
         )
-    for row_task_id, repo in rows:
+    for row_task_id, repo, age_seconds in rows:
         if not repo:
             report.skipped.append((row_task_id, "no_repo_on_task"))
             continue
@@ -348,6 +385,23 @@ def reconcile_pr_evidence(
             and entry["url"]
         ]
         if not matches:
+            if age_seconds is not None and age_seconds >= recover_after_seconds:
+                with factory() as conn, conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT * FROM backlog_recover_stuck_ready_to_review(%s)",
+                        (row_task_id,),
+                    )
+                    recovery = cur.fetchone()
+                if recovery and recovery[0]:
+                    report.recovered.append((row_task_id, "no_open_pr_on_task_branch"))
+                    continue
+                # The gate refused (e.g. a race recorded `pr` evidence, or
+                # moved the task, between the SELECT above and this call) --
+                # report what actually happened rather than a recovery that
+                # did not occur.
+                reason = (recovery[1] if recovery and len(recovery) > 1 else "") or "unknown"
+                report.skipped.append((row_task_id, f"recovery_refused: {reason}"))
+                continue
             report.skipped.append((row_task_id, "no_open_pr_on_task_branch"))
             continue
         if len(matches) > 1:
