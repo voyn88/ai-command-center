@@ -4438,6 +4438,70 @@ def test_the_lookup_runs_in_the_checkout_the_tick_was_given(rig, _test_repo_rout
     assert seen == [REPO]
 
 
+def test_no_pr_and_no_branch_within_the_grace_period_is_only_skipped(
+    rig, _test_repo_routes, monkeypatch  # noqa: F811
+):
+    """The default grace period (1h) protects a task whose publish step is
+    merely still in flight: a tick that happens to run moments after the
+    transition to READY_TO_REVIEW must not treat "not yet" as "never"."""
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE9"
+    _ready_without_pr(store, app_factory, task_id)
+    monkeypatch.setattr(review_merge, "_gh", _fake_pr_list([]))
+
+    report = reconcile_pr_evidence(app_factory, REPO)
+
+    assert (task_id, "no_open_pr_on_task_branch") in report.skipped
+    assert all(entry[0] != task_id for entry in report.recovered)
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", (task_id,))
+        assert cur.fetchone()[0] == "READY_TO_REVIEW"
+
+
+def test_no_pr_and_no_branch_past_the_grace_period_is_recovered_to_open(
+    rig, _test_repo_routes, monkeypatch  # noqa: F811
+):
+    """VOYN-W0-AICC-SRV-09-REVERSE-MIRROR-STALL: a task with neither `pr`
+    evidence nor an open PR on its branch, past the grace period, has no
+    other explanation left -- it is bounced back to OPEN through the 0018
+    recovery gate so a fresh dispatch gets a real second attempt, instead of
+    this tick reporting the identical skip forever."""
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE10"
+    _ready_without_pr(store, app_factory, task_id)
+    monkeypatch.setattr(review_merge, "_gh", _fake_pr_list([]))
+
+    report = reconcile_pr_evidence(app_factory, REPO, recover_after_seconds=0)
+
+    assert (task_id, "no_open_pr_on_task_branch") in report.recovered
+    assert all(entry[0] != task_id for entry in report.skipped)
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", (task_id,))
+        assert cur.fetchone()[0] == "OPEN"
+
+
+def test_recovery_leaves_a_task_with_pr_evidence_alone(
+    rig, _test_repo_routes, monkeypatch  # noqa: F811
+):
+    """A task whose branch already carries an open PR is recorded, never
+    recovered, no matter how long it has waited -- recovery is reached only
+    when there is genuinely nothing to record."""
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE11"
+    _ready_without_pr(store, app_factory, task_id)
+    url = "https://github.com/x/repo-d2/pull/907"
+    monkeypatch.setattr(
+        review_merge,
+        "_gh",
+        _fake_pr_list([{"url": url, "headRefName": f"backlog/{task_id}"}]),
+    )
+
+    report = reconcile_pr_evidence(app_factory, REPO, recover_after_seconds=0)
+
+    assert (task_id, url) in report.recorded
+    assert all(entry[0] != task_id for entry in report.recovered)
+
+
 # -- reconcile_pr_window: no database involved, gh is faked in-process ------
 
 
