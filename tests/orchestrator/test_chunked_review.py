@@ -45,7 +45,7 @@ def publish(monkeypatch, snapshot, review_rows):
 
     posted, remediated = [], []
     monkeypatch.setattr(review_merge, "_rows", fake_rows)
-    monkeypatch.setattr(review_merge, "_pr_diff_and_head", lambda *_: snapshot)
+    monkeypatch.setattr(review_merge, "_pr_diff_and_head", lambda *_: review_merge._PRSnapshotResult(snapshot, "ok"))
     monkeypatch.setattr(review_merge, "_has_accept_marker", lambda *_: (False, HEAD))
     monkeypatch.setattr(review_merge, "_acceptance_app_credentials", object)
     monkeypatch.setattr(
@@ -132,7 +132,7 @@ def test_reconcile_enqueues_only_fresh_chunk_retry(monkeypatch):
         review_merge, "_model_only_review_cascade", lambda: [{"executor": "copilot"}]
     )
     monkeypatch.setattr(planner, "repo_route", lambda _: ("AICC", "/repo"))
-    monkeypatch.setattr(review_merge, "_pr_diff_and_head", lambda *_: snapshot)
+    monkeypatch.setattr(review_merge, "_pr_diff_and_head", lambda *_: review_merge._PRSnapshotResult(snapshot, "ok"))
     monkeypatch.setattr(review_merge, "_has_accept_marker", lambda *_: (False, HEAD))
     monkeypatch.setattr(
         review_merge,
@@ -175,7 +175,7 @@ def test_untargeted_reconcile_uses_the_rotating_scan_window(monkeypatch):
         review_merge, "_model_only_review_cascade", lambda: [{"executor": "codex"}]
     )
     monkeypatch.setattr(planner, "repo_route", lambda _: ("AICC", "/repo"))
-    monkeypatch.setattr(review_merge, "_pr_diff_and_head", lambda *_: snapshot)
+    monkeypatch.setattr(review_merge, "_pr_diff_and_head", lambda *_: review_merge._PRSnapshotResult(snapshot, "ok"))
     monkeypatch.setattr(review_merge, "_has_accept_marker", lambda *_: (False, HEAD))
     monkeypatch.setattr(review_merge, "_next_retry_key", lambda *_: None)
 
@@ -226,7 +226,7 @@ def test_reconcile_cursor_advances_only_through_processed_rows(monkeypatch, firs
     monkeypatch.setattr(review_merge, "_model_only_review_cascade", lambda: [{"executor": "codex"}])
     monkeypatch.setattr(planner, "repo_route", lambda _: ("AICC", "/repo"))
     monkeypatch.setattr(review_merge, "_review_window_read_decision", lambda *_: SimpleNamespace(allowed=True, pull=None, reason=""))
-    monkeypatch.setattr(review_merge, "_pr_diff_and_head_with_pull", lambda *_: snapshot)
+    monkeypatch.setattr(review_merge, "_pr_diff_and_head_with_pull", lambda *_: review_merge._PRSnapshotResult(snapshot, "ok"))
     monkeypatch.setattr(review_merge, "_has_accept_marker_with_pull", lambda _repo, pr, *_a, **_kw: (first_page_skipped and pr in {entries[0][1], entries[1][1]}, HEAD))
     monkeypatch.setattr(review_merge, "_next_retry_key", lambda _f, _t, key, _h: key + ":retry:1")
     monkeypatch.setattr(review_merge, "_latest_attempt_executor", lambda *_: None)
@@ -263,7 +263,7 @@ def test_reconcile_ignores_stale_marker_and_binds_empty_task_id(monkeypatch):
     monkeypatch.setattr(review_merge, "_rows", fake_rows)
     monkeypatch.setattr(review_merge, "_model_only_review_cascade", lambda: [{"executor": "codex"}])
     monkeypatch.setattr(planner, "repo_route", lambda _: ("AICC", "/repo"))
-    monkeypatch.setattr(review_merge, "_pr_diff_and_head", lambda *_: snapshot)
+    monkeypatch.setattr(review_merge, "_pr_diff_and_head", lambda *_: review_merge._PRSnapshotResult(snapshot, "ok"))
     monkeypatch.setattr(review_merge, "_has_accept_marker", lambda *_: (True, "a" * 40))
     monkeypatch.setattr(review_merge, "_next_retry_key", lambda *_: None)
 
@@ -311,7 +311,7 @@ def _refusal_reconcile_setup(monkeypatch, *, executor="claude", cascade=None):
         lambda: cascade or [{"executor": "claude"}, {"executor": "codex"}],
     )
     monkeypatch.setattr(planner, "repo_route", lambda _: ("AICC", "/repo"))
-    monkeypatch.setattr(review_merge, "_pr_diff_and_head", lambda *_: snapshot)
+    monkeypatch.setattr(review_merge, "_pr_diff_and_head", lambda *_: review_merge._PRSnapshotResult(snapshot, "ok"))
     monkeypatch.setattr(review_merge, "_has_accept_marker", lambda *_: (False, HEAD))
 
     dispatched = []
@@ -433,7 +433,7 @@ def test_prompt_encoding_and_utf8_budget_preserve_every_byte(monkeypatch):
     monkeypatch.setattr(review_merge, "cascade_for", lambda _: [{"executor": "copilot"}])
     monkeypatch.setattr(review_merge, "_rows", lambda *_: [(TASK, PR)])
     monkeypatch.setattr(planner, "repo_route", lambda _: ("AICC", "/repo"))
-    monkeypatch.setattr(review_merge, "_pr_diff_and_head", lambda *_: snapshot)
+    monkeypatch.setattr(review_merge, "_pr_diff_and_head", lambda *_: review_merge._PRSnapshotResult(snapshot, "ok"))
     calls = []
     report = review_merge.review_once(None, lambda *args: calls.append(args), "/repo")
     assert report.reviewed and len(calls) > 1
@@ -474,7 +474,8 @@ def test_pr_snapshot_uses_only_atomic_pr_and_immutable_compare(monkeypatch):
         return subprocess.CompletedProcess(argv, 0, diff, "")
 
     monkeypatch.setattr(review_merge, "_gh", gh)
-    assert review_merge._pr_diff_and_head("/repo", PR) == snap(diff)
+    result = review_merge._pr_diff_and_head("/repo", PR)
+    assert result == review_merge._PRSnapshotResult(snap(diff), "ok")
     assert all(argv[:2] != ["pr", "diff"] for argv in calls)
 
 
@@ -489,8 +490,8 @@ def test_pr_snapshot_rejects_malformed_or_cross_repo(monkeypatch):
         return subprocess.CompletedProcess(argv, 0, json.dumps(bad.pop(0)), "")
 
     monkeypatch.setattr(review_merge, "_gh", gh)
-    assert review_merge._pr_diff_and_head("/repo", PR) is None
-    assert review_merge._pr_diff_and_head("/repo", PR) is None
+    assert review_merge._pr_diff_and_head("/repo", PR).reason == "pr_not_open"
+    assert review_merge._pr_diff_and_head("/repo", PR).reason == "pr_not_open"
 
 
 @pytest.mark.parametrize("stats", [(2, 0, 0), (1, 1, 0)])
@@ -504,7 +505,7 @@ def test_pr_snapshot_rejects_truncated_or_file_count_mismatch(monkeypatch, stats
         return subprocess.CompletedProcess(argv, 0, text, "")
 
     monkeypatch.setattr(review_merge, "_gh", gh)
-    assert review_merge._pr_diff_and_head("/repo", PR) is None
+    assert review_merge._pr_diff_and_head("/repo", PR).snapshot is None
 
 
 def test_pr_snapshot_rejects_oversize(monkeypatch):
@@ -514,7 +515,7 @@ def test_pr_snapshot_rejects_oversize(monkeypatch):
     monkeypatch.setattr(review_merge, "_MAX_REVIEW_DIFF_BYTES", 1)
     monkeypatch.setattr(review_merge, "_gh", lambda argv, _repo: subprocess.CompletedProcess(
         argv, 0, json.dumps(body) if "/pulls/" in argv[1] else "diff --git a/x b/x\n", ""))
-    assert review_merge._pr_diff_and_head("/repo", PR) is None
+    assert review_merge._pr_diff_and_head("/repo", PR).snapshot is None
 
 
 def test_pr_snapshot_rejects_binary_diff_even_when_stats_match(monkeypatch):
@@ -524,7 +525,7 @@ def test_pr_snapshot_rejects_binary_diff_even_when_stats_match(monkeypatch):
     binary = "diff --git a/image.png b/image.png\nBinary files a/image.png and b/image.png differ\n"
     monkeypatch.setattr(review_merge, "_gh", lambda argv, _repo: subprocess.CompletedProcess(
         argv, 0, json.dumps(body) if "/pulls/" in argv[1] else binary, ""))
-    assert review_merge._pr_diff_and_head("/repo", PR) is None
+    assert review_merge._pr_diff_and_head("/repo", PR).snapshot is None
 
 
 @pytest.mark.parametrize("text", [
@@ -598,11 +599,11 @@ def test_snapshot_revalidates_open_exact_head_after_diff(monkeypatch, change):
         return subprocess.CompletedProcess(args, 1 if change == "unavailable" else 0, json.dumps(current), "")
 
     monkeypatch.setattr(review_merge, "_gh", gh)
-    assert review_merge._pr_diff_and_head("/repo", PR, initial) is None
+    assert review_merge._pr_diff_and_head("/repo", PR, initial).snapshot is None
     assert len(calls) == 2
 
 
 @pytest.mark.parametrize("state", ["closed", None])
 def test_closed_or_unproven_pr_never_fetches_model_diff(monkeypatch, state):
     monkeypatch.setattr(review_merge, "_gh", lambda *a: pytest.fail("no diff fetch"))
-    assert review_merge._pr_diff_and_head("/repo", PR, {"state": state}) is None
+    assert review_merge._pr_diff_and_head("/repo", PR, {"state": state}).reason == "pr_not_open"

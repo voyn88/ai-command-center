@@ -41,6 +41,14 @@ SNAPSHOTS = {}
 ORIGINAL_PR_SNAPSHOT = review_merge._pr_diff_and_head
 
 
+def _snapshot_result(head, diff=DIFF, reason="ok"):
+    return review_merge._PRSnapshotResult(_snapshot(head, diff), reason)
+
+
+def _failed_snapshot_result(reason):
+    return review_merge._PRSnapshotResult(None, reason)
+
+
 def _snapshot(head, diff=DIFF):
     return review_merge._PRSnapshot.create(diff, BASE, head)
 
@@ -334,9 +342,50 @@ def test_review_skips_when_the_diff_fetch_fails(rig, _test_repo_routes, monkeypa
     )
     assert not calls
     assert any(
-        task_id == "VOYN-W0-R3" and reason.startswith("pr_diff_fetch_failed")
+        task_id == "VOYN-W0-R3" and reason.startswith("pr_diff_fetch_failed:")
         for task_id, reason in report.skipped
     )
+
+
+def test_review_skips_closed_prs_as_pr_not_open_without_diff_fetch(rig, _test_repo_routes, monkeypatch):  # noqa: F811,E501
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-RCLOSED", "https://github.com/x/repo-d2/pull/113")
+    gh_calls = []
+
+    def fake_gh(argv, repo):
+        import subprocess
+
+        gh_calls.append(argv)
+        if argv[0] == "api" and argv[1] == "repos/x/repo-d2/pulls/113":
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                json.dumps({
+                    "state": "closed",
+                    "merged_at": None,
+                    "labels": [{"name": "review-window:active"}],
+                    "base": {"sha": BASE, "repo": {"full_name": "x/repo-d2"}},
+                    "head": {"sha": "a" * 40},
+                    "changed_files": 1,
+                    "additions": 1,
+                    "deletions": 0,
+                }),
+                "",
+            )
+        return subprocess.CompletedProcess(argv, 1, "", "unexpected expensive lookup")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    enqueued = []
+
+    report = review_once(
+        app_factory,
+        lambda q, k, p, tid, attempts: enqueued.append((q, k, p, tid, attempts)),
+        "/tmp",
+    )
+
+    assert ("VOYN-W0-RCLOSED", "pr_not_open") in report.skipped
+    assert enqueued == []
+    assert gh_calls == [["api", "repos/x/repo-d2/pulls/113"]]
 
 
 def test_review_skips_prs_outside_the_active_review_window(rig, _test_repo_routes, monkeypatch):  # noqa: F811,E501
@@ -1002,6 +1051,104 @@ def test_publish_verdict_posts_the_marker_under_the_acceptance_bot_identity(rig,
     report = publish_review_verdicts(app_factory, "/tmp")
     assert ("VOYN-W0-P1", "https://github.com/x/y/pull/11") in report.reviewed
     assert posted == [("https://github.com/x/y/pull/11", "ACCEPT", head)]
+
+
+def test_publish_review_verdicts_skips_closed_prs_as_pr_not_open(rig, monkeypatch):  # noqa: F811,E501
+    app_factory, store, _ = rig
+    pr_url = "https://github.com/x/y/pull/120"
+    _ready(store, app_factory, "VOYN-W0-PCLOSED", pr_url)
+
+    def fake_gh(argv, repo):
+        import subprocess
+        if argv[0] == "api" and argv[1] == "repos/x/y/pulls/120":
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                json.dumps({
+                    "state": "closed",
+                    "merged_at": None,
+                    "labels": [{"name": "review-window:active"}],
+                    "base": {"sha": BASE, "repo": {"full_name": "x/y"}},
+                    "head": {"sha": "e" * 40},
+                    "changed_files": 1,
+                    "additions": 1,
+                    "deletions": 0,
+                }),
+                "",
+            )
+        return subprocess.CompletedProcess(argv, 1, "", "unexpected expensive lookup")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = publish_review_verdicts(app_factory, "/tmp")
+    assert not report.reviewed
+    assert ("VOYN-W0-PCLOSED", "pr_not_open") in report.skipped
+
+
+def test_pr_diff_and_head_reports_pr_not_open(monkeypatch):
+    monkeypatch.setattr(review_merge, "_pr_diff_and_head", ORIGINAL_PR_SNAPSHOT)
+    import subprocess
+
+    def fake_gh(argv, repo):
+        if argv == ["api", "repos/x/y/pulls/120"]:
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                json.dumps({
+                    "state": "closed",
+                    "merged_at": None,
+                    "base": {"sha": BASE, "repo": {"full_name": "x/y"}},
+                    "head": {"sha": "e" * 40},
+                    "changed_files": 1,
+                    "additions": 1,
+                    "deletions": 0,
+                }),
+                "",
+            )
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+
+    result = review_merge._pr_diff_and_head("/tmp", "https://github.com/x/y/pull/120")
+
+    assert not result.ok
+    assert result.reason == "pr_not_open"
+
+
+def test_pr_diff_and_head_reports_stats_mismatch(monkeypatch):
+    monkeypatch.setattr(review_merge, "_pr_diff_and_head", ORIGINAL_PR_SNAPSHOT)
+    import subprocess
+
+    def fake_gh(argv, repo):
+        if argv == ["api", "repos/x/y/pulls/121"]:
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                json.dumps({
+                    "state": "open",
+                    "merged_at": None,
+                    "base": {"sha": BASE, "repo": {"full_name": "x/y"}},
+                    "head": {"sha": "e" * 40},
+                    "changed_files": 2,
+                    "additions": 1,
+                    "deletions": 0,
+                }),
+                "",
+            )
+        if argv == [
+            "api",
+            f"repos/x/y/compare/{BASE}...{'e' * 40}",
+            "-H",
+            "Accept: application/vnd.github.v3.diff",
+        ]:
+            return subprocess.CompletedProcess(argv, 0, DIFF, "")
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+
+    result = review_merge._pr_diff_and_head("/tmp", "https://github.com/x/y/pull/121")
+
+    assert not result.ok
+    assert result.reason == "stats_mismatch"
 
 
 def test_publish_verdict_skips_without_the_acceptance_bot_configured(rig, monkeypatch):  # noqa: F811, E501
