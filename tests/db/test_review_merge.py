@@ -4438,6 +4438,122 @@ def test_the_lookup_runs_in_the_checkout_the_tick_was_given(rig, _test_repo_rout
     assert seen == [REPO]
 
 
+# ---------------------------------------------------------------------------
+# recover_stalled_pr_evidence: the sanctioned 0018 unstick path finally gets
+# a caller. `backlog_recover_stuck_ready_to_review` shipped with tests but no
+# invocation site anywhere in a tick, CLI command or cron unit, so a task
+# reconcile_pr_evidence correctly reports as `no_open_pr_on_task_branch`
+# forever had no way back to OPEN. This only acts on episodes the watchdog's
+# own ledger already escalated -- it never fires ahead of that escalation.
+# ---------------------------------------------------------------------------
+
+
+def _escalate_pr_evidence(factory, task_id, reason="no_open_pr_on_task_branch"):
+    with factory() as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO tick_stall_escalation "
+            "(tick_kind, task_id, reason, first_tick_id, consecutive_ticks, "
+            " first_seen_at, last_seen_at, escalation_task_id) "
+            "VALUES ('pr_evidence', %s, %s, 'tick-0000', 5, now(), now(), %s)",
+            (task_id, reason, f"{task_id}-STALL-test"),
+        )
+        conn.commit()
+
+
+def test_an_escalated_no_pr_task_is_returned_to_open(rig, monkeypatch):  # noqa: F811
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-REC1"
+    _ready_without_pr(store, app_factory, task_id)
+    _escalate_pr_evidence(app_factory, task_id)
+
+    report = review_merge.recover_stalled_pr_evidence(app_factory)
+
+    assert (task_id, "OPEN") in report.recovered
+    with app_factory() as conn, conn.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id = %s", (task_id,))
+        assert cur.fetchone() == ("OPEN",)
+
+
+def test_a_task_with_pr_evidence_is_refused_not_reopened(rig):  # noqa: F811
+    """The gate is `backlog_recover_stuck_ready_to_review`'s own: a task that
+    picked up a `pr` row by any other path (reconciliation, a late publish)
+    before this ran keeps its real review path untouched."""
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-REC2"
+    _ready(store, app_factory, task_id, "https://github.com/x/repo-d2/pull/950")
+    _escalate_pr_evidence(app_factory, task_id)
+
+    report = review_merge.recover_stalled_pr_evidence(app_factory)
+
+    assert report.recovered == []
+    assert (task_id, "has_pr_evidence") in report.skipped
+    with app_factory() as conn, conn.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id = %s", (task_id,))
+        assert cur.fetchone() == ("READY_TO_REVIEW",)
+
+
+def test_other_pr_evidence_reasons_are_never_recovered(rig):  # noqa: F811
+    """`ambiguous_open_prs_on_branch` names a real open PR this task cannot
+    safely abandon; `pr_list_failed` says the lookup itself never completed.
+    Neither means "GitHub definitively has no PR", so neither is eligible."""
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-REC3"
+    _ready_without_pr(store, app_factory, task_id)
+    _escalate_pr_evidence(app_factory, task_id, reason="ambiguous_open_prs_on_branch")
+
+    report = review_merge.recover_stalled_pr_evidence(app_factory)
+
+    assert report.recovered == [] and report.skipped == []
+    with app_factory() as conn, conn.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id = %s", (task_id,))
+        assert cur.fetchone() == ("READY_TO_REVIEW",)
+
+
+def test_other_tick_kinds_are_never_recovered(rig):  # noqa: F811
+    """The same reason string from a different tick (e.g. `review`) must not
+    be read as a pr_evidence escalation."""
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-REC4"
+    _ready_without_pr(store, app_factory, task_id)
+    with app_factory() as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO tick_stall_escalation "
+            "(tick_kind, task_id, reason, first_tick_id, consecutive_ticks, "
+            " first_seen_at, last_seen_at, escalation_task_id) "
+            "VALUES ('review', %s, 'no_open_pr_on_task_branch', 'tick-0000', 5, "
+            " now(), now(), %s)",
+            (task_id, f"{task_id}-STALL-test"),
+        )
+        conn.commit()
+
+    report = review_merge.recover_stalled_pr_evidence(app_factory)
+
+    assert report.recovered == [] and report.skipped == []
+
+
+def test_recovery_without_any_escalation_does_nothing(rig):  # noqa: F811
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-REC5"
+    _ready_without_pr(store, app_factory, task_id)
+
+    report = review_merge.recover_stalled_pr_evidence(app_factory)
+
+    assert report.recovered == [] and report.skipped == []
+
+
+def test_a_second_run_is_a_harmless_no_op_once_recovered(rig):  # noqa: F811
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-REC6"
+    _ready_without_pr(store, app_factory, task_id)
+    _escalate_pr_evidence(app_factory, task_id)
+
+    first = review_merge.recover_stalled_pr_evidence(app_factory)
+    second = review_merge.recover_stalled_pr_evidence(app_factory)
+
+    assert (task_id, "OPEN") in first.recovered
+    assert (task_id, "not_ready_to_review") in second.skipped
+
+
 # -- reconcile_pr_window: no database involved, gh is faked in-process ------
 
 

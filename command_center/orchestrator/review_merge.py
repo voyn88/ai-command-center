@@ -377,6 +377,75 @@ def reconcile_pr_evidence(
     return report
 
 
+@dataclass
+class PrEvidenceRecoveryReport:
+    """See `recover_stalled_pr_evidence`."""
+
+    #: (task_id, new_status) sent back to OPEN for a fresh attempt.
+    recovered: list[tuple[str, str]] = field(default_factory=list)
+    #: (task_id, reason) a recovery attempt was refused -- the precondition
+    #: no longer held (gone to review some other way, or already recovered).
+    skipped: list[tuple[str, str]] = field(default_factory=list)
+
+
+#: The ONE `pr_evidence` skip reason recovery may act on. Every other reason
+#: either names a real open PR this task cannot safely abandon
+#: (`ambiguous_open_prs_on_branch`), or a lookup that did not complete
+#: (`pr_list_failed`, `pr_list_undecodable`, `no_repo_route: ...`) and would
+#: therefore learn nothing from a fresh dispatch. Only this one reason means
+#: "GitHub was asked and definitively has no open PR for this branch" --
+#: exactly `backlog_recover_stuck_ready_to_review`'s (0018) own precondition.
+_RECOVERABLE_PR_EVIDENCE_REASON = "no_open_pr_on_task_branch"
+
+
+def recover_stalled_pr_evidence(factory: Any) -> PrEvidenceRecoveryReport:
+    """Send a task the watchdog has already escalated for
+    `no_open_pr_on_task_branch` back to OPEN for a fresh attempt.
+
+    VOYN-W0-AICC-NO-RECOVERY-PATH-STUCK-READY-TO-REVIEW (migration 0018)
+    built `backlog_recover_stuck_ready_to_review` as the sanctioned way out
+    of a task stuck in READY_TO_REVIEW with no `pr` evidence -- the shape a
+    completed-but-unpublished run (0011) left behind, or any future bug in a
+    different corner of the same pipeline that reintroduces it. That
+    function shipped with full tests but no caller: nothing in any tick,
+    CLI command or cron unit ever invoked it, so a task landing in that
+    state stayed there forever no matter how many times `reconcile_pr_
+    evidence` correctly reported it as unreconcilable. Measured live on
+    VOYN-W0-AICC-SRV-08-PITR (escalated 2026-11-04 as VOYN-W0-AICC-TICK-
+    STALL-WATCHDOG's first `pr_evidence` episode): the same skip reason,
+    unchanged, for 5 consecutive ticks and every one after, because nothing
+    downstream of the watchdog's report-only escalation ever acted on it.
+
+    Deliberately NOT part of `watchdog_once`: that function's whole contract
+    is that it never mutates the stalled item (`tick_stall_escalation`'s own
+    tests pin this). This is a separate, narrower actor that only reads the
+    watchdog's OWN ledger -- so it never fires before an episode has already
+    been escalated and made visible -- and only for the one reason above.
+    `backlog_recover_stuck_ready_to_review` re-checks its own preconditions
+    (status, zero `pr` evidence) before acting, so a task that moved on by
+    any other path in the meantime is simply refused, never corrupted; this
+    makes the whole function safe to run every tick without its own
+    idempotency bookkeeping.
+    """
+    from command_center.db.backlog_store import BacklogStore
+
+    report = PrEvidenceRecoveryReport()
+    rows = _rows(
+        factory,
+        "SELECT DISTINCT task_id FROM tick_stall_escalation "
+        "WHERE tick_kind = 'pr_evidence' AND reason = %s ORDER BY task_id",
+        (_RECOVERABLE_PR_EVIDENCE_REASON,),
+    )
+    store = BacklogStore(factory)
+    for (task_id,) in rows:
+        ok, reason, _revision = store.recover_stuck_ready_to_review(task_id)
+        if ok:
+            report.recovered.append((task_id, reason))
+        else:
+            report.skipped.append((task_id, reason))
+    return report
+
+
 def _open_pulls_for_branch(
     repo_path: str, branch: str
 ) -> tuple[list[dict[str, Any]] | None, str]:
