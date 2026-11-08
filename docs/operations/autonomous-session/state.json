@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "project": "AICC",
+  "repository": "voyn88/ai-command-center",
+  "observed_on": "2026-11-09",
+  "timezone": "Europe/Moscow",
+  "audited_main_sha": "99095570ea11cb2292598015f5ef47cdacd411ec",
+  "session_status": "BLOCKED_RUNTIME_ACCESS",
+  "dispatch_status": "NOT_DISPATCHED",
+  "canonical_authority": "existing AICC PostgreSQL backlog and work queue",
+  "checkpoint_is_authoritative_task_store": false,
+  "live_release_sha": null,
+  "live_claim_id": null,
+  "worker_connection_verified": false,
+  "mac_connection_verified": false,
+  "additional_metered_calls_authorized": false,
+  "production_change_authorized": false,
+  "session_provider_calls_made": 0,
+  "live_spend_usd": null,
+  "next_step": "Verify existing runtime owner, revision, leases and subscription admission read-only",
+  "handoff": "README.md"
+}
