@@ -3998,7 +3998,14 @@ def test_an_open_pr_on_the_task_branch_becomes_evidence(rig, _test_repo_routes, 
 def test_a_task_adopts_only_its_own_branch_never_a_prefix_match(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
     """`backlog/X` must not adopt `backlog/X-REM`'s pull request. `gh --head`
     is a filter, not a guarantee of exact equality, so the name is compared
-    here too."""
+    here too.
+
+    No open PR on the task's OWN branch is conclusive, not transient (0011
+    never leaves a freshly-completed run READY_TO_REVIEW without `pr`
+    evidence already recorded) -- so this is also the stuck-forever shape
+    VOYN-W0-AICC-SRV-09-READ-SWITCH-MISSING-STALL fixed: recovered straight
+    back to OPEN through the 0018 gate rather than skipped identically on
+    every future tick."""
     app_factory, store, _ = rig
     task_id = "VOYN-W0-PRE2"
     _ready_without_pr(store, app_factory, task_id)
@@ -4014,7 +4021,10 @@ def test_a_task_adopts_only_its_own_branch_never_a_prefix_match(rig, _test_repo_
     report = reconcile_pr_evidence(app_factory, REPO)
 
     assert _pr_rows(app_factory, task_id) == []
-    assert (task_id, "no_open_pr_on_task_branch") in report.skipped
+    assert (task_id, "no_open_pr_on_task_branch:OPEN") in report.skipped
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", (task_id,))
+        assert cur.fetchone()[0] == "OPEN"
 
 
 def test_two_open_prs_on_one_branch_are_refused_rather_than_guessed(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501

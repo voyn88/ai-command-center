@@ -296,9 +296,21 @@ def reconcile_pr_evidence(
     origin of that checkout and nothing else, so a task can never be attached
     to a pull request in another repository.
 
-    Reporting only: no status is changed here. A task becomes reviewable
-    because it is `READY_TO_REVIEW` and now has evidence, through the same
-    path it always did.
+    Reporting only in the matching case: a task becomes reviewable because
+    it is `READY_TO_REVIEW` and now has evidence, through the same path it
+    always did. The *non*-matching case changes status: no open PR on the
+    task's own branch means this task can never pass through here again no
+    matter how many more ticks look -- the ingest gate (0011) never leaves a
+    freshly-completed run in `READY_TO_REVIEW` without a `pr` already
+    recorded, so an evidence-free `READY_TO_REVIEW` row with nothing open on
+    GitHub is already a dead end the moment this function sees it, not a
+    run still catching up. Rather than report that dead end identically
+    forever (VOYN-W0-AICC-SRV-09-READ-SWITCH-MISSING-STALL: the exact same
+    `(task_id, "no_open_pr_on_task_branch")` skip, five ticks straight, with
+    no code path anywhere that ever did anything about it), this sends the
+    task back to OPEN through `backlog_recover_stuck_ready_to_review` (0018)
+    -- the narrow, audited recovery gate built for exactly this corner and
+    never wired into any tick until now -- for a fresh dispatch attempt.
     """
     # Imported here, as  does, so this module keeps its
     # import-time independence from the planner.
@@ -348,7 +360,19 @@ def reconcile_pr_evidence(
             and entry["url"]
         ]
         if not matches:
-            report.skipped.append((row_task_id, "no_open_pr_on_task_branch"))
+            # Conclusive, not transient: `_open_pulls_for_branch` already
+            # returned a successful (if empty) GitHub answer, so this is a
+            # task that is READY_TO_REVIEW with neither recorded `pr`
+            # evidence nor an open PR on its own branch -- a state the
+            # ingest gate (0011) never produces for a task that just
+            # finished publishing, so there is no "give it another tick"
+            # case to protect here. Recover it rather than re-running this
+            # identical, forever-empty search every tick
+            # (VOYN-W0-AICC-SRV-09-READ-SWITCH-MISSING-STALL).
+            verdict = _recover_stuck_ready_to_review(factory, row_task_id)
+            report.skipped.append(
+                (row_task_id, f"no_open_pr_on_task_branch:{verdict}")
+            )
             continue
         if len(matches) > 1:
             report.skipped.append((row_task_id, "ambiguous_open_prs_on_branch"))
@@ -827,6 +851,31 @@ def _clear_pr_evidence(factory: Any, task_id: str, pr_url: str, reason: str) -> 
         (task_id, pr_url, reason),
     )
     return rows[0][0] if rows else "unknown"
+
+
+def _recover_stuck_ready_to_review(factory: Any, task_id: str) -> str:
+    """Send a READY_TO_REVIEW task with no `pr` evidence and no open PR on
+    its own branch back to OPEN, through the 0018 machine gate
+    (`backlog_recover_stuck_ready_to_review`) -- the sanctioned path 0018
+    built for exactly this corner and left unreachable from any tick
+    (VOYN-W0-AICC-SRV-09-READ-SWITCH-MISSING-STALL): `reconcile_pr_evidence`
+    only ever backfills evidence from a PR that already exists, so a task
+    that reaches READY_TO_REVIEW with neither a recorded `pr` nor one still
+    open on GitHub -- the ingest gate (0011) requires both together, so this
+    is never the ordinary "publish hasn't caught up yet" case -- had no path
+    out at all: every later tick re-ran the identical open-PR search,
+    re-found nothing, and re-skipped it with the same reason forever. The
+    0018 function re-checks the PR-evidence count itself under its own row
+    lock, so calling it here cannot race a legitimate concurrent publish."""
+    rows = _rows(
+        factory,
+        "SELECT * FROM backlog_recover_stuck_ready_to_review(%s)",
+        (task_id,),
+    )
+    if not rows:
+        return "unknown"
+    ok, reason = rows[0][0], rows[0][1]
+    return "OPEN" if ok else str(reason)
 
 
 @dataclass(frozen=True, slots=True)
