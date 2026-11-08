@@ -3164,6 +3164,41 @@ def test_two_closed_unmerged_prs_reject_without_remediation(rig, monkeypatch):  
         assert cur.fetchone()[0] == 0
 
 
+def test_closed_pr_then_accepted_merged_sibling_goes_done_same_tick(rig, monkeypatch):  # noqa: F811
+    """A task whose first-scanned PR is closed unmerged and whose sibling PR
+    merged with acceptance completes DONE in one tick: the closed row only
+    skips (sibling pending), so it must not mark the task handled and hide
+    the merged sibling row (live shape: VOYN-PLAT-COORD-05, aios#297 closed
+    + aios#405 merged)."""
+    import subprocess as sp
+
+    app_factory, store, _ = rig
+    closed_pr = "https://github.com/x/y/pull/70"
+    merged_pr = "https://github.com/x/y/pull/71"
+    _ready(store, app_factory, "VOYN-W0-MCM", closed_pr)
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT backlog_record_evidence(%s,'pr',%s)", ("VOYN-W0-MCM", merged_pr))
+        c.commit()
+    head, merge_oid = "a" * 40, "b" * 40
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["pr", "view"] and argv[2] == closed_pr:
+            return sp.CompletedProcess(argv, 0, json.dumps({"state": "CLOSED", "mergedAt": None}), "")
+        if argv[:2] == ["pr", "view"] and argv[2] == merged_pr:
+            merged = json.loads(_merged(head, merge_oid))
+            merged["mergedAt"] = "2026-11-01T00:00:00Z"
+            return sp.CompletedProcess(argv, 0, json.dumps(merged), "")
+        return sp.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    assert report.merged == [("VOYN-W0-MCM", merge_oid)]
+    assert report.skipped == [("VOYN-W0-MCM", "pr_closed_unmerged_sibling_pending")]
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-MCM",))
+        assert cur.fetchone()[0] == "DONE"
+
+
 def test_an_externally_merged_pr_without_acceptance_never_goes_done(rig, monkeypatch):  # noqa: F811, E501
     """Verification of 53c7b52 (CONFIRMED): a PR merged around the queue --
     admin bypass, hand merge -- with no acceptance marker on its merged head

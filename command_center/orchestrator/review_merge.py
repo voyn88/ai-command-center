@@ -4418,14 +4418,20 @@ def _merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -
 
     open_pr_snapshot, _snapshot_failure = _merge_window_open_pr_snapshot(repo_path)
     origin = _origin_owner_repo(repo_path) if open_pr_snapshot is not None else None
-    processed_tasks: set[str] = set()
+    # Tasks this tick already moved out of READY_TO_REVIEW (REJECTED or DONE).
+    # The scan yields one row per (task, pr), so a multi-PR task's later rows
+    # must not re-run a transition that already happened. Only a COMMITTED
+    # transition marks a task: a row that merely skips (closed PR with a
+    # pending sibling, not ready, window inactive, ...) must leave the task's
+    # remaining PR rows to be examined -- otherwise a task whose first PR is
+    # closed and whose second PR merged with acceptance never reaches DONE.
+    finished_tasks: set[str] = set()
     for task_id, pr_url in tasks:
         if actions >= cfg.max_per_tick:
             break
         last_processed = (task_id, pr_url)
-        if task_id in processed_tasks:
+        if task_id in finished_tasks:
             continue
-        processed_tasks.add(task_id)
         if _repo_from_pr_url(pr_url) is None:
             # Same shape gate as review_once/publish_review_verdicts -- a
             # malformed pr_url fails every `gh pr view` below identically
@@ -4524,6 +4530,7 @@ def _merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -
                         ok, reason = cur.fetchone()
                     if ok:
                         conn.commit()
+                        finished_tasks.add(task_id)
                         report.skipped.append((task_id, "rejected_pr_closed_unmerged"))
                     else:
                         conn.rollback()
@@ -4688,6 +4695,7 @@ def _merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -
                     ok, reason = cur.fetchone()
                 if ok:
                     conn.commit()
+                    finished_tasks.add(task_id)
                     report.merged.append((task_id, head))
                 else:
                     conn.rollback()
