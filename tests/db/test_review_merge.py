@@ -4336,9 +4336,7 @@ def test_a_task_adopts_only_its_own_branch_never_a_prefix_match(rig, _test_repo_
     assert store.get_task(task_id)["status"] == "OPEN"
 
 
-def test_no_open_pr_recovers_evidence_free_task_for_a_fresh_attempt(
-    rig, _test_repo_routes, monkeypatch
-):  # noqa: F811
+def test_no_open_pr_recovers_evidence_free_task_for_a_fresh_attempt(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
     """A conclusive empty lookup must not strand READY_TO_REVIEW forever."""
     app_factory, store, _ = rig
     task_id = "VOYN-W0-PRE-NONE"
