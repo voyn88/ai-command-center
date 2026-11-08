@@ -3995,6 +3995,42 @@ def test_an_open_pr_on_the_task_branch_becomes_evidence(rig, _test_repo_routes, 
     assert _pr_rows(app_factory, task_id) == [url]
 
 
+def test_a_merged_or_closed_pr_on_the_task_branch_still_becomes_evidence(  # noqa: E501
+    rig, _test_repo_routes, monkeypatch  # noqa: F811
+):
+    """A PR that merged or closed before this tick ever ran against it must
+    still become evidence: the tick used to search `state=open` only, so a
+    fast merge-queue landing (or a tick outage spanning the merge) left the
+    task with no evidence and therefore invisible to every downstream gate
+    forever -- the exact `no_open_pr_on_task_branch` stall the tick-stall
+    watchdog escalated for VOYN-W0-AICC-SRV-08-BACKUP-CRYPTO."""
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE1B"
+    _ready_without_pr(store, app_factory, task_id)
+    url = "https://github.com/x/repo-d2/pull/906"
+    calls: list[list[str]] = []
+
+    import subprocess as sp
+
+    def fake_gh(argv, repo):
+        calls.append(argv)
+        if argv[0] == "api" and "/pulls?" in argv[1]:
+            body = json.dumps(
+                [{"html_url": url, "head": {"ref": f"backlog/{task_id}"},
+                  "state": "closed", "merged_at": "2026-11-04T10:00:00Z"}]
+            )
+            return sp.CompletedProcess(argv, 0, body, "")
+        return sp.CompletedProcess(argv, 1, "", "unexpected gh call")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+
+    report = reconcile_pr_evidence(app_factory, REPO)
+
+    assert (task_id, url) in report.recorded
+    assert _pr_rows(app_factory, task_id) == [url]
+    assert any("state=all" in argv[1] for argv in calls if argv[0] == "api")
+
+
 def test_a_task_adopts_only_its_own_branch_never_a_prefix_match(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
     """`backlog/X` must not adopt `backlog/X-REM`'s pull request. `gh --head`
     is a filter, not a guarantee of exact equality, so the name is compared

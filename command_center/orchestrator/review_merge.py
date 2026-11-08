@@ -276,12 +276,19 @@ def reconcile_pr_evidence(
 
     This closes the hole by deriving what was already true rather than by
     trusting a claim. The task's branch name is fixed by the same contract
-    `publish_run` follows, so an open pull request whose head is exactly that
-    branch is that task's PR -- a fact GitHub is asked for directly:
+    `publish_run` follows, so a pull request whose head is exactly that
+    branch is that task's PR -- a fact GitHub is asked for directly, in ANY
+    state (`_open_pulls_for_branch` searches `state=all`, not just `open`):
+    a PR that merged or closed before this tick ever ran against it would
+    otherwise never match again, stranding the task in `READY_TO_REVIEW`
+    with no evidence and therefore invisible to every downstream gate
+    forever -- exactly the repeating `no_open_pr_on_task_branch` skip the
+    tick-stall watchdog escalated for VOYN-W0-AICC-SRV-08-BACKUP-CRYPTO.
 
     * the head branch must equal `backlog/<task id>` exactly (never a prefix
       match: `backlog/X` must not adopt `backlog/X-REM`'s pull request);
-    * exactly one open PR may match, because two would make the choice a guess;
+    * exactly one matching PR may exist, because two would make the choice a
+      guess, in whatever states they are in;
     * a task that already has any `pr` evidence is left alone, so this can
       never overwrite or compete with what `publish_run` recorded.
 
@@ -380,12 +387,29 @@ def reconcile_pr_evidence(
 def _open_pulls_for_branch(
     repo_path: str, branch: str
 ) -> tuple[list[dict[str, Any]] | None, str]:
-    """Open pull requests whose head is `branch`, as `[{url, headRefName}]`.
+    """Pull requests whose head is `branch`, as `[{url, headRefName}]`, in
+    ANY state -- not only `open`.
 
     REST (`GET /repos/{owner}/{repo}/pulls?head=owner:branch`) rather than
     `gh pr list --head` (GraphQL): this runs once per unrecorded task on
     every review tick, and the review tick is one of the three that stopped
     dead when the shared human GraphQL quota ran out.
+
+    `state=all`, not `state=open`: this used to filter to `open` alone, which
+    meant a task whose pull request merged or closed before this reconciler
+    ever ran against it -- a fast merge-queue landing, a tick outage, a quick
+    manual merge -- left `reconcile_pr_evidence` with NO matching pull
+    request, forever. `no_open_pr_on_task_branch` on every later tick looked
+    identical to "no PR was ever opened," but the PR existed the whole time,
+    just not in the one state this call was willing to see; every downstream
+    gate requires `backlog_evidence(kind='pr')` to even consider the task
+    (see `merge_once`'s own join on `kind = 'pr'`), so without this the task
+    was stuck in `READY_TO_REVIEW` with no path forward at all (the tick-
+    stall watchdog's VOYN-W0-AICC-SRV-08-BACKUP-CRYPTO escalation). Recording
+    evidence from a closed-without-merge or already-merged PR is safe: every
+    reader of that evidence (`review_once`, `merge_once`) already re-reads
+    the PR's live state before acting on it and treats non-open/already-
+    merged PRs as their own named outcome rather than assuming `open`.
 
     The `head` filter is `owner:branch`, so only pull requests opened from a
     branch in THIS repository match -- which is exactly what
@@ -402,7 +426,7 @@ def _open_pulls_for_branch(
     owner, repo = origin
     head = urllib.parse.quote(f"{owner}:{branch}", safe="")
     outcome, decoded = _rest_json(
-        repo_path, f"repos/{owner}/{repo}/pulls?state=open&per_page=20&head={head}"
+        repo_path, f"repos/{owner}/{repo}/pulls?state=all&per_page=20&head={head}"
     )
     if outcome == _REST_FAILED:
         return None, "pr_list_failed"
