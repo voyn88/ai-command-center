@@ -240,10 +240,13 @@ class ReconcileReport:
 
 @dataclass
 class PrEvidenceReport:
-    """See `reconcile_pr_evidence`. Records evidence; never changes a status."""
+    """Evidence recorded, evidence-free tasks recovered, and skips."""
 
     #: (task_id, pr_url) newly recorded from the task's own branch.
     recorded: list[tuple[str, str]] = field(default_factory=list)
+    #: (task_id, new_status) returned to the dispatch pool because GitHub
+    #: confirmed that the evidence-free task branch has no open pull request.
+    recovered: list[tuple[str, str]] = field(default_factory=list)
     #: (task_id, reason) examined and deliberately left alone.
     skipped: list[tuple[str, str]] = field(default_factory=list)
 
@@ -296,9 +299,12 @@ def reconcile_pr_evidence(
     origin of that checkout and nothing else, so a task can never be attached
     to a pull request in another repository.
 
-    Reporting only: no status is changed here. A task becomes reviewable
-    because it is `READY_TO_REVIEW` and now has evidence, through the same
-    path it always did.
+    When the branch has no open pull request, the narrow audited recovery
+    gate added in migration 0018 returns the evidence-free task to `OPEN`.
+    That gate rechecks both status and evidence under a row lock, so a pull
+    request recorded concurrently cannot be displaced. Otherwise a task
+    becomes reviewable because it is `READY_TO_REVIEW` and now has evidence,
+    through the same path it always did.
     """
     # Imported here, as  does, so this module keeps its
     # import-time independence from the planner.
@@ -348,7 +354,24 @@ def reconcile_pr_evidence(
             and entry["url"]
         ]
         if not matches:
-            report.skipped.append((row_task_id, "no_open_pr_on_task_branch"))
+            # This is exactly the stuck state migration 0018 provided a
+            # sanctioned recovery for.  Merely reporting the absence made
+            # every review tick rediscover it forever because nothing in
+            # production called that recovery function.  Let its row lock
+            # and evidence recheck arbitrate races with publish/evidence
+            # ingestion rather than duplicating those rules here.
+            with factory() as conn, conn.cursor() as cur:
+                cur.execute(
+                    "SELECT ok, reason FROM "
+                    "backlog_recover_stuck_ready_to_review(%s)",
+                    (row_task_id,),
+                )
+                verdict = cur.fetchone()
+            if verdict and verdict[0]:
+                report.recovered.append((row_task_id, str(verdict[1] or "OPEN")))
+            else:
+                reason = (verdict[1] if verdict and len(verdict) > 1 else "") or "unknown"
+                report.skipped.append((row_task_id, f"recovery_refused: {reason}"))
             continue
         if len(matches) > 1:
             report.skipped.append((row_task_id, "ambiguous_open_prs_on_branch"))

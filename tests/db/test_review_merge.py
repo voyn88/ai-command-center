@@ -4332,7 +4332,56 @@ def test_a_task_adopts_only_its_own_branch_never_a_prefix_match(rig, _test_repo_
     report = reconcile_pr_evidence(app_factory, REPO)
 
     assert _pr_rows(app_factory, task_id) == []
-    assert (task_id, "no_open_pr_on_task_branch") in report.skipped
+    assert (task_id, "OPEN") in report.recovered
+    assert store.get_task(task_id)["status"] == "OPEN"
+
+
+def test_no_open_pr_recovers_evidence_free_ready_task_once(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+    """The evidence tick is the production caller of migration 0018's
+    recovery gate; an absent PR must not remain an identical skip forever."""
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE-NO-PR"
+    _ready_without_pr(store, app_factory, task_id)
+    monkeypatch.setattr(review_merge, "_gh", _fake_pr_list([]))
+
+    first = reconcile_pr_evidence(app_factory, REPO, task_id=task_id)
+    second = reconcile_pr_evidence(app_factory, REPO, task_id=task_id)
+
+    assert first.recovered == [(task_id, "OPEN")]
+    assert first.skipped == []
+    assert second.recovered == []
+    assert second.skipped == []
+    assert store.get_task(task_id)["status"] == "OPEN"
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) FROM backlog_event WHERE task_id=%s "
+            "AND event='recover_stuck_ready_to_review' AND outcome='granted'",
+            (task_id,),
+        )
+        assert cur.fetchone()[0] == 1
+
+
+def test_no_open_pr_surfaces_recovery_refusal(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+    """A concurrent state change is refusal-as-data, not a false recovery."""
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE-RACE"
+    _ready_without_pr(store, app_factory, task_id)
+    monkeypatch.setattr(review_merge, "_gh", _fake_pr_list([]))
+
+    original_rows = review_merge._rows
+
+    def racing_rows(factory, sql, params=()):
+        rows = original_rows(factory, sql, params)
+        if rows and "NOT EXISTS" in sql:
+            store.record_evidence(task_id, "pr", "https://github.com/x/repo-d2/pull/999")
+        return rows
+
+    monkeypatch.setattr(review_merge, "_rows", racing_rows)
+    report = reconcile_pr_evidence(app_factory, REPO, task_id=task_id)
+
+    assert report.recovered == []
+    assert (task_id, "recovery_refused: has_pr_evidence") in report.skipped
+    assert store.get_task(task_id)["status"] == "READY_TO_REVIEW"
 
 
 def test_two_open_prs_on_one_branch_are_refused_rather_than_guessed(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
