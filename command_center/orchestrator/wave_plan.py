@@ -1,6 +1,7 @@
 """Read-only project wave planner over the canonical AICC backlog."""
 from collections import defaultdict
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
+import re
 from graphlib import CycleError, TopologicalSorter
 from dataclasses import dataclass
 
@@ -23,11 +24,9 @@ SNAPSHOT_SQL = """SELECT json_build_object('as_of', now(), 'tasks', (
 ))"""
 
 def canonical_wave(value):
-    try:
-        wave = Decimal(value)
-        return wave if wave.is_finite() else Decimal("Infinity")
-    except (InvalidOperation, TypeError, ValueError):
-        return Decimal("Infinity")
+    if isinstance(value, str) and re.fullmatch(r"[0-9]+(?:[.][0-9]+)?", value):
+        return Decimal(value)
+    return Decimal("Infinity")
 
 
 @dataclass(frozen=True)
@@ -115,5 +114,5 @@ def build_plan(snapshot, route_for):
                                   stage, tuple(sorted(pending)), impact))
     return sorted(decisions, key=lambda d: (
         d.project, d.wave is None, d.wave or 0, canonical_wave(d.task["wave"]),
-        d.task["priority"] or "P9", -min(d.impact), -sum(d.impact), d.task["id"],
+        d.task["priority"] or "P9", -sum(d.impact), d.task["id"],
     ))

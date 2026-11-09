@@ -220,35 +220,6 @@ def _split_requested(rows: Any, task_id: str) -> bool:
     return bool(row and row[0] and row[0][0])
 
 
-_IMPACT_FIELDS = ("next_time", "current_quality", "next_cost")
-
-
-def _delivery_impact(body: str) -> tuple[int, int]:
-    """Rank a declared impact only when all three dimensions have evidence plans."""
-    prefix = "AICC-IMPACT: "
-    declarations = [line[len(prefix):] for line in body.splitlines() if line.startswith(prefix)]
-    if len(declarations) != 1:
-        return (0, 0)
-    try:
-        impact = json.loads(declarations[0])
-    except (ValueError, RecursionError):
-        return (0, 0)
-    if not isinstance(impact, dict):
-        return (0, 0)
-    scores = []
-    for name in _IMPACT_FIELDS:
-        dimension = impact.get(name)
-        if not isinstance(dimension, dict):
-            return (0, 0)
-        score, evidence = dimension.get("score"), dimension.get("check")
-        if type(score) is not int or not 1 <= score <= 5:
-            return (0, 0)
-        if not isinstance(evidence, str) or not evidence.strip():
-            return (0, 0)
-        scores.append(score)
-    return (min(scores), sum(scores))
-
-
 def _rank_project_candidates(candidates: list[tuple], decisions=()) -> list[tuple]:
     """Improve ordering within a project, wave, class and explicit priority."""
     by_id = {item.task["id"]: item for item in decisions}
@@ -261,10 +232,10 @@ def _rank_project_candidates(candidates: list[tuple], decisions=()) -> list[tupl
     def rank(task):
         decision = by_id.get(task[0])
         if decision is None:
-            return (False, False, 0, 0, 0)
+            return (False, False, 0, 0)
         return (
             decision.stage == "Проверить допуск", decision.wave is not None,
-            -(decision.wave or 0), min(decision.impact), sum(decision.impact),
+            -(decision.wave or 0), sum(decision.impact),
         )
 
     for indices in groups.values():
@@ -315,17 +286,10 @@ def _payload_for(
             "mode": "split",
         }
         return payload, len(cascade)
-    impact_acceptance = ""
-    if _delivery_impact(task["body"]) != (0, 0):
-        impact_acceptance = (
-            "Report observed before/after evidence for the three AICC-IMPACT checks. "
-            "Mark unavailable measurements as unverified.\n\n"
-        )
     prompt = (
         f"Central task: {task['task_id']} ({task['title']}).\n"
         f"Wave {task['wave']}, priority {task['priority'] or 'unset'}.\n\n"
         f"{task['body']}\n\n"
-        f"{impact_acceptance}"
         # The publisher (`orchestrator.publish.publish_run`, under the writer
         # lease) refuses a task clone that is not clean, and an agent has no
         # push capability at all. Asking the agent to "open a pull request"
@@ -468,7 +432,11 @@ class Planner:
             cur.execute(sql, params)
 
     def preview(self):
-        (snapshot,) = self._row(SNAPSHOT_SQL, ())
+        # A failed statement rolls back its transaction or savepoint before
+        # the dispatch caller can reuse the connection.
+        with self._factory() as conn, conn.transaction(), conn.cursor() as cur:
+            cur.execute(SNAPSHOT_SQL)
+            (snapshot,) = cur.fetchone()
         return build_plan(snapshot, repo_route)
 
     def plan_once(self, limits: PlanLimits = _DEFAULT_PLAN_LIMITS) -> PlanReport:
@@ -628,6 +596,11 @@ class Planner:
                 spend_24h_usd = _metered_spend_24h_usd(self._rows)
             except Exception:  # noqa: BLE001 — fail closed for metered paths
                 spend_24h_usd = None
+            if limits.only_task_id is None:
+                try:
+                    candidates = _rank_project_candidates(candidates, self.preview())
+                except Exception:  # advisory plan must not stop dispatch
+                    _LOG.warning("Project wave plan unavailable; keeping eligible order", exc_info=True)
             # Advisory reorder from coordination v2 (Grok). Stale/unknown ids
             # are ignored; backlog_dispatch still re-checks eligibility under
             # the row lock. Missing/unreadable state → original order.
@@ -638,11 +611,6 @@ class Planner:
                     advisory = []
                 if advisory:
                     candidates = apply_advisory_order(candidates, advisory, id_index=0)
-            if limits.only_task_id is None:
-                try:
-                    candidates = _rank_project_candidates(candidates, self.preview())
-                except Exception:  # advisory plan must not stop dispatch
-                    _LOG.warning("Project wave plan unavailable; keeping eligible order", exc_info=True)
             for (
                 task_id, wave, priority, title, body, repo, dispatchable, task_class,
             ) in candidates:

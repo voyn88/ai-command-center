@@ -14,7 +14,7 @@ def test_computed_impact_ranks_within_project_wave_and_priority():
         ("next-wave", "2", "P1", "", "", "ai-command-center", True, "functional"),
     ]
     decisions = [
-        Decision({"id": "unbalanced"}, "AICC", 1, "Проверить допуск", (), (5, 5, 1)),
+        Decision({"id": "unbalanced"}, "AICC", 1, "Проверить допуск", (), (2, 1, 1)),
         Decision({"id": "balanced"}, "AICC", 1, "Проверить допуск", (), (3, 3, 3)),
     ]
     assert [row[0] for row in _rank_project_candidates(rows, decisions)] == [
@@ -25,7 +25,7 @@ def test_computed_impact_ranks_within_project_wave_and_priority():
 def test_invalid_wave_values_sort_after_numeric_waves():
     from command_center.orchestrator.wave_plan import canonical_wave
 
-    for value in (None, "NaN", "sNaN", "Infinity", "W1"):
+    for value in (None, "NaN", "sNaN", "Infinity", "-Infinity", "-1", "1e999", " 1 ", "W1"):
         assert canonical_wave(value) == Decimal("Infinity")
     assert canonical_wave("2") < canonical_wave("10")
 
@@ -44,8 +44,9 @@ def test_wave_recalculates_after_canonical_completion():
     before = {item.task["id"]: item for item in build_plan(snapshot, repo_route)}
     assert before["child"].wave == 2
     assert before["child"].blockers == ("parent",)
-    parent.update(status="DONE", acceptance=True)
-    after = {item.task["id"]: item for item in build_plan(snapshot, repo_route)}
+    completed = {**snapshot, "tasks": [{**parent, "status": "DONE", "acceptance": True}, child]}
+    after = {item.task["id"]: item for item in build_plan(completed, repo_route)}
+    assert after["child"].blockers == ()
     assert after["child"].wave == 1
     assert after["child"].stage == "Проверить допуск"
     assert after["parent"].stage == "Принято"

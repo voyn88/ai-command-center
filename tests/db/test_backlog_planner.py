@@ -1603,3 +1603,18 @@ def test_worker_cannot_clear_evidence_or_park_tasks(rig, psycopg):
             cur.execute(
                 "SELECT * FROM backlog_clear_evidence('none', 'pr', 'x', 'x')"
             )
+
+
+def test_wave_preview_error_keeps_outer_transaction_usable(rig, monkeypatch):
+    from contextlib import nullcontext
+
+    from psycopg.errors import DivisionByZero
+
+    from command_center.orchestrator import planner
+
+    factory, _, _ = rig
+    monkeypatch.setattr(planner, "SNAPSHOT_SQL", "SELECT 1 / 0")
+    with factory() as conn, conn.transaction():
+        with pytest.raises(DivisionByZero):
+            planner.Planner(lambda: nullcontext(conn)).preview()
+        assert conn.execute("SELECT 1").fetchone() == (1,)
