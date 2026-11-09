@@ -206,7 +206,9 @@ and sets `recovery_target_action = 'pause'`. It deliberately does not start a
 server or modify the live data directory. After recovery pauses, validate the
 target database before promotion. Keep the WAL archive on storage with a
 failure domain independent from `aicc-pgdata`; the named volume in Compose is
-only the single-host default, not an off-host retention policy.
+only the single-host default, not an off-host retention policy. Compose runs a
+one-shot initializer to make that volume writable by the PostgreSQL identity
+before starting the server.
 
 ```bash
 # Nightly, with retention and an integrity check of the finished archive.
