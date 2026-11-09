@@ -192,7 +192,7 @@ def test_artifact_rejects_symlinks_and_nonregular_files(tmp_path, monkeypatch, k
 
 @pytest.mark.parametrize('raw', [
     b'not json', b'[]', b'{"schema":"delivery-release-observation/v1"}',
-    artifact_bytes(schema='other/v1'), artifact_bytes(secret='must not serve'),
+    artifact_bytes(schema='other/v1'), artifact_bytes(secret='must not serve'),  # pragma: allowlist secret -- synthetic negative-test fixture
     artifact_bytes(business_acceptance=True), b' ' * 65537,
 ])
 def test_artifact_rejects_unexpected_content(tmp_path, raw):
@@ -253,7 +253,7 @@ def test_check_artifact_authorized_read_is_byte_exact(tmp_path, monkeypatch, kin
     {'sha': 'A' * 40}, {'sha': None}, {'criterion_id': []},
     {'criterion_id': ' '}, {'check_id': None}, {'outcome': 'failed'},
     {'observed_at': '2026-11-04T00:00:01'}, {'observed_at': []},
-    {'observed_at': 'invalid'}, {'secret': 'must not serve'},
+    {'observed_at': 'invalid'}, {'secret': 'must not serve'},  # pragma: allowlist secret -- synthetic negative-test fixture
     {'repo': 'unexpected/field'}, {'business_acceptance': True},
 ])
 def test_check_artifact_rejects_malformed_or_extra_fields(tmp_path, kind, overrides):

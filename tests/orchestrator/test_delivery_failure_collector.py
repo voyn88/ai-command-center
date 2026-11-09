@@ -17,7 +17,7 @@ REPO = 'voyn88/ai-command-center'
 SHA = 'a' * 40
 OLD_SHA = 'b' * 40
 AT = '2026-11-04T12:00:00Z'
-SECRET = 'provider-title token=private-do-not-copy'
+SECRET = 'provider-title token=private-do-not-copy'  # pragma: allowlist secret -- synthetic negative-test fixture
 
 
 class Connection:

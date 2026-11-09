@@ -40,7 +40,7 @@ def test_observation_is_parameterized_exact_and_does_not_commit_or_schedule():
 @pytest.mark.parametrize("changes", [
     {"revision": True}, {"revision": 0}, {"sha": None}, {"sha": "main"},
     {"kind": "pending"}, {"reference": "verified by model"},
-    {"reference": "https://user:secret@example.test/log"},
+    {"reference": "https://user:secret@example.test/log"},  # pragma: allowlist secret -- synthetic negative-test fixture
     {"observed_at": "2026-11-04T11:00:00"}, {"observed_at": "yesterday"},
     {"detail": ""}, {"signature": "x" * 1025}, {"task_id": "other"},
 ])

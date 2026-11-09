@@ -135,6 +135,15 @@
     "command_center/orchestrator/coordination.py": [
       "orchestration"
     ],
+    "command_center/orchestrator/delivery_failure_collector.py": [
+      "orchestration"
+    ],
+    "command_center/orchestrator/delivery_incidents.py": [
+      "orchestration"
+    ],
+    "command_center/orchestrator/delivery_team.py": [
+      "orchestration"
+    ],
     "command_center/orchestrator/gh_access.py": [
       "orchestration"
     ],

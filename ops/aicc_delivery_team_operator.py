@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -10,6 +11,7 @@ import sys
 import stat
 
 from command_center.deployment import delivery_receipts as receipts
+from command_center.db import adapter
 
 
 def _positive(value):
@@ -168,6 +170,21 @@ def admit(connection, args, *, artifact_bearer=None, observation_bearer=None, ba
         _pin_scope(connection, args)
 
 
+@contextmanager
+def _operator_connection(dsn, *, autocommit, **connection_kwargs):
+    """Short-lived, explicitly configured pool through the AIOS lifecycle seam."""
+    pool = adapter.open_pool(
+        dsn, min_size=1, max_size=1, timeout=10, checkout_timeout=10,
+        autocommit=autocommit, connection_kwargs=connection_kwargs,
+        name="aicc-team-operator",
+    )
+    try:
+        with pool.connection() as connection:
+            yield connection
+    finally:
+        pool.close()
+
+
 def main(argv=None, *, connect=None):
     args = parser().parse_args(argv)
     try:
@@ -178,10 +195,9 @@ def main(argv=None, *, connect=None):
         if not dsn.strip():
             raise ValueError("missing operator configuration")
         if connect is None:
-            import psycopg
-            connect = psycopg.connect
-        # psycopg connection context commits on success, rolls back on any
-        # exception, and closes. No live connection occurs at import time.
+            connect = _operator_connection
+        # The pool checkout commits on success and rolls back on exception;
+        # the enclosing adapter lifecycle closes the dedicated pool.
         with connect(dsn, autocommit=False, connect_timeout=10,
                      options="-c statement_timeout=15000 -c lock_timeout=5000") as connection:
             admit(connection, args, artifact_bearer=bearer,

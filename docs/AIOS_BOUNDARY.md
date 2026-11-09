@@ -426,6 +426,37 @@ See [`docs/srv04b-two-host-acceptance.md`](srv04b-two-host-acceptance.md).
 
 ## CI wiring
 
+### Delivery-team SRV composition (2026-11-09)
+
+The independent source review of `48890fad825e97a7f9814da718f3b4a62285115c`
+accepted the following three name-signature findings as narrow clients of the
+existing SRV authority. Their explicit baseline entries do not exempt future
+behaviour changes, imports, or additional modules from this gate.
+
+- `command_center/orchestrator/delivery_team.py` constructs domain role prompts
+  and parses results. Its bounded `tick` is called by the existing planner
+  under `planner:global`; it calls `delivery_team_sync`, `delivery_team_ingest`,
+  `delivery_team_candidates` and `delivery_team_dispatch`. PostgreSQL owns the
+  stage ledger, prerequisites, idempotency and queue admission; no second
+  scheduler, queue, claim/retry implementation or background loop is introduced.
+- `command_center/orchestrator/delivery_incidents.py` validates domain incident
+  and corrective-action evidence and calls the existing SQL control functions
+  on the caller's connection. SQL owns persistence and deduplication. The
+  caller owns the transaction and trusted writer identity.
+- `command_center/orchestrator/delivery_failure_collector.py` converts a bounded
+  existing CI-attempt or retained journal observation into an incident through
+  the incident port. It neither polls nor retries nor maintains a collection
+  cursor. Scope and evidence persistence remain in the existing SQL authority.
+
+Import direction is AICC domain composition → existing DB/queue ports; it does
+not import AIOS Core internals. Generic lifecycle remains behind
+`command_center.db.adapter`. In particular, the operator CLI's direct driver
+connection was rejected in this review: it uses a short-lived, single-connection
+`adapter.open_pool` with an explicit operator DSN and no application-pool fallback.
+The operator CLI receives no baseline exception. Scanner semantics are unchanged.
+This placement does not prove runtime rollout, production acceptance or technical
+CTO-assignment enforcement; those have separate gates.
+
 - The required merge gate already runs these tests: `pytest -q` in
   `.github/workflows/ci.yml` collects `tests/architecture/`.
 - `.github/workflows/arch-fitness.yml` additionally runs *only* the boundary

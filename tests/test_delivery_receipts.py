@@ -69,7 +69,7 @@ def test_matching_runtime_records_only_scoped_observation(tmp_path):
         connection, task_id="VOYN-T", revision=1, target=TARGET,
         artifact_directory=tmp_path, artifact_base_url=ARTIFACT_BASE,
         read_artifact=served_artifacts(tmp_path),
-        observe=observer([{"sha": SHA, "secret": "must-not-copy"},
+        observe=observer([{"sha": SHA, "secret": "must-not-copy"},  # pragma: allowlist secret -- synthetic negative-test fixture
                           {"status": "ok"}, {"sha": SHA}]),
     )
     record = json.loads(artifact.read_text())
@@ -98,7 +98,7 @@ def test_foreign_repo_is_rejected_before_network(tmp_path):
                                 artifact_base_url=ARTIFACT_BASE, read_artifact=no_network)
 
 
-@pytest.mark.parametrize("url", ["http://release.example/version", "https://user:pass@release.example/version", "https://other.example/version"])
+@pytest.mark.parametrize("url", ["http://release.example/version", "https://user:pass@release.example/version", "https://other.example/version"])  # pragma: allowlist secret -- synthetic negative-test fixture
 def test_target_configuration_rejects_insecure_or_foreign_origin(url):
     with pytest.raises(ValueError):
         ReleaseTarget("repo", url, TARGET.health_url).validate()
@@ -122,7 +122,7 @@ class Response:
 
 def test_private_observer_pins_credential_to_origin_and_does_not_persist_it(monkeypatch, tmp_path):
     requests = []
-    secret = "private-test-token"
+    secret = "private-test-token"  # pragma: allowlist secret -- synthetic negative-test fixture
 
     class Opener:
         def open(self, request, timeout):
@@ -164,7 +164,7 @@ def test_release_receipt_requires_readable_exact_retained_artifact(tmp_path, mod
 
 
 @pytest.mark.parametrize("base", [
-    "", "http://release.example/artifacts", "https://user:secret@release.example/artifacts",
+    "", "http://release.example/artifacts", "https://user:secret@release.example/artifacts",  # pragma: allowlist secret -- synthetic negative-test fixture
     "https://release.example/artifacts?token=secret", "https://release.example/artifacts#fragment",
 ])
 def test_release_refuses_missing_or_unsafe_artifact_endpoint_before_observation(tmp_path, base):
@@ -179,7 +179,7 @@ def test_release_refuses_missing_or_unsafe_artifact_endpoint_before_observation(
 
 
 def test_fetch_failure_and_malformed_json_do_not_expose_response_or_credential(monkeypatch):
-    secret = "private-test-token"
+    secret = "private-test-token"  # pragma: allowlist secret -- synthetic negative-test fixture
 
     class Opener:
         def open(self, request, timeout):
@@ -271,7 +271,7 @@ def test_acceptance_refuses_hash_mismatch_stale_scope_and_database_refusal():
 
 
 @pytest.mark.parametrize("url", [
-    "http://evidence.example/a", "https://user:secret@evidence.example/a",
+    "http://evidence.example/a", "https://user:secret@evidence.example/a",  # pragma: allowlist secret -- synthetic negative-test fixture
     "https://evidence.example/a?token=secret", "https://evidence.example/a#sha256=bad",
 ])
 def test_acceptance_rejects_credential_or_untrusted_urls_before_database(url):

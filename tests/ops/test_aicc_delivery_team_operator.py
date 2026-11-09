@@ -104,6 +104,42 @@ def run(args, connection):
     return cli.main(args, connect=connect)
 
 
+@pytest.mark.parametrize("failure", [False, True])
+def test_operator_adapter_pool_closes_and_preserves_transaction(monkeypatch, failure):
+    connection = Connection()
+    closed = []
+
+    class Pool:
+        def connection(self):
+            return connection
+
+        def close(self):
+            closed.append(True)
+
+    def open_pool(dsn, **kwargs):
+        assert dsn == "dedicated-operator-dsn"
+        assert kwargs == dict(
+            min_size=1, max_size=1, timeout=10, checkout_timeout=10,
+            autocommit=False, connection_kwargs={"connect_timeout": 10},
+            name="aicc-team-operator",
+        )
+        return Pool()
+
+    monkeypatch.setattr(cli.adapter, "open_pool", open_pool)
+    try:
+        with cli._operator_connection(
+            "dedicated-operator-dsn", autocommit=False, connect_timeout=10
+        ) as observed:
+            assert observed is connection
+            if failure:
+                raise ValueError("refused admission")
+    except ValueError:
+        assert failure
+    assert closed == [True]
+    assert connection.committed is not failure
+    assert connection.rolled_back is failure
+
+
 @pytest.mark.parametrize("corrective", [False, True])
 def test_real_check_adapter_commits(credentials, monkeypatch, capsys, corrective):
     args = check_args(monkeypatch, corrective=corrective)
@@ -173,7 +209,7 @@ def test_release_real_adapter_readback_and_commit(
             "--artifact-base-url", "https://evidence.example/release"]
     if auth_mode == "basic":
         auth_path = tmp_path / "auth.json"
-        auth_path.write_text(json.dumps({"username": "operator", "password": "private-pass"}))
+        auth_path.write_text(json.dumps({"username": "operator", "password": "private-pass"}))  # pragma: allowlist secret -- synthetic negative-test fixture
         auth_path.chmod(0o600)
         monkeypatch.setenv("AICC_TEAM_AUTH_MODE", "basic")
         monkeypatch.setenv("AICC_TEAM_BASIC_CREDENTIALS_FILE", str(auth_path))
@@ -209,7 +245,7 @@ def test_release_real_adapter_readback_and_commit(
 @pytest.fixture
 def basic_credentials(credentials, monkeypatch, tmp_path):
     path = tmp_path / 'credentials.json'
-    path.write_text(json.dumps({'username': 'operator', 'password': 'private-pass'}))
+    path.write_text(json.dumps({'username': 'operator', 'password': 'private-pass'}))  # pragma: allowlist secret -- synthetic negative-test fixture
     path.chmod(0o600)
     monkeypatch.delenv('AICC_TEAM_ARTIFACT_BEARER')
     monkeypatch.delenv('AICC_TEAM_OBSERVATION_BEARER')
@@ -253,11 +289,11 @@ def test_private_basic_file_refusal(basic_credentials, monkeypatch, problem, tmp
     elif problem == 'malformed':
         path.write_text('not-json-private-pass')
     elif problem == 'duplicate':
-        path.write_text('{"username":"a","username":"b","password":"private-pass"}')
+        path.write_text('{"username":"a","username":"b","password":"private-pass"}')  # pragma: allowlist secret -- synthetic negative-test fixture
     elif problem == 'missing':
         path.unlink()
     elif problem == 'colon_username':
-        path.write_text('{"username":"a:b","password":"private-pass"}')
+        path.write_text('{"username":"a:b","password":"private-pass"}')  # pragma: allowlist secret -- synthetic negative-test fixture
     with pytest.raises(ValueError, match='^invalid private authentication file$'):
         cli._read_basic_credentials(path)
 
