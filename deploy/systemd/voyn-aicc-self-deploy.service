@@ -30,5 +30,5 @@ WorkingDirectory=/opt/aicc/current
 # the rollout's own lane mutations (live 2026-09-08 worker-01;
 # VOYN-W0-AICC-ROLLOUT-VS-ROTATE-SELFDEPLOY-TIMERS). A skipped
 # ExecCondition is not a failure.
-ExecCondition=/usr/bin/test ! -e /run/aicc-staged-rollout.lock
+ExecCondition=/bin/sh -c 'lock=/run/aicc-staged-rollout.lock; [ -e "$lock" ] || exit 0; holder=$(cat "$lock" 2>/dev/null) || exit 1; case "$holder" in ""|*[!0-9]*|0*) exit 1 ;; esac; [ -d /proc ] || exit 1; [ -d "/proc/$holder" ] && exit 1; exit 0'
 ExecStart=/bin/bash -lc "set -a && source ${AICC_PREPROD_ROOT}/.env && set +a && exec /opt/aicc/current/.venv/bin/python -m command_center.db self-deploy --repo-path ${AICC_SOURCE_REPO} --release-root /opt/aicc --release-venv ${AICC_RUNTIME_VENV} --migrate"
