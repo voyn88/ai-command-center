@@ -22,6 +22,18 @@ def test_authenticated_operator_login_is_allowed(connect_as):
         cli._authority(conn)
 
 
+@pytest.mark.parametrize("role", ["aicc_operator", "aicc_app", "aicc_worker"])
+def test_dedicated_adapter_pool_preserves_authenticated_role(test_dsn, role_passwords, psycopg, role):
+    dsn = psycopg.conninfo.make_conninfo(test_dsn, user=role, password=role_passwords[role])
+    with cli._operator_connection(dsn, autocommit=False, connect_timeout=10) as conn:
+        assert conn.execute("SELECT session_user").fetchone() == (role,)
+        if role == "aicc_operator":
+            cli._authority(conn)
+        else:
+            with pytest.raises(ValueError, match="^operator authority required$"):
+                cli._authority(conn)
+
+
 @pytest.mark.parametrize("role", ["aicc_app", "aicc_worker"])
 def test_app_and_worker_logins_are_denied(connect_as, role):
     with connect_as(role) as conn:
