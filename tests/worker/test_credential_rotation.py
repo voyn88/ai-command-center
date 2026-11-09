@@ -8,6 +8,7 @@ import shlex
 import signal
 import subprocess
 import sys
+import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -33,6 +34,7 @@ from command_center.ops.credential_rotation import (
     authority_timeout_seconds,
     load_lane_registry,
     main,
+    rollout_lock_is_active,
 )
 from command_center.worker.credential_file import (
     CredentialFileError,
@@ -1141,7 +1143,7 @@ def test_cli_defers_to_a_staged_rollout_without_touching_the_controller(
     must defer -- exit 0, audited, no controller mutation -- not race the
     rollout's own lane stop/start (live worker-01 2026-09-08)."""
     lock = tmp_path / "aicc-staged-rollout.lock"
-    lock.write_text("12345\n", encoding="utf-8")
+    lock.write_text(f"{os.getpid()}\n", encoding="utf-8")
 
     def fail(self) -> None:
         raise AssertionError("rotate() must not run while the rollout lock is held")
@@ -1170,6 +1172,120 @@ def test_cli_defers_to_a_staged_rollout_without_touching_the_controller(
     output = capsys.readouterr().out
     assert '"event":"rotation_deferred_staged_rollout"' in output
     assert str(lock) in output
+
+
+def test_cli_ignores_a_stale_staged_rollout_lock(tmp_path: Path, monkeypatch, capsys) -> None:
+    """A killed rollout must not suppress all later credential renewals."""
+    lock = tmp_path / "aicc-staged-rollout.lock"
+    lock.write_text("999999999\n", encoding="utf-8")
+    rotated = False
+
+    def rotate(self) -> None:
+        nonlocal rotated
+        rotated = True
+
+    monkeypatch.setattr(RotationController, "rotate", rotate)
+    result = main(
+        [
+            "--env-file",
+            str(_environment(tmp_path / "worker.env")),
+            "--lock-file",
+            str(tmp_path / "rotation.lock"),
+            "--phase-file",
+            str(tmp_path / "phase.json"),
+            "--circuit-file",
+            str(tmp_path / "circuit.json"),
+            "--tunnel-unit",
+            TUNNEL,
+            "--lane-registry",
+            str(_lane_registry(tmp_path, monkeypatch)),
+            "--rollout-lock",
+            str(lock),
+        ]
+    )
+
+    assert result == 0
+    assert rotated
+    assert "rotation_deferred_staged_rollout" not in capsys.readouterr().out
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="requires Linux procfs"
+)
+def test_rollout_lock_is_active_rejects_a_pid_reused_after_the_lock_was_written(
+    tmp_path: Path,
+) -> None:
+    """A live PID that started after the lock's mtime cannot be the process
+    that wrote it: the kernel only hands out a PID once its previous owner
+    has exited, and that owner had to be alive to create the marker. Treating
+    such a collision as an active rollout would reintroduce the exact
+    permanent-pause bug the PID-liveness check was added to close, just via
+    PID reuse instead of a missing owner."""
+    lock = tmp_path / "aicc-staged-rollout.lock"
+    lock.write_text(f"{os.getpid()}\n", encoding="utf-8")
+    long_before_this_process_started = time.time() - 10 * 365 * 24 * 3600
+    os.utime(lock, (long_before_this_process_started, long_before_this_process_started))
+
+    assert rollout_lock_is_active(lock) is False
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="requires Linux procfs"
+)
+def test_rollout_lock_is_active_keeps_a_pid_that_predates_the_lock(
+    tmp_path: Path,
+) -> None:
+    """The companion positive case: a live PID that started before the lock
+    was written is consistent with being its real owner, so the hold still
+    stands (this is the common case -- the owner creates the marker shortly
+    after it starts)."""
+    lock = tmp_path / "aicc-staged-rollout.lock"
+    lock.write_text(f"{os.getpid()}\n", encoding="utf-8")
+
+    assert rollout_lock_is_active(lock) is True
+
+
+def test_cli_ignores_a_stale_rollout_lock_whose_pid_was_reused(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """End-to-end companion to the ``rollout_lock_is_active`` unit tests
+    above: a PID reused by an unrelated live process must not suppress
+    rotation forever, the same way a dead owner must not (live worker-01:
+    the kill(pid, 0)-only fix for a SIGKILLed rollout's stale lock closed
+    the missing-owner case but left this PID-collision case open)."""
+    lock = tmp_path / "aicc-staged-rollout.lock"
+    lock.write_text(f"{os.getpid()}\n", encoding="utf-8")
+    long_before_this_process_started = time.time() - 10 * 365 * 24 * 3600
+    os.utime(lock, (long_before_this_process_started, long_before_this_process_started))
+    rotated = False
+
+    def rotate(self) -> None:
+        nonlocal rotated
+        rotated = True
+
+    monkeypatch.setattr(RotationController, "rotate", rotate)
+    result = main(
+        [
+            "--env-file",
+            str(_environment(tmp_path / "worker.env")),
+            "--lock-file",
+            str(tmp_path / "rotation.lock"),
+            "--phase-file",
+            str(tmp_path / "phase.json"),
+            "--circuit-file",
+            str(tmp_path / "circuit.json"),
+            "--tunnel-unit",
+            TUNNEL,
+            "--lane-registry",
+            str(_lane_registry(tmp_path, monkeypatch)),
+            "--rollout-lock",
+            str(lock),
+        ]
+    )
+
+    assert result == 0
+    assert rotated
+    assert "rotation_deferred_staged_rollout" not in capsys.readouterr().out
 
 
 def test_cli_recover_only_ignores_the_rollout_lock(
@@ -1303,6 +1419,7 @@ def test_versioned_units_pin_drain_shutdown_and_non_overlapping_timer(
     )
     assert "--lane-registry /etc/voyn/aicc-worker-lanes.conf" in rotation
     assert "ConditionPathExists" not in rotation
+    assert "ExecCondition=" not in rotation
     assert "OnFailure=voyn-aicc-credential-rotation-alert@%n.service" in rotation
     assert "ExecStopPost=" in rotation
     assert "--recover-only" in rotation

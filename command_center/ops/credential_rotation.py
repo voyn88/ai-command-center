@@ -81,6 +81,103 @@ class RotationError(RuntimeError):
     """A fail-closed operational error safe to show in an audit event."""
 
 
+def _process_age_seconds(pid: int) -> float | None:
+    """Seconds since ``pid`` started, or ``None`` when that cannot be read.
+
+    Reads ``/proc/[pid]/stat`` directly rather than shelling out to ``ps``:
+    this fleet is Linux/systemd-only (see the deploy/systemd units), and the
+    only use is a cheap, local staleness check -- not a portable identity
+    record. ``comm`` can contain spaces or parentheses, so the split point is
+    the *last* ``)`` rather than the first whitespace, matching the kernel's
+    own ``/proc/[pid]/stat`` grammar. Boot-relative "now" comes from
+    ``CLOCK_BOOTTIME`` (a syscall) rather than ``/proc/uptime`` (a file): some
+    restricted/sandboxed hosts expose per-process ``/proc/[pid]/stat`` without
+    the whole-system ``/proc/uptime``, and the syscall works in both.
+    """
+    if not hasattr(time, "CLOCK_BOOTTIME"):
+        return None
+    try:
+        stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    closing = stat_text.rfind(")")
+    if closing < 0:
+        return None
+    # Field 3 (state) is the first token after `comm`; field 22 (start ticks
+    # since boot) is therefore index 19 of that remainder.
+    fields = stat_text[closing + 1 :].split()
+    if len(fields) <= 19 or not fields[19].isdigit():
+        return None
+    start_seconds_since_boot = int(fields[19]) / os.sysconf("SC_CLK_TCK")
+    age = time.clock_gettime(time.CLOCK_BOOTTIME) - start_seconds_since_boot
+    return age if age >= 0 else None
+
+
+# Budget for the gap between reading the lock's mtime and this process's own
+# `/proc` reads, plus start-tick rounding. Real PID reuse only becomes
+# possible after the original owner has exited and the kernel has cycled the
+# whole PID space back around to it -- far longer than this budget -- so it
+# cannot hide a genuine reuse, only absorb measurement jitter.
+_ROLLOUT_LOCK_REUSE_SKEW_BUDGET_SECONDS = 5.0
+
+
+def rollout_lock_is_active(path: Path) -> bool:
+    """Whether a staged-rollout marker still belongs to a live process.
+
+    Rollout writers store their PID in the marker.  An existence-only check
+    turns a SIGKILLed rollout into a permanent rotation pause: ``/run``
+    survives for the rest of the boot while the owner process does not.  The
+    rotator must not remove a root-owned coordination file, but it can safely
+    ignore a well-formed marker whose owner no longer exists.
+
+    A bare ``kill(pid, 0)`` success is not proof either: on a long-running
+    host the kernel eventually reuses that PID for a completely unrelated,
+    still-live process, which would otherwise turn the same SIGKILLed-rollout
+    scenario into a permanent pause again, just later and through a PID
+    collision instead of a missing owner (the identity module's own warning
+    about this exact anti-pattern -- see ``command_center/runtime/identity.py``
+    -- applies here too). Any later holder of that PID can only have *started*
+    after the marker was written, because the original owner had to be alive
+    to write it. So a live PID whose own start time postdates the marker's
+    mtime is provably a reuse, not the rollout that created it.
+
+    An unreadable or malformed marker remains an active hold, as does a live
+    PID whose start time cannot be read (no ``/proc``, permission, etc.).
+    That preserves the fail-closed behavior for an unexpected
+    coordination-file state or an unverifiable host.
+    """
+    try:
+        marker_mtime = path.stat().st_mtime
+        owner = path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    if not owner.isascii() or not owner.isdecimal():
+        return True
+    pid = int(owner)
+    if pid < 1:
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # A root-owned rollout is expected to be unsignalable by the rotator;
+        # fall through to the reuse check below rather than trusting that
+        # alone.
+        pass
+    except OSError:
+        return True
+    age = _process_age_seconds(pid)
+    if age is None:
+        return True
+    lock_age = time.time() - marker_mtime
+    if age + _ROLLOUT_LOCK_REUSE_SKEW_BUDGET_SECONDS < lock_age:
+        return False
+    return True
+
+
 class CircuitOpen(RotationError):
     """A non-mutating cooldown refusal that must not extend its own deadline."""
 
@@ -1791,8 +1888,8 @@ def main(argv: list[str] | None = None) -> int:
     # Recovery is exempt: it is cleaning up an ALREADY-interrupted rotation
     # (a durable phase journal), and leaving that fleet drained until the
     # rollout finishes is a worse outcome than finishing the recovery.
-    if not args.recover_only and args.rollout_lock is not None and (
-        args.rollout_lock.exists()
+    if not args.recover_only and args.rollout_lock is not None and rollout_lock_is_active(
+        args.rollout_lock
     ):
         Audit(args.audit_file).emit(
             "rotation_deferred_staged_rollout", lock=str(args.rollout_lock)
