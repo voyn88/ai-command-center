@@ -9,7 +9,7 @@
 #
 # Format, one entry per line:   <glob> <TOKEN>
 #   <glob>   shell glob against the repository-relative path. `*` spans
-#            directory separators, so `ops/ci/**` covers every depth under it.
+#            directory separators.
 #   <TOKEN>  which home root the entry permits. WORKER_HOME is the only token
 #            the guard implements -- the deployment account root, already
 #            public in these files by design. There is deliberately NO token
@@ -23,7 +23,7 @@
 
 # The installer-integration fixture builds a clone at the worker's real path
 # and bind-mounts it into the container -- the path IS the thing under test.
-ops/ci/** WORKER_HOME
+ops/ci/installer-integration/** WORKER_HOME
 
 # systemd units: WorkingDirectory=, EnvironmentFile=, BindReadOnlyPaths= and
 # the ExecStart lines of the preprod lane all name the deployment account's

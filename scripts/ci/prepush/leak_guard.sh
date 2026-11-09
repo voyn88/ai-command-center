@@ -157,8 +157,11 @@ base_carries() {  # <base-ref> <path> <token>
         blob_key="$key"
         blob_text="$(git show "$1:$2" 2>/dev/null || true)"
     fi
-    case "$blob_text" in *"$3"*) return 0 ;; esac
-    return 1
+    # Compare extracted occurrences, not substrings.  A base token ending in
+    # `ai-command-center` must not bless a newly added
+    # `ai-command-center-secrets` path merely because it shares that prefix.
+    printf '%s\n' "$blob_text" | grep -oE "$HOME_TOKEN_PAT" \
+        | grep -Fxq -- "$3"
 }
 
 occurrence_is_exempt() {  # <base-ref> <path> <token>
@@ -168,8 +171,7 @@ occurrence_is_exempt() {  # <base-ref> <path> <token>
     for ((i = 0; i < ${#ALLOW_GLOB[@]}; i++)); do      # rule B
         [ "${ALLOW_TOKEN[i]}" = "$root" ] || continue
         # shellcheck disable=SC2254 — the entry IS a glob, matched unquoted
-        # on purpose; `*` spans directory separators, so `ops/ci/**` covers
-        # every depth under it.
+        # on purpose; `*` spans directory separators.
         case "$path" in ${ALLOW_GLOB[i]}) return 0 ;; esac
     done
     return 1

@@ -270,6 +270,24 @@ def test_a_new_path_in_a_file_that_already_carries_one_is_still_refused(repo):
     assert "deploy/install.sh" in r.stdout
 
 
+def test_base_path_does_not_exempt_an_extended_path_with_the_same_prefix(repo):
+    """Rule A compares complete occurrences, not string prefixes."""
+    unit = _on_main(
+        repo,
+        "deploy/install.sh",
+        f"REPO={WORK_HOME}/Projects/ai-command-center\n",
+    )
+    unit.write_text(
+        f"REPO={WORK_HOME}/Projects/ai-command-center\n"
+        f"SECRETS={WORK_HOME}/Projects/ai-command-center-secrets\n"
+    )
+    _commit(repo)
+    r = _guard(repo)
+    assert r.returncode == 1
+    assert "absolute home paths" in r.stdout
+    assert "ai-command-center-secrets" in r.stdout
+
+
 def test_personal_home_path_added_beside_a_carried_one_is_refused(repo):
     """A line is refused unless EVERY occurrence on it is exempt."""
     unit = _on_main(
@@ -319,6 +337,16 @@ def test_allowlist_never_covers_personal_home_paths(repo):
     assert "absolute home paths" in r.stdout
 
 
+def test_allowlist_does_not_cover_unrelated_ops_ci_files(repo):
+    target = repo / "ops" / "ci" / "unrelated" / "run.sh"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(f"REPO={WORK_HOME}/Projects/private\n")
+    _commit(repo)
+    r = _guard(repo)
+    assert r.returncode == 1
+    assert "ops/ci/unrelated/run.sh" in r.stdout
+
+
 def test_a_branch_cannot_allowlist_itself(repo):
     """The allowlist is read from the BASE commit: an entry a branch grants
     itself is not live until it has landed on the base branch."""
@@ -338,7 +366,7 @@ def test_unknown_allowlist_token_fails_closed(repo):
     _on_main(
         repo,
         "scripts/ci/prepush/leak_guard_allowlist",
-        ALLOWLIST.read_text() + "ops/ci/** EVERY_HOME\n",
+        ALLOWLIST.read_text() + "ops/ci/installer-integration/** EVERY_HOME\n",
     )
     (repo / "ok.py").write_text("x = 1\n")
     _commit(repo)
@@ -352,7 +380,7 @@ def test_malformed_allowlist_entry_fails_closed(repo):
     _on_main(
         repo,
         "scripts/ci/prepush/leak_guard_allowlist",
-        ALLOWLIST.read_text() + "ops/ci/**\n",
+        ALLOWLIST.read_text() + "ops/ci/installer-integration/**\n",
     )
     (repo / "ok.py").write_text("x = 1\n")
     _commit(repo)
@@ -380,7 +408,8 @@ def test_shipped_allowlist_covers_the_files_that_carry_paths_by_design():
         for line in ALLOWLIST.read_text().splitlines()
         if line.strip() and not line.lstrip().startswith("#")
     ]
-    assert ["ops/ci/**", "WORKER_HOME"] in entries
+    assert ["ops/ci/installer-integration/**", "WORKER_HOME"] in entries
+    assert ["ops/ci/**", "WORKER_HOME"] not in entries
     assert ["deploy/systemd/**", "WORKER_HOME"] in entries
     assert all(token == "WORKER_HOME" for _, token in entries)
 
