@@ -4274,7 +4274,7 @@ def _pr_rows(factory, task_id):
         return [row[0] for row in cur.fetchall()]
 
 
-def _fake_pr_list(entries, *, returncode=0, stdout=None):
+def _fake_pr_list(entries, *, closed_entries=(), returncode=0, stdout=None):
     """The branch lookup is REST now (`gh api repos/{o}/{r}/pulls?...head=`)
     rather than `gh pr list --head` (GraphQL) --
     VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS. Entries are still
@@ -4289,7 +4289,13 @@ def _fake_pr_list(entries, *, returncode=0, stdout=None):
 
     def fake_gh(argv, repo):
         if argv[0] == "api" and "/pulls?" in argv[1]:
-            body = json.dumps(rest) if stdout is None else stdout
+            selected = (
+                [{"html_url": entry["url"], "head": {"ref": entry["headRefName"]}}
+                 for entry in closed_entries]
+                if "state=closed" in argv[1]
+                else rest
+            )
+            body = json.dumps(selected) if stdout is None else stdout
             return sp.CompletedProcess(argv, returncode, body, "")
         return sp.CompletedProcess(argv, 1, "", "unexpected gh call")
 
@@ -4311,6 +4317,49 @@ def test_an_open_pr_on_the_task_branch_becomes_evidence(rig, _test_repo_routes, 
 
     assert (task_id, url) in report.recorded
     assert _pr_rows(app_factory, task_id) == [url]
+
+
+def test_a_single_closed_pr_becomes_evidence_for_terminal_recovery(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+    """A closed PR must reach the merge tick, which owns DONE/REJECTED."""
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE-CLOSED"
+    _ready_without_pr(store, app_factory, task_id)
+    url = "https://github.com/x/repo-d2/pull/899"
+    monkeypatch.setattr(
+        review_merge,
+        "_gh",
+        _fake_pr_list(
+            [], closed_entries=[{"url": url, "headRefName": f"backlog/{task_id}"}]
+        ),
+    )
+
+    report = reconcile_pr_evidence(app_factory, REPO)
+
+    assert (task_id, url) in report.recorded
+    assert _pr_rows(app_factory, task_id) == [url]
+
+
+def test_multiple_closed_prs_on_the_branch_are_not_guessed(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE-CLOSED-MULTI"
+    _ready_without_pr(store, app_factory, task_id)
+    branch = f"backlog/{task_id}"
+    monkeypatch.setattr(
+        review_merge,
+        "_gh",
+        _fake_pr_list(
+            [],
+            closed_entries=[
+                {"url": "https://github.com/x/repo-d2/pull/897", "headRefName": branch},
+                {"url": "https://github.com/x/repo-d2/pull/898", "headRefName": branch},
+            ],
+        ),
+    )
+
+    report = reconcile_pr_evidence(app_factory, REPO)
+
+    assert (task_id, "ambiguous_closed_prs_on_branch") in report.skipped
+    assert _pr_rows(app_factory, task_id) == []
 
 
 def test_a_task_adopts_only_its_own_branch_never_a_prefix_match(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
@@ -4435,7 +4484,8 @@ def test_the_lookup_runs_in_the_checkout_the_tick_was_given(rig, _test_repo_rout
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     reconcile_pr_evidence(app_factory, REPO)
 
-    assert seen == [REPO]
+    # No open match falls back to the closed-PR lookup in the same checkout.
+    assert seen == [REPO, REPO]
 
 
 # -- reconcile_pr_window: no database involved, gh is faked in-process ------
