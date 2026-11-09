@@ -1332,6 +1332,68 @@ def _latest_attempt_executor(factory: Any, task_id: str, base_key: str) -> str |
     return executor if isinstance(executor, str) and executor else None
 
 
+# Independence (VOYN-W0-AICC-REVIEW-EXECUTOR-INDEPENDENCE): a review must
+# never be handed to the executor that wrote the change under review. The
+# implementer is read from real attempt history, never from the static
+# routing plan -- the plan only says what the implementation cascade WOULD
+# try; the escalation link in `ROUTING_MATRIX["implementation"]` means the
+# executor that actually landed the work is not always the cascade's first
+# entry (e.g. codex, when claude's subscription window was exhausted).
+def _implementation_executor(factory: Any, task_id: str) -> str | None:
+    """The executor that produced the latest ``succeeded`` implementation
+    (or remediation) run for ``task_id`` -- read from
+    ``work_result.payload["executor"]``, the same field every completed run
+    records (`command_center/worker/handlers.py`). None means no
+    implementation history was found, or it named no executor, which leaves
+    the review cascade unfiltered rather than refusing it: an unknown
+    implementer is not evidence of a conflict."""
+    rows = _rows(
+        factory,
+        "SELECT wr.payload FROM work_result wr JOIN work_item i "
+        "ON i.result_id = wr.result_id "
+        "WHERE i.task_id = %s AND i.state = 'succeeded' "
+        "AND i.payload ->> 'task_type' IN ('implementation', 'remediation') "
+        "ORDER BY i.updated_at DESC LIMIT 1",
+        (task_id,),
+    )
+    if not rows:
+        return None
+    result = _json_object(rows[0][0])
+    executor = (result or {}).get("executor")
+    return executor if isinstance(executor, str) and executor else None
+
+
+def _review_cascade_for_task(
+    factory: Any, task_id: str, cascade: list[dict[str, Any]]
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Drop ``task_id``'s own implementer from its review cascade.
+
+    If that exclusion would empty the cascade there is no self-review
+    fallback: the caller must defer with the returned reason rather than
+    ever re-admitting the implementer. Claude's only model-only (zero-tool)
+    review transport today is the opt-in Mac bridge
+    (`docs/operations/CLAUDE_MAC_REVIEWS.md`) gated by
+    ``AICC_CLAUDE_MAC_ENABLED``; when that is off and claude is the sole
+    independent link left after exclusion, claude is unreachable too, and
+    the review must wait rather than fall back to the implementer.
+    """
+    implementer = _implementation_executor(factory, task_id)
+    if not implementer:
+        return cascade, None
+    filtered = [link for link in cascade if link.get("executor") != implementer]
+    if len(filtered) == len(cascade):
+        return cascade, None
+    if not filtered:
+        return [], "self_review_excluded:no_independent_reviewer"
+    if (
+        len(filtered) == 1
+        and filtered[0].get("executor") == "claude"
+        and os.environ.get("AICC_CLAUDE_MAC_ENABLED") != "1"
+    ):
+        return [], "self_review_excluded:claude_mac_unreachable"
+    return filtered, None
+
+
 def _failover_cascade(
     cascade: list[dict[str, Any]], avoid_executor: str | None
 ) -> list[dict[str, Any]]:
@@ -1653,6 +1715,10 @@ def _review_once(
         if not cascade:
             report.skipped.append((task_id, "no_review_executor_route"))
             continue
+        task_cascade, defer_reason = _review_cascade_for_task(factory, task_id, cascade)
+        if not task_cascade:
+            report.skipped.append((task_id, defer_reason or "no_review_executor_route"))
+            continue
         repo = _repo_from_pr_url(pr_url)
         if repo is None:
             # Not even shaped like a GitHub PR URL -- can never resolve
@@ -1711,7 +1777,7 @@ def _review_once(
                 "prompt": prompt,
                 "timeout_seconds": cfg.review_timeout,
                 "untrusted": True,
-                "cascade": cascade,
+                "cascade": task_cascade,
                 # Worker re-checks open+exact head before any model call;
                 # scheduling's snapshot guard does not cover the queue delay.
                 "review_head": {
@@ -1747,7 +1813,7 @@ def _review_once(
         # verification section comment above for why the eager full-context
         # pass of VOYN-W0-AICC-REVIEW-ADJUDICATE was retired).
         for review_key, payload in prepared:
-            enqueue(cfg.queue, review_key, payload, task_id, len(cascade))
+            enqueue(cfg.queue, review_key, payload, task_id, len(task_cascade))
         report.reviewed.append((task_id, pr_url))
         actions += 1
     if scan_token is not None:

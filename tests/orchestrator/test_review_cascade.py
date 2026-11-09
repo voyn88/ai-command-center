@@ -133,6 +133,121 @@ def test_empty_review_route_fails_closed_without_enqueuing(monkeypatch):
     assert report.skipped == [("VOYN-W0-X", "no_review_executor_route")]
 
 
+def _rows_with_implementer(task_id, pr_url, implementer):
+    """A `_rows` fake that answers the review scan's task/PR query with a
+    single row, and the independence check's implementer-history query
+    (`_implementation_executor`, keyed off its distinctive join) with the
+    given implementer's recorded executor -- or no row at all, meaning no
+    implementation history was found."""
+
+    def rows(_factory, sql, _params=()):
+        if "work_result wr JOIN work_item" in sql:
+            return [({"executor": implementer},)] if implementer else []
+        return [(task_id, pr_url)]
+
+    return rows
+
+
+def test_claude_implemented_excludes_claude_so_codex_reviews(monkeypatch):
+    """VOYN-W0-AICC-REVIEW-EXECUTOR-INDEPENDENCE (a): the executor that
+    actually implemented the task -- read from attempt history, not the
+    static plan -- must not reappear in its own review cascade."""
+    task_id = "VOYN-W0-IMPL-CLAUDE"
+    pr_url = "https://github.com/o/ai-command-center/pull/21"
+    monkeypatch.setattr(review_merge, "_rows", _rows_with_implementer(task_id, pr_url, "claude"))
+    monkeypatch.setattr(
+        review_merge, "_pr_diff_and_head",
+        lambda *args: review_merge._PRSnapshot.create("diff", "b" * 40, "a" * 40),
+    )
+    monkeypatch.setattr(
+        "command_center.orchestrator.planner.repo_route",
+        lambda repo: ("AICC", "/srv/aicc"),
+    )
+    calls = []
+    report = review_merge.review_once(
+        object(), lambda *args: calls.append(args), "/srv/aicc"
+    )
+    assert report.reviewed == [(task_id, pr_url)]
+    _queue, _key, payload, enqueued_task_id, max_attempts = calls[0]
+    assert enqueued_task_id == task_id
+    assert [link["executor"] for link in payload["cascade"]] == ["codex"]
+    assert max_attempts == 1
+
+
+def test_codex_implemented_excludes_codex_so_claude_reviews_when_mac_reachable(monkeypatch):
+    """VOYN-W0-AICC-REVIEW-EXECUTOR-INDEPENDENCE (b): when the escalation
+    link (codex) is the one that actually landed the implementation --
+    not merely the plan's first entry -- the review cascade must exclude
+    codex and fall to claude, provided claude is actually reachable (the
+    opt-in Mac bridge, `AICC_CLAUDE_MAC_ENABLED=1`)."""
+    monkeypatch.setenv("AICC_CLAUDE_MAC_ENABLED", "1")
+    task_id = "VOYN-W0-IMPL-CODEX"
+    pr_url = "https://github.com/o/ai-command-center/pull/22"
+    monkeypatch.setattr(review_merge, "_rows", _rows_with_implementer(task_id, pr_url, "codex"))
+    monkeypatch.setattr(
+        review_merge, "_pr_diff_and_head",
+        lambda *args: review_merge._PRSnapshot.create("diff", "b" * 40, "a" * 40),
+    )
+    monkeypatch.setattr(
+        "command_center.orchestrator.planner.repo_route",
+        lambda repo: ("AICC", "/srv/aicc"),
+    )
+    calls = []
+    report = review_merge.review_once(
+        object(), lambda *args: calls.append(args), "/srv/aicc"
+    )
+    assert report.reviewed == [(task_id, pr_url)]
+    _queue, _key, payload, enqueued_task_id, max_attempts = calls[0]
+    assert enqueued_task_id == task_id
+    assert [link["executor"] for link in payload["cascade"]] == ["claude"]
+    assert max_attempts == 1
+
+
+def test_codex_implemented_and_claude_mac_off_waits_instead_of_self_review(monkeypatch):
+    """VOYN-W0-AICC-REVIEW-EXECUTOR-INDEPENDENCE (c): with codex the
+    implementer and claude's only model-only transport (the opt-in Mac
+    bridge) unreachable, there is no independent reviewer left. The task
+    must wait with a reason rather than ever falling back to codex
+    reviewing its own change."""
+    monkeypatch.delenv("AICC_CLAUDE_MAC_ENABLED", raising=False)
+    task_id = "VOYN-W0-IMPL-CODEX-NO-MAC"
+    pr_url = "https://github.com/o/ai-command-center/pull/23"
+    monkeypatch.setattr(review_merge, "_rows", _rows_with_implementer(task_id, pr_url, "codex"))
+    calls = []
+    report = review_merge.review_once(
+        object(), lambda *args: calls.append(args), "/srv/aicc"
+    )
+    assert calls == []
+    assert report.skipped == [
+        (task_id, "self_review_excluded:claude_mac_unreachable")
+    ]
+
+
+def test_unknown_implementer_leaves_the_review_cascade_unfiltered(monkeypatch):
+    """No implementation history (e.g. a legacy or pre-independence task)
+    must not be treated as a conflict -- the cascade stays exactly the
+    static two-step route it is today."""
+    task_id = "VOYN-W0-IMPL-UNKNOWN"
+    pr_url = "https://github.com/o/ai-command-center/pull/24"
+    monkeypatch.setattr(review_merge, "_rows", _rows_with_implementer(task_id, pr_url, None))
+    monkeypatch.setattr(
+        review_merge, "_pr_diff_and_head",
+        lambda *args: review_merge._PRSnapshot.create("diff", "b" * 40, "a" * 40),
+    )
+    monkeypatch.setattr(
+        "command_center.orchestrator.planner.repo_route",
+        lambda repo: ("AICC", "/srv/aicc"),
+    )
+    calls = []
+    report = review_merge.review_once(
+        object(), lambda *args: calls.append(args), "/srv/aicc"
+    )
+    assert report.reviewed == [(task_id, pr_url)]
+    _queue, _key, payload, _task_id, max_attempts = calls[0]
+    assert [link["executor"] for link in payload["cascade"]] == ["codex", "claude"]
+    assert max_attempts == 2
+
+
 def test_owner_alternatives_review_filters_keep_grok_4_6_exclude_cursor(monkeypatch):
     """owner-alternatives is cursor+grok; model_only/verification filters must
     keep the supported Grok 4.6 reviewer and drop Cursor before enqueue, so the
