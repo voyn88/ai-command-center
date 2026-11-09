@@ -4279,11 +4279,18 @@ def _fake_pr_list(entries, *, returncode=0, stdout=None):
     rather than `gh pr list --head` (GraphQL) --
     VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS. Entries are still
     written in the shape the caller reads back ({url, headRefName}); the
-    fake translates them to the REST body GitHub actually returns."""
+    fake translates them to the REST body GitHub actually returns. An entry
+    with no `state` defaults to `"open"` -- the shape every pre-existing
+    test here was written against, back when the lookup only ever asked
+    GitHub for `state=open`."""
     import subprocess as sp
 
     rest = [
-        {"html_url": entry["url"], "head": {"ref": entry["headRefName"]}}
+        {
+            "html_url": entry["url"],
+            "head": {"ref": entry["headRefName"]},
+            "state": entry.get("state", "open"),
+        }
         for entry in entries
     ]
 
@@ -4353,6 +4360,85 @@ def test_two_open_prs_on_one_branch_are_refused_rather_than_guessed(rig, _test_r
 
     assert _pr_rows(app_factory, task_id) == []
     assert (task_id, "ambiguous_open_prs_on_branch") in report.skipped
+
+
+def test_a_closed_pr_on_the_task_branch_is_adopted_when_no_open_pr_exists(
+    rig, _test_repo_routes, monkeypatch  # noqa: F811
+):
+    """A branch whose only pull request already closed is a dead end: no
+    later tick ever reopens it, so `state=open` alone would report
+    `no_open_pr_on_task_branch` identically forever (VOYN-W0-AICC-SRV-07c's
+    stall). Adopting the closed PR anyway hands the task to the machinery
+    `merge_once` already has for a closed-unmerged PR -- rejecting it
+    (#1129) -- instead of leaving it to loop here with no way out."""
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE3B"
+    _ready_without_pr(store, app_factory, task_id)
+    url = "https://github.com/x/repo-d2/pull/910"
+    monkeypatch.setattr(
+        review_merge,
+        "_gh",
+        _fake_pr_list(
+            [{"url": url, "headRefName": f"backlog/{task_id}", "state": "closed"}]
+        ),
+    )
+
+    report = reconcile_pr_evidence(app_factory, REPO)
+
+    assert (task_id, url) in report.recorded
+    assert _pr_rows(app_factory, task_id) == [url]
+
+
+def test_an_open_pr_is_preferred_over_a_closed_sibling_on_the_same_branch(
+    rig, _test_repo_routes, monkeypatch  # noqa: F811
+):
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE3C"
+    _ready_without_pr(store, app_factory, task_id)
+    branch = f"backlog/{task_id}"
+    open_url = "https://github.com/x/repo-d2/pull/912"
+    monkeypatch.setattr(
+        review_merge,
+        "_gh",
+        _fake_pr_list(
+            [
+                {"url": "https://github.com/x/repo-d2/pull/911",
+                 "headRefName": branch, "state": "closed"},
+                {"url": open_url, "headRefName": branch, "state": "open"},
+            ]
+        ),
+    )
+
+    report = reconcile_pr_evidence(app_factory, REPO)
+
+    assert (task_id, open_url) in report.recorded
+    assert _pr_rows(app_factory, task_id) == [open_url]
+
+
+def test_two_closed_prs_on_one_branch_are_refused_rather_than_guessed(
+    rig, _test_repo_routes, monkeypatch  # noqa: F811
+):
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE3D"
+    _ready_without_pr(store, app_factory, task_id)
+    branch = f"backlog/{task_id}"
+    monkeypatch.setattr(
+        review_merge,
+        "_gh",
+        _fake_pr_list(
+            [
+                {"url": "https://github.com/x/repo-d2/pull/913",
+                 "headRefName": branch, "state": "closed"},
+                {"url": "https://github.com/x/repo-d2/pull/914",
+                 "headRefName": branch, "state": "closed"},
+            ]
+        ),
+    )
+
+    report = reconcile_pr_evidence(app_factory, REPO)
+
+    assert _pr_rows(app_factory, task_id) == []
+    assert (task_id, "ambiguous_closed_prs_on_branch") in report.skipped
 
 
 def test_an_existing_pr_evidence_row_is_never_touched(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
