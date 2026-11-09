@@ -12,6 +12,25 @@ PR = "https://github.com/voyn88/ai-command-center/pull/380"
 BASE, HEAD = "c" * 40, "e" * 40
 
 
+_REAL_ATTEMPT_HISTORY = review_merge._attempt_history
+
+
+@pytest.fixture(autouse=True)
+def _history_follows_mocked_latest_attempt(monkeypatch):
+    """Legacy tests pin only `_latest_attempt`.  Give them the matching pure
+    history (all earlier identities ended the same way as the latest one)
+    instead of a database; tests of the real history query restore
+    `_REAL_ATTEMPT_HISTORY`."""
+    def history(factory, task_id, base_key):
+        latest = review_merge._latest_attempt(factory, task_id, base_key)
+        if latest is None:
+            return []
+        attempt, state, payload = latest
+        reason = "infra_wait_exhausted: x" if state == "dead" else None
+        return [(n, state, reason, payload) for n in range(attempt + 1)]
+    monkeypatch.setattr(review_merge, "_attempt_history", history)
+
+
 def snap(text):
     return review_merge._PRSnapshot.create(text, BASE, HEAD)
 
@@ -230,6 +249,7 @@ def test_untargeted_reconcile_uses_the_rotating_scan_window(monkeypatch):
     monkeypatch.setattr(review_merge, "_pr_diff_and_head", lambda *_: review_merge._PRSnapshotResult(snapshot, "ok"))
     monkeypatch.setattr(review_merge, "_has_accept_marker", lambda *_: (False, HEAD))
     monkeypatch.setattr(review_merge, "_next_retry_key", lambda *_: None)
+    monkeypatch.setattr(review_merge, "_infra_retries_exhausted", lambda *_: False)
 
     report = review_merge.reconcile_review_once(
         None, lambda *_: None, "/repo"
@@ -318,6 +338,7 @@ def test_reconcile_ignores_stale_marker_and_binds_empty_task_id(monkeypatch):
     monkeypatch.setattr(review_merge, "_pr_diff_and_head", lambda *_: review_merge._PRSnapshotResult(snapshot, "ok"))
     monkeypatch.setattr(review_merge, "_has_accept_marker", lambda *_: (True, "a" * 40))
     monkeypatch.setattr(review_merge, "_next_retry_key", lambda *_: None)
+    monkeypatch.setattr(review_merge, "_infra_retries_exhausted", lambda *_: False)
 
     report = review_merge.reconcile_review_once(
         None, lambda *_: None, "/repo", task_id=""
@@ -659,3 +680,207 @@ def test_snapshot_revalidates_open_exact_head_after_diff(monkeypatch, change):
 def test_closed_or_unproven_pr_never_fetches_model_diff(monkeypatch, state):
     monkeypatch.setattr(review_merge, "_gh", lambda *a: pytest.fail("no diff fetch"))
     assert review_merge._pr_diff_and_head("/repo", PR, {"state": state}).reason == "pr_not_open"
+
+
+# -- separate infra / malformed retry budgets --------------------------------
+
+KEY = "review:identity:abc"
+MALFORMED = {"result_text": "I cannot comply with this request."}
+VALID = {"result_text": f"VERDICT: ACCEPT\nHEAD_SHA: {HEAD}"}
+INFRA = "infra_wait_exhausted: executor infrastructure failure: provider HTTP 402"
+
+
+def history_rows(base_key, entries):
+    """entries: [(state, dead_reason, payload)] for attempt 0..n -> SQL rows."""
+    out = []
+    for n, (state, reason, payload) in enumerate(entries):
+        row_key = base_key if n == 0 else f"{base_key}:retry:{n}"
+        out.append((row_key, state, reason, payload))
+    return out
+
+
+def sql_layer(monkeypatch, base_key, entries, age=10 ** 9):
+    """Drive the REAL `_attempt_history`/`_latest_attempt`/due-check SQL text
+    through a fake row layer keyed on the statements' shape."""
+    stored = history_rows(base_key, entries)
+    seen = []
+
+    def fake_rows(_factory, sql, params=()):
+        seen.append(sql)
+        if "dead_reason, wr.payload" in sql:
+            assert params == (TASK, base_key, base_key)
+            return [r for r in stored if r[0].startswith(base_key)] + [
+                ("other:" + base_key, "dead", INFRA, None)]  # foreign key: ignored
+        if "wr.payload" in sql:
+            return [(k, st, pl) for k, st, _dr, pl in stored]
+        if "EXTRACT(EPOCH FROM (now() - dead_at))" in sql:
+            key = params[1]
+            match = [r for r in stored if r[0] == key and r[1] == "dead"]
+            return [(match[0][2], age)] if match else []
+        raise AssertionError(sql)
+
+    monkeypatch.setattr(review_merge, "_rows", fake_rows)
+    monkeypatch.setattr(review_merge, "_attempt_history", _REAL_ATTEMPT_HISTORY)
+    return seen
+
+
+def walk(monkeypatch, outcome_for):
+    """Replay a full retry loop against the real row layer. `outcome_for(n,
+    infra, malformed)` returns the (state, reason, payload) of identity n."""
+    entries, keys = [], []
+    infra = malformed = 0
+    while True:
+        state, reason, payload = outcome_for(len(entries), infra, malformed)
+        entries.append((state, reason, payload))
+        if state == "dead":
+            infra += 1
+        elif state == "succeeded" and payload is MALFORMED:
+            malformed += 1
+        sql_layer(monkeypatch, KEY, entries)
+        nxt = review_merge._next_retry_key(None, TASK, KEY, HEAD)
+        if nxt is None:
+            return entries, keys
+        assert nxt == f"{KEY}:retry:{len(entries)}"  # next free :retry:N
+        keys.append(nxt)
+
+
+def test_malformed_after_infra_retries_still_gets_its_malformed_retry(monkeypatch):
+    # attempts 0..5 die on infra, #6 reaches a model and returns a refusal.
+    entries = [("dead", INFRA, None)] * 6 + [("succeeded", None, MALFORMED)]
+    sql_layer(monkeypatch, KEY, entries)
+    assert review_merge._next_retry_key(None, TASK, KEY, HEAD) == f"{KEY}:retry:7"
+    # a second malformed result still gets the second malformed retry ...
+    sql_layer(monkeypatch, KEY, entries + [("succeeded", None, MALFORMED)])
+    assert review_merge._next_retry_key(None, TASK, KEY, HEAD) == f"{KEY}:retry:8"
+    # ... and the third malformed result is terminal.
+    sql_layer(monkeypatch, KEY, entries + [("succeeded", None, MALFORMED)] * 2)
+    assert review_merge._next_retry_key(None, TASK, KEY, HEAD) is None
+
+
+def test_valid_verdict_after_infra_retries_is_never_retried(monkeypatch):
+    sql_layer(monkeypatch, KEY, [("dead", INFRA, None)] * 3 + [("succeeded", None, VALID)])
+    assert review_merge._next_retry_key(None, TASK, KEY, HEAD) is None
+
+
+def test_existing_pure_malformed_history_keeps_its_budget_and_keys(monkeypatch):
+    # production rows written before this change: only malformed retries.
+    sql_layer(monkeypatch, KEY, [("succeeded", None, MALFORMED)])
+    assert review_merge._next_retry_key(None, TASK, KEY, HEAD) == f"{KEY}:retry:1"
+    sql_layer(monkeypatch, KEY, [("succeeded", None, MALFORMED)] * 2)
+    assert review_merge._next_retry_key(None, TASK, KEY, HEAD) == f"{KEY}:retry:2"
+    sql_layer(monkeypatch, KEY, [("succeeded", None, MALFORMED)] * 3)
+    assert review_merge._next_retry_key(None, TASK, KEY, HEAD) is None
+
+
+def test_infra_bound_holds_independently_of_malformed_retries(monkeypatch):
+    # always infra-dead: 12 retries, then terminal (13 identities).
+    entries, keys = walk(monkeypatch, lambda n, i, m: ("dead", INFRA, None))
+    assert len(keys) == review_merge._MAX_INFRA_DEAD_RETRY_ATTEMPTS == 12
+    assert len(entries) == 13
+    # two malformed results first do not shrink the infra budget.
+    entries, keys = walk(
+        monkeypatch,
+        lambda n, i, m: ("succeeded", None, MALFORMED) if n < 2 else ("dead", INFRA, None),
+    )
+    infra_dead = [e for e in entries if e[0] == "dead"]
+    assert len(infra_dead) == 13  # 12 infra retries granted after the first infra death
+
+
+def test_malformed_bound_holds_independently_of_infra_retries(monkeypatch):
+    entries, keys = walk(
+        monkeypatch,
+        lambda n, i, m: ("dead", INFRA, None) if n < 9 else ("succeeded", None, MALFORMED),
+    )
+    malformed = [e for e in entries if e[0] == "succeeded"]
+    assert len(malformed) == review_merge._MAX_RESULT_RETRY_ATTEMPTS + 1 == 3
+
+
+def test_worst_case_total_is_finite_and_documented(monkeypatch):
+    bound = review_merge._MAX_INFRA_DEAD_RETRY_ATTEMPTS + review_merge._MAX_RESULT_RETRY_ATTEMPTS
+    assert bound == 14
+
+    def adversarial(n, infra, malformed):
+        # alternate to try to maximise: malformed whenever budget remains
+        # only after infra budget is used up, infra otherwise.
+        if infra <= review_merge._MAX_INFRA_DEAD_RETRY_ATTEMPTS - 1 and n % 5 != 4:
+            return ("dead", INFRA, None)
+        if infra <= review_merge._MAX_INFRA_DEAD_RETRY_ATTEMPTS:
+            return ("succeeded", None, MALFORMED) if n % 2 else ("dead", INFRA, None)
+        return ("succeeded", None, MALFORMED)
+
+    for outcome in (adversarial, lambda n, i, m: ("dead", INFRA, None),
+                    lambda n, i, m: ("succeeded", None, MALFORMED),
+                    lambda n, i, m: ("dead", INFRA, None) if n % 2 else ("succeeded", None, MALFORMED)):
+        entries, keys = walk(monkeypatch, outcome)
+        assert len(keys) <= bound
+        assert len(entries) <= bound + 1
+
+
+def test_chunked_keys_count_per_chunk_not_per_pull_request(monkeypatch):
+    chunk_a = "review:identity:chunk:0001:aaa"
+    chunk_b = "review:identity:chunk:0002:bbb"
+    stored = history_rows(chunk_a, [("dead", INFRA, None)] * 13) + history_rows(
+        chunk_b, [("dead", INFRA, None), ("succeeded", None, MALFORMED)])
+
+    def fake_rows(_factory, sql, params=()):
+        if "dead_reason, wr.payload" in sql:
+            return [r for r in stored if r[0].startswith(params[1])]
+        if "wr.payload" in sql:
+            return [(k, st, pl) for k, st, _dr, pl in stored if k.startswith(params[1])]
+        if "dead_at" in sql:
+            return [(INFRA, 10 ** 9)]
+        raise AssertionError(sql)
+
+    monkeypatch.setattr(review_merge, "_rows", fake_rows)
+    monkeypatch.setattr(review_merge, "_attempt_history", _REAL_ATTEMPT_HISTORY)
+    assert review_merge._next_retry_key(None, TASK, chunk_a, HEAD) is None
+    assert review_merge._infra_retries_exhausted(None, TASK, chunk_a)
+    assert review_merge._next_retry_key(None, TASK, chunk_b, HEAD) == f"{chunk_b}:retry:2"
+    assert not review_merge._infra_retries_exhausted(None, TASK, chunk_b)
+
+
+@pytest.mark.parametrize("reason", [
+    "max_attempts_exhausted: boom", "review_pin_stale: pull 1 head moved",
+    "non_retryable: review_pin_stale: pull 1", "attempt_budget_exhausted", None,
+])
+def test_other_dead_reasons_stay_fail_closed_and_are_not_reported_exhausted(monkeypatch, reason):
+    entries = [("dead", INFRA, None)] * 2 + [("dead", reason, None)]
+    sql_layer(monkeypatch, KEY, entries)
+    assert review_merge._next_retry_key(None, TASK, KEY, HEAD) is None
+    assert not review_merge._infra_retries_exhausted(None, TASK, KEY)
+
+
+def test_cooldown_still_applies_to_the_real_sql_path(monkeypatch):
+    sql_layer(monkeypatch, KEY, [("dead", INFRA, None)], age=review_merge._INFRA_DEAD_RETRY_BASE_SECONDS - 1)
+    assert review_merge._next_retry_key(None, TASK, KEY, HEAD) is None
+    sql_layer(monkeypatch, KEY, [("dead", INFRA, None)], age=review_merge._INFRA_DEAD_RETRY_BASE_SECONDS)
+    assert review_merge._next_retry_key(None, TASK, KEY, HEAD) == f"{KEY}:retry:1"
+
+
+def test_exhausted_infra_retries_are_reported_in_the_tick(monkeypatch):
+    snapshot = snap("diff --git a/a b/a\n-old\n+new\n")
+    base = review_merge._review_key(TASK, PR, snapshot)
+    entries = [("dead", INFRA, None)] * (review_merge._MAX_INFRA_DEAD_RETRY_ATTEMPTS + 1)
+    stored = history_rows(base, entries)
+
+    def fake_rows(_factory, sql, params=()):
+        if "SELECT t.task_id" in sql:
+            return [(TASK, PR)]
+        if "dead_reason, wr.payload" in sql:
+            return stored
+        if "wr.payload" in sql:
+            return [(k, st, pl) for k, st, _dr, pl in stored]
+        if "dead_at" in sql:
+            return [(INFRA, 10 ** 9)]
+        raise AssertionError(sql)
+
+    monkeypatch.setattr(review_merge, "_rows", fake_rows)
+    monkeypatch.setattr(review_merge, "_attempt_history", _REAL_ATTEMPT_HISTORY)
+    monkeypatch.setattr(review_merge, "_model_only_review_cascade", lambda: [{"executor": "codex"}])
+    monkeypatch.setattr(planner, "repo_route", lambda _: ("AICC", "/repo"))
+    monkeypatch.setattr(review_merge, "_pr_diff_and_head", lambda *_: review_merge._PRSnapshotResult(snapshot, "ok"))
+    monkeypatch.setattr(review_merge, "_has_accept_marker", lambda *_: (False, HEAD))
+    dispatched = []
+    report = review_merge.reconcile_review_once(None, lambda *a: dispatched.append(a), "/repo", task_id=TASK)
+    assert not dispatched
+    assert report.skipped == [(TASK, "review_infra_retries_exhausted")]

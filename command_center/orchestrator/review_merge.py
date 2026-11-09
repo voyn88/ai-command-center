@@ -1279,6 +1279,10 @@ _RETRY_KEY_SUFFIX = re.compile(r":retry:([0-9]+)\Z")
 # not hammered.  Every other dead reason (`max_attempts_exhausted`,
 # `review_pin_stale`, `non_retryable`) stays fail-closed.
 _INFRA_DEAD_REASON_PREFIXES = ("infra_wait_exhausted:", "lease_wait_exhausted:")
+# The two retry reasons are bounded independently, each on the number of
+# identities that ended that way (derived from the existing rows, key format
+# unchanged): at most 12 infra retries + 2 malformed-result retries = 14
+# retries (15 identities, highest suffix `:retry:14`) per base key.
 _MAX_INFRA_DEAD_RETRY_ATTEMPTS = 12
 _INFRA_DEAD_RETRY_BASE_SECONDS = 900
 _INFRA_DEAD_RETRY_MAX_SECONDS = 4 * 3600
@@ -1313,6 +1317,61 @@ def _latest_attempt(
     return max(candidates, key=lambda item: item[0]) if candidates else None
 
 
+def _attempt_history(
+    factory: Any, task_id: str, base_key: str
+) -> list[tuple[int, str, Any, Any]]:
+    """Every identity of ``base_key`` (``base`` and ``base:retry:N``) as
+    ``(attempt, state, dead_reason, result_payload)``, oldest first.  The key
+    format is untouched: the retry *reasons* are derived from these rows."""
+    pattern = re.compile(rf"\A{re.escape(base_key)}(?::retry:[0-9]+)?\Z")
+    rows = _rows(
+        factory,
+        "SELECT i.idempotency_key, i.state, i.dead_reason, wr.payload "
+        "FROM work_item i LEFT JOIN work_result wr ON wr.result_id = i.result_id "
+        "WHERE i.task_id = %s AND left(i.idempotency_key, char_length(%s)) = %s",
+        (task_id, base_key, base_key),
+    )
+    history = [
+        (_retry_attempt(row_key)[1], state, dead_reason, payload)
+        for row_key, state, dead_reason, payload in rows
+        if pattern.fullmatch(row_key)
+    ]
+    return sorted(history, key=lambda item: item[0])
+
+
+def _is_infra_dead(state: Any, dead_reason: Any) -> bool:
+    return (
+        state == "dead"
+        and isinstance(dead_reason, str)
+        and dead_reason.startswith(_INFRA_DEAD_REASON_PREFIXES)
+    )
+
+
+def _is_malformed_success(state: Any, payload_value: Any, expected_head: str) -> bool:
+    if state != "succeeded":
+        return False
+    result = _json_object(payload_value)
+    parsed = _parse_review_verdict((result or {}).get("result_text") or "")
+    return parsed is None or parsed[1] != expected_head
+
+
+def _retry_reason_counts(
+    factory: Any, task_id: str, base_key: str, expected_head: str
+) -> tuple[int, int]:
+    """(identities that ended infra-dead, identities that succeeded without a
+    valid verdict for ``expected_head``).  Each reason is bounded on its own
+    count, so infra retries never consume the malformed-result budget."""
+    infra = malformed = 0
+    for _attempt, state, dead_reason, payload_value in _attempt_history(
+        factory, task_id, base_key
+    ):
+        if _is_infra_dead(state, dead_reason):
+            infra += 1
+        elif _is_malformed_success(state, payload_value, expected_head):
+            malformed += 1
+    return infra, malformed
+
+
 def _next_retry_key(
     factory: Any, task_id: str, base_key: str, expected_head: str
 ) -> str | None:
@@ -1320,17 +1379,42 @@ def _next_retry_key(
     if latest is None:
         return None
     attempt, state, payload_value = latest
+    # Hard ceiling on the raw suffix: the two per-reason bounds below can never
+    # produce a larger one (12 infra + 2 malformed retries).
+    if attempt >= _MAX_INFRA_DEAD_RETRY_ATTEMPTS + _MAX_RESULT_RETRY_ATTEMPTS:
+        return None
     if state == "dead":
-        if _infra_dead_retry_due(factory, task_id, base_key, attempt):
-            return f"{base_key}:retry:{attempt + 1}"
+        if not _infra_dead_retry_due(factory, task_id, base_key, attempt):
+            return None
+        infra, _malformed = _retry_reason_counts(
+            factory, task_id, base_key, expected_head
+        )
+        # ``infra`` includes the latest dead identity: N infra-dead identities
+        # have used N-1 infra retries, so up to 12 retries are granted.
+        if infra > _MAX_INFRA_DEAD_RETRY_ATTEMPTS:
+            return None
+        return f"{base_key}:retry:{attempt + 1}"
+    if state != "succeeded":
         return None
-    if state != "succeeded" or attempt >= _MAX_RESULT_RETRY_ATTEMPTS:
+    if not _is_malformed_success(state, payload_value, expected_head):
         return None
-    result = _json_object(payload_value)
-    parsed = _parse_review_verdict((result or {}).get("result_text") or "")
-    if parsed is not None and parsed[1] == expected_head:
+    _infra, malformed = _retry_reason_counts(factory, task_id, base_key, expected_head)
+    if malformed > _MAX_RESULT_RETRY_ATTEMPTS:
         return None
     return f"{base_key}:retry:{attempt + 1}"
+
+
+def _infra_retries_exhausted(factory: Any, task_id: str, base_key: str) -> bool:
+    """The latest identity is dead from executor infrastructure and the infra
+    retry bound is spent: terminal, and an operator has to redrive it."""
+    history = _attempt_history(factory, task_id, base_key)
+    if not history:
+        return False
+    _attempt, state, dead_reason, _payload = history[-1]
+    if not _is_infra_dead(state, dead_reason):
+        return False
+    infra = sum(1 for _a, st, dr, _p in history if _is_infra_dead(st, dr))
+    return infra > _MAX_INFRA_DEAD_RETRY_ATTEMPTS
 
 
 def _infra_dead_retry_delay(attempt: int) -> int:
@@ -1342,10 +1426,9 @@ def _infra_dead_retry_due(
     factory: Any, task_id: str, base_key: str, attempt: int
 ) -> bool:
     """Whether the dead latest identity of ``base_key`` died on executor
-    infrastructure, is past its cool-down and still inside the retry bound.
+    infrastructure and is past its cool-down (the retry bound is applied by
+    the caller from the per-reason counts).
     The database clock decides the cool-down; an unreadable row is not due."""
-    if attempt >= _MAX_INFRA_DEAD_RETRY_ATTEMPTS:
-        return False
     key = base_key if attempt == 0 else f"{base_key}:retry:{attempt}"
     rows = _rows(
         factory,
@@ -1954,9 +2037,21 @@ def reconcile_review_once(
             report.retried.append((current_task_id, retry_key))
             actions += 1
         if actions == retries_before:
-            report.skipped.append(
-                (current_task_id, "no_malformed_review_result_eligible_for_retry")
-            )
+            exhausted = False
+            for chunk in chunks:
+                base_key = key if chunk.count == 1 else _chunk_review_key(
+                    current_task_id, pr_url, snapshot, chunk
+                )
+                if base_key is not None and _infra_retries_exhausted(
+                    factory, current_task_id, base_key
+                ):
+                    exhausted = True
+                    break
+            report.skipped.append((
+                current_task_id,
+                "review_infra_retries_exhausted" if exhausted
+                else "no_malformed_review_result_eligible_for_retry",
+            ))
     if scan_token is not None:
         _scan_commit(factory, "scan:reconcile_review_once", scan_token, last_processed)
     return report
