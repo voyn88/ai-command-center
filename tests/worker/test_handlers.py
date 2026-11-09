@@ -1328,17 +1328,16 @@ def test_absent_cascade_keeps_the_single_executor_behaviour(handler) -> None:
 
 # -- aider + local Ollama (AICC Fleet decision 2026-09-03): a free,
 # benchmark-gated executor for bounded_implementation. It is checked with
-# its own preflight (never the generic `claude_cli_preflight`), and it is
-# absent from `agent_runner.PRINCIPAL_EXECUTOR_BINARIES` on purpose, so a
-# dispatch under principal isolation must refuse it generically rather than
-# reaching `aider_preflight` at all.
+# its own preflight (never the generic `claude_cli_preflight`). Under principal
+# isolation the worker verifies both the exact Ollama model and the broker's
+# fixed executable before dispatch.
 
 
 def test_aider_preflight_checks_the_aider_cli_and_ollama_daemon(handler, monkeypatch):
     run_agent, runs = handler
     checked = []
 
-    def preflight():
+    def preflight(**_kwargs):
         checked.append("called")
         return False, "aider cli not found"
 
@@ -1364,7 +1363,7 @@ def test_aider_preflight_checks_the_aider_cli_and_ollama_daemon(handler, monkeyp
 
 def test_aider_is_available_when_its_preflight_passes(handler, monkeypatch):
     run_agent, runs = handler
-    monkeypatch.setattr(agent_runner, "aider_preflight", lambda: (True, ""))
+    monkeypatch.setattr(agent_runner, "aider_preflight", lambda **_kwargs: (True, ""))
     payload = _cascade_payload()
     payload["task_type"] = "implementation"
     payload["cascade"] = [{"executor": "aider", "task_type": "implementation"}]
@@ -1374,28 +1373,31 @@ def test_aider_is_available_when_its_preflight_passes(handler, monkeypatch):
     assert runs[0]["executor"] == "aider"
 
 
-def test_aider_is_refused_under_principal_isolation(handler, monkeypatch):
-    """aider is deliberately absent from `PRINCIPAL_EXECUTOR_BINARIES`
-    (ADR-0010's reasoning for copilot applies here too: a free local-model
-    executor has no business behind the privileged principal-isolation
-    broker). Under isolation this must route through
-    `principal_executor_preflight`, refuse aider generically, and never
-    reach the unguarded `aider_preflight` at all."""
-    called_unguarded = []
+def test_aider_uses_model_and_broker_preflights_under_principal_isolation(
+    handler, monkeypatch
+):
+    checked = []
     monkeypatch.setattr(
         agent_runner,
         "aider_preflight",
-        lambda: called_unguarded.append("called") or (True, ""),
+        lambda **kwargs: checked.append(("model", kwargs["binary"])) or (True, ""),
+    )
+    monkeypatch.setattr(
+        agent_runner,
+        "principal_executor_preflight",
+        lambda executor: checked.append(("broker", executor)) or (True, ""),
     )
     monkeypatch.setenv(agent_runner.PRINCIPAL_ISOLATION_REQUIRED_ENV, "required")
-    run_agent, runs = handler
-    payload = _cascade_payload()
-    payload["task_type"] = "implementation"
-    payload["cascade"] = [{"executor": "aider", "task_type": "implementation"}]
-    outcome = run_agent(payload, _event(), 1)
-    assert not outcome.ok and outcome.retryable
-    assert runs == []
-    assert called_unguarded == []
+    available, detail, reason = handlers_for_pin._executor_preflight(
+        "aider", "implementation"
+    )
+    assert available is True
+    assert detail == ""
+    assert reason == "isolated aider cli unavailable"
+    assert checked == [
+        ("model", agent_runner.PRINCIPAL_EXECUTOR_BINARIES["aider"]),
+        ("broker", "aider"),
+    ]
 
 
 # -- machine outcome extraction (BO-S3) ---------------------------------------

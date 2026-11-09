@@ -27,7 +27,7 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from command_center.orchestrator import local_model_gates
+from command_center import local_model_gates
 
 __all__ = [
     "BILLING_MODE_API_METERED",

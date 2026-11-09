@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Benchmarks the aider+Ollama executor against a fixed set of low-risk task
 fixtures and feeds each case's pass/fail into
-`command_center.orchestrator.local_model_gates.record_benchmark_run` under
+`command_center.local_model_gates.record_benchmark_run` under
 `orchestrator.routing.BOUNDED_IMPLEMENTATION_TASK_CLASS` -- the ONLY thing
 that can move that task class's `aider` link from excluded to offered in
 `cascade_for` (AICC Fleet decision 2026-09-03: local-model promotion is
@@ -38,8 +38,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from command_center import agent_runner
-from command_center.orchestrator import local_model_gates
+from command_center import agent_runner, local_model_gates
 from command_center.orchestrator.routing import BOUNDED_IMPLEMENTATION_TASK_CLASS
 
 __all__ = [

@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import pytest
 
-from command_center.orchestrator import local_model_gates
+from command_center import local_model_gates
 
 
 def test_an_unbenchmarked_class_is_not_promoted():

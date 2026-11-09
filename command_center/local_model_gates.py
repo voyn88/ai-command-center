@@ -52,7 +52,7 @@ __all__ = [
     "demote",
 ]
 
-ROOT = Path(__file__).resolve().parent.parent.parent
+ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = storage.resolve_data_dir(ROOT)
 LEDGER_FILE = DATA_DIR / "local_model_gates.jsonl"
 #: A dedicated lock file, never the ledger itself (see `storage.file_lock`):

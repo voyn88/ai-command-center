@@ -125,7 +125,7 @@ COPILOT_BINARY = os.environ.get("AICC_COPILOT_BINARY") or "copilot"
 AIDER_BINARY = os.environ.get("AICC_AIDER_BINARY") or "aider"
 OLLAMA_BINARY = os.environ.get("AICC_OLLAMA_BINARY") or "ollama"
 #: The exact Ollama tag the AICC Fleet benchmark (`scripts/aicc_aider_benchmark.py`)
-#: measures and `orchestrator.local_model_gates` gates promotion on (AICC Fleet
+#: measures and `command_center.local_model_gates` gates promotion on (AICC Fleet
 #: decision 2026-09-03, voyn-worker-01). `aider_preflight` checks for this EXACT
 #: tag, not a prefix match: a different tag pulled under the same daemon (e.g.
 #: an `-instruct` variant) was never benchmarked and must not be dispatched to
@@ -153,6 +153,7 @@ PRINCIPAL_EXECUTOR_BINARIES: dict[str, str] = {
     "cursor": "/opt/aicc/providers/cursor/agent",
     "claude": "/opt/aicc/toolchains/current/bin/claude",
     "codex": "/opt/aicc/toolchains/current/bin/codex",
+    "aider": "/opt/aicc/toolchains/current/bin/aider",
     # Copilot is DELIBERATELY absent: ADR-0010 keeps it disabled under
     # principal isolation because its login credential carries GitHub /
     # repository authority -- staging it would hand untrusted model code the
@@ -161,14 +162,6 @@ PRINCIPAL_EXECUTOR_BINARIES: dict[str, str] = {
     # closed in handlers instead: an unavailable executor falls through the
     # cascade to the next link rather than respinning forever.
     #
-    # Aider is DELIBERATELY absent too, for an unrelated reason: it is a
-    # free, benchmark-gated LOCAL-MODEL executor (orchestrator.routing's
-    # BOUNDED_IMPLEMENTATION_TASK_CLASS / orchestrator.local_model_gates),
-    # not something the privileged principal-isolation broker has any
-    # business staging behind its boundary. Its absence here is what makes
-    # `principal_executor_preflight("aider")` refuse it generically, so a
-    # bounded_implementation task dispatched under principal isolation falls
-    # through the cascade to the next (isolated) link instead.
 }
 CLAUDE_MAC_AGENT_BINARY = "/usr/libexec/aicc-claude-mac-agent"
 _PRINCIPAL_ISOLATION_FAILURE = "AICC_AGENT_LAUNCH_INFRA_FAILURE"
@@ -1101,7 +1094,7 @@ def build_aider_command(
     (AICC Fleet decision 2026-09-03: aider + local Ollama `DEFAULT_AIDER_MODEL`
     on voyn-worker-01, for low-risk bounded-implementation task classes only —
     see `orchestrator.routing.BOUNDED_IMPLEMENTATION_TASK_CLASS` and
-    `orchestrator.local_model_gates`).
+    `command_center.local_model_gates`).
 
     Fail-closed on `task_type`, unlike every other builder here: aider has no
     read-only sandbox mode at all -- every invocation of it can write the

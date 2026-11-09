@@ -677,12 +677,15 @@ def _executor_preflight(executor: str, task_type: str) -> tuple[bool, str, str]:
         available, detail = agent_runner.claude_mac_preflight()
         return available, detail, "Claude Mac inference adapter unavailable"
     if agent_runner.principal_isolation_required():
-        # `aider` falls through to here like any other executor: it is
-        # deliberately absent from `agent_runner.PRINCIPAL_EXECUTOR_BINARIES`
-        # (a free, benchmark-gated local-model executor has no business
-        # behind the privileged principal-isolation broker), so this refuses
-        # it generically -- the isolated cascade never reaches the unguarded
-        # `aider_preflight` check below at all.
+        if executor == "aider":
+            # The broker stages the mutating CLI under the isolated agent
+            # principal, while this worker-side probe additionally proves the
+            # exact benchmarked Ollama tag is locally available.
+            available, detail = agent_runner.aider_preflight(
+                binary=agent_runner.PRINCIPAL_EXECUTOR_BINARIES["aider"]
+            )
+            if not available:
+                return False, detail, "aider cli or ollama daemon unavailable"
         available, detail = agent_runner.principal_executor_preflight(executor)
         return available, detail, f"isolated {executor} cli unavailable"
     if executor == "aider":
