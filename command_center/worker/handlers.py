@@ -52,7 +52,11 @@ from command_center import agent_runner, project_config, workspace_provisioning
 from command_center.ops.source_clone_refresh import refresh_source_clone
 from command_center.orchestrator import gh_access
 from command_center.orchestrator.publish import PublishConfig, publish_run
-from command_center.orchestrator.routing import cascade_for
+from command_center.orchestrator.routing import (
+    BILLING_MODE_SUBSCRIPTION,
+    billing_mode_for_executor,
+    cascade_for,
+)
 from command_center.worker import admission, writer_lease
 from command_center.worker.daemon import Handler, HandlerOutcome
 from command_center.worker.payloads import PayloadError, parse_agent_run
@@ -701,9 +705,21 @@ def _run_agent(
             ok=False, reason=request.reason, retryable=request.retryable
         )
 
-    # Explicit operator profile also covers already queued subscription work.
-    # Preserve the requested capability class, prompt, task and idempotency key.
-    if apply_operator_profile and os.environ.get("AICC_EXECUTOR_PROFILE") in {"owner-alternatives", "owner-cascade"}:
+    # An explicit subscription-only review route is a spending boundary.
+    # A local operator profile may still route older jobs without that boundary.
+    subscription_review = (
+        request.task_type in agent_runner.REVIEW_TASK_TYPES
+        and bool(request.cascade)
+        and all(
+            billing_mode_for_executor(str(link.get("executor"))) == BILLING_MODE_SUBSCRIPTION
+            for link in request.cascade
+        )
+    )
+    if (
+        apply_operator_profile
+        and not subscription_review
+        and os.environ.get("AICC_EXECUTOR_PROFILE") in {"owner-alternatives", "owner-cascade"}
+    ):
         requested_type = request.task_type
         profiled = [
             {**entry, "task_type": requested_type}
