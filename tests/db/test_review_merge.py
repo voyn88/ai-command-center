@@ -19,6 +19,7 @@ from command_center.orchestrator.review_merge import (
     reconcile_merge_evidence,
     reconcile_pr_evidence,
     reconcile_pr_window,
+    reconcile_stuck_ready_to_review,
     review_once,
 )
 from tests.db.test_backlog_planner import (  # noqa: F401 — pytest fixtures
@@ -4436,6 +4437,113 @@ def test_the_lookup_runs_in_the_checkout_the_tick_was_given(rig, _test_repo_rout
     reconcile_pr_evidence(app_factory, REPO)
 
     assert seen == [REPO]
+
+
+# ---------------------------------------------------------------------------
+# reconcile_stuck_ready_to_review: a task that never got a pull request at
+# all, not just one `reconcile_pr_evidence` hasn't recorded yet.
+#
+# VOYN-W0-AICC-SHARED-PASSWORD-CONTRACT sat in READY_TO_REVIEW with no `pr`
+# evidence and no open pull request on its branch for 5 consecutive
+# `pr_evidence` ticks before `tick_stall_watchdog` escalated it: nothing
+# upstream of `reconcile_pr_evidence` has an adjacency out of
+# READY_TO_REVIEW, and nothing was ever wired to the recovery path 0018
+# already shipped for exactly this (`backlog_recover_stuck_ready_to_review`).
+# ---------------------------------------------------------------------------
+
+
+def _task_status(factory, task_id):
+    with factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", (task_id,))
+        return cur.fetchone()[0]
+
+
+def _backdate_updated_at(admin_conn, task_id, *, minutes):
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "UPDATE backlog_task SET updated_at = now() - %s * interval '1 minute' "
+            "WHERE task_id = %s",
+            (minutes, task_id),
+        )
+
+
+def test_a_freshly_ready_task_with_no_pr_is_left_alone(
+    rig, _test_repo_routes, admin_conn, monkeypatch  # noqa: F811
+):
+    """Just transitioned, no PR yet: ordinary publish lag, not a stall --
+    `reconcile_pr_evidence` keeps reporting it, this takes no action."""
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRR1"
+    _ready_without_pr(store, app_factory, task_id)
+    monkeypatch.setattr(review_merge, "_gh", _fake_pr_list([]))
+
+    report = reconcile_stuck_ready_to_review(app_factory, REPO)
+
+    assert all(entry[0] != task_id for entry in report.recovered)
+    assert all(entry[0] != task_id for entry in report.skipped)
+    assert _task_status(app_factory, task_id) == "READY_TO_REVIEW"
+
+
+def test_a_long_stuck_task_with_no_pr_ever_opened_recovers_to_open(
+    rig, _test_repo_routes, admin_conn, monkeypatch  # noqa: F811
+):
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRR2"
+    _ready_without_pr(store, app_factory, task_id)
+    _backdate_updated_at(admin_conn, task_id, minutes=25)
+    monkeypatch.setattr(review_merge, "_gh", _fake_pr_list([]))
+
+    report = reconcile_stuck_ready_to_review(app_factory, REPO)
+
+    assert (task_id, "no_open_pr_on_task_branch") in report.recovered
+    assert _task_status(app_factory, task_id) == "OPEN"
+
+
+def test_an_open_pr_that_appeared_since_is_not_discarded(
+    rig, _test_repo_routes, admin_conn, monkeypatch  # noqa: F811
+):
+    """A pull request opened between ticks must not be abandoned -- this
+    re-checks GitHub itself rather than trusting the staleness window, and
+    leaves `reconcile_pr_evidence` to record the PR on its next pass."""
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRR3"
+    _ready_without_pr(store, app_factory, task_id)
+    _backdate_updated_at(admin_conn, task_id, minutes=25)
+    url = "https://github.com/x/repo-d2/pull/907"
+    monkeypatch.setattr(
+        review_merge,
+        "_gh",
+        _fake_pr_list([{"url": url, "headRefName": f"backlog/{task_id}"}]),
+    )
+
+    report = reconcile_stuck_ready_to_review(app_factory, REPO)
+
+    assert all(entry[0] != task_id for entry in report.recovered)
+    assert (task_id, "open_pr_now_exists") in report.skipped
+    assert _task_status(app_factory, task_id) == "READY_TO_REVIEW"
+
+
+def test_a_task_with_pr_evidence_is_never_examined_by_recovery(
+    rig, _test_repo_routes, admin_conn, monkeypatch  # noqa: F811
+):
+    """A genuinely reviewable task, however long it has sat there, belongs
+    to the real review/merge path -- 0018's own gate refuses it, and this
+    never even calls `gh` to find out."""
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRR4"
+    recorded = "https://github.com/x/repo-x/pull/908"
+    _ready(store, app_factory, task_id, recorded)
+    _backdate_updated_at(admin_conn, task_id, minutes=25)
+    calls: list[str] = []
+    monkeypatch.setattr(
+        review_merge, "_gh", lambda argv, repo: calls.append(argv) or _fake_pr_list([])(argv, repo)
+    )
+
+    report = reconcile_stuck_ready_to_review(app_factory, REPO)
+
+    assert calls == []
+    assert all(entry[0] != task_id for entry in report.recovered)
+    assert _task_status(app_factory, task_id) == "READY_TO_REVIEW"
 
 
 # -- reconcile_pr_window: no database involved, gh is faked in-process ------

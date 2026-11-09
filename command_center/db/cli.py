@@ -654,6 +654,7 @@ def main(argv: list[str] | None = None) -> int:
                     publish_review_verdicts,
                     reconcile_pr_evidence,
                     reconcile_review_once,
+                    reconcile_stuck_ready_to_review,
                     review_once,
                 )
 
@@ -678,6 +679,20 @@ def main(argv: list[str] | None = None) -> int:
                         print(f"PR-FOUND  {evidence_task_id} -> {pr}")
                     for evidence_task_id, reason in evidence.skipped:
                         print(f"PR-SKIP   {evidence_task_id}: {reason}")
+                    # A task that never got a pull request at all (no PR to
+                    # find above, no matter how many ticks pass) has no
+                    # adjacency out of READY_TO_REVIEW without this: the
+                    # 0018 recovery gate, wired in here rather than inside
+                    # `reconcile_pr_evidence` itself, which stays
+                    # report-only (VOYN-W0-AICC-SHARED-PASSWORD-CONTRACT-
+                    # STALL-ed61733ae80f92f4-REM).
+                    recovery = reconcile_stuck_ready_to_review(
+                        lambda: _nc(conn), args.repo_path, task_id=args.task_id
+                    )
+                    for recovered_task_id, reason in recovery.recovered:
+                        print(f"RECOVER   {recovered_task_id}: {reason} -> OPEN")
+                    for recovered_task_id, reason in recovery.skipped:
+                        print(f"RECOVER-SKIP {recovered_task_id}: {reason}")
                     report = review_once(
                         lambda: _nc(conn),
                         enqueue,
@@ -712,6 +727,9 @@ def main(argv: list[str] | None = None) -> int:
                     for task_id, reason in marker_report.skipped:
                         print(f"SKIP      {task_id}: {reason}")
                 _watchdog.record_skips(conn, "pr_evidence", tick_id, evidence.skipped)
+                _watchdog.record_skips(
+                    conn, "pr_evidence_recovery", tick_id, recovery.skipped
+                )
                 _watchdog.record_skips(conn, "review", tick_id, report.skipped)
                 _watchdog.record_skips(conn, "review_retry", tick_id, retry_report.skipped)
                 _watchdog.record_skips(conn, "review_marker", tick_id, marker_report.skipped)
