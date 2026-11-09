@@ -24,8 +24,9 @@ SNAPSHOT_SQL = """SELECT json_build_object('as_of', now(), 'tasks', (
 
 def canonical_wave(value):
     try:
-        return Decimal(value)
-    except InvalidOperation:
+        wave = Decimal(value)
+        return wave if wave.is_finite() else Decimal("Infinity")
+    except (InvalidOperation, TypeError, ValueError):
         return Decimal("Infinity")
 
 

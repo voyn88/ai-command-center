@@ -1,28 +1,33 @@
-import json
+from decimal import Decimal
 
 from command_center.orchestrator.planner import _rank_project_candidates
 
 
-def test_balanced_impact_ranks_within_project_wave_and_priority():
-    def candidate(task_id, repo, wave, priority, scores=None):
-        fields = ("next_time", "current_quality", "next_cost")
-        body = "" if scores is None else "AICC-IMPACT: " + json.dumps({
-            field: {"score": score, "check": "Compare against baseline"}
-            for field, score in zip(fields, scores, strict=True)
-        })
-        return task_id, wave, priority, task_id, body, repo, True, "functional"
+def test_computed_impact_ranks_within_project_wave_and_priority():
+    from command_center.orchestrator.wave_plan import Decision
 
     rows = [
-        candidate("urgent", "ai-command-center", "1", "P0"),
-        candidate("unbalanced", "ai-command-center", "1", "P1", (5, 5, 1)),
-        candidate("other-project", "aios", "1", "P1"),
-        candidate("legacy", "ai-command-center", "1", "P1"),
-        candidate("balanced", "~/Projects/ai-command-center", "1", "P1", (3, 3, 3)),
-        candidate("next-wave", "ai-command-center", "2", "P1", (5, 5, 5)),
+        ("urgent", "1", "P0", "", "", "ai-command-center", True, "functional"),
+        ("unbalanced", "1", "P1", "", "", "ai-command-center", True, "functional"),
+        ("other-project", "1", "P1", "", "", "aios", True, "functional"),
+        ("balanced", "1", "P1", "", "", "~/Projects/ai-command-center", True, "functional"),
+        ("next-wave", "2", "P1", "", "", "ai-command-center", True, "functional"),
     ]
-    assert [row[0] for row in _rank_project_candidates(rows)] == [
-        "urgent", "balanced", "other-project", "unbalanced", "legacy", "next-wave",
+    decisions = [
+        Decision({"id": "unbalanced"}, "AICC", 1, "Проверить допуск", (), (5, 5, 1)),
+        Decision({"id": "balanced"}, "AICC", 1, "Проверить допуск", (), (3, 3, 3)),
     ]
+    assert [row[0] for row in _rank_project_candidates(rows, decisions)] == [
+        "urgent", "balanced", "other-project", "unbalanced", "next-wave",
+    ]
+
+
+def test_invalid_wave_values_sort_after_numeric_waves():
+    from command_center.orchestrator.wave_plan import canonical_wave
+
+    for value in (None, "NaN", "sNaN", "Infinity", "W1"):
+        assert canonical_wave(value) == Decimal("Infinity")
+    assert canonical_wave("2") < canonical_wave("10")
 
 
 def test_wave_recalculates_after_canonical_completion():

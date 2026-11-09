@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass, field
@@ -51,6 +52,7 @@ __all__ = [
 ]
 
 _PLANNER_AUTHORITY = "planner:global"
+_LOG = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -234,8 +236,8 @@ def _delivery_impact(body: str) -> tuple[int, int]:
     if not isinstance(impact, dict):
         return (0, 0)
     scores = []
-    for field in _IMPACT_FIELDS:
-        dimension = impact.get(field)
+    for name in _IMPACT_FIELDS:
+        dimension = impact.get(name)
         if not isinstance(dimension, dict):
             return (0, 0)
         score, evidence = dimension.get("score"), dimension.get("check")
@@ -257,13 +259,12 @@ def _rank_project_candidates(candidates: list[tuple], decisions=()) -> list[tupl
         if route is not None:
             groups.setdefault((route[0], wave, task_class, priority), []).append(index)
     def rank(task):
-        declared = _delivery_impact(task[4])
         decision = by_id.get(task[0])
         if decision is None:
-            return (0, 0, *declared, 0, 0)
+            return (False, False, 0, 0, 0)
         return (
-            decision.stage == "Проверить допуск", -(decision.wave or 0),
-            *declared, min(decision.impact), sum(decision.impact),
+            decision.stage == "Проверить допуск", decision.wave is not None,
+            -(decision.wave or 0), min(decision.impact), sum(decision.impact),
         )
 
     for indices in groups.values():
@@ -638,8 +639,10 @@ class Planner:
                 if advisory:
                     candidates = apply_advisory_order(candidates, advisory, id_index=0)
             if limits.only_task_id is None:
-                decisions = self.preview()
-                candidates = _rank_project_candidates(candidates, decisions)
+                try:
+                    candidates = _rank_project_candidates(candidates, self.preview())
+                except Exception:  # advisory plan must not stop dispatch
+                    _LOG.warning("Project wave plan unavailable; keeping eligible order", exc_info=True)
             for (
                 task_id, wave, priority, title, body, repo, dispatchable, task_class,
             ) in candidates:

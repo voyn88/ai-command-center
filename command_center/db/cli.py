@@ -134,13 +134,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--repo-path", default=os.environ.get("AICC_FLEET_REPO", ""),
         help="Configured repository path for opt-in coordination (AICC_FLEET_REPO).",
     )
-    plan_mode = plan.add_mutually_exclusive_group()
-    plan_mode.add_argument(
+    plan.add_argument(
         "--dry-run",
         action="store_true",
-        help="Compute project waves and stages without dispatching.",
+        help="Report the eligible set without dispatching.",
     )
-    plan_mode.add_argument(
+    plan.add_argument(
+        "--wave-plan", action="store_true",
+        help="Report project waves and stages for the full backlog without dispatching.",
+    )
+    plan.add_argument(
         "--smoke",
         action="store_true",
         help="Deploy preflight: run backlog_dispatch_smoke() (0021) -- the read-only "
@@ -575,6 +578,18 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"SMOKE     backlog_dispatch_smoke={'ok' if ok else 'refused'}")
                     return 0 if ok else 1
                 if args.dry_run:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT task_id, wave, priority, dispatchable "
+                            "FROM backlog_eligible"
+                        )
+                        for task_id, wave, priority, dispatchable in cur.fetchall():
+                            print(
+                                f"{task_id}  wave={wave} priority={priority or '-'} "
+                                f"{'dispatchable' if dispatchable else 'NO REPO'}"
+                            )
+                    return 0
+                if args.wave_plan:
                     for item in Planner(lambda: _nc(conn)).preview():
                         print(
                             f"{item.task['id']}  project={item.project} "
