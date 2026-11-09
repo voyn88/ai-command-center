@@ -1,4 +1,4 @@
-"""Provisional CTO authority, real PostgreSQL roles; not a production rollout."""
+"""CTO authority with foundation 0035, real roles; not a production rollout."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from tests.db.test_queue_claim import _worker_hosts
 pytestmark = [pytest.mark.serial, pytest.mark.usefixtures("role_passwords")]
 SQL = (
     Path(__file__).parents[2]
-    / "docs/operations/cto-enforcement-provisional/assignment.up.sql"
+    / "command_center/db/sql/0036_cto_assignment_enforcement.up.sql"
 )
 TASK = "VOYN-CTO-TEST"
 PAYLOAD = {"kind": "agent_run", "backlog_task_id": TASK, "prompt": "bounded test"}
@@ -28,7 +28,7 @@ TOKEN = hashlib.sha256(b"disposable claim fixture").hexdigest()
 def cto_rig(admin_conn, psycopg, test_dsn, role_passwords, connect_as):
     _provision(admin_conn, psycopg, test_dsn, role_passwords)
     with connect_as(roles.MIGRATOR_ROLE) as migrator:
-        migrator.execute(SQL.read_text())
+        assert migrator.execute("SELECT max(version) FROM schema_migration").fetchone()[0] == 36
         # Production reasserts grants after upgrade; no provisional-only grants.
         roles.apply_table_grants(migrator)
     admin_conn.execute("""INSERT INTO principal(principal_id,kind,db_role,display_name,host,state,trust_tier,created_at,updated_at)
@@ -153,6 +153,20 @@ def test_missing_assignment_does_not_enqueue_or_transition(cto_rig):
         .fetchone()[0]
         == 2
     )
+
+
+def test_cto_assignment_does_not_bypass_foundation_readiness(cto_rig, psycopg):
+    app = cto_rig[0]
+    app.execute("SELECT * FROM delivery_team_sync(100,%s::jsonb)", (json.dumps([TASK]),))
+    assert app.execute("SELECT count(*) FROM delivery_team_stage WHERE task_id=%s", (TASK,)).fetchone()[0] > 0
+    payload = {**PAYLOAD, "task_type": "implementation"}
+    assign(cto_rig, payload)
+    activate(cto_rig)
+    with pytest.raises(psycopg.errors.CheckViolation, match="delivery_team_requirements_not_ready"):
+        enqueue(cto_rig, payload=payload)
+    assert app.execute("SELECT count(*) FROM work_item WHERE task_id=%s", (TASK,)).fetchone()[0] == 0
+    assert app.execute("SELECT count(*) FROM cto_work_binding").fetchone()[0] == 0
+    assert app.execute("SELECT status FROM backlog_task WHERE task_id=%s", (TASK,)).fetchone()[0] == "OPEN"
 
 
 @pytest.mark.parametrize(
@@ -350,7 +364,7 @@ def test_rollback_denial_is_logged_without_creating_work(cto_rig):
 
 
 def test_disabled_downgrade_restores_existing_queue(cto_rig):
-    cto_rig[3].execute(SQL.with_name("assignment.down.sql").read_text())
+    cto_rig[3].execute(SQL.with_name("0036_cto_assignment_enforcement.down.sql").read_text())
     enqueue(cto_rig)
     assert claim(cto_rig)[0]
 
@@ -419,7 +433,7 @@ def test_start_and_revoke_serialize_at_database_boundary(cto_rig, connect_as, wi
 def test_active_enforcement_cannot_be_downgraded_to_bypass(cto_rig, psycopg):
     activate(cto_rig)
     with pytest.raises(psycopg.errors.RaiseException, match="forward migration"):
-        cto_rig[3].execute(SQL.with_name("assignment.down.sql").read_text())
+        cto_rig[3].execute(SQL.with_name("0036_cto_assignment_enforcement.down.sql").read_text())
     assert cto_rig[0].execute("SELECT enabled FROM cto_control").fetchone()[0]
 
 
