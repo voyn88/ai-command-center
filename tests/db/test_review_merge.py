@@ -2294,6 +2294,21 @@ def test_review_once_no_longer_enqueues_an_eager_adjudication(rig, _test_repo_ro
     head = "d" * 40
     snap = _snapshot(head)
     SNAPSHOTS[pr_url] = snap
+    # The window lookup is a separate GitHub read from the snapshot below.
+    # Keep this live-PostgreSQL test off the network, like the other ticks.
+    import subprocess
+
+    window_reads = []
+
+    def fake_gh(argv, repo):
+        assert repo == "/tmp"
+        assert argv == ["api", "repos/x/repo-d2/pulls/31"]
+        window_reads.append(argv)
+        body = {"state": "open", "head": {"sha": head},
+                "labels": [{"name": "review-window:active"}]}
+        return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
     monkeypatch.setattr(review_merge, "_pr_diff_and_head", lambda _r, _p: snap)
     monkeypatch.setattr(review_merge, "_review_chunks", lambda s, t, p: review_merge._make_diff_chunks(["a", "b", "c"]))
     monkeypatch.setattr(review_merge, "_render_review_prompt", lambda t, p, s, c: "prompt")
@@ -2303,6 +2318,7 @@ def test_review_once_no_longer_enqueues_an_eager_adjudication(rig, _test_repo_ro
     assert ("VOYN-W0-ADJ-D", pr_url) in report.reviewed
     assert len(enq) == 3
     assert all(":chunk:" in k for k in enq), enq
+    assert window_reads == [["api", "repos/x/repo-d2/pulls/31"]]
 
 
 # --- VOYN-W0-AICC-MERGE-TRAIN-COORDINATOR: keep behind PRs from gridlocking --
