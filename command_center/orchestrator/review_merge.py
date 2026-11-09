@@ -240,12 +240,21 @@ class ReconcileReport:
 
 @dataclass
 class PrEvidenceReport:
-    """See `reconcile_pr_evidence`. Records evidence; never changes a status."""
+    """See `reconcile_pr_evidence`. Usually records evidence without changing
+    a status; `recovered` is the one narrow exception (see that function's
+    docstring)."""
 
     #: (task_id, pr_url) newly recorded from the task's own branch.
     recorded: list[tuple[str, str]] = field(default_factory=list)
     #: (task_id, reason) examined and deliberately left alone.
     skipped: list[tuple[str, str]] = field(default_factory=list)
+    #: (task_id, new_status) sent back to the pool through the 0018 recovery
+    #: gate -- a task GitHub confirms has no open PR on its branch at all,
+    #: with no `pr` evidence of its own to misplace trust in. Always `OPEN`
+    #: in practice (`backlog_recover_stuck_ready_to_review` has no other
+    #: landing state); kept as a pair rather than a bare id so a future
+    #: landing state shows up here without a shape change.
+    recovered: list[tuple[str, str]] = field(default_factory=list)
 
 
 #: Branch naming contract. `publish_run` pushes `backlog/<task id>` and nothing
@@ -296,11 +305,33 @@ def reconcile_pr_evidence(
     origin of that checkout and nothing else, so a task can never be attached
     to a pull request in another repository.
 
-    Reporting only: no status is changed here. A task becomes reviewable
-    because it is `READY_TO_REVIEW` and now has evidence, through the same
-    path it always did.
+    Mostly reporting: a task becomes reviewable because it is
+    `READY_TO_REVIEW` and now has evidence, through the same path it always
+    did. The one status change this function does make is the narrow
+    opposite case: GitHub itself confirms NO open PR exists on the task's
+    branch at all. `backlog_recover_stuck_ready_to_review` (0018,
+    VOYN-W0-AICC-NO-RECOVERY-PATH-STUCK-READY-TO-REVIEW) was built for
+    exactly this -- a completed run whose publish step failed used to land
+    in READY_TO_REVIEW anyway, with no `pr` evidence and therefore invisible
+    to `review_once`, `publish_review_verdicts`, `merge_once` AND
+    `autonomy_remediate_once` (all four JOIN `backlog_evidence` on
+    `kind = 'pr'`), and to `backlog_transition`/`backlog_return_to_pool`
+    (neither has an adjacency into or out of this exact corner) -- but the
+    function had no caller anywhere in the fleet. Found live
+    2026-11-04 on VOYN-W0-AICC-SRV-08-CLEAN-HOST: five consecutive
+    `backlog-review` ticks (14:18-14:44 UTC) skipped it with
+    `no_open_pr_on_task_branch` and would have gone on doing so forever --
+    the watchdog escalates a repeating skip, but by design never touches the
+    stalled item itself (VOYN-W0-AICC-TICK-STALL-WATCHDOG), so nothing else
+    ever would have either. Recovery sends the task back to `OPEN` so an
+    ordinary dispatch gets a fresh attempt at actually publishing; it is
+    gated on the SAME absence of `pr` evidence this function already
+    requires to look at the task at all, so it can never fire on a task that
+    is genuinely reviewable, and it only ever fires on `gh`'s own confident
+    "no match" (a failed or undecodable lookup reports a different reason
+    and recovers nothing).
     """
-    # Imported here, as  does, so this module keeps its
+    # Imported here, as `review_once` does, so this module keeps its
     # import-time independence from the planner.
     from command_center.orchestrator.planner import repo_route
 
@@ -348,7 +379,11 @@ def reconcile_pr_evidence(
             and entry["url"]
         ]
         if not matches:
-            report.skipped.append((row_task_id, "no_open_pr_on_task_branch"))
+            recovered_status = _recover_stuck_ready_to_review(factory, row_task_id)
+            if recovered_status is not None:
+                report.recovered.append((row_task_id, recovered_status))
+            else:
+                report.skipped.append((row_task_id, "no_open_pr_on_task_branch"))
             continue
         if len(matches) > 1:
             report.skipped.append((row_task_id, "ambiguous_open_prs_on_branch"))
@@ -375,6 +410,25 @@ def reconcile_pr_evidence(
             continue
         report.recorded.append((row_task_id, pr_url))
     return report
+
+
+def _recover_stuck_ready_to_review(factory: Any, task_id: str) -> str | None:
+    """Send a READY_TO_REVIEW task with no `pr` evidence back to `OPEN`
+    through the 0018 gate, once `reconcile_pr_evidence` has already proven
+    GitHub has no open PR on its branch either. Returns the verdict's new
+    status on success, `None` on a refusal -- `has_pr_evidence` is the only
+    refusal reachable from this call site (the caller already filtered on
+    the same absence of evidence the gate itself re-checks under its own
+    row lock), but a refusal is still never raised past, consistent with
+    every other `backlog_*` verdict call in this module."""
+    with factory() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT * FROM backlog_recover_stuck_ready_to_review(%s)", (task_id,)
+        )
+        verdict = cur.fetchone()
+    if not verdict or not verdict[0]:
+        return None
+    return str(verdict[1])
 
 
 def _open_pulls_for_branch(

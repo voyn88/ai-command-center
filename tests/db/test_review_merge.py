@@ -4316,7 +4316,9 @@ def test_an_open_pr_on_the_task_branch_becomes_evidence(rig, _test_repo_routes, 
 def test_a_task_adopts_only_its_own_branch_never_a_prefix_match(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
     """`backlog/X` must not adopt `backlog/X-REM`'s pull request. `gh --head`
     is a filter, not a guarantee of exact equality, so the name is compared
-    here too."""
+    here too. Since no PR actually matches `backlog/X`, this is also the
+    confirmed-absent case the 0018 recovery gate acts on -- see
+    `test_a_task_with_no_matching_pr_anywhere_is_recovered_not_stalled`."""
     app_factory, store, _ = rig
     task_id = "VOYN-W0-PRE2"
     _ready_without_pr(store, app_factory, task_id)
@@ -4332,7 +4334,43 @@ def test_a_task_adopts_only_its_own_branch_never_a_prefix_match(rig, _test_repo_
     report = reconcile_pr_evidence(app_factory, REPO)
 
     assert _pr_rows(app_factory, task_id) == []
-    assert (task_id, "no_open_pr_on_task_branch") in report.skipped
+    assert (task_id, "OPEN") in report.recovered
+    assert store.get_task(task_id)["status"] == "OPEN"
+
+
+def test_a_task_with_no_matching_pr_anywhere_is_recovered_not_stalled(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+    """VOYN-W0-AICC-SRV-08-CLEAN-HOST, live 2026-11-04: a task reached
+    READY_TO_REVIEW with no `pr` evidence and GitHub confirmed no open PR on
+    its branch, five `backlog-review` ticks running 14:18-14:44 UTC, all with
+    the identical skip `no_open_pr_on_task_branch` -- and nothing short of a
+    human would ever have moved it, since `reconcile_pr_evidence` was the
+    only tick that even looks at an evidence-free READY_TO_REVIEW task, and
+    it could previously only ever RECORD evidence, never recover one.
+    `backlog_recover_stuck_ready_to_review` (0018) existed for exactly this
+    but had no caller anywhere until now."""
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-AICC-SRV-08-CLEAN-HOST"
+    _ready_without_pr(store, app_factory, task_id)
+    monkeypatch.setattr(review_merge, "_gh", _fake_pr_list([]))
+
+    report = reconcile_pr_evidence(app_factory, REPO)
+
+    assert _pr_rows(app_factory, task_id) == []
+    assert (task_id, "OPEN") in report.recovered
+    assert all(entry[0] != task_id for entry in report.skipped)
+    assert store.get_task(task_id)["status"] == "OPEN"
+
+    # The recovery lands exactly where backlog_return_to_pool's technical
+    # park does: OPEN, so an ordinary dispatch can claim it again.
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT reason, detail FROM backlog_event WHERE task_id = %s "
+            "AND event = 'recover_stuck_ready_to_review' AND outcome = 'granted'",
+            (task_id,),
+        )
+        rows = cur.fetchall()
+    assert len(rows) == 1
+    assert rows[0][0] == "no_pr_evidence"
 
 
 def test_two_open_prs_on_one_branch_are_refused_rather_than_guessed(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
