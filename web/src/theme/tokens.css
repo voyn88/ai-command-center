@@ -7,7 +7,8 @@
   --accent-1:#6C8CFF; --accent-2:#536DFE; --teal:#55D6E3;
   --run:#6C8CFF; --ok:#3DDC97; --warn:#F5B14C; --bad:#FF6B7A;
   --glass:rgba(17,22,38,.55); --gline:rgba(255,255,255,.08);
-  --tx:#E8ECF4; --tx2:#A6B0C3; --tx3:#6B7488;
+  --tx:#E8ECF4; --tx2:#A6B0C3; --tx3:#6B7488; --tx3-aa:#98A2B8;
+  --field-bg:rgba(17,22,38,.92);
   --font-sans:-apple-system,"SF Pro Text",system-ui,sans-serif;
   --font-mono:"SF Mono","JetBrains Mono",ui-monospace,monospace;
 }
