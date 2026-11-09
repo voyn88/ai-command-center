@@ -281,7 +281,9 @@ def reconcile_pr_evidence(
 
     * the head branch must equal `backlog/<task id>` exactly (never a prefix
       match: `backlog/X` must not adopt `backlog/X-REM`'s pull request);
-    * exactly one open PR may match, because two would make the choice a guess;
+    * exactly one open or merged PR may match, because two would make the
+      choice a guess (closed, unmerged attempts are not evidence of delivered
+      work);
     * a task that already has any `pr` evidence is left alone, so this can
       never overwrite or compete with what `publish_run` recorded.
 
@@ -332,7 +334,7 @@ def reconcile_pr_evidence(
             report.skipped.append((row_task_id, f"no_repo_route: {repo!r}"))
             continue
         branch = _task_branch(row_task_id)
-        decoded, failure = _open_pulls_for_branch(repo_path, branch)
+        decoded, failure = _pulls_for_branch(repo_path, branch)
         if decoded is None:
             report.skipped.append((row_task_id, failure))
             continue
@@ -377,10 +379,17 @@ def reconcile_pr_evidence(
     return report
 
 
-def _open_pulls_for_branch(
+def _pulls_for_branch(
     repo_path: str, branch: str
 ) -> tuple[list[dict[str, Any]] | None, str]:
-    """Open pull requests whose head is `branch`, as `[{url, headRefName}]`.
+    """Open or merged pull requests whose head is `branch`.
+
+    Merged PRs remain authoritative branch-to-PR evidence. Restricting this
+    recovery lookup to ``state=open`` permanently stranded a task whenever
+    its PR landed before ``publish_run`` recorded the evidence: the branch no
+    longer had an open PR, so every later tick emitted
+    ``no_open_pr_on_task_branch``. Closed, unmerged PRs are deliberately
+    excluded.
 
     REST (`GET /repos/{owner}/{repo}/pulls?head=owner:branch`) rather than
     `gh pr list --head` (GraphQL): this runs once per unrecorded task on
@@ -402,7 +411,7 @@ def _open_pulls_for_branch(
     owner, repo = origin
     head = urllib.parse.quote(f"{owner}:{branch}", safe="")
     outcome, decoded = _rest_json(
-        repo_path, f"repos/{owner}/{repo}/pulls?state=open&per_page=20&head={head}"
+        repo_path, f"repos/{owner}/{repo}/pulls?state=all&per_page=20&head={head}"
     )
     if outcome == _REST_FAILED:
         return None, "pr_list_failed"
@@ -413,6 +422,8 @@ def _open_pulls_for_branch(
     listed = []
     for item in decoded:
         if not isinstance(item, dict):
+            continue
+        if item.get("state") != "open" and not item.get("merged_at"):
             continue
         listed.append(
             {

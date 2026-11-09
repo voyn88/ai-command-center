@@ -3965,7 +3965,9 @@ def _fake_pr_list(entries, *, returncode=0, stdout=None):
     import subprocess as sp
 
     rest = [
-        {"html_url": entry["url"], "head": {"ref": entry["headRefName"]}}
+        {"html_url": entry["url"], "head": {"ref": entry["headRefName"]},
+         "state": entry.get("state", "open"),
+         "merged_at": entry.get("merged_at")}
         for entry in entries
     ]
 
@@ -3993,6 +3995,49 @@ def test_an_open_pr_on_the_task_branch_becomes_evidence(rig, _test_repo_routes, 
 
     assert (task_id, url) in report.recorded
     assert _pr_rows(app_factory, task_id) == [url]
+
+
+def test_a_merged_pr_on_the_task_branch_becomes_evidence(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+    """A merge racing evidence recording must not strand the task forever."""
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE-MERGED"
+    _ready_without_pr(store, app_factory, task_id)
+    url = "https://github.com/x/repo-d2/pull/910"
+    monkeypatch.setattr(
+        review_merge,
+        "_gh",
+        _fake_pr_list([{
+            "url": url,
+            "headRefName": f"backlog/{task_id}",
+            "state": "closed",
+            "merged_at": "2026-11-04T14:56:23Z",
+        }]),
+    )
+
+    report = reconcile_pr_evidence(app_factory, REPO)
+
+    assert (task_id, url) in report.recorded
+    assert _pr_rows(app_factory, task_id) == [url]
+
+
+def test_a_closed_unmerged_pr_is_not_adopted(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE-CLOSED"
+    _ready_without_pr(store, app_factory, task_id)
+    monkeypatch.setattr(
+        review_merge,
+        "_gh",
+        _fake_pr_list([{
+            "url": "https://github.com/x/repo-d2/pull/911",
+            "headRefName": f"backlog/{task_id}",
+            "state": "closed",
+        }]),
+    )
+
+    report = reconcile_pr_evidence(app_factory, REPO)
+
+    assert _pr_rows(app_factory, task_id) == []
+    assert (task_id, "no_open_pr_on_task_branch") in report.skipped
 
 
 def test_a_task_adopts_only_its_own_branch_never_a_prefix_match(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
