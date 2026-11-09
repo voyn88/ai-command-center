@@ -4335,6 +4335,109 @@ def test_a_task_adopts_only_its_own_branch_never_a_prefix_match(rig, _test_repo_
     assert (task_id, "no_open_pr_on_task_branch") in report.skipped
 
 
+def _escalate_no_open_pr(factory, task_id, *, first_tick_id="tick-first", latest_tick_id="tick-latest"):
+    """Seed the watchdog's own ledgers exactly as `record_skips` +
+    `watchdog_once` would have left them after `pr_evidence` repeated
+    `no_open_pr_on_task_branch` on `task_id` for 5 consecutive ticks (the
+    threshold `detect_stalls` requires before escalating): a `tick_observation`
+    row making `latest_tick_id` the latest `pr_evidence` tick, a
+    `tick_skip_event` row for that tick carrying the streak's own
+    `first_tick_id`, and the matching `tick_stall_escalation` row."""
+    with factory() as c, c.cursor() as cur:
+        cur.execute(
+            "INSERT INTO tick_observation (tick_kind, tick_id) VALUES ('pr_evidence', %s)",
+            (latest_tick_id,),
+        )
+        cur.execute(
+            "INSERT INTO tick_skip_event "
+            "(tick_id, tick_kind, task_id, reason, first_tick_id, first_seen_at, "
+            " consecutive_ticks) "
+            "VALUES (%s, 'pr_evidence', %s, 'no_open_pr_on_task_branch', %s, now(), 5)",
+            (latest_tick_id, task_id, first_tick_id),
+        )
+        cur.execute(
+            "INSERT INTO tick_stall_escalation "
+            "(tick_kind, task_id, reason, first_tick_id, consecutive_ticks, "
+            " first_seen_at, last_seen_at, escalation_task_id) "
+            "VALUES ('pr_evidence', %s, 'no_open_pr_on_task_branch', %s, 5, "
+            " now(), now(), %s)",
+            (task_id, first_tick_id, f"{task_id}-STALL-{first_tick_id}"),
+        )
+        c.commit()
+
+
+def test_no_open_pr_recovers_to_open_once_the_watchdog_has_escalated_it(
+    rig, _test_repo_routes, monkeypatch  # noqa: F811
+):
+    """`no_open_pr_on_task_branch` alone never recovers anything -- an
+    ordinary PR that simply has not landed yet must not be yanked back to
+    OPEN. Only once the tick-stall watchdog has already escalated this exact
+    (task, reason) -- proof the condition survived 5 straight ticks, not
+    ordinary latency -- does the next `pr_evidence` tick give the task a
+    fresh dispatch attempt through the 0018 gate (live gap:
+    VOYN-W0-AICC-SRV-08-PITR, same skip for 5 consecutive ticks with no
+    automatic recovery)."""
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE2R"
+    _ready_without_pr(store, app_factory, task_id)
+    monkeypatch.setattr(review_merge, "_gh", _fake_pr_list([]))
+
+    first = reconcile_pr_evidence(app_factory, REPO)
+    assert (task_id, "no_open_pr_on_task_branch") in first.skipped
+    assert first.recovered == []
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", (task_id,))
+        assert cur.fetchone()[0] == "READY_TO_REVIEW"
+
+    _escalate_no_open_pr(app_factory, task_id)
+    second = reconcile_pr_evidence(app_factory, REPO)
+
+    assert any(entry[0] == task_id for entry in second.recovered)
+    assert all(entry[0] != task_id for entry in second.skipped)
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", (task_id,))
+        assert cur.fetchone()[0] == "OPEN"
+
+
+def test_a_stale_escalation_from_a_resolved_episode_does_not_recover_a_new_one(
+    rig, _test_repo_routes, monkeypatch  # noqa: F811
+):
+    """A task recovered once can land right back in the identical skip if
+    whatever broke `publish_run` is still broken. The SECOND episode must
+    earn its own 5-tick confirmation before recovering again -- matching
+    only on `task_id` and `reason` would instead find the first episode's
+    now-stale escalation row and recover on the very first skip of the new
+    one, turning a single stall into an unbounded redispatch/recover churn."""
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE2S"
+    _ready_without_pr(store, app_factory, task_id)
+    monkeypatch.setattr(review_merge, "_gh", _fake_pr_list([]))
+    # An escalation exists, but for an EARLIER episode (`tick-old`) than the
+    # one `tick_observation`/`tick_skip_event` currently say is active.
+    _escalate_no_open_pr(app_factory, task_id, first_tick_id="tick-old", latest_tick_id="tick-old")
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute(
+            "INSERT INTO tick_observation (tick_kind, tick_id) VALUES ('pr_evidence', 'tick-new')"
+        )
+        cur.execute(
+            "INSERT INTO tick_skip_event "
+            "(tick_id, tick_kind, task_id, reason, first_tick_id, first_seen_at, "
+            " consecutive_ticks) "
+            "VALUES ('tick-new', 'pr_evidence', %s, 'no_open_pr_on_task_branch', "
+            " 'tick-new', now(), 1)",
+            (task_id,),
+        )
+        c.commit()
+
+    report = reconcile_pr_evidence(app_factory, REPO)
+
+    assert (task_id, "no_open_pr_on_task_branch") in report.skipped
+    assert report.recovered == []
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", (task_id,))
+        assert cur.fetchone()[0] == "READY_TO_REVIEW"
+
+
 def test_two_open_prs_on_one_branch_are_refused_rather_than_guessed(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
     app_factory, store, _ = rig
     task_id = "VOYN-W0-PRE3"
