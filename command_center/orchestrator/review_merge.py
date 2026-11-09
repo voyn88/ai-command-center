@@ -122,6 +122,7 @@ __all__ = [
     "reconcile_merge_evidence",
     "reconcile_pr_window",
     "reconcile_review_once",
+    "reconcile_stuck_ready_to_review",
     "review_once",
 ]
 
@@ -245,6 +246,18 @@ class PrEvidenceReport:
     #: (task_id, pr_url) newly recorded from the task's own branch.
     recorded: list[tuple[str, str]] = field(default_factory=list)
     #: (task_id, reason) examined and deliberately left alone.
+    skipped: list[tuple[str, str]] = field(default_factory=list)
+
+
+@dataclass
+class StuckReadyToReviewReport:
+    """See `reconcile_stuck_ready_to_review`."""
+
+    #: (task_id, prior_reason) returned OPEN through the 0018 gate
+    #: (`backlog_recover_stuck_ready_to_review`) for a fresh dispatch attempt.
+    recovered: list[tuple[str, str]] = field(default_factory=list)
+    #: (task_id, reason) examined and deliberately left alone -- including a
+    #: 0018 refusal, surfaced rather than swallowed.
     skipped: list[tuple[str, str]] = field(default_factory=list)
 
 
@@ -374,6 +387,134 @@ def reconcile_pr_evidence(
             report.skipped.append((row_task_id, f"evidence_refused: {reason}"))
             continue
         report.recorded.append((row_task_id, pr_url))
+    return report
+
+
+#: How long a READY_TO_REVIEW task may sit with no `pr` evidence and no open
+#: pull request on its branch before `reconcile_stuck_ready_to_review` stops
+#: waiting and returns it to OPEN. `updated_at` only moves on a real
+#: transition -- skips never bump it, see the window-starvation note
+#: elsewhere in this module -- so comparing it to `now()` is exactly "how
+#: long has this sat here with no evidence", with no separate clock for this
+#: function to keep. 20 minutes is roughly three `reconcile_pr_evidence`
+#: ticks at the ~6-7 minute cadence observed on
+#: VOYN-W0-AICC-SHARED-PASSWORD-CONTRACT (first seen 09:50:12, five ticks by
+#: 10:15:38): enough to absorb ordinary publish lag or a transient `gh`
+#: failure, but short enough that this resolves the stall on its own well
+#: before `tick_stall_watchdog`'s own 5-tick escalation threshold would fire
+#: again for the same reason. Bound as a plain parameter (`now() -
+#: %s::interval`), never interpolated into the query text.
+_STUCK_READY_TO_REVIEW_AFTER = "20 minutes"
+
+
+def reconcile_stuck_ready_to_review(
+    factory: Any,
+    repo_path: str,
+    *,
+    task_id: str | None = None,
+    limit: int = 25,
+) -> StuckReadyToReviewReport:
+    """Return a READY_TO_REVIEW task to OPEN when no pull request has ever
+    appeared on its branch and waiting longer cannot change that.
+
+    `reconcile_pr_evidence` reports exactly this situation every tick as
+    `no_open_pr_on_task_branch` -- and nothing upstream of it has an
+    adjacency out of READY_TO_REVIEW, so a task that genuinely never got a
+    pull request (`publish_run` cannot run on this fleet at all; see
+    `reconcile_pr_evidence`'s docstring) is invisible to the whole control
+    plane forever. VOYN-W0-AICC-SHARED-PASSWORD-CONTRACT sat in exactly this
+    state for 5 consecutive ticks before `tick_stall_watchdog` escalated it
+    -- not because no fix existed, but because nothing was ever wired to the
+    fix 0018 already shipped and tested for this precise gap:
+    `backlog_recover_stuck_ready_to_review`, READY_TO_REVIEW -> OPEN,
+    granted only for a task that is STILL READY_TO_REVIEW with STILL no `pr`
+    evidence at the instant it runs, checked atomically inside its own
+    SECURITY DEFINER function.
+
+    A prior attempt at this same gap (PR #1119, rejected at 24fdeccd) instead
+    had `reconcile_pr_evidence` itself adopt or create a pull request when
+    none was open: adopting an OPEN PR on the branch without checking its
+    head repository or base, which could silently cross the exact
+    cross-repository guard that function's own docstring promises; and
+    falling through to `gh pr create` whenever the branch's last PR was
+    CLOSED, resurrecting a pull request a human had just rejected. This
+    takes no GitHub-writing action at all. The only side effect is the
+    existing, narrowly-gated status flip 0018 already shipped: the task
+    lands back at OPEN for a fresh dispatch and a genuine new attempt at a
+    pull request, never a status this code invents by inference and never a
+    write to GitHub.
+
+    Still re-checks the branch for an open pull request immediately before
+    recovering (not just trusting the staleness window): a PR that appeared
+    since the last `reconcile_pr_evidence` tick is left alone
+    (`open_pr_now_exists`) so that function can record it next pass, rather
+    than this one discarding it. The repository-route guard is the same one
+    `reconcile_pr_evidence` applies, for the same reason: a task whose
+    repository is not the one `repo_path` points at must never be judged by
+    a branch lookup run against the wrong origin.
+
+    Report-only beyond that one gated call: a 0018 refusal (`has_pr_evidence`
+    / `not_ready_to_review`, both possible under a race with a concurrent
+    tick) is surfaced as a skip rather than swallowed.
+    """
+    from command_center.orchestrator.planner import repo_route
+
+    report = StuckReadyToReviewReport()
+    if task_id is not None:
+        rows = _rows(
+            factory,
+            "SELECT t.task_id, t.repo FROM backlog_task t "
+            "WHERE t.status = 'READY_TO_REVIEW' AND t.task_id = %s "
+            "AND t.updated_at <= now() - %s::interval "
+            "AND NOT EXISTS (SELECT 1 FROM backlog_evidence e "
+            "WHERE e.task_id = t.task_id AND e.kind = 'pr')",
+            (task_id, _STUCK_READY_TO_REVIEW_AFTER),
+        )
+    else:
+        rows = _rows(
+            factory,
+            "SELECT t.task_id, t.repo FROM backlog_task t "
+            "WHERE t.status = 'READY_TO_REVIEW' "
+            "AND t.updated_at <= now() - %s::interval "
+            "AND NOT EXISTS (SELECT 1 FROM backlog_evidence e "
+            "WHERE e.task_id = t.task_id AND e.kind = 'pr') "
+            "ORDER BY t.task_id LIMIT %s",
+            (_STUCK_READY_TO_REVIEW_AFTER, limit),
+        )
+    for row_task_id, repo in rows:
+        if not repo:
+            report.skipped.append((row_task_id, "no_repo_on_task"))
+            continue
+        if repo_route(repo) is None:
+            report.skipped.append((row_task_id, f"no_repo_route: {repo!r}"))
+            continue
+        branch = _task_branch(row_task_id)
+        decoded, failure = _open_pulls_for_branch(repo_path, branch)
+        if decoded is None:
+            report.skipped.append((row_task_id, failure))
+            continue
+        matches = [
+            entry
+            for entry in decoded
+            if isinstance(entry, dict)
+            and entry.get("headRefName") == branch
+            and isinstance(entry.get("url"), str)
+            and entry["url"]
+        ]
+        if matches:
+            report.skipped.append((row_task_id, "open_pr_now_exists"))
+            continue
+        with factory() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM backlog_recover_stuck_ready_to_review(%s)",
+                (row_task_id,),
+            )
+            verdict = cur.fetchone()
+        if not verdict or not verdict[0]:
+            reason = (verdict[1] if verdict and len(verdict) > 1 else "") or "unknown"
+            report.skipped.append((row_task_id, f"recovery_refused: {reason}"))
+            continue
+        report.recovered.append((row_task_id, "no_open_pr_on_task_branch"))
     return report
 
 
