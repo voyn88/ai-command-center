@@ -666,16 +666,17 @@ def main(argv: list[str] | None = None) -> int:
                 # and the identity is resolved once, here, rather than four
                 # times (VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS).
                 with gh_access.tick(args.repo_path) as quota:
-                    # Before selecting anything: a task whose PR exists but
-                    # was never recorded is invisible to every gate
-                    # downstream. This derives that evidence from the task's
-                    # own branch, so a pull request opened outside
-                    # `publish_run` still reaches review.
+                    # Before selecting anything: derive missing evidence from
+                    # the task's own branch. If there is no branch PR either,
+                    # return the evidence-free READY_TO_REVIEW task to OPEN
+                    # through its narrow audited recovery gate.
                     evidence = reconcile_pr_evidence(
                         lambda: _nc(conn), args.repo_path, task_id=args.task_id
                     )
                     for evidence_task_id, pr in evidence.recorded:
                         print(f"PR-FOUND  {evidence_task_id} -> {pr}")
+                    for evidence_task_id in evidence.recovered:
+                        print(f"PR-RECOVER {evidence_task_id}: READY_TO_REVIEW -> OPEN")
                     for evidence_task_id, reason in evidence.skipped:
                         print(f"PR-SKIP   {evidence_task_id}: {reason}")
                     report = review_once(

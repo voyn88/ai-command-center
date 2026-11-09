@@ -4332,7 +4332,37 @@ def test_a_task_adopts_only_its_own_branch_never_a_prefix_match(rig, _test_repo_
     report = reconcile_pr_evidence(app_factory, REPO)
 
     assert _pr_rows(app_factory, task_id) == []
-    assert (task_id, "no_open_pr_on_task_branch") in report.skipped
+    assert task_id in report.recovered
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", (task_id,))
+        assert cur.fetchone()[0] == "OPEN"
+
+
+def test_missing_pr_recovery_surfaces_a_concurrent_evidence_race(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+    """The database gate rechecks under lock; a concurrent PR writer must win."""
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE2-RACE"
+    _ready_without_pr(store, app_factory, task_id)
+    monkeypatch.setattr(review_merge, "_open_pulls_for_branch", lambda *_: ([], ""))
+
+    real_rows = review_merge._rows
+
+    def rows_then_record(factory, query, params=()):
+        rows = real_rows(factory, query, params)
+        assert store.record_evidence(
+            task_id, "pr", "https://github.com/x/repo-d2/pull/901"
+        )[0]
+        return rows
+
+    monkeypatch.setattr(review_merge, "_rows", rows_then_record)
+
+    report = reconcile_pr_evidence(app_factory, REPO, task_id=task_id)
+
+    assert report.recovered == []
+    assert (task_id, "recovery_refused: has_pr_evidence") in report.skipped
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", (task_id,))
+        assert cur.fetchone()[0] == "READY_TO_REVIEW"
 
 
 def test_two_open_prs_on_one_branch_are_refused_rather_than_guessed(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
