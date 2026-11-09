@@ -244,6 +244,9 @@ class PrEvidenceReport:
 
     #: (task_id, pr_url) newly recorded from the task's own branch.
     recorded: list[tuple[str, str]] = field(default_factory=list)
+    #: task_ids returned to OPEN after GitHub proved their own repository has
+    #: no open PR on the task branch.
+    recovered: list[str] = field(default_factory=list)
     #: (task_id, reason) examined and deliberately left alone.
     skipped: list[tuple[str, str]] = field(default_factory=list)
 
@@ -291,14 +294,13 @@ def reconcile_pr_evidence(
     its second element is a *worker's* local path, which need not exist on the
     host running the tick. Using it here made the first live run die with
     `FileNotFoundError: /home/voynadmin/Projects/ai-command-center`. A task
-    whose repository is not the one `repo_path` points at simply finds no
-    branch and is skipped, which is the safe outcome -- `gh` searches the
-    origin of that checkout and nothing else, so a task can never be attached
-    to a pull request in another repository.
+    whose repository is not the one `repo_path` points at is ignored by this
+    checkout's tick. This prevents both false permanent skips and tasks for
+    other repositories consuming this tick's lookup limit.
 
-    Reporting only: no status is changed here. A task becomes reviewable
-    because it is `READY_TO_REVIEW` and now has evidence, through the same
-    path it always did.
+    A discovered PR only records evidence. A successful empty lookup for the
+    correct checkout invokes the narrow audited recovery gate, returning the
+    otherwise-unreachable task to OPEN for a fresh implementation attempt.
     """
     # Imported here, as  does, so this module keeps its
     # import-time independence from the planner.
@@ -321,16 +323,27 @@ def reconcile_pr_evidence(
             "WHERE t.status = 'READY_TO_REVIEW' "
             "AND NOT EXISTS (SELECT 1 FROM backlog_evidence e "
             "WHERE e.task_id = t.task_id AND e.kind = 'pr') "
-            "ORDER BY t.task_id LIMIT %s",
-            (limit,),
+            "ORDER BY t.task_id",
         )
+    examined = 0
     for row_task_id, repo in rows:
         if not repo:
             report.skipped.append((row_task_id, "no_repo_on_task"))
             continue
-        if repo_route(repo) is None:
+        route = repo_route(repo)
+        if route is None:
             report.skipped.append((row_task_id, f"no_repo_route: {repo!r}"))
             continue
+        # A review tick is scoped to one checkout, while the candidate query
+        # is fleet-wide.  Looking for an AIOS branch in the AICC checkout is
+        # guaranteed to return an empty list and used to produce an immortal
+        # no_open_pr_on_task_branch skip.  Route paths are host-local, so only
+        # compare their repository basename (the stable part across hosts).
+        if Path(route[1]).name != Path(repo_path).resolve().name:
+            continue
+        if examined >= limit:
+            break
+        examined += 1
         branch = _task_branch(row_task_id)
         decoded, failure = _open_pulls_for_branch(repo_path, branch)
         if decoded is None:
@@ -348,7 +361,24 @@ def reconcile_pr_evidence(
             and entry["url"]
         ]
         if not matches:
-            report.skipped.append((row_task_id, "no_open_pr_on_task_branch"))
+            # A successful, empty lookup for the task's own repository proves
+            # this READY_TO_REVIEW row cannot enter any downstream gate.  The
+            # narrow 0018 recovery function exists for exactly this state and
+            # refuses tasks carrying PR evidence; use it instead of emitting
+            # the same unactionable skip forever.
+            with factory() as conn, conn.cursor() as cur:
+                cur.execute(
+                    "SELECT * FROM backlog_recover_stuck_ready_to_review(%s)",
+                    (row_task_id,),
+                )
+                verdict = cur.fetchone()
+            if verdict and verdict[0]:
+                report.recovered.append(row_task_id)
+            else:
+                reason = (
+                    verdict[1] if verdict and len(verdict) > 1 else ""
+                ) or "unknown"
+                report.skipped.append((row_task_id, f"recovery_refused: {reason}"))
             continue
         if len(matches) > 1:
             report.skipped.append((row_task_id, "ambiguous_open_prs_on_branch"))

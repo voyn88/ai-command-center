@@ -4332,7 +4332,28 @@ def test_a_task_adopts_only_its_own_branch_never_a_prefix_match(rig, _test_repo_
     report = reconcile_pr_evidence(app_factory, REPO)
 
     assert _pr_rows(app_factory, task_id) == []
-    assert (task_id, "no_open_pr_on_task_branch") in report.skipped
+    assert report.recovered == [task_id]
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", (task_id,))
+        assert cur.fetchone()[0] == "OPEN"
+
+
+def test_pr_reconcile_ignores_tasks_routed_to_another_checkout(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE-OTHER"
+    _ready_without_pr(store, app_factory, task_id, repo="repo-one")
+    calls = []
+    monkeypatch.setattr(review_merge, "_gh", lambda *args: calls.append(args))
+
+    report = reconcile_pr_evidence(app_factory, REPO, task_id=task_id)
+
+    assert calls == []
+    assert report.recorded == []
+    assert report.recovered == []
+    assert report.skipped == []
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", (task_id,))
+        assert cur.fetchone()[0] == "READY_TO_REVIEW"
 
 
 def test_two_open_prs_on_one_branch_are_refused_rather_than_guessed(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
@@ -4391,6 +4412,15 @@ def test_a_failed_or_undecodable_lookup_records_nothing(rig, _test_repo_routes, 
     assert (garbage, "pr_list_undecodable") in report.skipped
     assert _pr_rows(app_factory, failed) == []
     assert _pr_rows(app_factory, garbage) == []
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT task_id, status FROM backlog_task WHERE task_id IN (%s,%s) ORDER BY task_id",
+            (failed, garbage),
+        )
+        assert cur.fetchall() == [
+            (failed, "READY_TO_REVIEW"),
+            (garbage, "READY_TO_REVIEW"),
+        ]
 
 
 def test_only_ready_to_review_tasks_are_examined(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
