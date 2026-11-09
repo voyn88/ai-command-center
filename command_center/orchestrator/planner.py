@@ -75,6 +75,22 @@ class PlanLimits:
     #: RESUME). Bounded so a large parked backlog drains gradually across
     #: ticks instead of flooding OPEN in one; 0 disables the reconcile.
     max_resumes_per_tick: int = 10
+    #: Per-tick cap on READY_TO_REVIEW -> OPEN auto-recoveries for a task
+    #: carrying no `pr` evidence at all (VOYN-W0-AICC-TICK-STALL-WATCHDOG,
+    #: live shape: VOYN-W0-AICC-SRV-07a stuck READY_TO_REVIEW with nothing
+    #: on its branch for days -- `reconcile_pr_evidence` only ever records
+    #: evidence it finds, so a task with none to find sat skipped
+    #: `no_open_pr_on_task_branch` every tick forever; 0018's
+    #: `backlog_recover_stuck_ready_to_review` is the sanctioned way out but
+    #: nothing automated ever called it). 0 disables the reconcile.
+    max_stuck_ready_recoveries_per_tick: int = 5
+    #: How long a READY_TO_REVIEW task must sit with no `pr` evidence before
+    #: the reconcile above is allowed to touch it -- long enough that a
+    #: publish genuinely still in flight (or a PR an operator is in the
+    #: middle of opening by hand for a `reconcile_pr_evidence` pickup) is
+    #: never raced, short enough that a truly stuck task gets another
+    #: attempt within the hour rather than sitting for days.
+    stuck_ready_min_age_seconds: int = 1800
     #: The planner's dispatch-only backpressure fence: once this many
     #: READY_TO_REVIEW tasks are carrying `pr` evidence, this tick dispatches
     #: nothing new, so implementation supply stops outrunning review/merge
@@ -105,6 +121,9 @@ class PlanReport:
     #: (task, original park reason) — DEFER_TO_USER technical parks the 0014
     #: gate returned to OPEN this tick (VOYN-W0-AICC-DEFER-AUTO-RESUME).
     resumed: list[tuple[str, str]] = field(default_factory=list)
+    #: task_id — READY_TO_REVIEW tasks with no `pr` evidence at all, sent
+    #: back to OPEN this tick for a fresh attempt (0018 recovery gate).
+    recovered_stuck_ready: list[str] = field(default_factory=list)
     planner_busy: bool = False
     #: The review backlog count that tripped `PlanLimits.review_backlog_
     #: limit` this tick (None when the fence never fired). Ingest and the
@@ -475,6 +494,46 @@ class Planner:
                         )
                         if ok:
                             report.resumed.append((task_id, park_reason))
+
+                # Reconcile READY_TO_REVIEW tasks that will never acquire `pr`
+                # evidence on their own (VOYN-W0-AICC-TICK-STALL-WATCHDOG):
+                # `reconcile_pr_evidence` (BO-S3b) only ever RECORDS evidence
+                # it finds on the task's own branch -- a task with nothing to
+                # find there is skipped `no_open_pr_on_task_branch` and left
+                # untouched, by design (that function never changes a
+                # status). Nothing else in the pipeline revisits a
+                # READY_TO_REVIEW row either: `backlog_transition`'s adjacency
+                # has no edge out of it except DONE/REJECTED, and
+                # `backlog_return_to_pool` only accepts IN_PROGRESS. 0018's
+                # `backlog_recover_stuck_ready_to_review` is the sanctioned
+                # exit (READY_TO_REVIEW -> OPEN, refused outright if any `pr`
+                # evidence exists) but had no automated caller, so a task that
+                # reached this state -- a completed-but-unpublished run (0011
+                # closed that for NEW ingests; this covers whatever bug or
+                # manual edit produces it regardless) -- stayed wedged
+                # forever. The age floor keeps this from racing a publish
+                # genuinely still in flight or an operator mid-way through
+                # hand-opening the PR `reconcile_pr_evidence` is meant to pick
+                # up; the function's own evidence re-check under the row lock
+                # is the real safety net either way.
+                if limits.max_stuck_ready_recoveries_per_tick > 0:
+                    stuck_ready = self._rows(
+                        "SELECT t.task_id FROM backlog_task t "
+                        "WHERE t.status = 'READY_TO_REVIEW' AND t.kind = 'task' "
+                        "AND t.updated_at < now() - (%s * interval '1 second') "
+                        "AND NOT EXISTS (SELECT 1 FROM backlog_evidence e "
+                        "WHERE e.task_id = t.task_id AND e.kind = 'pr') "
+                        "ORDER BY t.updated_at LIMIT %s",
+                        (limits.stuck_ready_min_age_seconds,
+                         limits.max_stuck_ready_recoveries_per_tick),
+                    )
+                    for (task_id,) in stuck_ready:
+                        ok, _reason, _revision = self._row(
+                            "SELECT * FROM backlog_recover_stuck_ready_to_review(%s)",
+                            (task_id,),
+                        )
+                        if ok:
+                            report.recovered_stuck_ready.append(task_id)
 
                 # Fail-closed monitors record what they measured (0021
                 # monitor_finding); every open finding becomes a pipeline task
