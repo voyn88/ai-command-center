@@ -183,6 +183,31 @@ which is worse than returning none.
 
 ## Backup and restore
 
+There are two complementary recovery paths. The logical `pg_dump` path below
+is portable and is the routine restore drill. Point-in-time recovery (PITR)
+uses physical base backups plus the continuous WAL archive configured in
+`docker-compose.server.yml`:
+
+```bash
+# Run periodically with a role that has REPLICATION privilege.
+scripts/aicc_pg_pitr_backup.sh --out-dir /var/backups/aicc-pitr
+
+# Prepare a separate data directory and pause at an exact UTC instant.
+scripts/aicc_pg_pitr_prepare.sh \
+  --base /var/backups/aicc-pitr/base-20261104T020000Z \
+  --wal-dir /var/lib/docker/volumes/aicc-pgwal/_data \
+  --target-dir /srv/aicc-pitr-check \
+  --target-time 2026-11-04T14:30:00Z
+```
+
+The prepare command verifies the backup manifest before copying, refuses a
+non-empty target, removes stale postmaster PID files, writes `recovery.signal`,
+and sets `recovery_target_action = 'pause'`. It deliberately does not start a
+server or modify the live data directory. After recovery pauses, validate the
+target database before promotion. Keep the WAL archive on storage with a
+failure domain independent from `aicc-pgdata`; the named volume in Compose is
+only the single-host default, not an off-host retention policy.
+
 ```bash
 # Nightly, with retention and an integrity check of the finished archive.
 scripts/aicc_pg_backup.sh --out-dir /var/backups/aicc --verify --keep 14
