@@ -126,6 +126,22 @@ describe('server workspace', () => {
     expect(screen.getAllByRole('article').length).toBe(8)
   })
 
+  test('"Показать все" resets project/search filters so the row count equals N', async () => {
+    const mkp = (id: string, project: string) => ({ ...mk(id, 'IN_PROGRESS', 5 + Number(id.slice(1))), project })
+    vi.mocked(fetchBacklog).mockResolvedValue({
+      ...snapshot,
+      tasks: [...Array.from({ length: 6 }, (_, i) => mkp(`s${i}`, 'AICC')), mkp('s6', 'AIOS')],
+      counts: { IN_PROGRESS: 7 }, total: 7,
+    })
+    render(<ServerWorkspace />)
+    await screen.findByText('Дольше обычного без движения: 7')
+    // a project filter is left over from browsing the projects list
+    fireEvent.click(screen.getByRole('button', { name: /AIOS/ }))
+    fireEvent.click(screen.getByRole('button', { name: 'Обзор' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Показать все (7)' }))
+    expect(screen.getAllByRole('article')).toHaveLength(7)
+  })
+
   test('service data is a collapsed native disclosure with the raw codes', async () => {
     vi.mocked(fetchBacklog).mockResolvedValue({ ...snapshot, tasks: [{ id: 'x1', title: 'Odd', status: 'WEIRD', project: 'AICC', priority: 'P0', updated_at: '-' }] })
     window.location.hash = '#tasks'

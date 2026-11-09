@@ -7,6 +7,7 @@ is missing a value. The fixture is parsed as text; there is no build step.
 
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
 
@@ -71,6 +72,36 @@ def test_reason_codes() -> None:
         sql = path.read_text(encoding="utf-8")
         backend |= set(re.findall(r"(?:dead_reason|outcome_reason)\s*=\s*'([a-z_]+)'", sql))
     assert not missing("REASON_CODES", backend)
+
+
+def _literal_failure_reasons() -> set[str]:
+    """`failure_reason` codes are free-form string literals in code, not enums.
+    Derive them with ``ast`` from the places that persist or return them:
+    ``failure_reason = "x"`` / ``failure_reason="x"`` in supervisor.py / run_finalizer.py, and the
+    string literals returned by ``classify_failure*`` in providers.py."""
+    found: set[str] = set()
+    runtime = REPO_ROOT / "command_center" / "runtime"
+    trees = [ast.parse((runtime / name).read_text(encoding="utf-8")) for name in ("supervisor.py", "run_finalizer.py")]
+    for node in (n for tree in trees for n in ast.walk(tree)):
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+            if any(isinstance(t, ast.Name) and t.id == "failure_reason" for t in node.targets):
+                found.add(node.value.value)
+        if isinstance(node, ast.keyword) and node.arg == "failure_reason":
+            if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+                found.add(node.value.value)
+    tree = ast.parse((runtime / "providers.py").read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name.startswith("classify_failure"):
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Return) and isinstance(sub.value, ast.Constant) and isinstance(sub.value.value, str):
+                    found.add(sub.value.value)
+    return {code for code in found if re.fullmatch(r"[a-z_]+", code)}
+
+
+def test_literal_failure_reasons_from_supervisor_and_providers() -> None:
+    derived = _literal_failure_reasons()
+    assert {"timeout", "supervision_failed", "daemon_unreachable"} <= derived  # the derivation itself works
+    assert not missing("REASON_CODES", derived)
 
 
 def test_backlog_statuses() -> None:

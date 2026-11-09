@@ -144,6 +144,7 @@ main:focus { outline: none; }
 @media (max-width: 760px) { .task-row-head { grid-template-columns: 1fr auto; } .task-date { display: none; } }
 
 /* "Служебные данные": raw codes and ids, collapsed by default. */
+.execution-row .tech-details { grid-column: 1 / -1; }
 .tech-details { margin-top: .4rem; font-family: var(--font-mono); font-size: .75rem; color: var(--tx3-aa); overflow-wrap: anywhere; }
 .tech-details summary { min-height: 36px; display: flex; align-items: center; cursor: pointer; color: var(--accent-text); font-family: var(--font-sans); font-size: .75rem; }
 .tech-details--large summary { min-height: 44px; font-size: 14px; }

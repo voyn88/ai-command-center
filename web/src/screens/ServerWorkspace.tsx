@@ -125,7 +125,7 @@ export default function ServerWorkspace() {
             <p className="owner-muted">{stalled.length ? fmt(RU.staleSome, { n: stalled.length }) : RU.staleNone}</p>
             <p className="owner-muted">{RU.staleHint}</p>
             {stalled.slice(0, STALE_CAP).map((task, i) => <TaskCard key={`${task.id}-${i}`} task={task} commands={data.commands_enabled} onChanged={() => setRefresh(n => n + 1)} />)}
-            {stalled.length > STALE_CAP && <button className="owner-button" onClick={() => navigate('tasks', STALLED)}>{fmt(RU.staleAll, { n: stalled.length })}</button>}
+            {stalled.length > STALE_CAP && <button className="owner-button" onClick={() => { setQuery(''); setProject('ALL'); navigate('tasks', STALLED) }}>{fmt(RU.staleAll, { n: stalled.length })}</button>}
           </GlassPanel>
           <div className="owner-section"><GlassPanel title="Проекты">
             {[...new Set(tasks.map(t => t.project))].sort().map(name => <button className="owner-project" key={name} onClick={() => { setProject(name); navigate('tasks') }}><strong>{name}</strong><span>{tasks.filter(t => t.project === name).length} задач →</span></button>)}
