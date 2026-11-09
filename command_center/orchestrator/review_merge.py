@@ -246,6 +246,54 @@ class PrEvidenceReport:
     recorded: list[tuple[str, str]] = field(default_factory=list)
     #: (task_id, reason) examined and deliberately left alone.
     skipped: list[tuple[str, str]] = field(default_factory=list)
+    #: (task_id, reason) sent back OPEN through the 0018 recovery gate after
+    #: `_STUCK_WITHOUT_PR_THRESHOLD` straight ticks of the same skip reason.
+    recovered: list[tuple[str, str]] = field(default_factory=list)
+
+
+#: A task that has been skipped for the identical reason this many
+#: consecutive ticks in a row is not waiting on anything that will resolve
+#: itself -- it is the exact "actionable stall" the tick-stall watchdog
+#: (`tick_stall_watchdog.WatchdogConfig.threshold`, also 5) escalates. Reusing
+#: that threshold here means a `no_open_pr_on_task_branch` streak gets a
+#: chance to self-heal through the 0018 recovery gate at the same point the
+#: watchdog would otherwise have to file a ticket about it.
+_STUCK_WITHOUT_PR_THRESHOLD = 5
+
+
+def _prior_consecutive_skips(factory: Any, tick_kind: str, task_id: str, reason: str) -> int:
+    """The streak length `tick_skip_event` already recorded for this pair, as
+    of the last tick observed -- i.e. BEFORE this tick's own skip (not yet
+    persisted; the CLI handler writes it after this function returns)."""
+    with factory() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT consecutive_ticks FROM tick_skip_event "
+            "WHERE tick_kind = %s AND task_id = %s AND reason = %s "
+            "ORDER BY id DESC LIMIT 1",
+            (tick_kind, task_id, reason),
+        )
+        row = cur.fetchone()
+    return int(row[0]) if row else 0
+
+
+def _recover_stuck_ready_to_review(factory: Any, task_id: str) -> tuple[bool, str]:
+    """Send a task stuck READY_TO_REVIEW with no `pr` evidence back to OPEN
+    through the 0018 `backlog_recover_stuck_ready_to_review` gate -- the
+    sanctioned, narrow, audited path built for exactly this state (a
+    completed run whose publish step never produced a PR at all, not merely
+    one `reconcile_pr_evidence` failed to record). The function itself
+    revalidates everything under its own row lock; a refusal here just means
+    something about the task changed between the SELECT above and this call
+    (e.g. `pr` evidence landed in the meantime), so the ordinary skip path
+    below still applies."""
+    with factory() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT * FROM backlog_recover_stuck_ready_to_review(%s)", (task_id,)
+        )
+        verdict = cur.fetchone()
+    ok = bool(verdict[0]) if verdict else False
+    reason = str((verdict[1] if verdict and len(verdict) > 1 else "") or "unknown")
+    return ok, reason
 
 
 #: Branch naming contract. `publish_run` pushes `backlog/<task id>` and nothing
@@ -296,9 +344,25 @@ def reconcile_pr_evidence(
     origin of that checkout and nothing else, so a task can never be attached
     to a pull request in another repository.
 
-    Reporting only: no status is changed here. A task becomes reviewable
-    because it is `READY_TO_REVIEW` and now has evidence, through the same
-    path it always did.
+    Reporting only in the ordinary case: no status is changed, and a task
+    becomes reviewable because it is `READY_TO_REVIEW` and now has evidence,
+    through the same path it always did.
+
+    One exception. A task can be `READY_TO_REVIEW` with no PR to find on
+    GitHub at all -- not a recording gap, but a branch nothing ever opened a
+    pull request from (a run that reached the end of implementation but died
+    or was killed before `publish_run`'s push). No amount of asking GitHub
+    again changes that answer, so `no_open_pr_on_task_branch` would repeat
+    identically forever: live case VOYN-W0-AICC-SRV-07d, caught by the
+    tick-stall watchdog after 5 consecutive ticks with that exact reason
+    (VOYN-W0-AICC-SRV-07d-STALL-811b6b2996dadf39). Once a task's own skip
+    history (`tick_skip_event`) shows that same streak -- `_STUCK_WITHOUT_PR_
+    THRESHOLD`, deliberately the watchdog's own escalation threshold -- this
+    calls the 0018 `backlog_recover_stuck_ready_to_review` gate, which
+    revalidates READY_TO_REVIEW-with-no-pr-evidence itself and, only then,
+    returns the task to OPEN for a fresh dispatch. `ambiguous_open_prs_on_
+    branch` is never a candidate: PRs exist there, so recovery would hide a
+    choice that needs a human, not resolve a dead end.
     """
     # Imported here, as  does, so this module keeps its
     # import-time independence from the planner.
@@ -348,7 +412,14 @@ def reconcile_pr_evidence(
             and entry["url"]
         ]
         if not matches:
-            report.skipped.append((row_task_id, "no_open_pr_on_task_branch"))
+            reason = "no_open_pr_on_task_branch"
+            streak = _prior_consecutive_skips(factory, "pr_evidence", row_task_id, reason)
+            if streak >= _STUCK_WITHOUT_PR_THRESHOLD:
+                recovered, _detail = _recover_stuck_ready_to_review(factory, row_task_id)
+                if recovered:
+                    report.recovered.append((row_task_id, reason))
+                    continue
+            report.skipped.append((row_task_id, reason))
             continue
         if len(matches) > 1:
             report.skipped.append((row_task_id, "ambiguous_open_prs_on_branch"))
