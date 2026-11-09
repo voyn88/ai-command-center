@@ -13,17 +13,18 @@ type ActivityRowProps = {
 // comment in lib/api.ts), so most fields are optional. Raw event ids
 // (`event_type`) are never shown as text: without a message we say "Event".
 export default function ActivityRow({ item, fallbackLabel, projectLabel }: ActivityRowProps) {
-  const { t } = useTranslation()
+  const { t, i18n } = useTranslation()
   const label = item.message || fallbackLabel
   const project = projectLabel ?? item.project
   const age = item.ts ? formatRelativeAge(item.ts, t) : null
-  const raw = item.event_type || item.type
+  const raw = [item.event_type || item.type, item.task_id, item.run_id].filter(Boolean).join(' · ')
+  const date = item.ts && !Number.isNaN(new Date(item.ts).getTime()) ? new Date(item.ts).toLocaleString(i18n.language, { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }) : item.ts
   return (
     <div title={raw || undefined} style={{ display: 'flex', flexDirection: 'column', gap: '0.15rem', padding: '0.6rem 0', borderBottom: '1px solid var(--gline)' }}>
       <div style={{ color: 'var(--tx)', fontSize: '0.84rem' }}>{label}</div>
       <div style={{ display: 'flex', gap: '0.5rem', color: 'var(--tx3-aa)', fontSize: '0.75rem' }}>
         {project && <span>{project}</span>}
-        {item.ts && <span title={item.ts}>{age ?? item.ts}</span>}
+        {item.ts && <span title={item.ts}>{age ?? date}</span>}
       </div>
     </div>
   )

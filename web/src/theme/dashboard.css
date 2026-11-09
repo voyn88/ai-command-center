@@ -4,6 +4,8 @@ button:focus-visible, select:focus-visible, input:focus-visible, textarea:focus-
   outline-offset: 2px;
 }
 
+main:focus { outline: none; }
+
 /* Home dashboard: layout/animation CSS that can't be expressed as inline
    styles (keyframes, pseudo-elements, media queries, hover states).
    Colors/surfaces come from theme/tokens.css. */
