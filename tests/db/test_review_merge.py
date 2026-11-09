@@ -4438,6 +4438,118 @@ def test_the_lookup_runs_in_the_checkout_the_tick_was_given(rig, _test_repo_rout
     assert seen == [REPO]
 
 
+# ---------------------------------------------------------------------------
+# recover_evidence_free_stalls: the caller `backlog_recover_stuck_ready_to_
+# review` (0018) never had. `reconcile_pr_evidence` can only find a PR or
+# fail to -- never unstick the task whose branch simply never got one.
+# ---------------------------------------------------------------------------
+
+
+def _record_pr_evidence_skip(app_factory, tick_id, pairs):
+    from command_center.ops.tick_stall_watchdog import record_skips
+
+    with app_factory() as conn:
+        record_skips(conn, "pr_evidence", tick_id, pairs)
+
+
+def test_five_identical_skips_recover_the_task_to_open(rig, _test_repo_routes):  # noqa: F811
+    from command_center.orchestrator.review_merge import recover_evidence_free_stalls
+
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE9"
+    _ready_without_pr(store, app_factory, task_id)
+    for index in range(5):
+        _record_pr_evidence_skip(
+            app_factory, f"pre9-{index:04}", [(task_id, "no_open_pr_on_task_branch")]
+        )
+
+    report = recover_evidence_free_stalls(app_factory)
+
+    assert report.recovered == [task_id]
+    assert report.refused == []
+    assert store.get_task(task_id)["status"] == "OPEN"
+
+
+def test_fewer_than_threshold_skips_leave_the_task_alone(rig, _test_repo_routes):  # noqa: F811
+    from command_center.orchestrator.review_merge import recover_evidence_free_stalls
+
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE10"
+    _ready_without_pr(store, app_factory, task_id)
+    for index in range(4):
+        _record_pr_evidence_skip(
+            app_factory, f"pre10-{index:04}", [(task_id, "no_open_pr_on_task_branch")]
+        )
+
+    report = recover_evidence_free_stalls(app_factory)
+
+    assert report.recovered == []
+    assert store.get_task(task_id)["status"] == "READY_TO_REVIEW"
+
+
+def test_a_different_reason_is_never_recovered(rig, _test_repo_routes):  # noqa: F811
+    """`ambiguous_open_prs_on_branch` means a PR DOES exist; the real review
+    machinery owns that, not this recovery path."""
+    from command_center.orchestrator.review_merge import recover_evidence_free_stalls
+
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE11"
+    _ready_without_pr(store, app_factory, task_id)
+    for index in range(5):
+        _record_pr_evidence_skip(
+            app_factory, f"pre11-{index:04}", [(task_id, "ambiguous_open_prs_on_branch")]
+        )
+
+    report = recover_evidence_free_stalls(app_factory)
+
+    assert report.recovered == []
+    assert store.get_task(task_id)["status"] == "READY_TO_REVIEW"
+
+
+def test_a_task_with_pr_evidence_already_recorded_is_refused_not_mutated(  # noqa: E501
+    rig, _test_repo_routes  # noqa: F811
+):
+    """A stale streak (the PR showed up after the skips were recorded, in an
+    earlier tick this test skips straight past) must not re-open a task the
+    real review/merge path already owns -- the SQL gate itself refuses it."""
+    from command_center.orchestrator.review_merge import recover_evidence_free_stalls
+
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE12"
+    _ready(store, app_factory, task_id, "https://github.com/x/repo-x/pull/950")
+    for index in range(5):
+        _record_pr_evidence_skip(
+            app_factory, f"pre12-{index:04}", [(task_id, "no_open_pr_on_task_branch")]
+        )
+
+    report = recover_evidence_free_stalls(app_factory)
+
+    assert report.recovered == []
+    assert report.refused == [(task_id, "has_pr_evidence")]
+    assert store.get_task(task_id)["status"] == "READY_TO_REVIEW"
+
+
+def test_recovery_is_scoped_to_the_requested_task_id(rig, _test_repo_routes):  # noqa: F811
+    from command_center.orchestrator.review_merge import recover_evidence_free_stalls
+
+    app_factory, store, _ = rig
+    stalled, other = "VOYN-W0-PRE13", "VOYN-W0-PRE14"
+    _ready_without_pr(store, app_factory, stalled, repo="repo-x")
+    _ready_without_pr(store, app_factory, other, repo="repo-x")
+    for index in range(5):
+        _record_pr_evidence_skip(
+            app_factory,
+            f"pre13-{index:04}",
+            [(stalled, "no_open_pr_on_task_branch"), (other, "no_open_pr_on_task_branch")],
+        )
+
+    report = recover_evidence_free_stalls(app_factory, task_id=stalled)
+
+    assert report.recovered == [stalled]
+    assert store.get_task(stalled)["status"] == "OPEN"
+    assert store.get_task(other)["status"] == "READY_TO_REVIEW"
+
+
 # -- reconcile_pr_window: no database involved, gh is faked in-process ------
 
 

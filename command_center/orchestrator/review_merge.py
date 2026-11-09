@@ -74,6 +74,12 @@ pr/sha evidence, moving the task to READY_TO_REVIEW. This module is the rest:
   'sha' evidence against the default branch, for rows written before
   VOYN-W0-AICC-MERGE-DONE-BEFORE-TARGET-VERIFY (when that evidence was the
   PR head, not the merge commit). Never flips a status.
+- ``recover_evidence_free_stalls``: the one exception to "never flips a
+  status" above. Calls the SQL-only, narrow ``backlog_recover_stuck_ready_
+  to_review`` (0018) for a task ``reconcile_pr_evidence`` has reported
+  ``NO_OPEN_PR_ON_TASK_BRANCH`` for several ticks running -- a dead end
+  neither function alone can otherwise escape, since finding-or-not-finding
+  a PR is all ``reconcile_pr_evidence`` ever does. See its own docstring.
 
 All four are refusal-as-data, driven by oneshot timers, and idempotent: a
 task already reviewed is skipped, a marker already posted is skipped, an
@@ -112,9 +118,11 @@ from command_center.orchestrator.routing import cascade_for
 
 __all__ = [
     "LoopReport",
+    "NO_OPEN_PR_ON_TASK_BRANCH",
     "PrWindowConfig",
     "PrWindowReport",
     "ReconcileReport",
+    "RecoveredStallReport",
     "ReviewConfig",
     "autonomy_remediate_once",
     "merge_once",
@@ -122,6 +130,7 @@ __all__ = [
     "reconcile_merge_evidence",
     "reconcile_pr_window",
     "reconcile_review_once",
+    "recover_evidence_free_stalls",
     "review_once",
 ]
 
@@ -248,11 +257,32 @@ class PrEvidenceReport:
     skipped: list[tuple[str, str]] = field(default_factory=list)
 
 
+@dataclass
+class RecoveredStallReport:
+    """See `recover_evidence_free_stalls`."""
+
+    #: task_id sent back to OPEN for a fresh dispatch attempt.
+    recovered: list[str] = field(default_factory=list)
+    #: (task_id, reason) the SQL gate itself refused -- e.g. `pr` evidence
+    #: landed between this tick's read and the recovery call, or the task
+    #: already left READY_TO_REVIEW. Never raised, always reported.
+    refused: list[tuple[str, str]] = field(default_factory=list)
+
+
 #: Branch naming contract. `publish_run` pushes `backlog/<task id>` and nothing
 #: else does, so the branch name is a derivable fact about a task rather than a
 #: convention this function invents.
 def _task_branch(task_id: str) -> str:
     return f"backlog/{task_id}"
+
+
+#: `reconcile_pr_evidence`'s skip reason for exactly the condition
+#: `backlog_recover_stuck_ready_to_review` (0018) was built to repair: a
+#: READY_TO_REVIEW task with no `pr` evidence and no open PR on its own
+#: branch. Named once and shared with `recover_evidence_free_stalls` so the
+#: two can never drift apart (a reworded literal in one place silently
+#: stopping the other from ever matching it).
+NO_OPEN_PR_ON_TASK_BRANCH = "no_open_pr_on_task_branch"
 
 
 def reconcile_pr_evidence(
@@ -348,7 +378,7 @@ def reconcile_pr_evidence(
             and entry["url"]
         ]
         if not matches:
-            report.skipped.append((row_task_id, "no_open_pr_on_task_branch"))
+            report.skipped.append((row_task_id, NO_OPEN_PR_ON_TASK_BRANCH))
             continue
         if len(matches) > 1:
             report.skipped.append((row_task_id, "ambiguous_open_prs_on_branch"))
@@ -374,6 +404,77 @@ def reconcile_pr_evidence(
             report.skipped.append((row_task_id, f"evidence_refused: {reason}"))
             continue
         report.recorded.append((row_task_id, pr_url))
+    return report
+
+
+def recover_evidence_free_stalls(
+    factory: Any,
+    *,
+    tick_kind: str = "pr_evidence",
+    threshold: int = 5,
+    task_id: str | None = None,
+) -> RecoveredStallReport:
+    """Give `backlog_recover_stuck_ready_to_review` (0018) the caller it never
+    had.
+
+    That SQL function is a sanctioned, narrow repair for exactly one dead
+    end: a task stuck READY_TO_REVIEW with no `pr` evidence, which neither
+    `backlog_transition` (no READY_TO_REVIEW -> anything-but-DONE move) nor
+    `backlog_return_to_pool` (IN_PROGRESS only) can reach. It was shipped
+    fully wired at the SQL layer -- granted to the control-plane role,
+    unit-tested against the live gate -- and never called from anywhere:
+    `reconcile_pr_evidence` can only ever find or fail to find a PR, never
+    unstick the task that has none, and nothing else in this codebase holds
+    the role grant. A task whose branch simply never got a PR (a publish
+    that pushed the commit and then died, or GitHub racing the next tick)
+    therefore sat in `READY_TO_REVIEW` reporting the identical
+    `NO_OPEN_PR_ON_TASK_BRANCH` skip forever -- invisible to everything
+    except the tick-stall watchdog, which escalates it to a human rather
+    than fix it (VOYN-W0-AICC-TICK-STALL-WATCHDOG deliberately never mutates
+    the stalled item itself). Live: VOYN-W0-AICC-SRV-07c, five consecutive
+    `pr_evidence` ticks 2026-11-04 14:18-14:44 before escalation.
+
+    `threshold` mirrors the watchdog's own default rather than acting on the
+    very first skip: a push and its PR are not atomic, so one skip is
+    ordinary lag, not a stall. Reads `tick_skip_event` directly rather than
+    the watchdog's `detect_stalls`/`_load_episodes` -- those also exclude
+    any task already carrying an escalation ticket, which is exactly backward
+    here: an escalated task is the one most in need of this repair, not the
+    one to skip. The SQL gate re-reads `backlog_task` under `FOR UPDATE` and
+    re-checks both the status and the evidence-free condition itself before
+    acting, so a stale read here (an evidence row landing between this
+    query and the call, or the task leaving READY_TO_REVIEW some other way)
+    is caught there, not assumed here -- it comes back as an ordinary
+    `refused` entry, never a corrupted write.
+
+    `task_id`, when given, scopes to that one task -- mirroring `reconcile_
+    pr_evidence`'s own parameter so a `--task-id`-scoped CLI invocation
+    cannot have the side effect of recovering a different task entirely.
+    """
+    report = RecoveredStallReport()
+    with factory() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT s.task_id FROM "
+            "(SELECT tick_id FROM tick_observation WHERE tick_kind = %s "
+            " ORDER BY id DESC LIMIT 1) latest "
+            "JOIN tick_skip_event s ON s.tick_kind = %s AND s.tick_id = latest.tick_id "
+            "WHERE s.reason = %s AND s.consecutive_ticks >= %s "
+            "AND (%s IS NULL OR s.task_id = %s) "
+            "ORDER BY s.task_id",
+            (tick_kind, tick_kind, NO_OPEN_PR_ON_TASK_BRANCH, threshold, task_id, task_id),
+        )
+        task_ids = [row[0] for row in cur.fetchall()]
+    for task_id in task_ids:
+        with factory() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM backlog_recover_stuck_ready_to_review(%s)", (task_id,)
+            )
+            verdict = cur.fetchone()
+        if not verdict or not verdict[0]:
+            reason = (verdict[1] if verdict and len(verdict) > 1 else "") or "unknown"
+            report.refused.append((task_id, reason))
+            continue
+        report.recovered.append(task_id)
     return report
 
 

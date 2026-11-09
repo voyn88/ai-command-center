@@ -654,6 +654,7 @@ def main(argv: list[str] | None = None) -> int:
                     publish_review_verdicts,
                     reconcile_pr_evidence,
                     reconcile_review_once,
+                    recover_evidence_free_stalls,
                     review_once,
                 )
 
@@ -715,6 +716,20 @@ def main(argv: list[str] | None = None) -> int:
                 _watchdog.record_skips(conn, "review", tick_id, report.skipped)
                 _watchdog.record_skips(conn, "review_retry", tick_id, retry_report.skipped)
                 _watchdog.record_skips(conn, "review_marker", tick_id, marker_report.skipped)
+                # A task stuck READY_TO_REVIEW with no `pr` evidence (no PR
+                # ever appeared on its own branch) cannot be rescued by
+                # anything above -- reconcile_pr_evidence can only find a PR
+                # or fail to, never unstick the task that has none. This
+                # repairs that one dead end once the skip has repeated
+                # often enough to rule out ordinary publish lag (see
+                # recover_evidence_free_stalls).
+                recovery = recover_evidence_free_stalls(
+                    lambda: _nc(conn), tick_kind="pr_evidence", task_id=args.task_id
+                )
+                for task_id in recovery.recovered:
+                    print(f"RECOVER   {task_id} -> OPEN")
+                for task_id, reason in recovery.refused:
+                    print(f"RECOVER-SKIP {task_id}: {reason}")
                 stalls = _watchdog.watchdog_once(lambda: _nc(conn))
                 print(f"WATCHDOG  escalated={len(stalls.escalated)} refused={len(stalls.refused)}")
                 # Printed AFTER the scope closes: the remaining-budget half
