@@ -19,7 +19,7 @@ export default function BackgroundSwitcher({ label }: BackgroundSwitcherProps) {
 
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
-      <span style={{ fontSize: '0.7rem', color: 'var(--tx3)', textTransform: 'uppercase', letterSpacing: '0.04em' }}>{label}</span>
+      <span style={{ fontSize: '0.7rem', color: 'var(--tx3-aa)', textTransform: 'uppercase', letterSpacing: '0.04em' }}>{label}</span>
       <div style={{ display: 'flex', gap: '0.4rem' }}>
         {BACKGROUND_PRESETS.map((p) => (
           <button
