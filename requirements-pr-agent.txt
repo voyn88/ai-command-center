@@ -1,0 +1,7 @@
+# Self-hosted PR-Agent (Qodo OSS) review companion
+# (VOYN-W0-AICC-PR-AGENT-INTEGRATION). Installed into the same venv the
+# deploy-managed unit runs `command_center.db pr-agent-review` from
+# (deploy/systemd/aicc-pr-agent-review.service) -- NOT a dependency of the
+# core application, kept in its own file so a host that never runs this
+# companion tick never installs it.
+pr-agent==0.50.0

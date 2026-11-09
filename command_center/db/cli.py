@@ -198,6 +198,37 @@ def build_parser() -> argparse.ArgumentParser:
         "names the repository (the deploy-managed unit uses the release tree).",
     )
 
+    pr_agent_review = sub.add_parser(
+        "pr-agent-review",
+        help="One PR-Agent (Qodo OSS) tick (VOYN-W0-AICC-PR-AGENT-INTEGRATION): "
+        "run `pr_agent.cli ... review` against every open, non-draft pull "
+        "request this host has not already reviewed at its current head, "
+        "as a comment-only companion signal the review contour may read -- "
+        "it never posts the ACCEPTANCE/VERDICT marker and has no path to. "
+        "Skips cleanly (exit 0) with no GEMINI_API_KEY/GROQ_API_KEY "
+        "configured; never acquires one. GitHub+LLM only: opens no database "
+        "connection. Needs --repo-path.",
+    )
+    pr_agent_review.add_argument(
+        "--repo-path", default=".", help="Directory to run gh/git in."
+    )
+    pr_agent_review.add_argument(
+        "--state-path",
+        default="~/.aicc-pr-agent-state.json",
+        help="Per-PR dedup bookkeeping file. MUST resolve outside --repo-path "
+        "(a systemd StateDirectory path on a real deployment) -- enforced, "
+        "not just documented: an in-checkout path would make self-deploy's "
+        "dirty-tree check refuse every subsequent tick.",
+    )
+    pr_agent_review.add_argument(
+        "--timeout", type=int, default=600,
+        help="Per-PR subprocess budget in seconds (default 600).",
+    )
+    pr_agent_review.add_argument(
+        "--pr-limit", type=int, default=20,
+        help="Open PRs examined per tick, one REST page (default 20).",
+    )
+
     watchdog = sub.add_parser(
         "backlog-watchdog",
         help="One watchdog tick (VOYN-W0-AICC-TICK-STALL-WATCHDOG): read the "
@@ -387,6 +418,40 @@ def main(argv: list[str] | None = None) -> int:
         if window.quota is not None:
             print(window.quota.line())
         return 0
+
+    if args.command == "pr-agent-review":
+        # Deliberately BEFORE any database configuration or pool, same
+        # reasoning as backlog-pr-window above: this tick touches GitHub and
+        # an LLM API only, and must keep working on a host with no database
+        # role (or a down database) at all.
+        from command_center.orchestrator.pr_agent_review import (
+            PrAgentConfig,
+            review_once,
+        )
+
+        pr_report = review_once(
+            PrAgentConfig(
+                repo_path=args.repo_path,
+                state_path=args.state_path,
+                timeout=args.timeout,
+                pr_limit=args.pr_limit,
+            )
+        )
+        print(f"CREDENTIAL {pr_report.credential_env or 'none'}")
+        for number, url in pr_report.reviewed:
+            print(f"REVIEW    #{number} -> {url}")
+        for number, reason in pr_report.skipped:
+            print(f"SKIP      {('#' + str(number)) if number is not None else '-'}: {reason}")
+        for number, reason in pr_report.errors:
+            print(f"ERROR     {('#' + str(number)) if number is not None else '-'}: {reason}", file=sys.stderr)
+        if pr_report.quota is not None:
+            print(pr_report.quota.line())
+        # Errors are operational defects (listing failed, bad state path, a
+        # PR's own subprocess failed) -- distinct from the benign skips
+        # above, and reported with a non-zero exit so a timer run goes red
+        # instead of reporting success at the process level regardless of
+        # what happened underneath (review of PR #735, chunk 1/3, finding 2).
+        return 1 if pr_report.errors else 0
 
     try:
         config = load_config()
