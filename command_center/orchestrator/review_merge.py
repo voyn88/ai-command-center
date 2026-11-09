@@ -276,12 +276,13 @@ def reconcile_pr_evidence(
 
     This closes the hole by deriving what was already true rather than by
     trusting a claim. The task's branch name is fixed by the same contract
-    `publish_run` follows, so an open pull request whose head is exactly that
-    branch is that task's PR -- a fact GitHub is asked for directly:
+    `publish_run` follows, so a pull request whose head is exactly that branch
+    is that task's PR -- a fact GitHub is asked for directly. This includes a
+    PR already merged or closed before the evidence tick observes it:
 
     * the head branch must equal `backlog/<task id>` exactly (never a prefix
       match: `backlog/X` must not adopt `backlog/X-REM`'s pull request);
-    * exactly one open PR may match, because two would make the choice a guess;
+    * exactly one PR may match, because two would make the choice a guess;
     * a task that already has any `pr` evidence is left alone, so this can
       never overwrite or compete with what `publish_run` recorded.
 
@@ -332,7 +333,7 @@ def reconcile_pr_evidence(
             report.skipped.append((row_task_id, f"no_repo_route: {repo!r}"))
             continue
         branch = _task_branch(row_task_id)
-        decoded, failure = _open_pulls_for_branch(repo_path, branch)
+        decoded, failure = _pulls_for_branch(repo_path, branch)
         if decoded is None:
             report.skipped.append((row_task_id, failure))
             continue
@@ -348,7 +349,7 @@ def reconcile_pr_evidence(
             and entry["url"]
         ]
         if not matches:
-            report.skipped.append((row_task_id, "no_open_pr_on_task_branch"))
+            report.skipped.append((row_task_id, "no_pr_on_task_branch"))
             continue
         if len(matches) > 1:
             report.skipped.append((row_task_id, "ambiguous_open_prs_on_branch"))
@@ -377,12 +378,12 @@ def reconcile_pr_evidence(
     return report
 
 
-def _open_pulls_for_branch(
+def _pulls_for_branch(
     repo_path: str, branch: str
 ) -> tuple[list[dict[str, Any]] | None, str]:
-    """Open pull requests whose head is `branch`, as `[{url, headRefName}]`.
+    """Pull requests whose head is `branch`, as `[{url, headRefName}]`.
 
-    REST (`GET /repos/{owner}/{repo}/pulls?head=owner:branch`) rather than
+    REST (`GET /repos/{owner}/{repo}/pulls?state=all&head=owner:branch`) rather than
     `gh pr list --head` (GraphQL): this runs once per unrecorded task on
     every review tick, and the review tick is one of the three that stopped
     dead when the shared human GraphQL quota ran out.
@@ -393,6 +394,13 @@ def _open_pulls_for_branch(
     `backlog/<task id>` to origin, and a fork's branch of the same name is
     somebody else's work, not this task's evidence.
 
+    Closed and merged PRs are deliberately included. Evidence reconciliation
+    can run after the PR has left the open set (for example, when a publisher
+    recorded no evidence before a manual merge). Restricting this lookup to
+    ``state=open`` made such a READY_TO_REVIEW task invisible forever and
+    prevented the merge tick from performing its existing terminal-state
+    reconciliation.
+
     Returns `(None, reason)` when the lookup produced no evidence at all, so
     the caller can report the skip rather than mistake a failed lookup for
     "this task has no pull request"."""
@@ -402,7 +410,7 @@ def _open_pulls_for_branch(
     owner, repo = origin
     head = urllib.parse.quote(f"{owner}:{branch}", safe="")
     outcome, decoded = _rest_json(
-        repo_path, f"repos/{owner}/{repo}/pulls?state=open&per_page=20&head={head}"
+        repo_path, f"repos/{owner}/{repo}/pulls?state=all&per_page=20&head={head}"
     )
     if outcome == _REST_FAILED:
         return None, "pr_list_failed"

@@ -4332,7 +4332,7 @@ def test_a_task_adopts_only_its_own_branch_never_a_prefix_match(rig, _test_repo_
     report = reconcile_pr_evidence(app_factory, REPO)
 
     assert _pr_rows(app_factory, task_id) == []
-    assert (task_id, "no_open_pr_on_task_branch") in report.skipped
+    assert (task_id, "no_pr_on_task_branch") in report.skipped
 
 
 def test_two_open_prs_on_one_branch_are_refused_rather_than_guessed(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
@@ -4424,18 +4424,47 @@ def test_the_lookup_runs_in_the_checkout_the_tick_was_given(rig, _test_repo_rout
     app_factory, store, _ = rig
     task_id = "VOYN-W0-PRE8"
     _ready_without_pr(store, app_factory, task_id)
-    seen: list[str] = []
+    seen: list[tuple[list[str], str]] = []
 
     import subprocess as sp
 
     def fake_gh(argv, repo):
-        seen.append(repo)
+        seen.append((argv, repo))
         return sp.CompletedProcess(argv, 0, json.dumps([]), "")
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     reconcile_pr_evidence(app_factory, REPO)
 
-    assert seen == [REPO]
+    assert len(seen) == 1
+    argv, repo = seen[0]
+    assert repo == REPO
+    assert "state=all" in argv[1]
+
+
+def test_a_merged_pr_on_the_task_branch_becomes_evidence(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+    """A late evidence tick must still hand a merged PR to terminal reconcile."""
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE9"
+    _ready_without_pr(store, app_factory, task_id)
+    url = "https://github.com/x/repo-d2/pull/907"
+    calls: list[list[str]] = []
+
+    import subprocess as sp
+
+    def fake_gh(argv, repo):
+        calls.append(argv)
+        body = json.dumps([
+            {"html_url": url, "head": {"ref": f"backlog/{task_id}"}}
+        ])
+        return sp.CompletedProcess(argv, 0, body, "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+
+    report = reconcile_pr_evidence(app_factory, REPO, task_id=task_id)
+
+    assert report.recorded == [(task_id, url)]
+    assert _pr_rows(app_factory, task_id) == [url]
+    assert "state=all" in calls[0][1]
 
 
 # -- reconcile_pr_window: no database involved, gh is faked in-process ------
