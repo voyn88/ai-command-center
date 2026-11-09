@@ -1958,6 +1958,13 @@ def trusted_publish_clone(
             failed_step="checkout_trusted_candidate",
             env=trusted_git_environment,
         )
+        # Status deliberately combines the fresh publisher's trusted index
+        # with the agent workspace as its explicit work tree.  Classify any
+        # exception against that exact work tree; the publisher checkout is
+        # never weakened by paths discovered in a different tree.
+        cache_exclusions = _safe_unreadable_cache_exclusions(
+            publisher, workspace, expected_branch=expected_branch
+        )
         clean = subprocess.run(
             [
                 "git",
@@ -1970,6 +1977,9 @@ def trusted_publish_clone(
                 "status",
                 "--porcelain",
                 "--untracked-files=all",
+                "--",
+                ".",
+                *cache_exclusions,
             ],
             cwd=publisher,
             capture_output=True,
@@ -2108,6 +2118,146 @@ def _run_trusted_worktree_git(
             detail=(result.stderr or result.stdout).strip() or "trusted Git operation failed",
         )
     return result
+
+
+_DISPOSABLE_CACHE_DIRS = frozenset({".pytest_cache", ".ruff_cache", "__pycache__"})
+_CACHE_SCAN_ENTRY_LIMIT = 100_000
+_CACHE_CANDIDATE_LIMIT = 1_024
+_CACHE_PATHSPEC_BATCH_BYTES = 32_768
+
+
+def _stat_accessible_to_current_user(info: os.stat_result, *, directory: bool) -> bool:
+    """Model access without letting root's DAC override hide bad permissions."""
+    if info.st_uid == os.geteuid():
+        bits = (info.st_mode >> 6) & 0o7
+    elif info.st_gid in {os.getegid(), *os.getgroups()}:
+        bits = (info.st_mode >> 3) & 0o7
+    else:
+        bits = info.st_mode & 0o7
+    required = 0o5 if directory else 0o4
+    return bits & required == required
+
+
+def _unreadable_cache_candidates(
+    workspace: Path, *, expected_branch: str
+) -> list[str]:
+    """Find allowlisted caches containing data this worker cannot inspect.
+
+    The walk is iterative and bounded because the tree is agent-controlled.
+    Unknown unreadable paths are deliberately not returned: Git will reject
+    them later, preserving the fail-closed behaviour.
+    """
+    pending: list[tuple[Path, bool]] = [(workspace, False)]
+    candidates: list[str] = []
+    entries_seen = 0
+    while pending:
+        directory, inside_cache = pending.pop()
+        try:
+            directory_info = directory.stat(follow_symlinks=False)
+        except OSError:
+            if inside_cache:
+                candidates.append(directory.relative_to(workspace).as_posix())
+            continue
+        unreadable = not _stat_accessible_to_current_user(
+            directory_info, directory=True
+        )
+        if inside_cache and unreadable:
+            candidates.append(directory.relative_to(workspace).as_posix())
+            continue
+        try:
+            scan = os.scandir(directory)
+            with scan:
+                for entry in scan:
+                    entries_seen += 1
+                    if entries_seen > _CACHE_SCAN_ENTRY_LIMIT:
+                        raise WorkspaceVerificationError(
+                            failed_step="dirty_checkpoint_cache_scan",
+                            remediation="Preserve the dirty task clone and retry checkpointing.",
+                            expected_workspace=str(workspace),
+                            actual_workspace=str(workspace),
+                            expected_branch=expected_branch,
+                            detail="agent worktree exceeds the bounded cache scan",
+                        )
+                    if not inside_cache and entry.name == ".git":
+                        continue
+                    try:
+                        info = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        if inside_cache:
+                            candidates.append(directory.relative_to(workspace).as_posix())
+                            break
+                        continue
+                    if stat.S_ISDIR(info.st_mode):
+                        cache_root = inside_cache or entry.name in _DISPOSABLE_CACHE_DIRS
+                        pending.append((Path(entry.path), cache_root))
+                    elif inside_cache and not _stat_accessible_to_current_user(
+                        info, directory=False
+                    ):
+                        candidates.append(directory.relative_to(workspace).as_posix())
+                        break
+        except OSError:
+            if inside_cache:
+                candidates.append(directory.relative_to(workspace).as_posix())
+        if len(candidates) > _CACHE_CANDIDATE_LIMIT:
+            raise WorkspaceVerificationError(
+                failed_step="dirty_checkpoint_cache_scan",
+                remediation="Preserve the dirty task clone and retry checkpointing.",
+                expected_workspace=str(workspace),
+                actual_workspace=str(workspace),
+                expected_branch=expected_branch,
+                detail="agent worktree exceeds the bounded cache candidate scan",
+            )
+
+    # A child failure records the directory where it was observed. Collapse it
+    # to the nearest allowlisted cache root and de-duplicate without resolving
+    # agent-controlled symlinks.
+    roots: set[str] = set()
+    for candidate in candidates:
+        parts = Path(candidate).parts
+        for index, component in enumerate(parts):
+            if component in _DISPOSABLE_CACHE_DIRS:
+                roots.add(Path(*parts[: index + 1]).as_posix())
+                break
+    return sorted(roots)
+
+
+def _safe_unreadable_cache_exclusions(
+    publisher: Path, workspace: Path, *, expected_branch: str
+) -> list[str]:
+    """Return literal exclusions only for unreadable, wholly untracked caches."""
+    candidates = _unreadable_cache_candidates(
+        workspace, expected_branch=expected_branch
+    )
+    safe: list[str] = []
+    batch: list[str] = []
+    batch_bytes = 0
+
+    def classify(paths: list[str]) -> None:
+        if not paths:
+            return
+        tracked = _run_trusted_worktree_git(
+            publisher,
+            workspace,
+            ["ls-files", "-z", "--", *[f":(top,literal){path}" for path in paths]],
+            expected_branch=expected_branch,
+            failed_step="dirty_checkpoint_cache_classification",
+        ).stdout
+        tracked_paths = {path for path in tracked.split("\0") if path}
+        for path in paths:
+            prefix = f"{path}/"
+            if not any(item == path or item.startswith(prefix) for item in tracked_paths):
+                safe.append(path)
+
+    for path in candidates:
+        path_bytes = len(path.encode("utf-8", "surrogateescape")) + 32
+        if batch and batch_bytes + path_bytes > _CACHE_PATHSPEC_BATCH_BYTES:
+            classify(batch)
+            batch = []
+            batch_bytes = 0
+        batch.append(path)
+        batch_bytes += path_bytes
+    classify(batch)
+    return [f":(exclude,top,literal){path}" for path in safe]
 
 
 def _open_standalone_agent_git_dir(
@@ -2446,10 +2596,20 @@ def checkpoint_dirty_task_workspace(
         expected_candidate_sha=candidate_sha,
         require_clean=False,
     ) as publisher:
+        cache_exclusions = _safe_unreadable_cache_exclusions(
+            publisher, workspace, expected_branch=expected_branch
+        )
         status = _run_trusted_worktree_git(
             publisher,
             workspace,
-            ["status", "--porcelain", "--untracked-files=all"],
+            [
+                "status",
+                "--porcelain",
+                "--untracked-files=all",
+                "--",
+                ".",
+                *cache_exclusions,
+            ],
             expected_branch=expected_branch,
             failed_step="dirty_checkpoint_status",
         )
@@ -2458,7 +2618,7 @@ def checkpoint_dirty_task_workspace(
         _run_trusted_worktree_git(
             publisher,
             workspace,
-            ["add", "-A"],
+            ["add", "-A", "--", ".", *cache_exclusions],
             expected_branch=expected_branch,
             failed_step="dirty_checkpoint_stage",
         )
