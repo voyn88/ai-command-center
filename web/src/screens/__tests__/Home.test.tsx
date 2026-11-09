@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { describe, test, expect, vi, beforeEach } from 'vitest'
 import Home from '../Home'
 import { fetchHome } from '../../lib/api'
@@ -117,7 +117,15 @@ describe('Home', () => {
 
     const badge = await screen.findByText('Running now')
     expect(badge).toHaveAttribute('title', 'RUNNING')
-    expect(screen.queryByText('RUNNING')).not.toBeInTheDocument()
+    expect(badge).not.toHaveTextContent('RUNNING')
+    // raw code is in the collapsed per-panel "Service data" block
+    const details = Array.from(document.querySelectorAll('details.tech-details')) as HTMLDetailsElement[]
+    expect(details.length).toBeGreaterThanOrEqual(2)
+    expect(details.every((d) => !d.open)).toBe(true)
+    expect(details[0]).toHaveTextContent('Desktop Architecture D1')
+    expect(details[0]).toHaveTextContent('RUNNING')
+    fireEvent.click(details[0].querySelector('summary') as HTMLElement)
+    expect(details[0].open).toBe(true)
   })
 
   test('an unknown KPI meta_key renders nothing, never a raw i18n key', async () => {

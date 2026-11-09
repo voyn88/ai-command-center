@@ -166,9 +166,13 @@ describe('Tasks — one-button audit', () => {
     expect(screen.getByText('Project check: AICC')).toHaveAttribute('title', 'Task id: T-42')
     fireEvent.click(screen.getByText('Details'))
     expect(await screen.findByText('being clarified')).toHaveAttribute('title', 'brand_new_reason')
-    expect(screen.queryByText('brand_new_reason')).not.toBeInTheDocument()
+    const tech = document.querySelector('details.tech-details') as HTMLDetailsElement
+    expect(tech.open).toBe(false)
+    expect(tech).toHaveTextContent('brand_new_reason')
+    expect(tech).toHaveTextContent('wki_1')
+    expect(tech).toHaveTextContent('№1 expired / visibility_timeout')
     expect(screen.getByText(/№1 — timed out \(did not finish in time\)/)).toBeInTheDocument()
-    expect(screen.getByText('T-42')).toBeInTheDocument()
+    expect(tech).toHaveTextContent('T-42')
   })
 
   test('an empty filtered list offers "Reset filters"', async () => {

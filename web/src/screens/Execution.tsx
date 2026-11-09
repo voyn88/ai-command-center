@@ -4,6 +4,7 @@ import { fetchExecution } from '../lib/api'
 import type { ExecutionDTO, ExecutionRun } from '../lib/api'
 import BackgroundSwitcher from '../components/BackgroundSwitcher'
 import GlassPanel from '../components/GlassPanel'
+import TechDetails from '../components/TechDetails'
 import KpiCard from '../components/KpiCard'
 import LangToggle from '../components/LangToggle'
 import NavItem from '../components/NavItem'
@@ -39,9 +40,23 @@ function RunRow({ run, fallback, language }: { run: ExecutionRun; fallback: stri
         <span>{formatDurationRu(run.duration_seconds, t, fallback)}</span>
         <span title={resultTitle}>{result}</span>
       </div>
+      <TechDetails
+        title={t('techTitle')}
+        hint={t('techHint')}
+        items={[
+          [t('techState'), run.state],
+          [t('techFailure'), run.failure_reason],
+          [t('techExit'), run.exit_code],
+          [t('techVerdict'), run.verdict],
+          [t('techRunId'), run.id],
+          [t('techSource'), run.source],
+        ]}
+      />
     </article>
   )
 }
+
+const ATTENTION = 'ATTENTION' // virtual chip: FAILED + INTERRUPTED + UNKNOWN
 
 function runRank(state: string): number {
   if (ATTENTION_STATES.includes(state)) return 0
@@ -63,16 +78,25 @@ export default function Execution({ onNavigate }: { onNavigate: (screen: 'home' 
   useEffect(load, [])
   const retry = () => { mainRef.current?.focus(); load() }
 
-  const states = useMemo(() => data ? Object.entries(data.state_counts).filter(([, count]) => count > 0) : [], [data])
-  // A chip whose state vanished after a refresh must not leave the list stuck empty.
-  const state = selected === 'ALL' || states.some(([name]) => name === selected) ? selected : 'ALL'
+  // Everything on screen is counted from the rows we actually have (data.runs),
+  // never from the server's summary, so tiles, banner, chips and list agree.
+  const allRuns = useMemo(() => data?.runs || [], [data])
+  const states = useMemo(() => {
+    const counts = new Map<string, number>()
+    for (const run of allRuns) counts.set(run.state, (counts.get(run.state) ?? 0) + 1)
+    return [...counts.entries()]
+  }, [allRuns])
+  const attentionCount = allRuns.filter((run) => ATTENTION_STATES.includes(run.state)).length
+  const activeCount = allRuns.filter((run) => ['PREPARED', 'QUEUED', 'RUNNING'].includes(run.state)).length
+  const completedCount = allRuns.filter((run) => run.state === 'COMPLETED').length
+  // A chip whose rows vanished after a refresh must not leave the list stuck empty.
+  const state = selected === 'ALL' || (selected === ATTENTION && attentionCount > 0) || states.some(([name]) => name === selected) ? selected : 'ALL'
   const setState = setSelected
   const runs = useMemo(() => {
-    const list = data?.runs.filter((run) => state === 'ALL' || run.state === state) || []
+    const list = allRuns.filter((run) => state === 'ALL' || (state === ATTENTION ? ATTENTION_STATES.includes(run.state) : run.state === state))
     // Stable sort: attention first, then running, then the rest (only for "all").
     return state === 'ALL' ? [...list].sort((a, b) => runRank(a.state) - runRank(b.state)) : list
-  }, [data, state])
-  const attentionCount = data?.summary.needs_attention ?? 0
+  }, [allRuns, state])
 
   return (
     <div style={{ padding: '1.5rem', display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
@@ -92,18 +116,19 @@ export default function Execution({ onNavigate }: { onNavigate: (screen: 'home' 
         </aside>
         <main className="execution-main" tabIndex={-1} ref={mainRef}>
           {!data && !error && <GlassPanel><span role="status">{t('loading')}</span></GlassPanel>}
-          {error && <GlassPanel><p role="alert" style={{ color: 'var(--bad)' }}>{t('errorLoading')} {t('errorLoadingHint')}</p><button className="execution-back" onClick={retry}>{t('retry')}</button></GlassPanel>}
+          {error && <GlassPanel><p role="alert" style={{ color: 'var(--bad-text)' }}>{t('errorLoading')} {t('errorLoadingHint')}</p><button className="execution-back" onClick={retry}>{t('retry')}</button></GlassPanel>}
           {data && <>
             <div className="kpi-grid">
-              <KpiCard label={t('visibleRuns')} value={data.summary.visible_runs} meta={t('runHistory')} />
-              <KpiCard label={t('activeRuns')} value={data.summary.active} meta={t('running')} />
-              <KpiCard label={t('completedRuns')} value={data.summary.completed} meta={t('completedRuns')} />
-              <KpiCard label={t('needsAttentionRuns')} value={data.summary.needs_attention} meta={t('needsAttention')} />
+              <KpiCard label={t('visibleRuns')} value={allRuns.length} meta={t('runHistory')} />
+              <KpiCard label={t('activeRuns')} value={activeCount} meta={t('running')} />
+              <KpiCard label={t('completedRuns')} value={completedCount} meta={t('completedRuns')} />
+              <KpiCard label={t('needsAttentionRuns')} value={attentionCount} meta={t('needsAttention')} />
             </div>
-            {attentionCount > 0 && <div className="glass" role="status" style={{ padding: '.8rem 1.1rem', color: 'var(--warn)', fontWeight: 600 }}>{t('attentionBanner', { n: attentionCount })}</div>}
+            {attentionCount > 0 && <div className="glass" role="status" style={{ padding: '.8rem 1.1rem', color: 'var(--warn)', fontWeight: 600, display: 'flex', gap: '.8rem', alignItems: 'center', flexWrap: 'wrap' }}><span>{t('attentionBanner', { n: attentionCount })}</span><button type="button" className="execution-back" onClick={() => setState(ATTENTION)}>{t('attentionShow')}</button></div>}
             <GlassPanel title={t('runHistory')}>
               <div className="execution-filters" role="group" aria-label={t('allStates')}>
-                <button aria-pressed={state === 'ALL'} className={state === 'ALL' ? 'active' : ''} onClick={() => setState('ALL')}>{t('allStates')} · {data.summary.visible_runs}</button>
+                <button aria-pressed={state === 'ALL'} className={state === 'ALL' ? 'active' : ''} onClick={() => setState('ALL')}>{t('allStates')} · {allRuns.length}</button>
+                {attentionCount > 0 && <button aria-pressed={state === ATTENTION} className={state === ATTENTION ? 'active' : ''} onClick={() => setState(ATTENTION)}>{t('needsAttentionRuns')} · {attentionCount}</button>}
                 {states.map(([name, count]) => <button key={name} aria-pressed={state === name} title={name} className={state === name ? 'active' : ''} onClick={() => setState(name)}>{humanStatus(RUN_STATE_KEYS, name, t).label} · {count}</button>)}
               </div>
               <div className="execution-list">

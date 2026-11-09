@@ -10,7 +10,11 @@ export const RU = {
   kpiAllTime: 'всего',
   staleTitle: 'Давно без движения',
   staleNone: 'Застрявших задач нет.',
-  staleSome: 'Без движения 3 дня и больше: {{n}}',
+  staleSome: 'Дольше обычного без движения: {{n}}',
+  staleHint: 'В работе — от 3 дней, на проверке — от 2, на уточнении — от 5.',
+  staleAll: 'Показать все ({{n}})',
+  staleOption: 'Давно без движения ({{n}})',
+
   updatedAgo: 'обновлено {{age}}',
   detailsHint: 'Служебные данные задачи',
   detailsNote: 'Готово в списке задач ещё не значит, что изменение уже работает у пользователей.',
@@ -20,8 +24,6 @@ export const RU = {
   errorWithData: 'Не удалось обновить данные. Показан последний полученный список.',
   errorNoData: 'Не удалось загрузить задачи. Проверьте соединение и нажмите «Повторить».',
   priorityNone: 'Приоритет не задан',
-  showAll: 'Показать все',
-  showLess: 'Свернуть',
   noTasks: 'Задач пока нет.',
   statusUnclear: 'Статус уточняется',
 } as const
@@ -30,11 +32,13 @@ export function fmt(template: string, vars: Record<string, string | number>): st
   return template.replace(/\{\{(\w+)\}\}/g, (_, k: string) => String(vars[k] ?? ''))
 }
 
-/** Stale threshold (days) for the owner overview. The RU.staleSome text says "3 дня". */
-export const STALE_DAYS = 3
-
-/** Backlog statuses that need no more attention (terminal in the owner's eyes). */
-export const BACKLOG_TERMINAL = ['DONE', 'REJECTED', 'DECIDED', 'SPLIT']
+/**
+ * Backlog statuses that are expected to keep moving, and after how many full
+ * days without an update they count as stalled. Everything else (OPEN,
+ * UNTRIAGED, DEFER_TO_USER = "your move", terminal and unknown statuses) is
+ * never "stalled".
+ */
+export const STALE_AFTER_DAYS: Record<string, number> = { IN_PROGRESS: 3, READY_TO_REVIEW: 2, NEEDS_REFINEMENT: 5 }
 
 export const RUN_STATE_KEYS: Record<string, string> = {
   PREPARED: 'runPrepared',
@@ -101,6 +105,7 @@ export const REASON_KEYS: Record<string, string> = {
   quota_limit: 'reasonQuota',
   provider_api_error: 'reasonProviderApi',
   provider_exit_nonzero: 'reasonExitNonzero',
+  network_error: 'reasonNetwork',
   daemon_unreachable: 'reasonDaemon',
   model_missing: 'reasonModelMissing',
   insufficient_memory: 'reasonMemory',
@@ -127,7 +132,7 @@ export const KPI_META_KEYS: Record<string, string> = {
 }
 
 const RUN_STATE_COLOR: Record<string, string> = {
-  RUNNING: 'var(--run)',
+  RUNNING: 'var(--accent-text)',
   QUEUED: 'var(--warn)',
   PENDING: 'var(--warn)',
   PREPARED: 'var(--warn)',
@@ -135,11 +140,11 @@ const RUN_STATE_COLOR: Record<string, string> = {
   DONE: 'var(--ok)',
   COMPLETE: 'var(--ok)',
   SUCCESS: 'var(--ok)',
-  FAILED: 'var(--bad)',
-  ERROR: 'var(--bad)',
-  CANCELLED: 'var(--bad)',
-  INTERRUPTED: 'var(--bad)',
-  UNKNOWN: 'var(--bad)',
+  FAILED: 'var(--bad-text)',
+  ERROR: 'var(--bad-text)',
+  CANCELLED: 'var(--bad-text)',
+  INTERRUPTED: 'var(--bad-text)',
+  UNKNOWN: 'var(--bad-text)',
 }
 
 /** One colour map for every run-state badge (queue, execution). */
@@ -147,7 +152,7 @@ export function runStateColor(state: string): string {
   return RUN_STATE_COLOR[(state || '').toUpperCase()] ?? 'var(--tx3-aa)'
 }
 
-/** Run states that need the owner's eyes first. */
+/** Run states that need the owner's eyes first (single source for banner, tile, chips, sorting). */
 export const ATTENTION_STATES = ['FAILED', 'INTERRUPTED', 'UNKNOWN']
 
 export const runStateKey = (state: string): string => RUN_STATE_KEYS[(state || '').toUpperCase()] ?? 'statusUnclear'
@@ -188,8 +193,16 @@ export function formatRelativeAge(iso: string, t: TFunction, now?: Date): string
   return t(age.key, { n: age.key === 'ageDays' ? age.days : age.hours })
 }
 
-export function isStale(iso: string, days = STALE_DAYS, now: Date = new Date()): boolean {
+export function isStale(iso: string, days: number, now: Date = new Date()): boolean {
   return relativeAge(iso, now).days >= days
+}
+
+/** Full days a task of this status has been idle when that exceeds its threshold; null when not stalled. */
+export function stalledDays(status: string, iso: string, now: Date = new Date()): number | null {
+  const threshold = STALE_AFTER_DAYS[status]
+  if (threshold === undefined) return null
+  const { days } = relativeAge(iso, now)
+  return days >= threshold ? days : null
 }
 
 export function formatDurationRu(sec: number | null | undefined, t: TFunction, fallback: string): string {

@@ -26,7 +26,7 @@ test('renders real execution summary and run rows', async () => {
   await waitFor(() => expect(screen.getByText('implementation')).toBeInTheDocument())
   expect(screen.getByText('AI Command Center')).toBeInTheDocument()
   expect(screen.getAllByText('Running now').length).toBeGreaterThan(0)
-  expect(screen.queryByText('RUNNING')).not.toBeInTheDocument()
+  expect(document.querySelector('.execution-state')).toHaveTextContent('Running now')
   expect(screen.getByText('Visible runs')).toBeInTheDocument()
 })
 
@@ -36,7 +36,7 @@ test('shows plain Russian state labels with the raw id kept in a tooltip', async
 
   await waitFor(() => expect(screen.getByText('implementation')).toBeInTheDocument())
   expect(screen.getAllByText('Идёт сейчас').length).toBeGreaterThan(0)
-  expect(screen.queryByText('RUNNING')).not.toBeInTheDocument()
+  expect(document.querySelector('.execution-state')).toHaveTextContent('Идёт сейчас')
   expect(screen.getAllByText('Идёт сейчас')[0]).toHaveAttribute('title', 'RUNNING')
   expect(screen.getByText('Видимые запуски')).toBeInTheDocument()
 })
@@ -92,10 +92,16 @@ test('an unknown state shows a neutral phrase, the raw code only in a tooltip', 
   render(<Execution onNavigate={vi.fn()} />)
 
   await screen.findByText('odd run')
-  expect(screen.queryByText('WAITING_FOR_APPROVAL')).not.toBeInTheDocument()
-  expect(screen.queryByText('WEIRD_VERDICT')).not.toBeInTheDocument()
-  expect(screen.queryByText(/brand_new_reason/)).not.toBeInTheDocument()
-  expect(screen.getAllByText('Status being clarified')[0]).toHaveAttribute('title', 'WAITING_FOR_APPROVAL')
+  // Main text is neutral; raw codes live in the collapsed "Service data" block (and title).
+  expect(document.querySelector('.execution-state')).toHaveTextContent('Status being clarified')
+  expect(document.querySelector('.execution-meta')).not.toHaveTextContent(/WEIRD_VERDICT|brand_new_reason/)
+  expect(document.querySelector('.execution-state')).toHaveAttribute('title', 'WAITING_FOR_APPROVAL')
+  const details = document.querySelector('.execution-row details.tech-details') as HTMLDetailsElement
+  expect(details.open).toBe(false)
+  fireEvent.click(details.querySelector('summary') as HTMLElement)
+  expect(details).toHaveTextContent('WAITING_FOR_APPROVAL')
+  expect(details).toHaveTextContent('brand_new_reason')
+  expect(details).toHaveTextContent('WEIRD_VERDICT')
 })
 
 test('an empty filtered list offers "Reset filters" that restores the list', async () => {
@@ -114,4 +120,29 @@ test('an empty filtered list offers "Reset filters" that restores the list', asy
   expect(screen.queryByText('running one')).not.toBeInTheDocument()
   fireEvent.click(screen.getByRole('button', { name: /^All states/ }))
   expect(screen.getByText('running one')).toBeInTheDocument()
+})
+
+test('attention number comes from the rows, not from an out-of-sync summary', async () => {
+  const row = (id: string, state: string) => ({ id, source: 'v2', title: `run ${id}`, project: 'AICC', project_name: 'AICC', task_type: 'x', state, created_at: '2026-08-03T10:00:00', started_at: null, completed_at: null, duration_seconds: null, exit_code: null, failure_reason: null, verdict: null })
+  vi.mocked(fetchExecution).mockResolvedValueOnce({
+    summary: { visible_runs: 99, active: 50, completed: 40, needs_attention: 7 },
+    state_counts: { FAILED: 7 },
+    runs: [row('1', 'FAILED'), row('2', 'INTERRUPTED'), row('3', 'UNKNOWN'), row('4', 'CANCELLED'), row('5', 'RUNNING'), row('6', 'COMPLETED')],
+  })
+  render(<Execution onNavigate={vi.fn()} />)
+  await screen.findByText('run 1')
+
+  expect(screen.getByText('Need attention: 3')).toBeInTheDocument()
+  const tiles = Array.from(document.querySelectorAll('.kpi-grid > .glass'))
+  const tile = (label: string) => tiles.find((el) => el.textContent?.startsWith(label)) as HTMLElement
+  expect(tile('Needs attention')).toHaveTextContent('3')
+  expect(tile('Visible runs')).toHaveTextContent('6')
+  expect(tile('Active now')).toHaveTextContent('1')
+  expect(tile('Completed')).toHaveTextContent('1')
+  const chip = screen.getByRole('button', { name: /^Needs attention · 3$/ })
+  const fixedSum = ['Failed', 'Interrupted', 'State unknown'].map((n) => Number(screen.getByRole('button', { name: new RegExp(`^${n} · `) }).textContent?.split('· ')[1])).reduce((a, b) => a + b, 0)
+  expect(fixedSum).toBe(3)
+  fireEvent.click(screen.getByRole('button', { name: 'Show' }))
+  expect(chip).toHaveAttribute('aria-pressed', 'true')
+  expect(screen.getAllByRole('article')).toHaveLength(3)
 })

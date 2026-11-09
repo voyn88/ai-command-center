@@ -6,6 +6,7 @@ import { kpiMeta } from '../lib/labels'
 import { fetchHome } from '../lib/api'
 import type { HomeDTO, Kpi } from '../lib/api'
 import GlassPanel from '../components/GlassPanel'
+import TechDetails from '../components/TechDetails'
 import KpiCard from '../components/KpiCard'
 import QueueRow from '../components/QueueRow'
 import HealthDonut from '../components/HealthDonut'
@@ -132,7 +133,7 @@ export default function Home({ onNavigate = () => undefined }: { onNavigate?: (s
   if (error || !data) {
     return (
       <CenteredPanel>
-        <div role="alert" style={{ color: 'var(--bad)', marginBottom: '0.25rem' }}>{error || t('errorLoading')}</div>
+        <div role="alert" style={{ color: 'var(--bad-text)', marginBottom: '0.25rem' }}>{error || t('errorLoading')}</div>
         <div style={{ color: 'var(--tx2)', fontSize: '0.8rem', marginBottom: '0.75rem' }}>{t('errorLoadingHint')}</div>
         <button
           type="button"
@@ -221,6 +222,7 @@ export default function Home({ onNavigate = () => undefined }: { onNavigate?: (s
                   />
                 ))
               )}
+              <TechDetails title={t('techTitle')} hint={t('techHint')} items={data.queue.map((item) => [item.title, item.state])} />
             </GlassPanel>
 
             <GlassPanel title={t('projectHealth')}>
@@ -245,7 +247,7 @@ export default function Home({ onNavigate = () => undefined }: { onNavigate?: (s
                     {p.redacted ? (
                       <span style={{ fontSize: '0.75rem', color: 'var(--tx3-aa)' }}>{t('restricted')}</span>
                     ) : (
-                      <span style={{ fontSize: '0.75rem', color: p.healthy ? 'var(--ok)' : 'var(--bad)' }}>
+                      <span style={{ fontSize: '0.75rem', color: p.healthy ? 'var(--ok)' : 'var(--bad-text)' }}>
                         {p.healthy ? t('healthy') : t('needsAttention')}
                       </span>
                     )}
@@ -264,6 +266,7 @@ export default function Home({ onNavigate = () => undefined }: { onNavigate?: (s
                   <ActivityRow key={item.id || `${item.ts || ''}-${i}`} item={item} fallbackLabel={t('activityGeneric')} projectLabel={item.project ? projectLabel(item.project) : undefined} />
                 ))
               )}
+              <TechDetails title={t('techTitle')} hint={t('techHint')} items={data.activity.map((item) => [item.project ? projectLabel(item.project) : t('techEvent'), item.event_type || item.type])} />
             </GlassPanel>
 
             <GlassPanel title={t('systemStatus')}>
@@ -279,6 +282,7 @@ export default function Home({ onNavigate = () => undefined }: { onNavigate?: (s
                   />
                 ))
               )}
+              <TechDetails title={t('techTitle')} hint={t('techHint')} items={data.status.map((s) => [projectLabel(s.project), s.repository_state])} />
             </GlassPanel>
           </div>
 

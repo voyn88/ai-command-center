@@ -43,19 +43,25 @@ function lightestBackground(value: string): RGB {
   return bg
 }
 
-describe('secondary text contrast (WCAG AA 4.5:1) on every background preset', () => {
-  const glass = parseColor(token('glass'))
-  for (const textToken of ['tx3-aa', 'tx2']) {
+const TEXT_TOKENS = ['tx', 'tx2', 'tx3-aa', 'accent-text', 'bad-text', 'warn', 'ok', 'teal']
+
+describe('text contrast (WCAG AA 4.5:1) on every background preset, with that preset\'s own glass', () => {
+  for (const textToken of TEXT_TOKENS) {
     const text = parseColor(token(textToken)).rgb
     for (const preset of BACKGROUND_PRESETS) {
       test(`--${textToken} on glass over "${preset.id}"`, () => {
+        const glass = parseColor(preset.glass)
         const surface = over(glass.rgb, glass.a, lightestBackground(preset.value))
         const r = ratio(text, surface)
         expect(r, `${textToken}/${preset.id} = ${r.toFixed(2)}`).toBeGreaterThanOrEqual(4.5)
       })
     }
   }
-  test('covers all presets', () => {
+  test('covers all presets and the default glass stays at .55', () => {
     expect(BACKGROUND_PRESETS.length).toBe(7)
+    expect(token('glass')).toBe('rgba(17,22,38,.55)')
+    expect(Object.fromEntries(BACKGROUND_PRESETS.map((p) => [p.id, parseColor(p.glass).a]))).toEqual({
+      auto: 0.55, day: 0.76, sunset: 0.72, night: 0.55, rain: 0.55, snow: 0.78, custom: 0.55,
+    })
   })
 })

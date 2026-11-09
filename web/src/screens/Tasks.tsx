@@ -21,6 +21,7 @@ import BackgroundSwitcher from '../components/BackgroundSwitcher'
 import GlassPanel from '../components/GlassPanel'
 import LangToggle from '../components/LangToggle'
 import NavItem from '../components/NavItem'
+import TechDetails from '../components/TechDetails'
 import { ExecutionIcon, HomeIcon, TasksIcon } from '../components/NavIcons'
 import { fetchHome } from '../lib/api'
 import type { Project } from '../lib/api'
@@ -42,8 +43,8 @@ function statusKey(state: string): string {
 
 function statusTone(state: string): string {
   if (state === 'succeeded') return 'var(--ok)'
-  if (state === 'dead') return 'var(--bad)'
-  if (state === 'claimed') return 'var(--accent-2)'
+  if (state === 'dead') return 'var(--bad-text)'
+  if (state === 'claimed') return 'var(--accent-text)'
   return 'var(--tx3-aa)'
 }
 
@@ -94,9 +95,18 @@ function TaskDetails({ detail, fallback }: { detail: QueueItemDetail; fallback: 
               )
             })}
       </p>
-      {/* Технические идентификаторы — только здесь, моноширинно, для копирования в отчёт. */}
-      <p className="task-details-tech">{detail.work_item_id}</p>
-      {detail.task_id && <p className="task-details-tech" title={t('taskIdLabel')}>{detail.task_id}</p>}
+      {/* Raw ids and codes live only in the collapsed "Service data" block. */}
+      <TechDetails
+        title={t('techTitle')}
+        hint={t('techHint')}
+        items={[
+          [t('techWorkItem'), detail.work_item_id],
+          [t('techTask'), detail.task_id],
+          [t('techState'), detail.state],
+          [t('techReason'), detail.dead_reason],
+          [t('techAttempts'), detail.attempts.length ? detail.attempts.map((a, i) => <span key={i} style={{ display: 'block' }}>{`№${a.attempt_no} ${a.state}${a.outcome_reason ? ` / ${a.outcome_reason}` : ''}`}</span>) : null],
+        ]}
+      />
     </div>
   )
 }
@@ -131,7 +141,7 @@ function TaskRow({ item, language, fallback }: { item: QueueItem; language: stri
       {open && (
         <>
           {!detail && !detailError && <p className="task-details">{t('loading')}</p>}
-          {detailError && <p className="task-details" role="alert" style={{ color: 'var(--bad)' }}>{t('taskDetailsError')}</p>}
+          {detailError && <p className="task-details" role="alert" style={{ color: 'var(--bad-text)' }}>{t('taskDetailsError')}</p>}
           {detail && <TaskDetails detail={detail} fallback={t('notAvailable')} />}
         </>
       )}
@@ -234,7 +244,7 @@ function AuditLauncher({
           rows={2}
           style={{ width: '100%', resize: 'vertical', fontFamily: 'inherit' }}
         />
-        {status === 'error' && <p style={{ color: 'var(--bad)', margin: 0 }}>{t('auditError')}</p>}
+        {status === 'error' && <p style={{ color: 'var(--bad-text)', margin: 0 }}>{t('auditError')}</p>}
         {lastQueued && status === 'idle' && (
           <p style={{ color: 'var(--ok)', margin: 0 }}>{t('auditQueued')}</p>
         )}
@@ -248,7 +258,7 @@ function TokenGate({ notice, onUnlocked }: { notice?: string | null; onUnlocked:
   const [value, setValue] = useState('')
   return (
     <GlassPanel title={t('tokenPrompt')}>
-      {notice && <p style={{ color: 'var(--bad)', marginTop: 0 }}>{notice}</p>}
+      {notice && <p style={{ color: 'var(--bad-text)', marginTop: 0 }}>{notice}</p>}
       <p style={{ color: 'var(--tx3-aa)', marginTop: 0 }}>{t('tokenHint')}</p>
       <form
         style={{ display: 'flex', gap: '.6rem', flexWrap: 'wrap' }}
@@ -343,7 +353,7 @@ export default function Tasks({ onNavigate }: { onNavigate: (screen: 'home' | 'e
           {!locked && !items && !error && <GlassPanel><span role="status">{t('loading')}</span></GlassPanel>}
           {!locked && error && (
             <GlassPanel>
-              <p role="alert" style={{ color: 'var(--bad)' }}>{t('errorLoading')} {t('errorLoadingHint')}</p>
+              <p role="alert" style={{ color: 'var(--bad-text)' }}>{t('errorLoading')} {t('errorLoadingHint')}</p>
               <button className="execution-back" onClick={() => { mainRef.current?.focus(); load() }}>{t('retry')}</button>
             </GlassPanel>
           )}

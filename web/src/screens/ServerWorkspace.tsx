@@ -5,11 +5,12 @@ import GlassPanel from '../components/GlassPanel'
 import KpiCard from '../components/KpiCard'
 import NavItem from '../components/NavItem'
 import OwnerTaskActions from '../components/OwnerTaskActions'
+import TechDetails from '../components/TechDetails'
 import { HomeIcon, TasksIcon, ExecutionIcon } from '../components/NavIcons'
 import { fetchBacklog, statusName } from '../lib/backlogApi'
 import type { BacklogSnapshot, BacklogTask } from '../lib/backlogApi'
 import i18n from '../lib/i18n'
-import { BACKLOG_TERMINAL, fmt, formatRelativeAge, isStale, priorityLabel, RU } from '../lib/labels'
+import { fmt, formatRelativeAge, priorityLabel, RU, STALE_AFTER_DAYS, stalledDays } from '../lib/labels'
 import '../theme/serverWorkspace.css'
 
 // Server mode is Russian regardless of the saved UI language.
@@ -17,7 +18,10 @@ const tRu = i18n.getFixedT('ru')
 
 type Screen = 'home' | 'tasks' | 'execution'
 const initialScreen = (): Screen => window.location.hash === '#tasks' || window.location.search.includes('master_backlog') ? 'tasks' : window.location.hash === '#execution' ? 'execution' : 'home'
-const isStalled = (task: BacklogTask) => !BACKLOG_TERMINAL.includes(task.status) && isStale(task.updated_at)
+const idleDays = (task: BacklogTask) => stalledDays(task.status, task.updated_at)
+const isStalled = (task: BacklogTask) => idleDays(task) !== null
+const STALLED = 'STALLED'
+const STALE_CAP = 5
 const order: Record<string, number> = { DEFER_TO_USER: 0, IN_PROGRESS: 1, READY_TO_REVIEW: 2, NEEDS_REFINEMENT: 3, OPEN: 4 }
 const displayDate = (value: string) => {
   const date = new Date(value)
@@ -29,10 +33,10 @@ function TaskCard({ task, commands, onChanged }: { task: BacklogTask; commands?:
   const priority = priorityLabel(task.priority, tRu)
   const age = formatRelativeAge(task.updated_at, tRu)
   return <article className="owner-task">
-    <div className="owner-task-meta"><span className={`owner-status status-${task.status}`} title={task.status}>{statusName(task.status)}</span><span>{task.project}</span>{isStalled(task) && <span className="owner-stale">{tRu('staleBadge')}</span>}</div>
+    <div className="owner-task-meta"><span className={`owner-status status-${task.status}`} title={task.status}>{statusName(task.status)}</span><span>{task.project}</span>{isStalled(task) && <span className="owner-stale">{tRu('staleBadgeDays', { n: idleDays(task) })}</span>}</div>
     <h3>{task.title === '[REDACTED]' ? 'Описание скрыто: содержит служебные данные' : task.title}</h3>
     <div className="owner-task-meta"><span title={priority.title}>{priority.label}</span><span title={displayDate(task.updated_at)}>{age ? fmt(RU.updatedAgo, { age }) : displayDate(task.updated_at)}</span></div>
-    <details onToggle={e => setOpen(e.currentTarget.open)}><summary>Подробнее{commands ? ' и действия' : ''}</summary><p className="owner-muted">{RU.detailsHint}</p><p className="owner-id">{task.id}</p><p>{RU.detailsNote}</p>{commands && open && <OwnerTaskActions taskId={task.id} onChanged={onChanged} />}</details>
+    <details onToggle={e => setOpen(e.currentTarget.open)}><summary>Подробнее{commands ? ' и действия' : ''}</summary><p>{RU.detailsNote}</p>{commands && open && <OwnerTaskActions taskId={task.id} onChanged={onChanged} />}<TechDetails large title={tRu('techTitle')} hint={tRu('techHint')} items={[[tRu('techId'), task.id], [tRu('techStatus'), task.status], [tRu('techPriority'), task.priority]]} /></details>
   </article>
 }
 
@@ -46,7 +50,6 @@ export default function ServerWorkspace() {
   const [status, setStatus] = useState('ALL')
   const [project, setProject] = useState('ALL')
   const [limit, setLimit] = useState(30)
-  const [showAllStale, setShowAllStale] = useState(false)
   const refreshButton = useRef<HTMLButtonElement>(null)
   const restoreFocus = useRef(false)
 
@@ -80,13 +83,15 @@ export default function ServerWorkspace() {
   const tasks = data?.tasks || []
   const counts = data?.counts || {}
   const filtered = tasks.filter(task =>
-    (status === 'ALL' || task.status === status) &&
+    (status === 'ALL' || (status === STALLED ? isStalled(task) : task.status === status)) &&
     (project === 'ALL' || task.project === project) &&
     (screen !== 'execution' || ['IN_PROGRESS', 'READY_TO_REVIEW'].includes(task.status)) &&
     `${task.title} ${task.id} ${task.project}`.toLocaleLowerCase().includes(query.toLocaleLowerCase()),
   ).sort((a, b) => (order[a.status] ?? 9) - (order[b.status] ?? 9) || (a.priority || 'Z').localeCompare(b.priority || 'Z') || b.updated_at.localeCompare(a.updated_at))
   const attention = tasks.filter(t => t.status === 'DEFER_TO_USER')
-  const stalled = tasks.filter(isStalled).sort((a, b) => a.updated_at.localeCompare(b.updated_at))
+  // Excess over the status threshold first, then priority P0 -> P3. DEFER_TO_USER is never stalled ("your move" wins).
+  const excess = (t: BacklogTask) => (idleDays(t) ?? 0) - (STALE_AFTER_DAYS[t.status] ?? 0)
+  const stalled = tasks.filter(isStalled).sort((a, b) => excess(b) - excess(a) || (a.priority || 'Z').localeCompare(b.priority || 'Z'))
   const filtersActive = query !== '' || project !== 'ALL' || status !== 'ALL'
   const retry = () => { restoreFocus.current = true; setLoading(true); setRefresh(n => n + 1) }
   // The Retry button unmounts on success; give focus to the stable refresh button instead of losing it.
@@ -118,8 +123,9 @@ export default function ServerWorkspace() {
           </div>
           <GlassPanel title={RU.staleTitle}>
             <p className="owner-muted">{stalled.length ? fmt(RU.staleSome, { n: stalled.length }) : RU.staleNone}</p>
-            {stalled.slice(0, showAllStale ? stalled.length : 4).map((task, i) => <TaskCard key={`${task.id}-${i}`} task={task} commands={data.commands_enabled} onChanged={() => setRefresh(n => n + 1)} />)}
-            {stalled.length > 4 && <button className="owner-button" onClick={() => setShowAllStale(v => !v)} aria-expanded={showAllStale}>{showAllStale ? RU.showLess : `${RU.showAll} (${stalled.length})`}</button>}
+            <p className="owner-muted">{RU.staleHint}</p>
+            {stalled.slice(0, STALE_CAP).map((task, i) => <TaskCard key={`${task.id}-${i}`} task={task} commands={data.commands_enabled} onChanged={() => setRefresh(n => n + 1)} />)}
+            {stalled.length > STALE_CAP && <button className="owner-button" onClick={() => navigate('tasks', STALLED)}>{fmt(RU.staleAll, { n: stalled.length })}</button>}
           </GlassPanel>
           <div className="owner-section"><GlassPanel title="Проекты">
             {[...new Set(tasks.map(t => t.project))].sort().map(name => <button className="owner-project" key={name} onClick={() => { setProject(name); navigate('tasks') }}><strong>{name}</strong><span>{tasks.filter(t => t.project === name).length} задач →</span></button>)}
@@ -128,7 +134,7 @@ export default function ServerWorkspace() {
           <div className="owner-filters">
             <label>Поиск<input value={query} placeholder="Название или номер задачи" onChange={e => { setQuery(e.target.value); setLimit(30) }} /></label>
             <label>Проект<select value={project} onChange={e => { setProject(e.target.value); setLimit(30) }}><option value="ALL">Все проекты</option>{[...new Set(tasks.map(t => t.project))].sort().map(name => <option key={name}>{name}</option>)}</select></label>
-            <label>Статус<select value={status} onChange={e => { setStatus(e.target.value); setLimit(30) }}><option value="ALL">Все статусы</option>{Object.keys(counts).filter(s => screen !== 'execution' || ['IN_PROGRESS', 'READY_TO_REVIEW'].includes(s)).map(s => <option value={s} key={s}>{statusName(s)} ({counts[s]})</option>)}</select></label>
+            <label>Статус<select value={status} onChange={e => { setStatus(e.target.value); setLimit(30) }}><option value="ALL">Все статусы</option>{screen === 'tasks' && stalled.length > 0 && <option value={STALLED}>{fmt(RU.staleOption, { n: stalled.length })}</option>}{Object.keys(counts).filter(s => screen !== 'execution' || ['IN_PROGRESS', 'READY_TO_REVIEW'].includes(s)).map(s => <option value={s} key={s}>{statusName(s)} ({counts[s]})</option>)}</select></label>
           </div>
           <p className="owner-muted" role="status">Найдено {filtered.length} · Всего {data.total}</p>
           {filtered.slice(0, limit).map((task, i) => <TaskCard key={`${task.id}-${i}`} task={task} commands={data.commands_enabled} onChanged={() => setRefresh(n => n + 1)} />)}

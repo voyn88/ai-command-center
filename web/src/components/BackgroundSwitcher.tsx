@@ -14,6 +14,7 @@ export default function BackgroundSwitcher({ label }: BackgroundSwitcherProps) {
 
   function apply(preset: BackgroundPreset) {
     document.documentElement.style.setProperty('--bg', preset.value)
+    document.documentElement.style.setProperty('--glass', preset.glass)
     setActive(preset.id)
   }
 
