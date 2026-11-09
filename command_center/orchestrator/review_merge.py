@@ -283,7 +283,16 @@ def reconcile_pr_evidence(
       match: `backlog/X` must not adopt `backlog/X-REM`'s pull request);
     * exactly one open PR may match, because two would make the choice a guess;
     * a task that already has any `pr` evidence is left alone, so this can
-      never overwrite or compete with what `publish_run` recorded.
+      never overwrite or compete with what `publish_run` recorded;
+    * when no OPEN pull request matches, exactly one CLOSED one on the same
+      branch is adopted too (see `_closed_pulls_for_branch`). Without this, a
+      PR closed before this function ever ran leaves the task with no `pr`
+      evidence forever: `_merge_once`'s existing handling for a closed-
+      unmerged or bypass-merged PR only ever looks at tasks that already have
+      evidence, so such a task is invisible to the whole control plane and
+      this function reports the identical `no_open_pr_on_task_branch` skip
+      every tick with no way out (live stall
+      VOYN-W0-AICC-SRV-08-BACKUP-CRYPTO-STALL, first observed 2026-11-04).
 
     The lookup runs in `repo_path` -- the checkout this tick was given --
     exactly as `review_once` does for its own `gh` calls. The route table is
@@ -347,13 +356,37 @@ def reconcile_pr_evidence(
             and isinstance(entry.get("url"), str)
             and entry["url"]
         ]
-        if not matches:
-            report.skipped.append((row_task_id, "no_open_pr_on_task_branch"))
-            continue
         if len(matches) > 1:
             report.skipped.append((row_task_id, "ambiguous_open_prs_on_branch"))
             continue
-        pr_url = matches[0]["url"]
+        if matches:
+            pr_url = matches[0]["url"]
+        else:
+            # No OPEN pr on the branch. Before giving up, check for a
+            # CLOSED one: a PR closed (merged or not) before this
+            # reconciliation ever ran has no other way to become evidence,
+            # and without evidence the task is invisible to every other
+            # tick too -- an unrecoverable stall rather than a plain
+            # "nothing here yet" (see `_closed_pulls_for_branch`).
+            closed_decoded, closed_failure = _closed_pulls_for_branch(repo_path, branch)
+            if closed_decoded is None:
+                report.skipped.append((row_task_id, closed_failure))
+                continue
+            closed_matches = [
+                entry
+                for entry in closed_decoded
+                if isinstance(entry, dict)
+                and entry.get("headRefName") == branch
+                and isinstance(entry.get("url"), str)
+                and entry["url"]
+            ]
+            if not closed_matches:
+                report.skipped.append((row_task_id, "no_open_pr_on_task_branch"))
+                continue
+            if len(closed_matches) > 1:
+                report.skipped.append((row_task_id, "ambiguous_closed_prs_on_branch"))
+                continue
+            pr_url = closed_matches[0]["url"]
         # Written through `backlog_record_evidence`, never a direct INSERT:
         # the control plane's role has no write grant on `backlog_evidence`
         # itself, and every other writer in this codebase goes through the
@@ -396,13 +429,41 @@ def _open_pulls_for_branch(
     Returns `(None, reason)` when the lookup produced no evidence at all, so
     the caller can report the skip rather than mistake a failed lookup for
     "this task has no pull request"."""
+    return _pulls_for_branch(repo_path, branch, state="open")
+
+
+def _closed_pulls_for_branch(
+    repo_path: str, branch: str
+) -> tuple[list[dict[str, Any]] | None, str]:
+    """Closed pull requests (merged or not) whose head is `branch`.
+
+    `reconcile_pr_evidence` calls this only once the OPEN lookup above has
+    already come back empty: a PR closed without ever being merged, on a
+    branch whose task never got `pr` evidence recorded, is otherwise
+    invisible to the entire control plane forever -- `_merge_once` only
+    examines a task that already HAS `pr` evidence, so nothing downstream
+    of `reconcile_pr_evidence` can ever reach it (live stall
+    VOYN-W0-AICC-SRV-08-BACKUP-CRYPTO-STALL, 2026-11-04: the `pr_evidence`
+    tick skipped the same task with `no_open_pr_on_task_branch` for 5
+    ticks running, because its branch's only PR had already been closed
+    unmerged before this reconciliation ever ran). Recording that closed
+    PR as evidence routes the task into `_merge_once`'s existing
+    `pr_closed_unmerged` / `merged_without_acceptance_evidence` handling
+    instead of leaving it permanently unexamined."""
+    return _pulls_for_branch(repo_path, branch, state="closed")
+
+
+def _pulls_for_branch(
+    repo_path: str, branch: str, *, state: str
+) -> tuple[list[dict[str, Any]] | None, str]:
     origin = _origin_owner_repo(repo_path)
     if origin is None:
         return None, "pr_list_failed: no github origin remote"
     owner, repo = origin
     head = urllib.parse.quote(f"{owner}:{branch}", safe="")
     outcome, decoded = _rest_json(
-        repo_path, f"repos/{owner}/{repo}/pulls?state=open&per_page=20&head={head}"
+        repo_path,
+        f"repos/{owner}/{repo}/pulls?state={state}&per_page=20&head={head}",
     )
     if outcome == _REST_FAILED:
         return None, "pr_list_failed"

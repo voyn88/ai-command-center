@@ -4416,6 +4416,112 @@ def test_only_ready_to_review_tasks_are_examined(rig, _test_repo_routes, monkeyp
     assert all(entry[0] != task_id for entry in report.recorded)
 
 
+def _fake_pr_list_by_state(by_state):
+    """Like `_fake_pr_list`, but keyed on the `state=` query param so a test
+    can give the OPEN and CLOSED lookups different answers."""
+    import re as _re
+    import subprocess as sp
+
+    def fake_gh(argv, repo):
+        if argv[0] == "api" and "/pulls?" in argv[1]:
+            match = _re.search(r"state=([a-z]+)", argv[1])
+            state = match.group(1) if match else "open"
+            entries = by_state.get(state, [])
+            rest = [
+                {"html_url": entry["url"], "head": {"ref": entry["headRefName"]}}
+                for entry in entries
+            ]
+            return sp.CompletedProcess(argv, 0, json.dumps(rest), "")
+        return sp.CompletedProcess(argv, 1, "", "unexpected gh call")
+
+    return fake_gh
+
+
+def test_a_closed_pr_on_the_task_branch_becomes_evidence_when_no_open_pr_exists(
+    rig, _test_repo_routes, monkeypatch  # noqa: F811
+):
+    """A PR closed (merged or not) before `reconcile_pr_evidence` ever ran is
+    otherwise invisible to the whole control plane forever -- nothing else
+    ever examines a task with no `pr` evidence (live stall
+    VOYN-W0-AICC-SRV-08-BACKUP-CRYPTO-STALL). Adopting the closed PR as
+    evidence routes the task into `_merge_once`'s existing closed-PR
+    handling instead."""
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE9"
+    _ready_without_pr(store, app_factory, task_id)
+    branch = f"backlog/{task_id}"
+    url = "https://github.com/x/repo-d2/pull/910"
+    monkeypatch.setattr(
+        review_merge,
+        "_gh",
+        _fake_pr_list_by_state(
+            {"closed": [{"url": url, "headRefName": branch}]}
+        ),
+    )
+
+    report = reconcile_pr_evidence(app_factory, REPO)
+
+    assert (task_id, url) in report.recorded
+    assert _pr_rows(app_factory, task_id) == [url]
+
+
+def test_two_closed_prs_on_one_branch_are_refused_rather_than_guessed(
+    rig, _test_repo_routes, monkeypatch  # noqa: F811
+):
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE10"
+    _ready_without_pr(store, app_factory, task_id)
+    branch = f"backlog/{task_id}"
+    monkeypatch.setattr(
+        review_merge,
+        "_gh",
+        _fake_pr_list_by_state(
+            {
+                "closed": [
+                    {"url": "https://github.com/x/repo-d2/pull/911", "headRefName": branch},
+                    {"url": "https://github.com/x/repo-d2/pull/912", "headRefName": branch},
+                ]
+            }
+        ),
+    )
+
+    report = reconcile_pr_evidence(app_factory, REPO)
+
+    assert _pr_rows(app_factory, task_id) == []
+    assert (task_id, "ambiguous_closed_prs_on_branch") in report.skipped
+
+
+def test_an_open_pr_is_never_shadowed_by_a_closed_lookup(
+    rig, _test_repo_routes, monkeypatch  # noqa: F811
+):
+    """When an OPEN pr already matches, the CLOSED fallback must never even
+    run -- an open match is unambiguous and spending a second `gh` call on
+    it would be pure waste."""
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE11"
+    _ready_without_pr(store, app_factory, task_id)
+    branch = f"backlog/{task_id}"
+    open_url = "https://github.com/x/repo-d2/pull/913"
+    seen_states: list[str] = []
+    import re as _re
+    import subprocess as sp
+
+    def fake_gh(argv, repo):
+        match = _re.search(r"state=([a-z]+)", argv[1])
+        seen_states.append(match.group(1) if match else "")
+        if match and match.group(1) == "open":
+            rest = [{"html_url": open_url, "head": {"ref": branch}}]
+            return sp.CompletedProcess(argv, 0, json.dumps(rest), "")
+        return sp.CompletedProcess(argv, 1, "", "unexpected gh call")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+
+    report = reconcile_pr_evidence(app_factory, REPO)
+
+    assert (task_id, open_url) in report.recorded
+    assert seen_states == ["open"]
+
+
 def test_the_lookup_runs_in_the_checkout_the_tick_was_given(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
     """Not the route table's path. That second element is a worker's local
     directory and need not exist on the host running the tick — using it made
@@ -4435,7 +4541,9 @@ def test_the_lookup_runs_in_the_checkout_the_tick_was_given(rig, _test_repo_rout
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     reconcile_pr_evidence(app_factory, REPO)
 
-    assert seen == [REPO]
+    # The empty OPEN lookup triggers a follow-up CLOSED lookup (see the
+    # closed-PR-adoption tests below); both must run in the same checkout.
+    assert seen and set(seen) == {REPO}
 
 
 # -- reconcile_pr_window: no database involved, gh is faked in-process ------
