@@ -317,6 +317,18 @@ class WorkerDaemon:
         self._notify("STOPPING=1")
 
     def _execute(self, work: ClaimedWork) -> None:
+        # A claim is not permission to start. SQL serializes this decision
+        # with operator revocation and commits it before returning. On an
+        # unavailable gate (including an old schema), leave the lease to its
+        # existing expiry/reaper protocol; never launch or invent a result.
+        try:
+            authorized = self._store.authorize_start(work)
+        except Exception:
+            logger.warning("attempt %s: start authorization unavailable", work.attempt_id)
+            return
+        if not authorized:
+            logger.warning("attempt %s: start authorization denied", work.attempt_id)
+            return
         lease_lost = threading.Event()
         beat_stop = threading.Event()
         beat = threading.Thread(

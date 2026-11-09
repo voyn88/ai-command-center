@@ -108,6 +108,19 @@ class WorkQueueStore:
             claim_token=token,
         )
 
+    def authorize_start(self, work: ClaimedWork) -> bool:
+        """Commit the server's start decision before handing work to an executor.
+
+        The authenticated worker session and fenced claim capability identify
+        the caller; payload actor fields never authorize this operation.
+        """
+        token_hash = hashlib.sha256(work.claim_token.encode("ascii")).hexdigest()
+        row = self._call(
+            "SELECT * FROM cto_authorize_start(%s, %s)",
+            (work.attempt_id, token_hash),
+        )
+        return bool(row["ok"])
+
     def heartbeat(self, work: ClaimedWork) -> bool:
         """Renew the lease. ``False`` means the attempt is no longer ours —
         superseded after a lapse — and the only correct response is to stop
@@ -202,6 +215,10 @@ class WorkQueueStore:
                 backoff_seconds,
             ),
         )
+        if row["work_item_id"] is None:
+            # _call has committed the server refusal/audit before surfacing
+            # it. Never turn SQL NULL into a fabricated work-item ID "None".
+            raise ValueError("queue admission refused")
         return str(row["work_item_id"])
 
     # -- plumbing -------------------------------------------------------------

@@ -54,6 +54,9 @@ class ScriptedStore:
         self.calls.append(("heartbeat", work.attempt_id))
         return self.heartbeat_alive
 
+    def authorize_start(self, work):
+        return True
+
     def complete(self, work, result):
         self.calls.append(("complete", work.attempt_id, result))
         return True
@@ -78,6 +81,51 @@ def _run_until_idle(daemon: WorkerDaemon, store: ScriptedStore) -> None:
     # sleep is called with the idle backoff; use it as the stop trigger
     daemon._sleep = lambda _t: daemon.request_stop()  # type: ignore[method-assign]
     daemon.run_forever()
+
+
+@pytest.mark.parametrize("decision", [False, "unavailable", "missing_schema"])
+def test_cto_start_denial_never_invokes_handler_or_records_completion(decision, caplog):
+    work = _work({"kind": "echo", "actor": "cto", "executor": "trusted"})
+    store = ScriptedStore([])
+    handlers = []
+
+    def authorize(observed):
+        assert observed is work
+        if decision is not False:
+            raise RuntimeError("private diagnostic must not appear")
+        return False
+
+    if decision == "missing_schema":
+        store.authorize_start = None
+    else:
+        store.authorize_start = authorize
+    daemon = WorkerDaemon(store, {"echo": lambda *args: handlers.append(args)})
+    daemon._execute(work)
+    assert handlers == []
+    assert store.calls == []
+    assert "private diagnostic" not in caplog.text
+    assert "authorization" in caplog.text
+
+
+def test_cto_authorization_is_committed_before_handler_and_checked_per_attempt():
+    store = ScriptedStore([])
+    order = []
+    decisions = iter([True, False])
+
+    def authorize(work):
+        order.append(("authorize", work.attempt_id))
+        return next(decisions)
+
+    def handler(payload, lease_lost, attempt_no):
+        order.append(("handler", attempt_no))
+        return HandlerOutcome(ok=True, result={"observed": True})
+
+    store.authorize_start = authorize
+    daemon = WorkerDaemon(store, {"echo": handler})
+    daemon._execute(_work({"kind": "echo"}, "first"))
+    daemon._execute(_work({"kind": "echo"}, "retry"))
+    assert order == [("authorize", "first"), ("handler", 1), ("authorize", "retry")]
+    assert [call[1] for call in store.calls if call[0] == "complete"] == ["first"]
 
 
 def test_a_claimed_item_is_dispatched_and_completed() -> None:
@@ -354,6 +402,12 @@ class _FileLeaseStore:
     def heartbeat(self, work):
         self._publish(self.root / "lease", str(time.monotonic() + 1.0))
         return True
+
+    def authorize_start(self, work):
+        return (
+            (self.root / "claimed").read_text() == work.attempt_id
+            and float((self.root / "lease").read_text()) > time.monotonic()
+        )
 
     def _publish(self, path, text):
         # Atomic rename: a SIGKILL landing mid-write must never leave an
