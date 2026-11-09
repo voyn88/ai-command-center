@@ -46,21 +46,10 @@ services:
       - log_statement=ddl
       - -c
       - log_min_duration_statement=1000
-      # PITR requires a continuous WAL stream in addition to periodic base
-      # backups. Never overwrite an archived segment.
-      - -c
-      - wal_level=replica
-      - -c
-      - archive_mode=on
-      - -c
-      - archive_timeout=300s
-      - -c
-      - "archive_command=test ! -f /var/lib/postgresql/wal-archive/%f && cp %p /var/lib/postgresql/wal-archive/%f"
     ports:
       - "127.0.0.1:${AICC_PG_PORT:-5432}:5432"
     volumes:
       - aicc-pgdata:/var/lib/postgresql/data
-      - aicc-pgwal:/var/lib/postgresql/wal-archive
     healthcheck:
       test:
         ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB} -q"]
@@ -77,5 +66,3 @@ services:
 volumes:
   aicc-pgdata:
     name: aicc-pgdata
-  aicc-pgwal:
-    name: aicc-pgwal
