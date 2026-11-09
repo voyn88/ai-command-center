@@ -299,6 +299,9 @@ def test_the_control_plane_cannot_claim() -> None:
         # VOYN-OPS-AICC-PUBLISH-WINDOW-STARVATION (0015): the persisted
         # scan cursor for the tick windows.
         "backlog_scan_claim",
+        # 0035: exact-head invalidated-verdict priority queue.
+        "backlog_review_priority_mark",
+        "backlog_review_priority_pop",
         "backlog_triage",
         # 0030: clear proven malformed evidence through the audited function.
         "backlog_clear_evidence",

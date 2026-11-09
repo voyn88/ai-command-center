@@ -114,6 +114,13 @@ UNMIRRORED_SCHEMA_TABLES: dict[str, Exclusion] = {
         ),
         task="VOYN-OPS-AICC-PUBLISH-WINDOW-STARVATION",
     ),
+    "backlog_review_priority": Exclusion(
+        reason=(
+            "PostgreSQL-native tick-scheduler state from birth (0035): a "
+            "one-shot exact-head priority marker with no SQLite incumbent."
+        ),
+        task="VOYN-W0-AICC-INVALIDATED-VERDICT-PRIORITY-REREVIEW-REM",
+    ),
     "tick_observation": Exclusion(
         reason="PostgreSQL-native observations include empty ticks to break stale failure streaks; no SQLite database ever owned these records, so there is no source to mirror.",
         task="VOYN-W0-AICC-TICK-STALL-WATCHDOG",
