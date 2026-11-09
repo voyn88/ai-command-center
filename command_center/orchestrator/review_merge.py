@@ -282,6 +282,8 @@ def reconcile_pr_evidence(
     * the head branch must equal `backlog/<task id>` exactly (never a prefix
       match: `backlog/X` must not adopt `backlog/X-REM`'s pull request);
     * exactly one open PR may match, because two would make the choice a guess;
+    * when no open PR matches, exactly one closed PR may match so the merge
+      tick can perform its terminal merged/closed-unmerged recovery;
     * a task that already has any `pr` evidence is left alone, so this can
       never overwrite or compete with what `publish_run` recorded.
 
@@ -296,9 +298,9 @@ def reconcile_pr_evidence(
     origin of that checkout and nothing else, so a task can never be attached
     to a pull request in another repository.
 
-    Reporting only: no status is changed here. A task becomes reviewable
-    because it is `READY_TO_REVIEW` and now has evidence, through the same
-    path it always did.
+    Reporting only: no status is changed here. An open pull request becomes
+    reviewable through the same path it always did; a closed pull request is
+    handed to the merge tick, which owns the terminal state transition.
     """
     # Imported here, as  does, so this module keeps its
     # import-time independence from the planner.
@@ -332,7 +334,7 @@ def reconcile_pr_evidence(
             report.skipped.append((row_task_id, f"no_repo_route: {repo!r}"))
             continue
         branch = _task_branch(row_task_id)
-        decoded, failure = _open_pulls_for_branch(repo_path, branch)
+        decoded, failure = _pulls_for_branch(repo_path, branch, state="open")
         if decoded is None:
             report.skipped.append((row_task_id, failure))
             continue
@@ -348,8 +350,33 @@ def reconcile_pr_evidence(
             and entry["url"]
         ]
         if not matches:
-            report.skipped.append((row_task_id, "no_open_pr_on_task_branch"))
-            continue
+            # A closed PR still has to become evidence.  The merge tick owns
+            # the terminal decision (DONE when merged, REJECTED when closed
+            # unmerged), but it cannot inspect a PR that is absent from the
+            # evidence table.  Looking only for open PRs therefore stranded
+            # such tasks in READY_TO_REVIEW forever.  Preserve open-PR
+            # precedence, then adopt a closed PR only when the exact branch
+            # identifies one unambiguously.
+            decoded, failure = _pulls_for_branch(repo_path, branch, state="closed")
+            if decoded is None:
+                report.skipped.append((row_task_id, failure))
+                continue
+            matches = [
+                entry
+                for entry in decoded
+                if isinstance(entry, dict)
+                and entry.get("headRefName") == branch
+                and isinstance(entry.get("url"), str)
+                and entry["url"]
+            ]
+            if not matches:
+                # Keep the established reason stable for a genuinely absent
+                # PR; watchdog episode identity includes the reason string.
+                report.skipped.append((row_task_id, "no_open_pr_on_task_branch"))
+                continue
+            if len(matches) > 1:
+                report.skipped.append((row_task_id, "ambiguous_closed_prs_on_branch"))
+                continue
         if len(matches) > 1:
             report.skipped.append((row_task_id, "ambiguous_open_prs_on_branch"))
             continue
@@ -377,10 +404,10 @@ def reconcile_pr_evidence(
     return report
 
 
-def _open_pulls_for_branch(
-    repo_path: str, branch: str
+def _pulls_for_branch(
+    repo_path: str, branch: str, *, state: str = "open"
 ) -> tuple[list[dict[str, Any]] | None, str]:
-    """Open pull requests whose head is `branch`, as `[{url, headRefName}]`.
+    """Pull requests in ``state`` whose head is `branch`.
 
     REST (`GET /repos/{owner}/{repo}/pulls?head=owner:branch`) rather than
     `gh pr list --head` (GraphQL): this runs once per unrecorded task on
@@ -401,8 +428,10 @@ def _open_pulls_for_branch(
         return None, "pr_list_failed: no github origin remote"
     owner, repo = origin
     head = urllib.parse.quote(f"{owner}:{branch}", safe="")
+    if state not in {"open", "closed"}:
+        raise ValueError(f"unsupported pull request state: {state}")
     outcome, decoded = _rest_json(
-        repo_path, f"repos/{owner}/{repo}/pulls?state=open&per_page=20&head={head}"
+        repo_path, f"repos/{owner}/{repo}/pulls?state={state}&per_page=20&head={head}"
     )
     if outcome == _REST_FAILED:
         return None, "pr_list_failed"
