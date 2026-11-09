@@ -289,10 +289,12 @@ def test_basic_release_shared_origin_refusal(basic_credentials, monkeypatch):
 
 @pytest.mark.parametrize("capability", ["O_NOFOLLOW", "geteuid", "posix"])
 def test_missing_private_file_capability_fails_before_open(monkeypatch, capability):
-    if capability == "posix":
-        monkeypatch.setattr(cli.os, "name", "nt")
-    else:
-        monkeypatch.delattr(cli.os, capability, raising=False)
-    monkeypatch.setattr(cli.os, "open", lambda *a, **k: pytest.fail("must not read file"))
-    with pytest.raises(ValueError, match="require POSIX security capabilities"):
-        cli._read_basic_credentials("unused-private-credentials.json")
+    # Restore the shared os module before autouse temporary-directory cleanup.
+    with monkeypatch.context() as patch:
+        if capability == "posix":
+            patch.setattr(cli.os, "name", "nt")
+        else:
+            patch.delattr(cli.os, capability, raising=False)
+        patch.setattr(cli.os, "open", lambda *a, **k: pytest.fail("must not read file"))
+        with pytest.raises(ValueError, match="require POSIX security capabilities"):
+            cli._read_basic_credentials("unused-private-credentials.json")
