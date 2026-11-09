@@ -4283,7 +4283,12 @@ def _fake_pr_list(entries, *, returncode=0, stdout=None):
     import subprocess as sp
 
     rest = [
-        {"html_url": entry["url"], "head": {"ref": entry["headRefName"]}}
+        {
+            "html_url": entry["url"],
+            "head": {"ref": entry["headRefName"]},
+            "state": entry.get("state", "open"),
+            "merged_at": entry.get("mergedAt"),
+        }
         for entry in entries
     ]
 
@@ -4332,7 +4337,58 @@ def test_a_task_adopts_only_its_own_branch_never_a_prefix_match(rig, _test_repo_
     report = reconcile_pr_evidence(app_factory, REPO)
 
     assert _pr_rows(app_factory, task_id) == []
-    assert (task_id, "no_open_pr_on_task_branch") in report.skipped
+    assert (task_id, "no_open_or_merged_pr_on_task_branch") in report.skipped
+
+
+def test_a_merged_pr_on_the_task_branch_becomes_evidence(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+    """Evidence recovery must not become impossible as soon as the PR merges."""
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE2M"
+    _ready_without_pr(store, app_factory, task_id)
+    url = "https://github.com/x/repo-d2/pull/907"
+    monkeypatch.setattr(
+        review_merge,
+        "_gh",
+        _fake_pr_list(
+            [{
+                "url": url,
+                "headRefName": f"backlog/{task_id}",
+                "state": "closed",
+                "mergedAt": "2026-08-15T16:59:32Z",
+            }]
+        ),
+    )
+
+    report = reconcile_pr_evidence(app_factory, REPO)
+
+    assert (task_id, url) in report.recorded
+    assert _pr_rows(app_factory, task_id) == [url]
+
+
+def test_a_closed_unmerged_pr_is_not_adopted_as_evidence(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE2C"
+    _ready_without_pr(store, app_factory, task_id)
+    monkeypatch.setattr(
+        review_merge,
+        "_gh",
+        _fake_pr_list(
+            [{
+                "url": "https://github.com/x/repo-d2/pull/908",
+                "headRefName": f"backlog/{task_id}",
+                "state": "closed",
+                "mergedAt": None,
+            }]
+        ),
+    )
+
+    report = reconcile_pr_evidence(app_factory, REPO)
+
+    assert _pr_rows(app_factory, task_id) == []
+    assert (
+        task_id,
+        "no_open_or_merged_pr_on_task_branch",
+    ) in report.skipped
 
 
 def test_two_open_prs_on_one_branch_are_refused_rather_than_guessed(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501

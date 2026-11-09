@@ -269,7 +269,9 @@ def reconcile_pr_evidence(
     finds a task's pull request through `backlog_evidence(kind='pr')`, and
     exactly one writer ever filled that table: `publish_run`. So a pull request
     opened any other way is invisible to the entire control plane, no matter
-    how green it is. Measured live 2026-08-31: two PRs sat with every required
+    how green it is. The same is true if the PR merged before evidence was
+    recovered: limiting discovery to open PRs makes the loss permanent.
+    Measured live 2026-08-31: two PRs sat with every required
     check passing and were never once picked up, because `publish_run` cannot
     run at all on this fleet (it requires a `voyn-lease` binary that is not
     installed anywhere). The evidence had to be inserted by hand to move them.
@@ -281,7 +283,8 @@ def reconcile_pr_evidence(
 
     * the head branch must equal `backlog/<task id>` exactly (never a prefix
       match: `backlog/X` must not adopt `backlog/X-REM`'s pull request);
-    * exactly one open PR may match, because two would make the choice a guess;
+    * exactly one open or merged PR may match, because two would make the
+      choice a guess; closed-unmerged PRs are never evidence of delivery;
     * a task that already has any `pr` evidence is left alone, so this can
       never overwrite or compete with what `publish_run` recorded.
 
@@ -332,7 +335,7 @@ def reconcile_pr_evidence(
             report.skipped.append((row_task_id, f"no_repo_route: {repo!r}"))
             continue
         branch = _task_branch(row_task_id)
-        decoded, failure = _open_pulls_for_branch(repo_path, branch)
+        decoded, failure = _recoverable_pulls_for_branch(repo_path, branch)
         if decoded is None:
             report.skipped.append((row_task_id, failure))
             continue
@@ -344,11 +347,22 @@ def reconcile_pr_evidence(
             for entry in decoded
             if isinstance(entry, dict)
             and entry.get("headRefName") == branch
+            # A task can lose its evidence after its PR has already merged
+            # (for example, when old control-plane state is imported).  That
+            # PR is still authoritative evidence.  A closed-unmerged PR is
+            # not: adopting it would send failed work into the review/merge
+            # pipeline merely because its branch name matched.
+            and (
+                entry.get("state") == "open"
+                or (entry.get("state") == "closed" and entry.get("mergedAt"))
+            )
             and isinstance(entry.get("url"), str)
             and entry["url"]
         ]
         if not matches:
-            report.skipped.append((row_task_id, "no_open_pr_on_task_branch"))
+            report.skipped.append(
+                (row_task_id, "no_open_or_merged_pr_on_task_branch")
+            )
             continue
         if len(matches) > 1:
             report.skipped.append((row_task_id, "ambiguous_open_prs_on_branch"))
@@ -377,10 +391,15 @@ def reconcile_pr_evidence(
     return report
 
 
-def _open_pulls_for_branch(
+def _recoverable_pulls_for_branch(
     repo_path: str, branch: str
 ) -> tuple[list[dict[str, Any]] | None, str]:
-    """Open pull requests whose head is `branch`, as `[{url, headRefName}]`.
+    """Open or merged pull requests whose head is ``branch``.
+
+    Closed-unmerged pulls are returned with their state so the caller can
+    exclude them.  Merged pulls must remain discoverable: a PR can have
+    landed before its task's evidence was recorded, and querying only open
+    pulls makes that READY_TO_REVIEW task permanently unrecoverable.
 
     REST (`GET /repos/{owner}/{repo}/pulls?head=owner:branch`) rather than
     `gh pr list --head` (GraphQL): this runs once per unrecorded task on
@@ -402,7 +421,7 @@ def _open_pulls_for_branch(
     owner, repo = origin
     head = urllib.parse.quote(f"{owner}:{branch}", safe="")
     outcome, decoded = _rest_json(
-        repo_path, f"repos/{owner}/{repo}/pulls?state=open&per_page=20&head={head}"
+        repo_path, f"repos/{owner}/{repo}/pulls?state=all&per_page=20&head={head}"
     )
     if outcome == _REST_FAILED:
         return None, "pr_list_failed"
@@ -418,6 +437,8 @@ def _open_pulls_for_branch(
             {
                 "url": str(item.get("html_url") or ""),
                 "headRefName": str((item.get("head") or {}).get("ref") or ""),
+                "state": str(item.get("state") or "").lower(),
+                "mergedAt": item.get("merged_at"),
             }
         )
     return listed, ""
