@@ -575,6 +575,77 @@ def test_persistent_heartbeat_errors_stop_the_work() -> None:
     assert not any(c[0] == "complete" for c in store.calls)
 
 
+@pytest.mark.parametrize("heartbeat_ok", [False, True])
+def test_slow_heartbeat_exhausts_the_visibility_window(monkeypatch, heartbeat_ok):
+    """Database call time consumes the lease even when only one beat ran."""
+    import threading
+
+    from command_center.worker import daemon as daemon_module
+
+    clock = [0.0]
+    monkeypatch.setattr(daemon_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(daemon_module.sdnotify, "watchdog_interval_seconds", lambda: None)
+    store = ScriptedStore([])
+
+    def slow_heartbeat(work):
+        clock[0] += 3.0
+        if not heartbeat_ok:
+            raise ConnectionError("slow database timeout")
+        return True
+
+    store.heartbeat = slow_heartbeat
+    lease_lost = threading.Event()
+
+    class OneBeat:
+        def wait(self, interval):
+            if clock[0] > 0:
+                return True
+            clock[0] += interval
+            return False
+
+    daemon = WorkerDaemon(store, {}, WorkerConfig(visibility_seconds=3))
+    daemon._heartbeat_loop(_work({}), lease_lost, OneBeat())
+
+    assert lease_lost.is_set(), "slow heartbeat left the handler running past expiry"
+
+
+def test_successful_heartbeat_rearms_recovery_without_forgetting_call_latency(monkeypatch):
+    import threading
+
+    from command_center.worker import daemon as daemon_module
+
+    clock = [0.0]
+    waits = []
+    monkeypatch.setattr(daemon_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(daemon_module.sdnotify, "watchdog_interval_seconds", lambda: None)
+    store = ScriptedStore([])
+
+    def heartbeat(work):
+        store.calls.append(("heartbeat", work.attempt_id))
+        clock[0] += 0.25
+        if len(store.calls) == 2:
+            return True
+        raise ConnectionError("temporary database failure")
+
+    store.heartbeat = heartbeat
+    lease_lost = threading.Event()
+
+    class BeatStop:
+        def wait(self, interval):
+            waits.append(interval)
+            if len(waits) > 5:
+                return True
+            clock[0] += interval
+            return False
+
+    daemon = WorkerDaemon(store, {}, WorkerConfig(visibility_seconds=3))
+    daemon._heartbeat_loop(_work({}), lease_lost, BeatStop())
+
+    assert lease_lost.is_set()
+    assert len(store.calls) == 4, "recovery must renew the deadline after a successful beat"
+    assert waits == [1.0, 1.0, 1.0, 1.0, 0.25]
+
+
 # -- the systemd watchdog seam (SRV-06) --------------------------------------
 
 

@@ -427,8 +427,12 @@ class WorkerDaemon:
         watchdog = sdnotify.watchdog_interval_seconds()
         if watchdog is not None:
             interval = min(interval, max(watchdog, 1.0))
-        consecutive_errors = 0
-        while not beat_stop.wait(interval):
+        deadline = time.monotonic() + self._config.visibility_seconds
+        while not beat_stop.wait(min(interval, max(deadline - time.monotonic(), 0.0))):
+            started = time.monotonic()
+            if started >= deadline:
+                lease_lost.set()
+                return
             # Fed even when the database is unreachable: the watchdog answers
             # "is the process alive", not "is PostgreSQL up" — restarting the
             # unit cures a wedged process and cures nothing about a DB outage,
@@ -437,20 +441,17 @@ class WorkerDaemon:
             try:
                 alive = self._store.heartbeat(work)
             except Exception:
-                consecutive_errors += 1
                 logger.exception("heartbeat error for attempt %s", work.attempt_id)
-                # Errors are not refusals, but they are not free either: after
-                # a full visibility window without one successful beat the
-                # lease has provably lapsed on the server, whatever the reason
-                # here — and the handler must stop before its outcome becomes
-                # a stale write. Review found the interleaving this closes:
-                # DB down through the lapse, recovered before the handler
-                # finished, result refused as stale with no trace.
-                if consecutive_errors * interval >= self._config.visibility_seconds:
+                # Include database latency and scheduling delays, not just
+                # the nominal intervals between failed beats.
+                if time.monotonic() >= deadline:
                     lease_lost.set()
                     return
                 continue
-            consecutive_errors = 0
-            if not alive:
+            # PostgreSQL renews from transaction time, before the response
+            # arrives. Counting from request start conservatively accounts
+            # for that latency instead of granting a fresh window on receipt.
+            deadline = started + self._config.visibility_seconds
+            if not alive or time.monotonic() >= deadline:
                 lease_lost.set()
                 return
