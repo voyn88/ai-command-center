@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -248,14 +249,19 @@ def _run_ruff_fix(workspace: Path, report: PrescreenReport, budget: _Budget) -> 
         _skip(report, name)
         return
     try:
-        # `python3 -m ruff`, not a bare `ruff` PATH lookup: this always matches
-        # the interpreter's installed package (see `audit.checks._ruff`'s
-        # docstring for why a bare binary guess is the wrong default here). No
+        # Use the worker's current interpreter, not a bare `ruff` PATH lookup
+        # or the host's unrelated `python3`. This keeps an activated/toolchain
+        # venv intact (see `audit.checks._ruff` for why a bare binary guess is
+        # the wrong default here). No
         # `--quiet`: ruff's plain-text fix summary ("N fixed") is the only
         # cheap, reliable "did this actually change anything" signal -- a
         # before/after `git status` diff is blind to edits inside a file that
         # is still untracked (its status stays `??` either way).
-        plan = [parse_command("python3 -m ruff check --fix .")]
+        plan = [
+            parse_command(
+                f"{shlex.quote(sys.executable)} -m ruff check --fix ."
+            )
+        ]
     except InvalidValidationCommand as exc:
         report.steps.append(StepResult(name, ran=False, passed=True, detail=f"cannot build ruff command: {exc}"))
         return
@@ -279,7 +285,9 @@ def _run_compileall(workspace: Path, report: PrescreenReport, budget: _Budget) -
     if budget.remaining() < 1:
         _skip(report, name)
         return
-    plan = [parse_command(DEFAULT_VALIDATION_COMMANDS[0])]
+    command = parse_command(DEFAULT_VALIDATION_COMMANDS[0])
+    command.argv[0] = sys.executable
+    plan = [command]
     outcome = run_validation(str(workspace), plan, timeout_seconds=int(budget.remaining()))
     result = outcome.results[0] if outcome.results else None
     if result is None:

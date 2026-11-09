@@ -12,7 +12,7 @@ import subprocess
 from pathlib import Path
 
 from command_center.runtime import providers
-from command_center.worker import prepush_prescreen as ps
+from command_center import prepush_prescreen as ps
 
 
 def _head(repo: Path) -> str:

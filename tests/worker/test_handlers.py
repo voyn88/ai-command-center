@@ -22,7 +22,7 @@ from command_center import agent_runner, workspace_provisioning
 from command_center.orchestrator import review_merge
 from command_center.orchestrator.publish import PublishResult
 from command_center.worker import handlers as handlers_for_pin
-from command_center.worker import prepush_prescreen
+from command_center import prepush_prescreen
 from command_center.worker.handlers import build_handlers
 from command_center.worker.payloads import PayloadError, parse_agent_run
 

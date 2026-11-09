@@ -53,7 +53,8 @@ from command_center.ops.source_clone_refresh import refresh_source_clone
 from command_center.orchestrator import gh_access
 from command_center.orchestrator.publish import PublishConfig, publish_run
 from command_center.orchestrator.routing import cascade_for
-from command_center.worker import admission, prepush_prescreen, writer_lease
+from command_center import prepush_prescreen
+from command_center.worker import admission, writer_lease
 from command_center.worker.daemon import Handler, HandlerOutcome
 from command_center.worker.payloads import PayloadError, parse_agent_run
 from command_center.worker.worktree_lease import blocking_lease
