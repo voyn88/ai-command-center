@@ -245,6 +245,9 @@ def test_the_worker_reaches_the_queue_only_through_the_six_protocol_steps() -> N
         "monitor_record_finding",
         "monitor_clear_finding",
         "monitor_clear_resolved_findings",
+        # 0036: validate this authenticated worker's fenced attempt before
+        # handler start; this grants no assignment issuance or revocation.
+        "cto_authorize_start",
     }
     assert roles.VIEW_PRIVILEGES[roles.WORKER_ROLE] == {}
 
