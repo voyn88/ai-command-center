@@ -35,6 +35,7 @@ def _env(**overrides: str) -> dict[str, str]:
         "GITHUB_RUN_ID": "900",
         "GITHUB_SERVER_URL": "https://github.com",
         "GITHUB_TOKEN": "t",
+        "AICC_CI_REUSE_MODE": "1",
     }
     env.update(overrides)
     return env
@@ -193,7 +194,7 @@ def test_main_writes_reuse_and_names_the_run(tmp_path: Path, capsys) -> None:
     env = _env(GITHUB_OUTPUT=str(out))
     assert attestation.main(env, _fetcher([_run()])) == 0
     url = f"https://github.com/{REPO}/actions/runs/777"
-    assert _outputs(out) == {"reuse": "true", "run_id": "777", "run_url": url}
+    assert _outputs(out) == {"reuse": "true", "run_id": "777", "run_url": url, "decision": "reuse"}
     printed = capsys.readouterr().out
     assert "777" in printed and url in printed
 
@@ -205,7 +206,7 @@ def test_main_turns_every_error_into_a_full_run(tmp_path: Path, error: Exception
 
     out = tmp_path / "out"
     assert attestation.main(_env(GITHUB_OUTPUT=str(out)), fetch) == 0
-    assert _outputs(out) == {"reuse": "false", "run_id": "", "run_url": ""}
+    assert _outputs(out) == {"reuse": "false", "run_id": "", "run_url": "", "decision": "full"}
 
 
 def test_main_without_a_token_is_a_full_run(tmp_path: Path) -> None:
@@ -214,3 +215,81 @@ def test_main_without_a_token_is_a_full_run(tmp_path: Path) -> None:
     del env["GITHUB_TOKEN"]
     assert attestation.main(env) == 0
     assert _outputs(out)["reuse"] == "false"
+
+
+@pytest.mark.parametrize("mode", [None, "", "0", "true", "TRUE", "yes", "Shadow", " 1"])
+def test_reuse_is_off_unless_the_variable_says_exactly_1_or_shadow(tmp_path: Path, mode) -> None:
+    out = tmp_path / "out"
+    env = _env(GITHUB_OUTPUT=str(out))
+    if mode is None:
+        del env["AICC_CI_REUSE_MODE"]
+    else:
+        env["AICC_CI_REUSE_MODE"] = mode
+    fetch = _fetcher([_run()])
+    assert attestation.main(env, fetch) == 0
+    assert _outputs(out) == {"reuse": "false", "run_id": "", "run_url": "", "decision": "disabled"}
+    assert fetch.calls == []  # disabled means no API traffic at all
+
+
+def test_shadow_mode_reports_the_run_but_never_reuses(tmp_path: Path, capsys) -> None:
+    out = tmp_path / "out"
+    env = _env(GITHUB_OUTPUT=str(out), AICC_CI_REUSE_MODE="shadow")
+    assert attestation.main(env, _fetcher([_run()])) == 0
+    assert _outputs(out) == {"reuse": "false", "run_id": "", "run_url": "", "decision": "shadow-reuse"}
+    printed = capsys.readouterr().out
+    assert printed.startswith("SHADOW (no effect): REUSE: merge_group run 777 (")
+    assert f"https://github.com/{REPO}/actions/runs/777" in printed
+    assert "every step still runs" in printed
+
+
+def test_shadow_mode_reports_a_full_run_decision(tmp_path: Path, capsys) -> None:
+    out = tmp_path / "out"
+    env = _env(GITHUB_OUTPUT=str(out), AICC_CI_REUSE_MODE="shadow")
+    assert attestation.main(env, _fetcher([_run(conclusion="failure")])) == 0
+    assert _outputs(out)["decision"] == "shadow-full"
+    assert _outputs(out)["reuse"] == "false"
+    assert capsys.readouterr().out.startswith("SHADOW (no effect): FULL RUN:")
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def test_the_time_budget_ends_polling_in_a_full_run() -> None:
+    clock = _Clock()
+    fetch = _fetcher([_run(status="in_progress", conclusion=None)])
+    with pytest.raises(attestation.NotAttested, match="budget"):
+        attestation.attest(_env(), fetch, clock.sleep, attempts=1000, clock=clock, budget=40)
+    assert clock.now <= 40
+
+
+def test_a_slow_api_exhausts_the_budget_before_the_next_request() -> None:
+    clock = _Clock()
+    inner = _fetcher([_run()])
+
+    def slow(path: str) -> object:
+        clock.now += 60
+        return inner(path)
+
+    with pytest.raises(attestation.NotAttested, match="budget"):
+        attestation.attest(_env(), slow, clock.sleep, clock=clock, budget=50)
+    assert len(inner.calls) == 1
+
+
+def test_the_bounds_fit_inside_the_step_timeout() -> None:
+    """The step has `timeout-minutes: 3`; the script must give up well before."""
+    worst = attestation.TOTAL_BUDGET_SECONDS + attestation.REQUEST_TIMEOUT_SECONDS
+    assert worst <= 120 < 180
+    assert attestation.POLL_DELAY_SECONDS * (attestation.POLL_ATTEMPTS - 1) < attestation.TOTAL_BUDGET_SECONDS
+
+
+def test_the_real_fetcher_refuses_a_non_https_api() -> None:
+    with pytest.raises(attestation.NotAttested, match="non-https"):
+        attestation._api_fetcher({"GITHUB_TOKEN": "t", "GITHUB_API_URL": "http://api.github.com"})

@@ -24,8 +24,19 @@ The rule, all of which must hold:
 Identical SHA means identical tree, so the `merge_group` run executed this very
 `ci.yml` — including its coverage gate.
 
-Outputs (`$GITHUB_OUTPUT`): `reuse` (`true` / `false`), `run_id`, `run_url`.
-Standard library only: it runs on the runner's own Python, before setup.
+Staged rollout: the mode comes from the repository variable
+`AICC_CI_REUSE_MERGE_GROUP` (passed in as `AICC_CI_REUSE_MODE`):
+
+* `1`      -> reuse on positive proof (the rule above);
+* `shadow` -> attest and print what *would* happen, but always `reuse=false`;
+* anything else, unset included -> no API call, `reuse=false`.
+
+The whole attestation is bounded by `TOTAL_BUDGET_SECONDS`; running out of
+time is one more reason for a full run.
+
+Outputs (`$GITHUB_OUTPUT`): `reuse` (`true` / `false`), `run_id`, `run_url`,
+`decision`. Standard library only: it runs on the runner's own Python, before
+setup.
 """
 
 from __future__ import annotations
@@ -47,6 +58,12 @@ _MAX_BYTES = 4 * 1024 * 1024
 # `completed` status can trail the last job by a few seconds.
 POLL_ATTEMPTS = 4
 POLL_DELAY_SECONDS = 15.0
+#: Wall-clock bound for the whole attestation, well inside the step's
+#: `timeout-minutes: 3`: a slow API means a full run, never a failed job.
+TOTAL_BUDGET_SECONDS = 90.0
+REQUEST_TIMEOUT_SECONDS = 20.0
+MODE_ENV = "AICC_CI_REUSE_MODE"
+ENABLED, SHADOW = "1", "shadow"
 
 FetchJson = Callable[[str], Any]
 
@@ -73,7 +90,7 @@ def _api_fetcher(env: dict[str, str]) -> FetchJson:
                 "User-Agent": "aicc-merge-group-attestation",
             },
         )
-        with urlopen(request, timeout=30) as response:  # noqa: S310 - see above
+        with urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:  # noqa: S310 - see above
             body = response.read(_MAX_BYTES + 1)
         if len(body) > _MAX_BYTES:
             raise NotAttested("API response is implausibly large")
@@ -125,8 +142,20 @@ def attest(
     fetch: FetchJson,
     sleep: Callable[[float], None] = time.sleep,
     attempts: int = POLL_ATTEMPTS,
+    clock: Callable[[], float] = time.monotonic,
+    budget: float = TOTAL_BUDGET_SECONDS,
 ) -> dict:
     """Return the successful `merge_group` run for this SHA, or raise NotAttested."""
+    deadline = clock() + budget
+
+    def within_budget(seconds: float = 0.0) -> None:
+        if clock() + seconds >= deadline:
+            raise NotAttested(f"attestation exceeded its {budget:.0f}s budget")
+
+    def get(path: str) -> Any:
+        within_budget()
+        return fetch(path)
+
     if env.get("GITHUB_EVENT_NAME") != "push":
         raise NotAttested(f"event is {env.get('GITHUB_EVENT_NAME')!r}, not push")
     if env.get("GITHUB_REF") != MAIN_REF:
@@ -144,7 +173,7 @@ def attest(
     if not run_id.isdigit():
         raise NotAttested("GITHUB_RUN_ID is not numeric")
 
-    current = fetch(f"/repos/{repository}/actions/runs/{run_id}")
+    current = get(f"/repos/{repository}/actions/runs/{run_id}")
     if not isinstance(current, dict) or current.get("path") != WORKFLOW_PATH:
         raise NotAttested("this run is not reported as ci.yml")
     workflow_id = current.get("workflow_id")
@@ -156,7 +185,7 @@ def attest(
         f"?event=merge_group&head_sha={quote(sha)}&per_page=100"
     )
     for attempt in range(attempts):
-        body = fetch(listing)
+        body = get(listing)
         runs = body.get("workflow_runs") if isinstance(body, dict) else None
         if not isinstance(runs, list):
             raise NotAttested("workflow run listing is malformed")
@@ -171,6 +200,7 @@ def attest(
         pending = [run for run in candidates if run.get("status") != "completed"]
         if not pending or attempt == attempts - 1:
             break
+        within_budget(POLL_DELAY_SECONDS)
         sleep(POLL_DELAY_SECONDS)
     raise NotAttested(f"no successful merge_group run of {WORKFLOW_PATH} for {sha}")
 
@@ -184,20 +214,40 @@ def _write_outputs(env: dict[str, str], values: dict[str, str]) -> None:
             handle.write(f"{key}={value}\n")
 
 
-def main(env: dict[str, str] | None = None, fetch: FetchJson | None = None) -> int:
-    env = dict(os.environ) if env is None else env
+def decide(env: dict[str, str], fetch: FetchJson | None = None) -> tuple[dict[str, str], str]:
+    """The step outputs and the log line. Never raises."""
+    mode = env.get(MODE_ENV, "")
+    full = {"reuse": "false", "run_id": "", "run_url": ""}
+    if mode not in (ENABLED, SHADOW):
+        return {**full, "decision": "disabled"}, (
+            f"FULL RUN: merge-queue reuse is disabled ({MODE_ENV}={mode!r})."
+        )
+    label = "SHADOW (no effect): " if mode == SHADOW else ""
     try:
         run = attest(env, fetch or _api_fetcher(env))
         server = env.get("GITHUB_SERVER_URL", "https://github.com").rstrip("/")
         url = f"{server}/{env['GITHUB_REPOSITORY']}/actions/runs/{run['id']}"
-        outputs = {"reuse": "true", "run_id": str(run["id"]), "run_url": url}
-        message = (
-            f"REUSE: merge_group run {run['id']} ({url}) passed {WORKFLOW_PATH} "
-            f"on exact SHA {env['GITHUB_SHA']}; heavy steps stand down."
-        )
     except Exception as error:  # noqa: BLE001 - any doubt means the full run
-        outputs = {"reuse": "false", "run_id": "", "run_url": ""}
-        message = f"FULL RUN: {type(error).__name__}: {error}"
+        decision = "shadow-full" if mode == SHADOW else "full"
+        return {**full, "decision": decision}, (
+            f"{label}FULL RUN: {type(error).__name__}: {error}"
+        )
+    message = (
+        f"{label}REUSE: merge_group run {run['id']} ({url}) passed {WORKFLOW_PATH} "
+        f"on exact SHA {env['GITHUB_SHA']}"
+    )
+    if mode == SHADOW:
+        return {**full, "decision": "shadow-reuse"}, (
+            message + "; would stand heavy steps down, but every step still runs."
+        )
+    return {"reuse": "true", "run_id": str(run["id"]), "run_url": url, "decision": "reuse"}, (
+        message + "; heavy steps stand down."
+    )
+
+
+def main(env: dict[str, str] | None = None, fetch: FetchJson | None = None) -> int:
+    env = dict(os.environ) if env is None else env
+    outputs, message = decide(env, fetch)
     print(message)
     _write_outputs(env, outputs)
     return 0

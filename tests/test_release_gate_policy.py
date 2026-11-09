@@ -155,12 +155,15 @@ def test_release_context_names_and_workflow_coverage_are_exact() -> None:
     # `test_every_step_holding_a_repository_secret_first_proves_its_code_is_ours`
     # (`VOYN-W0-AICC-MERGE-QUEUE-FORK-POLICY`).
     for workflow in (ci, boundary):
+        # `schedule` (ci.yml only) is the nightly independent main run; it
+        # never reaches PR-authored code and is pinned by
+        # `test_the_nightly_main_run_is_one_daily_independent_full_run`.
         assert set(workflow["on"]) == {
             "pull_request",
             "merge_group",
             "push",
             "workflow_dispatch",
-        }
+        } | ({"schedule"} if workflow is ci else set())
         assert set(workflow["on"]["pull_request"]["types"]) == {
             "opened",
             "synchronize",
@@ -175,10 +178,23 @@ def test_release_context_names_and_workflow_coverage_are_exact() -> None:
                 # to resolve the queued pull request to learn its head
                 # repository, which the `merge_group` payload omits.
                 "pull-requests": "read",
-                # Read-only, and used by exactly one caller: the push-run
-                # attestation lists this workflow's `merge_group` runs for the
-                # pushed SHA (`scripts/ci/merge_group_attestation.py`).
-                "actions": "read",
+            }
+            # `actions: read` is job-scoped to the three jobs that run the
+            # push-run attestation (`scripts/ci/merge_group_attestation.py`).
+            # A job-level block replaces the workflow's, so each restates
+            # exactly what it still needs and nothing more.
+            assert {
+                job_id: job["permissions"]
+                for job_id, job in workflow["jobs"].items()
+                if "permissions" in job
+            } == {
+                "prepare": {"contents": "read", "pull-requests": "read", "actions": "read"},
+                "windows-quality-gates": {
+                    "contents": "read",
+                    "pull-requests": "read",
+                    "actions": "read",
+                },
+                "build-gates": {"contents": "read", "actions": "read"},
             }
         else:
             assert workflow["permissions"] == {"contents": "read"}
@@ -733,10 +749,22 @@ def test_push_reuse_is_attested_once_per_independent_job_and_fails_safe() -> Non
         assert step == {
             "name": "Attest merge-queue result for this exact SHA",
             "id": "reuse",
-            "if": "github.event_name == 'push'",
+            # Push only (never schedule/dispatch/queue/PR), and only once the
+            # rollout variable is exactly `1` or `shadow`; unset means the step
+            # is skipped, its output is empty, and every heavy step runs.
+            "if": (
+                "github.event_name == 'push' && (vars.AICC_CI_REUSE_MERGE_GROUP == '1' "
+                "|| vars.AICC_CI_REUSE_MERGE_GROUP == 'shadow')"
+            ),
             "continue-on-error": "true",
+            # A step timeout under `continue-on-error` is a full run; a job
+            # timeout would be a red main. The script's own budget is 90 s.
+            "timeout-minutes": "3",
             "shell": "bash",
-            "env": {"GITHUB_TOKEN": "${{ github.token }}"},
+            "env": {
+                "GITHUB_TOKEN": "${{ github.token }}",
+                "AICC_CI_REUSE_MODE": "${{ vars.AICC_CI_REUSE_MERGE_GROUP }}",
+            },
             "run": f"{python} scripts/ci/merge_group_attestation.py",
         }, job_id
     # Jobs downstream of `prepare` take its single decision rather than
@@ -762,6 +790,10 @@ def test_a_standing_down_job_skips_every_heavy_step_and_still_concludes() -> Non
                 continue
             condition = str(step.get("if", ""))
             assert guard in _top_level_conjuncts(condition), (job_id, name, condition)
+            # Exactly the one guard: a second reference such as
+            # `&& ...reuse == 'false'` would skip the step on every PR and
+            # queue run, where the output is unset.
+            assert condition.count("outputs.reuse") == 1, (job_id, name, condition)
         if job_id in {"quality-gates", "manifest-gate", "coverage-gate"}:
             (echo,) = [s for s in jobs[job_id]["steps"] if s.get("name") == "Reuse merge-queue result"]
             assert echo["if"] == "needs.prepare.outputs.reuse == 'true'"
@@ -797,3 +829,43 @@ def test_coverage_is_collected_where_the_merge_queue_runs_the_tests() -> None:
         ), name
     assert '"${#shards[@]}" -ne 4' in coverage["Combine four coverage shards"]["run"]
     assert "coverage-gate" in jobs["final-gate"]["needs"]
+
+
+def test_the_reuse_output_is_read_in_exactly_the_pinned_forms() -> None:
+    """Every mention of the decision in ci.yml is one of four exact forms."""
+    text = CI_WORKFLOW.read_text(encoding="utf-8")
+    forms = {
+        REUSE_SKIP: None,
+        REUSE_SKIP_LOCAL: None,
+        "if: needs.prepare.outputs.reuse == 'true'\n": 3,
+        "reuse: ${{ steps.reuse.outputs.reuse }}\n": 1,
+    }
+    mentions = len(re.findall(r"outputs\.reuse\b", text))
+    accounted = 0
+    for form, expected in forms.items():
+        found = text.count(form)
+        if expected is not None:
+            assert found == expected, (form, found)
+        accounted += found
+    assert mentions == accounted, "ci.yml reads the reuse decision in an unpinned form"
+    assert len(re.findall(r"reuse_run_(id|url)\b", text)) == 2 + 2 * 3
+    assert len(re.findall(r"steps\.reuse\.outputs\.run_(id|url)\b", text)) == 2
+    assert "vars.AICC_CI_REUSE_MERGE_GROUP" in text
+    assert text.count("vars.") == 3 * 3  # if (x2) + env, on each attestation step
+
+
+def test_the_nightly_main_run_is_one_daily_independent_full_run() -> None:
+    ci = _workflow(CI_WORKFLOW)
+    assert ci["on"]["schedule"] == [{"cron": "23 2 * * *"}]
+    # A group of its own: a push to main neither cancels it nor is cancelled
+    # by it. Every other event keeps exactly the pre-existing group.
+    assert ci["concurrency"]["group"] == (
+        "${{ github.workflow }}-${{ github.ref }}"
+        "${{ github.event_name == 'schedule' && '-nightly' || '' }}"
+        f"-${{{{ ({LABEL_NOISE_GUARD}) && github.run_id || 'head' }}}}"
+    )
+    # Never a reuse candidate: the attestation is push-only (pinned exactly in
+    # `test_push_reuse_is_attested_once_per_independent_job_and_fails_safe`)
+    # and no job, step or gate special-cases the schedule otherwise.
+    text = CI_WORKFLOW.read_text(encoding="utf-8")
+    assert text.count("'schedule'") == 1

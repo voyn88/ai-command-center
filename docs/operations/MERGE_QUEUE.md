@@ -27,6 +27,15 @@ reachable on that trigger, so every step that receives one first asserts the
 queued code was authored here (`scripts/assert_trusted_head_repository.py`,
 pinned by `tests/test_release_gate_policy.py`).
 
+The queue run is also where coverage is collected and combined, so a
+coverage-combine failure ejects the entry instead of turning `main` red after
+the merge. Because main only ever moves to a SHA the queue passed, the push run
+of that SHA can reuse the queue's verdict. This is staged behind the repository
+variable `AICC_CI_REUSE_MERGE_GROUP`: unset means off, `shadow` means log only,
+`1` means on. A nightly `schedule` run keeps one independent full run of
+`main` a day. See README "Continuous integration" and
+`scripts/ci/merge_group_attestation.py`.
+
 `scripts/enable-branch-protection.sh` re-asserts the protection rule only. The
 queue toggle itself lives in Settings → Branches and is owner-only; the script
 cannot turn it on or off.

@@ -4,8 +4,8 @@ name: CI
 #
 # Runs the deterministic local validation commands (whitespace errors, Ruff,
 # byte-compile, full pytest with coverage) in a clean, ephemeral environment on
-# every pull request into main and on every push to main, plus on-demand via the
-# Actions tab.
+# every pull request into main, in the merge queue, on every push to main, once
+# a night on main, plus on-demand via the Actions tab.
 #
 # Design constraints (see README "Continuous integration"):
 #   * No secrets are referenced; the suite mocks every real Claude/Codex CLI call
@@ -14,16 +14,21 @@ name: CI
 #   * The test suite isolates itself from real data via AICC_DATA_DIR / a
 #     monkeypatched REPORTS_ROOT (tests/conftest.py); the runner is disposable, so
 #     nothing is mutated outside per-test temp fixtures.
-#   * Merge-queue reuse: the queue only advances main to a commit its
-#     `merge_group` run already passed, so a `push` run whose exact SHA has a
-#     successful `merge_group` run of this workflow stands its heavy steps down
-#     (`scripts/ci/merge_group_attestation.py`; every job still concludes
-#     `success` under its unchanged name and prints the run it relies on).
-#     No such run, any API doubt, or a re-run attempt means the full run as
-#     before. Coverage is therefore collected where the tests run: on
-#     `merge_group` (so the queue blocks on it) and on a full `push` run.
-#     `security-gates` never stands down: its CodeQL analysis of main is the
-#     default-branch code-scanning baseline.
+#   * Coverage is collected where the queue runs the tests: on `merge_group`
+#     (so the queue blocks on the four-shard combine before the merge) and on
+#     every full `push` run.
+#   * Merge-queue reuse (staged, OFF by default; repository variable
+#     `AICC_CI_REUSE_MERGE_GROUP`): the queue only advances main to a commit
+#     its `merge_group` run already passed. With the variable `1`, a `push` run
+#     whose exact SHA has a successful `merge_group` run of this workflow
+#     stands its heavy steps down (`scripts/ci/merge_group_attestation.py`;
+#     every job still concludes `success` under its unchanged name and prints
+#     the run it relies on). With `shadow` the attestation only logs what it
+#     would do and every step runs. Unset or any other value: no attestation
+#     at all. No such run, any API doubt, the 90 s budget / 3 min step timeout,
+#     or a re-run attempt all mean the full run. `security-gates` never stands
+#     down: its CodeQL analysis of main is the default-branch code-scanning
+#     baseline. The nightly `schedule` run is never eligible for reuse.
 
 on:
   pull_request:
@@ -48,10 +53,18 @@ on:
   merge_group:
   push:
     branches: [main]
+  # Nightly independent full run of main: never eligible for merge-queue reuse
+  # (the attestation runs on `push` only), never a required check, one run a
+  # day. GitHub fires `schedule` only for the default branch of the repository
+  # that holds this file, so a fork cannot trigger it here (and forks have
+  # scheduled workflows disabled by default).
+  schedule:
+    - cron: "23 2 * * *"
   workflow_dispatch:
 
 # Cancel superseded runs for the same ref (e.g. a new push to an open PR) so only
-# the latest commit's gates keep running.
+# the latest commit's gates keep running. The nightly run has a group of its
+# own so a push to main neither cancels it nor is cancelled by it.
 # Two kinds of pull_request run never run the gates and never cancel a real
 # run (they get a concurrency group of their own and every job skips):
 #  - label noise: a `labeled`/`unlabeled` event for anything but a
@@ -69,7 +82,7 @@ on:
 #    absent (VOYN-W0-AICC-MERGE-TICK-REQUIRED-CHECKS-PRESENT), so a skipped
 #    run can never merge.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ ((github.event_name == 'pull_request' && (github.event.action == 'labeled' || github.event.action == 'unlabeled') && !startsWith(github.event.label.name, 'release-gate-canary-') && !(github.event.action == 'labeled' && (github.event.label.name == 'review-window:active' || github.event.label.name == 'queue-active'))) || (github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'review-window:active') && !contains(github.event.pull_request.labels.*.name, 'queue-active') && !startsWith(github.event.label.name, 'release-gate-canary-'))) && github.run_id || 'head' }}
+  group: ${{ github.workflow }}-${{ github.ref }}${{ github.event_name == 'schedule' && '-nightly' || '' }}-${{ ((github.event_name == 'pull_request' && (github.event.action == 'labeled' || github.event.action == 'unlabeled') && !startsWith(github.event.label.name, 'release-gate-canary-') && !(github.event.action == 'labeled' && (github.event.label.name == 'review-window:active' || github.event.label.name == 'queue-active'))) || (github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'review-window:active') && !contains(github.event.pull_request.labels.*.name, 'queue-active') && !startsWith(github.event.label.name, 'release-gate-canary-'))) && github.run_id || 'head' }}
   cancel-in-progress: true
 
 # Least privilege: the gates only read the checked-out code.
@@ -78,13 +91,13 @@ concurrency:
 # pull request to learn which repository authored the code, because the
 # `merge_group` payload does not say. Read-only, and narrower than the secret it
 # protects.
-# `actions: read` exists for `scripts/ci/merge_group_attestation.py`, which
-# lists this workflow's `merge_group` runs for the pushed SHA. Read-only.
+# `actions: read` is NOT granted here: only the three jobs that run
+# `scripts/ci/merge_group_attestation.py` declare it, at job level (which
+# replaces this block for that job, so each restates what it still needs).
 permissions:
   contents: read
   security-events: write
   pull-requests: read
-  actions: read
 
 jobs:
   prepare:
@@ -92,6 +105,10 @@ jobs:
     if: ${{ !((github.event_name == 'pull_request' && (github.event.action == 'labeled' || github.event.action == 'unlabeled') && !startsWith(github.event.label.name, 'release-gate-canary-') && !(github.event.action == 'labeled' && (github.event.label.name == 'review-window:active' || github.event.label.name == 'queue-active'))) || (github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'review-window:active') && !contains(github.event.pull_request.labels.*.name, 'queue-active') && !startsWith(github.event.label.name, 'release-gate-canary-'))) }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
     outputs:
       deploy_only: ${{ steps.change-scope.outputs.deploy_only }}
       reuse: ${{ steps.reuse.outputs.reuse }}
@@ -106,15 +123,18 @@ jobs:
         with:
           fetch-depth: 0
 
-      # Push to main only: positive proof that the merge queue already passed
-      # this exact SHA, or `reuse=false` (full run). Never fails the job.
+      # Push to main only, and only once the rollout variable is `1` or
+      # `shadow`: positive proof that the merge queue already passed this exact
+      # SHA, or `reuse=false` (full run). Never fails the job.
       - name: Attest merge-queue result for this exact SHA
         id: reuse
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' && (vars.AICC_CI_REUSE_MERGE_GROUP == '1' || vars.AICC_CI_REUSE_MERGE_GROUP == 'shadow')
         continue-on-error: true
+        timeout-minutes: 3
         shell: bash
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          AICC_CI_REUSE_MODE: ${{ vars.AICC_CI_REUSE_MERGE_GROUP }}
         run: python3 scripts/ci/merge_group_attestation.py
 
       - name: Detect deploy-only change scope
@@ -586,6 +606,10 @@ jobs:
     if: ${{ !((github.event_name == 'pull_request' && (github.event.action == 'labeled' || github.event.action == 'unlabeled') && !startsWith(github.event.label.name, 'release-gate-canary-') && !(github.event.action == 'labeled' && (github.event.label.name == 'review-window:active' || github.event.label.name == 'queue-active'))) || (github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'review-window:active') && !contains(github.event.pull_request.labels.*.name, 'queue-active') && !startsWith(github.event.label.name, 'release-gate-canary-'))) }}
     runs-on: windows-latest
     timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
     env:
       # PySide6 headless platform plugin; `tests/desktop/conftest.py` already
       # `setdefault`s this, but set it explicitly so a non-empty value is
@@ -629,15 +653,18 @@ jobs:
         if: github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'release-gate-canary-windows')
         run: exit 1
 
-      # Push to main only: positive proof that the merge queue already passed
-      # this exact SHA, or `reuse=false` (full run). Never fails the job.
+      # Push to main only, and only once the rollout variable is `1` or
+      # `shadow`: positive proof that the merge queue already passed this exact
+      # SHA, or `reuse=false` (full run). Never fails the job.
       - name: Attest merge-queue result for this exact SHA
         id: reuse
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' && (vars.AICC_CI_REUSE_MERGE_GROUP == '1' || vars.AICC_CI_REUSE_MERGE_GROUP == 'shadow')
         continue-on-error: true
+        timeout-minutes: 3
         shell: bash
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          AICC_CI_REUSE_MODE: ${{ vars.AICC_CI_REUSE_MERGE_GROUP }}
         run: python scripts/ci/merge_group_attestation.py
 
       - name: Set up Python
@@ -821,6 +848,9 @@ jobs:
     if: ${{ !((github.event_name == 'pull_request' && (github.event.action == 'labeled' || github.event.action == 'unlabeled') && !startsWith(github.event.label.name, 'release-gate-canary-') && !(github.event.action == 'labeled' && (github.event.label.name == 'review-window:active' || github.event.label.name == 'queue-active'))) || (github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'review-window:active') && !contains(github.event.pull_request.labels.*.name, 'queue-active') && !startsWith(github.event.label.name, 'release-gate-canary-'))) }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
     steps:
       - name: Check out repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -829,15 +859,18 @@ jobs:
         if: github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'release-gate-canary-build')
         run: exit 1
 
-      # Push to main only: positive proof that the merge queue already passed
-      # this exact SHA, or `reuse=false` (full run). Never fails the job.
+      # Push to main only, and only once the rollout variable is `1` or
+      # `shadow`: positive proof that the merge queue already passed this exact
+      # SHA, or `reuse=false` (full run). Never fails the job.
       - name: Attest merge-queue result for this exact SHA
         id: reuse
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' && (vars.AICC_CI_REUSE_MERGE_GROUP == '1' || vars.AICC_CI_REUSE_MERGE_GROUP == 'shadow')
         continue-on-error: true
+        timeout-minutes: 3
         shell: bash
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          AICC_CI_REUSE_MODE: ${{ vars.AICC_CI_REUSE_MERGE_GROUP }}
         run: python3 scripts/ci/merge_group_attestation.py
 
       - name: Set up Node

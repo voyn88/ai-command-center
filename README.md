@@ -476,6 +476,24 @@ compilation, and pytest for pull requests into `main`, pushes to `main`, and man
 Python 3.14, plus a `windows-latest` job covering the automated half of the desktop leg. The workflow
 uses a read-only token, pins actions to commit SHAs, and cancels superseded runs for the same ref.
 
+When the suite runs, and where coverage is collected:
+
+- **Pull request** (inside the review window) and **merge queue** (`merge_group`): the full gates.
+  The merge queue also collects coverage on all four Linux shards and combines it in
+  `Main coverage aggregation`, so a coverage-combine failure blocks the entry before it merges.
+- **Push to `main`**: the full gates with coverage, unless merge-queue reuse is switched on (below).
+- **Nightly** (`schedule`, 02:23 UTC, one run a day): an independent full run of `main`'s head that
+  is never eligible for reuse and is not a required check. **Manual dispatch** is also a full run.
+- **Merge-queue reuse** (repository variable `AICC_CI_REUSE_MERGE_GROUP`, off by default). The queue
+  fast-forwards `main` to the exact commit its `merge_group` run passed, so a push run of that SHA
+  repeats work already done. With the variable set to `1`, `scripts/ci/merge_group_attestation.py`
+  looks for a successful `merge_group` run of `ci.yml` for the exact pushed SHA. If it finds one,
+  the push run's heavy steps stand down: every job still concludes `success` under its unchanged
+  name and logs the run id and URL it relies on. `security-gates` (CodeQL baseline for `main`)
+  always runs. With `shadow`, the attestation only logs what it would have done and every step
+  runs. Unset or any other value: no attestation. No matching run, an API error, the 90 s budget,
+  or a re-run attempt all mean a full run. To roll back, unset the variable.
+
 `main` requires `Final merge gate` and `Acceptance gate (independent verdict on exact SHA)`
 (`strict: true`, so a queued branch must be current with `main`); force-push and branch deletion are
 denied. A GitHub merge queue is enabled on `main` (squash, `maximumEntriesToBuild: 5`): entries build
