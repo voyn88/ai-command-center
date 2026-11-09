@@ -240,10 +240,16 @@ class ReconcileReport:
 
 @dataclass
 class PrEvidenceReport:
-    """See `reconcile_pr_evidence`. Records evidence; never changes a status."""
+    """See `reconcile_pr_evidence`. Records evidence or, failing that, returns
+    a genuinely PR-less task to OPEN; never any other status change."""
 
     #: (task_id, pr_url) newly recorded from the task's own branch.
     recorded: list[tuple[str, str]] = field(default_factory=list)
+    #: (task_id, reason) READY_TO_REVIEW -> OPEN through the 0018 recovery
+    #: gate (`backlog_recover_stuck_ready_to_review`), because a live lookup
+    #: proved the branch carries no open PR at all -- see the function
+    #: docstring for why this is the one skip reason safe to act on.
+    recovered: list[tuple[str, str]] = field(default_factory=list)
     #: (task_id, reason) examined and deliberately left alone.
     skipped: list[tuple[str, str]] = field(default_factory=list)
 
@@ -296,9 +302,23 @@ def reconcile_pr_evidence(
     origin of that checkout and nothing else, so a task can never be attached
     to a pull request in another repository.
 
-    Reporting only: no status is changed here. A task becomes reviewable
-    because it is `READY_TO_REVIEW` and now has evidence, through the same
-    path it always did.
+    Mostly reporting: a task becomes reviewable because it is
+    `READY_TO_REVIEW` and now has evidence, through the same path it always
+    did. The one exception is `no_open_pr_on_task_branch` -- a *live* lookup
+    that came back empty, as opposed to a failed or ambiguous one. Found live
+    on VOYN-W0-AICC-PARITY-QUERY-EQUIVALENCE (escalated by the tick-stall
+    watchdog, VOYN-W0-AICC-TICK-STALL-WATCHDOG, after 5 identical ticks): a
+    task that reaches READY_TO_REVIEW with zero `pr` evidence and no open PR
+    on its branch can never get one by waiting -- `backlog_ingest_results`
+    only ever sets READY_TO_REVIEW together with a `pr` evidence row in the
+    same transaction, so a task that lacks both got here some other way (the
+    Markdown-authority import path setting status directly is the one this
+    codebase still has) and nothing will ever publish to that branch on its
+    own. `backlog_recover_stuck_ready_to_review` (migration 0018) was built
+    for exactly this stuck shape but was never wired into a caller, so it sat
+    unused while the pr_evidence tick skipped the same task forever. This is
+    that wiring: send the task back to OPEN for a genuine fresh attempt
+    instead of reporting the same inconclusive skip every tick.
     """
     # Imported here, as  does, so this module keeps its
     # import-time independence from the planner.
@@ -348,7 +368,24 @@ def reconcile_pr_evidence(
             and entry["url"]
         ]
         if not matches:
-            report.skipped.append((row_task_id, "no_open_pr_on_task_branch"))
+            # A succeeded lookup with zero matches is conclusive -- unlike
+            # `pr_list_failed`/`pr_list_undecodable`/`pr_list_wrong_shape`
+            # above, there is no open PR on this exact branch to find later.
+            # The task's own query already proved it carries no `pr`
+            # evidence, which is this gate's only other precondition, so the
+            # call below should normally succeed; a refusal (lost the race
+            # against a concurrent change) just leaves the ordinary skip in
+            # place for the next tick to re-examine.
+            with factory() as conn, conn.cursor() as cur:
+                cur.execute(
+                    "SELECT * FROM backlog_recover_stuck_ready_to_review(%s)",
+                    (row_task_id,),
+                )
+                recovery = cur.fetchone()
+            if recovery and recovery[0]:
+                report.recovered.append((row_task_id, "no_open_pr_on_task_branch"))
+            else:
+                report.skipped.append((row_task_id, "no_open_pr_on_task_branch"))
             continue
         if len(matches) > 1:
             report.skipped.append((row_task_id, "ambiguous_open_prs_on_branch"))

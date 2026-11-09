@@ -4274,6 +4274,13 @@ def _pr_rows(factory, task_id):
         return [row[0] for row in cur.fetchall()]
 
 
+def _task_status(factory, task_id):
+    with factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", (task_id,))
+        row = cur.fetchone()
+        return row[0] if row else None
+
+
 def _fake_pr_list(entries, *, returncode=0, stdout=None):
     """The branch lookup is REST now (`gh api repos/{o}/{r}/pulls?...head=`)
     rather than `gh pr list --head` (GraphQL) --
@@ -4316,7 +4323,9 @@ def test_an_open_pr_on_the_task_branch_becomes_evidence(rig, _test_repo_routes, 
 def test_a_task_adopts_only_its_own_branch_never_a_prefix_match(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
     """`backlog/X` must not adopt `backlog/X-REM`'s pull request. `gh --head`
     is a filter, not a guarantee of exact equality, so the name is compared
-    here too."""
+    here too. This task's own branch genuinely carries no open PR, so the
+    same live lookup that proves that also recovers it to OPEN (0018) rather
+    than reporting the same inconclusive skip forever."""
     app_factory, store, _ = rig
     task_id = "VOYN-W0-PRE2"
     _ready_without_pr(store, app_factory, task_id)
@@ -4332,7 +4341,38 @@ def test_a_task_adopts_only_its_own_branch_never_a_prefix_match(rig, _test_repo_
     report = reconcile_pr_evidence(app_factory, REPO)
 
     assert _pr_rows(app_factory, task_id) == []
-    assert (task_id, "no_open_pr_on_task_branch") in report.skipped
+    assert (task_id, "no_open_pr_on_task_branch") in report.recovered
+    assert _task_status(app_factory, task_id) == "OPEN"
+
+
+def test_no_open_pr_at_all_recovers_the_task_for_a_fresh_attempt(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+    """VOYN-W0-AICC-PARITY-QUERY-EQUIVALENCE, live: a task reached
+    READY_TO_REVIEW with zero `pr` evidence and no open PR ever opened on its
+    branch. Nothing was ever going to make `gh` return a match later, so the
+    tick-stall watchdog escalated the same `no_open_pr_on_task_branch` skip
+    after 5 identical ticks. The fix is this function sending the task back
+    to OPEN through the 0018 recovery gate on the very lookup that proves
+    there is nothing to find -- not waiting for a watchdog that, by design,
+    never touches the stalled task itself."""
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PARITY-QUERY-EQUIVALENCE"
+    _ready_without_pr(store, app_factory, task_id)
+    monkeypatch.setattr(review_merge, "_gh", _fake_pr_list([]))
+
+    report = reconcile_pr_evidence(app_factory, REPO)
+
+    assert _pr_rows(app_factory, task_id) == []
+    assert (task_id, "no_open_pr_on_task_branch") in report.recovered
+    assert all(entry[0] != task_id for entry in report.skipped)
+    assert _task_status(app_factory, task_id) == "OPEN"
+
+    # Idempotent: a second tick over the now-OPEN task finds nothing to do --
+    # it is no longer in reconcile_pr_evidence's own READY_TO_REVIEW
+    # candidate set, so the watchdog's streak for this episode is broken for
+    # good rather than racing a second recovery attempt.
+    second = reconcile_pr_evidence(app_factory, REPO)
+    assert all(entry[0] != task_id for entry in second.recovered)
+    assert all(entry[0] != task_id for entry in second.skipped)
 
 
 def test_two_open_prs_on_one_branch_are_refused_rather_than_guessed(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
