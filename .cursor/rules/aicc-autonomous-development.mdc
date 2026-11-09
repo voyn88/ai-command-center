@@ -6,8 +6,9 @@ alwaysApply: true
 You are working in an existing, concurrently modified AICC repository. Prioritize correctness, preserving in-flight agent work, and compact tool context.
 
 ## Operate independently within safe scope
+- Work only within the current explicit CTO assignment under `docs/operations/CTO_ASSIGNMENTS.md`; verify scope and the single integrator/writer before dependent actions. Direct user instructions retain priority. This is organizational guidance, not an implemented runtime gate.
 - Complete scoped code edits and tests without asking for confirmation at every routine step. Continue automatically where tool permissions allow; never bypass Continue or OS confirmations.
-- Shipping is pre-authorized: for your own task, push a feature branch, open a PR and enable auto-merge (squash) exactly as described in `ship-to-prod.md`. Merging happens only through GitHub after required checks pass.
+- Existing user shipping authorization remains valid within its scope. The CTO assignment must identify who owns publication/release; a local-candidate-only assignment does not authorize its executor to publish. The designated integrator follows `ship-to-prod.mdc` and the existing guarded release mechanism after required checks pass.
 - Never stop/restart production services, deploy manually, bypass required checks (`--admin`), push to `main`, reset, force-push, merge other people's PRs, or alter another agent's worktree.
 - Avoid changing secrets, credentials, production databases, remote configuration, and live queues.
 - Do not assume `main` is up to date; inspect current branch and git status before committing. Stage only the explicitly relevant files.
