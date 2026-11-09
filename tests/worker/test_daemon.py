@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import signal
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -33,6 +34,7 @@ def _work(payload: dict, attempt_id: str = "wat-1") -> ClaimedWork:
         visible_until="2026-01-01T00:00:00+00:00",
         payload=payload,
         claim_token="token-plain",
+        start_deadline=time.monotonic() + 60,
     )
 
 
@@ -126,6 +128,65 @@ def test_cto_authorization_is_committed_before_handler_and_checked_per_attempt()
     daemon._execute(_work({"kind": "echo"}, "retry"))
     assert order == [("authorize", "first"), ("handler", 1), ("authorize", "retry")]
     assert [call[1] for call in store.calls if call[0] == "complete"] == ["first"]
+
+
+@pytest.mark.parametrize("delay", [1.0, 2.0])
+def test_cto_delayed_start_permission_cannot_launch_after_lease_budget(monkeypatch, delay):
+    clock = [100.0]
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    work = replace(_work({"kind": "echo"}), start_deadline=101.0)
+    store = ScriptedStore([])
+    handlers = []
+
+    def authorize(work):
+        clock[0] += delay
+        return True
+
+    store.authorize_start = authorize
+    WorkerDaemon(store, {"echo": lambda *args: handlers.append(args)})._execute(work)
+    assert handlers == []
+    assert store.calls == []
+
+
+def test_cto_start_budget_rechecked_at_actual_handler_boundary(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    work = replace(_work({"kind": "echo"}), start_deadline=101.0)
+    store = ScriptedStore([])
+    handlers = []
+
+    class DelayedHandlers(dict):
+        def get(self, key):
+            clock[0] = 102.0
+            return lambda *args: handlers.append(args)
+
+    daemon = WorkerDaemon(store, {})
+    daemon._handlers = DelayedHandlers()
+    daemon._execute(work)
+    assert handlers == []
+    assert store.calls == []
+
+
+def test_cto_initial_heartbeat_keeps_budget_consumed_by_authorization(monkeypatch):
+    import threading
+
+    clock = [100.9]
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    work = replace(_work({}), start_deadline=101.0)
+    store = ScriptedStore([])
+    lost = threading.Event()
+    waits = []
+
+    class Stop:
+        def wait(self, interval):
+            waits.append(interval)
+            clock[0] += interval
+            return False
+
+    WorkerDaemon(store, {}, WorkerConfig(visibility_seconds=3))._heartbeat_loop(work, lost, Stop())
+    assert lost.is_set()
+    assert waits == [pytest.approx(0.1)]
+    assert store.calls == []
 
 
 def test_a_claimed_item_is_dispatched_and_completed() -> None:
@@ -397,6 +458,7 @@ class _FileLeaseStore:
             visible_until="bounded-by-test-clock",
             payload={"kind": "long"},
             claim_token=f"token-{attempt_no}",
+            start_deadline=now + float(visibility_seconds),
         )
 
     def heartbeat(self, work):
@@ -1009,3 +1071,74 @@ def test_unhandled_execution_exception_does_not_advertise_idle():
     with pytest.raises(RuntimeError, match="unhandled execution failure"):
         daemon.run_forever()
     assert not any("STATUS=aicc-drained-idle" in p for p in notices)
+
+
+@pytest.mark.parametrize("heartbeat_ok", [False, True])
+def test_slow_heartbeat_exhausts_the_visibility_window(monkeypatch, heartbeat_ok):
+    """Database call time consumes the lease even when only one beat ran."""
+    import threading
+
+    from command_center.worker import daemon as daemon_module
+
+    clock = [0.0]
+    monkeypatch.setattr(daemon_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(daemon_module.sdnotify, "watchdog_interval_seconds", lambda: None)
+    store = ScriptedStore([])
+
+    def slow_heartbeat(work):
+        clock[0] += 3.0
+        if not heartbeat_ok:
+            raise ConnectionError("slow database timeout")
+        return True
+
+    store.heartbeat = slow_heartbeat
+    lease_lost = threading.Event()
+
+    class OneBeat:
+        def wait(self, interval):
+            if clock[0] > 0:
+                return True
+            clock[0] += interval
+            return False
+
+    daemon = WorkerDaemon(store, {}, WorkerConfig(visibility_seconds=3))
+    daemon._heartbeat_loop(_work({}), lease_lost, OneBeat())
+
+    assert lease_lost.is_set(), "slow heartbeat left the handler running past expiry"
+
+
+def test_successful_heartbeat_rearms_recovery_without_forgetting_call_latency(monkeypatch):
+    import threading
+
+    from command_center.worker import daemon as daemon_module
+
+    clock = [0.0]
+    waits = []
+    monkeypatch.setattr(daemon_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(daemon_module.sdnotify, "watchdog_interval_seconds", lambda: None)
+    store = ScriptedStore([])
+
+    def heartbeat(work):
+        store.calls.append(("heartbeat", work.attempt_id))
+        clock[0] += 0.25
+        if len(store.calls) == 2:
+            return True
+        raise ConnectionError("temporary database failure")
+
+    store.heartbeat = heartbeat
+    lease_lost = threading.Event()
+
+    class BeatStop:
+        def wait(self, interval):
+            waits.append(interval)
+            if len(waits) > 5:
+                return True
+            clock[0] += interval
+            return False
+
+    daemon = WorkerDaemon(store, {}, WorkerConfig(visibility_seconds=3))
+    daemon._heartbeat_loop(_work({}), lease_lost, BeatStop())
+
+    assert lease_lost.is_set()
+    assert len(store.calls) == 4, "recovery must renew the deadline after a successful beat"
+    assert waits == [1.0, 1.0, 1.0, 1.0, 0.25]

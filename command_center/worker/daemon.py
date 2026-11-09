@@ -317,6 +317,9 @@ class WorkerDaemon:
         self._notify("STOPPING=1")
 
     def _execute(self, work: ClaimedWork) -> None:
+        if work.start_deadline is None or time.monotonic() >= work.start_deadline:
+            logger.warning("attempt %s: claim start budget elapsed", work.attempt_id)
+            return
         # A claim is not permission to start. SQL serializes this decision
         # with operator revocation and commits it before returning. On an
         # unavailable gate (including an old schema), leave the lease to its
@@ -328,6 +331,9 @@ class WorkerDaemon:
             return
         if not authorized:
             logger.warning("attempt %s: start authorization denied", work.attempt_id)
+            return
+        if time.monotonic() >= work.start_deadline:
+            logger.warning("attempt %s: authorization response outlived lease budget", work.attempt_id)
             return
         lease_lost = threading.Event()
         beat_stop = threading.Event()
@@ -399,6 +405,9 @@ class WorkerDaemon:
     def _dispatch(
         self, work: ClaimedWork, lease_lost: threading.Event
     ) -> HandlerOutcome:
+        if work.start_deadline is None or time.monotonic() >= work.start_deadline:
+            lease_lost.set()
+            return HandlerOutcome(ok=False, reason="claim start budget elapsed", retryable=False)
         if not isinstance(work.payload, dict):
             # queue_enqueue accepts any jsonb — a list or bare string is
             # producible by the app role, and `.get` on it would raise out of
@@ -420,6 +429,9 @@ class WorkerDaemon:
                 retryable=False,
             )
         try:
+            if lease_lost.is_set() or time.monotonic() >= work.start_deadline:
+                lease_lost.set()
+                return HandlerOutcome(ok=False, reason="claim start budget elapsed", retryable=False)
             return handler(work.payload, lease_lost, work.attempt_no)
         except Exception as error:
             logger.exception("handler for %r raised", kind)
@@ -435,12 +447,20 @@ class WorkerDaemon:
         # PostgreSQL, a network blip) before the lease actually lapses. The
         # watchdog cap can shorten the wait — an extra lease renewal is
         # harmless, a missed watchdog deadline during a long run is a restart.
-        interval = max(self._config.visibility_seconds / 3.0, 1.0)
+        window = min(max(self._config.visibility_seconds, 1), 3600)
+        interval = max(window / 3.0, 1.0)
         watchdog = sdnotify.watchdog_interval_seconds()
         if watchdog is not None:
             interval = min(interval, max(watchdog, 1.0))
-        consecutive_errors = 0
-        while not beat_stop.wait(interval):
+        if work.start_deadline is None:
+            lease_lost.set()
+            return
+        deadline = min(work.start_deadline, time.monotonic() + window)
+        while not beat_stop.wait(min(interval, max(deadline - time.monotonic(), 0.0))):
+            started = time.monotonic()
+            if started >= deadline:
+                lease_lost.set()
+                return
             # Fed even when the database is unreachable: the watchdog answers
             # "is the process alive", not "is PostgreSQL up" — restarting the
             # unit cures a wedged process and cures nothing about a DB outage,
@@ -449,20 +469,17 @@ class WorkerDaemon:
             try:
                 alive = self._store.heartbeat(work)
             except Exception:
-                consecutive_errors += 1
                 logger.exception("heartbeat error for attempt %s", work.attempt_id)
-                # Errors are not refusals, but they are not free either: after
-                # a full visibility window without one successful beat the
-                # lease has provably lapsed on the server, whatever the reason
-                # here — and the handler must stop before its outcome becomes
-                # a stale write. Review found the interleaving this closes:
-                # DB down through the lapse, recovered before the handler
-                # finished, result refused as stale with no trace.
-                if consecutive_errors * interval >= self._config.visibility_seconds:
+                # Include database latency and scheduling delays, not just
+                # the nominal intervals between failed beats.
+                if time.monotonic() >= deadline:
                     lease_lost.set()
                     return
                 continue
-            consecutive_errors = 0
-            if not alive:
+            # PostgreSQL renews from transaction time, before the response
+            # arrives. Counting from request start conservatively accounts
+            # for that latency instead of granting a fresh window on receipt.
+            deadline = started + window
+            if not alive or time.monotonic() >= deadline:
                 lease_lost.set()
                 return

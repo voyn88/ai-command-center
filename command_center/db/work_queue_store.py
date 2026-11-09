@@ -26,6 +26,7 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -52,6 +53,9 @@ class ClaimedWork:
     visible_until: str
     payload: dict[str, Any]
     claim_token: str
+    # Conservative local start budget: measured before claim DB I/O, never
+    # from response receipt or a comparison with the server's wall clock.
+    start_deadline: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,12 +94,15 @@ class WorkQueueStore:
         """
         token = secrets.token_hex(32)
         token_hash = hashlib.sha256(token.encode("ascii")).hexdigest()
+        start_deadline = time.monotonic() + min(max(visibility_seconds, 1), 3600)
         row = self._call(
             "SELECT * FROM queue_claim(%s, %s, %s)",
             (queue, token_hash, visibility_seconds),
         )
         if not row["ok"]:
             return QueueRefusal(reason=row["reason"])
+        if time.monotonic() >= start_deadline:
+            return QueueRefusal(reason="claim_lease_elapsed")
         payload = row["payload"]
         if isinstance(payload, str):  # psycopg may hand jsonb back as text
             payload = json.loads(payload)
@@ -106,6 +113,7 @@ class WorkQueueStore:
             visible_until=str(row["visible_until"]),
             payload=payload or {},
             claim_token=token,
+            start_deadline=start_deadline,
         )
 
     def authorize_start(self, work: ClaimedWork) -> bool:
