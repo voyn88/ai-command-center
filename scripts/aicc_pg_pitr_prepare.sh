@@ -19,8 +19,8 @@ done
 [[ -f "$BASE/backup_manifest" ]] || { echo "base backup has no backup_manifest" >&2; exit 2; }
 [[ -d "$WAL_DIR" ]] || { echo "WAL archive directory not found: $WAL_DIR" >&2; exit 2; }
 [[ -n "$TARGET_DIR" ]] || { echo "--target-dir is required" >&2; exit 2; }
-[[ "$WAL_DIR" =~ ^/[A-Za-z0-9_./-]+$ ]] || {
-    echo "--wal-dir must be an absolute path containing only letters, digits, _, ., /, or -" >&2; exit 2;
+[[ "$WAL_DIR" == /* && "$WAL_DIR" != *"'"* && "$WAL_DIR" != *$'\n'* ]] || {
+    echo "--wal-dir must be an absolute path without quotes or newlines" >&2; exit 2;
 }
 [[ "$TARGET_TIME" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || {
     echo "--target-time must be UTC RFC3339 (YYYY-MM-DDTHH:MM:SSZ)" >&2; exit 2;

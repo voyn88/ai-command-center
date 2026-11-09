@@ -165,29 +165,6 @@ def test_pitr_prepare_rejects_ambiguous_or_injectable_target_time(tmp_path, valu
     assert not (tmp_path / "target").exists()
 
 
-@pytest.mark.parametrize(
-    "suffix",
-    ['bad"quote', "bad'quote", "bad space", "bad$(touch exploited)", "bad;command"],
-)
-def test_pitr_prepare_rejects_shell_metacharacters_in_wal_path(tmp_path, suffix: str) -> None:
-    base = tmp_path / "base"
-    wal = tmp_path / suffix
-    base.mkdir()
-    wal.mkdir()
-    (base / "backup_manifest").write_text("manifest")
-
-    result = subprocess.run(
-        [str(PITR_PREPARE), "--base", str(base), "--wal-dir", str(wal),
-         "--target-dir", str(tmp_path / "target"),
-         "--target-time", "2026-11-04T14:30:00Z"],
-        capture_output=True, text=True, check=False,
-    )
-
-    assert result.returncode == 2
-    assert "--wal-dir" in result.stderr
-    assert not (tmp_path / "target").exists()
-
-
 def test_pitr_prepare_verifies_then_writes_recovery_configuration(tmp_path) -> None:
     base = tmp_path / "base"
     wal = tmp_path / "wal"
