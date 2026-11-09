@@ -39,6 +39,7 @@ from command_center.orchestrator.routing import (
     cascade_for,
     metered_executors,
 )
+from command_center.orchestrator.wave_plan import SNAPSHOT_SQL, build_plan
 from command_center.worker.payloads import AGENT_RUN_SCHEMA_VERSION
 
 __all__ = [
@@ -217,6 +218,65 @@ def _split_requested(rows: Any, task_id: str) -> bool:
     return bool(row and row[0] and row[0][0])
 
 
+_IMPACT_FIELDS = ("next_time", "current_quality", "next_cost")
+
+
+def _delivery_impact(body: str) -> tuple[int, int]:
+    """Rank a declared impact only when all three dimensions have evidence plans."""
+    prefix = "AICC-IMPACT: "
+    declarations = [line[len(prefix):] for line in body.splitlines() if line.startswith(prefix)]
+    if len(declarations) != 1:
+        return (0, 0)
+    try:
+        impact = json.loads(declarations[0])
+    except (ValueError, RecursionError):
+        return (0, 0)
+    if not isinstance(impact, dict):
+        return (0, 0)
+    scores = []
+    for field in _IMPACT_FIELDS:
+        dimension = impact.get(field)
+        if not isinstance(dimension, dict):
+            return (0, 0)
+        score, evidence = dimension.get("score"), dimension.get("check")
+        if type(score) is not int or not 1 <= score <= 5:
+            return (0, 0)
+        if not isinstance(evidence, str) or not evidence.strip():
+            return (0, 0)
+        scores.append(score)
+    return (min(scores), sum(scores))
+
+
+def _rank_project_candidates(candidates: list[tuple], decisions=()) -> list[tuple]:
+    """Improve ordering within a project, wave, class and explicit priority."""
+    by_id = {item.task["id"]: item for item in decisions}
+    groups: dict[tuple, list[int]] = {}
+    result = list(candidates)
+    for index, (_, wave, priority, _, _, repo, dispatchable, task_class) in enumerate(candidates):
+        route = repo_route(repo) if dispatchable and repo else None
+        if route is not None:
+            groups.setdefault((route[0], wave, task_class, priority), []).append(index)
+    def rank(task):
+        declared = _delivery_impact(task[4])
+        decision = by_id.get(task[0])
+        if decision is None:
+            return (0, 0, *declared, 0, 0)
+        return (
+            decision.stage == "Проверить допуск", -(decision.wave or 0),
+            *declared, min(decision.impact), sum(decision.impact),
+        )
+
+    for indices in groups.values():
+        ranked = sorted(
+            (candidates[index] for index in indices),
+            key=rank,
+            reverse=True,
+        )
+        for index, task in zip(indices, ranked, strict=True):
+            result[index] = task
+    return result
+
+
 def _payload_for(
     task: dict[str, Any], limits: PlanLimits, route: tuple[str, str], *, mode: str = "implement"
 ) -> tuple[dict[str, Any], int]:
@@ -254,10 +314,17 @@ def _payload_for(
             "mode": "split",
         }
         return payload, len(cascade)
+    impact_acceptance = ""
+    if _delivery_impact(task["body"]) != (0, 0):
+        impact_acceptance = (
+            "Report observed before/after evidence for the three AICC-IMPACT checks. "
+            "Mark unavailable measurements as unverified.\n\n"
+        )
     prompt = (
         f"Central task: {task['task_id']} ({task['title']}).\n"
         f"Wave {task['wave']}, priority {task['priority'] or 'unset'}.\n\n"
         f"{task['body']}\n\n"
+        f"{impact_acceptance}"
         # The publisher (`orchestrator.publish.publish_run`, under the writer
         # lease) refuses a task clone that is not clean, and an agent has no
         # push capability at all. Asking the agent to "open a pull request"
@@ -398,6 +465,10 @@ class Planner:
     def _exec(self, sql: str, params: tuple[Any, ...] = ()) -> None:
         with self._factory() as conn, conn.cursor() as cur:
             cur.execute(sql, params)
+
+    def preview(self):
+        (snapshot,) = self._row(SNAPSHOT_SQL, ())
+        return build_plan(snapshot, repo_route)
 
     def plan_once(self, limits: PlanLimits = _DEFAULT_PLAN_LIMITS) -> PlanReport:
         report = PlanReport()
@@ -566,6 +637,9 @@ class Planner:
                     advisory = []
                 if advisory:
                     candidates = apply_advisory_order(candidates, advisory, id_index=0)
+            if limits.only_task_id is None:
+                decisions = self.preview()
+                candidates = _rank_project_candidates(candidates, decisions)
             for (
                 task_id, wave, priority, title, body, repo, dispatchable, task_class,
             ) in candidates:

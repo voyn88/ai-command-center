@@ -134,12 +134,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--repo-path", default=os.environ.get("AICC_FLEET_REPO", ""),
         help="Configured repository path for opt-in coordination (AICC_FLEET_REPO).",
     )
-    plan.add_argument(
+    plan_mode = plan.add_mutually_exclusive_group()
+    plan_mode.add_argument(
         "--dry-run",
         action="store_true",
-        help="Report the eligible set without dispatching.",
+        help="Compute project waves and stages without dispatching.",
     )
-    plan.add_argument(
+    plan_mode.add_argument(
         "--smoke",
         action="store_true",
         help="Deploy preflight: run backlog_dispatch_smoke() (0021) -- the read-only "
@@ -565,7 +566,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.command == "backlog-plan":
                 from contextlib import nullcontext as _nc
 
-                from command_center.orchestrator.planner import PlanLimits, plan_once
+                from command_center.orchestrator.planner import Planner, PlanLimits, plan_once
 
                 if args.smoke:
                     with conn.cursor() as cur:
@@ -574,16 +575,13 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"SMOKE     backlog_dispatch_smoke={'ok' if ok else 'refused'}")
                     return 0 if ok else 1
                 if args.dry_run:
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            "SELECT task_id, wave, priority, dispatchable "
-                            "FROM backlog_eligible"
+                    for item in Planner(lambda: _nc(conn)).preview():
+                        print(
+                            f"{item.task['id']}  project={item.project} "
+                            f"wave={item.wave or '-'} stage={item.stage} "
+                            f"impact={item.impact} "
+                            f"blockers={','.join(item.blockers) or '-'}"
                         )
-                        for task_id, wave, priority, dispatchable in cur.fetchall():
-                            print(
-                                f"{task_id}  wave={wave} priority={priority or '-'} "
-                                f"{'dispatchable' if dispatchable else 'NO REPO'}"
-                            )
                     return 0
                 report = plan_once(
                     lambda: _nc(conn), PlanLimits(wip_limit=args.wip_limit)
