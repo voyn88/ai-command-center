@@ -246,6 +246,9 @@ class PrEvidenceReport:
     recorded: list[tuple[str, str]] = field(default_factory=list)
     #: (task_id, reason) examined and deliberately left alone.
     skipped: list[tuple[str, str]] = field(default_factory=list)
+    #: task ids returned to OPEN after five previously recorded, consecutive
+    #: ``no_open_pr_on_task_branch`` observations and one fresh confirmation.
+    recovered: list[str] = field(default_factory=list)
 
 
 #: Branch naming contract. `publish_run` pushes `backlog/<task id>` and nothing
@@ -296,9 +299,12 @@ def reconcile_pr_evidence(
     origin of that checkout and nothing else, so a task can never be attached
     to a pull request in another repository.
 
-    Reporting only: no status is changed here. A task becomes reviewable
-    because it is `READY_TO_REVIEW` and now has evidence, through the same
-    path it always did.
+    Ordinarily this only records evidence. There is one bounded recovery:
+    after the watchdog has observed five consecutive missing-PR ticks, a
+    fresh lookup that still finds no PR invokes the existing audited
+    ``backlog_recover_stuck_ready_to_review`` gate. That returns the task to
+    OPEN so the planner can dispatch/publish it again. The watchdog remains
+    observability-only and never mutates the stalled task itself.
     """
     # Imported here, as  does, so this module keeps its
     # import-time independence from the planner.
@@ -348,6 +354,19 @@ def reconcile_pr_evidence(
             and entry["url"]
         ]
         if not matches:
+            if _missing_pr_streak(factory, row_task_id) >= 5:
+                with factory() as conn, conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT * FROM backlog_recover_stuck_ready_to_review(%s)",
+                        (row_task_id,),
+                    )
+                    verdict = cur.fetchone()
+                if verdict and verdict[0]:
+                    report.recovered.append(row_task_id)
+                    continue
+                reason = (verdict[1] if verdict and len(verdict) > 1 else "") or "unknown"
+                report.skipped.append((row_task_id, f"recovery_refused: {reason}"))
+                continue
             report.skipped.append((row_task_id, "no_open_pr_on_task_branch"))
             continue
         if len(matches) > 1:
@@ -375,6 +394,26 @@ def reconcile_pr_evidence(
             continue
         report.recorded.append((row_task_id, pr_url))
     return report
+
+
+def _missing_pr_streak(factory: Any, task_id: str) -> int:
+    """Current persisted pr-evidence streak for ``task_id``, or zero.
+
+    Joining through the latest observation matters: an old five-tick episode
+    must not re-arm recovery after an empty tick or a different reason broke
+    it. The current invocation is deliberately not counted yet; callers have
+    just independently reconfirmed the missing PR against GitHub.
+    """
+    rows = _rows(
+        factory,
+        "SELECT s.consecutive_ticks FROM tick_observation o "
+        "JOIN tick_skip_event s ON s.tick_kind=o.tick_kind AND s.tick_id=o.tick_id "
+        "WHERE o.tick_kind='pr_evidence' AND s.task_id=%s "
+        "AND s.reason='no_open_pr_on_task_branch' "
+        "AND o.id=(SELECT max(id) FROM tick_observation WHERE tick_kind='pr_evidence')",
+        (task_id,),
+    )
+    return int(rows[0][0]) if rows else 0
 
 
 def _open_pulls_for_branch(

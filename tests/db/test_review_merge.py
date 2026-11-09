@@ -4335,6 +4335,56 @@ def test_a_task_adopts_only_its_own_branch_never_a_prefix_match(rig, _test_repo_
     assert (task_id, "no_open_pr_on_task_branch") in report.skipped
 
 
+def test_five_prior_missing_pr_ticks_recover_task_to_open(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+    """The sixth fresh confirmation uses the sanctioned recovery gate instead
+    of producing an identical skip forever. The watchdog itself remains
+    observation-only."""
+    from command_center.ops.tick_stall_watchdog import record_skips
+
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE2-STALLED"
+    _ready_without_pr(store, app_factory, task_id)
+    monkeypatch.setattr(review_merge, "_gh", _fake_pr_list([]))
+    with app_factory() as conn:
+        for index in range(5):
+            record_skips(
+                conn,
+                "pr_evidence",
+                f"missing-pr-{index}",
+                [(task_id, "no_open_pr_on_task_branch")],
+            )
+
+    report = reconcile_pr_evidence(app_factory, REPO, task_id=task_id)
+
+    assert report.recovered == [task_id]
+    assert report.skipped == []
+    assert store.get_task(task_id)["status"] == "OPEN"
+
+
+def test_broken_missing_pr_streak_does_not_recover(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+    from command_center.ops.tick_stall_watchdog import record_skips
+
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE2-BROKEN"
+    _ready_without_pr(store, app_factory, task_id)
+    monkeypatch.setattr(review_merge, "_gh", _fake_pr_list([]))
+    with app_factory() as conn:
+        for index in range(5):
+            record_skips(
+                conn,
+                "pr_evidence",
+                f"old-missing-pr-{index}",
+                [(task_id, "no_open_pr_on_task_branch")],
+            )
+        record_skips(conn, "pr_evidence", "empty-pr-tick", [])
+
+    report = reconcile_pr_evidence(app_factory, REPO, task_id=task_id)
+
+    assert report.recovered == []
+    assert (task_id, "no_open_pr_on_task_branch") in report.skipped
+    assert store.get_task(task_id)["status"] == "READY_TO_REVIEW"
+
+
 def test_two_open_prs_on_one_branch_are_refused_rather_than_guessed(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
     app_factory, store, _ = rig
     task_id = "VOYN-W0-PRE3"
