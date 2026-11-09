@@ -7,6 +7,7 @@ import json
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier
 
 import pytest
 
@@ -25,7 +26,7 @@ TOKEN = hashlib.sha256(b"disposable claim fixture").hexdigest()
 
 
 @pytest.fixture
-def cto_rig(admin_conn, psycopg, test_dsn, role_passwords, connect_as):
+def cto_rig(admin_conn, psycopg, test_dsn, role_passwords, connect_as, request):
     _provision(admin_conn, psycopg, test_dsn, role_passwords)
     with connect_as(roles.MIGRATOR_ROLE) as migrator:
         assert migrator.execute("SELECT max(version) FROM schema_migration").fetchone()[0] == 36
@@ -124,6 +125,14 @@ def test_dispatch_carries_only_its_own_revision_transition(cto_rig):
         .fetchone()[0]
     )
     assert bound == result[3]
+    key = (
+        cto_rig[0]
+        .execute(
+            "SELECT idempotency_key FROM work_item WHERE work_item_id=%s", (result[2],)
+        )
+        .fetchone()[0]
+    )
+    assert enqueue(cto_rig, key=key) == result[2]
     assert claim(cto_rig)[0]
 
 
@@ -316,13 +325,19 @@ def test_foreign_authenticated_principal_cannot_claim(cto_rig, psycopg, test_dsn
           VALUES('worker:foreign','worker_host',%s,'foreign','fixture','active',2,now(),now())""",
             (names[0],),
         )
-        revision = cto_rig[0].execute(
-            "SELECT revision FROM backlog_task WHERE task_id=%s", (TASK,)
-        ).fetchone()[0]
-        conflicting = cto_rig[1].execute(
-            "SELECT * FROM cto_assign(%s,%s,'worker:foreign',%s::jsonb,'competing owner')",
-            (TASK, revision, json.dumps(PAYLOAD)),
-        ).fetchone()
+        revision = (
+            cto_rig[0]
+            .execute("SELECT revision FROM backlog_task WHERE task_id=%s", (TASK,))
+            .fetchone()[0]
+        )
+        conflicting = (
+            cto_rig[1]
+            .execute(
+                "SELECT * FROM cto_assign(%s,%s,'worker:foreign',%s::jsonb,'competing owner')",
+                (TASK, revision, json.dumps(PAYLOAD)),
+            )
+            .fetchone()
+        )
         assert not conflicting[0] and conflicting[1] == "assignment_conflict"
         with psycopg.connect(dsns[0], autocommit=True) as foreign:
             assert not foreign.execute(
@@ -489,6 +504,338 @@ def test_unrevoked_assignment_does_not_follow_unrelated_revision_edit(cto_rig):
         (TASK,),
     )
     assert not claim(cto_rig)[0]
+    assert (
+        cto_rig[0]
+        .execute(
+            "SELECT count(*) FROM cto_assignment_event WHERE reason='stale_revision'"
+        )
+        .fetchone()[0]
+        == 1
+    )
+
+
+def _null_enqueue(admin):
+    """Fault injection: a producer must not turn an explicit refusal into work."""
+    admin.execute("""CREATE OR REPLACE FUNCTION queue_enqueue(
+      p_queue text,p_idempotency_key text,p_payload jsonb,p_task_id text DEFAULT NULL,
+      p_repository_id text DEFAULT NULL,p_max_attempts integer DEFAULT 3,
+      p_priority integer DEFAULT 0,p_delay_seconds integer DEFAULT 0,p_backoff_seconds integer DEFAULT 2)
+      RETURNS text LANGUAGE sql AS 'SELECT NULL::text'""")
+
+
+def _coordinator(app):
+    return app.execute(
+        "SELECT * FROM coordinator_enqueue('cto-test','snapshot','blocker','coord-key','execution',%s::jsonb)",
+        (json.dumps({"kind": "agent_run", "mode": "coordination_v2"}),),
+    ).fetchone()
+
+
+def test_enabled_coordinator_is_explicitly_held_without_cas_or_work(cto_rig):
+    activate(cto_rig)
+    assert _coordinator(cto_rig[0]) == (None, "cto_assignment_required")
+    assert (
+        cto_rig[0].execute("SELECT count(*) FROM coordinator_state").fetchone()[0] == 0
+    )
+    assert cto_rig[0].execute("SELECT count(*) FROM work_item").fetchone()[0] == 0
+    assert (
+        cto_rig[0]
+        .execute(
+            "SELECT reason FROM cto_assignment_event WHERE action='coordinator_enqueue'"
+        )
+        .fetchone()[0]
+        == "assignment_required"
+    )
+
+
+def test_disabled_coordinator_preserves_legacy_enqueue_and_cas(cto_rig):
+    wid, failure = _coordinator(cto_rig[0])
+    assert wid is not None and failure is None
     assert cto_rig[0].execute(
-        "SELECT count(*) FROM cto_assignment_event WHERE reason='stale_revision'"
-    ).fetchone()[0] == 1
+        "SELECT last_status,in_flight_key FROM coordinator_state"
+    ).fetchone() == ("queued", "coord-key")
+    assert claim(cto_rig)[0]
+
+
+def test_null_coordinator_enqueue_clears_cas_and_returns_real_failure(cto_rig):
+    _null_enqueue(cto_rig[3])
+    assert _coordinator(cto_rig[0]) == (None, "enqueue_failed:cto_enqueue_refused")
+    assert cto_rig[0].execute(
+        "SELECT last_status,in_flight_key FROM coordinator_state"
+    ).fetchone() == ("enqueue_failed", None)
+    assert (
+        cto_rig[0]
+        .execute(
+            "SELECT reason FROM cto_assignment_event WHERE action='coordinator_enqueue'"
+        )
+        .fetchone()[0]
+        == "enqueue_refused"
+    )
+
+
+def test_null_backlog_enqueue_rolls_back_status_and_lease_but_keeps_denial(cto_rig):
+    _null_enqueue(cto_rig[3])
+    result = (
+        cto_rig[0]
+        .execute(
+            "SELECT * FROM backlog_dispatch(%s,'planner',60,2,%s::jsonb,2)",
+            (TASK, json.dumps(PAYLOAD)),
+        )
+        .fetchone()
+    )
+    assert (
+        result[0] is False and result[1] == "cto_enqueue_refused" and result[2] is None
+    )
+    assert (
+        cto_rig[0]
+        .execute("SELECT status FROM backlog_task WHERE task_id=%s", (TASK,))
+        .fetchone()[0]
+        == "OPEN"
+    )
+    assert (
+        cto_rig[0]
+        .execute(
+            "SELECT count(*) FROM backlog_writer_lease WHERE authority='repo:repo-test'"
+        )
+        .fetchone()[0]
+        == 0
+    )
+    assert (
+        cto_rig[0]
+        .execute("SELECT reason FROM cto_assignment_event WHERE action='dispatch'")
+        .fetchone()[0]
+        == "enqueue_refused"
+    )
+
+
+@pytest.mark.parametrize("cto_rig", ["foundation"], indirect=True)
+@pytest.mark.parametrize("enabled", [False, True])
+def test_foundation_role_dispatch_handles_enqueue_refusal(cto_rig, enabled):
+    app = cto_rig[0]
+    app.execute("SELECT delivery_team_sync(100,NULL)")
+    revision, digest = app.execute(
+        "SELECT revision,input_digest FROM delivery_team_stage WHERE task_id=%s AND stage='ba'",
+        (TASK,),
+    ).fetchone()
+    payload = {
+        "kind": "agent_run",
+        "task_type": "review",
+        "untrusted": False,
+        "delivery_team": {
+            "task_id": TASK,
+            "revision": revision,
+            "stage": "ba",
+            "input_digest": digest,
+        },
+        "cascade": [{"executor": "claude", "task_type": "review"}],
+    }
+    if enabled:
+        activate(cto_rig)  # missing assignment: real fail-closed queue refusal
+    else:
+        _null_enqueue(cto_rig[3])
+    result = app.execute(
+        "SELECT * FROM delivery_team_dispatch(%s,%s,'ba',%s,%s::jsonb,2)",
+        (TASK, revision, digest, json.dumps(payload)),
+    ).fetchone()
+    assert result == (False, "cto_enqueue_refused", None)
+    assert app.execute(
+        "SELECT status,work_item_id,dispatch_count FROM delivery_team_stage WHERE task_id=%s AND stage='ba'",
+        (TASK,),
+    ).fetchone() == ("pending", None, 0)
+    assert (
+        app.execute(
+            "SELECT reason FROM cto_assignment_event WHERE action='delivery_team_dispatch'"
+        ).fetchone()[0]
+        == "enqueue_refused"
+    )
+
+
+@pytest.mark.parametrize("cto_rig", ["foundation"], indirect=True)
+def test_foundation_role_dispatch_disabled_baseline_still_queues(cto_rig):
+    app = cto_rig[0]
+    app.execute("SELECT delivery_team_sync(100,NULL)")
+    revision, digest = app.execute(
+        "SELECT revision,input_digest FROM delivery_team_stage WHERE task_id=%s AND stage='ba'",
+        (TASK,),
+    ).fetchone()
+    payload = {
+        "kind": "agent_run",
+        "task_type": "review",
+        "untrusted": False,
+        "delivery_team": {
+            "task_id": TASK,
+            "revision": revision,
+            "stage": "ba",
+            "input_digest": digest,
+        },
+        "cascade": [{"executor": "claude", "task_type": "review"}],
+    }
+    result = app.execute(
+        "SELECT * FROM delivery_team_dispatch(%s,%s,'ba',%s,%s::jsonb,2)",
+        (TASK, revision, digest, json.dumps(payload)),
+    ).fetchone()
+    assert result[0] and result[2]
+    assert app.execute(
+        "SELECT status,work_item_id FROM delivery_team_stage WHERE task_id=%s AND stage='ba'",
+        (TASK,),
+    ).fetchone() == ("queued", result[2])
+
+
+def test_large_denied_prefix_uses_indexed_binding_selection_and_revoke_progresses(
+    cto_rig, connect_as, tmp_path
+):
+    app, operator, _, admin = cto_rig
+    # 5,000 legacy work items plus 2,000 revoked bindings are never eligible.
+    app.execute(
+        "SELECT queue_enqueue('execution','legacy-'||n,%s::jsonb,%s,'repo-test') FROM generate_series(1,5000) n",
+        (json.dumps(PAYLOAD), TASK),
+    )
+    activate(cto_rig)
+    operator.execute(
+        "SELECT cto_assign(%s,1,'worker:test',jsonb_build_object('kind','agent_run','backlog_task_id',%s::text,'prompt','revoked-'||n),'perf revoked seed') FROM generate_series(1,2000) n",
+        (TASK, TASK),
+    )
+    seeded = app.execute(
+        "SELECT queue_enqueue('execution','revoked-'||n,jsonb_build_object('kind','agent_run','backlog_task_id',%s::text,'prompt','revoked-'||n),%s,'repo-test') FROM generate_series(1,2000) n",
+        (TASK, TASK),
+    ).fetchall()
+    assert len(seeded) == 2000 and all(row[0] for row in seeded)
+    operator.execute(
+        "SELECT cto_revoke(assignment_id,'replace perf assignment') FROM cto_assignment WHERE reference='perf revoked seed'"
+    )
+    assign(cto_rig)
+    approved = enqueue(cto_rig, key="approved-tail")
+    for table in ("work_item", "cto_assignment", "cto_work_binding", "backlog_task"):
+        admin.execute("ANALYZE " + table)
+    source = SQL.read_text()
+    query = source[source.index("    WITH authorized AS MATERIALIZED (") :]
+    query = query[: query.index("    IF NOT FOUND")].strip().rstrip(";")
+    query = (
+        query.replace("INTO it ", "")
+        .replace("p_queue", "'execution'")
+        .replace("current_principal()", "'worker:test'")
+    )
+    plan = admin.execute("EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) " + query).fetchone()[0]
+    nodes = []
+
+    def walk(node):
+        nodes.append(
+            {
+                key: node[key]
+                for key in (
+                    "Node Type",
+                    "Relation Name",
+                    "Index Name",
+                    "Actual Rows",
+                    "Actual Loops",
+                    "Rows Removed by Filter",
+                )
+                if key in node
+            }
+        )
+        for child in node.get("Plans", []):
+            walk(child)
+
+    walk(plan[0]["Plan"])
+    work_nodes = [n for n in nodes if n.get("Relation Name") == "work_item"]
+    assert work_nodes and all(
+        n["Node Type"] in ("Index Scan", "Index Only Scan") for n in work_nodes
+    )
+    assert sum(n["Actual Rows"] * n["Actual Loops"] for n in work_nodes) <= 2
+    binding_nodes = [n for n in nodes if n.get("Relation Name") == "cto_work_binding"]
+    assert binding_nodes and all(
+        n["Node Type"] in ("Index Scan", "Index Only Scan") for n in binding_nodes
+    )
+    assert sum(n["Actual Rows"] * n["Actual Loops"] for n in binding_nodes) == 1
+    assert claim(cto_rig)[2] == approved
+    # A second approved item races revocation. Both decisions must progress;
+    # any granted claim still fails start after the winning revoke commits.
+    race_payload = {**PAYLOAD, "prompt": "race tail"}
+    current = assign(cto_rig, race_payload)
+    assert enqueue(cto_rig, key="race-tail", payload=race_payload)
+    barrier = Barrier(2)
+
+    def claimant():
+        with connect_as(roles.WORKER_ROLE) as conn:
+            barrier.wait(timeout=5)
+            return conn.execute(
+                "SELECT * FROM queue_claim('execution',%s,300)", (TOKEN,)
+            ).fetchone()
+
+    def revoker():
+        with connect_as(roles.OPERATOR_ROLE) as conn:
+            barrier.wait(timeout=5)
+            return conn.execute(
+                "SELECT cto_revoke(%s,'concurrent perf revoke')", (current,)
+            ).fetchone()[0]
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        cf = pool.submit(claimant)
+        rf = pool.submit(revoker)
+        outcome = cf.result(timeout=10)
+        assert rf.result(timeout=10)
+    if outcome[0]:
+        assert start(cto_rig, outcome[3])[0] is False
+    artifact = {
+        "denied_items": 7000,
+        "plan_observer": "test admin, explicit principal literal; real worker claim separately verified",
+        "nodes": nodes,
+        "execution_ms": plan[0]["Execution Time"],
+        "revoke_finished": True,
+        "claim_won_race": outcome[0],
+    }
+    print("CTO_INDEXED_PLAN " + json.dumps(artifact, sort_keys=True))
+    (tmp_path / "plan.json").write_text(json.dumps(artifact, indent=2))
+
+
+def test_assignment_one_identity_replay_and_durable_conflict(cto_rig):
+    assign(cto_rig)
+    activate(cto_rig)
+    first = enqueue(cto_rig)
+    assert first and enqueue(cto_rig) == first
+    assert enqueue(cto_rig, key="another-identity") is None
+    assert cto_rig[3].execute("SELECT count(*) FROM work_item").fetchone()[0] == 1
+    assert (
+        cto_rig[3].execute("SELECT count(*) FROM cto_work_binding").fetchone()[0] == 1
+    )
+    assert (
+        cto_rig[3]
+        .execute(
+            "SELECT count(*) FROM cto_assignment_event WHERE reason='binding_conflict'"
+        )
+        .fetchone()[0]
+        == 1
+    )
+
+
+def test_assignment_concurrent_different_identities_create_one_work(
+    cto_rig, connect_as
+):
+    assign(cto_rig)
+    activate(cto_rig)
+    barrier = Barrier(2)
+
+    def submit(key):
+        with connect_as(roles.APP_ROLE) as conn:
+            barrier.wait(timeout=5)
+            return conn.execute(
+                "SELECT queue_enqueue('execution',%s,%s::jsonb,%s,'repo-test')",
+                (key, json.dumps(PAYLOAD), TASK),
+            ).fetchone()[0]
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        a = pool.submit(submit, "identity-a")
+        b = pool.submit(submit, "identity-b")
+        results = [a.result(timeout=10), b.result(timeout=10)]
+    assert sum(value is not None for value in results) == 1
+    assert cto_rig[3].execute("SELECT count(*) FROM work_item").fetchone()[0] == 1
+    assert (
+        cto_rig[3].execute("SELECT count(*) FROM cto_work_binding").fetchone()[0] == 1
+    )
+    assert (
+        cto_rig[3]
+        .execute(
+            "SELECT count(*) FROM cto_assignment_event WHERE reason='binding_conflict'"
+        )
+        .fetchone()[0]
+        == 1
+    )

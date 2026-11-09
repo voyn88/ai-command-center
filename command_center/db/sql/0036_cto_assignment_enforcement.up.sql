@@ -24,9 +24,11 @@ CREATE TABLE cto_assignment (
 CREATE UNIQUE INDEX cto_assignment_active_identity ON cto_assignment(task_id,revision,payload_digest) WHERE revoked_at IS NULL;
 CREATE TABLE cto_work_binding (
  work_item_id text PRIMARY KEY REFERENCES work_item(work_item_id),
- assignment_id text NOT NULL REFERENCES cto_assignment(assignment_id),
+ assignment_id text NOT NULL UNIQUE REFERENCES cto_assignment(assignment_id),
  task_revision bigint NOT NULL
 );
+CREATE INDEX cto_assignment_active_principal ON cto_assignment(principal_id,task_id,assignment_id) WHERE revoked_at IS NULL;
+CREATE INDEX cto_work_binding_assignment_revision ON cto_work_binding(assignment_id,task_revision,work_item_id);
 CREATE TABLE cto_execution_start (
  attempt_id text PRIMARY KEY REFERENCES work_attempt(attempt_id),
  started_at timestamptz NOT NULL DEFAULT clock_timestamp(),
@@ -152,16 +154,34 @@ CREATE FUNCTION queue_enqueue(p_queue text,p_idempotency_key text,p_payload json
  p_task_id text DEFAULT NULL,p_repository_id text DEFAULT NULL,p_max_attempts integer DEFAULT 3,
  p_priority integer DEFAULT 0,p_delay_seconds integer DEFAULT 0,p_backoff_seconds integer DEFAULT 2)
 RETURNS text LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,public AS $$
-DECLARE aid text; wid text; rev bigint; old work_item%ROWTYPE;
+DECLARE aid text; wid text; rev bigint; old work_item%ROWTYPE; bound_work text; refusal text;
 BEGIN
  PERFORM pg_advisory_xact_lock(73536001);
  IF _cto_enabled() THEN
+  SELECT * INTO old FROM work_item WHERE queue=p_queue AND idempotency_key=p_idempotency_key;
+  IF FOUND THEN
+   IF old.task_id IS DISTINCT FROM p_task_id OR old.repository_id IS DISTINCT FROM p_repository_id
+     OR old.payload IS DISTINCT FROM p_payload THEN
+    PERFORM _cto_audit('enqueue','idempotency_conflict',NULL,old.work_item_id); RETURN NULL;
+   END IF;
+   SELECT assignment_id INTO aid FROM cto_work_binding WHERE work_item_id=old.work_item_id;
+   IF FOUND THEN
+    -- Replay the exact bound identity, including a legitimate dispatch R→R+1.
+    -- No revoked/stale binding can be replaced merely by reusing its key.
+    refusal:=_cto_work_reason(old.work_item_id,false);
+    IF refusal IS NOT NULL THEN
+     PERFORM _cto_audit('enqueue',refusal,aid,old.work_item_id); RETURN NULL;
+    END IF;
+    RETURN old.work_item_id;
+   END IF;
+  END IF;
   aid:=_cto_assignment_for(p_task_id,p_repository_id,p_payload);
   IF aid IS NULL THEN PERFORM _cto_audit('enqueue','assignment_required'); RETURN NULL; END IF;
-  SELECT * INTO old FROM work_item WHERE queue=p_queue AND idempotency_key=p_idempotency_key;
-  IF FOUND AND (old.task_id IS DISTINCT FROM p_task_id OR old.repository_id IS DISTINCT FROM p_repository_id
-    OR old.payload IS DISTINCT FROM p_payload) THEN
-   PERFORM _cto_audit('enqueue','idempotency_conflict',aid,old.work_item_id); RETURN NULL;
+  SELECT work_item_id INTO bound_work FROM cto_work_binding WHERE assignment_id=aid;
+  IF FOUND AND bound_work IS DISTINCT FROM old.work_item_id THEN
+   -- One operator assignment names one queue identity. Check before INSERT;
+   -- the UNIQUE constraint is the race-safe backstop, not exception recovery.
+   PERFORM _cto_audit('enqueue','binding_conflict',aid,bound_work); RETURN NULL;
   END IF;
  END IF;
  wid:=_cto_legacy_enqueue(p_queue,p_idempotency_key,p_payload,p_task_id,p_repository_id,
@@ -190,7 +210,17 @@ BEGIN
    PERFORM _cto_audit('dispatch','assignment_required'); RETURN v;
   END IF;
  END IF;
- v:=_cto_legacy_dispatch(p_task_id,p_planner,p_ttl_seconds,p_wip_limit,p_payload,p_max_attempts);
+ BEGIN
+  v:=_cto_legacy_dispatch(p_task_id,p_planner,p_ttl_seconds,p_wip_limit,p_payload,p_max_attempts);
+  IF v.ok AND v.work_item_id IS NULL THEN
+   RAISE SQLSTATE 'PCT01' USING MESSAGE='CTO enqueue refusal';
+  END IF;
+ EXCEPTION WHEN SQLSTATE 'PCT01' THEN
+  -- Restore any legacy lease/status mutation before persisting the denial.
+  v.ok:=false; v.reason:='cto_enqueue_refused'; v.work_item_id:=NULL;
+  SELECT revision INTO v.revision FROM backlog_task WHERE task_id=p_task_id;
+  PERFORM _cto_audit('dispatch','enqueue_refused'); RETURN v;
+ END;
  IF v.ok AND aid IS NOT NULL THEN
   -- Only this atomic transition may carry an authorization from R to R+1.
   UPDATE cto_work_binding SET task_revision=v.revision
@@ -284,12 +314,42 @@ BEGIN
         PERFORM _cto_audit('claim',deny,NULL,first_ready.work_item_id);
       END IF;
     END IF;
-    SELECT * INTO it FROM work_item
-      WHERE queue=p_queue AND state='ready' AND available_at<=now()
-      AND _cto_work_reason(work_item_id) IS NULL
-      ORDER BY priority DESC,available_at,created_at
-      FOR UPDATE SKIP LOCKED LIMIT 1;
+    -- Materialize only this principal's active, current-revision bindings.
+    -- Unassigned/foreign/revoked queue prefixes never invoke a per-row guard.
+    WITH authorized AS MATERIALIZED (
+      SELECT b.work_item_id,a.task_id,a.repo,a.payload_digest
+      FROM cto_assignment a
+      JOIN backlog_task t ON t.task_id=a.task_id AND t.repo=a.repo
+      CROSS JOIN LATERAL (
+        SELECT binding.work_item_id FROM cto_work_binding binding
+        WHERE binding.assignment_id=a.assignment_id AND binding.task_revision=t.revision
+        ORDER BY binding.work_item_id
+        OFFSET 0
+      ) b
+      WHERE a.principal_id=current_principal() AND a.revoked_at IS NULL
+    ), selected AS MATERIALIZED (
+      SELECT candidate.work_item_id FROM authorized a
+      CROSS JOIN LATERAL (
+        -- OFFSET 0 preserves the per-authorized-ID lookup under skewed queue
+        -- statistics instead of flattening this into a scan of all work.
+        SELECT wi.work_item_id,wi.priority,wi.available_at,wi.created_at FROM work_item wi
+        WHERE wi.work_item_id=a.work_item_id AND wi.queue=p_queue
+        AND wi.state='ready' AND wi.available_at<=now() AND wi.repository_id=a.repo
+        AND _cto_task(wi.task_id,wi.payload)=a.task_id AND _cto_digest(wi.payload)=a.payload_digest
+        OFFSET 0
+      ) candidate
+      ORDER BY candidate.priority DESC,candidate.available_at,candidate.created_at LIMIT 1
+    )
+    SELECT i.* INTO it FROM selected s JOIN work_item i USING(work_item_id)
+    FOR UPDATE OF i SKIP LOCKED LIMIT 1;
     IF NOT FOUND THEN v.reason:='no_work'; RETURN v; END IF;
+    -- Recheck the one selected identity under its canonical row lock in case
+    -- a non-CTO task edit raced the relational snapshot. No attempt is spent.
+    deny:=_cto_work_reason(it.work_item_id);
+    IF deny IS NOT NULL THEN
+      PERFORM _cto_audit('claim',deny,NULL,it.work_item_id);
+      v.reason:=deny; RETURN v;
+    END IF;
 
     -- Budget: what this item has actually consumed (refunds included).
     v_used := it.attempt_count;
@@ -345,6 +405,114 @@ BEGIN
     RETURN v;
 END
 $$;
+
+
+-- Every existing SQL producer must interpret queue_enqueue's explicit refusal.
+-- Preserve originals solely for pre-activation downgrade, never for callers.
+ALTER FUNCTION coordinator_enqueue(text,text,text,text,text,jsonb) RENAME TO _cto_legacy_coordinator_enqueue;
+CREATE FUNCTION coordinator_enqueue(
+    p_name text, p_snapshot_hash text, p_blocker_hash text, p_key text,
+    p_queue text, p_payload jsonb
+) RETURNS TABLE (work_item_id text, failure text)
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+DECLARE v_id text;
+BEGIN
+    PERFORM pg_advisory_xact_lock(73536001);
+    IF _cto_enabled() THEN
+        -- This producer has no canonical repository/task assignment. Do not
+        -- invent one or advance its CAS into a queue state without work.
+        PERFORM _cto_audit('coordinator_enqueue','assignment_required');
+        RETURN QUERY SELECT NULL::text,'cto_assignment_required'::text; RETURN;
+    END IF;
+    IF NOT coordinator_cas_begin(p_name, p_snapshot_hash, p_blocker_hash, p_key) THEN
+        RETURN QUERY SELECT NULL::text, 'cas_begin_refused'::text;
+        RETURN;
+    END IF;
+    BEGIN
+        v_id := queue_enqueue(p_queue, p_key, p_payload,
+            'VOYN-AICC-COORD-V2', NULL, 1, 100, 0, 2);
+    EXCEPTION WHEN OTHERS THEN
+        UPDATE coordinator_state SET in_flight_key = NULL, in_flight_at = NULL,
+            last_status = 'enqueue_failed',
+            cooldown_until = clock_timestamp() + interval '5 minutes',
+            detail = detail || jsonb_build_object('enqueue_sqlstate', SQLSTATE),
+            updated_at = clock_timestamp()
+        WHERE name = p_name AND in_flight_key = p_key;
+        RETURN QUERY SELECT NULL::text, ('enqueue_failed:' || SQLSTATE)::text;
+        RETURN;
+    END;
+    IF v_id IS NULL THEN
+        UPDATE coordinator_state SET in_flight_key=NULL,in_flight_at=NULL,
+            last_status='enqueue_failed',
+            cooldown_until=clock_timestamp()+interval '5 minutes',
+            detail=detail || jsonb_build_object('enqueue_refusal','null_work_item'),
+            updated_at=clock_timestamp()
+        WHERE name=p_name AND in_flight_key=p_key;
+        PERFORM _cto_audit('coordinator_enqueue','enqueue_refused');
+        RETURN QUERY SELECT NULL::text,'enqueue_failed:cto_enqueue_refused'::text; RETURN;
+    END IF;
+    RETURN QUERY SELECT v_id, NULL::text;
+END
+$$;
+
+REVOKE ALL ON FUNCTION coordinator_enqueue(text,text,text,text,text,jsonb) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION coordinator_enqueue(text,text,text,text,text,jsonb) TO aicc_app;
+DO $foundation$
+BEGIN
+ IF to_regprocedure('public.delivery_team_dispatch(text,bigint,text,text,jsonb,integer)') IS NOT NULL THEN
+  ALTER FUNCTION delivery_team_dispatch(text,bigint,text,text,jsonb,integer) RENAME TO _cto_legacy_delivery_team_dispatch;
+  EXECUTE $definition$
+CREATE FUNCTION delivery_team_dispatch(p_task_id text,p_revision bigint,p_stage text,
+ p_input_digest text,p_payload jsonb,p_max_attempts integer DEFAULT 2)
+RETURNS TABLE(ok boolean,reason text,work_item_id text) LANGUAGE plpgsql VOLATILE SECURITY DEFINER
+SET search_path = pg_catalog, public AS $$
+DECLARE s delivery_team_stage%ROWTYPE; v_id text; v_meta jsonb; v_count integer;
+BEGIN
+ PERFORM pg_advisory_xact_lock(73536001);
+ PERFORM pg_advisory_xact_lock(73535001);
+ PERFORM 1 FROM backlog_task b WHERE b.task_id=p_task_id AND b.revision=p_revision FOR UPDATE;
+ IF NOT FOUND THEN RETURN QUERY SELECT false,'stale_revision',NULL::text;RETURN; END IF;
+ SELECT * INTO s FROM delivery_team_stage d WHERE d.task_id=p_task_id AND d.revision=p_revision AND d.stage=p_stage FOR UPDATE;
+ IF NOT FOUND THEN RETURN QUERY SELECT false,'unknown_stage',NULL::text;RETURN;END IF;
+ IF p_input_digest IS DISTINCT FROM s.input_digest OR s.input_digest IS DISTINCT FROM
+   _delivery_team_digest(p_task_id,p_revision,s.ordinal) THEN
+   RETURN QUERY SELECT false,'stale_digest',NULL::text;RETURN;END IF;
+ IF s.status='queued' THEN RETURN QUERY SELECT true,'already_queued',s.work_item_id;RETURN;END IF;
+ IF NOT _delivery_team_eligible(p_task_id,p_revision,p_stage) THEN
+   RETURN QUERY SELECT false,'not_eligible',NULL::text;RETURN;END IF;
+ v_meta:=jsonb_build_object('task_id',p_task_id,'revision',p_revision,'stage',p_stage,'input_digest',p_input_digest);
+ IF coalesce(p_payload->>'kind','')<>'agent_run' OR coalesce(p_payload->>'task_type','')<>'review'
+    OR p_payload->'delivery_team' IS DISTINCT FROM v_meta OR p_payload ? 'backlog_task_id'
+    OR coalesce(p_payload->>'untrusted','true')<>'false'
+    OR jsonb_typeof(p_payload->'cascade') IS DISTINCT FROM 'array'
+    OR jsonb_array_length(p_payload->'cascade')=0
+    OR EXISTS(SELECT 1 FROM jsonb_array_elements(p_payload->'cascade') c
+          WHERE c->>'task_type' IS DISTINCT FROM 'review' OR coalesce(c->>'executor','') NOT IN ('claude','codex')) THEN
+    RETURN QUERY SELECT false,'unsafe_payload',NULL::text;RETURN;END IF;
+ IF s.ordinal IN (8,9,10) AND (p_payload->>'delivery_team_source_sha' IS DISTINCT FROM
+    (_delivery_team_context(p_task_id,p_revision,s.ordinal)->>'source_sha')
+    OR coalesce(p_payload->>'delivery_team_source_sha','')!~'^[a-f0-9]{40}$') THEN
+    RETURN QUERY SELECT false,'source_sha_mismatch',NULL::text;RETURN;END IF;
+ -- Serialized global admission: at most two readonly team jobs occupy the
+ -- existing execution queue. Terminal retry is bounded by queue max_attempts.
+ SELECT count(*) INTO v_count FROM work_item w WHERE w.state IN ('ready','claimed') AND w.payload ? 'delivery_team';
+ IF v_count>=2 THEN RETURN QUERY SELECT false,'capacity',NULL::text;RETURN;END IF;
+ v_id:=queue_enqueue('execution','delivery-team:'||p_task_id||':'||p_revision||':'||p_stage||':'||p_input_digest||':'||(s.dispatch_count+1),
+      p_payload,NULL,(SELECT b.repo FROM backlog_task b WHERE b.task_id=p_task_id),least(greatest(coalesce(p_max_attempts,2),1),2));
+ IF v_id IS NULL THEN
+  PERFORM _cto_audit('delivery_team_dispatch','enqueue_refused');
+  RETURN QUERY SELECT false,'cto_enqueue_refused',NULL::text; RETURN;
+ END IF;
+ UPDATE delivery_team_stage d SET status='queued',work_item_id=v_id,dispatch_count=d.dispatch_count+1,
+   reason=NULL,updated_at=now() WHERE d.task_id=p_task_id AND d.revision=p_revision AND d.stage=p_stage;
+ RETURN QUERY SELECT true,'queued',v_id;
+END $$;
+
+$definition$;
+  REVOKE ALL ON FUNCTION delivery_team_dispatch(text,bigint,text,text,jsonb,integer) FROM PUBLIC;
+  GRANT EXECUTE ON FUNCTION delivery_team_dispatch(text,bigint,text,text,jsonb,integer) TO aicc_app;
+ END IF;
+END $foundation$;
 
 -- Every new function defaults PUBLIC EXECUTE in PostgreSQL: close that default,
 -- including renamed legacy entry points, before selectively granting public API.

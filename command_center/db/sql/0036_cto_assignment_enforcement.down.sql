@@ -5,6 +5,17 @@ DO $$ BEGIN
   RAISE EXCEPTION 'activated CTO authorization requires a reviewed forward migration';
  END IF;
 END $$;
+DROP FUNCTION coordinator_enqueue(text,text,text,text,text,jsonb);
+ALTER FUNCTION _cto_legacy_coordinator_enqueue(text,text,text,text,text,jsonb) RENAME TO coordinator_enqueue;
+GRANT EXECUTE ON FUNCTION coordinator_enqueue(text,text,text,text,text,jsonb) TO aicc_app;
+DO $foundation$
+BEGIN
+ IF to_regprocedure('public._cto_legacy_delivery_team_dispatch(text,bigint,text,text,jsonb,integer)') IS NOT NULL THEN
+  DROP FUNCTION delivery_team_dispatch(text,bigint,text,text,jsonb,integer);
+  ALTER FUNCTION _cto_legacy_delivery_team_dispatch(text,bigint,text,text,jsonb,integer) RENAME TO delivery_team_dispatch;
+  GRANT EXECUTE ON FUNCTION delivery_team_dispatch(text,bigint,text,text,jsonb,integer) TO aicc_app;
+ END IF;
+END $foundation$;
 DROP FUNCTION queue_claim(text,text,integer);
 DROP FUNCTION backlog_dispatch(text,text,integer,integer,jsonb,integer);
 DROP FUNCTION queue_enqueue(text,text,jsonb,text,text,integer,integer,integer,integer);

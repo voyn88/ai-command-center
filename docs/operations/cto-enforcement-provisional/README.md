@@ -15,7 +15,11 @@ rollout wrapper belong to the integration owner. The published old policy
   repository, and active enrolled worker principal. Claimed actor/executor
   payload fields are not authority. After revocation an explicit new assignment
   may use the same task revision, but needs a new work identity; old bindings
-  cannot silently move to it.
+  cannot silently move to it. One assignment authorizes exactly one work identity:
+  a unique constraint and serialized precheck reject another queue/key with
+  `binding_conflict` before inserting work. Exact queue/key/payload replay returns
+  the same work ID only while its original binding remains valid, including the
+  legitimate dispatch revision transition. Revoked bindings never revive.
 - `cto_revoke(assignment_id, reason)` serializes with claim and start. It does
   not stop an attempt already authorized to start.
 - `cto_activate(fleet_verification_reference)` enables enforcement once. The
@@ -53,6 +57,12 @@ Every control function shares one transaction-scoped advisory lock. This
 serializes authorization decisions; it is not a second planner or runtime
 writer. Claim selection searches authorized candidates beyond a denied prefix,
 auditing at most one refused head per call without spending attempt budgets.
+Eligibility starts from an index of active assignments for the authenticated
+principal, then unique assignment-to-work bindings and work primary-key lookups.
+A 7,000-item denied-prefix fixture verifies those actual plan nodes and concurrent
+revocation progress. This is not constant-time: sorting and probing still scale
+with that principal's active eligible assignment cardinality, and the global
+lock serializes decisions. The fixture is evidence, not a production latency SLA.
 Combined foundation 0035 trigger/lock-order regression remains an integration
 gate because this provisional suite starts from main's schema 0034.
 
@@ -76,3 +86,24 @@ PostgreSQL 16 container on an ephemeral loopback port and removes it in `finally
 No production database or another task's container is an acceptable test target.
 Runtime enforcement outside the supported SQL/worker route, including arbitrary
 manual tools in another chat, is not implemented or claimed here.
+
+## Existing SQL producers
+
+All existing SQL callers of `queue_enqueue` were inspected:
+
+- `backlog_dispatch` supports an exact approved payload and atomic R→R+1 binding.
+  A NULL refusal rolls back its inner status/lease mutations before recording a
+  durable denial; it cannot report IN_PROGRESS with a NULL work identity.
+- Foundation `delivery_team_dispatch` supports its exact final role payload.
+  A NULL refusal leaves the stage pending and queued count unchanged, returning
+  `cto_enqueue_refused` with a durable audit event. The wrapper acquires the CTO
+  lock before the foundation lock. Installation is conditional on foundation0035;
+  the integrated numbered migration must have that approved predecessor.
+- `coordinator_enqueue` remains unchanged while enforcement is disabled. When
+  enabled, its taskless/repository-NULL advisory producer is explicitly held as
+  `cto_assignment_required` before its global in-flight CAS. Canonical task/repo
+  integration and operator assignment are required before this producer may run.
+  A disabled-mode NULL enqueue also releases its CAS and returns a truthful error.
+
+These producer refusals preserve committed audit rows. Explicit caller rollback
+still requires the redacted server log, as described above.
