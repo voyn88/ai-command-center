@@ -1,7 +1,9 @@
 # Cheap API verdict bench: PR #745 remediation
 
-Task: `VOYN-W0-AICC-CHEAP-API-VERDICT-BENCH-REM`  
-Reconciled: 2026-11-09  
+Task: `VOYN-W0-AICC-CHEAP-API-VERDICT-BENCH-REM`
+
+Reconciled: 2026-11-09
+
 Supersedes: PR #745 at `80485d1fa7294aa0fce02fd617844403e49ed066`
 
 ## Reconciliation
