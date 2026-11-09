@@ -101,6 +101,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Iterable
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -374,6 +375,59 @@ def reconcile_pr_evidence(
             report.skipped.append((row_task_id, f"evidence_refused: {reason}"))
             continue
         report.recorded.append((row_task_id, pr_url))
+    return report
+
+
+@dataclass
+class StuckReviewRecoveryReport:
+    """See `recover_stuck_ready_to_review_once`."""
+
+    #: (task_id, reason) sent back to OPEN for a fresh dispatch attempt.
+    recovered: list[tuple[str, str]] = field(default_factory=list)
+    #: (task_id, reason) the 0018 gate refused -- the candidate no longer
+    #: qualifies (e.g. evidence landed, or the status moved on, between the
+    #: caller's scan and this call).
+    skipped: list[tuple[str, str]] = field(default_factory=list)
+
+
+def recover_stuck_ready_to_review_once(
+    factory: Any, candidates: Iterable[str]
+) -> StuckReviewRecoveryReport:
+    """Send each `no_open_pr_on_task_branch` candidate back to OPEN.
+
+    `reconcile_pr_evidence` already proved, with a live GitHub lookup, that
+    a READY_TO_REVIEW task carries no `pr` evidence and no open pull request
+    on its own branch. That is exactly the narrow condition
+    `backlog_recover_stuck_ready_to_review` exists to repair (migration
+    0018, VOYN-W0-AICC-NO-RECOVERY-PATH-STUCK-READY-TO-REVIEW) -- the state
+    a run whose publish step failed used to leave behind before 0011, or any
+    future bug that reintroduces the same evidence-free row. The gate was
+    built, granted, and tested, but had no caller anywhere in the fleet: the
+    tick that detects the condition only ever reported it, forever, which is
+    precisely the shape the tick-stall watchdog
+    (VOYN-W0-AICC-TICK-STALL-WATCHDOG) escalates after five ticks but never
+    acts on itself -- `watchdog_once` deliberately never touches the stalled
+    item. This closes the loop one call away from where the condition is
+    already proven, live, 2026-11-04 on VOYN-W0-AICC-SRV-07b.
+
+    `candidates` is the caller's own tick-local `no_open_pr_on_task_branch`
+    skip list -- no second GitHub lookup is spent confirming it. The 0018
+    function revalidates everything itself under its own row lock (still
+    READY_TO_REVIEW, still zero `pr` evidence) before granting, so a
+    candidate that changed between the caller's scan and this call is
+    simply refused (`not_ready_to_review` / `has_pr_evidence`), never acted
+    on stale information.
+    """
+    from command_center.db.backlog_store import BacklogStore
+
+    store = BacklogStore(factory)
+    report = StuckReviewRecoveryReport()
+    for task_id in candidates:
+        ok, reason, _revision = store.recover_stuck_ready_to_review(task_id)
+        if ok:
+            report.recovered.append((task_id, reason))
+        else:
+            report.skipped.append((task_id, reason))
     return report
 
 

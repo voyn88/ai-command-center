@@ -19,6 +19,7 @@ from command_center.orchestrator.review_merge import (
     reconcile_merge_evidence,
     reconcile_pr_evidence,
     reconcile_pr_window,
+    recover_stuck_ready_to_review_once,
     review_once,
 )
 from tests.db.test_backlog_planner import (  # noqa: F401 — pytest fixtures
@@ -4333,6 +4334,78 @@ def test_a_task_adopts_only_its_own_branch_never_a_prefix_match(rig, _test_repo_
 
     assert _pr_rows(app_factory, task_id) == []
     assert (task_id, "no_open_pr_on_task_branch") in report.skipped
+
+
+def _task_status(factory, task_id):
+    with factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", (task_id,))
+        return cur.fetchone()[0]
+
+
+# ---------------------------------------------------------------------------
+# recover_stuck_ready_to_review_once: the 0018 gate's missing caller
+# (VOYN-W0-AICC-TICK-STALL-WATCHDOG, live 2026-11-04 on VOYN-W0-AICC-SRV-07b).
+#
+# `reconcile_pr_evidence` only ever reports `no_open_pr_on_task_branch` --
+# "reporting only: no status is changed here" by its own docstring -- so a
+# READY_TO_REVIEW task with no `pr` evidence and no open PR on its branch
+# skipped with the SAME reason every tick forever with nothing to break the
+# streak, five of which is exactly what the watchdog escalates on. This is
+# the call that was missing: feeding that exact skip list into the gate
+# migration 0018 built, granted, and tested but no production path ever
+# invoked.
+# ---------------------------------------------------------------------------
+
+
+def test_recover_stuck_ready_to_review_once_sends_the_task_back_to_open(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-REC1"
+    _ready_without_pr(store, app_factory, task_id)
+
+    report = recover_stuck_ready_to_review_once(app_factory, [task_id])
+
+    assert (task_id, "OPEN") in report.recovered
+    assert report.skipped == []
+    assert _task_status(app_factory, task_id) == "OPEN"
+
+
+def test_recover_stuck_ready_to_review_once_refuses_a_task_with_pr_evidence(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+    """Defense in depth: even if a caller passed a stale candidate whose
+    evidence landed since the scan that produced it, the 0018 gate
+    revalidates under its own row lock and refuses rather than yanking a
+    genuinely reviewable task back to OPEN."""
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-REC2"
+    _ready(store, app_factory, task_id, "https://github.com/x/repo-x/pull/1")
+
+    report = recover_stuck_ready_to_review_once(app_factory, [task_id])
+
+    assert report.recovered == []
+    assert (task_id, "has_pr_evidence") in report.skipped
+    assert _task_status(app_factory, task_id) == "READY_TO_REVIEW"
+
+
+def test_no_open_pr_on_task_branch_closes_the_loop_through_reconcile_and_recover(  # noqa: E501
+    rig, _test_repo_routes, monkeypatch  # noqa: F811
+):
+    """End to end: the exact skip `reconcile_pr_evidence` reports for a
+    task with no PR anywhere is the candidate list that sends it back to
+    OPEN, so the SAME tick that proves the stall also ends it -- the next
+    tick's `reconcile_pr_evidence` scan (READY_TO_REVIEW only) no longer
+    selects this task at all."""
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-REC3"
+    _ready_without_pr(store, app_factory, task_id)
+    monkeypatch.setattr(review_merge, "_gh", _fake_pr_list([]))
+
+    evidence = reconcile_pr_evidence(app_factory, REPO)
+    assert (task_id, "no_open_pr_on_task_branch") in evidence.skipped
+
+    stuck = [t for t, reason in evidence.skipped if reason == "no_open_pr_on_task_branch"]
+    recovery = recover_stuck_ready_to_review_once(app_factory, stuck)
+
+    assert (task_id, "OPEN") in recovery.recovered
+    assert _task_status(app_factory, task_id) == "OPEN"
 
 
 def test_two_open_prs_on_one_branch_are_refused_rather_than_guessed(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501

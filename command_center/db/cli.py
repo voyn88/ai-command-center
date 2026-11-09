@@ -654,6 +654,7 @@ def main(argv: list[str] | None = None) -> int:
                     publish_review_verdicts,
                     reconcile_pr_evidence,
                     reconcile_review_once,
+                    recover_stuck_ready_to_review_once,
                     review_once,
                 )
 
@@ -678,6 +679,28 @@ def main(argv: list[str] | None = None) -> int:
                         print(f"PR-FOUND  {evidence_task_id} -> {pr}")
                     for evidence_task_id, reason in evidence.skipped:
                         print(f"PR-SKIP   {evidence_task_id}: {reason}")
+                    # A READY_TO_REVIEW task with no `pr` evidence and no
+                    # open PR on its own branch (just proved above, live)
+                    # can never resolve itself: nothing else ever sends it
+                    # back for a fresh attempt, and it would otherwise skip
+                    # with this same reason every tick forever (the exact
+                    # shape VOYN-W0-AICC-TICK-STALL-WATCHDOG escalates after
+                    # five ticks, live 2026-11-04 on VOYN-W0-AICC-SRV-07b).
+                    # The 0018 recovery gate was built for this and granted,
+                    # but had no caller anywhere in the fleet.
+                    stuck_candidates = [
+                        evidence_task_id
+                        for evidence_task_id, reason in evidence.skipped
+                        if reason == "no_open_pr_on_task_branch"
+                    ]
+                    if stuck_candidates:
+                        recovery = recover_stuck_ready_to_review_once(
+                            lambda: _nc(conn), stuck_candidates
+                        )
+                        for recovered_task_id, reason in recovery.recovered:
+                            print(f"PR-RECOVER {recovered_task_id} -> {reason}")
+                        for skipped_task_id, reason in recovery.skipped:
+                            print(f"PR-RECOVER-SKIP {skipped_task_id}: {reason}")
                     report = review_once(
                         lambda: _nc(conn),
                         enqueue,
