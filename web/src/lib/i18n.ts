@@ -12,7 +12,7 @@ export const en = {
   artifacts: 'Artifacts',
   reviewCenter: 'Review Center',
   settings: 'Settings',
-  greeting: 'Good morning, Dmitry',
+  greeting: 'Hello',
   greetingSub: "Here's what's happening with your projects today.",
   newTask: 'New Task',
   projects: 'Projects',
@@ -101,6 +101,40 @@ export const en = {
   bgRain: 'Rain',
   bgSnow: 'Snow',
   bgCustom: 'Custom',
+  runPrepared: 'Prepared',
+  runQueued: 'Queued',
+  runRunning: 'Running now',
+  runCompleted: 'Completed',
+  runFailed: 'Failed',
+  runCancelled: 'Cancelled',
+  runInterrupted: 'Interrupted',
+  runUnknown: 'State unknown',
+  repoOk: 'Repository is fine',
+  repoUnconfigured: 'Repository not connected',
+  repoInvalidPath: 'Repository path not found',
+  repoNotGit: 'Folder is not a git repository',
+  attemptRunning: 'running',
+  attemptDone: 'succeeded',
+  attemptFailed: 'failed',
+  reasonTimeout: 'ran out of time',
+  reasonGeneric: 'reason: {{reason}}',
+  durSec: '{{n}} s',
+  durMin: '{{m}} min {{s}} s',
+  ageNow: 'just now',
+  ageHours: '{{n}} h ago',
+  ageDays: '{{n}} d ago',
+  staleBadge: 'Stalled for a while',
+  prioP0: 'Critical',
+  prioP1: 'High',
+  prioP2: 'Normal',
+  prioP3: 'Low',
+  prioNone: 'No priority set',
+  activityGeneric: 'Event',
+  taskDetailsError: 'Could not load task details. Close and open them again.',
+  taskAuditTitle: 'Project check: {{project}}',
+  attentionBanner: 'Need attention: {{n}}',
+  errorLoadingHint: 'Check the connection and press “Retry”.',
+  healthLabel: 'Project health: {{healthy}} of {{total}}',
 }
 
 export const ru = {
@@ -114,7 +148,7 @@ export const ru = {
   artifacts: 'Артефакты',
   reviewCenter: 'Ревью',
   settings: 'Настройки',
-  greeting: 'Доброе утро, Dmitry',
+  greeting: 'Здравствуйте',
   greetingSub: 'Вот что происходит с вашими проектами сегодня.',
   newTask: 'Новая задача',
   projects: 'Проекты',
@@ -203,6 +237,52 @@ export const ru = {
   bgRain: 'Дождь',
   bgSnow: 'Снег',
   bgCustom: 'Свой',
+  runPrepared: 'Подготовлен',
+  runQueued: 'В очереди',
+  runRunning: 'Идёт сейчас',
+  runCompleted: 'Завершён',
+  runFailed: 'Сбой',
+  runCancelled: 'Отменён',
+  runInterrupted: 'Прерван',
+  runUnknown: 'Состояние неизвестно',
+  repoOk: 'Репозиторий в порядке',
+  repoUnconfigured: 'Репозиторий не подключён',
+  repoInvalidPath: 'Не найден путь к репозиторию',
+  repoNotGit: 'Папка не является git-репозиторием',
+  attemptRunning: 'выполняется',
+  attemptDone: 'успешно',
+  attemptFailed: 'не удалось',
+  reasonTimeout: 'не уложились во время',
+  reasonGeneric: 'причина: {{reason}}',
+  durSec: '{{n}} с',
+  durMin: '{{m}} мин {{s}} с',
+  ageNow: 'только что',
+  ageHours: '{{n}} ч назад',
+  ageDays: '{{n}} дн. назад',
+  staleBadge: 'Давно без движения',
+  prioP0: 'Критический',
+  prioP1: 'Высокий',
+  prioP2: 'Обычный',
+  prioP3: 'Низкий',
+  prioNone: 'Приоритет не задан',
+  activityGeneric: 'Событие',
+  taskDetailsError: 'Не удалось загрузить подробности задачи. Закройте и откройте их снова.',
+  taskAuditTitle: 'Проверка проекта {{project}}',
+  attentionBanner: 'Требуют внимания: {{n}}',
+  errorLoadingHint: 'Проверьте соединение и нажмите «Повторить».',
+  healthLabel: 'Здоровье проектов: {{healthy}} из {{total}}',
+}
+
+const LANG_KEY = 'aicc-lang'
+
+function initialLang(): 'ru' | 'en' {
+  try {
+    const saved = window.localStorage.getItem(LANG_KEY)
+    if (saved === 'ru' || saved === 'en') return saved
+  } catch {
+    // storage unavailable (private mode etc.) - fall back to Russian
+  }
+  return 'ru'
 }
 
 i18n
@@ -212,13 +292,25 @@ i18n
       en: { translation: en },
       ru: { translation: ru },
     },
-    lng: 'en',
+    lng: initialLang(),
     fallbackLng: 'en',
     interpolation: { escapeValue: false },
   })
 
+function syncDocumentLang(lng: string) {
+  if (typeof document !== 'undefined') document.documentElement.lang = lng
+}
+syncDocumentLang(i18n.language)
+i18n.on('languageChanged', syncDocumentLang)
+
 export function toggleLang() {
-  i18n.changeLanguage(i18n.language === 'en' ? 'ru' : 'en')
+  const next = i18n.language === 'en' ? 'ru' : 'en'
+  try {
+    window.localStorage.setItem(LANG_KEY, next)
+  } catch {
+    // ignore: the choice just will not survive a reload
+  }
+  i18n.changeLanguage(next)
 }
 
 export default i18n
