@@ -123,3 +123,46 @@ the lock only after the outer context exited. The receipt records the exact
 wrapper and foundation SQL hashes. This proves the lock interaction, not a
 complete target-36 wrapper apply or production acceptance. Production execution
 is not part of this candidate's preparation.
+
+## Public upgrade and self-deploy wiring
+
+`python -m command_center.db upgrade` now guards the first application of 0035
+or 0036. `self_deploy._run_migrations` invokes that same command, so automatic
+release cannot silently take the legacy route around the preflight. This changes
+neither the low-level `migrations.upgrade` API used by disposable test/bootstrap
+harnesses nor the generic AIOS runner.
+
+Before observing applied/pending versions, the CLI acquires the same
+`aicc:schema-migration` session lock. It checks for a nonempty contiguous known
+ledger and verifies all applied checksums before choosing a route. An old or
+modified version 36 is refused before any upgrade or grant restoration. Crossing
+35/36 requires all four release-environment inputs:
+
+- `AICC_CTO_MIGRATION_MANIFEST`: reviewed release manifest path.
+- `AICC_CTO_MIGRATION_MANIFEST_SHA256`: exact approved manifest hash.
+- `AICC_CTO_MIGRATION_IDENTITY_EVIDENCE`: approved identity evidence path.
+- `AICC_CTO_MIGRATION_CONNECTION_EVIDENCE`: approved connection evidence path.
+
+The CLI loads and validates those inputs, snapshots its current assembled
+`migrations.SQL_DIR`, then invokes `execute(existing_connection, ..., apply=True)`.
+It does **not** open the wrapper's separate DSN, call the wrapper CLI, switch
+roles, or try another credential. Missing manifest, drift, missing packaged
+`ops.aicc_cto_migration`, or any preflight failure returns nonzero without calling
+legacy upgrade or restoring grants. The existing source-release package must
+therefore include the reviewed `ops` module; a missing module is a hard failure.
+
+After the guarded runner succeeds, the existing grant matrix is restored while
+the outer lock remains held. A failed apply may already have committed 0035;
+resume still requires its exact approved history and structural fingerprint.
+Already-36 databases with verified unchanged history retain the ordinary
+idempotent upgrade and future-migration path; no perpetual 34/35-only wrapper is
+imposed on later deployments. A future bundle crossing from 34/35 is not silently
+approved by this version's exact 1..36 manifest: assemble and review its lineage
+explicitly. Empty/missing/unknown ledgers do not cause automatic ledger creation.
+
+The public command suppresses pool/driver diagnostics while upgrading and emits
+fixed refusal/error messages, so failures cannot print DSNs or arbitrary SQL
+exception text. The focused tests invoke the actual `cli.main(["upgrade"])`
+entrypoint and verify refusal paths, shared connection/lock ordering, success-only
+grants, and the already-36/future paths. Final combined PostgreSQL acceptance and
+authorized runtime rollout remain owned by the integrator.

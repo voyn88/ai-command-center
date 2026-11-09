@@ -20,9 +20,10 @@ import logging
 import os
 import sys
 from contextlib import nullcontext
+from pathlib import Path
 from typing import Any
 
-from command_center.db import migrations, pool, roles
+from command_center.db import adapter, migrations, pool, roles
 from command_center.db.config import ConfigError, load_config
 
 
@@ -315,6 +316,92 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+
+class _UpgradeRefusal(ValueError):
+    """Fixed diagnostics for the public upgrade entrypoint."""
+
+
+def _upgrade_existing_connection(conn) -> tuple[tuple[int, ...], int]:
+    """Guard the 35/36 boundary, including automatic self-deploy upgrades.
+
+    Observe the ledger and decide the route under the same session lock held
+    through migration and grant restoration. The wrapper and runner may acquire
+    this key reentrantly; there is no read/upgrade exclusion gap.
+    """
+    with adapter.advisory_lock(
+        conn, adapter.lock_key(migrations.LOCK_NAMESPACE), wait_timeout=10
+    ):
+        runner = migrations.runner()
+        defined = runner.discover()
+        available = tuple(m.version for m in defined)
+        applied = runner.applied_versions(conn)
+        if (
+            not available
+            or not applied
+            or applied != tuple(range(1, applied[-1] + 1))
+            or not set(applied).issubset(available)
+        ):
+            raise _UpgradeRefusal("unsupported_migration_history")
+        # This occurs before *any* upgrade/ensure_ledger call, including no-op
+        # upgrades of an existing 36. Old policy 36 cannot impersonate new 36.
+        runner.verify_checksums(conn, defined)
+        crosses_cto_boundary = bool({35, 36}.intersection(set(available) - set(applied)))
+        if crosses_cto_boundary:
+            names = (
+                "AICC_CTO_MIGRATION_MANIFEST",
+                "AICC_CTO_MIGRATION_MANIFEST_SHA256",
+                "AICC_CTO_MIGRATION_IDENTITY_EVIDENCE",
+                "AICC_CTO_MIGRATION_CONNECTION_EVIDENCE",
+            )
+            values = [os.environ.get(name) for name in names]
+            if not all(values):
+                raise _UpgradeRefusal("cto_migration_manifest_required")
+            # ops is part of the existing source-release tree. A missing module
+            # is a packaging error and must refuse, never use legacy upgrade.
+            from ops import aicc_cto_migration as guarded
+
+            manifest = guarded.load_manifest(Path(values[0]), values[1])
+            guarded.validate_identity_evidence(Path(values[2]), manifest)
+            guarded.validate_connection_evidence(Path(values[3]), manifest)
+            with guarded.approved_source(migrations.SQL_DIR, manifest) as snapshot:
+                result = guarded.execute(conn, manifest, snapshot, apply=True)
+            completed = tuple(result["applied"])
+        else:
+            # Verified already-36 histories retain ordinary idempotent/future
+            # upgrades. Databases below the crossing keep their existing path.
+            completed = migrations.upgrade(conn)
+        count = roles.apply_table_grants(conn)
+        return completed, count
+
+
+def _run_upgrade() -> int:
+    """Use the ordinary configured pool; never introduce a credential fallback."""
+    previous_logging_disable = logging.root.manager.disable
+    logging.disable(logging.CRITICAL)
+    try:
+        config = load_config()
+        pool.open_pool(config)
+        with pool.connection() as conn:
+            applied, count = _upgrade_existing_connection(conn)
+        print(f"applied: {list(applied)}" if applied else "already up to date")
+        print(f"re-asserted {count} table grants")
+        return 0
+    except _UpgradeRefusal as exc:
+        print(f"upgrade refused: {exc}", file=sys.stderr)
+        return 1
+    except Exception:
+        # Pool, file, driver and migration exceptions may carry DSNs or SQL
+        # literals. The standalone preflight can provide its fixed reason code.
+        print("upgrade failed: migration preflight or apply refused", file=sys.stderr)
+        return 1
+    finally:
+        try:
+            pool.close_pool()
+        except Exception:
+            pass
+        logging.disable(previous_logging_disable)
+
+
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(
         level=logging.INFO, format="%(levelname)s %(name)s: %(message)s"
@@ -388,6 +475,9 @@ def main(argv: list[str] | None = None) -> int:
             print(window.quota.line())
         return 0
 
+    if args.command == "upgrade":
+        return _run_upgrade()
+
     try:
         config = load_config()
     except ConfigError as exc:
@@ -406,17 +496,6 @@ def main(argv: list[str] | None = None) -> int:
             if args.command == "bootstrap":
                 count = roles.apply_bootstrap(conn)
                 print(f"applied {count} role/schema statements")
-                return 0
-
-            if args.command == "upgrade":
-                applied = migrations.upgrade(conn)
-                print(f"applied: {list(applied)}" if applied else "already up to date")
-                # Unconditionally, not only when something was applied: a table
-                # created by a migration starts with no grants, and re-asserting
-                # the matrix here is what keeps "migrated" and "reachable by the
-                # app" the same state.
-                count = roles.apply_table_grants(conn)
-                print(f"re-asserted {count} table grants")
                 return 0
 
             if args.command == "queue-reap":
