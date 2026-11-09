@@ -91,13 +91,28 @@ def test_uncheckpointed_workspace_probe_counts_only_signed_head_mismatches(
     _git(workspace, "commit", "-q", "-m", "agent")
     assert wp.count_uncheckpointed_task_workspaces(root) == 1
 
-    # A copied/forged marker is not fleet evidence.
+    # A copied/forged marker makes the count unknown; it must not look like 0.
     marker["authority_hmac"] = "0" * 64
     wp._atomic_write_private(
         wp._task_local_marker_path(workspace),
         (__import__("json").dumps(marker, sort_keys=True) + "\n").encode(),
     )
-    assert wp.count_uncheckpointed_task_workspaces(root) == 0
+    with pytest.raises(wp.WorkspaceProbeError, match="invalid authority"):
+        wp.count_uncheckpointed_task_workspaces(root)
+
+
+def test_uncheckpointed_workspace_probe_fails_closed_without_authority_or_root(
+    tmp_path, monkeypatch
+):
+    from command_center import workspace_provisioning as wp
+
+    monkeypatch.delenv("AICC_WORKSPACE_AUTHORITY_KEY", raising=False)
+    with pytest.raises(wp.WorkspaceProbeError, match="authority key"):
+        wp.count_uncheckpointed_task_workspaces(tmp_path)
+
+    monkeypatch.setenv("AICC_WORKSPACE_AUTHORITY_KEY", "hex:" + "ab" * 32)
+    with pytest.raises(wp.WorkspaceProbeError, match="not a directory"):
+        wp.count_uncheckpointed_task_workspaces(tmp_path / "missing")
 
 
 def test_workspace_authority_short_read_cannot_hide_trailing_assignment(

@@ -469,34 +469,43 @@ def main(argv: list[str] | None = None) -> int:
             if args.command == "fleet-status":
                 from command_center.db.fleet_admin import FleetAdmin
                 from command_center.workspace_provisioning import (
+                    WorkspaceProbeError,
                     count_uncheckpointed_task_workspaces,
                 )
 
                 devices = FleetAdmin(lambda: nullcontext(conn)).list_devices(
                     state=args.state, limit=args.limit
                 )
-                print(
-                    "uncheckpointed_workspaces="
-                    f"{count_uncheckpointed_task_workspaces(args.workspace_root)}"
-                    f"  workspace_root={args.workspace_root}"
-                )
                 if not devices:
                     print("no worker-host devices enrolled")
-                    return 0
-                for device in devices:
-                    credential = device.credential_expires_at or "none issued"
-                    event = (
-                        f"{device.last_event_type}/{device.last_event_outcome}"
-                        f"@{device.last_event_at}"
-                        if device.last_event_type
-                        else "(no events)"
-                    )
+                else:
+                    for device in devices:
+                        credential = device.credential_expires_at or "none issued"
+                        event = (
+                            f"{device.last_event_type}/{device.last_event_outcome}"
+                            f"@{device.last_event_at}"
+                            if device.last_event_type
+                            else "(no events)"
+                        )
+                        print(
+                            f"{device.principal_id}  state={device.state}  "
+                            f"host={device.host}  credential_expires={credential}  "
+                            f"last_event={event}"
+                        )
+                    print(f"{len(devices)} device(s)")
+                try:
+                    count = count_uncheckpointed_task_workspaces(args.workspace_root)
+                except WorkspaceProbeError as exc:
                     print(
-                        f"{device.principal_id}  state={device.state}  "
-                        f"host={device.host}  credential_expires={credential}  "
-                        f"last_event={event}"
+                        "uncheckpointed_workspaces=unknown  "
+                        f"workspace_root={args.workspace_root}  error={exc}",
+                        file=sys.stderr,
                     )
-                print(f"{len(devices)} device(s)")
+                    return 1
+                print(
+                    f"uncheckpointed_workspaces={count}  "
+                    f"workspace_root={args.workspace_root}"
+                )
                 return 0
 
             if args.command == "fleet-suspend":

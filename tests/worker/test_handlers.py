@@ -356,6 +356,108 @@ def test_principal_isolation_failure_checkpoints_commit_before_retry(
     assert checkpoints[0]["expected_candidate_sha"] == candidate
 
 
+@pytest.mark.parametrize("abnormal_termination", ["launcher_failure", "timeout"])
+def test_abnormal_termination_checkpoint_failure_quarantines_without_attempt_burn(
+    handler, monkeypatch, abnormal_termination
+) -> None:
+    run_agent, _ = handler
+    candidate = "1" * 40
+    quarantined: list[str] = []
+    monkeypatch.setattr(
+        workspace_provisioning,
+        "task_workspace_candidate_sha",
+        lambda workspace, **kwargs: candidate,
+    )
+
+    def checkpoint_fails(workspace, **kwargs):
+        raise workspace_provisioning.WorkspaceVerificationError(
+            failed_step="task_workspace_checkpoint_candidate",
+            remediation="quarantine",
+            expected_workspace=str(workspace),
+            actual_workspace=str(workspace),
+            detail="candidate changed",
+        )
+
+    monkeypatch.setattr(
+        workspace_provisioning, "checkpoint_task_workspace", checkpoint_fails
+    )
+    monkeypatch.setattr(
+        workspace_provisioning,
+        "quarantine_task_workspace",
+        lambda workspace: quarantined.append(str(workspace)) or f"{workspace}.q",
+    )
+    is_timeout = abnormal_termination == "timeout"
+    monkeypatch.setattr(
+        agent_runner,
+        "run_claude_code",
+        lambda **kwargs: agent_runner.RunResult(
+            status="timed_out" if is_timeout else "failed",
+            exit_code=None if is_timeout else 125,
+            stdout="partial" if is_timeout else "",
+            stderr=(
+                "agent exceeded timeout"
+                if is_timeout
+                else "AICC_AGENT_LAUNCH_INFRA_FAILURE: launcher died"
+            ),
+            duration_seconds=0.1,
+            started_at="t0",
+            completed_at="t1",
+        ),
+    )
+
+    outcome = run_agent(
+        _payload(task_type="implementation"),
+        _event(),
+        1,
+    )
+
+    assert not outcome.ok and outcome.retryable and outcome.infra_wait
+    assert "checkpoint_candidate" in outcome.reason
+    assert "quarantined at" in outcome.reason
+    assert len(quarantined) == 1
+
+
+def test_principal_isolation_checkpoint_failure_without_quarantine_spends_attempt(
+    handler, monkeypatch
+) -> None:
+    run_agent, _ = handler
+    monkeypatch.setattr(
+        workspace_provisioning,
+        "task_workspace_candidate_sha",
+        lambda workspace, **kwargs: "1" * 40,
+    )
+    monkeypatch.setattr(
+        workspace_provisioning,
+        "checkpoint_task_workspace",
+        lambda workspace, **kwargs: (_ for _ in ()).throw(
+            workspace_provisioning.WorkspaceVerificationError(
+                failed_step="task_workspace_checkpoint_candidate",
+                remediation="quarantine",
+                expected_workspace=str(workspace),
+                actual_workspace=str(workspace),
+                detail="candidate changed",
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        workspace_provisioning, "quarantine_task_workspace", lambda workspace: None
+    )
+    monkeypatch.setattr(
+        agent_runner,
+        "run_claude_code",
+        lambda **kwargs: agent_runner.RunResult(
+            status="failed", exit_code=125, stdout="",
+            stderr="AICC_AGENT_LAUNCH_INFRA_FAILURE: launcher died",
+            duration_seconds=0.1, started_at="t0", completed_at="t1",
+        ),
+    )
+
+    outcome = run_agent(_payload(task_type="implementation"), _event(), 1)
+
+    assert not outcome.ok and outcome.retryable and not outcome.infra_wait
+    assert "could not be quarantined" in outcome.reason
+
+
 def test_successful_review_may_quote_principal_failure_marker(
     handler, monkeypatch
 ) -> None:

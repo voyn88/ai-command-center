@@ -1461,6 +1461,23 @@ def _run_agent(
             "result_text": _tail(result_text),
         }
 
+        def quarantine_checkpoint_failure(failure: HandlerOutcome) -> HandlerOutcome:
+            """Remove a failed checkpoint from the retry launch path."""
+            with _provision_lock(str(isolated_workspace)):
+                quarantined = workspace_provisioning.quarantine_task_workspace(
+                    isolated_workspace
+                )
+            if quarantined is None:
+                return replace(
+                    failure,
+                    reason=f"{failure.reason}; uncheckpointed clone could not be quarantined",
+                )
+            return replace(
+                failure,
+                reason=f"{failure.reason}; uncheckpointed clone quarantined at {quarantined}",
+                infra_wait=True,
+            )
+
         def checkpoint_preserved_candidate() -> HandlerOutcome | None:
             """Authenticate the committed prefix before an infrastructure retry."""
             if isolated_workspace is None:
@@ -1506,7 +1523,7 @@ def _run_agent(
                         ),
                     )
             except workspace_provisioning.WorkspaceVerificationError as exc:
-                return HandlerOutcome(
+                failure = HandlerOutcome(
                     ok=False,
                     reason=(
                         "infrastructure retry checkpoint failed at "
@@ -1515,6 +1532,11 @@ def _run_agent(
                     retryable=True,
                     result=result,
                 )
+                # No later delivery may repeatedly collide with a clone whose
+                # commit could not be authenticated into signed retry
+                # authority. Preserve it out of band and refund only after
+                # the poison clone is definitely out of the launch path.
+                return quarantine_checkpoint_failure(failure)
             return None
 
         if run.status == "failed" and run.exit_code is None and not run.stdout:
@@ -1564,24 +1586,6 @@ def _run_agent(
             # recovery and safely inspect/reuse the workspace.
             checkpoint_failure = checkpoint_preserved_candidate()
             if checkpoint_failure is not None:
-                # A transport failure can happen after the launcher allowed
-                # the model to commit.  If that committed prefix cannot be
-                # authenticated and checkpointed, move the clone out of the
-                # retry path now; otherwise its divergent HEAD would poison
-                # every later delivery at preflight.
-                with _provision_lock(str(isolated_workspace)):
-                    quarantined = workspace_provisioning.quarantine_task_workspace(
-                        isolated_workspace
-                    )
-                if quarantined is not None:
-                    checkpoint_failure = replace(
-                        checkpoint_failure,
-                        reason=(
-                            checkpoint_failure.reason
-                            + f"; uncheckpointed clone quarantined at {quarantined}"
-                        ),
-                        infra_wait=True,
-                    )
                 return checkpoint_failure
             return HandlerOutcome(
                 ok=False,
@@ -1906,14 +1910,16 @@ def _run_agent(
                         ),
                     )
             except workspace_provisioning.WorkspaceVerificationError as exc:
-                return HandlerOutcome(
-                    ok=False,
-                    reason=(
-                        "local task checkpoint failed at "
-                        f"{exc.failed_step}: {exc.detail}"
-                    ),
-                    retryable=True,
-                    result=result,
+                return quarantine_checkpoint_failure(
+                    HandlerOutcome(
+                        ok=False,
+                        reason=(
+                            "local task checkpoint failed at "
+                            f"{exc.failed_step}: {exc.detail}"
+                        ),
+                        retryable=True,
+                        result=result,
+                    )
                 )
         return HandlerOutcome(ok=True, result=result)
     finally:

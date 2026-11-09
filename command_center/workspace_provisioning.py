@@ -785,28 +785,38 @@ def _read_task_local_marker(workspace: Path) -> dict | None:
     return value
 
 
+class WorkspaceProbeError(RuntimeError):
+    """The local workspace incident probe could not establish a count."""
+
+
 def count_uncheckpointed_task_workspaces(root_path: str | Path) -> int:
     """Count saved task clones whose HEAD outran signed retry authority.
 
-    This is intentionally a local, credential-free fleet probe.  Only valid
-    signed markers participate, so an unrelated directory (or an attacker-
-    supplied marker) cannot create a false incident.  Unreadable/racing
-    entries are skipped: provisioning remains the fail-closed enforcement
-    point, while this function is an availability-oriented status signal.
+    Only valid signed markers participate.  Unlike the launch gate, this is
+    an observability boundary, so inability to inspect is raised as
+    ``WorkspaceProbeError`` rather than being reported as a reassuring zero.
     """
     root = Path(os.path.abspath(Path(root_path).expanduser()))
+    if _workspace_authority_key() is None:
+        raise WorkspaceProbeError("workspace authority key is unavailable")
     try:
+        if not root.is_dir():
+            raise WorkspaceProbeError(f"workspace root is not a directory: {root}")
         parents = (root, *(path for path in root.iterdir() if path.is_dir()))
-    except OSError:
-        return 0
+    except OSError as exc:
+        raise WorkspaceProbeError(f"cannot read workspace root {root}: {exc}") from exc
     suffix = f".{_TASK_LOCAL_MARKER}"
     count = 0
     marker_paths: list[Path] = []
     for parent in parents:
         try:
             marker_paths.extend((parent / ".aicc-task-metadata").iterdir())
-        except OSError:
+        except FileNotFoundError:
             continue
+        except OSError as exc:
+            raise WorkspaceProbeError(
+                f"cannot read workspace metadata in {parent}: {exc}"
+            ) from exc
     for marker_path in marker_paths:
         if not marker_path.name.endswith(suffix):
             continue
@@ -816,15 +826,18 @@ def count_uncheckpointed_task_workspaces(root_path: str | Path) -> int:
                 continue
             marker = _read_task_local_marker(workspace)
             if marker is None:
-                continue
+                raise WorkspaceProbeError(
+                    "marker is unreadable or has invalid authority: "
+                    f"{marker_path}"
+                )
             branch = marker.get("expected_branch")
             start_sha = str(marker.get("start_sha") or "").lower()
             if not isinstance(branch, str) or not _FULL_SHA1.fullmatch(start_sha):
-                continue
+                raise WorkspaceProbeError(f"marker fields are invalid: {marker_path}")
             if _read_agent_head(workspace, branch) != start_sha:
                 count += 1
-        except (OSError, WorkspaceVerificationError):
-            continue
+        except (OSError, WorkspaceVerificationError) as exc:
+            raise WorkspaceProbeError(f"cannot inspect workspace {workspace}: {exc}") from exc
     return count
 
 
