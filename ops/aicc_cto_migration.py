@@ -33,9 +33,12 @@ SELECT current_database(), inet_server_addr()::text, inet_server_port(),
 LEDGER_SQL = "SELECT version, slug, checksum FROM public.schema_migration ORDER BY version"
 # Only structure, not row contents, ownership, OIDs, ACLs or statistics. All
 # comparison order is imposed in Python, independent of database collation.
+# PostgreSQL UNION must never infer its identity column as the 63-byte `name`
+# type. Cast catalog names to text before composing structured identities;
+# arrays also distinguish identifiers containing dots/parentheses/quotes.
 CATALOG_SQL = """
 WITH objects AS (
- SELECT 'relation' AS kind, c.relname AS name,
+ SELECT 'relation'::text AS kind, jsonb_build_array(n.nspname::text,c.relname::text)::text AS name,
   jsonb_build_object('kind',c.relkind,'persistence',c.relpersistence,
    'row_security',c.relrowsecurity,'force_row_security',c.relforcerowsecurity,
    'options',c.reloptions,'partition_bound',pg_get_expr(c.relpartbound,c.oid),
@@ -43,7 +46,7 @@ WITH objects AS (
    'view',CASE WHEN c.relkind IN ('v','m') THEN pg_get_viewdef(c.oid,false) END) AS definition
  FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public'
  UNION ALL
- SELECT 'column', c.relname||'.'||a.attname,
+ SELECT 'column', jsonb_build_array(n.nspname::text,c.relname::text,a.attname::text)::text,
   jsonb_build_object('position',a.attnum,'type',format_type(a.atttypid,a.atttypmod),
    'not_null',a.attnotnull,'identity',a.attidentity,'generated',a.attgenerated,
    'default',pg_get_expr(d.adbin,d.adrelid))
@@ -52,41 +55,43 @@ WITH objects AS (
  LEFT JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum
  WHERE n.nspname='public' AND a.attnum>0 AND NOT a.attisdropped
  UNION ALL
- SELECT 'constraint', (CASE WHEN c.conrelid<>0 THEN c.conrelid::regclass::text ELSE c.contypid::regtype::text END)||'.'||c.conname,
+ SELECT 'constraint', jsonb_build_array(n.nspname::text,
+  CASE WHEN c.conrelid<>0 THEN 'relation' ELSE 'type' END,
+  CASE WHEN c.conrelid<>0 THEN c.conrelid::regclass::text ELSE c.contypid::regtype::text END,c.conname::text)::text,
   jsonb_build_object('definition',pg_get_constraintdef(c.oid,false),'validated',c.convalidated)
  FROM pg_constraint c JOIN pg_namespace n ON n.oid=c.connamespace WHERE n.nspname='public'
  UNION ALL
- SELECT 'index', c.relname, jsonb_build_object('definition',pg_get_indexdef(c.oid),
+ SELECT 'index', jsonb_build_array(n.nspname::text,c.relname::text)::text, jsonb_build_object('definition',pg_get_indexdef(c.oid),
    'valid',i.indisvalid,'ready',i.indisready)
  FROM pg_class c JOIN pg_index i ON i.indexrelid=c.oid
  JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public'
  UNION ALL
- SELECT 'trigger',c.relname||'.'||t.tgname,
+ SELECT 'trigger',jsonb_build_array(n.nspname::text,c.relname::text,t.tgname::text)::text,
   jsonb_build_object('definition',pg_get_triggerdef(t.oid,false),'enabled',t.tgenabled)
  FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid
  JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND NOT t.tgisinternal
  UNION ALL
- SELECT 'routine',p.proname||'('||pg_get_function_identity_arguments(p.oid)||')',
+ SELECT 'routine',jsonb_build_array(n.nspname::text,p.proname::text,pg_get_function_identity_arguments(p.oid)::text)::text,
   jsonb_build_object('kind',p.prokind,'definition',CASE WHEN p.prokind IN ('f','p') THEN pg_get_functiondef(p.oid) ELSE p.prosrc END)
  FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
  WHERE n.nspname='public'
  UNION ALL
- SELECT 'rule',c.relname||'.'||r.rulename,jsonb_build_object('definition',pg_get_ruledef(r.oid,false),'enabled',r.ev_enabled)
+ SELECT 'rule',jsonb_build_array(n.nspname::text,c.relname::text,r.rulename::text)::text,jsonb_build_object('definition',pg_get_ruledef(r.oid,false),'enabled',r.ev_enabled)
  FROM pg_rewrite r JOIN pg_class c ON c.oid=r.ev_class
  JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public'
  UNION ALL
- SELECT 'type',t.typname,jsonb_build_object('kind',t.typtype,'category',t.typcategory,
+ SELECT 'type',jsonb_build_array(n.nspname::text,t.typname::text)::text,jsonb_build_object('kind',t.typtype,'category',t.typcategory,
   'base',format_type(t.typbasetype,t.typtypmod),'not_null',t.typnotnull,'default',t.typdefault,
   'enum',(SELECT jsonb_agg(e.enumlabel ORDER BY e.enumsortorder) FROM pg_enum e WHERE e.enumtypid=t.oid))
  FROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace WHERE n.nspname='public'
  UNION ALL
- SELECT 'sequence',c.relname,jsonb_build_object('type',format_type(s.seqtypid,NULL),
+ SELECT 'sequence',jsonb_build_array(n.nspname::text,c.relname::text)::text,jsonb_build_object('type',format_type(s.seqtypid,NULL),
   'start',s.seqstart,'increment',s.seqincrement,'max',s.seqmax,'min',s.seqmin,
   'cache',s.seqcache,'cycle',s.seqcycle)
  FROM pg_sequence s JOIN pg_class c ON c.oid=s.seqrelid
  JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public'
  UNION ALL
- SELECT 'policy',c.relname||'.'||p.polname,jsonb_build_object('command',p.polcmd,
+ SELECT 'policy',jsonb_build_array(n.nspname::text,c.relname::text,p.polname::text)::text,jsonb_build_object('command',p.polcmd,
   'permissive',p.polpermissive,'using',pg_get_expr(p.polqual,p.polrelid),
   'check',pg_get_expr(p.polwithcheck,p.polrelid),
   'roles',(SELECT jsonb_agg(CASE WHEN r=0 THEN 'public' ELSE pg_get_userbyid(r) END ORDER BY CASE WHEN r=0 THEN 'public' ELSE pg_get_userbyid(r) END)
@@ -184,17 +189,58 @@ def validate_connection_evidence(path: Path, manifest: dict) -> None:
     if len(raw) > 1024 * 1024 or _sha(raw) != manifest["connection_evidence_sha256"]:
         raise Refusal("connection_evidence_hash_mismatch")
     evidence = json.loads(raw, object_pairs_hook=_object)
-    approved = evidence["approved_manifest"]
-    selection, observed = evidence["selection"], evidence["snapshot"]
     identity = manifest["identity"]
-    if (approved["sha256"] != manifest["identity_evidence_sha256"]
-        or approved["database"] != identity["dbname"]
-        or int(approved["database_oid"]) != identity["database_oid"]
-        or approved["system_identifier"] != identity["system_identifier"]
-        or observed["hostname"] != manifest["execution_host"]
-        or int(observed["port_show"]) != manifest["connection_port"]
-        or selection["directory"] != manifest["connection_host"]
-        or selection["exists"] is not True or selection["is_socket"] is not True):
+    if not isinstance(evidence, dict):
+        raise Refusal("connection_evidence_mismatch")
+    try:
+        if evidence.get("task") == "CTO-AICC-CONNECTION-PIN-02":
+            receipt = evidence["receipt"]
+            configured, session = receipt["configured_target"], receipt["session"]
+            expected_ledger = [(m["version"], m["slug"], m["checksum"])
+                               for m in manifest["migrations"][:34]]
+            observed_ledger = [(m["version"], m["slug"], m["checksum"])
+                               for m in receipt["ledger"]]
+            valid = (
+                evidence["approved_manifest_sha256"] == manifest["identity_evidence_sha256"]
+                and receipt["host"] == manifest["execution_host"]
+                and receipt["fallback_used"] is False
+                and type(receipt["read_exit"]) is int and receipt["read_exit"] == 0
+                and configured["host"] == manifest["connection_host"]
+                and configured["port"] == manifest["connection_port"]
+                and configured["dbname"] == identity["dbname"]
+                and configured["user"] == manifest["migration_session_user"]
+                and session["session_user"] == manifest["migration_session_user"]
+                and session["current_user"] == manifest["migration_session_user"]
+                and session["server_addr"] == identity["server_address"]
+                and session["server_addr"] is not None
+                and session["server_port"] == identity["server_port"]
+                and session["database_name"] == identity["dbname"]
+                and int(session["database_oid"]) == identity["database_oid"]
+                and session["system_identifier"] == identity["system_identifier"]
+                and session["read_only"] == "on"
+                and session["can_read_system_identifier"] is True
+                and observed_ledger == expected_ledger
+            )
+        elif evidence.get("task") == "CTO-AICC-CONNECTION-PIN-01":
+            approved = evidence["approved_manifest"]
+            selection, observed = evidence["selection"], evidence["snapshot"]
+            valid = (
+                approved["sha256"] == manifest["identity_evidence_sha256"]
+                and approved["database"] == identity["dbname"]
+                and int(approved["database_oid"]) == identity["database_oid"]
+                and approved["system_identifier"] == identity["system_identifier"]
+                and observed["hostname"] == manifest["execution_host"]
+                and int(observed["port_show"]) == manifest["connection_port"]
+                and selection["directory"] == manifest["connection_host"]
+                and manifest["connection_host"].startswith("/")
+                and identity["server_address"] is None
+                and selection["exists"] is True and selection["is_socket"] is True
+            )
+        else:
+            valid = False
+    except (KeyError, TypeError, ValueError):
+        valid = False
+    if not valid:
         raise Refusal("connection_evidence_mismatch")
 
 
@@ -231,12 +277,23 @@ def approved_source(sql_dir: Path, manifest: dict):
 
 def catalog_hash(rows) -> str:
     normalized = []
+    identities = set()
     for kind, name, definition in rows:
+        if not isinstance(kind, str) or not kind or not isinstance(name, str) or not name:
+            raise Refusal("invalid_catalog_identity")
+        identity = (kind, name)
+        # Even identical duplicates are invalid: deduplicating could hide an
+        # ambiguous/truncated SQL identity and make a changed object invisible.
+        if identity in identities:
+            raise Refusal("duplicate_catalog_identity")
+        identities.add(identity)
         if isinstance(definition, str):
             definition = json.loads(definition)
         normalized.append([kind, name, definition])
-    normalized.sort(key=lambda row: (row[0], row[1]))
-    return _sha(json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode())
+    def canonical(row):
+        return json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    normalized.sort(key=canonical)
+    return _sha(canonical(normalized).encode())
 
 
 def validate_live(conn, manifest: dict) -> int:

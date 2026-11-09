@@ -24,8 +24,8 @@ supplied with `--manifest-sha256`. Its strict `aicc-cto-migration/v1` JSON contr
   release manifest. A manifest generated from the connection being upgraded is
   not an approval source; the wrapper has no such generator.
 - `connection_evidence_sha256`: hash of the separately approved connection-pin
-  evidence, binding its socket selection and deployment hostname back to the
-  approved identity evidence. `migration_session_user` pins the explicitly
+  evidence, binding its explicitly supported socket or TCP proof and deployment
+  hostname back to the approved identity evidence. `migration_session_user` pins the explicitly
   approved existing migration login; no hardcoded new login or admin fallback.
 - `migrations`: exactly versions 1 through 36 in order, each with `version`, `slug`,
   `checksum` (SHA256 of UTF-8/LF up SQL), and `down_checksum`. Both directions of
@@ -48,9 +48,26 @@ used a Unix socket (server address/port fields null). It does **not** supply thi
 The additional approved `CTO-AICC-CONNECTION-PIN-01.json`, SHA256
 `32aaaee579ab0660d58fc1f7bf6602a114ac2aa004226736d84f8401c867de2b`,
 pins `/var/run/postgresql` (resolved `/run/postgresql`) on that host at port 5433. Its schema/function anchor hashes are a different representation and must
-not be substituted for `catalog_sha256`. Approval of the composed release
+not be substituted for `catalog_sha256`. Catalog identities use schema/object
+component arrays rendered as PostgreSQL `text`, never its 63-byte `name` type.
+Duplicate `(kind, identity)` rows are refused even when definitions match;
+canonical full-row ordering makes fetch order irrelevant. Fingerprints from the
+old truncated-identity representation are invalid and must be recomputed/reviewed. Approval of the composed release
 manifest and missing structural catalog/login approval remains an integrator/CTO gate.
 No runnable production manifest is shipped here.
+
+The later approved TCP proof `CTO-AICC-CONNECTION-PIN-02.json`, SHA256
+`336092cc9619fd31ca858b032bc4558c266d8b1038282a79b18e995b258c6c1b`,
+records the existing configured migration route: host `127.0.0.1`, port 5433,
+database `aicc_preprod`, login `aicc_admin`, executed on `voyn-control-01`.
+Its explicit PIN02 shape must bind the approved identity hash, configured endpoint,
+authenticated/current login, server endpoint, cluster/database identity, read-only
+observation, no credential fallback, successful read, and all 34 original ledger
+triples. Historical applied-by/time fields are not lineage identity. PIN01 remains
+supported only as its explicit socket shape; unknown shapes never fall through
+into a weaker generic validator. The existing admin route is an explicit approved
+migration context, not authorization to create roles or use it for operator-only
+CTO assignment calls.
 
 Old policy candidate `277409f` remains separate historical evidence. Its hashes
 must be retained by the integration handoff; its SQL is not included or relabeled

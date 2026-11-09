@@ -229,7 +229,8 @@ def test_identity_evidence_is_bound_to_reviewed_target_and_first34(tmp_path):
 def test_connection_evidence_binds_endpoint_to_identity_evidence(tmp_path):
     manifest = _manifest()
     manifest["connection_host"] = "/var/run/postgresql"
-    source = {"approved_manifest": {"sha256": manifest["identity_evidence_sha256"],
+    manifest["identity"]["server_address"] = None
+    source = {"task": "CTO-AICC-CONNECTION-PIN-01", "approved_manifest": {"sha256": manifest["identity_evidence_sha256"],
               "database": "aicc_preprod", "database_oid": "42", "system_identifier": "123456789"},
               "selection": {"directory": "/var/run/postgresql", "exists": True, "is_socket": True},
               "snapshot": {"hostname": "approved-host", "port_show": "5433"}}
@@ -258,3 +259,110 @@ def test_unix_socket_identity_keeps_all_pins(locked):
     conn = Connection(manifest)
     conn.identity = (*conn.identity[:2], None, *conn.identity[3:])
     assert cli.execute(conn, manifest, Path("unused"))["mode"] == "plan"
+
+
+@pytest.mark.parametrize("second_definition", [{"body": "first"}, {"body": "changed"}])
+def test_duplicate_catalog_identity_is_refused_not_silently_sorted(second_definition):
+    rows = [("routine", '["public","same()"]', {"body": "first"}),
+            ("routine", '["public","same()"]', second_definition)]
+    for ordered in (rows, list(reversed(rows))):
+        with pytest.raises(cli.Refusal, match="duplicate_catalog_identity"):
+            cli.catalog_hash(ordered)
+
+
+def test_long_catalog_identities_are_stable_under_shuffled_input():
+    import random
+    prefix = "long_shared_identity_" + "x" * 80
+    rows = [("routine", json.dumps(["public", prefix, arg]), {"body": arg, "properties": {"b": 2, "a": 1}})
+            for arg in ("first integer", "second text", "third boolean")]
+    expected = cli.catalog_hash(rows)
+    for seed in range(12):
+        shuffled = list(rows)
+        random.Random(seed).shuffle(shuffled)
+        assert cli.catalog_hash(shuffled) == expected
+    assert cli.catalog_hash(rows[:-1]) != expected
+
+
+def _tcp_evidence(manifest):
+    identity = manifest["identity"]
+    return {"task": "CTO-AICC-CONNECTION-PIN-02",
+            "approved_manifest_sha256": manifest["identity_evidence_sha256"],
+            "receipt": {"host": manifest["execution_host"], "fallback_used": False,
+                        "read_exit": 0,
+                        "configured_target": {"host": manifest["connection_host"],
+                                              "port": manifest["connection_port"],
+                                              "dbname": identity["dbname"],
+                                              "user": manifest["migration_session_user"]},
+                        "session": {"session_user": manifest["migration_session_user"],
+                                    "current_user": manifest["migration_session_user"],
+                                    "server_addr": identity["server_address"],
+                                    "server_port": identity["server_port"],
+                                    "database_name": identity["dbname"],
+                                    "database_oid": str(identity["database_oid"]),
+                                    "system_identifier": identity["system_identifier"],
+                                    "read_only": "on", "can_read_system_identifier": True},
+                        "ledger": [{**m, "applied_at": "historical", "applied_by": "historical-owner"}
+                                   for m in manifest["migrations"][:34]]}}
+
+
+def _check_tcp(tmp_path, manifest, evidence):
+    raw = json.dumps(evidence).encode()
+    path = tmp_path / "tcp.json"
+    path.write_bytes(raw)
+    manifest["connection_evidence_sha256"] = hashlib.sha256(raw).hexdigest()
+    cli.validate_connection_evidence(path, manifest)
+
+
+def test_approved_tcp_evidence_accepts_explicit_existing_admin(tmp_path):
+    manifest = _manifest()
+    manifest["migration_session_user"] = "aicc_admin"
+    _check_tcp(tmp_path, manifest, _tcp_evidence(manifest))
+
+
+@pytest.mark.parametrize("section,key,value", [
+    ("root", "task", "unknown-pin"),
+    ("root", "approved_manifest_sha256", "f" * 64),
+    ("receipt", "host", "cloned-host"),
+    ("receipt", "fallback_used", True),
+    ("receipt", "read_exit", 1),
+    ("receipt", "read_exit", False),
+    ("configured_target", "host", "192.0.2.99"),
+    ("configured_target", "port", 5432),
+    ("configured_target", "dbname", "foreign"),
+    ("configured_target", "user", "foreign"),
+    ("session", "session_user", "foreign"),
+    ("session", "current_user", "foreign"),
+    ("session", "server_addr", "192.0.2.99"),
+    ("session", "server_port", 5432),
+    ("session", "database_name", "foreign"),
+    ("session", "database_oid", "43"),
+    ("session", "system_identifier", "987654321"),
+    ("session", "read_only", "off"),
+    ("session", "can_read_system_identifier", False),
+])
+def test_tcp_evidence_mismatches_refuse_without_generic_fallback(tmp_path, section, key, value):
+    manifest = _manifest()
+    evidence = _tcp_evidence(manifest)
+    target = evidence if section == "root" else evidence["receipt"]
+    if section not in ("root", "receipt"):
+        target = target[section]
+    target[key] = value
+    with pytest.raises(cli.Refusal, match="connection_evidence_mismatch"):
+        _check_tcp(tmp_path, manifest, evidence)
+
+
+@pytest.mark.parametrize("mutation", ["missing", "reordered", "checksum", "duplicate"])
+def test_tcp_evidence_checks_complete_original34_ledger(tmp_path, mutation):
+    manifest = _manifest()
+    evidence = _tcp_evidence(manifest)
+    ledger = evidence["receipt"]["ledger"]
+    if mutation == "missing":
+        ledger.pop()
+    elif mutation == "reordered":
+        ledger.reverse()
+    elif mutation == "checksum":
+        ledger[0]["checksum"] = "f" * 64
+    else:
+        ledger[1] = ledger[0]
+    with pytest.raises(cli.Refusal, match="connection_evidence_mismatch"):
+        _check_tcp(tmp_path, manifest, evidence)
