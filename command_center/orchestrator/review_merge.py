@@ -276,14 +276,28 @@ def reconcile_pr_evidence(
 
     This closes the hole by deriving what was already true rather than by
     trusting a claim. The task's branch name is fixed by the same contract
-    `publish_run` follows, so an open pull request whose head is exactly that
+    `publish_run` follows, so a pull request whose head is exactly that
     branch is that task's PR -- a fact GitHub is asked for directly:
 
     * the head branch must equal `backlog/<task id>` exactly (never a prefix
       match: `backlog/X` must not adopt `backlog/X-REM`'s pull request);
-    * exactly one open PR may match, because two would make the choice a guess;
+    * exactly one PR of the state being searched may match, because two
+      would make the choice a guess;
     * a task that already has any `pr` evidence is left alone, so this can
       never overwrite or compete with what `publish_run` recorded.
+
+    The open-PR search runs first and is the common case. When it finds
+    nothing, a second search over closed pull requests (GitHub's `state`
+    values are only `open`/`closed`; a merged PR is a closed one with
+    `merged_at` set) catches the task whose PR closed or merged in the gap
+    between the hand-opened PR and this reconciler's next tick -- otherwise
+    that task's evidence can NEVER be recorded: `state=open` will never again
+    contain a PR that has already closed, so `no_open_pr_on_task_branch`
+    would repeat identically forever (VOYN-W0-AICC-SRV-04a-STALL). Recording
+    evidence from a closed PR is safe to hand off exactly as the open case
+    is: `merge_once` already resolves a merged or closed-unmerged `pr`
+    evidence row to DONE or REJECTED on its own next pass
+    (VOYN-W0-AICC-TICK-STALL-WATCHDOG escalation).
 
     The lookup runs in `repo_path` -- the checkout this tick was given --
     exactly as `review_once` does for its own `gh` calls. The route table is
@@ -347,12 +361,35 @@ def reconcile_pr_evidence(
             and isinstance(entry.get("url"), str)
             and entry["url"]
         ]
-        if not matches:
-            report.skipped.append((row_task_id, "no_open_pr_on_task_branch"))
-            continue
         if len(matches) > 1:
             report.skipped.append((row_task_id, "ambiguous_open_prs_on_branch"))
             continue
+        if not matches:
+            # No OPEN pr on the branch -- but a pr that already closed or
+            # merged is just as real a fact, and the only one this task will
+            # ever get: `state=open` can never again surface a pr that has
+            # already closed, so skipping outright here would repeat this
+            # exact reason forever.
+            closed_decoded, closed_failure = _open_pulls_for_branch(
+                repo_path, branch, state="closed"
+            )
+            if closed_decoded is None:
+                report.skipped.append((row_task_id, closed_failure))
+                continue
+            matches = [
+                entry
+                for entry in closed_decoded
+                if isinstance(entry, dict)
+                and entry.get("headRefName") == branch
+                and isinstance(entry.get("url"), str)
+                and entry["url"]
+            ]
+            if not matches:
+                report.skipped.append((row_task_id, "no_open_pr_on_task_branch"))
+                continue
+            if len(matches) > 1:
+                report.skipped.append((row_task_id, "ambiguous_closed_prs_on_branch"))
+                continue
         pr_url = matches[0]["url"]
         # Written through `backlog_record_evidence`, never a direct INSERT:
         # the control plane's role has no write grant on `backlog_evidence`
@@ -378,9 +415,9 @@ def reconcile_pr_evidence(
 
 
 def _open_pulls_for_branch(
-    repo_path: str, branch: str
+    repo_path: str, branch: str, *, state: str = "open"
 ) -> tuple[list[dict[str, Any]] | None, str]:
-    """Open pull requests whose head is `branch`, as `[{url, headRefName}]`.
+    """Pull requests of `state` whose head is `branch`, as `[{url, headRefName}]`.
 
     REST (`GET /repos/{owner}/{repo}/pulls?head=owner:branch`) rather than
     `gh pr list --head` (GraphQL): this runs once per unrecorded task on
@@ -393,6 +430,12 @@ def _open_pulls_for_branch(
     `backlog/<task id>` to origin, and a fork's branch of the same name is
     somebody else's work, not this task's evidence.
 
+    `state` defaults to `"open"`, the common case `reconcile_pr_evidence`
+    tries first; it also calls this with `state="closed"` -- GitHub's REST
+    API has no third value, so a merged pull request is simply a closed one
+    with `merged_at` set -- as its fallback for a pull request that closed
+    or merged before ever being observed open.
+
     Returns `(None, reason)` when the lookup produced no evidence at all, so
     the caller can report the skip rather than mistake a failed lookup for
     "this task has no pull request"."""
@@ -402,7 +445,7 @@ def _open_pulls_for_branch(
     owner, repo = origin
     head = urllib.parse.quote(f"{owner}:{branch}", safe="")
     outcome, decoded = _rest_json(
-        repo_path, f"repos/{owner}/{repo}/pulls?state=open&per_page=20&head={head}"
+        repo_path, f"repos/{owner}/{repo}/pulls?state={state}&per_page=20&head={head}"
     )
     if outcome == _REST_FAILED:
         return None, "pr_list_failed"

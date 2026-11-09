@@ -4393,6 +4393,131 @@ def test_a_failed_or_undecodable_lookup_records_nothing(rig, _test_repo_routes, 
     assert _pr_rows(app_factory, garbage) == []
 
 
+def _fake_pr_list_by_state(open_entries, closed_entries, *, closed_returncode=0, closed_stdout=None):  # noqa: E501
+    """Like `_fake_pr_list`, but answers `state=open` and `state=closed`
+    queries differently -- the shape `reconcile_pr_evidence`'s closed-PR
+    fallback (VOYN-W0-AICC-SRV-04a-STALL) needs in order to be exercised at
+    all: the real bug it fixed was that a branch's PR having already closed
+    or merged by the time this reconciler looked made `state=open` return
+    the SAME empty answer on every tick, forever."""
+    import subprocess as sp
+
+    def _rest(entries):
+        return [
+            {"html_url": entry["url"], "head": {"ref": entry["headRefName"]}}
+            for entry in entries
+        ]
+
+    def fake_gh(argv, repo):
+        if argv[0] == "api" and "/pulls?" in argv[1]:
+            if "state=closed" in argv[1]:
+                body = (
+                    json.dumps(_rest(closed_entries))
+                    if closed_stdout is None
+                    else closed_stdout
+                )
+                return sp.CompletedProcess(argv, closed_returncode, body, "")
+            return sp.CompletedProcess(argv, 0, json.dumps(_rest(open_entries)), "")
+        return sp.CompletedProcess(argv, 1, "", "unexpected gh call")
+
+    return fake_gh
+
+
+def test_a_merged_pr_on_the_task_branch_becomes_evidence_when_never_seen_open(
+    rig, _test_repo_routes, monkeypatch  # noqa: F811
+):
+    """A PR that merged before this reconciler ever ran is a fact just as real
+    as an open one -- and the ONLY one this task will ever get, since
+    `state=open` can never again surface a PR that has already closed.
+    `merge_once` already knows how to take a merged `pr` evidence row the
+    rest of the way to DONE; this only has to stop discarding the fact."""
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE9"
+    _ready_without_pr(store, app_factory, task_id)
+    url = "https://github.com/x/repo-d2/pull/910"
+    monkeypatch.setattr(
+        review_merge,
+        "_gh",
+        _fake_pr_list_by_state(
+            [], [{"url": url, "headRefName": f"backlog/{task_id}"}]
+        ),
+    )
+
+    report = reconcile_pr_evidence(app_factory, REPO)
+
+    assert (task_id, url) in report.recorded
+    assert _pr_rows(app_factory, task_id) == [url]
+
+
+def test_a_closed_unmerged_pr_on_the_task_branch_becomes_evidence_when_never_seen_open(
+    rig, _test_repo_routes, monkeypatch  # noqa: F811
+):
+    """Same as the merged case: `merge_once` resolves a closed-unmerged `pr`
+    evidence row to REJECTED on its own; this only has to record it."""
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE10"
+    _ready_without_pr(store, app_factory, task_id)
+    url = "https://github.com/x/repo-d2/pull/911"
+    monkeypatch.setattr(
+        review_merge,
+        "_gh",
+        _fake_pr_list_by_state(
+            [], [{"url": url, "headRefName": f"backlog/{task_id}"}]
+        ),
+    )
+
+    report = reconcile_pr_evidence(app_factory, REPO)
+
+    assert (task_id, url) in report.recorded
+    assert _pr_rows(app_factory, task_id) == [url]
+
+
+def test_two_closed_prs_on_one_branch_are_refused_rather_than_guessed(
+    rig, _test_repo_routes, monkeypatch  # noqa: F811
+):
+    """The closed-PR fallback keeps the same refuse-rather-than-guess rule
+    as the open-PR search: two candidates must not pick a winner."""
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE11"
+    _ready_without_pr(store, app_factory, task_id)
+    branch = f"backlog/{task_id}"
+    monkeypatch.setattr(
+        review_merge,
+        "_gh",
+        _fake_pr_list_by_state(
+            [],
+            [
+                {"url": "https://github.com/x/repo-d2/pull/912", "headRefName": branch},
+                {"url": "https://github.com/x/repo-d2/pull/913", "headRefName": branch},
+            ],
+        ),
+    )
+
+    report = reconcile_pr_evidence(app_factory, REPO)
+
+    assert _pr_rows(app_factory, task_id) == []
+    assert (task_id, "ambiguous_closed_prs_on_branch") in report.skipped
+
+
+def test_a_failed_closed_state_fallback_records_nothing(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+    """A closed-PR lookup that itself fails must surface that failure, not
+    the generic 'no PR at all' reason -- the two point at different
+    problems and a caller re-examining the skip needs to tell them apart."""
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE12"
+    _ready_without_pr(store, app_factory, task_id)
+    monkeypatch.setattr(
+        review_merge,
+        "_gh",
+        _fake_pr_list_by_state([], [], closed_returncode=1),
+    )
+
+    report = reconcile_pr_evidence(app_factory, REPO)
+
+    assert _pr_rows(app_factory, task_id) == []
+    assert (task_id, "pr_list_failed") in report.skipped
+
+
 def test_only_ready_to_review_tasks_are_examined(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
     """This records evidence; it never promotes anything. A task that is not
     yet ready stays untouched even when its branch already has a PR."""
@@ -4435,7 +4560,10 @@ def test_the_lookup_runs_in_the_checkout_the_tick_was_given(rig, _test_repo_rout
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     reconcile_pr_evidence(app_factory, REPO)
 
-    assert seen == [REPO]
+    # Twice: the open-state search, then the closed-state fallback it falls
+    # through to once that first search comes back empty -- both still in
+    # the SAME checkout, never the route table's worker-local path.
+    assert seen == [REPO, REPO]
 
 
 # -- reconcile_pr_window: no database involved, gh is faked in-process ------
