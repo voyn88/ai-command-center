@@ -106,6 +106,28 @@ def test_defer_report_zero_fills_both_buckets(client, monkeypatch):
     assert body["total"] == 5
 
 
+def test_defer_report_retains_unknown_bucket_in_total(client, monkeypatch):
+    monkeypatch.setattr(
+        backlog_service,
+        "BacklogStore",
+        lambda *a, **k: _FakeStore(
+            defer_report={
+                "infra_induced_safe_to_retry": 5,
+                "future_classification": 2,
+            }
+        ),
+    )
+    resp = client.get("/api/v1/backlog/defer-report")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["counts"] == {
+        "infra_induced_safe_to_retry": 5,
+        "genuine_owner_decision": 0,
+        "future_classification": 2,
+    }
+    assert body["total"] == 7
+
+
 def test_defer_report_unconfigured_backlog_is_503(client, monkeypatch):
     def _raise(*a, **k):
         raise PoolNotOpenError("PostgreSQL pool is not open.")

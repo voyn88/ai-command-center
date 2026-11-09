@@ -42,6 +42,15 @@ def test_queue_dlq_defaults_to_every_queue_fifty_rows() -> None:
     assert scoped.queue == "execution" and scoped.limit == 5
 
 
+def test_backlog_defer_sweep_limit_must_be_nonnegative() -> None:
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["backlog-defer-sweep", "--limit", "-1"])
+    assert (
+        build_parser().parse_args(["backlog-defer-sweep", "--limit", "0"]).limit
+        == 0
+    )
+
+
 def test_queue_redrive_requires_the_item_id() -> None:
     args = build_parser().parse_args(
         ["queue-redrive", "wki_1", "--extra-attempts", "2"]

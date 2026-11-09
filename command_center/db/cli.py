@@ -29,6 +29,13 @@ from command_center.db.config import ConfigError, load_config
 _REVIEW_QUEUE_PRIORITY = 10
 
 
+def _nonnegative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be greater than or equal to 0")
+    return parsed
+
+
 def _review_enqueue(
     store: Any, *, priority: int = _REVIEW_QUEUE_PRIORITY
 ) -> Any:
@@ -130,7 +137,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sweep.add_argument(
         "--limit",
-        type=int,
+        type=_nonnegative_int,
         default=None,
         help="Cap the number of resumes this run performs (default: no cap).",
     )
@@ -620,7 +627,8 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"resumed {resumed}/{len(candidates)}")
                 # A refusal here means the queue moved under the sweep (a
                 # concurrent planner tick, a re-park) -- worth a non-zero
-                # exit so a human notices, never a reason to half-apply.
+                # exit so a human notices. Earlier successful resumes remain
+                # applied, making a retry safe and intentionally incremental.
                 return 1 if refused else 0
 
             if args.command == "backlog-export":

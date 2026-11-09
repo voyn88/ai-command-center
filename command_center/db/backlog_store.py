@@ -25,11 +25,11 @@ from typing import Any
 
 from command_center.db.backlog_parser import ParsedTask, parse_backlog
 
-__all__ = ["BacklogStore", "ImportReport"]
+__all__ = ["BacklogStore", "DEFER_BUCKETS", "ImportReport"]
 
 #: The two buckets `backlog_defer_classification` (0035) ever assigns, in
 #: the order the report always shows them.
-_DEFER_BUCKETS = ("infra_induced_safe_to_retry", "genuine_owner_decision")
+DEFER_BUCKETS = ("infra_induced_safe_to_retry", "genuine_owner_decision")
 
 
 @dataclass(slots=True)
@@ -245,15 +245,19 @@ class BacklogStore:
     def defer_report(self) -> dict[str, int]:
         """The explicit count `DEFER-QUEUE-ROOT-CAUSE-SWEEP` asks for:
         genuine owner decisions vs. infra-induced failures safe to retry,
-        zero-filled so an empty bucket still reports 0 rather than vanishing."""
+        zero-filled so an empty bucket still reports 0 rather than vanishing.
+        Unknown buckets are retained, and a NULL classification is exposed as
+        ``unclassified``, so this operational count can never silently
+        understate the parked population."""
         with self._connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT bucket, count(*) FROM backlog_defer_classification "
+                    "SELECT coalesce(bucket, 'unclassified'), count(*) "
+                    "FROM backlog_defer_classification "
                     "GROUP BY bucket"
                 )
                 live = {bucket: int(count) for bucket, count in cur.fetchall()}
-        return {bucket: live.get(bucket, 0) for bucket in _DEFER_BUCKETS}
+        return {**{bucket: live.get(bucket, 0) for bucket in DEFER_BUCKETS}, **live}
 
     def list_tasks(
         self,
