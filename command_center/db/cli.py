@@ -654,6 +654,7 @@ def main(argv: list[str] | None = None) -> int:
                     publish_review_verdicts,
                     reconcile_pr_evidence,
                     reconcile_review_once,
+                    recover_stale_pr_evidence_tasks,
                     review_once,
                 )
 
@@ -678,6 +679,13 @@ def main(argv: list[str] | None = None) -> int:
                         print(f"PR-FOUND  {evidence_task_id} -> {pr}")
                     for evidence_task_id, reason in evidence.skipped:
                         print(f"PR-SKIP   {evidence_task_id}: {reason}")
+                    recovery = recover_stale_pr_evidence_tasks(
+                        lambda: _nc(conn), args.repo_path, task_id=args.task_id
+                    )
+                    for evidence_task_id, landing in recovery.recovered:
+                        print(f"PR-RECOVER {evidence_task_id} -> {landing}")
+                    for evidence_task_id, reason in recovery.skipped:
+                        print(f"PR-RECOVER-SKIP {evidence_task_id}: {reason}")
                     report = review_once(
                         lambda: _nc(conn),
                         enqueue,

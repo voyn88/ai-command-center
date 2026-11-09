@@ -296,6 +296,7 @@ def test_the_control_plane_cannot_claim() -> None:
         # machine exit from READY_TO_REVIEW for a task stuck there with no
         # `pr` evidence.
         "backlog_recover_stuck_ready_to_review",
+        "backlog_recover_stale_ready_to_review",
         # VOYN-OPS-AICC-PUBLISH-WINDOW-STARVATION (0015): the persisted
         # scan cursor for the tick windows.
         "backlog_scan_claim",

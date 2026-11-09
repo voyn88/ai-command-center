@@ -19,6 +19,7 @@ from command_center.orchestrator.review_merge import (
     reconcile_merge_evidence,
     reconcile_pr_evidence,
     reconcile_pr_window,
+    recover_stale_pr_evidence_tasks,
     review_once,
 )
 from tests.db.test_backlog_planner import (  # noqa: F401 — pytest fixtures
@@ -4274,7 +4275,7 @@ def _pr_rows(factory, task_id):
         return [row[0] for row in cur.fetchall()]
 
 
-def _fake_pr_list(entries, *, returncode=0, stdout=None):
+def _fake_pr_list(entries, *, returncode=0, stdout=None, all_entries=None):
     """The branch lookup is REST now (`gh api repos/{o}/{r}/pulls?...head=`)
     rather than `gh pr list --head` (GraphQL) --
     VOYN-W0-AICC-GH-GRAPHQL-QUOTA-EXHAUSTED-BY-TICKS. Entries are still
@@ -4289,7 +4290,14 @@ def _fake_pr_list(entries, *, returncode=0, stdout=None):
 
     def fake_gh(argv, repo):
         if argv[0] == "api" and "/pulls?" in argv[1]:
-            body = json.dumps(rest) if stdout is None else stdout
+            selected = rest
+            if "state=all" in argv[1] and all_entries is not None:
+                selected = [
+                    {"html_url": entry["url"],
+                     "head": {"ref": entry["headRefName"]}}
+                    for entry in all_entries
+                ]
+            body = json.dumps(selected) if stdout is None else stdout
             return sp.CompletedProcess(argv, returncode, body, "")
         return sp.CompletedProcess(argv, 1, "", "unexpected gh call")
 
@@ -4333,6 +4341,88 @@ def test_a_task_adopts_only_its_own_branch_never_a_prefix_match(rig, _test_repo_
 
     assert _pr_rows(app_factory, task_id) == []
     assert (task_id, "no_open_pr_on_task_branch") in report.skipped
+
+
+def _age_ready_task(factory, task_id):
+    with factory() as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE backlog_task SET updated_at = now() - interval '16 minutes' "
+            "WHERE task_id = %s",
+            (task_id,),
+        )
+
+
+def test_stale_task_without_pr_in_any_state_is_recovered_once(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE2B"
+    _ready_without_pr(store, app_factory, task_id)
+    _age_ready_task(app_factory, task_id)
+    monkeypatch.setattr(review_merge, "_gh", _fake_pr_list([]))
+
+    report = recover_stale_pr_evidence_tasks(app_factory, REPO, task_id=task_id)
+
+    assert report.recovered == [(task_id, "OPEN")]
+    assert store.get_task(task_id)["status"] == "OPEN"
+
+    # A second failed publication may reach READY_TO_REVIEW again, but the
+    # durable one-shot budget prevents an endless dispatch/recovery loop.
+    task = store.get_task(task_id)
+    assert store.transition(task_id, "IN_PROGRESS", task["revision"])[0]
+    task = store.get_task(task_id)
+    assert store.transition(task_id, "READY_TO_REVIEW", task["revision"])[0]
+    _age_ready_task(app_factory, task_id)
+    again = recover_stale_pr_evidence_tasks(app_factory, REPO, task_id=task_id)
+    assert again.recovered == []
+    assert again.skipped == [(task_id, "recovery_refused: recovery_budget_exhausted")]
+    assert store.get_task(task_id)["status"] == "READY_TO_REVIEW"
+
+
+@pytest.mark.parametrize("pr_state", ["closed", "merged"])
+def test_closed_or_merged_pr_prevents_recovery(rig, _test_repo_routes, monkeypatch, pr_state):  # noqa: F811, E501
+    app_factory, store, _ = rig
+    task_id = f"VOYN-W0-PRE-{pr_state.upper()}"
+    _ready_without_pr(store, app_factory, task_id)
+    _age_ready_task(app_factory, task_id)
+    historical = {"url": f"https://github.com/x/repo-d2/pull/{910 if pr_state == 'closed' else 911}",
+                  "headRefName": f"backlog/{task_id}"}
+    monkeypatch.setattr(
+        review_merge, "_gh", _fake_pr_list([], all_entries=[historical])
+    )
+
+    report = recover_stale_pr_evidence_tasks(app_factory, REPO, task_id=task_id)
+
+    assert report.recovered == []
+    assert report.skipped == [(task_id, "pr_exists_on_task_branch")]
+    assert store.get_task(task_id)["status"] == "READY_TO_REVIEW"
+
+
+def test_recovery_waits_for_grace_period(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE-GRACE"
+    _ready_without_pr(store, app_factory, task_id)
+    monkeypatch.setattr(review_merge, "_gh", _fake_pr_list([]))
+
+    report = recover_stale_pr_evidence_tasks(app_factory, REPO, task_id=task_id)
+
+    assert report.recovered == []
+    assert report.skipped == [(task_id, "recovery_refused: recovery_grace_period")]
+    assert store.get_task(task_id)["status"] == "READY_TO_REVIEW"
+
+
+def test_failed_all_state_lookup_never_recovers(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE-LOOKUP-FAIL"
+    _ready_without_pr(store, app_factory, task_id)
+    _age_ready_task(app_factory, task_id)
+    monkeypatch.setattr(
+        review_merge, "_gh", _fake_pr_list([], returncode=1)
+    )
+
+    report = recover_stale_pr_evidence_tasks(app_factory, REPO, task_id=task_id)
+
+    assert report.recovered == []
+    assert report.skipped == [(task_id, "pr_list_failed")]
+    assert store.get_task(task_id)["status"] == "READY_TO_REVIEW"
 
 
 def test_two_open_prs_on_one_branch_are_refused_rather_than_guessed(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501

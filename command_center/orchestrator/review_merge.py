@@ -248,6 +248,16 @@ class PrEvidenceReport:
     skipped: list[tuple[str, str]] = field(default_factory=list)
 
 
+@dataclass
+class PrEvidenceRecoveryReport:
+    """Status changes made by the separate, conservative recovery pass."""
+
+    #: (task_id, landing_status) moved through the guarded database function.
+    recovered: list[tuple[str, str]] = field(default_factory=list)
+    #: (task_id, reason) deliberately left unchanged.
+    skipped: list[tuple[str, str]] = field(default_factory=list)
+
+
 #: Branch naming contract. `publish_run` pushes `backlog/<task id>` and nothing
 #: else does, so the branch name is a derivable fact about a task rather than a
 #: convention this function invents.
@@ -377,6 +387,87 @@ def reconcile_pr_evidence(
     return report
 
 
+def _verdict_values(cur: Any, verdict: Any) -> tuple[bool, str]:
+    """Read a backlog verdict from tuple- or mapping-row cursor factories."""
+    if verdict is None:
+        return False, "empty_verdict"
+    if isinstance(verdict, dict):
+        return bool(verdict.get("ok")), str(verdict.get("reason") or "unknown")
+    names = [column.name for column in cur.description]
+    values = dict(zip(names, verdict, strict=True))
+    return bool(values.get("ok")), str(values.get("reason") or "unknown")
+
+
+def recover_stale_pr_evidence_tasks(
+    factory: Any,
+    repo_path: str,
+    *,
+    task_id: str | None = None,
+    limit: int = 25,
+) -> PrEvidenceRecoveryReport:
+    """Recover a stale evidence-free task only when its branch has no PR.
+
+    This is intentionally separate from :func:`reconcile_pr_evidence`: that
+    pass remains reporting/evidence-only.  GitHub is queried with ``state=all``
+    before any mutation, so a closed or merged PR is not confused with a
+    never-published branch.  The database function atomically enforces the
+    remaining policy: the state must be at least 15 minutes old and only one
+    automatic recovery is allowed for a task's lifetime.
+    """
+    from command_center.orchestrator.planner import repo_route
+
+    report = PrEvidenceRecoveryReport()
+    where = "AND t.task_id = %s" if task_id is not None else ""
+    params: tuple[Any, ...] = (task_id,) if task_id is not None else (limit,)
+    tail = "" if task_id is not None else "ORDER BY t.task_id LIMIT %s"
+    rows = _rows(
+        factory,
+        "SELECT t.task_id, t.repo FROM backlog_task t "
+        "WHERE t.status = 'READY_TO_REVIEW' "
+        "AND NOT EXISTS (SELECT 1 FROM backlog_evidence e "
+        "WHERE e.task_id = t.task_id AND e.kind = 'pr') "
+        f"{where} {tail}",
+        params,
+    )
+    for row in rows:
+        row_task_id = row["task_id"] if isinstance(row, dict) else row[0]
+        task_repo = row["repo"] if isinstance(row, dict) else row[1]
+        route = repo_route(task_repo) if task_repo else None
+        origin = _origin_owner_repo(repo_path)
+        if route is None:
+            report.skipped.append((row_task_id, f"no_repo_route: {task_repo!r}"))
+            continue
+        # A negative lookup is meaningful only for the repository that owns
+        # the task.  Route paths are worker-local, but their final component
+        # is the canonical checkout/repository name on every supported route.
+        if origin is None or os.path.basename(os.path.normpath(route[1])) != origin[1]:
+            report.skipped.append((row_task_id, "task_repo_does_not_match_checkout"))
+            continue
+        pulls, failure = _pulls_for_branch(repo_path, _task_branch(row_task_id), "all")
+        if pulls is None:
+            report.skipped.append((row_task_id, failure))
+            continue
+        exact_pulls = [
+            pull
+            for pull in pulls
+            if pull.get("headRefName") == _task_branch(row_task_id)
+        ]
+        if exact_pulls:
+            report.skipped.append((row_task_id, "pr_exists_on_task_branch"))
+            continue
+        with factory() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM backlog_recover_stale_ready_to_review(%s)",
+                (row_task_id,),
+            )
+            ok, reason = _verdict_values(cur, cur.fetchone())
+        if ok:
+            report.recovered.append((row_task_id, reason))
+        else:
+            report.skipped.append((row_task_id, f"recovery_refused: {reason}"))
+    return report
+
+
 def _open_pulls_for_branch(
     repo_path: str, branch: str
 ) -> tuple[list[dict[str, Any]] | None, str]:
@@ -396,13 +487,20 @@ def _open_pulls_for_branch(
     Returns `(None, reason)` when the lookup produced no evidence at all, so
     the caller can report the skip rather than mistake a failed lookup for
     "this task has no pull request"."""
+    return _pulls_for_branch(repo_path, branch, "open")
+
+
+def _pulls_for_branch(
+    repo_path: str, branch: str, state: str
+) -> tuple[list[dict[str, Any]] | None, str]:
+    """Pull requests in ``state`` for the origin-owned branch."""
     origin = _origin_owner_repo(repo_path)
     if origin is None:
         return None, "pr_list_failed: no github origin remote"
     owner, repo = origin
     head = urllib.parse.quote(f"{owner}:{branch}", safe="")
     outcome, decoded = _rest_json(
-        repo_path, f"repos/{owner}/{repo}/pulls?state=open&per_page=20&head={head}"
+        repo_path, f"repos/{owner}/{repo}/pulls?state={state}&per_page=100&head={head}"
     )
     if outcome == _REST_FAILED:
         return None, "pr_list_failed"
@@ -412,12 +510,16 @@ def _open_pulls_for_branch(
         return None, "pr_list_wrong_shape"
     listed = []
     for item in decoded:
-        if not isinstance(item, dict):
-            continue
+        if not isinstance(item, dict) or not isinstance(item.get("head"), dict):
+            return None, "pr_list_wrong_shape"
+        url = item.get("html_url")
+        head_ref = item["head"].get("ref")
+        if not isinstance(url, str) or not url or not isinstance(head_ref, str):
+            return None, "pr_list_wrong_shape"
         listed.append(
             {
-                "url": str(item.get("html_url") or ""),
-                "headRefName": str((item.get("head") or {}).get("ref") or ""),
+                "url": url,
+                "headRefName": head_ref,
             }
         )
     return listed, ""
