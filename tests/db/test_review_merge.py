@@ -4438,6 +4438,96 @@ def test_the_lookup_runs_in_the_checkout_the_tick_was_given(rig, _test_repo_rout
     assert seen == [REPO]
 
 
+def _seed_skip_streak(factory, tick_kind, task_id, reason, *, consecutive_ticks):
+    """A synthetic `tick_skip_event` row carrying a given streak length.
+    `_prior_consecutive_skips` only ever reads the latest row for the pair,
+    so one row is enough to stand in for N real ticks of history."""
+    with factory() as c, c.cursor() as cur:
+        cur.execute(
+            "INSERT INTO tick_skip_event "
+            "(tick_id, tick_kind, task_id, reason, first_tick_id, first_seen_at, "
+            " consecutive_ticks) VALUES ('seed-tick', %s, %s, %s, 'seed-tick', now(), %s)",
+            (tick_kind, task_id, reason, consecutive_ticks),
+        )
+        c.commit()
+
+
+def test_a_persistent_no_open_pr_streak_recovers_the_task_to_open(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+    """VOYN-W0-AICC-SRV-07d-STALL-811b6b2996dadf39: a branch nothing ever
+    opened a pull request from repeats `no_open_pr_on_task_branch` forever --
+    asking GitHub again never changes the answer. Once the task's own skip
+    history shows the watchdog's own escalation threshold (5) of identical
+    skips, this sends it back OPEN through the 0018 recovery gate instead of
+    repeating the same skip a sixth time."""
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE9"
+    _ready_without_pr(store, app_factory, task_id)
+    _seed_skip_streak(
+        app_factory, "pr_evidence", task_id, "no_open_pr_on_task_branch",
+        consecutive_ticks=review_merge._STUCK_WITHOUT_PR_THRESHOLD,
+    )
+    monkeypatch.setattr(review_merge, "_gh", _fake_pr_list([]))
+
+    report = reconcile_pr_evidence(app_factory, REPO)
+
+    assert (task_id, "no_open_pr_on_task_branch") in report.recovered
+    assert all(entry[0] != task_id for entry in report.skipped)
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", (task_id,))
+        assert cur.fetchone()[0] == "OPEN"
+
+
+def test_a_short_no_open_pr_streak_is_only_skipped(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+    """Below the threshold this is ordinary waiting, not a stall -- the task
+    stays READY_TO_REVIEW and is reported skipped exactly as before."""
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE10"
+    _ready_without_pr(store, app_factory, task_id)
+    _seed_skip_streak(
+        app_factory, "pr_evidence", task_id, "no_open_pr_on_task_branch",
+        consecutive_ticks=review_merge._STUCK_WITHOUT_PR_THRESHOLD - 1,
+    )
+    monkeypatch.setattr(review_merge, "_gh", _fake_pr_list([]))
+
+    report = reconcile_pr_evidence(app_factory, REPO)
+
+    assert (task_id, "no_open_pr_on_task_branch") in report.skipped
+    assert all(entry[0] != task_id for entry in report.recovered)
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", (task_id,))
+        assert cur.fetchone()[0] == "READY_TO_REVIEW"
+
+
+def test_an_ambiguous_streak_is_never_auto_recovered(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+    """`ambiguous_open_prs_on_branch` means pull requests exist -- recovery
+    would hide a choice a human needs to make, so a long streak of that
+    reason is left to the watchdog, never auto-resolved."""
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE11"
+    _ready_without_pr(store, app_factory, task_id)
+    branch = f"backlog/{task_id}"
+    _seed_skip_streak(
+        app_factory, "pr_evidence", task_id, "ambiguous_open_prs_on_branch",
+        consecutive_ticks=review_merge._STUCK_WITHOUT_PR_THRESHOLD + 5,
+    )
+    monkeypatch.setattr(
+        review_merge,
+        "_gh",
+        _fake_pr_list(
+            [{"url": "https://github.com/x/repo-d2/pull/910", "headRefName": branch},
+             {"url": "https://github.com/x/repo-d2/pull/911", "headRefName": branch}]
+        ),
+    )
+
+    report = reconcile_pr_evidence(app_factory, REPO)
+
+    assert (task_id, "ambiguous_open_prs_on_branch") in report.skipped
+    assert all(entry[0] != task_id for entry in report.recovered)
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", (task_id,))
+        assert cur.fetchone()[0] == "READY_TO_REVIEW"
+
+
 # -- reconcile_pr_window: no database involved, gh is faked in-process ------
 
 
