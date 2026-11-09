@@ -28,14 +28,16 @@ def test_check_run_still_in_progress_blocks_merge(rig, monkeypatch):  # noqa: F8
     def fake_gh(argv, repo):
         body = json.dumps({
             "state": "OPEN", "headRefOid": head,
-            "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
+            "author": {"login": "writer-bot"},
+            "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}",
+                         "author": {"login": "acceptance-gate[bot]"}}],
             "statusCheckRollup": [{"name": "CI", "status": "IN_PROGRESS", "conclusion": None}],
         })
         return sp.CompletedProcess(argv, 0, body, "")
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     report = merge_once(app_factory, "/tmp")
-    assert (task_id, "checks_not_green: ['CI']") in report.skipped
+    assert (task_id, "checks_pending: ['CI']") in report.skipped
     with app_factory() as c, c.cursor() as cur:
         cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", (task_id,))
         assert cur.fetchone()[0] == "READY_TO_REVIEW"
@@ -51,11 +53,13 @@ def test_legacy_pending_status_context_blocks_merge(rig, monkeypatch):  # noqa: 
     def fake_gh(argv, repo):
         body = json.dumps({
             "state": "OPEN", "headRefOid": head,
-            "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
+            "author": {"login": "writer-bot"},
+            "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}",
+                         "author": {"login": "acceptance-gate[bot]"}}],
             "statusCheckRollup": [{"name": "legacy-ci", "state": "PENDING"}],
         })
         return sp.CompletedProcess(argv, 0, body, "")
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     report = merge_once(app_factory, "/tmp")
-    assert (task_id, "checks_not_green: ['legacy-ci']") in report.skipped
+    assert (task_id, "checks_pending: ['legacy-ci']") in report.skipped

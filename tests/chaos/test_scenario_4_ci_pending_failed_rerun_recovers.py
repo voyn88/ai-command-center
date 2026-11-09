@@ -23,7 +23,7 @@ import subprocess as sp
 
 from command_center.orchestrator import review_merge
 from command_center.orchestrator.review_merge import merge_once
-from tests.chaos.conftest import _ready
+from tests.chaos.conftest import _ready, accepted_pull, stub_merge_gateway
 
 
 def test_pending_then_failed_then_rerun_recovers_to_merge(rig, monkeypatch):  # noqa: F811, E501
@@ -47,12 +47,7 @@ def test_pending_then_failed_then_rerun_recovers_to_merge(rig, monkeypatch):  # 
                 {"headRefName": "backlog/chaos4", "headRefOid": head}), "")
         if argv[:2] == ["pr", "view"]:
             if merged_state["merged"]:
-                body = json.dumps({
-                    "state": "MERGED", "mergeCommit": {"oid": merge_oid},
-                    "headRefOid": head,
-                    "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
-                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
-                })
+                body = accepted_pull(head, state="MERGED", merge_oid=merge_oid)
                 return sp.CompletedProcess(argv, 0, body, "")
             check = {
                 "pending": {"name": "CI", "status": "IN_PROGRESS", "conclusion": None},
@@ -61,7 +56,10 @@ def test_pending_then_failed_then_rerun_recovers_to_merge(rig, monkeypatch):  # 
             }[ci_state["phase"]]
             body = json.dumps({
                 "state": "OPEN", "headRefOid": head,
-                "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
+                "mergeStateStatus": "CLEAN",
+                "author": {"login": "writer-bot"},
+                "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}",
+                             "author": {"login": "acceptance-gate[bot]"}}],
                 "statusCheckRollup": [check],
             })
             return sp.CompletedProcess(argv, 0, body, "")
@@ -69,23 +67,22 @@ def test_pending_then_failed_then_rerun_recovers_to_merge(rig, monkeypatch):  # 
             if ci_state["phase"] != "failed":
                 return sp.CompletedProcess(argv, 0, "[]", "")
             return sp.CompletedProcess(argv, 0, json.dumps([
-                {"databaseId": 31, "headSha": head, "status": "completed",
+                {"workflowName": "CI", "createdAt": "2026-11-01T00:00:00Z",
+                 "databaseId": 31, "headSha": head, "status": "completed",
                  "conclusion": "failure", "attempt": 1},
             ]), "")
         if argv[:2] == ["run", "rerun"]:
             reruns.append(argv)
             return sp.CompletedProcess(argv, 0, "", "")
-        if argv[:2] == ["pr", "merge"]:
-            merged_state["merged"] = True
-            return sp.CompletedProcess(argv, 0, "merged", "")
         return sp.CompletedProcess(argv, 1, "", "?")
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    stub_merge_gateway(monkeypatch, merged_state)
 
     # Tick 1: the workflow is still running. Blocked, no rerun spent -- a
     # running check is not a failure, so the flake retry has nothing to do.
     pending_report = merge_once(app_factory, "/tmp")
-    assert (task_id, "checks_not_green: ['CI']") in pending_report.skipped
+    assert (task_id, "checks_pending: ['CI']") in pending_report.skipped
     assert reruns == []
     with app_factory() as c, c.cursor() as cur:
         cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", (task_id,))

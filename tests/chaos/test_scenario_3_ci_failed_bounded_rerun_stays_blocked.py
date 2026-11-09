@@ -40,13 +40,16 @@ def test_a_genuinely_broken_head_is_rerun_once_then_left_blocked(rig, monkeypatc
         if argv[:2] == ["pr", "view"]:
             body = json.dumps({
                 "state": "OPEN", "headRefOid": head,
-                "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
+                "author": {"login": "writer-bot"},
+                "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}",
+                             "author": {"login": "acceptance-gate[bot]"}}],
                 "statusCheckRollup": [{"name": "CI", "conclusion": "FAILURE"}],
             })
             return sp.CompletedProcess(argv, 0, body, "")
         if argv[:2] == ["run", "list"]:
             return sp.CompletedProcess(argv, 0, json.dumps([
-                {"databaseId": 21, "headSha": head, "status": "completed",
+                {"workflowName": "CI", "createdAt": "2026-11-01T00:00:00Z",
+                 "databaseId": 21, "headSha": head, "status": "completed",
                  "conclusion": "failure", "attempt": run_state["attempt"]},
             ]), "")
         if argv[:2] == ["run", "rerun"]:

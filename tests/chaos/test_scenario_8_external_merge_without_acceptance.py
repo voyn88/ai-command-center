@@ -33,8 +33,14 @@ def test_merged_around_the_queue_without_a_marker_never_goes_done(rig, monkeypat
         if argv[:2] == ["pr", "view"]:
             body = json.dumps({
                 "state": "MERGED", "mergeCommit": {"oid": merge_oid},
-                "headRefOid": head, "reviews": [],
-                "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
+                "headRefOid": head, "author": {"login": "writer-bot"},
+                "reviews": [],
+                "statusCheckRollup": [
+                    {"name": "CI", "conclusion": "SUCCESS"},
+                    {"name": "Final merge gate", "conclusion": "SUCCESS"},
+                    {"name": "Acceptance gate (independent verdict on exact SHA)",
+                     "conclusion": "SUCCESS"},
+                ],
             })
             return sp.CompletedProcess(argv, 0, body, "")
         return sp.CompletedProcess(argv, 1, "", "?")
@@ -65,7 +71,9 @@ def test_merged_with_empty_check_data_is_inconclusive_not_done(rig, monkeypatch)
             body = json.dumps({
                 "state": "MERGED", "mergeCommit": {"oid": merge_oid},
                 "headRefOid": head,
-                "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}"}],
+                "author": {"login": "writer-bot"},
+                "reviews": [{"body": f"ACCEPTANCE: ACCEPT {head}",
+                             "author": {"login": "acceptance-gate[bot]"}}],
                 "statusCheckRollup": [],
             })
             return sp.CompletedProcess(argv, 0, body, "")

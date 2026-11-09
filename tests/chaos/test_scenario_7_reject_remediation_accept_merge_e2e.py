@@ -22,7 +22,12 @@ import subprocess as sp
 
 from command_center.orchestrator import review_merge
 from command_center.orchestrator.review_merge import merge_once, publish_review_verdicts
-from tests.chaos.conftest import _complete_review, _ready
+from tests.chaos.conftest import (
+    _complete_review,
+    _ready,
+    accepted_pull,
+    stub_merge_gateway,
+)
 
 
 def test_reject_remediation_accept_merge_chain(rig, monkeypatch):  # noqa: F811
@@ -93,26 +98,18 @@ def test_reject_remediation_accept_merge_chain(rig, monkeypatch):  # noqa: F811
 
     def fake_gh_merge(argv, repo):
         if argv[:2] == ["pr", "view"]:
-            if merged_state["merged"]:
-                body = json.dumps({
-                    "state": "MERGED", "mergeCommit": {"oid": merge_oid},
-                    "headRefOid": remediation_head,
-                    "reviews": [{"body": f"ACCEPTANCE: ACCEPT {remediation_head}"}],
-                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
-                })
-            else:
-                body = json.dumps({
-                    "state": "OPEN", "headRefOid": remediation_head,
-                    "reviews": [{"body": f"ACCEPTANCE: ACCEPT {remediation_head}"}],
-                    "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}],
-                })
+            body = (
+                accepted_pull(
+                    remediation_head, state="MERGED", merge_oid=merge_oid
+                )
+                if merged_state["merged"]
+                else accepted_pull(remediation_head)
+            )
             return sp.CompletedProcess(argv, 0, body, "")
-        if argv[:2] == ["pr", "merge"]:
-            merged_state["merged"] = True
-            return sp.CompletedProcess(argv, 0, "merged", "")
         return sp.CompletedProcess(argv, 1, "", "?")
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh_merge)
+    stub_merge_gateway(monkeypatch, merged_state)
     merge_report = merge_once(app_factory, "/tmp")
     assert (rem_task_id, merge_oid) in merge_report.merged
 

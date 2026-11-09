@@ -21,6 +21,12 @@ skips and the whole suite skips with it, exactly like tests/db/*.
 
 from __future__ import annotations
 
+import json
+import subprocess as sp
+
+import pytest
+
+from command_center.orchestrator import review_merge
 from tests.db.conftest import (  # noqa: F401 -- re-exported fixtures, see module docstring
     admin_conn,
     admin_dsn,
@@ -29,6 +35,7 @@ from tests.db.conftest import (  # noqa: F401 -- re-exported fixtures, see modul
     role_passwords,
     test_dsn,
 )
+
 from tests.db.test_review_merge import (  # noqa: F401 -- re-exported fixtures/helpers
     BASE,
     DIFF,
@@ -42,3 +49,58 @@ from tests.db.test_review_merge import (  # noqa: F401 -- re-exported fixtures/h
     _test_repo_routes,
     rig,
 )
+
+
+@pytest.fixture(autouse=True)
+def isolated_generated_dir():
+    """Avoid initializing the Streamlit application in this backend-only suite."""
+    yield None
+
+
+def accepted_pull(head: str, *, state: str = "OPEN", merge_oid: str | None = None) -> str:
+    """Return the current fail-closed shape of an independently accepted PR."""
+    body = {
+        "state": state,
+        "headRefOid": head,
+        "mergeStateStatus": "CLEAN",
+        "author": {"login": "writer-bot"},
+        "reviews": [
+            {
+                "body": f"ACCEPTANCE: ACCEPT {head}",
+                "author": {"login": "acceptance-gate[bot]"},
+            }
+        ],
+        "statusCheckRollup": [
+            {"name": "CI", "conclusion": "SUCCESS"},
+            {"name": "Final merge gate", "conclusion": "SUCCESS"},
+            {
+                "name": "Acceptance gate (independent verdict on exact SHA)",
+                "conclusion": "SUCCESS",
+            },
+        ],
+    }
+    if merge_oid is not None:
+        body["mergeCommit"] = {"oid": merge_oid}
+    return json.dumps(body)
+
+
+def stub_merge_gateway(monkeypatch, merged_state: dict[str, bool]) -> None:
+    """Stub the dedicated merge identity and its sole privileged mutation."""
+    monkeypatch.setattr(
+        review_merge,
+        "_merge_app_credentials",
+        lambda: review_merge.github_app_auth.GitHubAppCredentials(
+            "merge-app", "merge-installation", "/dev/null"
+        ),
+    )
+    monkeypatch.setattr(
+        review_merge.github_app_auth,
+        "installation_token",
+        lambda _credentials: "test-merge-token",
+    )
+
+    def merge(_repo_path, _pr_url, _token):
+        merged_state["merged"] = True
+        return sp.CompletedProcess(["gh", "pr", "merge"], 0, "merged", "")
+
+    monkeypatch.setattr(review_merge, "_merge_pr_as_bot", merge)
