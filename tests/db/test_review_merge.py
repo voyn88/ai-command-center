@@ -4332,7 +4332,28 @@ def test_a_task_adopts_only_its_own_branch_never_a_prefix_match(rig, _test_repo_
     report = reconcile_pr_evidence(app_factory, REPO)
 
     assert _pr_rows(app_factory, task_id) == []
-    assert (task_id, "no_open_pr_on_task_branch") in report.skipped
+    assert task_id in report.recovered
+    assert store.get_task(task_id)["status"] == "OPEN"
+
+
+def test_no_open_pr_uses_the_audited_stuck_task_recovery(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE2B"
+    _ready_without_pr(store, app_factory, task_id)
+    monkeypatch.setattr(review_merge, "_gh", _fake_pr_list([]))
+
+    report = reconcile_pr_evidence(app_factory, REPO, task_id=task_id)
+
+    assert report.recovered == [task_id]
+    assert report.skipped == []
+    assert store.get_task(task_id)["status"] == "OPEN"
+    with app_factory() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT reason FROM backlog_event WHERE task_id=%s "
+            "AND event='recover_stuck_ready_to_review' AND outcome='granted'",
+            (task_id,),
+        )
+        assert cur.fetchall() == [("no_pr_evidence",)]
 
 
 def test_two_open_prs_on_one_branch_are_refused_rather_than_guessed(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
