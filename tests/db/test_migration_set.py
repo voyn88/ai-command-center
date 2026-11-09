@@ -112,3 +112,16 @@ def test_expected_schema_version_tracks_the_migration_set() -> None:
     from command_center.db import health
 
     assert health.EXPECTED_SCHEMA_VERSION == len(migrations.discover())
+
+
+def test_srv_07d_disposition_is_narrow_and_does_not_forge_pr_evidence() -> None:
+    """The stalled original was replaced and merged, not itself published."""
+    sql = (
+        migrations.SQL_DIR / "0035_retire_superseded_srv_07d.up.sql"
+    ).read_text(encoding="utf-8")
+
+    assert "t.task_id = 'VOYN-W0-AICC-SRV-07d'" in sql
+    assert "t.status = 'READY_TO_REVIEW'" in sql
+    assert "e.kind = 'pr'" in sql
+    assert "VOYN-W0-AICC-SRV-07d-RETRY" in sql
+    assert "INSERT INTO backlog_evidence" not in sql
