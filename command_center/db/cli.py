@@ -654,6 +654,7 @@ def main(argv: list[str] | None = None) -> int:
                     publish_review_verdicts,
                     reconcile_pr_evidence,
                     reconcile_review_once,
+                    recover_abandoned_ready_to_review_once,
                     review_once,
                 )
 
@@ -717,6 +718,19 @@ def main(argv: list[str] | None = None) -> int:
                 _watchdog.record_skips(conn, "review_marker", tick_id, marker_report.skipped)
                 stalls = _watchdog.watchdog_once(lambda: _nc(conn))
                 print(f"WATCHDOG  escalated={len(stalls.escalated)} refused={len(stalls.refused)}")
+                # After the watchdog, not before: this reads the escalation
+                # ledger `watchdog_once` just wrote to, so a task only
+                # recovers once the watchdog itself has proven the same
+                # no-PR dead end held for a full stall streak
+                # (VOYN-W0-AICC-REAPER-NOT-RUNNING-STALL) -- never on this
+                # tick's own first sight of the skip.
+                recovery = recover_abandoned_ready_to_review_once(
+                    lambda: _nc(conn), task_id=args.task_id
+                )
+                for recovered_task_id, revision in recovery.recovered:
+                    print(f"RECOVER   {recovered_task_id} -> OPEN (revision {revision})")
+                for recovered_task_id, reason in recovery.skipped:
+                    print(f"RECOVER-SKIP {recovered_task_id}: {reason}")
                 # Printed AFTER the scope closes: the remaining-budget half
                 # of the line is read on the way out (`gh api rate_limit`,
                 # which does not itself consume quota).

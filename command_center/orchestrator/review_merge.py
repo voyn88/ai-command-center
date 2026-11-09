@@ -248,6 +248,16 @@ class PrEvidenceReport:
     skipped: list[tuple[str, str]] = field(default_factory=list)
 
 
+@dataclass
+class AbandonedReadyToReviewReport:
+    """See `recover_abandoned_ready_to_review_once`."""
+
+    #: (task_id, new_revision) sent back to OPEN for a fresh dispatch.
+    recovered: list[tuple[str, int | None]] = field(default_factory=list)
+    #: (task_id, reason) a candidate the 0018 machine gate itself refused.
+    skipped: list[tuple[str, str]] = field(default_factory=list)
+
+
 #: Branch naming contract. `publish_run` pushes `backlog/<task id>` and nothing
 #: else does, so the branch name is a derivable fact about a task rather than a
 #: convention this function invents.
@@ -374,6 +384,74 @@ def reconcile_pr_evidence(
             report.skipped.append((row_task_id, f"evidence_refused: {reason}"))
             continue
         report.recorded.append((row_task_id, pr_url))
+    return report
+
+
+#: `reconcile_pr_evidence`'s skip reason meaning no `gh` lookup, however
+#: often repeated, will ever turn into evidence: the branch genuinely carries
+#: no open pull request. The other skip reasons it raises
+#: (`no_repo_on_task`, `no_repo_route: ...`, `pr_list_failed*`,
+#: `ambiguous_open_prs_on_branch`, `evidence_refused: ...`) name a config or
+#: lookup problem that returning the task to OPEN would not fix, so only this
+#: one reason is eligible for recovery.
+_ABANDONED_PUBLISH_REASON = "no_open_pr_on_task_branch"
+
+
+def recover_abandoned_ready_to_review_once(
+    factory: Any, *, task_id: str | None = None
+) -> AbandonedReadyToReviewReport:
+    """Return a READY_TO_REVIEW task to OPEN once the watchdog has proven its
+    missing PR is not a transient gap but a dead end
+    (VOYN-W0-AICC-REAPER-NOT-RUNNING-STALL).
+
+    `reconcile_pr_evidence` is reporting-only by contract -- it never changes
+    a status -- so a task whose `publish_run` died before it ever pushed a
+    branch (the exact gap 0011/0018 were written for) sits in
+    `READY_TO_REVIEW` with no `pr` evidence and gets skipped
+    `no_open_pr_on_task_branch` forever: nothing re-dispatches it, so no
+    branch is ever pushed, so the skip can never stop recurring. The 0018
+    migration added `backlog_recover_stuck_ready_to_review` as the sanctioned
+    way out of exactly this state, but nothing called it -- the watchdog
+    (VOYN-W0-AICC-TICK-STALL-WATCHDOG) only ever files an escalation task and
+    is documented to never touch the stalled item itself, so the recovery
+    function sat wired to nothing while the same tick kept reporting the same
+    dead end.
+
+    This closes that gap, gated on the watchdog's own escalation ledger
+    rather than on this function's own repeat count: `tick_stall_escalation`
+    already proves the reason held for a full `consecutive_ticks >=
+    threshold` streak (default 5), one escalation per episode by its UNIQUE
+    constraint, so reading it here -- instead of re-deriving persistence from
+    `tick_skip_event` -- can never recover a task before the watchdog itself
+    considers it stalled. `backlog_recover_stuck_ready_to_review` is the only
+    write: it re-checks READY_TO_REVIEW and the absence of `pr` evidence
+    under its own row lock, so a task that reached review or got its PR
+    recorded in between is refused (`not_ready_to_review` /
+    `has_pr_evidence`), not raced.
+    """
+    report = AbandonedReadyToReviewReport()
+    sql = (
+        "SELECT DISTINCT esc.task_id FROM tick_stall_escalation esc "
+        "WHERE esc.tick_kind = 'pr_evidence' AND esc.reason = %s"
+    )
+    params: tuple[Any, ...] = (_ABANDONED_PUBLISH_REASON,)
+    if task_id is not None:
+        sql += " AND esc.task_id = %s"
+        params = (*params, task_id)
+    sql += " ORDER BY esc.task_id"
+    for (candidate_id,) in _rows(factory, sql, params):
+        verdict = _rows(
+            factory,
+            "SELECT * FROM backlog_recover_stuck_ready_to_review(%s)",
+            (candidate_id,),
+        )
+        ok = bool(verdict and verdict[0][0])
+        if not ok:
+            reason = (verdict[0][1] if verdict and len(verdict[0]) > 1 else "") or "unknown"
+            report.skipped.append((candidate_id, reason))
+            continue
+        revision = verdict[0][2] if len(verdict[0]) > 2 else None
+        report.recovered.append((candidate_id, revision))
     return report
 
 

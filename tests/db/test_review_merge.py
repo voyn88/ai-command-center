@@ -19,6 +19,7 @@ from command_center.orchestrator.review_merge import (
     reconcile_merge_evidence,
     reconcile_pr_evidence,
     reconcile_pr_window,
+    recover_abandoned_ready_to_review_once,
     review_once,
 )
 from tests.db.test_backlog_planner import (  # noqa: F401 — pytest fixtures
@@ -4436,6 +4437,131 @@ def test_the_lookup_runs_in_the_checkout_the_tick_was_given(rig, _test_repo_rout
     reconcile_pr_evidence(app_factory, REPO)
 
     assert seen == [REPO]
+
+
+# ---------------------------------------------------------------------------
+# recover_abandoned_ready_to_review_once: the 0018 machine gate
+# (`backlog_recover_stuck_ready_to_review`) wired to the watchdog's own
+# escalation ledger (VOYN-W0-AICC-REAPER-NOT-RUNNING-STALL). A task whose
+# `publish_run` never pushed a branch sits READY_TO_REVIEW with no `pr`
+# evidence, `reconcile_pr_evidence` skips it `no_open_pr_on_task_branch`
+# forever, and nothing re-dispatched it until this closed the loop.
+# ---------------------------------------------------------------------------
+
+
+def _escalate_no_open_pr(app_factory, task_id: str, *, reason: str = "no_open_pr_on_task_branch"):
+    """Drive the real watchdog pipeline until `task_id` has a
+    `tick_stall_escalation` row for (`pr_evidence`, `reason`) -- the exact
+    precondition `recover_abandoned_ready_to_review_once` reads, rather than
+    inserting the ledger row directly and risking a fixture that drifts from
+    what `watchdog_once` actually writes."""
+    from command_center.ops.tick_stall_watchdog import (
+        WatchdogConfig,
+        record_skips,
+        watchdog_once,
+    )
+
+    for index in range(5):
+        with app_factory() as conn:
+            record_skips(conn, "pr_evidence", f"{task_id}-tick-{index:04}", [(task_id, reason)])
+            conn.commit()
+    report = watchdog_once(app_factory, WatchdogConfig(threshold=5))
+    assert any(episode.task_id == task_id for episode, _new_id in report.escalated)
+
+
+def test_recover_abandoned_ready_to_review_reopens_an_escalated_task(rig, _test_repo_routes):  # noqa: F811, E501
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE9"
+    _ready_without_pr(store, app_factory, task_id)
+    _escalate_no_open_pr(app_factory, task_id)
+
+    report = recover_abandoned_ready_to_review_once(app_factory)
+
+    assert any(entry[0] == task_id for entry in report.recovered)
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", (task_id,))
+        assert cur.fetchone()[0] == "OPEN"
+
+
+def test_recover_abandoned_ready_to_review_leaves_a_task_without_an_escalation_alone(
+    rig, _test_repo_routes  # noqa: F811
+):
+    """A single skip, or a streak short of the watchdog's own threshold, must
+    not recover anything -- only `watchdog_once` having already escalated the
+    episode proves the condition is a dead end rather than a transient gap."""
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE10"
+    _ready_without_pr(store, app_factory, task_id)
+    with app_factory() as conn:
+        from command_center.ops.tick_stall_watchdog import record_skips
+
+        record_skips(conn, "pr_evidence", "lone-tick", [(task_id, "no_open_pr_on_task_branch")])
+        conn.commit()
+
+    report = recover_abandoned_ready_to_review_once(app_factory)
+
+    assert all(entry[0] != task_id for entry in report.recovered)
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", (task_id,))
+        assert cur.fetchone()[0] == "READY_TO_REVIEW"
+
+
+def test_recover_abandoned_ready_to_review_refuses_a_task_that_gained_pr_evidence(
+    rig, _test_repo_routes  # noqa: F811
+):
+    """The escalation ledger can be stale by the time this runs: between the
+    watchdog tick and this one, `reconcile_pr_evidence` may have recorded the
+    PR after all. `backlog_recover_stuck_ready_to_review` re-checks under its
+    own row lock, so this must refuse rather than yank a now-reviewable task
+    back to OPEN."""
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE11"
+    _ready_without_pr(store, app_factory, task_id)
+    _escalate_no_open_pr(app_factory, task_id)
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT backlog_record_evidence(%s,'pr',%s)",
+            (task_id, "https://github.com/x/repo-d2/pull/999"),
+        )
+        c.commit()
+
+    report = recover_abandoned_ready_to_review_once(app_factory)
+
+    assert (task_id, "has_pr_evidence") in report.skipped
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", (task_id,))
+        assert cur.fetchone()[0] == "READY_TO_REVIEW"
+
+
+def test_recover_abandoned_ready_to_review_ignores_other_skip_reasons(rig, _test_repo_routes):  # noqa: F811, E501
+    """`no_repo_route`, `pr_list_failed`, `ambiguous_open_prs_on_branch` and
+    friends name a config or lookup problem that returning the task to OPEN
+    would not fix -- only `no_open_pr_on_task_branch` is eligible."""
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE12"
+    _ready_without_pr(store, app_factory, task_id)
+    _escalate_no_open_pr(app_factory, task_id, reason="ambiguous_open_prs_on_branch")
+
+    report = recover_abandoned_ready_to_review_once(app_factory)
+
+    assert all(entry[0] != task_id for entry in report.recovered)
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", (task_id,))
+        assert cur.fetchone()[0] == "READY_TO_REVIEW"
+
+
+def test_recover_abandoned_ready_to_review_filters_by_task_id(rig, _test_repo_routes):  # noqa: F811, E501
+    app_factory, store, _ = rig
+    watched, other = "VOYN-W0-PRE13", "VOYN-W0-PRE14"
+    _ready_without_pr(store, app_factory, watched)
+    _ready_without_pr(store, app_factory, other)
+    _escalate_no_open_pr(app_factory, watched)
+    _escalate_no_open_pr(app_factory, other)
+
+    report = recover_abandoned_ready_to_review_once(app_factory, task_id=watched)
+
+    assert any(entry[0] == watched for entry in report.recovered)
+    assert all(entry[0] != other for entry in report.recovered)
 
 
 # -- reconcile_pr_window: no database involved, gh is faked in-process ------
