@@ -1269,6 +1269,20 @@ def _chunk_key_prefix(task_id: str, pr_url: str, snapshot: _PRSnapshot) -> str |
 _MAX_RESULT_RETRY_ATTEMPTS = 2
 _RETRY_KEY_SUFFIX = re.compile(r":retry:([0-9]+)\Z")
 
+# A review item that was dead-lettered because every executor was unavailable
+# (`infra_wait_exhausted:` / `lease_wait_exhausted:`) never reached a model, so
+# it carries no verdict and spent no inference.  Its exact-head identity is
+# nevertheless terminal, and without a fresh identity the pull request keeps
+# its review-window slot forever (`no_accept_marker_on_head`); five such pull
+# requests held the whole window from 2026-11-08.  Such an item gets a new
+# identity too -- bounded, and only after a growing cool-down so an outage is
+# not hammered.  Every other dead reason (`max_attempts_exhausted`,
+# `review_pin_stale`, `non_retryable`) stays fail-closed.
+_INFRA_DEAD_REASON_PREFIXES = ("infra_wait_exhausted:", "lease_wait_exhausted:")
+_MAX_INFRA_DEAD_RETRY_ATTEMPTS = 12
+_INFRA_DEAD_RETRY_BASE_SECONDS = 900
+_INFRA_DEAD_RETRY_MAX_SECONDS = 4 * 3600
+
 
 def _retry_attempt(key: str) -> tuple[str, int]:
     match = _RETRY_KEY_SUFFIX.search(key)
@@ -1306,6 +1320,10 @@ def _next_retry_key(
     if latest is None:
         return None
     attempt, state, payload_value = latest
+    if state == "dead":
+        if _infra_dead_retry_due(factory, task_id, base_key, attempt):
+            return f"{base_key}:retry:{attempt + 1}"
+        return None
     if state != "succeeded" or attempt >= _MAX_RESULT_RETRY_ATTEMPTS:
         return None
     result = _json_object(payload_value)
@@ -1313,6 +1331,37 @@ def _next_retry_key(
     if parsed is not None and parsed[1] == expected_head:
         return None
     return f"{base_key}:retry:{attempt + 1}"
+
+
+def _infra_dead_retry_delay(attempt: int) -> int:
+    return min(_INFRA_DEAD_RETRY_BASE_SECONDS * (2 ** max(attempt, 0)),
+               _INFRA_DEAD_RETRY_MAX_SECONDS)
+
+
+def _infra_dead_retry_due(
+    factory: Any, task_id: str, base_key: str, attempt: int
+) -> bool:
+    """Whether the dead latest identity of ``base_key`` died on executor
+    infrastructure, is past its cool-down and still inside the retry bound.
+    The database clock decides the cool-down; an unreadable row is not due."""
+    if attempt >= _MAX_INFRA_DEAD_RETRY_ATTEMPTS:
+        return False
+    key = base_key if attempt == 0 else f"{base_key}:retry:{attempt}"
+    rows = _rows(
+        factory,
+        "SELECT dead_reason, EXTRACT(EPOCH FROM (now() - dead_at)) "
+        "FROM work_item WHERE task_id = %s AND idempotency_key = %s AND state = 'dead'",
+        (task_id, key),
+    )
+    if len(rows) != 1:
+        return False
+    reason, age = rows[0]
+    if not isinstance(reason, str) or not reason.startswith(_INFRA_DEAD_REASON_PREFIXES):
+        return False
+    try:
+        return float(age) >= _infra_dead_retry_delay(attempt)
+    except (TypeError, ValueError):
+        return False
 
 
 def _latest_attempt_executor(factory: Any, task_id: str, base_key: str) -> str | None:

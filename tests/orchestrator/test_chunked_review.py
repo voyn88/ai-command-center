@@ -123,6 +123,58 @@ def test_malformed_result_gets_fresh_bounded_retry_key(monkeypatch):
     assert review_merge._next_retry_key(None, TASK, key, HEAD) is None
 
 
+def test_infra_dead_review_gets_bounded_cooled_down_retry_key(monkeypatch):
+    key = "review:identity:chunk:0001:abc"
+    seen = []
+
+    def dead_rows(reason, age):
+        def fake_rows(_factory, sql, params=()):
+            seen.append(params)
+            assert "state = 'dead'" in sql
+            return [(reason, age)]
+        return fake_rows
+
+    monkeypatch.setattr(review_merge, "_latest_attempt", lambda *_: (0, "dead", None))
+    base_delay = review_merge._INFRA_DEAD_RETRY_BASE_SECONDS
+
+    # Executor outage, cool-down elapsed: a fresh identity, looked up by the exact dead key.
+    monkeypatch.setattr(review_merge, "_rows", dead_rows(
+        "infra_wait_exhausted: executor infrastructure failure (provider/auth/quota): provider HTTP 402",
+        base_delay))
+    assert review_merge._next_retry_key(None, TASK, key, HEAD) == f"{key}:retry:1"
+    assert seen[-1] == (TASK, key)
+
+    # Still cooling down: wait.
+    monkeypatch.setattr(review_merge, "_rows", dead_rows(
+        "lease_wait_exhausted: another lane holds mutation admission", base_delay - 1))
+    assert review_merge._next_retry_key(None, TASK, key, HEAD) is None
+
+    # Every other dead reason stays fail-closed, however old.
+    for reason in ("max_attempts_exhausted: boom", "review_pin_stale: pull 1 head is x",
+                   "non_retryable: review_pin_stale: pull 1", None):
+        monkeypatch.setattr(review_merge, "_rows", dead_rows(reason, 10 ** 9))
+        assert review_merge._next_retry_key(None, TASK, key, HEAD) is None
+
+    # A later retry looks up its own key and waits longer; the bound is final.
+    monkeypatch.setattr(review_merge, "_latest_attempt", lambda *_: (3, "dead", None))
+    monkeypatch.setattr(review_merge, "_rows", dead_rows("infra_wait_exhausted: x", base_delay * 8 - 1))
+    assert review_merge._next_retry_key(None, TASK, key, HEAD) is None
+    assert seen[-1] == (TASK, f"{key}:retry:3")
+    monkeypatch.setattr(review_merge, "_rows", dead_rows("infra_wait_exhausted: x", base_delay * 8))
+    assert review_merge._next_retry_key(None, TASK, key, HEAD) == f"{key}:retry:4"
+    assert review_merge._infra_dead_retry_delay(99) == review_merge._INFRA_DEAD_RETRY_MAX_SECONDS
+
+    last = review_merge._MAX_INFRA_DEAD_RETRY_ATTEMPTS
+    monkeypatch.setattr(review_merge, "_latest_attempt", lambda *_: (last, "dead", None))
+    monkeypatch.setattr(review_merge, "_rows", dead_rows("infra_wait_exhausted: x", 10 ** 9))
+    assert review_merge._next_retry_key(None, TASK, key, HEAD) is None
+
+    # Unreadable or ambiguous rows are never due.
+    monkeypatch.setattr(review_merge, "_latest_attempt", lambda *_: (0, "dead", None))
+    monkeypatch.setattr(review_merge, "_rows", lambda *_a, **_k: [])
+    assert review_merge._next_retry_key(None, TASK, key, HEAD) is None
+
+
 def test_reconcile_enqueues_only_fresh_chunk_retry(monkeypatch):
     snapshot = snap("diff --git a/a b/a\n" + "x\n" * 40_000)
     chunks = review_merge._review_chunks(snapshot, TASK, PR)
