@@ -133,6 +133,7 @@ ALL_TABLES: tuple[str, ...] = (
     "cto_work_binding",
     "cto_execution_start",
     "cto_assignment_event",
+    "cto_control_event",
     "completion",
     "completion_event",
     "completion_validation",
@@ -214,6 +215,7 @@ IDENTITY_SEQUENCES: MappingProxyType[str, str] = MappingProxyType(
         "completion_validation": "completion_validation_id_seq",
         "council_event": "council_event_id_seq",
         "cto_assignment_event": "cto_assignment_event_event_id_seq",
+        "cto_control_event": "cto_control_event_event_id_seq",
         "model_event": "model_event_id_seq",
         "principal_event": "principal_event_id_seq",
         "proposal_event": "proposal_event_id_seq",
@@ -340,6 +342,7 @@ _APP_BACKLOG_TABLES: dict[str, frozenset[str]] = {
     "cto_work_binding": _READ,
     "cto_execution_start": _READ,
     "cto_assignment_event": _READ,
+    "cto_control_event": _READ,
     "backlog_task": _READ,
     "backlog_dependency": _READ,
     "backlog_evidence": _READ,
@@ -365,6 +368,7 @@ _WORKER_BACKLOG_TABLES: dict[str, frozenset[str]] = {
     "cto_work_binding": _NONE,
     "cto_execution_start": _NONE,
     "cto_assignment_event": _NONE,
+    "cto_control_event": _NONE,
     "backlog_task": _NONE,
     "backlog_dependency": _NONE,
     "backlog_evidence": _NONE,
@@ -709,6 +713,8 @@ _OPERATOR_FUNCTIONS = (
     "cto_assign(text, bigint, text, jsonb, text)",
     "cto_revoke(text, text)",
     "cto_activate(text)",
+    # 0037: the audited off switch shares activation's operator-only boundary.
+    "cto_deactivate(text)",
     "enroll_mint_ticket(text, text, text, inet, interval, text)",
     "enroll_revoke_ticket(text, text)",
     "enroll_sweep_expired()",
@@ -793,6 +799,7 @@ PRIVILEGES: MappingProxyType[str, MappingProxyType[str, frozenset[str]]] = (
                     {name: _READ for name in (
                         "cto_control", "cto_assignment", "cto_work_binding",
                         "cto_execution_start", "cto_assignment_event",
+                        "cto_control_event",
                     )},
                 )
             ),

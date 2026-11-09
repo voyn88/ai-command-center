@@ -22,6 +22,44 @@ The authenticated owner endpoint `/api/version` reports an immutable startup sna
 
 `record_acceptance_artifact` admits an independently produced `delivery-acceptance-observation/v1` artifact. The trusted operator selects its producer, expected check ID and checksum. The reader fetches the actual bounded HTTPS bytes, rejects redirects, checks SHA256, rejects duplicate JSON fields, and validates task, revision, production environment, exact SHA, criterion, check ID, passed outcome and aware observation timestamp. SQL rechecks authoritative release scope and freshness. The configured private reader pins credentials to the selected origin. A model-supplied URL, checksum or claim is not a trusted producer. The resulting HTTPS reference includes the verified hash; retained artifacts must be available to authorized reviewers on other hosts. These adapters admit existing evidence; they neither run the check nor manufacture its result.
 
+## CTO assignment enforcement scope (migration 0037)
+
+Migration 0036 installs operator-issued CTO assignments, disabled. Migration 0037 limits what activation (`cto_activate`) affects. After activation, work needs an exact assignment only when it belongs to an enrolled task. A task is enrolled when `delivery_team_stage` has any row for it, at any revision. This is the same rule the 0035 implementation gate uses, and there is no separate list.
+
+A requested payload is in scope when any of these identities, with whitespace trimmed, is enrolled:
+
+- the canonical queue `task_id`;
+- the payload's `backlog_task_id`;
+- the payload's `delivery_team.task_id`.
+
+Role work items have a NULL queue task_id, and their `delivery_team.task_id` places them in scope. A queued work item is also in scope while it is bound to an assignment (`cto_work_binding`). If a bound item's payload is later changed, it does not fall back to the legacy path.
+
+In-scope work gets exactly the 0036 checks, at enqueue, `backlog_dispatch`, claim and `cto_authorize_start`. Each of these is refused:
+
+- a missing assignment;
+- a stale revision;
+- a digest or binding mismatch;
+- a revoked assignment;
+- an ambiguous identity;
+- a foreign or inactive principal;
+- a binding conflict.
+
+A conflicting or padded identity that names an enrolled task is in scope, and is then refused by those checks.
+
+All other work keeps its pre-activation path unchanged, even while enforcement is active. This covers:
+
+- ordinary independent PR reviews and their `:retry:N` items;
+- legacy implementation work for tasks that were never enrolled;
+- taskless jobs and the coordinator, unless its payload names an enrolled task.
+
+The worker's principal-state check at start is likewise applied only to in-scope work. The independent review of an enrolled task's PR carries that task's id, so it is in scope and needs its own assignment.
+
+Claims serve the higher-priority of two candidates: the authorized in-scope item and the first ready out-of-scope item. Ready, unassigned in-scope items are skipped without spending attempts. Each claim filters such items when they sit ahead of out-of-scope work. Enrollment bounds how many there are, but keep that prefix small: requeue or retire stale enrolled items rather than leaving them ready.
+
+The operator can switch enforcement off with `cto_deactivate(reason)`. It has the same boundary as `cto_activate`: only a non-superuser `aicc_operator` session, and app/worker roles cannot execute it. Every activation and deactivation appends an immutable row (action, reference/reason, actor, time) to `cto_control_event`. Deactivation keeps all assignments, bindings, start decisions and audit rows. `cto_activate` re-enables enforcement later, with the same snapshot of the attempts already running.
+
+Rollback does not bypass enforcement. The 0037 and 0036 down migrations both refuse while enforcement is active. When it is inactive, 0037.down restores the exact 0036 definitions and drops `cto_control_event` with its history, so back up first. A database can take 0037 through the ordinary upgrade only once it is at 36. The guarded 34→36 CTO crossing (`ops.aicc_cto_migration`) accepts a source lineage of exactly 1..36.
+
 ## Incident and corrective-action evidence
 
 RCA is a branch associated with an incident, not a recursively generated REM chain. External `incident_key` binds the exact project, run, SHA and failure signature. The existing review-rejection/merge-remediation transaction records observations for enrolled tasks when the feature is enabled. Replays retain the first admitted observation rather than replacing its timestamp or evidence. Incident records survive task status revisions.

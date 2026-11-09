@@ -112,6 +112,14 @@ UNMIRRORED_SCHEMA_TABLES: dict[str, Exclusion] = {
         ),
         task="VOYN-W0-AICC-DELIVERY-TEAM",
     ),
+    "cto_control_event": Exclusion(
+        reason=(
+            "The append-only activation/deactivation history of the CTO latch is "
+            "PostgreSQL-native with no SQLite source. Restore it with cto_control and "
+            "assignment state; a mirror could not prove who switched enforcement and why. "
+        ),
+        task="VOYN-W0-AICC-DELIVERY-TEAM",
+    ),
     "delivery_team_corrective_assignment": Exclusion(
         reason=("PostgreSQL-native operator corrective authority has no SQLite source; "
                 "restore it with canonical remediation lineage and incident evidence."),

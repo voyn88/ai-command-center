@@ -20,6 +20,7 @@ SQL = (
     Path(__file__).parents[2]
     / "command_center/db/sql/0036_cto_assignment_enforcement.up.sql"
 )
+SCOPE_SQL = SQL.with_name("0037_cto_enforcement_scope.up.sql")
 TASK = "VOYN-CTO-TEST"
 PAYLOAD = {"kind": "agent_run", "backlog_task_id": TASK, "prompt": "bounded test"}
 TOKEN = hashlib.sha256(b"disposable claim fixture").hexdigest()
@@ -29,7 +30,7 @@ TOKEN = hashlib.sha256(b"disposable claim fixture").hexdigest()
 def cto_rig(admin_conn, psycopg, test_dsn, role_passwords, connect_as, request):
     _provision(admin_conn, psycopg, test_dsn, role_passwords)
     with connect_as(roles.MIGRATOR_ROLE) as migrator:
-        assert migrator.execute("SELECT max(version) FROM schema_migration").fetchone()[0] == 36
+        assert migrator.execute("SELECT max(version) FROM schema_migration").fetchone()[0] == 37
         # Production reasserts grants after upgrade; no provisional-only grants.
         roles.apply_table_grants(migrator)
     admin_conn.execute("""INSERT INTO principal(principal_id,kind,db_role,display_name,host,state,trust_tier,created_at,updated_at)
@@ -44,6 +45,12 @@ def cto_rig(admin_conn, psycopg, test_dsn, role_passwords, connect_as, request):
             (TASK,),
         ).fetchone()
         assert row[0]
+        # 0037 scopes activated enforcement to delivery-team-enrolled work, so
+        # every assertion in this module exercises the enrolled (scoped) path.
+        app.execute("SELECT * FROM delivery_team_sync(100,%s::jsonb)", (json.dumps([TASK]),))
+        assert app.execute(
+            "SELECT count(*) FROM delivery_team_stage WHERE task_id=%s", (TASK,)
+        ).fetchone()[0] > 0
         yield app, operator, worker, admin_conn
 
 
@@ -245,6 +252,8 @@ def test_operator_and_hidden_legacy_functions_are_not_reachable(cto_rig, psycopg
         with pytest.raises(psycopg.errors.InsufficientPrivilege):
             conn.execute("SELECT cto_activate('forged')")
         with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            conn.execute("SELECT cto_deactivate('forged')")
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
             conn.execute("SELECT _cto_legacy_claim('execution',%s,300)", (TOKEN,))
         with pytest.raises(psycopg.errors.InsufficientPrivilege):
             conn.execute("UPDATE cto_control SET enabled=true")
@@ -379,6 +388,7 @@ def test_rollback_denial_is_logged_without_creating_work(cto_rig):
 
 
 def test_disabled_downgrade_restores_existing_queue(cto_rig):
+    cto_rig[3].execute(SCOPE_SQL.with_name("0037_cto_enforcement_scope.down.sql").read_text())
     cto_rig[3].execute(SQL.with_name("0036_cto_assignment_enforcement.down.sql").read_text())
     enqueue(cto_rig)
     assert claim(cto_rig)[0]
@@ -445,10 +455,13 @@ def test_start_and_revoke_serialize_at_database_boundary(cto_rig, connect_as, wi
     assert start(cto_rig, result[3])[0] is (winner == "start")
 
 
-def test_active_enforcement_cannot_be_downgraded_to_bypass(cto_rig, psycopg):
+@pytest.mark.parametrize(
+    "down", ["0037_cto_enforcement_scope.down.sql", "0036_cto_assignment_enforcement.down.sql"]
+)
+def test_active_enforcement_cannot_be_downgraded_to_bypass(cto_rig, psycopg, down):
     activate(cto_rig)
     with pytest.raises(psycopg.errors.RaiseException, match="forward migration"):
-        cto_rig[3].execute(SQL.with_name("0036_cto_assignment_enforcement.down.sql").read_text())
+        cto_rig[3].execute(SQL.with_name(down).read_text())
     assert cto_rig[0].execute("SELECT enabled FROM cto_control").fetchone()[0]
 
 
@@ -523,16 +536,21 @@ def _null_enqueue(admin):
       RETURNS text LANGUAGE sql AS 'SELECT NULL::text'""")
 
 
-def _coordinator(app):
+COORDINATION = {"kind": "agent_run", "mode": "coordination_v2"}
+
+
+def _coordinator(app, payload=None):
     return app.execute(
         "SELECT * FROM coordinator_enqueue('cto-test','snapshot','blocker','coord-key','execution',%s::jsonb)",
-        (json.dumps({"kind": "agent_run", "mode": "coordination_v2"}),),
+        (json.dumps(payload or COORDINATION),),
     ).fetchone()
 
 
 def test_enabled_coordinator_is_explicitly_held_without_cas_or_work(cto_rig):
     activate(cto_rig)
-    assert _coordinator(cto_rig[0]) == (None, "cto_assignment_required")
+    # Held only when its payload names enrolled work (0037 scope).
+    enrolled = {**COORDINATION, "backlog_task_id": TASK}
+    assert _coordinator(cto_rig[0], enrolled) == (None, "cto_assignment_required")
     assert (
         cto_rig[0].execute("SELECT count(*) FROM coordinator_state").fetchone()[0] == 0
     )
@@ -706,9 +724,10 @@ def test_large_denied_prefix_uses_indexed_binding_selection_and_revoke_progresse
     approved = enqueue(cto_rig, key="approved-tail")
     for table in ("work_item", "cto_assignment", "cto_work_binding", "backlog_task"):
         admin.execute("ANALYZE " + table)
-    source = SQL.read_text()
+    # The active claim is 0037's; its authorized selection is 0036's verbatim.
+    source = SCOPE_SQL.read_text()
     query = source[source.index("    WITH authorized AS MATERIALIZED (") :]
-    query = query[: query.index("    IF NOT FOUND")].strip().rstrip(";")
+    query = query[: query.index("    -- END AUTHORIZED SELECTION")].strip().rstrip(";")
     query = (
         query.replace("INTO it ", "")
         .replace("p_queue", "'execution'")

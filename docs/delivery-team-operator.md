@@ -56,6 +56,16 @@ Keep the pilot to one real eligible canonical AICC task using the existing plann
 and explicit delivery-team scope. No fake incidents, new producers, daemon, grants,
 queue writer or expanded scope are supplied by this command.
 
+## CTO enforcement switch (schema 37)
+
+These are SQL functions, not commands of this CLI. Run them only through the trusted operator credential path described above: a non-superuser `aicc_operator` session, never app, worker, superuser or `SET ROLE`. Any other caller gets a denial or `false`, and the refusal is audited.
+
+- `SELECT cto_activate('<fleet verification reference>')` turns enforcement on. It then applies only to delivery-team-enrolled tasks, meaning tasks with any `delivery_team_stage` row. Ordinary PR reviews, retries and never-enrolled legacy work are unaffected. Each enrolled task's work then needs its own `cto_assign` (exact task, revision, principal and payload digest).
+- `SELECT cto_deactivate('<reason>')` turns enforcement off. A blank reason is refused. It deletes or revokes nothing: assignments, bindings, start decisions and audit rows are kept, and you can re-activate later.
+- Each transition appends an immutable row to `cto_control_event`, which records the action, the reference or reason, the actor (`session_user`) and the time. Read the switch history there. `cto_control` holds only the current latch and the latest activation.
+
+While enforcement is active, schema rollback (the 0037 or 0036 down migration) is refused. Deactivate with a recorded reason before any reviewed downgrade, and back up first: 0037.down drops `cto_control_event`.
+
 ## Existing Basic-auth edge
 
 Bearer remains the default (`AICC_TEAM_AUTH_MODE=bearer`). To use an existing

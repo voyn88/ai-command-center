@@ -420,6 +420,18 @@ def test_identifier_guard_rejects_injection(bad: str) -> None:
         roles.render_grants(bad)
 
 
+def test_only_operator_can_switch_cto_enforcement() -> None:
+    """0037: deactivation shares activation's operator-only boundary."""
+    for lever in ("cto_activate(text)", "cto_deactivate(text)"):
+        assert lever in roles.FUNCTION_PRIVILEGES[roles.OPERATOR_ROLE]
+        assert lever not in roles.FUNCTION_PRIVILEGES[roles.APP_ROLE]
+        assert lever not in roles.FUNCTION_PRIVILEGES[roles.WORKER_ROLE]
+    # Its append-only history is observable, never writable, by product roles.
+    assert roles.PRIVILEGES[roles.APP_ROLE]["cto_control_event"] == frozenset({"SELECT"})
+    assert roles.PRIVILEGES[roles.OPERATOR_ROLE]["cto_control_event"] == frozenset({"SELECT"})
+    assert roles.PRIVILEGES[roles.WORKER_ROLE]["cto_control_event"] == frozenset()
+
+
 def test_only_operator_can_attest_delivery_release() -> None:
     release = "delivery_team_record_release(text, bigint, text, text, jsonb, text)"
     assert release in roles.FUNCTION_PRIVILEGES[roles.OPERATOR_ROLE]
