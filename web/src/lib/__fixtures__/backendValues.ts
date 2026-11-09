@@ -44,6 +44,7 @@ export const REASON_CODES = [
   'quota_limit',
   'provider_api_error',
   'provider_exit_nonzero',
+  'network_error',
   'daemon_unreachable',
   'model_missing',
   'insufficient_memory',
