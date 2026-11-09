@@ -246,6 +246,11 @@ class PrEvidenceReport:
     recorded: list[tuple[str, str]] = field(default_factory=list)
     #: (task_id, reason) examined and deliberately left alone.
     skipped: list[tuple[str, str]] = field(default_factory=list)
+    #: (task_id, verdict_reason) sent back to OPEN through the 0018 gate
+    #: because the tick-stall watchdog had already escalated this exact
+    #: task for `no_open_pr_on_task_branch` -- see `_recover_escalated_
+    #: no_pr_stall`. A genuine fresh attempt, not a skip.
+    recovered: list[tuple[str, str]] = field(default_factory=list)
 
 
 #: Branch naming contract. `publish_run` pushes `backlog/<task id>` and nothing
@@ -296,9 +301,28 @@ def reconcile_pr_evidence(
     origin of that checkout and nothing else, so a task can never be attached
     to a pull request in another repository.
 
-    Reporting only: no status is changed here. A task becomes reviewable
-    because it is `READY_TO_REVIEW` and now has evidence, through the same
-    path it always did.
+    Reporting only for everything above: no status is changed by recording
+    evidence. A task becomes reviewable because it is `READY_TO_REVIEW` and
+    now has evidence, through the same path it always did.
+
+    One case is not reporting only. `no_open_pr_on_task_branch` covers two
+    very different situations that look identical from here: a task whose
+    PR simply has not landed yet (ordinary latency -- wait), and a task
+    whose PR will never land because nothing ever pushed the branch
+    (`publish_run` requires a `voyn-lease` binary that is not installed
+    anywhere on this fleet -- see above). The second case cannot resolve
+    itself; the tick would otherwise report the identical skip forever
+    (live: VOYN-W0-AICC-SRV-08-PITR, the same reason for 5 consecutive
+    `pr_evidence` ticks, 2026-11-04 14:18-14:44). The tick-stall watchdog
+    (0034) already tells the two apart for free: it only escalates a
+    `(task, reason)` pair once it has repeated on every one of the last 5
+    ticks, which ordinary latency does not survive. So once -- and only
+    once -- `tick_stall_escalation` already holds that escalation for this
+    exact task, `_recover_escalated_no_pr_stall` sends it back to OPEN
+    through the 0018 gate (`backlog_recover_stuck_ready_to_review`, granted
+    to this role since the migration that added it but never, until now,
+    called by anything) for a fresh dispatch attempt, instead of reporting
+    the same dead-end skip for a sixth tick and every tick after.
     """
     # Imported here, as  does, so this module keeps its
     # import-time independence from the planner.
@@ -348,7 +372,11 @@ def reconcile_pr_evidence(
             and entry["url"]
         ]
         if not matches:
-            report.skipped.append((row_task_id, "no_open_pr_on_task_branch"))
+            recovery = _recover_escalated_no_pr_stall(factory, row_task_id)
+            if recovery is not None:
+                report.recovered.append((row_task_id, recovery))
+            else:
+                report.skipped.append((row_task_id, "no_open_pr_on_task_branch"))
             continue
         if len(matches) > 1:
             report.skipped.append((row_task_id, "ambiguous_open_prs_on_branch"))
@@ -375,6 +403,53 @@ def reconcile_pr_evidence(
             continue
         report.recorded.append((row_task_id, pr_url))
     return report
+
+
+def _recover_escalated_no_pr_stall(factory: Any, task_id: str) -> str | None:
+    """`None` unless the watchdog has already escalated `task_id`'s CURRENT,
+    still-unbroken `no_open_pr_on_task_branch` streak, in which case this
+    sends it back to OPEN (0018) and returns the recovery verdict's reason.
+
+    The watchdog's escalation ledger is the gate, not a timer or a retry
+    count of this function's own: `tick_stall_escalation` only gains a row
+    once `(pr_evidence, task_id, no_open_pr_on_task_branch)` has repeated on
+    every one of the last 5 ticks (`detect_stalls`'s threshold), which a PR
+    that is merely still in flight will not do.
+
+    Matching on `task_id` and `reason` alone would also match a STALE
+    escalation from a past episode that already resolved (recovered once,
+    redispatched, and -- if whatever breaks `publish_run` is still broken --
+    landed right back in the identical skip): every tick after the first
+    would then find that old row and recover again immediately, without
+    ever re-earning the 5-tick confirmation the watchdog's whole design is
+    for. The join to `tick_skip_event` through `first_tick_id` -- the
+    episode's own immutable identity (`detect_stalls`) -- scopes this to
+    the escalation for the streak that is active RIGHT NOW, so a second,
+    independent episode must survive its own 5 ticks before this fires
+    again.
+    """
+    with factory() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM tick_skip_event s "
+            "JOIN (SELECT tick_id FROM tick_observation "
+            " WHERE tick_kind = 'pr_evidence' ORDER BY id DESC LIMIT 1) latest "
+            " ON s.tick_id = latest.tick_id "
+            "JOIN tick_stall_escalation e "
+            " ON e.tick_kind = s.tick_kind AND e.task_id = s.task_id "
+            " AND e.reason = s.reason AND e.first_tick_id = s.first_tick_id "
+            "WHERE s.tick_kind = 'pr_evidence' AND s.task_id = %s "
+            "AND s.reason = 'no_open_pr_on_task_branch'",
+            (task_id,),
+        )
+        if cur.fetchone() is None:
+            return None
+        cur.execute(
+            "SELECT * FROM backlog_recover_stuck_ready_to_review(%s)", (task_id,)
+        )
+        verdict = cur.fetchone()
+    if not verdict or not verdict[0]:
+        return None
+    return str(verdict[1] or "OPEN")
 
 
 def _open_pulls_for_branch(
