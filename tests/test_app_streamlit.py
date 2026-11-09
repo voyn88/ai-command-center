@@ -2018,3 +2018,25 @@ def test_execution_queue_panel_launch_ready_button_present_once_queued():
     assert not at.exception
     assert any(b.key == "exec_queue_launch_ready" for b in at.button)
     assert any(b.key == "exec_queue_launch_next" for b in at.button)
+
+
+@pytest.mark.parametrize("provenance", [{"source": "master", "read_only": True}, {"source": "master"}, {"read_only": True}])
+def test_overview_readonly_recommendation_has_open_but_no_launch(provenance):
+    _seed_tasks([{"id": "overview-readonly", "title": "Read-only recommendation", **provenance}])
+    at = _at_on_page("dashboard")
+    assert not at.exception
+    assert any("Read-only recommendation" in item.value for item in at.markdown)
+    assert "home_hero_launch" not in {button.key for button in at.button}
+    at.button(key="home_hero_open_task").click().run()
+    assert not at.exception
+    assert at.session_state["nav_page"] == "kanban"
+
+
+def test_overview_ordinary_recommendation_preserves_launch_navigation():
+    _seed_tasks([{"id": "overview-ordinary", "title": "Ordinary recommendation", "read_only": False}])
+    at = _at_on_page("dashboard")
+    assert not at.exception
+    assert "home_hero_open_task" in {button.key for button in at.button}
+    at.button(key="home_hero_launch").click().run()
+    assert not at.exception
+    assert at.session_state["nav_page"] == "execution_center"

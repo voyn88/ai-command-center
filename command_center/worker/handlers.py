@@ -705,7 +705,7 @@ def _run_agent(
     # Preserve the requested capability class, prompt, task and idempotency key.
     if request.delivery_team is None and apply_operator_profile and os.environ.get("AICC_EXECUTOR_PROFILE") in {"owner-alternatives", "owner-cascade"}:
         requested_type = request.task_type
-        request = replace(request, cascade=tuple(
+        profiled = [
             {**entry, "task_type": requested_type}
             for entry in cascade_for(
                 "implementation" if requested_type in agent_runner.MUTATING_TASK_TYPES else "review"
@@ -713,7 +713,19 @@ def _run_agent(
             if requested_type not in agent_runner.MODEL_ONLY_TASK_TYPES
             or entry["executor"] == "grok"
             or (entry["executor"] == "claude" and os.environ.get("AICC_CLAUDE_MAC_ENABLED") == "1")
-        ))
+        ]
+        if request.finops_excluded_executors:
+            excluded = set(request.finops_excluded_executors)
+            profiled = [
+                entry for entry in profiled if str(entry.get("executor")) not in excluded
+            ]
+            if not profiled:
+                return HandlerOutcome(
+                    ok=False,
+                    infra_wait=True,
+                    reason="finops: all profile links excluded (cost_data_unavailable)",
+                )
+        request = replace(request, cascade=tuple(profiled))
 
     link = _cascade_link(request, attempt_no)
     cascade_step = (
@@ -1595,6 +1607,28 @@ def _run_agent(
                 reason=(
                     "executor infrastructure failure (agent principal "
                     f"isolation): {_tail(run.stderr or result_text)}"
+                ),
+                retryable=True,
+                infra_wait=True,
+            )
+        if (
+            run.status == "timed_out"
+            and task_type not in agent_runner.MUTATING_TASK_TYPES
+        ):
+            # A read-only review timeout has produced no verdict and has no
+            # side effects to protect. Completing it would permanently
+            # occupy the deterministic (task, PR, head, policy) review key
+            # with an unusable result. Retry it through the independently
+            # bounded infrastructure-wait path. Mutating timeouts remain
+            # results because repeating them can duplicate side effects.
+            checkpoint_failure = checkpoint_preserved_candidate()
+            if checkpoint_failure is not None:
+                return checkpoint_failure
+            return HandlerOutcome(
+                ok=False,
+                reason=(
+                    "executor infrastructure failure (review timeout): "
+                    f"{_tail(result_text or run.stderr) or 'agent timed out'}"
                 ),
                 retryable=True,
                 infra_wait=True,

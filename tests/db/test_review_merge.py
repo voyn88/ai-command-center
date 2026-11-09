@@ -41,6 +41,14 @@ SNAPSHOTS = {}
 ORIGINAL_PR_SNAPSHOT = review_merge._pr_diff_and_head
 
 
+def _snapshot_result(head, diff=DIFF, reason="ok"):
+    return review_merge._PRSnapshotResult(_snapshot(head, diff), reason)
+
+
+def _failed_snapshot_result(reason):
+    return review_merge._PRSnapshotResult(None, reason)
+
+
 def _snapshot(head, diff=DIFF):
     return review_merge._PRSnapshot.create(diff, BASE, head)
 
@@ -334,9 +342,50 @@ def test_review_skips_when_the_diff_fetch_fails(rig, _test_repo_routes, monkeypa
     )
     assert not calls
     assert any(
-        task_id == "VOYN-W0-R3" and reason.startswith("pr_diff_fetch_failed")
+        task_id == "VOYN-W0-R3" and reason.startswith("pr_diff_fetch_failed:")
         for task_id, reason in report.skipped
     )
+
+
+def test_review_skips_closed_prs_as_pr_not_open_without_diff_fetch(rig, _test_repo_routes, monkeypatch):  # noqa: F811,E501
+    app_factory, store, _ = rig
+    _ready(store, app_factory, "VOYN-W0-RCLOSED", "https://github.com/x/repo-d2/pull/113")
+    gh_calls = []
+
+    def fake_gh(argv, repo):
+        import subprocess
+
+        gh_calls.append(argv)
+        if argv[0] == "api" and argv[1] == "repos/x/repo-d2/pulls/113":
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                json.dumps({
+                    "state": "closed",
+                    "merged_at": None,
+                    "labels": [{"name": "review-window:active"}],
+                    "base": {"sha": BASE, "repo": {"full_name": "x/repo-d2"}},
+                    "head": {"sha": "a" * 40},
+                    "changed_files": 1,
+                    "additions": 1,
+                    "deletions": 0,
+                }),
+                "",
+            )
+        return subprocess.CompletedProcess(argv, 1, "", "unexpected expensive lookup")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    enqueued = []
+
+    report = review_once(
+        app_factory,
+        lambda q, k, p, tid, attempts: enqueued.append((q, k, p, tid, attempts)),
+        "/tmp",
+    )
+
+    assert ("VOYN-W0-RCLOSED", "pr_not_open") in report.skipped
+    assert enqueued == []
+    assert gh_calls == [["api", "repos/x/repo-d2/pulls/113"]]
 
 
 def test_review_skips_prs_outside_the_active_review_window(rig, _test_repo_routes, monkeypatch):  # noqa: F811,E501
@@ -1002,6 +1051,104 @@ def test_publish_verdict_posts_the_marker_under_the_acceptance_bot_identity(rig,
     report = publish_review_verdicts(app_factory, "/tmp")
     assert ("VOYN-W0-P1", "https://github.com/x/y/pull/11") in report.reviewed
     assert posted == [("https://github.com/x/y/pull/11", "ACCEPT", head)]
+
+
+def test_publish_review_verdicts_skips_closed_prs_as_pr_not_open(rig, monkeypatch):  # noqa: F811,E501
+    app_factory, store, _ = rig
+    pr_url = "https://github.com/x/y/pull/120"
+    _ready(store, app_factory, "VOYN-W0-PCLOSED", pr_url)
+
+    def fake_gh(argv, repo):
+        import subprocess
+        if argv[0] == "api" and argv[1] == "repos/x/y/pulls/120":
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                json.dumps({
+                    "state": "closed",
+                    "merged_at": None,
+                    "labels": [{"name": "review-window:active"}],
+                    "base": {"sha": BASE, "repo": {"full_name": "x/y"}},
+                    "head": {"sha": "e" * 40},
+                    "changed_files": 1,
+                    "additions": 1,
+                    "deletions": 0,
+                }),
+                "",
+            )
+        return subprocess.CompletedProcess(argv, 1, "", "unexpected expensive lookup")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = publish_review_verdicts(app_factory, "/tmp")
+    assert not report.reviewed
+    assert ("VOYN-W0-PCLOSED", "pr_not_open") in report.skipped
+
+
+def test_pr_diff_and_head_reports_pr_not_open(monkeypatch):
+    monkeypatch.setattr(review_merge, "_pr_diff_and_head", ORIGINAL_PR_SNAPSHOT)
+    import subprocess
+
+    def fake_gh(argv, repo):
+        if argv == ["api", "repos/x/y/pulls/120"]:
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                json.dumps({
+                    "state": "closed",
+                    "merged_at": None,
+                    "base": {"sha": BASE, "repo": {"full_name": "x/y"}},
+                    "head": {"sha": "e" * 40},
+                    "changed_files": 1,
+                    "additions": 1,
+                    "deletions": 0,
+                }),
+                "",
+            )
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+
+    result = review_merge._pr_diff_and_head("/tmp", "https://github.com/x/y/pull/120")
+
+    assert not result.ok
+    assert result.reason == "pr_not_open"
+
+
+def test_pr_diff_and_head_reports_stats_mismatch(monkeypatch):
+    monkeypatch.setattr(review_merge, "_pr_diff_and_head", ORIGINAL_PR_SNAPSHOT)
+    import subprocess
+
+    def fake_gh(argv, repo):
+        if argv == ["api", "repos/x/y/pulls/121"]:
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                json.dumps({
+                    "state": "open",
+                    "merged_at": None,
+                    "base": {"sha": BASE, "repo": {"full_name": "x/y"}},
+                    "head": {"sha": "e" * 40},
+                    "changed_files": 2,
+                    "additions": 1,
+                    "deletions": 0,
+                }),
+                "",
+            )
+        if argv == [
+            "api",
+            f"repos/x/y/compare/{BASE}...{'e' * 40}",
+            "-H",
+            "Accept: application/vnd.github.v3.diff",
+        ]:
+            return subprocess.CompletedProcess(argv, 0, DIFF, "")
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+
+    result = review_merge._pr_diff_and_head("/tmp", "https://github.com/x/y/pull/121")
+
+    assert not result.ok
+    assert result.reason == "stats_mismatch"
 
 
 def test_publish_verdict_skips_without_the_acceptance_bot_configured(rig, monkeypatch):  # noqa: F811, E501
@@ -3026,6 +3173,177 @@ def test_reconcile_skips_an_unresolvable_lookup_instead_of_flagging(rig, monkeyp
     report = reconcile_merge_evidence(app_factory, "/tmp")
     assert ("VOYN-W0-RC4", "default_branch_lookup_failed") in report.skipped
     assert report.suspect == []
+
+
+def test_a_closed_unmerged_pr_leaves_ready_to_review_via_rejected_without_remediation(rig, monkeypatch):  # noqa: F811, E501
+    """A PR that is closed without merge is terminal for the parent task: it must
+    leave READY_TO_REVIEW via REJECTED and must not spawn remediation work."""
+    import subprocess as sp
+
+    app_factory, store, _ = rig
+    pr_url = "https://github.com/x/y/pull/32"
+    _ready(store, app_factory, "VOYN-W0-MC", pr_url)
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["pr", "view"]:
+            body = json.dumps({"state": "CLOSED", "mergedAt": None})
+            return sp.CompletedProcess(argv, 0, body, "")
+        return sp.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    assert ("VOYN-W0-MC", "rejected_pr_closed_unmerged") in report.skipped
+    assert not report.merged
+
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-MC",))
+        assert cur.fetchone()[0] == "REJECTED"
+        cur.execute("SELECT count(*) FROM backlog_task WHERE task_id=%s", ("VOYN-W0-MC-REM",))
+        assert cur.fetchone()[0] == 0
+
+
+def test_closed_plus_open_pr_leaves_ready_to_review_untouched(rig, monkeypatch):  # noqa: F811
+    import subprocess as sp
+
+    app_factory, store, _ = rig
+    closed_pr = "https://github.com/x/y/pull/320"
+    open_pr = "https://github.com/x/y/pull/321"
+    _ready(store, app_factory, "VOYN-W0-MCO", closed_pr)
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT backlog_record_evidence(%s,'pr',%s)", ("VOYN-W0-MCO", open_pr))
+        c.commit()
+
+    def fake_gh(argv, repo):
+        if argv[:3] == ["api", "repos/x/y/pulls/320"]:
+            return sp.CompletedProcess(argv, 0, json.dumps({"state": "closed", "merged_at": None, "labels": [{"name": "review-window:active"}] }), "")
+        if argv[:3] == ["api", "repos/x/y/pulls/321"]:
+            return sp.CompletedProcess(argv, 0, json.dumps({"state": "open", "merged_at": None, "labels": [{"name": "review-window:active"}] }), "")
+        if argv[:2] == ["pr", "view"] and argv[2] == closed_pr:
+            return sp.CompletedProcess(argv, 0, json.dumps({"state": "CLOSED", "mergedAt": None}), "")
+        return sp.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    assert ("VOYN-W0-MCO", "pr_closed_unmerged_sibling_pending") in report.skipped
+    assert len(report.skipped) == 1
+    assert not report.merged
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-MCO",))
+        assert cur.fetchone()[0] == "READY_TO_REVIEW"
+
+
+def test_merged_without_acceptance_leaves_ready_to_review_untouched(rig, monkeypatch):  # noqa: F811
+    import subprocess as sp
+
+    app_factory, store, _ = rig
+    head, merge_oid = "a1" * 20, "b2" * 20
+    pr_url = "https://github.com/x/y/pull/33"
+    _ready(store, app_factory, "VOYN-W0-MX", pr_url)
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["pr", "view"]:
+            body = json.dumps({
+                "state": "MERGED", "mergeCommit": {"oid": merge_oid},
+                "headRefOid": head, "reviews": [],
+                "statusCheckRollup": [{"name": "CI", "conclusion": "SUCCESS"}, {"name": "Final merge gate", "conclusion": "SUCCESS"}, {"name": "Acceptance gate (independent verdict on exact SHA)", "conclusion": "SUCCESS"}],
+            })
+            return sp.CompletedProcess(argv, 0, body, "")
+        return sp.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    assert ("VOYN-W0-MX", "merged_without_acceptance_evidence") in report.skipped
+    assert not report.merged
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-MX",))
+        assert cur.fetchone()[0] == "READY_TO_REVIEW"
+
+
+def test_closed_unmerged_repeat_tick_is_idempotent(rig, monkeypatch):  # noqa: F811
+    import subprocess as sp
+
+    app_factory, store, _ = rig
+    pr_url = "https://github.com/x/y/pull/322"
+    _ready(store, app_factory, "VOYN-W0-MCI", pr_url)
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["pr", "view"]:
+            return sp.CompletedProcess(argv, 0, json.dumps({"state": "CLOSED", "mergedAt": None}), "")
+        return sp.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    first = merge_once(app_factory, "/tmp")
+    second = merge_once(app_factory, "/tmp")
+    assert ("VOYN-W0-MCI", "rejected_pr_closed_unmerged") in first.skipped
+    assert second.skipped == []
+    assert second.merged == []
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-MCI",))
+        assert cur.fetchone()[0] == "REJECTED"
+        cur.execute("SELECT count(*) FROM backlog_task WHERE task_id=%s", ("VOYN-W0-MCI-REM",))
+        assert cur.fetchone()[0] == 0
+
+
+def test_two_closed_unmerged_prs_reject_without_remediation(rig, monkeypatch):  # noqa: F811
+    import subprocess as sp
+
+    app_factory, store, _ = rig
+    first_pr = "https://github.com/x/y/pull/323"
+    second_pr = "https://github.com/x/y/pull/324"
+    _ready(store, app_factory, "VOYN-W0-MC2", first_pr)
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT backlog_record_evidence(%s,'pr',%s)", ("VOYN-W0-MC2", second_pr))
+        c.commit()
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["pr", "view"] and argv[2] in (first_pr, second_pr):
+            return sp.CompletedProcess(argv, 0, json.dumps({"state": "CLOSED", "mergedAt": None}), "")
+        return sp.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    assert report.skipped == [("VOYN-W0-MC2", "rejected_pr_closed_unmerged")]
+    assert not report.merged
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-MC2",))
+        assert cur.fetchone()[0] == "REJECTED"
+        cur.execute("SELECT count(*) FROM backlog_task WHERE task_id=%s", ("VOYN-W0-MC2-REM",))
+        assert cur.fetchone()[0] == 0
+
+
+def test_closed_pr_then_accepted_merged_sibling_goes_done_same_tick(rig, monkeypatch):  # noqa: F811
+    """A task whose first-scanned PR is closed unmerged and whose sibling PR
+    merged with acceptance completes DONE in one tick: the closed row only
+    skips (sibling pending), so it must not mark the task handled and hide
+    the merged sibling row (live shape: VOYN-PLAT-COORD-05, aios#297 closed
+    + aios#405 merged)."""
+    import subprocess as sp
+
+    app_factory, store, _ = rig
+    closed_pr = "https://github.com/x/y/pull/70"
+    merged_pr = "https://github.com/x/y/pull/71"
+    _ready(store, app_factory, "VOYN-W0-MCM", closed_pr)
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT backlog_record_evidence(%s,'pr',%s)", ("VOYN-W0-MCM", merged_pr))
+        c.commit()
+    head, merge_oid = "a" * 40, "b" * 40
+
+    def fake_gh(argv, repo):
+        if argv[:2] == ["pr", "view"] and argv[2] == closed_pr:
+            return sp.CompletedProcess(argv, 0, json.dumps({"state": "CLOSED", "mergedAt": None}), "")
+        if argv[:2] == ["pr", "view"] and argv[2] == merged_pr:
+            merged = json.loads(_merged(head, merge_oid))
+            merged["mergedAt"] = "2026-11-01T00:00:00Z"
+            return sp.CompletedProcess(argv, 0, json.dumps(merged), "")
+        return sp.CompletedProcess(argv, 1, "", "?")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    report = merge_once(app_factory, "/tmp")
+    assert report.merged == [("VOYN-W0-MCM", merge_oid)]
+    assert report.skipped == [("VOYN-W0-MCM", "pr_closed_unmerged_sibling_pending")]
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", ("VOYN-W0-MCM",))
+        assert cur.fetchone()[0] == "DONE"
 
 
 def test_an_externally_merged_pr_without_acceptance_never_goes_done(rig, monkeypatch):  # noqa: F811, E501

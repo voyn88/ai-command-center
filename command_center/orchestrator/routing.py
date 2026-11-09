@@ -27,7 +27,52 @@ from __future__ import annotations
 import os
 from typing import Any
 
-__all__ = ["ROUTING_MATRIX", "cascade_for"]
+__all__ = [
+    "BILLING_MODE_API_METERED",
+    "BILLING_MODE_SUBSCRIPTION",
+    "BILLING_MODE_UNKNOWN",
+    "ROUTING_MATRIX",
+    "billing_mode_for_executor",
+    "metered_executors",
+    "cascade_for",
+]
+
+BILLING_MODE_SUBSCRIPTION = "subscription/quota"
+BILLING_MODE_API_METERED = "api_metered"
+BILLING_MODE_UNKNOWN = "unknown"
+
+#: Owner source of truth (2026-11-07) for executor billing mode, captured from
+#: worker-01 in `.ai-team/tasks/VOYN-FINOPS-B1/owner-billing-classification.md`.
+#: Any executor not listed here is unknown and therefore fail-closed in FinOps
+#: policy checks.
+_EXECUTOR_BILLING_MODES: dict[str, str] = {
+    "grok": BILLING_MODE_API_METERED,
+    "cursor": BILLING_MODE_API_METERED,
+    "openai_http": BILLING_MODE_API_METERED,
+    "codex": BILLING_MODE_SUBSCRIPTION,
+    "claude": BILLING_MODE_SUBSCRIPTION,
+}
+
+
+def billing_mode_for_executor(executor: str) -> str:
+    """Billing mode for an executor id; unknown names stay explicit.
+
+    Unknown links are never silently treated as free: budget policy decides how
+    to fail closed when this function returns `BILLING_MODE_UNKNOWN`.
+    """
+    return _EXECUTOR_BILLING_MODES.get(executor, BILLING_MODE_UNKNOWN)
+
+
+def metered_executors() -> tuple[str, ...]:
+    """Owner billing-table executors that are metered per API spend."""
+    return tuple(
+        sorted(
+            executor
+            for executor, mode in _EXECUTOR_BILLING_MODES.items()
+            if mode == BILLING_MODE_API_METERED
+        )
+    )
+
 
 #: task class -> ordered cascade. Each link: executor + the agent_run fields
 #: it pins. 'claude' is the headless CLI the worker's agent_runner already

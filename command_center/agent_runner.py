@@ -1777,7 +1777,12 @@ def _safe_path_component(value: str, fallback: str) -> str:
 
 
 def report_path_for(run: dict) -> Path:
-    project = _safe_path_component(run.get("project") or "UNKNOWN", "UNKNOWN")
+    # Keep both runtime generations on the same canonical project identity.
+    # Persisted historical report paths remain readable by
+    # runtime.reports.resolve_report_path; only newly written paths converge.
+    from command_center.runtime.reports import project_path_component
+
+    project = project_path_component(run.get("project"))
     started = run.get("started_at") or run.get("created_at") or models.iso_now()
     try:
         started_dt = datetime.fromisoformat(started)

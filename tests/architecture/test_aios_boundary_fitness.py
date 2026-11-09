@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import ast
 
+import pytest
+
 from tests.architecture import aios_boundary as boundary
 
 
@@ -601,3 +603,39 @@ def test_coordination_srv_client_has_only_package_name_signature():
     assert boundary.classify_engine_categories(
         "command_center/orchestrator/coordination.py", tree
     ) == {"orchestration"}
+
+
+_MIRROR_IMPORTS = (
+    "from command_center.db.table_mirror import MirroredTable, PostgresTableMirror\n"
+)
+
+
+@pytest.mark.parametrize("injection,table,base,body", [
+    ("from foreign import start_engine as MirroredTable\n", "MirroredTable()", "PostgresTableMirror", "    spec = TABLE\n"),
+    ("from foreign import EngineMeta as PostgresTableMirror\n", "MirroredTable()", "PostgresTableMirror", "    spec = TABLE\n"),
+    ("import foreign as h\n", "h.MirroredTable()", "PostgresTableMirror", "    spec = TABLE\n"),
+    ("import foreign as h\n", "MirroredTable()", "h.PostgresTableMirror", "    spec = TABLE\n"),
+    ("from foreign import start_engine\nMirroredTable = start_engine\n", "MirroredTable()", "PostgresTableMirror", "    spec = TABLE\n"),
+    ("from foreign import start_engine\nMirroredTable: object = start_engine\n", "MirroredTable()", "PostgresTableMirror", "    spec = TABLE\n"),
+    ("import command_center.db.table_mirror as mirrors\nimport foreign\nmirrors = foreign\n", "mirrors.MirroredTable()", "PostgresTableMirror", "    spec = TABLE\n"),
+    ("class MirroredTable(PostgresTableMirror):\n    spec = None\n", "MirroredTable()", "PostgresTableMirror", "    spec = TABLE\n"),
+    ("from foreign import start_engine as frozenset\n", "MirroredTable(columns=frozenset())", "PostgresTableMirror", "    spec = TABLE\n"),
+    ("from foreign import start_engine\nfrozenset = start_engine\n", "MirroredTable(columns=frozenset())", "PostgresTableMirror", "    spec = TABLE\n"),
+    ("from foreign import *\n", "MirroredTable()", "PostgresTableMirror", "    spec = TABLE\n"),
+    ("from .command_center.db.table_mirror import MirroredTable\n", "MirroredTable()", "PostgresTableMirror", "    spec = TABLE\n"),
+    ("from foreign import start_engine\n", "MirroredTable()", "PostgresTableMirror", "    MirroredTable = start_engine\n    spec = MirroredTable()\n"),
+    ("", "MirroredTable()", "PostgresTableMirror, metaclass=EngineMeta", "    spec = TABLE\n"),
+])
+def test_mirror_exemption_rejects_foreign_origins_and_shadowing(injection, table, base, body):
+    tree = ast.parse(_MIRROR_IMPORTS + injection + f"TABLE = {table}\nclass AuditMirror({base}):\n" + body)
+    assert "audit" in boundary.classify_engine_categories("command_center/db/audit_store.py", tree)
+
+
+@pytest.mark.parametrize("imports,table,base", [
+    ("from command_center.db.table_mirror import MirroredTable as Table, PostgresTableMirror as Base\n", "Table(columns=frozenset({'id'}))", "Base"),
+    ("import command_center.db.table_mirror as mirrors\n", "mirrors.MirroredTable()", "mirrors.PostgresTableMirror"),
+    ("import command_center.db.table_mirror\n", "command_center.db.table_mirror.MirroredTable()", "command_center.db.table_mirror.PostgresTableMirror"),
+])
+def test_mirror_exemption_accepts_verified_import_aliases(imports, table, base):
+    tree = ast.parse(imports + f"TABLE = {table}\nclass AuditMirror({base}):\n    spec = TABLE\n")
+    assert boundary.classify_engine_categories("command_center/db/audit_store.py", tree) == set()

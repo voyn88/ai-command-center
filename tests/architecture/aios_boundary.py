@@ -713,13 +713,16 @@ def _corroborates_queue_name(tree: ast.AST) -> bool:
 #: it names exactly the callables `command_center/db/audit_store.py` and
 #: `command_center/db/provenance_store.py` actually use, not "anything that
 #: looks like a constructor".
-_DECLARATIVE_FACTORY_NAMES = frozenset(
-    {"MirroredTable", "ColumnCodec", "divergence_against", "frozenset"}
-)
+_DECLARATIVE_FACTORY_ORIGINS = frozenset({
+    "command_center.db.table_mirror.MirroredTable",
+    "command_center.db.mirror_support.ColumnCodec",
+    "command_center.db.table_mirror.divergence_against",
+    "builtins.frozenset",
+})
 
 #: The one base a class must have to be considered a table declaration rather
 #: than engine code wearing a mirror's name.
-_MIRROR_BASE_NAME = "PostgresTableMirror"
+_MIRROR_BASE_ORIGIN = "command_center.db.table_mirror.PostgresTableMirror"
 
 
 def _is_docstring_statement(stmt: ast.stmt) -> bool:
@@ -730,16 +733,33 @@ def _is_docstring_statement(stmt: ast.stmt) -> bool:
     )
 
 
-def _call_target_name(node: ast.Call) -> str | None:
-    func = node.func
-    if isinstance(func, ast.Name):
-        return func.id
-    if isinstance(func, ast.Attribute):
-        return func.attr
+def _import_origin(node: ast.AST, bindings: dict[str, str]) -> str | None:
+    """Resolve only statically imported names, never a lookalike attribute."""
+    if isinstance(node, ast.Name):
+        return bindings.get(node.id)
+    if isinstance(node, ast.Attribute):
+        parent = _import_origin(node.value, bindings)
+        return f"{parent}.{node.attr}" if parent else None
     return None
 
 
-def _is_declarative_value(node: ast.AST) -> bool:
+def _bind_import(stmt: ast.Import | ast.ImportFrom, bindings: dict[str, str]) -> bool:
+    if isinstance(stmt, ast.ImportFrom):
+        if any(alias.name == "*" for alias in stmt.names):
+            return False  # May shadow any previously verified name.
+        for alias in stmt.names:
+            name = alias.asname or alias.name
+            bindings.pop(name, None)
+            if stmt.level == 0 and stmt.module:
+                bindings[name] = f"{stmt.module}.{alias.name}"
+    else:
+        for alias in stmt.names:
+            name = alias.asname or alias.name.split(".")[0]
+            bindings[name] = alias.name if alias.asname else name
+    return True
+
+
+def _is_declarative_value(node: ast.AST, bindings: dict[str, str]) -> bool:
     """Whether `node` is data — a literal, a name reference, or a call to one
     of the known declarative factories built only from more of the same.
 
@@ -751,36 +771,36 @@ def _is_declarative_value(node: ast.AST) -> bool:
     if isinstance(node, ast.Constant):
         return True
     if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
-        return all(_is_declarative_value(elt) for elt in node.elts)
+        return all(_is_declarative_value(elt, bindings) for elt in node.elts)
     if isinstance(node, ast.Dict):
         return all(
-            (key is None or _is_declarative_value(key)) and _is_declarative_value(value)
+            (key is None or _is_declarative_value(key, bindings)) and _is_declarative_value(value, bindings)
             for key, value in zip(node.keys, node.values)
         )
     if isinstance(node, ast.Name):
         return True
     if isinstance(node, ast.Attribute):
-        return _is_declarative_value(node.value)
+        return _is_declarative_value(node.value, bindings)
     if isinstance(node, ast.Call):
-        if _call_target_name(node) not in _DECLARATIVE_FACTORY_NAMES:
+        if _import_origin(node.func, bindings) not in _DECLARATIVE_FACTORY_ORIGINS:
             return False
         if any(isinstance(arg, ast.Starred) for arg in node.args):
             return False
         if any(kw.arg is None for kw in node.keywords):
             return False
-        return all(_is_declarative_value(arg) for arg in node.args) and all(
-            _is_declarative_value(kw.value) for kw in node.keywords
+        return all(_is_declarative_value(arg, bindings) for arg in node.args) and all(
+            _is_declarative_value(kw.value, bindings) for kw in node.keywords
         )
     return False
 
 
-def _is_declarative_assign(stmt: ast.Assign) -> bool:
+def _is_declarative_assign(stmt: ast.Assign, bindings: dict[str, str]) -> bool:
     if len(stmt.targets) != 1 or not isinstance(stmt.targets[0], ast.Name):
         return False
-    return _is_declarative_value(stmt.value)
+    return _is_declarative_value(stmt.value, bindings)
 
 
-def _is_declarative_ann_assign(stmt: ast.AnnAssign) -> bool:
+def _is_declarative_ann_assign(stmt: ast.AnnAssign, bindings: dict[str, str]) -> bool:
     if not isinstance(stmt.target, ast.Name):
         return False
     # An annotation is inert under `from __future__ import annotations`
@@ -789,22 +809,18 @@ def _is_declarative_ann_assign(stmt: ast.AnnAssign) -> bool:
     # have opted in.
     if any(isinstance(node, ast.Call) for node in ast.walk(stmt.annotation)):
         return False
-    return stmt.value is None or _is_declarative_value(stmt.value)
+    return stmt.value is None or _is_declarative_value(stmt.value, bindings)
 
 
-def _is_mirror_base(node: ast.expr) -> bool:
-    if isinstance(node, ast.Name):
-        return node.id == _MIRROR_BASE_NAME
-    if isinstance(node, ast.Attribute):
-        return node.attr == _MIRROR_BASE_NAME
-    return False
+def _is_mirror_base(node: ast.expr, bindings: dict[str, str]) -> bool:
+    return _import_origin(node, bindings) == _MIRROR_BASE_ORIGIN
 
 
-def _is_mirror_class_def(node: ast.ClassDef) -> bool:
+def _is_mirror_class_def(node: ast.ClassDef, bindings: dict[str, str]) -> bool:
     """Whether `node` declares a table and nothing else.
 
     Checked structurally, not by name: real bases only (`PostgresTableMirror`,
-    never an alias or a lookalike token), no decorator, no keyword (a
+    including verified aliases, never a lookalike token), no decorator, no keyword (a
     metaclass could run arbitrary code at class-creation time), and a body
     that is a docstring plus plain `name = value` declarations — never a
     method, a nested class, or a statement that merely happens not to be a
@@ -813,14 +829,18 @@ def _is_mirror_class_def(node: ast.ClassDef) -> bool:
     """
     if node.decorator_list or node.keywords:
         return False
-    if not node.bases or not all(_is_mirror_base(base) for base in node.bases):
+    if not node.bases or not all(_is_mirror_base(base, bindings) for base in node.bases):
         return False
+    bindings = bindings.copy()  # Class assignments shadow globals only in this body.
     for stmt in node.body:
         if _is_docstring_statement(stmt):
             continue
-        if isinstance(stmt, ast.Assign) and _is_declarative_assign(stmt):
+        if isinstance(stmt, ast.Assign) and _is_declarative_assign(stmt, bindings):
+            bindings.pop(stmt.targets[0].id, None)
             continue
-        if isinstance(stmt, ast.AnnAssign) and _is_declarative_ann_assign(stmt):
+        if isinstance(stmt, ast.AnnAssign) and _is_declarative_ann_assign(stmt, bindings):
+            if stmt.value is not None:
+                bindings.pop(stmt.target.id, None)
             continue
         return False
     return True
@@ -843,22 +863,29 @@ def _is_declarative_mirror_module(tree: ast.AST) -> bool:
     if not isinstance(tree, ast.Module):
         return False
     found_mirror_class = False
+    bindings = {"frozenset": "builtins.frozenset"}
     for stmt in tree.body:
         if _is_docstring_statement(stmt):
             continue
         if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+            if not _bind_import(stmt, bindings):
+                return False
             continue
         if isinstance(stmt, ast.Assign):
-            if not _is_declarative_assign(stmt):
+            if not _is_declarative_assign(stmt, bindings):
                 return False
+            bindings.pop(stmt.targets[0].id, None)
             continue
         if isinstance(stmt, ast.AnnAssign):
-            if not _is_declarative_ann_assign(stmt):
+            if not _is_declarative_ann_assign(stmt, bindings):
                 return False
+            if stmt.value is not None:
+                bindings.pop(stmt.target.id, None)
             continue
         if isinstance(stmt, ast.ClassDef):
-            if not _is_mirror_class_def(stmt):
+            if not _is_mirror_class_def(stmt, bindings):
                 return False
+            bindings.pop(stmt.name, None)
             found_mirror_class = True
             continue
         return False

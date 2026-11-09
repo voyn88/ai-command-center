@@ -841,6 +841,16 @@ class _PRSnapshot:
         return cls(text, base, head, hashlib.sha256(text.encode()).hexdigest())
 
 
+@dataclass(frozen=True, slots=True)
+class _PRSnapshotResult:
+    snapshot: _PRSnapshot | None
+    reason: str
+
+    @property
+    def ok(self) -> bool:
+        return self.snapshot is not None
+
+
 def _review_key(task_id: str, pr_url: str, snapshot: _PRSnapshot) -> str | None:
     """The review-cycle identity: (task, PR, exact head sha, policy
     version) -- not just task_id. A permanent `review:<task_id>` key meant
@@ -1352,7 +1362,7 @@ def _failover_cascade(
 
 def _pr_diff_and_head(
     repo_path: str, pr_url: str, pull: dict[str, Any] | None = None
-) -> _PRSnapshot | None:
+) -> _PRSnapshotResult:
     """The PR's diff and current head sha, fetched by the trusted
     orchestrator -- not the review agent itself. Embedding the diff in the
     prompt (rather than granting the agent its own `gh`/Bash access to fetch
@@ -1363,69 +1373,88 @@ def _pr_diff_and_head(
     `--repo` argument and read PRs from other, unrelated repositories with no
     shell-escape needed at all -- a risk that scoping the Bash pattern more
     tightly cannot close, but never granting Bash to begin with does.
-    Returns None on any malformed or cross-repository response."""
+    Returns the exact failure reason when no trustworthy snapshot exists."""
     parsed = _owner_repo_number_from_pr_url(pr_url)
     if parsed is None:
-        return None
+        return _PRSnapshotResult(None, "malformed_pr_url")
     owner, repo, number = parsed
     try:
         if pull is None:
             view = _gh(["api", f"repos/{owner}/{repo}/pulls/{number}"], repo_path)
-            data = json.loads(view.stdout or "{}") if view.returncode == 0 else {}
+            if view.returncode != 0:
+                return _PRSnapshotResult(None, "pull_fetch_failed")
+            data = json.loads(view.stdout or "{}")
         else:
             data = pull
         if data.get("state") != "open" or data.get("merged_at"):
-            return None
+            return _PRSnapshotResult(None, "pr_not_open")
         base, head = data["base"], data["head"]
         base_sha, head_sha = base["sha"], head["sha"]
         same_repo = base["repo"]["full_name"].casefold() == f"{owner}/{repo}".casefold()
         stats = tuple(data[name] for name in ("changed_files", "additions", "deletions"))
-    except (KeyError, TypeError, AttributeError, json.JSONDecodeError):
-        return None
-    if (not same_repo or not re.fullmatch(r"[0-9a-f]{40}", base_sha)
-            or not re.fullmatch(r"[0-9a-f]{40}", head_sha)
-            or not all(type(value) is int and value >= 0 for value in stats)):
-        return None
+    except json.JSONDecodeError:
+        return _PRSnapshotResult(None, "pull_malformed")
+    except (KeyError, TypeError, AttributeError):
+        return _PRSnapshotResult(None, "pull_malformed")
+    if not same_repo:
+        return _PRSnapshotResult(None, "cross_repo")
+    if not re.fullmatch(r"[0-9a-f]{40}", base_sha) or not re.fullmatch(r"[0-9a-f]{40}", head_sha):
+        return _PRSnapshotResult(None, "pull_malformed")
+    if not all(type(value) is int and value >= 0 for value in stats):
+        return _PRSnapshotResult(None, "pull_malformed")
     diff = _gh(["api", f"repos/{owner}/{repo}/compare/{base_sha}...{head_sha}",
                 "-H", "Accept: application/vnd.github.v3.diff"], repo_path)
+    if diff.returncode != 0:
+        return _PRSnapshotResult(None, "compare_failed")
     text = diff.stdout
-    if diff.returncode != 0 or len(text.encode("utf-8")) > _MAX_REVIEW_DIFF_BYTES:
-        return None
+    if len(text.encode("utf-8")) > _MAX_REVIEW_DIFF_BYTES:
+        return _PRSnapshotResult(None, "diff_too_large")
     lines = text.splitlines()
     if any(
         line == "GIT binary patch"
         or (line.startswith("Binary files ") and line.endswith(" differ"))
         for line in lines
     ):
-        return None
+        return _PRSnapshotResult(None, "binary_patch")
     observed = (
         sum(line.startswith("diff --git ") for line in lines),
         sum(line.startswith("+") and not line.startswith("+++ ") for line in lines),
         sum(line.startswith("-") and not line.startswith("--- ") for line in lines),
     )
     if observed != stats:
-        return None
-    # A compare is immutable, but the PR can close or move while it is fetched.
-    # Revalidate before scheduling model work against that exact snapshot.
+        return _PRSnapshotResult(None, "stats_mismatch")
     refreshed = _gh(["api", f"repos/{owner}/{repo}/pulls/{number}"], repo_path)
+    if refreshed.returncode != 0:
+        return _PRSnapshotResult(None, "refresh_failed")
     try:
         current = json.loads(refreshed.stdout or "{}")
-        if (refreshed.returncode != 0 or current.get("state") != "open"
+    except json.JSONDecodeError:
+        return _PRSnapshotResult(None, "refresh_malformed")
+    try:
+        if (current.get("state") != "open"
                 or current.get("merged_at")
                 or current["head"]["sha"] != head_sha
                 or current["base"]["sha"] != base_sha):
-            return None
-    except (KeyError, TypeError, AttributeError, json.JSONDecodeError):
-        return None
-    return _PRSnapshot.create(text, base_sha, head_sha)
+            return _PRSnapshotResult(None, "pr_moved_during_snapshot")
+    except (KeyError, TypeError, AttributeError):
+        return _PRSnapshotResult(None, "refresh_malformed")
+    return _PRSnapshotResult(_PRSnapshot.create(text, base_sha, head_sha), "ok")
+
+
+def _coerce_pr_snapshot_result(value: _PRSnapshotResult | _PRSnapshot | None) -> _PRSnapshotResult:
+    if isinstance(value, _PRSnapshotResult):
+        return value
+    if isinstance(value, _PRSnapshot):
+        return _PRSnapshotResult(value, "ok")
+    return _PRSnapshotResult(None, "unknown")
 
 
 def _pr_diff_and_head_with_pull(
     repo_path: str, pr_url: str, pull: dict[str, Any] | None
-) -> _PRSnapshot | None:
+) -> _PRSnapshotResult:
     """Fetch a PR snapshot, reusing a window-gate pull body when available."""
     if pull is None:
-        return _pr_diff_and_head(repo_path, pr_url)
+        return _coerce_pr_snapshot_result(_pr_diff_and_head(repo_path, pr_url))
     try:
         signature = inspect.signature(_pr_diff_and_head)
     except (TypeError, ValueError):
@@ -1439,8 +1468,8 @@ def _pr_diff_and_head_with_pull(
             if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
         ]
         if not accepts_varargs and len(positional) < 3:
-            return _pr_diff_and_head(repo_path, pr_url)
-    return _pr_diff_and_head(repo_path, pr_url, pull)
+            return _coerce_pr_snapshot_result(_pr_diff_and_head(repo_path, pr_url))
+    return _coerce_pr_snapshot_result(_pr_diff_and_head(repo_path, pr_url, pull))
 
 
 _SCAN_KEY_SEP = "\x1f"
@@ -1642,14 +1671,18 @@ def _review_once(
         window = _review_window_read_decision(
             repo_path, pr_url, recovery_budget
         )
+        if window.reason == "pr_not_open":
+            report.skipped.append((task_id, "pr_not_open"))
+            continue
         if not window.allowed:
             report.skipped.append((task_id, window.reason))
             continue
         fetched = _pr_diff_and_head_with_pull(repo_path, pr_url, window.pull)
-        if fetched is None:
-            report.skipped.append((task_id, f"pr_diff_fetch_failed: {pr_url!r}"))
+        if not fetched.ok:
+            report.skipped.append((task_id, f"pr_diff_fetch_failed:{fetched.reason}: {pr_url!r}"))
             continue
-        snapshot = fetched
+        snapshot = fetched.snapshot
+        assert snapshot is not None
         key = _review_key(task_id, pr_url, snapshot)
         if key is None:
             report.skipped.append((task_id, f"no_repo_route: {pr_url!r}"))
@@ -1790,13 +1823,18 @@ def reconcile_review_once(
         window = _review_window_read_decision(
             repo_path, pr_url, recovery_budget
         )
+        if window.reason == "pr_not_open":
+            report.skipped.append((current_task_id, "pr_not_open"))
+            continue
         if not window.allowed:
             report.skipped.append((current_task_id, window.reason))
             continue
-        snapshot = _pr_diff_and_head_with_pull(repo_path, pr_url, window.pull)
-        if snapshot is None:
-            report.skipped.append((current_task_id, "pr_diff_fetch_failed"))
+        fetched = _pr_diff_and_head_with_pull(repo_path, pr_url, window.pull)
+        if not fetched.ok:
+            report.skipped.append((current_task_id, f"pr_diff_fetch_failed:{fetched.reason}"))
             continue
+        snapshot = fetched.snapshot
+        assert snapshot is not None
         marker, marker_head = _has_accept_marker_with_pull(
             repo_path,
             pr_url,
@@ -2826,6 +2864,9 @@ def publish_review_verdicts(
         window = _review_window_read_decision(
             repo_path, pr_url, recovery_budget
         )
+        if window.reason == "pr_not_open":
+            report.skipped.append((task_id, "pr_not_open"))
+            continue
         if not window.allowed:
             report.skipped.append((task_id, window.reason))
             continue
@@ -2841,9 +2882,14 @@ def publish_review_verdicts(
         if not current_head:
             report.skipped.append((task_id, "pr_view_failed"))
             continue
-        snapshot = _pr_diff_and_head_with_pull(repo_path, pr_url, window.pull)
-        if snapshot is None or snapshot.head != current_head:
-            report.skipped.append((task_id, "pr_diff_snapshot_failed"))
+        fetched = _pr_diff_and_head_with_pull(repo_path, pr_url, window.pull)
+        if not fetched.ok:
+            report.skipped.append((task_id, f"pr_diff_snapshot_failed:{fetched.reason}"))
+            continue
+        snapshot = fetched.snapshot
+        assert snapshot is not None
+        if snapshot.head != current_head:
+            report.skipped.append((task_id, "pr_diff_snapshot_failed:pr_moved_during_snapshot"))
             continue
         key = _review_key(task_id, pr_url, snapshot)
         if key is None:
@@ -3606,7 +3652,12 @@ def _merged_target_sha(repo_path: str, pr_url: str) -> tuple[str | None, str]:
         data = json.loads(view.stdout or "{}")
     except json.JSONDecodeError:
         return None, "pr_view_failed"
-    if not isinstance(data, dict) or data.get("state") != "MERGED":
+    if not isinstance(data, dict):
+        return None, "pr_view_failed"
+    state = str(data.get("state") or "")
+    if state == "CLOSED":
+        return None, "pr_closed_unmerged"
+    if state != "MERGED":
         return None, "not_merged"
     oid = str((data.get("mergeCommit") or {}).get("oid") or "")
     if not re.fullmatch(r"[0-9a-f]{40}", oid):
@@ -4089,9 +4140,11 @@ def _enqueue_review_refresh(
     route = repo_route(repo) if repo else None
     if route is None:
         return f"no_repo_route: {pr_url!r}"
-    snapshot = _pr_diff_and_head_with_pull(repo_path, pr_url, pull)
-    if snapshot is None:
-        return "pr_diff_fetch_failed"
+    fetched = _pr_diff_and_head_with_pull(repo_path, pr_url, pull)
+    if not fetched.ok:
+        return f"pr_diff_fetch_failed:{fetched.reason}"
+    snapshot = fetched.snapshot
+    assert snapshot is not None
     key = _review_key(task_id, pr_url, snapshot)
     if key is None:
         return "review_key_invalid"
@@ -4449,10 +4502,20 @@ def _merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -
 
     open_pr_snapshot, _snapshot_failure = _merge_window_open_pr_snapshot(repo_path)
     origin = _origin_owner_repo(repo_path) if open_pr_snapshot is not None else None
+    # Tasks this tick already moved out of READY_TO_REVIEW (REJECTED or DONE).
+    # The scan yields one row per (task, pr), so a multi-PR task's later rows
+    # must not re-run a transition that already happened. Only a COMMITTED
+    # transition marks a task: a row that merely skips (closed PR with a
+    # pending sibling, not ready, window inactive, ...) must leave the task's
+    # remaining PR rows to be examined -- otherwise a task whose first PR is
+    # closed and whose second PR merged with acceptance never reaches DONE.
+    finished_tasks: set[str] = set()
     for task_id, pr_url in tasks:
         if actions >= cfg.max_per_tick:
             break
         last_processed = (task_id, pr_url)
+        if task_id in finished_tasks:
+            continue
         if _repo_from_pr_url(pr_url) is None:
             # Same shape gate as review_once/publish_review_verdicts -- a
             # malformed pr_url fails every `gh pr view` below identically
@@ -4515,6 +4578,53 @@ def _merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -
             merge_sha, merge_reason = None, "not_merged"
         else:
             merge_sha, merge_reason = _merged_target_sha(repo_path, pr_url)
+        if merge_sha is None and merge_reason == "pr_closed_unmerged":
+            sibling_pr_rows = _rows(
+                factory,
+                "SELECT value FROM backlog_evidence WHERE task_id = %s AND kind = 'pr' AND value <> %s ORDER BY evidence_id",
+                (task_id, pr_url),
+            )
+            sibling_pending = False
+            for sibling_pr_url, in sibling_pr_rows:
+                _sibling_sha, sibling_reason = _merged_target_sha(repo_path, sibling_pr_url)
+                if sibling_reason != "pr_closed_unmerged":
+                    sibling_pending = True
+                    break
+            if sibling_pending:
+                report.skipped.append((task_id, "pr_closed_unmerged_sibling_pending"))
+                continue
+            with factory() as conn:
+                conn.autocommit = False
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT revision FROM backlog_task WHERE task_id = %s",
+                            (task_id,),
+                        )
+                        row = cur.fetchone()
+                        if row is None:
+                            conn.rollback()
+                            report.skipped.append((task_id, "task_vanished"))
+                            continue
+                        revision = row[0]
+                        cur.execute(
+                            "SELECT ok, reason FROM backlog_transition(%s, 'REJECTED', %s)",
+                            (task_id, revision),
+                        )
+                        ok, reason = cur.fetchone()
+                    if ok:
+                        conn.commit()
+                        finished_tasks.add(task_id)
+                        report.skipped.append((task_id, "rejected_pr_closed_unmerged"))
+                    else:
+                        conn.rollback()
+                        report.skipped.append((task_id, f"transition:{reason}"))
+                except Exception:
+                    conn.rollback()
+                    raise
+                finally:
+                    conn.autocommit = True
+            continue
         if merge_sha is None and merge_reason == "merged_without_acceptance_evidence":
             report.skipped.append((task_id, merge_reason))
             continue
@@ -4669,6 +4779,7 @@ def _merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -
                     ok, reason = cur.fetchone()
                 if ok:
                     conn.commit()
+                    finished_tasks.add(task_id)
                     report.merged.append((task_id, head))
                 else:
                     conn.rollback()
@@ -5012,6 +5123,8 @@ def _window_block_reason(
     already carries a fresh accept marker at its current head is never
     blocked for age alone, since `merge_once`'s own gate is what decides its
     fate from there."""
+    if pr.get("isDraft") is True:
+        return "draft"
     head = str(pr.get("headRefOid") or "")
     author_login = (pr.get("author") or {}).get("login")
     reviews = pr.get("reviews") or []
@@ -5221,6 +5334,26 @@ def _reconcile_pr_window(
         )
         window_full = selected >= cfg.max_active
         needs_merge_state = active_now or not window_full
+        # Draft is mutable without a head change, so the fresh listing is
+        # authoritative even if detail cache/budget is unavailable. Do not
+        # spend checks/reviews budget or keep a draft's active slot.
+        if pr.get("isDraft") is True:
+            if not _remove_pr_window_labels(
+                repo_path, pr, cfg, {cfg.label_active, _QUEUE_ACTIVE_LABEL}
+            ):
+                selected += int(active_now)
+                report.unreadable.append((number, head))
+                continue
+            report.blocked.append((number, "draft"))
+            # Removal succeeded: the setter must not delete those labels a
+            # second time from the stale listing (GitHub would return 404).
+            draft_pr = dict(pr)
+            draft_pr["labels"] = [
+                {"name": name}
+                for name in sorted(labels - {cfg.label_active, _QUEUE_ACTIVE_LABEL})
+            ]
+            _set_pr_window_labels(repo_path, draft_pr, cfg, cfg.label_blocked)
+            continue
         if queue_waiting_now:
             report.waiting.append((number, head))
             _remove_pr_window_labels(
@@ -5376,6 +5509,7 @@ def _light_pr_from_rest(item: Any) -> dict[str, Any] | None:
         "number": item["number"],
         "url": str(item.get("html_url") or ""),
         "headRefOid": str((item.get("head") or {}).get("sha") or ""),
+        "isDraft": item.get("draft") is True,
         "createdAt": str(item.get("created_at") or ""),
         "author": {"login": (item.get("user") or {}).get("login")},
         "labels": [
@@ -5610,6 +5744,10 @@ def _pr_window_details(
         if cached is not None:
             merged = dict(pr)
             merged.update(cached)
+            # Draft/readied transitions do not change the cache's head key.
+            # Preserve this tick's listing value over stale cached metadata.
+            if "isDraft" in pr:
+                merged["isDraft"] = pr["isDraft"]
             if all(key in merged for key in required):
                 if quota is not None:
                     quota.cache_hits += 1

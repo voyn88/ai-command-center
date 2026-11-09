@@ -65,6 +65,34 @@ def test_review_payload_carries_the_two_step_cascade(monkeypatch):
     assert max_attempts == len(payload["cascade"]) == 2
 
 
+def test_same_head_review_ticks_reuse_one_bounded_cycle(monkeypatch):
+    """Transient retries stay inside one queue item: an unchanged head must
+    not mint fresh work and thereby evade the item's retry bounds."""
+    task = ("VOYN-W0-SAME-HEAD", "https://github.com/o/ai-command-center/pull/7")
+    head = "a" * 40
+    monkeypatch.setattr(review_merge, "_rows", lambda *args: [task])
+    monkeypatch.setattr(
+        review_merge,
+        "_pr_diff_and_head",
+        lambda *args: review_merge._PRSnapshot.create("diff", "b" * 40, head),
+    )
+    monkeypatch.setattr(
+        "command_center.orchestrator.planner.repo_route",
+        lambda repo: ("AICC", "/srv/aicc"),
+    )
+    enqueues = []
+
+    for _ in range(3):
+        review_merge.review_once(
+            object(), lambda *args: enqueues.append(args), "/srv/aicc"
+        )
+
+    keys = [call[1] for call in enqueues]
+    assert len(set(keys)) == 1
+    assert f":7:{head}:{review_merge._REVIEW_POLICY_VERSION}:" in keys[0]
+    assert [call[4] for call in enqueues] == [2, 2, 2]
+
+
 def test_exact_task_target_is_parameterized_for_enqueue_and_marker(monkeypatch):
     captured = []
     cfg = review_merge.ReviewConfig(max_per_tick=3, scan_cap=40)
@@ -227,3 +255,55 @@ def test_review_tick_only_fills_available_global_wip(monkeypatch):
 
     assert report.reviewed == [tasks[0]]
     assert len(calls) == 1
+
+
+def test_review_once_skips_closed_pr_as_pr_not_open_without_diff_fetch(monkeypatch):
+    monkeypatch.setattr(
+        review_merge,
+        "_rows",
+        lambda *args: [("VOYN-W0-CLOSED", "https://github.com/o/ai-command-center/pull/7")],
+    )
+    monkeypatch.setattr(
+        review_merge,
+        "_review_window_read_decision",
+        lambda *_args, **_kwargs: review_merge._PrWindowReadDecision(
+            True, "pr_not_open", {"state": "closed"}
+        ),
+    )
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("diff fetch must not run for closed PRs")
+
+    monkeypatch.setattr(review_merge, "_pr_diff_and_head_with_pull", fail_if_called)
+    calls = []
+
+    report = review_merge.review_once(
+        object(), lambda *args: calls.append(args), "/srv/aicc"
+    )
+
+    assert calls == []
+    assert report.skipped == [("VOYN-W0-CLOSED", "pr_not_open")]
+
+
+def test_publish_review_verdicts_skips_closed_pr_as_pr_not_open_without_diff_fetch(monkeypatch):
+    monkeypatch.setattr(
+        review_merge,
+        "_rows",
+        lambda *args: [("VOYN-W0-CLOSED", "https://github.com/o/ai-command-center/pull/7")],
+    )
+    monkeypatch.setattr(
+        review_merge,
+        "_review_window_read_decision",
+        lambda *_args, **_kwargs: review_merge._PrWindowReadDecision(
+            True, "pr_not_open", {"state": "closed"}
+        ),
+    )
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("diff fetch must not run for closed PRs")
+
+    monkeypatch.setattr(review_merge, "_pr_diff_and_head_with_pull", fail_if_called)
+
+    report = review_merge.publish_review_verdicts(object(), "/srv/aicc")
+
+    assert report.skipped == [("VOYN-W0-CLOSED", "pr_not_open")]
