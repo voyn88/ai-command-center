@@ -248,6 +248,16 @@ class PrEvidenceReport:
     skipped: list[tuple[str, str]] = field(default_factory=list)
 
 
+@dataclass
+class RecoverStalledPrEvidenceReport:
+    """See `recover_stalled_pr_evidence`. Reopens a task; no other status change."""
+
+    #: task_id sent back to OPEN for a fresh dispatch attempt.
+    recovered: list[str] = field(default_factory=list)
+    #: (task_id, reason) examined and deliberately left alone.
+    skipped: list[tuple[str, str]] = field(default_factory=list)
+
+
 #: Branch naming contract. `publish_run` pushes `backlog/<task id>` and nothing
 #: else does, so the branch name is a derivable fact about a task rather than a
 #: convention this function invents.
@@ -374,6 +384,90 @@ def reconcile_pr_evidence(
             report.skipped.append((row_task_id, f"evidence_refused: {reason}"))
             continue
         report.recorded.append((row_task_id, pr_url))
+    return report
+
+
+def recover_stalled_pr_evidence(
+    factory: Any, repo_path: str, *, limit: int = 25
+) -> RecoverStalledPrEvidenceReport:
+    """Unstick a READY_TO_REVIEW task `reconcile_pr_evidence` can never clear.
+
+    Migration 0018 (VOYN-W0-AICC-NO-RECOVERY-PATH-STUCK-READY-TO-REVIEW) added
+    `backlog_recover_stuck_ready_to_review` -- READY_TO_REVIEW -> OPEN,
+    granted only while the task carries no `pr` evidence -- as the sanctioned
+    way out of exactly the state this module reports as
+    `no_open_pr_on_task_branch`: a publish that never produced a pull request
+    (the `voyn-lease` unavailability `reconcile_pr_evidence`'s own docstring
+    measured live 2026-08-31, or any future bug in the same corner). Nothing
+    ever called that function -- it sat granted and audited with zero
+    callers, so a task that lands there stayed there forever: the pr_evidence
+    tick reports the identical skip tick after tick with no path out, which
+    is exactly the shape the tick-stall watchdog
+    (VOYN-W0-AICC-TICK-STALL-WATCHDOG) escalates but, by that module's own
+    design, never fixes -- "the watchdog never touches the stalled item
+    itself."
+
+    This is the fix the watchdog's escalation points at. It acts only on
+    episodes the watchdog has ALREADY escalated -- rows in
+    `tick_stall_escalation` for `tick_kind = 'pr_evidence'` and
+    `reason = 'no_open_pr_on_task_branch'` -- so recovery only fires once the
+    same 5-consecutive-tick persistence signal the watchdog requires has
+    already been observed, never on a task whose publish might simply still
+    be in flight. Live GitHub state is checked once more before recovering: a
+    PR that opened between escalation and this tick means the stall already
+    resolved itself, and the task is left for `reconcile_pr_evidence` to pick
+    up normally rather than being yanked back to OPEN underneath a review
+    that is actually proceeding.
+    """
+    from command_center.orchestrator.planner import repo_route
+
+    report = RecoverStalledPrEvidenceReport()
+    rows = _rows(
+        factory,
+        "SELECT DISTINCT s.task_id, t.repo FROM tick_stall_escalation s "
+        "JOIN backlog_task t ON t.task_id = s.task_id "
+        "WHERE s.tick_kind = 'pr_evidence' "
+        "AND s.reason = 'no_open_pr_on_task_branch' "
+        "AND t.status = 'READY_TO_REVIEW' "
+        "AND NOT EXISTS (SELECT 1 FROM backlog_evidence e "
+        "WHERE e.task_id = t.task_id AND e.kind = 'pr') "
+        "ORDER BY s.task_id LIMIT %s",
+        (limit,),
+    )
+    for task_id, repo in rows:
+        if not repo or repo_route(repo) is None:
+            report.skipped.append((task_id, "no_repo_route"))
+            continue
+        branch = _task_branch(task_id)
+        decoded, failure = _open_pulls_for_branch(repo_path, branch)
+        if decoded is None:
+            report.skipped.append((task_id, failure))
+            continue
+        matches = [
+            entry
+            for entry in decoded
+            if isinstance(entry, dict)
+            and entry.get("headRefName") == branch
+            and isinstance(entry.get("url"), str)
+            and entry["url"]
+        ]
+        if matches:
+            report.skipped.append((task_id, "pr_now_open"))
+            continue
+        # Written through `backlog_recover_stuck_ready_to_review`, the same
+        # SECURITY DEFINER gate `reconcile_pr_evidence` uses above for its own
+        # write: the control plane's role has no direct write grant on
+        # `backlog_task`.
+        with factory() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM backlog_recover_stuck_ready_to_review(%s)", (task_id,)
+            )
+            verdict = cur.fetchone()
+        if not verdict or not verdict[0]:
+            reason = (verdict[1] if verdict and len(verdict) > 1 else "") or "unknown"
+            report.skipped.append((task_id, f"recovery_refused: {reason}"))
+            continue
+        report.recovered.append(task_id)
     return report
 
 

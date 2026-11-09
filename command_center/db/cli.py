@@ -654,6 +654,7 @@ def main(argv: list[str] | None = None) -> int:
                     publish_review_verdicts,
                     reconcile_pr_evidence,
                     reconcile_review_once,
+                    recover_stalled_pr_evidence,
                     review_once,
                 )
 
@@ -711,12 +712,24 @@ def main(argv: list[str] | None = None) -> int:
                         print(f"REMEDIATE {task_id} -> {new_task_id}")
                     for task_id, reason in marker_report.skipped:
                         print(f"SKIP      {task_id}: {reason}")
-                _watchdog.record_skips(conn, "pr_evidence", tick_id, evidence.skipped)
-                _watchdog.record_skips(conn, "review", tick_id, report.skipped)
-                _watchdog.record_skips(conn, "review_retry", tick_id, retry_report.skipped)
-                _watchdog.record_skips(conn, "review_marker", tick_id, marker_report.skipped)
-                stalls = _watchdog.watchdog_once(lambda: _nc(conn))
-                print(f"WATCHDOG  escalated={len(stalls.escalated)} refused={len(stalls.refused)}")
+                    _watchdog.record_skips(conn, "pr_evidence", tick_id, evidence.skipped)
+                    _watchdog.record_skips(conn, "review", tick_id, report.skipped)
+                    _watchdog.record_skips(conn, "review_retry", tick_id, retry_report.skipped)
+                    _watchdog.record_skips(conn, "review_marker", tick_id, marker_report.skipped)
+                    stalls = _watchdog.watchdog_once(lambda: _nc(conn))
+                    print(f"WATCHDOG  escalated={len(stalls.escalated)} refused={len(stalls.refused)}")
+                    # The sanctioned unstick for exactly what the watchdog just
+                    # escalated (0018, VOYN-W0-AICC-NO-RECOVERY-PATH-STUCK-READY-
+                    # TO-REVIEW): a task stuck READY_TO_REVIEW with no `pr`
+                    # evidence, never fixed by the watchdog itself, goes back to
+                    # OPEN for a fresh dispatch attempt. Inside the same quota
+                    # scope -- it makes its own `gh` calls to re-check the live PR
+                    # state before recovering.
+                    recovery = recover_stalled_pr_evidence(lambda: _nc(conn), args.repo_path)
+                    for recovered_task_id in recovery.recovered:
+                        print(f"RECOVERED {recovered_task_id} -> OPEN")
+                    for recovered_task_id, reason in recovery.skipped:
+                        print(f"RECOVER-SKIP {recovered_task_id}: {reason}")
                 # Printed AFTER the scope closes: the remaining-budget half
                 # of the line is read on the way out (`gh api rate_limit`,
                 # which does not itself consume quota).

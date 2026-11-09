@@ -19,6 +19,7 @@ from command_center.orchestrator.review_merge import (
     reconcile_merge_evidence,
     reconcile_pr_evidence,
     reconcile_pr_window,
+    recover_stalled_pr_evidence,
     review_once,
 )
 from tests.db.test_backlog_planner import (  # noqa: F401 — pytest fixtures
@@ -4436,6 +4437,118 @@ def test_the_lookup_runs_in_the_checkout_the_tick_was_given(rig, _test_repo_rout
     reconcile_pr_evidence(app_factory, REPO)
 
     assert seen == [REPO]
+
+
+# ---------------------------------------------------------------------------
+# recover_stalled_pr_evidence: the sanctioned 0018 unstick
+# (backlog_recover_stuck_ready_to_review) for a task the watchdog has already
+# escalated for `no_open_pr_on_task_branch` — nothing called that function
+# before this, so a task stuck READY_TO_REVIEW with no `pr` evidence stayed
+# there forever no matter how many ticks ran.
+# ---------------------------------------------------------------------------
+
+
+def _escalate_pr_evidence_stall(factory, task_id, *, reason="no_open_pr_on_task_branch"):
+    with factory() as c, c.cursor() as cur:
+        cur.execute(
+            "INSERT INTO tick_stall_escalation "
+            "(tick_kind, task_id, reason, first_tick_id, consecutive_ticks, "
+            " first_seen_at, last_seen_at, escalation_task_id) "
+            "VALUES ('pr_evidence', %s, %s, 'tick-0000', 5, now(), now(), %s)",
+            (task_id, reason, f"{task_id}-STALL-test"),
+        )
+
+
+def _task_status(factory, task_id):
+    with factory() as c, c.cursor() as cur:
+        cur.execute("SELECT status FROM backlog_task WHERE task_id=%s", (task_id,))
+        return cur.fetchone()[0]
+
+
+def test_an_escalated_stall_with_still_no_open_pr_is_sent_back_to_open(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRR1"
+    _ready_without_pr(store, app_factory, task_id)
+    _escalate_pr_evidence_stall(app_factory, task_id)
+    monkeypatch.setattr(review_merge, "_gh", _fake_pr_list([]))
+
+    report = recover_stalled_pr_evidence(app_factory, REPO)
+
+    assert report.recovered == [task_id]
+    assert report.skipped == []
+    assert _task_status(app_factory, task_id) == "OPEN"
+
+
+def test_a_task_never_escalated_is_left_alone(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+    """Only episodes the watchdog has already escalated are eligible — a task
+    merely matching the shape (READY_TO_REVIEW, no `pr` evidence) is not
+    enough, or recovery would fire before the watchdog's own 5-tick
+    persistence signal ever applied."""
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRR2"
+    _ready_without_pr(store, app_factory, task_id)
+    monkeypatch.setattr(review_merge, "_gh", _fake_pr_list([]))
+
+    report = recover_stalled_pr_evidence(app_factory, REPO)
+
+    assert report.recovered == []
+    assert _task_status(app_factory, task_id) == "READY_TO_REVIEW"
+
+
+def test_a_pr_that_appeared_since_escalation_is_left_alone(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+    """The stall resolved itself between escalation and this tick: recovering
+    anyway would yank the task back to OPEN out from under a PR that now
+    genuinely exists, so this re-checks GitHub rather than trusting the
+    ledger alone."""
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRR3"
+    _ready_without_pr(store, app_factory, task_id)
+    _escalate_pr_evidence_stall(app_factory, task_id)
+    monkeypatch.setattr(
+        review_merge,
+        "_gh",
+        _fake_pr_list(
+            [{"url": "https://github.com/x/repo-d2/pull/950",
+              "headRefName": f"backlog/{task_id}"}]
+        ),
+    )
+
+    report = recover_stalled_pr_evidence(app_factory, REPO)
+
+    assert report.recovered == []
+    assert (task_id, "pr_now_open") in report.skipped
+    assert _task_status(app_factory, task_id) == "READY_TO_REVIEW"
+
+
+def test_a_task_with_pr_evidence_is_never_recovered(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+    """A stale escalation row (e.g. from before reconcile_pr_evidence found
+    the real PR by hand) must never re-open a task that is genuinely
+    reviewable now."""
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRR4"
+    _ready(store, app_factory, task_id, "https://github.com/x/repo-d2/pull/951")
+    _escalate_pr_evidence_stall(app_factory, task_id)
+    monkeypatch.setattr(review_merge, "_gh", _fake_pr_list([]))
+
+    report = recover_stalled_pr_evidence(app_factory, REPO)
+
+    assert report.recovered == []
+    assert _task_status(app_factory, task_id) == "READY_TO_REVIEW"
+
+
+def test_a_different_escalated_reason_is_left_alone(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+    """This recovers only the `no_open_pr_on_task_branch` shape; any other
+    escalated pr_evidence reason is someone else's problem to fix."""
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRR5"
+    _ready_without_pr(store, app_factory, task_id)
+    _escalate_pr_evidence_stall(app_factory, task_id, reason="pr_list_failed")
+    monkeypatch.setattr(review_merge, "_gh", _fake_pr_list([]))
+
+    report = recover_stalled_pr_evidence(app_factory, REPO)
+
+    assert report.recovered == []
+    assert _task_status(app_factory, task_id) == "READY_TO_REVIEW"
 
 
 # -- reconcile_pr_window: no database involved, gh is faked in-process ------
