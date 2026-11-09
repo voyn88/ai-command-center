@@ -71,7 +71,7 @@ EXPECTED_STEPS = {
         "Publish prepared SDK, DB, and test manifest",
     },
     "manifest-gate": {"Verify actual collections equal planned partition"},
-    "coverage-gate": {"PR and merge-group coverage policy"},
+    "coverage-gate": {"Pull request coverage policy", "Combine four coverage shards"},
     "impact-fast-check": {
         "Select impacted tests",
         "Run impacted tests (parallel body + serial tail)",
@@ -175,6 +175,10 @@ def test_release_context_names_and_workflow_coverage_are_exact() -> None:
                 # to resolve the queued pull request to learn its head
                 # repository, which the `merge_group` payload omits.
                 "pull-requests": "read",
+                # Read-only, and used by exactly one caller: the push-run
+                # attestation lists this workflow's `merge_group` runs for the
+                # pushed SHA (`scripts/ci/merge_group_attestation.py`).
+                "actions": "read",
             }
         else:
             assert workflow["permissions"] == {"contents": "read"}
@@ -652,3 +656,144 @@ def test_acceptance_review_bursts_preserve_running_exact_head_check():
     assert identity({"merge_group": {"head_sha": "a" * 40}}) != same_head[0]
     assert workflow["on"]["pull_request_review"]["types"] == ["submitted", "edited", "dismissed"]
     assert workflow["on"]["merge_group"]["types"] == ["checks_requested"]
+
+
+# --- Merge-queue reuse on push (scripts/ci/merge_group_attestation.py) -------
+
+REUSE_SKIP = "needs.prepare.outputs.reuse != 'true'"
+REUSE_SKIP_LOCAL = "steps.reuse.outputs.reuse != 'true'"
+#: Jobs that may stand down on an attested push, and the guard each uses.
+REUSING_JOBS = {
+    "prepare": REUSE_SKIP_LOCAL,
+    "quality-gates": REUSE_SKIP,
+    "manifest-gate": REUSE_SKIP,
+    "coverage-gate": REUSE_SKIP,
+    "windows-quality-gates": REUSE_SKIP_LOCAL,
+    "build-gates": REUSE_SKIP_LOCAL,
+}
+#: Steps a standing-down job still runs: none of them executes the suite.
+CHEAP_STEPS = {
+    "Check out repository",
+    "Deliberate failure canary",
+    "Attest merge-queue result for this exact SHA",
+    "Detect deploy-only change scope",
+    "Detect docs-only change scope",
+    "Reuse merge-queue result",
+    "Whitespace errors",
+    "Write deploy-only manifest placeholder",
+    "Deploy-only fast path",
+    "Deploy-only empty shard receipt",
+    "Accept deploy-only Linux fast path",
+    "Pull request coverage policy",
+}
+
+
+def _top_level_conjuncts(condition: str) -> list[str]:
+    """The terms ANDed at the top level of a condition.
+
+    `&&` binds tighter than `||`, so `x || y && guard` is `x || (y && guard)`:
+    any top-level `||` means nothing is a top-level conjunct, and the whole
+    condition is returned as the one term (which never equals a guard).
+    """
+    parts, depth, current, i = [], 0, "", 0
+    while i < len(condition):
+        char = condition[i]
+        depth += (char == "(") - (char == ")")
+        if depth == 0 and condition.startswith("||", i):
+            return [condition.strip()]
+        if depth == 0 and condition.startswith("&&", i):
+            parts.append(current.strip())
+            current, i = "", i + 2
+            continue
+        current += char
+        i += 1
+    parts.append(current.strip())
+    return parts
+
+
+def test_the_conjunct_reader_refuses_a_guard_under_a_top_level_or() -> None:
+    guard = REUSE_SKIP
+    assert guard in _top_level_conjuncts(f"(a || b) && {guard}")
+    assert guard in _top_level_conjuncts(f"always() && x && {guard} && matrix.y")
+    assert guard not in _top_level_conjuncts(f"a || b && {guard}")
+    assert guard not in _top_level_conjuncts(f"({guard} || a)")
+    assert guard not in _top_level_conjuncts("")
+
+
+def test_push_reuse_is_attested_once_per_independent_job_and_fails_safe() -> None:
+    """The attestation runs only on push, can never fail a job, and decides via
+    an output whose absence means "run everything" (`!= 'true'`)."""
+    jobs = _workflow(CI_WORKFLOW)["jobs"]
+    interpreter = {"prepare": "python3", "build-gates": "python3", "windows-quality-gates": "python"}
+    for job_id, python in interpreter.items():
+        (step,) = [
+            s for s in jobs[job_id]["steps"]
+            if s.get("name") == "Attest merge-queue result for this exact SHA"
+        ]
+        assert step == {
+            "name": "Attest merge-queue result for this exact SHA",
+            "id": "reuse",
+            "if": "github.event_name == 'push'",
+            "continue-on-error": "true",
+            "shell": "bash",
+            "env": {"GITHUB_TOKEN": "${{ github.token }}"},
+            "run": f"{python} scripts/ci/merge_group_attestation.py",
+        }, job_id
+    # Jobs downstream of `prepare` take its single decision rather than
+    # attesting again: a split decision would leave a shard without inputs.
+    outputs = jobs["prepare"]["outputs"]
+    assert outputs["reuse"] == "${{ steps.reuse.outputs.reuse }}"
+    assert outputs["reuse_run_id"] == "${{ steps.reuse.outputs.run_id }}"
+    assert outputs["reuse_run_url"] == "${{ steps.reuse.outputs.run_url }}"
+    assert "prepare" in jobs["coverage-gate"]["needs"]
+    # Only the step that prints the relied-on run may test for `== 'true'`.
+    text = CI_WORKFLOW.read_text(encoding="utf-8")
+    assert text.count("outputs.reuse == 'true'") == 3
+
+
+def test_a_standing_down_job_skips_every_heavy_step_and_still_concludes() -> None:
+    """Reuse is step-level only: jobs keep their exact `if` (pinned by the
+    label-noise test) so they conclude `success`, never `skipped`."""
+    jobs = _workflow(CI_WORKFLOW)["jobs"]
+    for job_id, guard in REUSING_JOBS.items():
+        for step in jobs[job_id]["steps"]:
+            name = step.get("name")
+            if name in CHEAP_STEPS:
+                continue
+            condition = str(step.get("if", ""))
+            assert guard in _top_level_conjuncts(condition), (job_id, name, condition)
+        if job_id in {"quality-gates", "manifest-gate", "coverage-gate"}:
+            (echo,) = [s for s in jobs[job_id]["steps"] if s.get("name") == "Reuse merge-queue result"]
+            assert echo["if"] == "needs.prepare.outputs.reuse == 'true'"
+            assert echo["env"] == {
+                "RUN_ID": "${{ needs.prepare.outputs.reuse_run_id }}",
+                "RUN_URL": "${{ needs.prepare.outputs.reuse_run_url }}",
+            }
+            assert "$RUN_ID" in echo["run"] and "$RUN_URL" in echo["run"]
+    # Never reused: CodeQL on main is the default-branch code-scanning
+    # baseline, and the aggregator asserts results rather than doing work.
+    for job_id in ("security-gates", "final-gate", "impact-fast-check"):
+        assert "reuse" not in str(jobs[job_id]), job_id
+
+
+def test_coverage_is_collected_where_the_merge_queue_runs_the_tests() -> None:
+    jobs = _workflow(CI_WORKFLOW)["jobs"]
+    instrumented = '[[ "${{ github.event_name }}" == "push" || "${{ github.event_name }}" == "merge_group" ]]'
+    steps = {s.get("name"): s for s in jobs["quality-gates"]["steps"]}
+    for name in ("Pytest core shard", "Pytest (serial tail)"):
+        assert f"if {instrumented}; then" in steps[name]["run"], name
+        assert "--cov=command_center" in steps[name]["run"], name
+    assert steps["Publish main coverage shard"]["if"] == (
+        "always() && (github.event_name == 'push' || github.event_name == 'merge_group') && "
+        + REUSE_SKIP
+    )
+    coverage = {s.get("name"): s for s in jobs["coverage-gate"]["steps"]}
+    assert coverage["Pull request coverage policy"]["if"] == (
+        "github.event_name != 'push' && github.event_name != 'merge_group'"
+    )
+    for name in ("Download coverage shards", "Combine four coverage shards"):
+        assert coverage[name]["if"] == (
+            "(github.event_name == 'push' || github.event_name == 'merge_group') && " + REUSE_SKIP
+        ), name
+    assert '"${#shards[@]}" -ne 4' in coverage["Combine four coverage shards"]["run"]
+    assert "coverage-gate" in jobs["final-gate"]["needs"]

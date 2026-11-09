@@ -14,6 +14,16 @@ name: CI
 #   * The test suite isolates itself from real data via AICC_DATA_DIR / a
 #     monkeypatched REPORTS_ROOT (tests/conftest.py); the runner is disposable, so
 #     nothing is mutated outside per-test temp fixtures.
+#   * Merge-queue reuse: the queue only advances main to a commit its
+#     `merge_group` run already passed, so a `push` run whose exact SHA has a
+#     successful `merge_group` run of this workflow stands its heavy steps down
+#     (`scripts/ci/merge_group_attestation.py`; every job still concludes
+#     `success` under its unchanged name and prints the run it relies on).
+#     No such run, any API doubt, or a re-run attempt means the full run as
+#     before. Coverage is therefore collected where the tests run: on
+#     `merge_group` (so the queue blocks on it) and on a full `push` run.
+#     `security-gates` never stands down: its CodeQL analysis of main is the
+#     default-branch code-scanning baseline.
 
 on:
   pull_request:
@@ -68,10 +78,13 @@ concurrency:
 # pull request to learn which repository authored the code, because the
 # `merge_group` payload does not say. Read-only, and narrower than the secret it
 # protects.
+# `actions: read` exists for `scripts/ci/merge_group_attestation.py`, which
+# lists this workflow's `merge_group` runs for the pushed SHA. Read-only.
 permissions:
   contents: read
   security-events: write
   pull-requests: read
+  actions: read
 
 jobs:
   prepare:
@@ -81,6 +94,9 @@ jobs:
     timeout-minutes: 10
     outputs:
       deploy_only: ${{ steps.change-scope.outputs.deploy_only }}
+      reuse: ${{ steps.reuse.outputs.reuse }}
+      reuse_run_id: ${{ steps.reuse.outputs.run_id }}
+      reuse_run_url: ${{ steps.reuse.outputs.run_url }}
     env:
       AICC_AIOS_SDK_WHEEL: ${{ github.workspace }}/.artifacts/aios_sdk-0.2.0-py3-none-any.whl
       AICC_AIOS_DB_WHEEL: ${{ github.workspace }}/.artifacts/aios_db-0.1.0-py3-none-any.whl
@@ -89,6 +105,17 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           fetch-depth: 0
+
+      # Push to main only: positive proof that the merge queue already passed
+      # this exact SHA, or `reuse=false` (full run). Never fails the job.
+      - name: Attest merge-queue result for this exact SHA
+        id: reuse
+        if: github.event_name == 'push'
+        continue-on-error: true
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci/merge_group_attestation.py
 
       - name: Detect deploy-only change scope
         id: change-scope
@@ -116,7 +143,7 @@ jobs:
           fi
 
       - name: Set up Python
-        if: steps.change-scope.outputs.deploy_only != 'true'
+        if: steps.change-scope.outputs.deploy_only != 'true' && steps.reuse.outputs.reuse != 'true'
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.13"
@@ -128,19 +155,19 @@ jobs:
       # prepare job must too, or collection dies with
       # `ImportError: libEGL.so.1` before it can plan anything.
       - name: Install Qt system libraries (for optional desktop shell)
-        if: steps.change-scope.outputs.deploy_only != 'true'
+        if: steps.change-scope.outputs.deploy_only != 'true' && steps.reuse.outputs.reuse != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libdbus-1-3 libfontconfig1
 
       - name: Install dependencies
-        if: steps.change-scope.outputs.deploy_only != 'true'
+        if: steps.change-scope.outputs.deploy_only != 'true' && steps.reuse.outputs.reuse != 'true'
         run: |
           python -m pip install --upgrade pip
           pip install --require-hashes --no-deps -r requirements-ci-linux.lock
 
       - name: Fetch and verify exact accepted AIOS SDK and DB artifacts
-        if: steps.change-scope.outputs.deploy_only != 'true'
+        if: steps.change-scope.outputs.deploy_only != 'true' && steps.reuse.outputs.reuse != 'true'
         shell: bash
         env:
           AIOS_ARTIFACT_READONLY_TOKEN: ${{ secrets.AIOS_ARTIFACT_READONLY_TOKEN }}
@@ -154,7 +181,7 @@ jobs:
           pip install "$AICC_AIOS_DB_WHEEL"
 
       - name: Build exactly-once test manifest
-        if: steps.change-scope.outputs.deploy_only != 'true'
+        if: steps.change-scope.outputs.deploy_only != 'true' && steps.reuse.outputs.reuse != 'true'
         run: |
           python scripts/ci/test_shards.py build \
             --shards 4 \
@@ -166,6 +193,7 @@ jobs:
           printf '{"mode":"deploy-only-fast-path","shards":4}\n' > test-manifest.json
 
       - name: Publish prepared SDK, DB, and test manifest
+        if: steps.reuse.outputs.reuse != 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ci-shared-inputs
@@ -246,13 +274,21 @@ jobs:
         if: github.event_name == 'pull_request' && matrix.shard == 1 && contains(github.event.pull_request.labels.*.name, 'release-gate-canary-linux')
         run: exit 1
 
+      - name: Reuse merge-queue result
+        if: needs.prepare.outputs.reuse == 'true'
+        env:
+          RUN_ID: ${{ needs.prepare.outputs.reuse_run_id }}
+          RUN_URL: ${{ needs.prepare.outputs.reuse_run_url }}
+        run: echo "Exact SHA passed merge_group run $RUN_ID ($RUN_URL); heavy steps stand down."
+
       - name: Download prepared SDK, DB, and test manifest
+        if: needs.prepare.outputs.reuse != 'true'
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: ci-shared-inputs
 
       - name: Set up Python
-        if: needs.prepare.outputs.deploy_only != 'true' || matrix.shard == 1
+        if: (needs.prepare.outputs.deploy_only != 'true' || matrix.shard == 1) && needs.prepare.outputs.reuse != 'true'
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.13"
@@ -266,7 +302,7 @@ jobs:
       # (even non-desktop ones) can run. Cheap (apt), only needed when the
       # desktop deps are installed.
       - name: Install Qt system libraries (for optional desktop shell)
-        if: needs.prepare.outputs.deploy_only != 'true'
+        if: needs.prepare.outputs.deploy_only != 'true' && needs.prepare.outputs.reuse != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libdbus-1-3 libfontconfig1
@@ -276,7 +312,7 @@ jobs:
       # postgresql-client, and pg_dump refuses to dump a newer server outright,
       # so the matching major is installed from PGDG.
       - name: Install PostgreSQL 17 client (for the backup/restore drill)
-        if: needs.prepare.outputs.deploy_only != 'true'
+        if: needs.prepare.outputs.deploy_only != 'true' && needs.prepare.outputs.reuse != 'true'
         run: |
           sudo install -d /usr/share/postgresql-common/pgdg
           sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
@@ -288,13 +324,13 @@ jobs:
           sudo apt-get install -y postgresql-client-17
 
       - name: Install dependencies
-        if: needs.prepare.outputs.deploy_only != 'true' || matrix.shard == 1
+        if: (needs.prepare.outputs.deploy_only != 'true' || matrix.shard == 1) && needs.prepare.outputs.reuse != 'true'
         run: |
           python -m pip install --upgrade pip
           pip install --require-hashes --no-deps -r requirements-ci-linux.lock
 
       - name: Install prepared AIOS SDK and DB artifacts
-        if: needs.prepare.outputs.deploy_only != 'true'
+        if: needs.prepare.outputs.deploy_only != 'true' && needs.prepare.outputs.reuse != 'true'
         run: |
           pip install "$AICC_AIOS_SDK_WHEEL"
           pip install "$AICC_AIOS_DB_WHEEL"
@@ -312,11 +348,11 @@ jobs:
           fi
 
       - name: Ruff
-        if: needs.prepare.outputs.deploy_only != 'true'
+        if: needs.prepare.outputs.deploy_only != 'true' && needs.prepare.outputs.reuse != 'true'
         run: ruff check .
 
       - name: Compile validation
-        if: needs.prepare.outputs.deploy_only != 'true'
+        if: needs.prepare.outputs.deploy_only != 'true' && needs.prepare.outputs.reuse != 'true'
         run: python -m compileall -q command_center scripts tests app.py
 
       - name: Deploy-only fast path
@@ -341,7 +377,7 @@ jobs:
           printf '{"nodeids":[],"mode":"deploy-only-fast-path","shard":${{ matrix.shard }}}\n' > test-collection.json
 
       - name: Pytest core shard
-        if: needs.prepare.outputs.deploy_only != 'true'
+        if: needs.prepare.outputs.deploy_only != 'true' && needs.prepare.outputs.reuse != 'true'
         shell: bash
         run: |
           args=(
@@ -352,7 +388,7 @@ jobs:
             --pytest-arg=loadscope
             --pytest-arg=--durations=50
           )
-          if [[ "${{ github.event_name }}" == "push" ]]; then
+          if [[ "${{ github.event_name }}" == "push" || "${{ github.event_name }}" == "merge_group" ]]; then
             args+=(--pytest-arg=--cov=command_center --pytest-arg=--cov-report=)
           fi
           python scripts/ci/test_shards.py run \
@@ -363,11 +399,11 @@ jobs:
             "${args[@]}"
 
       - name: Pytest (serial tail)
-        if: needs.prepare.outputs.deploy_only != 'true' && matrix.run_serial
+        if: needs.prepare.outputs.deploy_only != 'true' && needs.prepare.outputs.reuse != 'true' && matrix.run_serial
         shell: bash
         run: |
           args=(--pytest-arg=-q --pytest-arg=-p --pytest-arg=no:xdist)
-          if [[ "${{ github.event_name }}" == "push" ]]; then
+          if [[ "${{ github.event_name }}" == "push" || "${{ github.event_name }}" == "merge_group" ]]; then
             args+=(
               --pytest-arg=--cov=command_center
               --pytest-arg=--cov-append
@@ -385,7 +421,7 @@ jobs:
       # type-check progress for a codebase that is not yet fully typed.
 
       - name: Type check (informational)
-        if: needs.prepare.outputs.deploy_only != 'true' && matrix.run_typecheck
+        if: needs.prepare.outputs.deploy_only != 'true' && needs.prepare.outputs.reuse != 'true' && matrix.run_typecheck
         continue-on-error: true
         run: mypy command_center || true
 
@@ -393,7 +429,7 @@ jobs:
       # does not re-download the browser on every run. Keyed on the pinned
       # playwright version in the lock so a driver bump invalidates the cache.
       - name: Cache Playwright browsers
-        if: needs.prepare.outputs.deploy_only != 'true' && matrix.run_e2e
+        if: needs.prepare.outputs.deploy_only != 'true' && needs.prepare.outputs.reuse != 'true' && matrix.run_e2e
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~/.cache/ms-playwright
@@ -402,7 +438,7 @@ jobs:
       # Real-browser lifecycle projection is a release invariant, not an
       # informational signal: a failing user journey must fail this check.
       - name: Real-browser E2E
-        if: needs.prepare.outputs.deploy_only != 'true' && matrix.run_e2e
+        if: needs.prepare.outputs.deploy_only != 'true' && needs.prepare.outputs.reuse != 'true' && matrix.run_e2e
         run: |
           python -m playwright install chromium
           python scripts/ci/test_shards.py run \
@@ -412,7 +448,7 @@ jobs:
             --pytest-arg=-q
 
       - name: Publish actual test collection receipt
-        if: always()
+        if: always() && needs.prepare.outputs.reuse != 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: test-collection-${{ matrix.shard }}
@@ -421,7 +457,7 @@ jobs:
           retention-days: 7
 
       - name: Publish main coverage shard
-        if: always() && github.event_name == 'push'
+        if: always() && (github.event_name == 'push' || github.event_name == 'merge_group') && needs.prepare.outputs.reuse != 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: coverage-shard-${{ matrix.shard }}
@@ -440,21 +476,28 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
+      - name: Reuse merge-queue result
+        if: needs.prepare.outputs.reuse == 'true'
+        env:
+          RUN_ID: ${{ needs.prepare.outputs.reuse_run_id }}
+          RUN_URL: ${{ needs.prepare.outputs.reuse_run_url }}
+        run: echo "Exact SHA passed merge_group run $RUN_ID ($RUN_URL); heavy steps stand down."
+
       - name: Download prepared test manifest
-        if: needs.prepare.outputs.deploy_only != 'true'
+        if: needs.prepare.outputs.deploy_only != 'true' && needs.prepare.outputs.reuse != 'true'
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: ci-shared-inputs
 
       - name: Download shard collection receipts
-        if: needs.prepare.outputs.deploy_only != 'true'
+        if: needs.prepare.outputs.deploy_only != 'true' && needs.prepare.outputs.reuse != 'true'
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: test-collection-*
           path: collections
 
       - name: Verify actual collections equal planned partition
-        if: needs.prepare.outputs.deploy_only != 'true'
+        if: needs.prepare.outputs.deploy_only != 'true' && needs.prepare.outputs.reuse != 'true'
         shell: bash
         run: |
           shopt -s nullglob
@@ -474,20 +517,27 @@ jobs:
   coverage-gate:
     name: Main coverage aggregation
     if: ${{ always() && !((github.event_name == 'pull_request' && (github.event.action == 'labeled' || github.event.action == 'unlabeled') && !startsWith(github.event.label.name, 'release-gate-canary-') && !(github.event.action == 'labeled' && (github.event.label.name == 'review-window:active' || github.event.label.name == 'queue-active'))) || (github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'review-window:active') && !contains(github.event.pull_request.labels.*.name, 'queue-active') && !startsWith(github.event.label.name, 'release-gate-canary-'))) }}
-    needs: [quality-gates]
+    needs: [prepare, quality-gates]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: PR and merge-group coverage policy
-        if: github.event_name != 'push'
-        run: echo "Coverage instrumentation runs only on the post-merge main push."
+      - name: Pull request coverage policy
+        if: github.event_name != 'push' && github.event_name != 'merge_group'
+        run: echo "Coverage instrumentation runs only in the merge queue and on a full main push."
+
+      - name: Reuse merge-queue result
+        if: needs.prepare.outputs.reuse == 'true'
+        env:
+          RUN_ID: ${{ needs.prepare.outputs.reuse_run_id }}
+          RUN_URL: ${{ needs.prepare.outputs.reuse_run_url }}
+        run: echo "Exact SHA passed merge_group run $RUN_ID ($RUN_URL); heavy steps stand down."
 
       - name: Check out repository
-        if: github.event_name == 'push'
+        if: (github.event_name == 'push' || github.event_name == 'merge_group') && needs.prepare.outputs.reuse != 'true'
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - name: Set up Python
-        if: github.event_name == 'push'
+        if: (github.event_name == 'push' || github.event_name == 'merge_group') && needs.prepare.outputs.reuse != 'true'
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.13"
@@ -495,18 +545,18 @@ jobs:
           cache-dependency-path: requirements-ci-linux.lock
 
       - name: Install locked coverage tooling
-        if: github.event_name == 'push'
+        if: (github.event_name == 'push' || github.event_name == 'merge_group') && needs.prepare.outputs.reuse != 'true'
         run: pip install --require-hashes --no-deps -r requirements-ci-linux.lock
 
       - name: Download coverage shards
-        if: github.event_name == 'push'
+        if: (github.event_name == 'push' || github.event_name == 'merge_group') && needs.prepare.outputs.reuse != 'true'
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: coverage-shard-*
           path: coverage
 
       - name: Combine four coverage shards
-        if: github.event_name == 'push'
+        if: (github.event_name == 'push' || github.event_name == 'merge_group') && needs.prepare.outputs.reuse != 'true'
         shell: bash
         run: |
           shopt -s nullglob
@@ -579,8 +629,19 @@ jobs:
         if: github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'release-gate-canary-windows')
         run: exit 1
 
+      # Push to main only: positive proof that the merge queue already passed
+      # this exact SHA, or `reuse=false` (full run). Never fails the job.
+      - name: Attest merge-queue result for this exact SHA
+        id: reuse
+        if: github.event_name == 'push'
+        continue-on-error: true
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python scripts/ci/merge_group_attestation.py
+
       - name: Set up Python
-        if: steps.change-scope.outputs.docs_only != 'true'
+        if: steps.change-scope.outputs.docs_only != 'true' && steps.reuse.outputs.reuse != 'true'
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.14"
@@ -588,13 +649,13 @@ jobs:
           cache-dependency-path: requirements-ci-windows.lock
 
       - name: Install dependencies
-        if: steps.change-scope.outputs.docs_only != 'true'
+        if: steps.change-scope.outputs.docs_only != 'true' && steps.reuse.outputs.reuse != 'true'
         run: |
           python -m pip install --upgrade pip
           pip install --require-hashes --no-deps -r requirements-ci-windows.lock
 
       - name: Install exact accepted AIOS SDK and DB artifacts
-        if: steps.change-scope.outputs.docs_only != 'true'
+        if: steps.change-scope.outputs.docs_only != 'true' && steps.reuse.outputs.reuse != 'true'
         # This step is why the invariant checks the shell and not just the
         # order of the lines. It had no `shell:`, so on `windows-latest` it ran
         # under `pwsh`, where a native command's non-zero exit is not a
@@ -617,11 +678,11 @@ jobs:
           pip install "$AICC_AIOS_DB_WHEEL"
 
       - name: Ruff
-        if: steps.change-scope.outputs.docs_only != 'true'
+        if: steps.change-scope.outputs.docs_only != 'true' && steps.reuse.outputs.reuse != 'true'
         run: ruff check .
 
       - name: Compile validation
-        if: steps.change-scope.outputs.docs_only != 'true'
+        if: steps.change-scope.outputs.docs_only != 'true' && steps.reuse.outputs.reuse != 'true'
         run: python -m compileall -q command_center scripts tests app.py
 
       # The desktop pytest-qt suite is the deterministic Windows-relevant signal
@@ -630,7 +691,7 @@ jobs:
       # surface early. This is exactly the automated half WINDOWS_RUNBOOK.md
       # Step 2 calls for (ruff · compile · `pytest tests/desktop`).
       - name: Desktop pytest-qt suite
-        if: steps.change-scope.outputs.docs_only != 'true'
+        if: steps.change-scope.outputs.docs_only != 'true' && steps.reuse.outputs.reuse != 'true'
         run: pytest tests/desktop -q
 
       # Real-browser E2E of the status projection. The full repository `pytest -q` is deliberately
@@ -640,7 +701,7 @@ jobs:
       # noise plus ~23 min of runtime that risks cancelling the job. The
       # desktop gate signal is the `tests/desktop` suite above.
       - name: Real-browser E2E
-        if: steps.change-scope.outputs.docs_only != 'true'
+        if: steps.change-scope.outputs.docs_only != 'true' && steps.reuse.outputs.reuse != 'true'
         run: |
           python -m playwright install chromium
           pytest -q tests/test_e2e_status_projection.py
@@ -768,7 +829,19 @@ jobs:
         if: github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'release-gate-canary-build')
         run: exit 1
 
+      # Push to main only: positive proof that the merge queue already passed
+      # this exact SHA, or `reuse=false` (full run). Never fails the job.
+      - name: Attest merge-queue result for this exact SHA
+        id: reuse
+        if: github.event_name == 'push'
+        continue-on-error: true
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci/merge_group_attestation.py
+
       - name: Set up Node
+        if: steps.reuse.outputs.reuse != 'true'
         uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
         with:
           node-version: "24"
@@ -776,9 +849,11 @@ jobs:
           cache-dependency-path: web/package-lock.json
 
       - name: Install locked web dependencies
+        if: steps.reuse.outputs.reuse != 'true'
         run: npm ci --prefix web
 
       - name: Web production build
+        if: steps.reuse.outputs.reuse != 'true'
         run: npm run build --prefix web
 
   # ADVISORY fast pre-check. On a pull request it uses the dependency-based
