@@ -148,7 +148,7 @@ describe('Tasks — one-button audit', () => {
 
     // The task list still renders (queue reads are independent of the
     // project picker), proving the screen settled before asserting absence.
-    await waitFor(() => expect(screen.getByText('Task: AICC')).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByText('Project check: AICC')).toBeInTheDocument())
     expect(screen.queryByText('Run audit')).not.toBeInTheDocument()
   })
 })

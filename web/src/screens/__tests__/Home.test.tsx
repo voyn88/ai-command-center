@@ -99,4 +99,24 @@ describe('Home', () => {
 
     await waitFor(() => expect(screen.getByText('Could not load dashboard data.')).toBeInTheDocument())
   })
+
+  test('has no dead (disabled) controls, no New Task button and no fake sparkline', async () => {
+    vi.mocked(fetchHome).mockResolvedValue(baseHome)
+    const { container } = render(<Home />)
+
+    await waitFor(() => expect(screen.getByText('Desktop Architecture D1')).toBeInTheDocument())
+    expect(container.querySelectorAll('button:disabled')).toHaveLength(0)
+    expect(screen.queryByText('New Task')).not.toBeInTheDocument()
+    expect(container.querySelector('svg line')).toBeNull()
+    expect(screen.getByRole('button', { name: 'Home' })).toHaveAttribute('aria-current', 'page')
+  })
+
+  test('queue state is a plain label with the raw id in a tooltip', async () => {
+    vi.mocked(fetchHome).mockResolvedValue(baseHome)
+    render(<Home />)
+
+    const badge = await screen.findByText('Running now')
+    expect(badge).toHaveAttribute('title', 'RUNNING')
+    expect(screen.queryByText('RUNNING')).not.toBeInTheDocument()
+  })
 })

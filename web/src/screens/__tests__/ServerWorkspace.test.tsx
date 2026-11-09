@@ -42,4 +42,43 @@ describe('server workspace', () => {
     await waitFor(() => expect(screen.getByText(/Не удалось обновить данные/)).toBeInTheDocument())
     expect(screen.getByText('Choose scope')).toBeInTheDocument()
   })
+  test('marks in-progress tasks idle for 3+ days as stale', async () => {
+    const old = new Date(Date.now() - 5 * 24 * 3600 * 1000).toISOString()
+    vi.mocked(fetchBacklog).mockResolvedValue({
+      ...snapshot,
+      tasks: [{ id: 'one', title: 'Deploy web', status: 'IN_PROGRESS', project: 'AICC', priority: 'P1', updated_at: old }],
+    })
+    render(<ServerWorkspace />)
+    await screen.findByText('Без движения 3 дня и больше: 1')
+    expect(screen.getAllByText('Давно без движения').length).toBeGreaterThan(1)
+    expect(screen.getByText('обновлено 5 дн. назад')).toBeInTheDocument()
+  })
+  test('empty filter result offers to reset the filters', async () => {
+    window.location.hash = '#tasks'
+    render(<ServerWorkspace />)
+    await screen.findByText('Old work')
+    fireEvent.change(screen.getByLabelText('Поиск'), { target: { value: 'does not exist' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Сбросить фильтры' }))
+    expect(await screen.findByText('Old work')).toBeInTheDocument()
+  })
+  test('failed first load shows a retry button, not a dead end', async () => {
+    vi.mocked(fetchBacklog).mockRejectedValueOnce(new Error('offline'))
+    render(<ServerWorkspace />)
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('Не удалось загрузить задачи. Проверьте соединение и нажмите «Повторить».')
+    fireEvent.click(screen.getByRole('button', { name: 'Повторить' }))
+    expect(await screen.findByText('Choose scope')).toBeInTheDocument()
+  })
+  test('shows the loading skeleton while the first request is pending', async () => {
+    vi.mocked(fetchBacklog).mockReturnValue(new Promise(() => {}))
+    render(<ServerWorkspace />)
+    expect(screen.getByRole('status', { name: 'Загружаем задачи…' })).toBeInTheDocument()
+  })
+  test('decision block comes before the status tiles', async () => {
+    render(<ServerWorkspace />)
+    await screen.findByText('Choose scope')
+    const heading = screen.getAllByText('Нужно ваше решение')[0]
+    const tile = screen.getByRole('button', { name: 'В работе: 1' })
+    expect(heading.compareDocumentPosition(tile) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+  })
 })

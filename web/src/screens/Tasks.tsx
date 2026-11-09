@@ -32,6 +32,7 @@ import {
   setOwnerToken,
 } from '../lib/queueApi'
 import type { QueueItem, QueueItemDetail } from '../lib/queueApi'
+import { ATTEMPT_STATE_KEYS, formatOutcomeReason, humanStatus } from '../lib/labels'
 
 const STATUS_ORDER = ['ALL', 'ready', 'claimed', 'succeeded', 'dead'] as const
 
@@ -47,7 +48,7 @@ function statusTone(state: string): string {
   if (state === 'succeeded') return 'var(--ok)'
   if (state === 'dead') return 'var(--bad)'
   if (state === 'claimed') return 'var(--accent-2)'
-  return 'var(--tx3)'
+  return 'var(--tx3-aa)'
 }
 
 function formatDate(value: string | null, language: string, fallback: string) {
@@ -60,9 +61,8 @@ function formatDate(value: string | null, language: string, fallback: string) {
 
 /** A human name for a queue item: the repository or task it concerns —
  * never its wki_* id. */
-function taskTitle(item: QueueItem, generic: string): string {
-  const subject = item.repository_id || item.task_id
-  return subject ? `${generic}: ${subject}` : generic
+function taskTitle(item: QueueItem, t: (key: string, opts?: Record<string, string>) => string): string {
+  return item.repository_id ? t('taskAuditTitle', { project: item.repository_id }) : t('taskGeneric')
 }
 
 function TaskDetails({ detail, fallback }: { detail: QueueItemDetail; fallback: string }) {
@@ -75,7 +75,8 @@ function TaskDetails({ detail, fallback }: { detail: QueueItemDetail; fallback: 
     <div className="task-details">
       {detail.dead_reason && (
         <p>
-          <span className="task-details-label">{t('taskReason')}</span> {detail.dead_reason}
+          <span className="task-details-label">{t('taskReason')}</span>{' '}
+          <span title={detail.dead_reason}>{detail.dead_reason === 'timeout' ? t('reasonTimeout') : detail.dead_reason}</span>
         </p>
       )}
       {resultText && (
@@ -88,7 +89,7 @@ function TaskDetails({ detail, fallback }: { detail: QueueItemDetail; fallback: 
         {detail.attempts.length === 0
           ? fallback
           : detail.attempts
-              .map((attempt) => `№${attempt.attempt_no} — ${attempt.state}${attempt.outcome_reason ? ` (${attempt.outcome_reason})` : ''}`)
+              .map((attempt) => `№${attempt.attempt_no} — ${humanStatus(ATTEMPT_STATE_KEYS, attempt.state, t).label}${attempt.outcome_reason ? ` (${formatOutcomeReason(attempt.outcome_reason, t)})` : ''}`)
               .join('; ')}
       </p>
       {/* Технические идентификаторы — только здесь, моноширинно, для копирования в отчёт. */}
@@ -115,19 +116,19 @@ function TaskRow({ item, language, fallback }: { item: QueueItem; language: stri
   return (
     <article className="task-row">
       <div className="task-row-head">
-        <span className="task-status" style={{ color: statusTone(item.state) }}>
+        <span className="task-status" title={item.state} style={{ color: statusTone(item.state) }}>
           {t(statusKey(item.state))}
         </span>
-        <strong>{taskTitle(item, t('taskGeneric'))}</strong>
+        <strong>{taskTitle(item, t)}</strong>
         <span className="task-date">{formatDate(item.created_at, language, fallback)}</span>
-        <button type="button" className="task-toggle" onClick={toggle}>
+        <button type="button" className="task-toggle" aria-expanded={open} onClick={toggle}>
           {open ? t('taskHide') : t('taskDetails')}
         </button>
       </div>
       {open && (
         <>
           {!detail && !detailError && <p className="task-details">{t('loading')}</p>}
-          {detailError && <p className="task-details" style={{ color: 'var(--bad)' }}>{t('errorLoading')}</p>}
+          {detailError && <p className="task-details" role="alert" style={{ color: 'var(--bad)' }}>{t('taskDetailsError')}</p>}
           {detail && <TaskDetails detail={detail} fallback={t('notAvailable')} />}
         </>
       )}
@@ -245,7 +246,7 @@ function TokenGate({ notice, onUnlocked }: { notice?: string | null; onUnlocked:
   return (
     <GlassPanel title={t('tokenPrompt')}>
       {notice && <p style={{ color: 'var(--bad)', marginTop: 0 }}>{notice}</p>}
-      <p style={{ color: 'var(--tx3)', marginTop: 0 }}>{t('tokenHint')}</p>
+      <p style={{ color: 'var(--tx3-aa)', marginTop: 0 }}>{t('tokenHint')}</p>
       <form
         style={{ display: 'flex', gap: '.6rem', flexWrap: 'wrap' }}
         onSubmit={(event) => {
@@ -335,10 +336,10 @@ export default function Tasks({ onNavigate }: { onNavigate: (screen: 'home' | 'e
           {locked && (
             <TokenGate notice={pendingAudit ? t('auditLocked') : null} onUnlocked={load} />
           )}
-          {!locked && !items && !error && <GlassPanel>{t('loading')}</GlassPanel>}
+          {!locked && !items && !error && <GlassPanel><span role="status">{t('loading')}</span></GlassPanel>}
           {!locked && error && (
             <GlassPanel>
-              <p style={{ color: 'var(--bad)' }}>{t('errorLoading')}</p>
+              <p role="alert" style={{ color: 'var(--bad)' }}>{t('errorLoading')} {t('errorLoadingHint')}</p>
               <button className="execution-back" onClick={load}>{t('retry')}</button>
             </GlassPanel>
           )}
@@ -356,6 +357,7 @@ export default function Tasks({ onNavigate }: { onNavigate: (screen: 'home' | 'e
                 {STATUS_ORDER.map((state) => (
                   <button
                     key={state}
+                    aria-pressed={filter === state}
                     className={filter === state ? 'active' : ''}
                     onClick={() => setFilter(state)}
                   >
@@ -365,7 +367,7 @@ export default function Tasks({ onNavigate }: { onNavigate: (screen: 'home' | 'e
               </div>
               <div className="execution-list">
                 {visible.length === 0 ? (
-                  <p style={{ color: 'var(--tx3)' }}>{t('taskEmpty')}</p>
+                  <p style={{ color: 'var(--tx3-aa)' }}>{t('taskEmpty')}</p>
                 ) : (
                   visible.map((item) => (
                     <TaskRow key={item.work_item_id} item={item} language={i18n.language} fallback={t('notAvailable')} />
