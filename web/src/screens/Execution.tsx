@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { fetchExecution } from '../lib/api'
 import type { ExecutionDTO, ExecutionRun } from '../lib/api'
@@ -8,7 +8,7 @@ import KpiCard from '../components/KpiCard'
 import LangToggle from '../components/LangToggle'
 import NavItem from '../components/NavItem'
 import { ExecutionIcon, HomeIcon, TasksIcon } from '../components/NavIcons'
-import { ATTENTION_STATES, formatDurationRu, formatOutcomeReason, humanStatus, RUN_STATE_KEYS, runStateColor } from '../lib/labels'
+import { ATTENTION_STATES, formatDurationRu, formatOutcomeReason, humanStatus, RUN_STATE_KEYS, runStateColor, VERDICT_KEYS } from '../lib/labels'
 
 function formatDate(value: string | null, language: string, fallback: string) {
   if (!value) return fallback
@@ -19,11 +19,13 @@ function formatDate(value: string | null, language: string, fallback: string) {
 function RunRow({ run, fallback, language }: { run: ExecutionRun; fallback: string; language: string }) {
   const { t } = useTranslation()
   const status = humanStatus(RUN_STATE_KEYS, run.state, t)
-  const result = run.verdict || (run.failure_reason ? formatOutcomeReason(run.failure_reason, t) : fallback)
+  const verdict = run.verdict ? humanStatus(VERDICT_KEYS, run.verdict, t) : null
+  const result = verdict?.label || (run.failure_reason ? formatOutcomeReason(run.failure_reason, t) : fallback)
   // Raw exit code and failure reason stay reachable, but only as a tooltip.
   const resultTitle = [
     run.exit_code !== null ? `${t('exitCode')}: ${run.exit_code}` : '',
     run.failure_reason || '',
+    verdict?.raw || '',
   ].filter(Boolean).join(' · ') || t('result')
   return (
     <article className="execution-row">
@@ -51,15 +53,20 @@ export default function Execution({ onNavigate }: { onNavigate: (screen: 'home' 
   const { t, i18n } = useTranslation()
   const [data, setData] = useState<ExecutionDTO | null>(null)
   const [error, setError] = useState(false)
-  const [state, setState] = useState('ALL')
+  const [selected, setSelected] = useState('ALL')
+  const mainRef = useRef<HTMLElement>(null)
 
   const load = () => {
     setError(false)
     fetchExecution().then(setData).catch(() => setError(true))
   }
   useEffect(load, [])
+  const retry = () => { mainRef.current?.focus(); load() }
 
   const states = useMemo(() => data ? Object.entries(data.state_counts).filter(([, count]) => count > 0) : [], [data])
+  // A chip whose state vanished after a refresh must not leave the list stuck empty.
+  const state = selected === 'ALL' || states.some(([name]) => name === selected) ? selected : 'ALL'
+  const setState = setSelected
   const runs = useMemo(() => {
     const list = data?.runs.filter((run) => state === 'ALL' || run.state === state) || []
     // Stable sort: attention first, then running, then the rest (only for "all").
@@ -83,9 +90,9 @@ export default function Execution({ onNavigate }: { onNavigate: (screen: 'home' 
           <NavItem label={t('execution')} icon={<ExecutionIcon />} active onClick={() => onNavigate('execution')} />
           <NavItem label={t('tasks')} icon={<TasksIcon />} onClick={() => onNavigate('tasks')} />
         </aside>
-        <main className="execution-main">
+        <main className="execution-main" tabIndex={-1} ref={mainRef}>
           {!data && !error && <GlassPanel><span role="status">{t('loading')}</span></GlassPanel>}
-          {error && <GlassPanel><p role="alert" style={{ color: 'var(--bad)' }}>{t('errorLoading')} {t('errorLoadingHint')}</p><button className="execution-back" onClick={load}>{t('retry')}</button></GlassPanel>}
+          {error && <GlassPanel><p role="alert" style={{ color: 'var(--bad)' }}>{t('errorLoading')} {t('errorLoadingHint')}</p><button className="execution-back" onClick={retry}>{t('retry')}</button></GlassPanel>}
           {data && <>
             <div className="kpi-grid">
               <KpiCard label={t('visibleRuns')} value={data.summary.visible_runs} meta={t('runHistory')} />
@@ -100,7 +107,7 @@ export default function Execution({ onNavigate }: { onNavigate: (screen: 'home' 
                 {states.map(([name, count]) => <button key={name} aria-pressed={state === name} title={name} className={state === name ? 'active' : ''} onClick={() => setState(name)}>{humanStatus(RUN_STATE_KEYS, name, t).label} · {count}</button>)}
               </div>
               <div className="execution-list">
-                {runs.length === 0 ? <p style={{ color: 'var(--tx3-aa)' }}>{t('noRuns')}</p> : runs.map((run) => <RunRow key={`${run.source}-${run.id}`} run={run} fallback={t('notAvailable')} language={i18n.language} />)}
+                {runs.length === 0 ? <div><p style={{ color: 'var(--tx3-aa)' }}>{t('noRuns')}</p>{state !== 'ALL' && <button type="button" className="execution-back" onClick={() => setState('ALL')}>{t('resetFilters')}</button>}</div> : runs.map((run) => <RunRow key={`${run.source}-${run.id}`} run={run} fallback={t('notAvailable')} language={i18n.language} />)}
               </div>
             </GlassPanel>
           </>}

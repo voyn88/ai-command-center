@@ -81,3 +81,37 @@ test('failed runs sort first and raise an attention banner', async () => {
   expect(screen.getByText('2 min 5 s')).toBeInTheDocument()
   expect(screen.getByRole('button', { name: /^All states/ })).toHaveAttribute('aria-pressed', 'true')
 })
+
+test('an unknown state shows a neutral phrase, the raw code only in a tooltip', async () => {
+  vi.mocked(fetchExecution).mockResolvedValueOnce({
+    summary: { visible_runs: 1, active: 0, completed: 0, needs_attention: 0 },
+    state_counts: { WAITING_FOR_APPROVAL: 1 },
+    runs: [{ id: 'z', source: 'v2', title: 'odd run', project: 'AICC', project_name: 'AICC', task_type: 'x', state: 'WAITING_FOR_APPROVAL', created_at: '2026-08-03T10:00:00', started_at: null, completed_at: null, duration_seconds: null, exit_code: null, failure_reason: 'brand_new_reason', verdict: 'WEIRD_VERDICT' },
+    ],
+  })
+  render(<Execution onNavigate={vi.fn()} />)
+
+  await screen.findByText('odd run')
+  expect(screen.queryByText('WAITING_FOR_APPROVAL')).not.toBeInTheDocument()
+  expect(screen.queryByText('WEIRD_VERDICT')).not.toBeInTheDocument()
+  expect(screen.queryByText(/brand_new_reason/)).not.toBeInTheDocument()
+  expect(screen.getAllByText('Status being clarified')[0]).toHaveAttribute('title', 'WAITING_FOR_APPROVAL')
+})
+
+test('an empty filtered list offers "Reset filters" that restores the list', async () => {
+  vi.mocked(fetchExecution).mockResolvedValueOnce({
+    summary: { visible_runs: 2, active: 1, completed: 1, needs_attention: 0 },
+    state_counts: { RUNNING: 1, COMPLETED: 1 },
+    runs: [
+      { id: 'a', source: 'v2', title: 'running one', project: 'AICC', project_name: 'AICC', task_type: 'x', state: 'RUNNING', created_at: '2026-08-03T10:00:00', started_at: null, completed_at: null, duration_seconds: null, exit_code: null, failure_reason: null, verdict: null },
+      { id: 'b', source: 'v2', title: 'done one', project: 'AICC', project_name: 'AICC', task_type: 'x', state: 'COMPLETED', created_at: '2026-08-03T09:00:00', started_at: null, completed_at: null, duration_seconds: null, exit_code: 0, failure_reason: null, verdict: 'APPROVED_FOR_COMMIT' },
+    ],
+  })
+  render(<Execution onNavigate={vi.fn()} />)
+  await screen.findByText('running one')
+  expect(screen.getByText('Approved for commit')).toBeInTheDocument()
+  fireEvent.click(screen.getByRole('button', { name: /^Completed/ }))
+  expect(screen.queryByText('running one')).not.toBeInTheDocument()
+  fireEvent.click(screen.getByRole('button', { name: /^All states/ }))
+  expect(screen.getByText('running one')).toBeInTheDocument()
+})

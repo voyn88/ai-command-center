@@ -14,7 +14,7 @@
 // 401 from the queue reads, because both mean the same thing — the stored
 // credential is missing or rejected.
 
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 import BackgroundSwitcher from '../components/BackgroundSwitcher'
@@ -32,16 +32,12 @@ import {
   setOwnerToken,
 } from '../lib/queueApi'
 import type { QueueItem, QueueItemDetail } from '../lib/queueApi'
-import { ATTEMPT_STATE_KEYS, formatOutcomeReason, humanStatus } from '../lib/labels'
+import { ATTEMPT_STATE_KEYS, formatOutcomeReason, humanStatus, QUEUE_STATE_KEYS, reasonLabel } from '../lib/labels'
 
 const STATUS_ORDER = ['ALL', 'ready', 'claimed', 'succeeded', 'dead'] as const
 
 function statusKey(state: string): string {
-  if (state === 'ready') return 'taskStatusReady'
-  if (state === 'claimed') return 'taskStatusClaimed'
-  if (state === 'succeeded') return 'taskStatusSucceeded'
-  if (state === 'dead') return 'taskStatusDead'
-  return 'unknownState'
+  return QUEUE_STATE_KEYS[state] ?? 'statusUnclear'
 }
 
 function statusTone(state: string): string {
@@ -76,7 +72,7 @@ function TaskDetails({ detail, fallback }: { detail: QueueItemDetail; fallback: 
       {detail.dead_reason && (
         <p>
           <span className="task-details-label">{t('taskReason')}</span>{' '}
-          <span title={detail.dead_reason}>{detail.dead_reason === 'timeout' ? t('reasonTimeout') : detail.dead_reason}</span>
+          <span title={detail.dead_reason}>{reasonLabel(detail.dead_reason, t) ?? t('reasonUnclear')}</span>
         </p>
       )}
       {resultText && (
@@ -88,12 +84,19 @@ function TaskDetails({ detail, fallback }: { detail: QueueItemDetail; fallback: 
         <span className="task-details-label">{t('taskAttempts')}</span>{' '}
         {detail.attempts.length === 0
           ? fallback
-          : detail.attempts
-              .map((attempt) => `№${attempt.attempt_no} — ${humanStatus(ATTEMPT_STATE_KEYS, attempt.state, t).label}${attempt.outcome_reason ? ` (${formatOutcomeReason(attempt.outcome_reason, t)})` : ''}`)
-              .join('; ')}
+          : detail.attempts.map((attempt, i) => {
+              const state = humanStatus(ATTEMPT_STATE_KEYS, attempt.state, t)
+              return (
+                <span key={`${attempt.attempt_no}-${i}`} title={[attempt.state, attempt.outcome_reason].filter(Boolean).join(' · ')}>
+                  {i > 0 && '; '}
+                  {`№${attempt.attempt_no} — ${state.label}${attempt.outcome_reason ? ` (${formatOutcomeReason(attempt.outcome_reason, t)})` : ''}`}
+                </span>
+              )
+            })}
       </p>
       {/* Технические идентификаторы — только здесь, моноширинно, для копирования в отчёт. */}
       <p className="task-details-tech">{detail.work_item_id}</p>
+      {detail.task_id && <p className="task-details-tech" title={t('taskIdLabel')}>{detail.task_id}</p>}
     </div>
   )
 }
@@ -119,7 +122,7 @@ function TaskRow({ item, language, fallback }: { item: QueueItem; language: stri
         <span className="task-status" title={item.state} style={{ color: statusTone(item.state) }}>
           {t(statusKey(item.state))}
         </span>
-        <strong>{taskTitle(item, t)}</strong>
+        <strong title={item.task_id ? `${t('taskIdLabel')}: ${item.task_id}` : undefined}>{taskTitle(item, t)}</strong>
         <span className="task-date">{formatDate(item.created_at, language, fallback)}</span>
         <button type="button" className="task-toggle" aria-expanded={open} onClick={toggle}>
           {open ? t('taskHide') : t('taskDetails')}
@@ -277,6 +280,7 @@ export default function Tasks({ onNavigate }: { onNavigate: (screen: 'home' | 'e
   const [error, setError] = useState(false)
   const [filter, setFilter] = useState<string>('ALL')
   const [projects, setProjects] = useState<Project[]>([])
+  const mainRef = useRef<HTMLElement>(null)
   const [pendingAudit, setPendingAudit] = useState<AuditDraft | null>(null)
 
   const load = useCallback(() => {
@@ -332,7 +336,7 @@ export default function Tasks({ onNavigate }: { onNavigate: (screen: 'home' | 'e
           <NavItem label={t('execution')} icon={<ExecutionIcon />} onClick={() => onNavigate('execution')} />
           <NavItem label={t('tasks')} icon={<TasksIcon />} active onClick={() => onNavigate('tasks')} />
         </aside>
-        <main className="execution-main">
+        <main className="execution-main" tabIndex={-1} ref={mainRef}>
           {locked && (
             <TokenGate notice={pendingAudit ? t('auditLocked') : null} onUnlocked={load} />
           )}
@@ -340,7 +344,7 @@ export default function Tasks({ onNavigate }: { onNavigate: (screen: 'home' | 'e
           {!locked && error && (
             <GlassPanel>
               <p role="alert" style={{ color: 'var(--bad)' }}>{t('errorLoading')} {t('errorLoadingHint')}</p>
-              <button className="execution-back" onClick={load}>{t('retry')}</button>
+              <button className="execution-back" onClick={() => { mainRef.current?.focus(); load() }}>{t('retry')}</button>
             </GlassPanel>
           )}
           {!locked && items && (
@@ -367,7 +371,7 @@ export default function Tasks({ onNavigate }: { onNavigate: (screen: 'home' | 'e
               </div>
               <div className="execution-list">
                 {visible.length === 0 ? (
-                  <p style={{ color: 'var(--tx3-aa)' }}>{t('taskEmpty')}</p>
+                  <div><p style={{ color: 'var(--tx3-aa)' }}>{t('taskEmpty')}</p>{filter !== 'ALL' && <button type="button" className="execution-back" onClick={() => setFilter('ALL')}>{t('resetFilters')}</button>}</div>
                 ) : (
                   visible.map((item) => (
                     <TaskRow key={item.work_item_id} item={item} language={i18n.language} fallback={t('notAvailable')} />

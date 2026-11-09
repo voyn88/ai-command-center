@@ -1,6 +1,8 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
+import type { TFunction } from 'i18next'
+import { kpiMeta } from '../lib/labels'
 import { fetchHome } from '../lib/api'
 import type { HomeDTO, Kpi } from '../lib/api'
 import GlassPanel from '../components/GlassPanel'
@@ -62,9 +64,10 @@ const NAV_ICONS = [
 // Pairs `meta_n` with `meta_key` for the agents/tasks/reviews KPIs
 // ("2 running", "5 in progress", "1 pending"). NOT used for the Projects
 // KPI — see `formatProjectsMeta` below.
-function formatKpiMeta(kpi: Kpi, t: (key: string) => string): string {
-  if (kpi.meta_n !== undefined) return `${kpi.meta_n} ${t(kpi.meta_key)}`
-  return t(kpi.meta_key)
+// Backend meta_key values are mapped in lib/labels.ts (KPI_META_KEYS); an
+// unknown key renders nothing rather than a raw i18n key.
+function formatKpiMeta(kpi: Kpi, t: TFunction): string {
+  return kpiMeta(kpi.meta_key, kpi.meta_n, t)
 }
 
 // The backend's `kpis.projects.meta_key` is ALWAYS the literal string
@@ -75,7 +78,7 @@ function formatKpiMeta(kpi: Kpi, t: (key: string) => string): string {
 // `health.{projects_healthy,projects_total}` (the same source
 // `HealthDonut` uses), so we derive the Projects KPI's meta text from that
 // instead of from `meta_key`.
-function formatProjectsMeta(healthy: number, total: number, t: (key: string) => string): string {
+function formatProjectsMeta(healthy: number, total: number, t: TFunction): string {
   if (total > 0 && healthy === total) return t('all_healthy')
   return `${healthy} ${t('healthyCount')}`
 }
@@ -97,6 +100,7 @@ export default function Home({ onNavigate = () => undefined }: { onNavigate?: (s
   const [data, setData] = useState<HomeDTO | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
+  const restoreFocus = useRef(false)
 
   function load() {
     setLoading(true)
@@ -113,6 +117,14 @@ export default function Home({ onNavigate = () => undefined }: { onNavigate?: (s
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  // After "Retry" the button that had focus is gone; hand focus to <main>.
+  useEffect(() => {
+    if (!loading && data && restoreFocus.current) {
+      restoreFocus.current = false
+      document.querySelector('main')?.focus()
+    }
+  }, [loading, data])
+
   if (loading) {
     return <CenteredPanel><span role="status">{t('loading')}</span></CenteredPanel>
   }
@@ -124,7 +136,7 @@ export default function Home({ onNavigate = () => undefined }: { onNavigate?: (s
         <div style={{ color: 'var(--tx2)', fontSize: '0.8rem', marginBottom: '0.75rem' }}>{t('errorLoadingHint')}</div>
         <button
           type="button"
-          onClick={load}
+          onClick={() => { restoreFocus.current = true; load() }}
           className="glass"
           style={{ padding: '0.4rem 0.9rem', color: 'var(--tx)', cursor: 'pointer', background: 'var(--glass)' }}
         >
@@ -183,7 +195,7 @@ export default function Home({ onNavigate = () => undefined }: { onNavigate?: (s
           })}
         </aside>
 
-        <main style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem', minWidth: 0 }}>
+        <main tabIndex={-1} style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem', minWidth: 0 }}>
           <div className="kpi-grid">
             <KpiCard
               label={t('projects')}

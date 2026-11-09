@@ -119,4 +119,16 @@ describe('Home', () => {
     expect(badge).toHaveAttribute('title', 'RUNNING')
     expect(screen.queryByText('RUNNING')).not.toBeInTheDocument()
   })
+
+  test('an unknown KPI meta_key renders nothing, never a raw i18n key', async () => {
+    vi.mocked(fetchHome).mockResolvedValue({
+      ...baseHome,
+      kpis: { ...baseHome.kpis, agents: { value: 4, meta_key: 'kpi.agents.meta', meta_n: 2 } },
+    })
+    render(<Home />)
+
+    await waitFor(() => expect(screen.getByText('Desktop Architecture D1')).toBeInTheDocument())
+    expect(screen.queryByText(/kpi\.agents\.meta/)).not.toBeInTheDocument()
+    expect(screen.getByText('1 pending')).toBeInTheDocument() // real keys still work
+  })
 })

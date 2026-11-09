@@ -81,4 +81,43 @@ describe('server workspace', () => {
     const tile = screen.getByRole('button', { name: 'В работе: 1' })
     expect(heading.compareDocumentPosition(tile) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
   })
+  test('stale list covers every non-terminal status, oldest first, with a show-all toggle', async () => {
+    const ago = (d: number) => new Date(Date.now() - d * 24 * 3600 * 1000).toISOString()
+    const mk = (id: string, status: string, d: number) => ({ id, title: `T ${id}`, status, project: 'AICC', priority: null, updated_at: ago(d) })
+    vi.mocked(fetchBacklog).mockResolvedValue({
+      ...snapshot,
+      tasks: [mk('a', 'READY_TO_REVIEW', 4), mk('b', 'DEFER_TO_USER', 9), mk('c', 'OPEN', 5), mk('d', 'IN_PROGRESS', 6), mk('e', 'NEEDS_REFINEMENT', 7), mk('f', 'DONE', 30), mk('g', 'IN_PROGRESS', 1)],
+    })
+    render(<ServerWorkspace />)
+    await screen.findByText('Без движения 3 дня и больше: 5')
+    const panel = screen.getByRole('heading', { name: 'Давно без движения' }).closest('section') as HTMLElement
+    const titles = () => Array.from(panel.querySelectorAll('h3')).map(h => h.textContent)
+    expect(titles()).toEqual(['T b', 'T e', 'T d', 'T c'])
+    fireEvent.click(screen.getByRole('button', { name: 'Показать все (5)' }))
+    expect(titles()).toEqual(['T b', 'T e', 'T d', 'T c', 'T a'])
+    expect(titles()).not.toContain('T f')
+  })
+  test('unknown backlog status is a neutral phrase with the raw code in a tooltip', async () => {
+    vi.mocked(fetchBacklog).mockResolvedValue({ ...snapshot, tasks: [{ id: 'x', title: 'Odd', status: 'SOMETHING_NEW', project: 'AICC', priority: null, updated_at: '-' }] })
+    window.location.hash = '#tasks'
+    render(<ServerWorkspace />)
+    const badge = await screen.findByText('Статус уточняется')
+    expect(badge).toHaveAttribute('title', 'SOMETHING_NEW')
+  })
+  test('no reset button when no filter is active; no focus loss after retry', async () => {
+    window.location.hash = '#tasks'
+    vi.mocked(fetchBacklog).mockResolvedValue({ ...snapshot, tasks: [], total: 0, counts: {} })
+    render(<ServerWorkspace />)
+    expect(await screen.findByText('Задач пока нет.')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Сбросить фильтры' })).not.toBeInTheDocument()
+  })
+  test('focus moves to the refresh button after a successful retry', async () => {
+    vi.mocked(fetchBacklog).mockRejectedValueOnce(new Error('offline'))
+    render(<ServerWorkspace />)
+    const retry = await screen.findByRole('button', { name: 'Повторить' })
+    retry.focus()
+    fireEvent.click(retry)
+    await screen.findByText('Choose scope')
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Обновить' })).toHaveFocus())
+  })
 })

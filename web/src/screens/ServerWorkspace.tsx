@@ -1,6 +1,6 @@
 // Server data mode of the existing AICC React application. Reuses its visual
 // components; the local workspace and privileged queue client stay unchanged.
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import GlassPanel from '../components/GlassPanel'
 import KpiCard from '../components/KpiCard'
 import NavItem from '../components/NavItem'
@@ -9,7 +9,7 @@ import { HomeIcon, TasksIcon, ExecutionIcon } from '../components/NavIcons'
 import { fetchBacklog, statusName } from '../lib/backlogApi'
 import type { BacklogSnapshot, BacklogTask } from '../lib/backlogApi'
 import i18n from '../lib/i18n'
-import { fmt, formatRelativeAge, isStale, priorityLabel, RU } from '../lib/labels'
+import { BACKLOG_TERMINAL, fmt, formatRelativeAge, isStale, priorityLabel, RU } from '../lib/labels'
 import '../theme/serverWorkspace.css'
 
 // Server mode is Russian regardless of the saved UI language.
@@ -17,7 +17,7 @@ const tRu = i18n.getFixedT('ru')
 
 type Screen = 'home' | 'tasks' | 'execution'
 const initialScreen = (): Screen => window.location.hash === '#tasks' || window.location.search.includes('master_backlog') ? 'tasks' : window.location.hash === '#execution' ? 'execution' : 'home'
-const isStalled = (task: BacklogTask) => task.status === 'IN_PROGRESS' && isStale(task.updated_at)
+const isStalled = (task: BacklogTask) => !BACKLOG_TERMINAL.includes(task.status) && isStale(task.updated_at)
 const order: Record<string, number> = { DEFER_TO_USER: 0, IN_PROGRESS: 1, READY_TO_REVIEW: 2, NEEDS_REFINEMENT: 3, OPEN: 4 }
 const displayDate = (value: string) => {
   const date = new Date(value)
@@ -46,6 +46,9 @@ export default function ServerWorkspace() {
   const [status, setStatus] = useState('ALL')
   const [project, setProject] = useState('ALL')
   const [limit, setLimit] = useState(30)
+  const [showAllStale, setShowAllStale] = useState(false)
+  const refreshButton = useRef<HTMLButtonElement>(null)
+  const restoreFocus = useRef(false)
 
   useEffect(() => {
     document.documentElement.lang = 'ru'
@@ -83,17 +86,22 @@ export default function ServerWorkspace() {
     `${task.title} ${task.id} ${task.project}`.toLocaleLowerCase().includes(query.toLocaleLowerCase()),
   ).sort((a, b) => (order[a.status] ?? 9) - (order[b.status] ?? 9) || (a.priority || 'Z').localeCompare(b.priority || 'Z') || b.updated_at.localeCompare(a.updated_at))
   const attention = tasks.filter(t => t.status === 'DEFER_TO_USER')
-  const stalled = tasks.filter(isStalled)
-  const retry = () => { setLoading(true); setRefresh(n => n + 1) }
+  const stalled = tasks.filter(isStalled).sort((a, b) => a.updated_at.localeCompare(b.updated_at))
+  const filtersActive = query !== '' || project !== 'ALL' || status !== 'ALL'
+  const retry = () => { restoreFocus.current = true; setLoading(true); setRefresh(n => n + 1) }
+  // The Retry button unmounts on success; give focus to the stable refresh button instead of losing it.
+  useEffect(() => {
+    if (!loading && restoreFocus.current) { restoreFocus.current = false; refreshButton.current?.focus() }
+  }, [loading])
   const resetFilters = () => { setQuery(''); setStatus('ALL'); setProject('ALL'); setLimit(30) }
   return <div className="owner-shell">
-    <header className="glass owner-header"><div className="owner-brand"><div className="mark" aria-hidden="true" /><div><strong>AI Command Center</strong><p>Разработка под контролем</p></div></div><button className="owner-button" onClick={retry} disabled={loading}>{loading ? 'Обновление…' : 'Обновить'}</button></header>
+    <header className="glass owner-header"><div className="owner-brand"><div className="mark" aria-hidden="true" /><div><strong>AI Command Center</strong><p>Разработка под контролем</p></div></div><button ref={refreshButton} className="owner-button" onClick={() => { if (!loading) retry() }} aria-disabled={loading} aria-busy={loading}>{loading ? 'Обновление…' : 'Обновить'}</button></header>
     <nav className="glass owner-nav" aria-label="Главное меню">
       <NavItem label="Обзор" icon={<HomeIcon />} active={screen === 'home'} onClick={() => navigate('home')} />
       <NavItem label="Задачи" icon={<TasksIcon />} active={screen === 'tasks'} onClick={() => navigate('tasks')} />
       <NavItem label="В работе" icon={<ExecutionIcon />} active={screen === 'execution'} onClick={() => navigate('execution')} />
     </nav>
-    <main>
+    <main tabIndex={-1}>
       {error && <div role="alert" className="owner-notice">{data ? RU.errorWithData : RU.errorNoData}<button className="owner-button" onClick={retry}>{RU.retry}</button></div>}
       {data?.stale && <div role="alert" className="owner-notice">Список давно не обновлялся. Статусы могут быть неактуальны.</div>}
       {!data && !error && <div role="status" aria-label={RU.loadingTasks}><p className="owner-muted">{RU.loadingTasks}</p><div className="owner-skeleton" /><div className="owner-skeleton" /><div className="owner-skeleton" /></div>}
@@ -110,7 +118,8 @@ export default function ServerWorkspace() {
           </div>
           <GlassPanel title={RU.staleTitle}>
             <p className="owner-muted">{stalled.length ? fmt(RU.staleSome, { n: stalled.length }) : RU.staleNone}</p>
-            {stalled.slice(0, 4).map((task, i) => <TaskCard key={`${task.id}-${i}`} task={task} commands={data.commands_enabled} onChanged={() => setRefresh(n => n + 1)} />)}
+            {stalled.slice(0, showAllStale ? stalled.length : 4).map((task, i) => <TaskCard key={`${task.id}-${i}`} task={task} commands={data.commands_enabled} onChanged={() => setRefresh(n => n + 1)} />)}
+            {stalled.length > 4 && <button className="owner-button" onClick={() => setShowAllStale(v => !v)} aria-expanded={showAllStale}>{showAllStale ? RU.showLess : `${RU.showAll} (${stalled.length})`}</button>}
           </GlassPanel>
           <div className="owner-section"><GlassPanel title="Проекты">
             {[...new Set(tasks.map(t => t.project))].sort().map(name => <button className="owner-project" key={name} onClick={() => { setProject(name); navigate('tasks') }}><strong>{name}</strong><span>{tasks.filter(t => t.project === name).length} задач →</span></button>)}
@@ -123,7 +132,7 @@ export default function ServerWorkspace() {
           </div>
           <p className="owner-muted" role="status">Найдено {filtered.length} · Всего {data.total}</p>
           {filtered.slice(0, limit).map((task, i) => <TaskCard key={`${task.id}-${i}`} task={task} commands={data.commands_enabled} onChanged={() => setRefresh(n => n + 1)} />)}
-          {!filtered.length && <div><p>По этим фильтрам задач нет.</p><button className="owner-button" onClick={resetFilters}>{RU.resetFilters}</button></div>}
+          {!filtered.length && (filtersActive ? <div><p>По этим фильтрам задач нет.</p><button className="owner-button" onClick={resetFilters}>{RU.resetFilters}</button></div> : <p>{RU.noTasks}</p>)}
           {filtered.length > limit && <button className="owner-button" onClick={() => setLimit(n => n + 30)}>Показать ещё ({filtered.length - limit})</button>}
         </GlassPanel>}
       </>}
