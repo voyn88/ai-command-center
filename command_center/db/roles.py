@@ -128,6 +128,11 @@ ALL_TABLES: tuple[str, ...] = (
     "backlog_scan_cursor",
     "backlog_writer_lease",
     "coordinator_state",
+    "cto_control",
+    "cto_assignment",
+    "cto_work_binding",
+    "cto_execution_start",
+    "cto_assignment_event",
     "completion",
     "completion_event",
     "completion_validation",
@@ -208,6 +213,7 @@ IDENTITY_SEQUENCES: MappingProxyType[str, str] = MappingProxyType(
         "completion_event": "completion_event_id_seq",
         "completion_validation": "completion_validation_id_seq",
         "council_event": "council_event_id_seq",
+        "cto_assignment_event": "cto_assignment_event_event_id_seq",
         "model_event": "model_event_id_seq",
         "principal_event": "principal_event_id_seq",
         "proposal_event": "proposal_event_id_seq",
@@ -329,6 +335,11 @@ _APP_BACKLOG_TABLES: dict[str, frozenset[str]] = {
     "delivery_team_evidence": _READ,
     "delivery_team_release_receipt": _READ,
 
+    "cto_control": _READ,
+    "cto_assignment": _READ,
+    "cto_work_binding": _READ,
+    "cto_execution_start": _READ,
+    "cto_assignment_event": _READ,
     "backlog_task": _READ,
     "backlog_dependency": _READ,
     "backlog_evidence": _READ,
@@ -349,6 +360,11 @@ _WORKER_BACKLOG_TABLES: dict[str, frozenset[str]] = {
     "delivery_team_evidence": _NONE,
     "delivery_team_release_receipt": _NONE,
 
+    "cto_control": _NONE,
+    "cto_assignment": _NONE,
+    "cto_work_binding": _NONE,
+    "cto_execution_start": _NONE,
+    "cto_assignment_event": _NONE,
     "backlog_task": _NONE,
     "backlog_dependency": _NONE,
     "backlog_evidence": _NONE,
@@ -569,6 +585,7 @@ VIEW_PRIVILEGES: MappingProxyType[str, MappingProxyType[str, frozenset[str]]] = 
 # `GRANT EXECUTE ON FUNCTION queue_claim` would be ambiguous the moment an
 # overload appeared.
 _WORKER_FUNCTIONS = (
+    "cto_authorize_start(text, text)",
     "queue_claim(text, text, integer)",
     "queue_heartbeat(text, text)",
     "queue_complete(text, text, jsonb)",
@@ -689,6 +706,9 @@ _APP_ENROLMENT_FUNCTIONS = (
 # readmitting a retired host (through a `re_enroll` mint, gated inside the
 # function on the caller's tier) and revoking one.
 _OPERATOR_FUNCTIONS = (
+    "cto_assign(text, bigint, text, jsonb, text)",
+    "cto_revoke(text, text)",
+    "cto_activate(text)",
     "enroll_mint_ticket(text, text, text, inet, interval, text)",
     "enroll_revoke_ticket(text, text)",
     "enroll_sweep_expired()",
@@ -767,7 +787,14 @@ PRIVILEGES: MappingProxyType[str, MappingProxyType[str, frozenset[str]]] = (
             # folding the default in would hand the admission lever DML on every
             # domain table in the schema.
             OPERATOR_ROLE: MappingProxyType(
-                merge_privileges(_OPERATOR_ENROLMENT_TABLES, _FINALIZATION_CLAIM_TABLES)
+                merge_privileges(
+                    _OPERATOR_ENROLMENT_TABLES,
+                    _FINALIZATION_CLAIM_TABLES,
+                    {name: _READ for name in (
+                        "cto_control", "cto_assignment", "cto_work_binding",
+                        "cto_execution_start", "cto_assignment_event",
+                    )},
+                )
             ),
         }
     )

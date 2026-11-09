@@ -317,6 +317,24 @@ class WorkerDaemon:
         self._notify("STOPPING=1")
 
     def _execute(self, work: ClaimedWork) -> None:
+        if work.start_deadline is None or time.monotonic() >= work.start_deadline:
+            logger.warning("attempt %s: claim start budget elapsed", work.attempt_id)
+            return
+        # A claim is not permission to start. SQL serializes this decision
+        # with operator revocation and commits it before returning. On an
+        # unavailable gate (including an old schema), leave the lease to its
+        # existing expiry/reaper protocol; never launch or invent a result.
+        try:
+            authorized = self._store.authorize_start(work)
+        except Exception:
+            logger.warning("attempt %s: start authorization unavailable", work.attempt_id)
+            return
+        if not authorized:
+            logger.warning("attempt %s: start authorization denied", work.attempt_id)
+            return
+        if time.monotonic() >= work.start_deadline:
+            logger.warning("attempt %s: authorization response outlived lease budget", work.attempt_id)
+            return
         lease_lost = threading.Event()
         beat_stop = threading.Event()
         beat = threading.Thread(
@@ -387,6 +405,9 @@ class WorkerDaemon:
     def _dispatch(
         self, work: ClaimedWork, lease_lost: threading.Event
     ) -> HandlerOutcome:
+        if work.start_deadline is None or time.monotonic() >= work.start_deadline:
+            lease_lost.set()
+            return HandlerOutcome(ok=False, reason="claim start budget elapsed", retryable=False)
         if not isinstance(work.payload, dict):
             # queue_enqueue accepts any jsonb — a list or bare string is
             # producible by the app role, and `.get` on it would raise out of
@@ -408,6 +429,9 @@ class WorkerDaemon:
                 retryable=False,
             )
         try:
+            if lease_lost.is_set() or time.monotonic() >= work.start_deadline:
+                lease_lost.set()
+                return HandlerOutcome(ok=False, reason="claim start budget elapsed", retryable=False)
             return handler(work.payload, lease_lost, work.attempt_no)
         except Exception as error:
             logger.exception("handler for %r raised", kind)
@@ -423,11 +447,15 @@ class WorkerDaemon:
         # PostgreSQL, a network blip) before the lease actually lapses. The
         # watchdog cap can shorten the wait — an extra lease renewal is
         # harmless, a missed watchdog deadline during a long run is a restart.
-        interval = max(self._config.visibility_seconds / 3.0, 1.0)
+        window = min(max(self._config.visibility_seconds, 1), 3600)
+        interval = max(window / 3.0, 1.0)
         watchdog = sdnotify.watchdog_interval_seconds()
         if watchdog is not None:
             interval = min(interval, max(watchdog, 1.0))
-        deadline = time.monotonic() + self._config.visibility_seconds
+        if work.start_deadline is None:
+            lease_lost.set()
+            return
+        deadline = min(work.start_deadline, time.monotonic() + window)
         while not beat_stop.wait(min(interval, max(deadline - time.monotonic(), 0.0))):
             started = time.monotonic()
             if started >= deadline:
@@ -451,7 +479,7 @@ class WorkerDaemon:
             # PostgreSQL renews from transaction time, before the response
             # arrives. Counting from request start conservatively accounts
             # for that latency instead of granting a fresh window on receipt.
-            deadline = started + self._config.visibility_seconds
+            deadline = started + window
             if not alive or time.monotonic() >= deadline:
                 lease_lost.set()
                 return
