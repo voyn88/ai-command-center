@@ -120,6 +120,14 @@ UNMIRRORED_SCHEMA_TABLES: dict[str, Exclusion] = {
         ),
         task="VOYN-W0-AICC-DELIVERY-TEAM",
     ),
+    "cto_scope": Exclusion(
+        reason=(
+            "The operator's explicit CTO enforcement scope is PostgreSQL-native "
+            "authorization state with no SQLite source. Restore it with cto_control, "
+            "assignments and the switch history; never rebuild it from enrollment. "
+        ),
+        task="VOYN-W0-AICC-DELIVERY-TEAM",
+    ),
     "delivery_team_corrective_assignment": Exclusion(
         reason=("PostgreSQL-native operator corrective authority has no SQLite source; "
                 "restore it with canonical remediation lineage and incident evidence."),

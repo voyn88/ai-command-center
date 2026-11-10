@@ -333,7 +333,8 @@ def test_refusal_with_exit_zero_and_no_verdict_is_retried_not_permanently_succee
 
     assert report.retried == [(TASK, f"{target}:retry:1")]
     assert len(dispatched) == 1
-    _queue, retry_key, payload, task_id, max_attempts = dispatched[0]
+    _queue, retry_key, payload, task_id, max_attempts, repository_id = dispatched[0]
+    assert repository_id == "ai-command-center"
     assert retry_key == f"{target}:retry:1"
     assert task_id == TASK
     assert max_attempts > 0
@@ -352,7 +353,7 @@ def test_retry_prefers_a_different_executor_than_the_one_that_refused(monkeypatc
     )
 
     assert len(dispatched) == 1
-    _queue, _retry_key, payload, _task_id, _max_attempts = dispatched[0]
+    _queue, _retry_key, payload, _task_id, _max_attempts, _repository = dispatched[0]
     retry_cascade = payload["cascade"]
     assert [link["executor"] for link in retry_cascade] == ["codex", "claude"]
 

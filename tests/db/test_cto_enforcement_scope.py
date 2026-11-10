@@ -1,7 +1,10 @@
-"""0037: activated CTO enforcement applies to enrolled work only and is reversible.
+"""0037: activated CTO enforcement applies to the operator's scope and is reversible.
 
-PostgreSQL-backed like the 0036 suite (skipped without AICC_TEST_PG_ADMIN_DSN).
-The shared `cto_rig` enrolls TASK in the 0035 stage ledger; OTHER never is.
+PostgreSQL-backed like the 0036 suite: every test here is skipped without
+AICC_TEST_PG_ADMIN_DSN. The shared `cto_rig` enrolls TASK and the operator puts
+it in `cto_scope`; OTHER is never in scope. Payloads below are built by the
+real producers (delivery_team.build_payload, planner._payload_for, the
+review_merge cascade helpers) or copied field-for-field from review_merge.
 """
 
 from __future__ import annotations
@@ -11,6 +14,8 @@ import json
 import pytest
 
 from command_center.db import migrations, roles
+from command_center.orchestrator import delivery_team, review_merge
+from command_center.orchestrator.planner import PlanLimits, _payload_for
 from tests.db.test_cto_assignment import (
     PAYLOAD,
     TASK,
@@ -19,13 +24,71 @@ from tests.db.test_cto_assignment import (
     claim,
     enqueue,
     start,
+    try_activate,
 )
 
 pytest_plugins = ("tests.db.test_cto_assignment",)
 pytestmark = [pytest.mark.serial, pytest.mark.usefixtures("role_passwords")]
 
-OTHER = "VOYN-CTO-UNENROLLED"
-REVIEW = {"kind": "agent_run", "task_type": "review", "prompt": "independent PR review"}
+OTHER = "VOYN-CTO-UNSCOPED"
+REPO = "repo-test"
+ROUTE = ("AICC", "/srv/aicc")
+HEAD = "b" * 40
+
+
+def review_payload(task_id, *, chunk=None, cascade=None):
+    """Field-for-field the payload review_merge._review_once enqueues."""
+    cascade = cascade if cascade is not None else [
+        {"executor": "claude", "task_type": "independent_review", "capability": "model_only"},
+        {"executor": "codex", "task_type": "independent_review", "capability": "model_only"},
+    ]
+    payload = {
+        "kind": "agent_run", "v": 1, "project_id": ROUTE[0],
+        "repository_path": ROUTE[1],
+        "task_type": "independent_review",
+        "prompt": f"Independent review of {task_id} https://github.com/o/{REPO}/pull/7 at {HEAD}",
+        "timeout_seconds": 900,
+        "untrusted": True,
+        "cascade": cascade,
+        "review_head": {"pr_number": "7", "head_sha": HEAD},
+    }
+    if chunk is not None:
+        payload["review_chunk"] = {
+            "version": 3, "index": chunk, "count": 2, "content_bytes": 10,
+            "content_hash": "c" * 64, "manifest_hash": "d" * 64,
+            "base_sha": "a" * 40, "head_sha": HEAD, "diff_hash": "e" * 64,
+        }
+    return payload
+
+
+def verification_payload(task_id):
+    """Field-for-field review_merge's finding-verification payload."""
+    return {
+        "kind": "agent_run", "v": 1, "project_id": ROUTE[0],
+        "repository_path": ROUTE[1],
+        "task_type": "verification_review",
+        "prompt": f"Verify the findings for {task_id}",
+        "timeout_seconds": 900,
+        "untrusted": True,
+        "cascade": [{"executor": "claude", "task_type": "verification_review", "capability": "read_only"}],
+        "review_head": {"pr_number": "7", "head_sha": HEAD},
+    }
+
+
+def audit_payload():
+    """Field-for-field the taskless payload webapi/queue_routes.py enqueues."""
+    return {
+        "kind": "agent_run", "v": 1, "project_id": ROUTE[0],
+        "repository_path": ROUTE[1], "prompt": "audit the repository",
+        "task_type": "review", "untrusted": False, "timeout_seconds": 600,
+    }
+
+
+def raw_enqueue(rig, key, payload, task, repo=REPO):
+    return rig[0].execute(
+        "SELECT queue_enqueue('execution',%s,%s::jsonb,%s,%s)",
+        (key, json.dumps(payload), task, repo),
+    ).fetchone()[0]
 
 
 def deactivate(rig, reason="pilot paused by operator"):
@@ -45,135 +108,201 @@ def audit_count(rig, reason, action=None):
     return rig[0].execute(sql, args).fetchone()[0]
 
 
-def _other_task(app):
+def _other_task(app, enroll=False):
     assert app.execute(
-        "SELECT * FROM backlog_upsert_task(%s,'1','P1','OPEN','task','other','bounded','repo-test')",
-        (OTHER,),
+        "SELECT * FROM backlog_upsert_task(%s,'1','P1','OPEN','task','other','bounded',%s)",
+        (OTHER, REPO),
     ).fetchone()[0]
+    if enroll:
+        app.execute("SELECT * FROM delivery_team_sync(100,%s::jsonb)", (json.dumps([OTHER]),))
 
 
-def _role_payload(rig):
-    revision, digest = rig[0].execute(
-        "SELECT revision,input_digest FROM delivery_team_stage WHERE task_id=%s AND stage='ba'",
-        (TASK,),
-    ).fetchone()
-    return {
-        "kind": "agent_run",
-        "task_type": "review",
-        "untrusted": False,
-        "delivery_team": {"task_id": TASK, "revision": revision, "stage": "ba", "input_digest": digest},
-        "cascade": [{"executor": "claude", "task_type": "review"}],
-    }
+def _candidate(app, task=TASK):
+    return next(
+        row[0] for row in app.execute("SELECT * FROM delivery_team_candidates(100)").fetchall()
+        if row[0]["task_id"] == task
+    )
 
 
-# --- non-enrolled work keeps its pre-activation behaviour --------------------
+# --- out of scope: pre-activation admission ---------------------------------------
 
 
-def test_unenrolled_review_and_retry_pass_after_activation(cto_rig):
+def test_unscoped_review_chunks_and_retry_pass_after_activation(cto_rig):
     app = cto_rig[0]
     _other_task(app)
     activate(cto_rig)
-    review = {**REVIEW, "backlog_task_id": OTHER}
-    first = enqueue(cto_rig, key="pr-review", payload=review, task=OTHER)
-    retry = enqueue(cto_rig, key="pr-review:retry:1", payload=review, task=OTHER)
-    assert first and retry and first != retry
-    # A taskless/other-kind item is not in scope either.
-    assert enqueue(cto_rig, key="service", payload={"kind": "service"}, task=None)
+    chunk = review_payload(OTHER, chunk=0)
+    retry = review_payload(OTHER, chunk=0, cascade=review_merge._failover_cascade(
+        chunk["cascade"], "claude"))
+    first = raw_enqueue(cto_rig, "review:OTHER:chunk0", chunk, OTHER)
+    again = raw_enqueue(cto_rig, "review:OTHER:chunk0:retry:1", retry, OTHER)
+    # The production review writer used to send repository_id NULL; out of
+    # scope that is still admitted exactly as before activation.
+    legacy_null = raw_enqueue(cto_rig, "review:OTHER:chunk1", review_payload(OTHER, chunk=1), OTHER, None)
+    assert first and again and legacy_null
     work = claim(cto_rig)
-    assert work[0] and work[2] in (first, retry)
+    assert work[0] and work[2] in (first, again, legacy_null)
     assert start(cto_rig, work[3])[0]
     assert app.execute("SELECT count(*) FROM cto_work_binding").fetchone()[0] == 0
     assert audit_count(cto_rig, "assignment_required") == 0
 
 
-def test_unenrolled_backlog_dispatch_and_coordinator_pass_after_activation(cto_rig):
+def test_enrollment_growth_alone_does_not_extend_enforcement(cto_rig):
+    """F4: the app role enrolls OTHER; only the operator's scope is enforced."""
+    app = cto_rig[0]
+    _other_task(app, enroll=True)
+    assert app.execute(
+        "SELECT count(*) FROM delivery_team_stage WHERE task_id=%s", (OTHER,)
+    ).fetchone()[0] > 0
+    activate(cto_rig)
+    role = delivery_team.build_payload(_candidate(app, OTHER), ROUTE)
+    candidate = _candidate(app, OTHER)
+    result = app.execute(
+        "SELECT * FROM delivery_team_dispatch(%s,%s,%s,%s,%s::jsonb,2)",
+        (OTHER, candidate["revision"], candidate["stage"], candidate["input_digest"], json.dumps(role)),
+    ).fetchone()
+    assert result[0] and result[2], result
+    assert app.execute("SELECT count(*) FROM cto_scope WHERE task_id=%s", (OTHER,)).fetchone()[0] == 0
+
+
+def test_unscoped_backlog_dispatch_and_coordinator_pass_after_activation(cto_rig):
     from tests.db.test_cto_assignment import _coordinator
 
     app = cto_rig[0]
     _other_task(app)
     activate(cto_rig)
+    task = {"task_id": OTHER, "title": "other", "body": "bounded", "wave": "1", "priority": "P1"}
+    payload, budget = _payload_for(task, PlanLimits(), ROUTE)
     result = app.execute(
-        "SELECT * FROM backlog_dispatch(%s,'planner',60,2,%s::jsonb,2)",
-        (OTHER, json.dumps({"kind": "agent_run", "backlog_task_id": OTHER, "prompt": "legacy"})),
+        "SELECT * FROM backlog_dispatch(%s,'planner',60,2,%s::jsonb,%s)",
+        (OTHER, json.dumps(payload), budget),
     ).fetchone()
     assert result[0] and result[2], result
     wid, failure = _coordinator(app)
     assert wid is not None and failure is None
 
 
-def test_enrolled_unassigned_prefix_does_not_starve_unenrolled_work(cto_rig):
-    for n in range(20):
-        enqueue(cto_rig, key=f"enrolled-{n}")
+def test_taskless_read_only_work_passes_and_taskless_writing_work_is_refused(cto_rig):
+    """F3: work naming no task is out of scope only if it cannot write."""
     activate(cto_rig)
-    wid = enqueue(cto_rig, key="pr-review", payload={**REVIEW, "backlog_task_id": OTHER}, task=OTHER)
-    result = claim(cto_rig)
-    assert result[0] and result[2] == wid
-    assert not claim(cto_rig)[0]
-    assert cto_rig[0].execute(
-        "SELECT max(attempt_count) FROM work_item WHERE idempotency_key LIKE 'enrolled-%'"
-    ).fetchone()[0] == 0
+    assert raw_enqueue(cto_rig, "audit-1", audit_payload(), None, None)
+    writing = {**audit_payload(), "task_type": "implementation", "untrusted": False}
+    laundered = {**audit_payload(), "cascade": [{"executor": "codex", "task_type": "implementation"}]}
+    untyped = {k: v for k, v in audit_payload().items() if k != "task_type"}
+    simple = {"kind": "simple_task", "prompt": "write a file"}
+    for key, payload in (("w1", writing), ("w2", laundered), ("w3", untyped), ("w4", simple)):
+        assert raw_enqueue(cto_rig, key, payload, None) is None, key
+    assert cto_rig[0].execute("SELECT count(*) FROM work_item").fetchone()[0] == 1
+    assert audit_count(cto_rig, "assignment_required", "enqueue") == 4
 
 
-# --- enrolled work: exactly 0036's refusals -----------------------------------
+# --- in scope: every pilot work kind, real shapes ----------------------------------
 
 
-def test_enrolled_role_item_with_null_queue_task_needs_assignment(cto_rig):
+def test_scoped_review_with_null_repository_is_refused_not_matched(cto_rig):
+    """F1: the old review writer's NULL repository can never match a binding."""
+    payload = review_payload(TASK)
+    assign(cto_rig, payload)
     activate(cto_rig)
-    role = _role_payload(cto_rig)
-    assert enqueue(cto_rig, key="role", payload=role, task=None) is None
-    assert audit_count(cto_rig, "assignment_required", "enqueue") == 1
-    assign(cto_rig, role)
-    wid = enqueue(cto_rig, key="role", payload=role, task=None)
+    assert raw_enqueue(cto_rig, "review:TASK", payload, TASK, None) is None
+    assert audit_count(cto_rig, "repository_unresolved", "enqueue") == 1
+    assert cto_rig[0].execute("SELECT count(*) FROM work_item").fetchone()[0] == 0
+
+
+def test_scoped_review_with_repository_and_exact_assignment_is_admitted(cto_rig):
+    payload = review_payload(TASK)
+    assign(cto_rig, payload)
+    activate(cto_rig)
+    wid = raw_enqueue(cto_rig, "review:TASK", payload, TASK)
     assert wid
     work = claim(cto_rig)
     assert work[0] and work[2] == wid
     assert start(cto_rig, work[3])[0]
 
 
-def test_enrolled_payload_with_valid_assignment_passes(cto_rig):
-    assign(cto_rig)
+@pytest.mark.parametrize("kind", ["chunk", "retry", "verification"])
+def test_scoped_review_variants_each_need_their_own_assignment(cto_rig, kind):
+    """Each chunk, :retry:N and verification is a distinct exact payload."""
+    base = review_payload(TASK, chunk=0)
+    assign(cto_rig, base)
     activate(cto_rig)
-    wid = enqueue(cto_rig)
+    variant = {
+        "chunk": review_payload(TASK, chunk=1),
+        "retry": review_payload(TASK, chunk=0, cascade=review_merge._failover_cascade(
+            base["cascade"], "claude")),
+        "verification": verification_payload(TASK),
+    }[kind]
+    assert raw_enqueue(cto_rig, f"review:{kind}", variant, TASK) is None
+    assign(cto_rig, variant)
+    assert raw_enqueue(cto_rig, f"review:{kind}", variant, TASK)
+
+
+def test_scoped_role_stage_from_real_dispatcher_payload(cto_rig):
+    """Role items carry a NULL queue task_id; delivery_team.task_id scopes them."""
+    app = cto_rig[0]
+    candidate = _candidate(app)
+    role = delivery_team.build_payload(candidate, ROUTE)
+    activate(cto_rig)
+    args = (TASK, candidate["revision"], candidate["stage"], candidate["input_digest"], json.dumps(role))
+    sql = "SELECT * FROM delivery_team_dispatch(%s,%s,%s,%s,%s::jsonb,2)"
+    assert app.execute(sql, args).fetchone() == (False, "cto_enqueue_refused", None)
+    assign(cto_rig, role)
+    ok, reason, wid = app.execute(sql, args).fetchone()
+    assert ok and reason == "queued" and wid
+    assert app.execute("SELECT task_id,repository_id FROM work_item WHERE work_item_id=%s",
+                       (wid,)).fetchone() == (None, REPO)
     work = claim(cto_rig)
     assert work[0] and work[2] == wid
     assert start(cto_rig, work[3])[0]
 
 
+def test_scoped_implementation_from_real_planner_payload(cto_rig):
+    app = cto_rig[0]
+    task = {"task_id": TASK, "title": "test", "body": "bounded", "wave": "1", "priority": "P1"}
+    payload, budget = _payload_for(task, PlanLimits(), ROUTE)
+    activate(cto_rig)
+    sql = "SELECT * FROM backlog_dispatch(%s,'planner',60,2,%s::jsonb,%s)"
+    refused = app.execute(sql, (TASK, json.dumps(payload), budget)).fetchone()
+    assert not refused[0] and refused[1] == "cto_assignment_required"
+    # The implementation gate (0035) still applies before any CTO admission.
+    assign(cto_rig, payload)
+    with pytest.raises(Exception, match="delivery_team_requirements_not_ready"):
+        app.execute(sql, (TASK, json.dumps(payload), budget))
+
+
 @pytest.mark.parametrize(
     "task,payload",
     [
-        # Unenrolled queue task id, enrolled payload identity: ambiguous.
         (OTHER, {"kind": "agent_run", "backlog_task_id": TASK, "prompt": "bounded test"}),
         (OTHER, {"kind": "agent_run", "delivery_team": {"task_id": TASK}, "prompt": "bounded test"}),
-        # Padded identities are still recognised as the enrolled task.
         (TASK + " ", {"kind": "agent_run", "prompt": "bounded test"}),
         (None, {"kind": "agent_run", "backlog_task_id": "\t" + TASK, "prompt": "bounded test"}),
-        # Out-of-type kinds for an enrolled task stay refused.
+        (TASK.lower(), {"kind": "agent_run", "prompt": "bounded test"}),
         (TASK, {"kind": "service", "backlog_task_id": TASK}),
     ],
 )
-def test_enrolled_identity_cannot_be_laundered_onto_legacy_path(cto_rig, task, payload):
+def test_scoped_identity_cannot_be_laundered_onto_legacy_path(cto_rig, task, payload):
     assign(cto_rig)
     activate(cto_rig)
-    assert enqueue(cto_rig, key="laundered", payload=payload, task=task) is None
+    assert raw_enqueue(cto_rig, "laundered", payload, task) is None
     assert cto_rig[0].execute("SELECT count(*) FROM work_item").fetchone()[0] == 0
     assert audit_count(cto_rig, "assignment_required", "enqueue") == 1
 
 
-def test_enrolled_digest_mismatch_is_refused(cto_rig):
+def test_scoped_digest_mismatch_is_refused(cto_rig):
     assign(cto_rig)
     activate(cto_rig)
     assert enqueue(cto_rig, payload={**PAYLOAD, "prompt": "changed after approval"}) is None
 
 
-def test_enrolled_revoked_assignment_is_refused(cto_rig):
+def test_scoped_revoked_assignment_is_refused(cto_rig):
     aid = assign(cto_rig)
     cto_rig[1].execute("SELECT cto_revoke(%s,'operator revoked')", (aid,))
     activate(cto_rig)
     assert enqueue(cto_rig) is None
 
 
-def test_enrolled_stale_revision_is_refused_at_claim(cto_rig):
+def test_scoped_stale_revision_is_refused_at_claim(cto_rig):
     assign(cto_rig)
     activate(cto_rig)
     enqueue(cto_rig)
@@ -185,11 +314,8 @@ def test_enrolled_stale_revision_is_refused_at_claim(cto_rig):
     assert audit_count(cto_rig, "stale_revision", "claim") >= 1
 
 
-@pytest.mark.parametrize(
-    "tamper", [{"prompt": "tampered"}, {"backlog_task_id": OTHER}]
-)
+@pytest.mark.parametrize("tamper", [{"prompt": "tampered"}, {"backlog_task_id": OTHER}])
 def test_bound_work_never_falls_back_to_legacy_claim(cto_rig, tamper):
-    """A binding keeps work in scope even if its payload stops naming the task."""
     assign(cto_rig)
     activate(cto_rig)
     wid = enqueue(cto_rig)
@@ -204,7 +330,76 @@ def test_bound_work_never_falls_back_to_legacy_claim(cto_rig, tamper):
     assert audit_count(cto_rig, "binding_mismatch", "claim") == 1
 
 
-# --- deactivation ---------------------------------------------------------------
+# --- operator scope control -----------------------------------------------------
+
+
+def test_scope_is_operator_only_requires_enrollment_and_is_audited(cto_rig, psycopg):
+    app, operator, worker, admin = cto_rig
+    _other_task(app)
+    for conn in (app, worker):
+        for sql in ("SELECT cto_scope_add('X','r')", "SELECT cto_scope_remove('X','r')"):
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                conn.execute(sql)
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            conn.execute("INSERT INTO cto_scope(task_id,reference,added_by) VALUES('X','r','x')")
+    assert not admin.execute("SELECT cto_scope_add(%s,'superuser')", (OTHER,)).fetchone()[0]
+    # Not enrolled in the 0035 ledger: refused.
+    assert not operator.execute("SELECT cto_scope_add(%s,'pilot')", (OTHER,)).fetchone()[0]
+    assert audit_count(cto_rig, "not_enrolled", "scope_add") == 1
+    app.execute("SELECT * FROM delivery_team_sync(100,%s::jsonb)", (json.dumps([OTHER]),))
+    assert not operator.execute("SELECT cto_scope_add(%s,'  ')", (OTHER,)).fetchone()[0]
+    assert operator.execute("SELECT cto_scope_add(%s,'pilot 2')", (OTHER,)).fetchone()[0]
+    assert operator.execute("SELECT cto_scope_add(%s,'pilot 2 again')", (OTHER,)).fetchone()[0]
+    assert operator.execute("SELECT cto_scope_remove(%s,'pilot 2 done')", (OTHER,)).fetchone()[0]
+    assert app.execute(
+        "SELECT action,task_id,reference,actor FROM cto_control_event WHERE task_id=%s ORDER BY event_id",
+        (OTHER,),
+    ).fetchall() == [
+        ("scope_add", OTHER, "pilot 2", roles.OPERATOR_ROLE),
+        ("scope_remove", OTHER, "pilot 2 done", roles.OPERATOR_ROLE),
+    ]
+
+
+def test_scope_remove_releases_unbound_work_but_bound_work_stays_enforced(cto_rig):
+    aid = assign(cto_rig)
+    activate(cto_rig)
+    bound = enqueue(cto_rig, key="bound")
+    assert cto_rig[1].execute("SELECT cto_scope_remove(%s,'pilot paused')", (TASK,)).fetchone()[0]
+    free = enqueue(cto_rig, key="free", payload={**PAYLOAD, "prompt": "unassigned"})
+    assert free
+    cto_rig[1].execute("SELECT cto_revoke(%s,'revoked after scope removal')", (aid,))
+    work = claim(cto_rig)
+    assert work[0] and work[2] == free and work[2] != bound
+    assert not claim(cto_rig)[0]
+
+
+def test_scope_add_while_active_refuses_unbound_work(cto_rig):
+    app, operator = cto_rig[0], cto_rig[1]
+    _other_task(app, enroll=True)
+    activate(cto_rig)
+    assert raw_enqueue(cto_rig, "other-1", {**PAYLOAD, "backlog_task_id": OTHER}, OTHER)
+    assert not operator.execute("SELECT cto_scope_add(%s,'too late')", (OTHER,)).fetchone()[0]
+    assert audit_count(cto_rig, "unbound_scoped_work", "scope_add") == 1
+
+
+# --- activation, deactivation, redrive --------------------------------------------
+
+
+def test_activation_waits_for_unbound_scoped_work_and_redrive_cannot_revive_it(cto_rig):
+    """Low case: scoped work queued before activation is refused, never stranded."""
+    wid = enqueue(cto_rig, key="before-activation")
+    assert not try_activate(cto_rig)
+    assert audit_count(cto_rig, "unbound_scoped_work", "activate") == 1
+    work = claim(cto_rig)  # disabled: legacy claim
+    assert work[0] and work[2] == wid
+    assert cto_rig[2].execute(
+        "SELECT (queue_fail(%s,%s,'abandon before activation',false)).ok",
+        (work[3], "disposable claim fixture"),
+    ).fetchone()[0]
+    activate(cto_rig)
+    assert not cto_rig[0].execute("SELECT queue_redrive(%s,1)", (wid,)).fetchone()[0]
+    assert audit_count(cto_rig, "assignment_required", "redrive") == 1
+    assert cto_rig[0].execute("SELECT state FROM work_item WHERE work_item_id=%s", (wid,)).fetchone()[0] == "dead"
 
 
 def test_deactivation_restores_legacy_path_keeps_history_and_reactivates(cto_rig, psycopg):
@@ -218,30 +413,19 @@ def test_deactivation_restores_legacy_path_keeps_history_and_reactivates(cto_rig
     assert not enabled(cto_rig)
     wid = enqueue(cto_rig, key="unassigned", payload=unassigned)
     assert wid
+    # Reactivation refuses while that unassigned scoped work is outstanding.
+    assert not try_activate(cto_rig)
     work = claim(cto_rig)
     assert work[0] and work[2] == wid
     assert start(cto_rig, work[3])[0]
-    # Nothing is deleted or revoked by deactivation.
     assert app.execute(
         "SELECT revoked_at FROM cto_assignment WHERE assignment_id=%s", (aid,)
     ).fetchone() == (None,)
-    assert app.execute(
-        "SELECT action,reference,actor FROM cto_control_event ORDER BY event_id"
-    ).fetchall() == [
-        ("activate", "all workers test-compatible", roles.OPERATOR_ROLE),
-        ("deactivate", "pilot paused: reviews blocked", roles.OPERATOR_ROLE),
-    ]
     assert audit_count(cto_rig, "granted", "deactivate") == 1
-    # Idempotent when already inactive; no second history row.
-    assert deactivate(cto_rig)
-    assert app.execute("SELECT count(*) FROM cto_control_event").fetchone()[0] == 2
-
-    activate(cto_rig)
-    assert enabled(cto_rig)
-    assert enqueue(cto_rig, key="after-reactivation", payload={**PAYLOAD, "prompt": "again"}) is None
-    assert app.execute("SELECT count(*) FROM cto_control_event").fetchone()[0] == 3
-
-    # The history is append-only even for the database owner.
+    assert deactivate(cto_rig)  # idempotent while off, no second row
+    assert app.execute(
+        "SELECT count(*) FROM cto_control_event WHERE action IN ('activate','deactivate')"
+    ).fetchone()[0] == 2
     for statement in (
         "UPDATE cto_control_event SET reference='rewritten'",
         "DELETE FROM cto_control_event",
@@ -251,7 +435,19 @@ def test_deactivation_restores_legacy_path_keeps_history_and_reactivates(cto_rig
             admin.execute(statement)
 
 
-def test_deactivation_requires_operator_and_reason(cto_rig, psycopg):
+def test_reactivation_after_draining_restores_enforcement(cto_rig):
+    assign(cto_rig)
+    activate(cto_rig)
+    assert deactivate(cto_rig)
+    activate(cto_rig)
+    assert enabled(cto_rig)
+    assert enqueue(cto_rig, key="after", payload={**PAYLOAD, "prompt": "again"}) is None
+    assert cto_rig[0].execute(
+        "SELECT array_agg(action ORDER BY event_id) FROM cto_control_event WHERE task_id IS NULL"
+    ).fetchone()[0] == ["activate", "deactivate", "activate"]
+
+
+def test_switch_requires_operator_and_reason(cto_rig, psycopg):
     app, operator, worker, admin = cto_rig
     activate(cto_rig)
     for conn in (app, worker):
@@ -270,9 +466,18 @@ def test_deactivation_requires_operator_and_reason(cto_rig, psycopg):
     assert not operator.execute("SELECT cto_deactivate('   ')").fetchone()[0]
     assert enabled(cto_rig)
     assert audit_count(cto_rig, "operator_required", "deactivate") == 2
-    assert app.execute(
-        "SELECT count(*) FROM cto_control_event WHERE action='deactivate'"
-    ).fetchone()[0] == 0
+    assert audit_count(cto_rig, "reason_required", "deactivate") == 1
+
+
+def test_claim_token_shape_is_checked_before_scope(cto_rig):
+    app = cto_rig[0]
+    _other_task(app)
+    activate(cto_rig)
+    wid = raw_enqueue(cto_rig, "review", review_payload(OTHER), OTHER)
+    denied = cto_rig[2].execute("SELECT * FROM queue_claim('execution',%s,300)", ("z" * 64,)).fetchone()
+    assert not denied[0] and denied[1] == "bad_claim_token_hash"
+    assert app.execute("SELECT attempt_count FROM work_item WHERE work_item_id=%s", (wid,)).fetchone()[0] == 0
+    assert claim(cto_rig)[0]
 
 
 # --- migration path ---------------------------------------------------------------
@@ -294,8 +499,15 @@ def _migrate(connect_as, target=None):
         return tuple(applied)
 
 
-def test_upgrade_from_unactivated_36_then_clean_downgrade(admin_conn, connect_as):
-    """The real production path: 0036 applied but never activated, then 0037."""
+def _downgrade(connect_as):
+    with connect_as(roles.MIGRATOR_ROLE) as conn:
+        reverted = migrations.downgrade(conn, target=36)
+        roles.apply_table_grants(conn)
+        return tuple(reverted)
+
+
+def test_upgrade_from_unactivated_36_and_guarded_downgrade(admin_conn, connect_as):
+    """Release path: #1110 at 36, never activated, then 0037 as a plain upgrade."""
     roles.apply_bootstrap(admin_conn)
     _migrate(connect_as, target=36)
     baseline = admin_conn.execute(CATALOG).fetchall()
@@ -313,48 +525,34 @@ def test_upgrade_from_unactivated_36_then_clean_downgrade(admin_conn, connect_as
         )
         app.execute("SELECT * FROM delivery_team_sync(100,%s::jsonb)", (json.dumps([TASK]),))
         aid = assign(rig)
-        legacy = enqueue(rig, key="queued-before-upgrade", payload={**REVIEW, "backlog_task_id": OTHER}, task=OTHER)
-        assert legacy
+        queued = raw_enqueue(rig, "queued-before-upgrade", review_payload(OTHER), OTHER, None)
+        assert queued
 
         assert _migrate(connect_as) == (37,)
-        assert admin_conn.execute("SELECT max(version) FROM schema_migration").fetchone()[0] == 37
         assert not enabled(rig)
-        assert app.execute("SELECT count(*) FROM cto_control_event").fetchone()[0] == 0
+        assert app.execute("SELECT count(*) FROM cto_scope").fetchone()[0] == 0
         assert app.execute(
             "SELECT revoked_at FROM cto_assignment WHERE assignment_id=%s", (aid,)
         ).fetchone() == (None,)
-        # Disabled: identical legacy behaviour for queued work.
-        work = claim(rig)
-        assert work[0] and work[2] == legacy
+        # A never-used 37 downgrades to exactly the 36 catalog, then re-upgrades.
+        assert _downgrade(connect_as) == (37,)
+        assert admin_conn.execute(CATALOG).fetchall() == baseline
+        assert _migrate(connect_as) == (37,)
+
+        work = claim(rig)  # disabled: identical legacy behaviour
+        assert work[0] and work[2] == queued
         assert start(rig, work[3])[0]
-
+        assert operator.execute("SELECT cto_scope_add(%s,'pilot')", (TASK,)).fetchone()[0]
         activate(rig)
-        assert enqueue(rig, key="pr-review", payload={**REVIEW, "backlog_task_id": OTHER}, task=OTHER)
-        assert enqueue(rig, key="enrolled-unassigned", payload={**PAYLOAD, "prompt": "x"}) is None
         assert enqueue(rig, key="enrolled-assigned")
+        assert enqueue(rig, key="enrolled-unassigned", payload={**PAYLOAD, "prompt": "x"}) is None
+        assert raw_enqueue(rig, "review-other", review_payload(OTHER), OTHER, None)
 
-        # Downgrade refuses while active, then restores exactly 0036 when off.
-        with connect_as(roles.MIGRATOR_ROLE) as conn:
-            with pytest.raises(Exception, match="forward migration"):
-                migrations.downgrade(conn, target=36)
-        assert enabled(rig)
+        with pytest.raises(Exception, match="forward migration"):
+            _downgrade(connect_as)
         assert deactivate(rig)
-        with connect_as(roles.MIGRATOR_ROLE) as conn:
-            assert tuple(migrations.downgrade(conn, target=36)) == (37,)
-            roles.apply_table_grants(conn)
-    assert admin_conn.execute("SELECT max(version) FROM schema_migration").fetchone()[0] == 36
-    assert admin_conn.execute(CATALOG).fetchall() == baseline
-    # History created by 0037 is gone with its table; assignments survive.
-    assert admin_conn.execute("SELECT to_regclass('cto_control_event')").fetchone()[0] is None
-    assert admin_conn.execute("SELECT count(*) FROM cto_assignment").fetchone()[0] == 1
-
-
-def test_claim_token_shape_is_checked_before_scope(cto_rig):
-    """Unchanged 0036 front door: a malformed hash claims nothing in or out of scope."""
-    activate(cto_rig)
-    wid = enqueue(cto_rig, key="pr-review", payload={**REVIEW, "backlog_task_id": OTHER}, task=OTHER)
-    denied = cto_rig[2].execute("SELECT * FROM queue_claim('execution',%s,300)", ("z" * 64,)).fetchone()
-    assert not denied[0] and denied[1] == "bad_claim_token_hash"
-    assert cto_rig[0].execute(
-        "SELECT attempt_count FROM work_item WHERE work_item_id=%s", (wid,)
-    ).fetchone()[0] == 0
+        # Switch history exists: downgrade still refuses rather than drop it.
+        with pytest.raises(Exception, match="switch history"):
+            _downgrade(connect_as)
+        assert app.execute("SELECT count(*) FROM cto_control_event").fetchone()[0] == 3
+    assert admin_conn.execute("SELECT max(version) FROM schema_migration").fetchone()[0] == 37

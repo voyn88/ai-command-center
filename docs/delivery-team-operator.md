@@ -60,11 +60,14 @@ queue writer or expanded scope are supplied by this command.
 
 These are SQL functions, not commands of this CLI. Run them only through the trusted operator credential path described above: a non-superuser `aicc_operator` session, never app, worker, superuser or `SET ROLE`. Any other caller gets a denial or `false`, and the refusal is audited.
 
-- `SELECT cto_activate('<fleet verification reference>')` turns enforcement on. It then applies only to delivery-team-enrolled tasks, meaning tasks with any `delivery_team_stage` row. Ordinary PR reviews, retries and never-enrolled legacy work are unaffected. Each enrolled task's work then needs its own `cto_assign` (exact task, revision, principal and payload digest).
-- `SELECT cto_deactivate('<reason>')` turns enforcement off. A blank reason is refused. It deletes or revokes nothing: assignments, bindings, start decisions and audit rows are kept, and you can re-activate later.
-- Each transition appends an immutable row to `cto_control_event`, which records the action, the reference or reason, the actor (`session_user`) and the time. Read the switch history there. `cto_control` holds only the current latch and the latest activation.
+1. `SELECT cto_scope_add('<task_id>', '<reference>')` puts one enrolled task under enforcement. Delivery-team enrollment alone never does this. Check the scope with `SELECT * FROM cto_scope`. Use `SELECT cto_scope_remove('<task_id>', '<reason>')` to take a task out of scope; its bound work stays enforced.
+2. Before activating, make sure no unassigned scoped work is ready or claimed. If any is, `cto_activate` returns `false` and audits `unbound_scoped_work`. Then call `SELECT cto_activate('<fleet verification reference>')`. Each scoped task's work then needs its own exact `cto_assign`; the work must carry its canonical repository. Ordinary PR reviews, retries and unscoped work are unaffected.
+3. `SELECT cto_deactivate('<reason>')` turns enforcement off. A blank reason is refused and audited. Nothing is deleted or revoked.
+4. Every switch and scope change appends an immutable row to `cto_control_event`. Put the human or ticket in the reference: the actor column is always `aicc_operator`.
 
-While enforcement is active, schema rollback (the 0037 or 0036 down migration) is refused. Deactivate with a recorded reason before any reviewed downgrade, and back up first: 0037.down drops `cto_control_event`.
+Automatically generated review and verification payloads of a scoped task cannot be pre-assigned, because their digest depends on the PR diff. Keep a task in scope only while its stages are being assigned.
+
+Schema rollback is refused while enforcement is active. It is also refused once any switch or scope decision has been recorded. Use a reviewed forward migration instead.
 
 ## Existing Basic-auth edge
 

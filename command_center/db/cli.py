@@ -33,8 +33,12 @@ _REVIEW_QUEUE_PRIORITY = 10
 def _review_enqueue(
     store: Any, *, priority: int = _REVIEW_QUEUE_PRIORITY
 ) -> Any:
-    """Build the ``enqueue(queue, key, payload, task_id, max_attempts)``
-    writer that ``review_once``/``publish_review_verdicts`` call.
+    """Build the ``enqueue(queue, key, payload, task_id, max_attempts,
+    repository_id)`` writer that ``review_once``/``publish_review_verdicts`` call.
+
+    ``repository_id`` is the canonical repository the PR URL names (the same
+    key as ``backlog_task.repo`` and the planner route table). CTO enforcement
+    (0037) binds in-scope work to that repository and refuses it when absent.
 
     A review run unblocks a merge in minutes; an implementation run can hold
     a worker slot for up to 900s. The claim protocol already orders ready
@@ -49,12 +53,14 @@ def _review_enqueue(
         payload: dict[str, Any],
         task_id: str | None,
         max_attempts: int,
+        repository_id: str | None = None,
     ) -> str:
         return store.enqueue(
             queue,
             idempotency_key=idempotency_key,
             payload=payload,
             task_id=task_id,
+            repository_id=repository_id,
             max_attempts=max_attempts,
             priority=priority,
         )

@@ -422,7 +422,12 @@ def test_identifier_guard_rejects_injection(bad: str) -> None:
 
 def test_only_operator_can_switch_cto_enforcement() -> None:
     """0037: deactivation shares activation's operator-only boundary."""
-    for lever in ("cto_activate(text)", "cto_deactivate(text)"):
+    for lever in (
+        "cto_activate(text)",
+        "cto_deactivate(text)",
+        "cto_scope_add(text, text)",
+        "cto_scope_remove(text, text)",
+    ):
         assert lever in roles.FUNCTION_PRIVILEGES[roles.OPERATOR_ROLE]
         assert lever not in roles.FUNCTION_PRIVILEGES[roles.APP_ROLE]
         assert lever not in roles.FUNCTION_PRIVILEGES[roles.WORKER_ROLE]
@@ -430,6 +435,25 @@ def test_only_operator_can_switch_cto_enforcement() -> None:
     assert roles.PRIVILEGES[roles.APP_ROLE]["cto_control_event"] == frozenset({"SELECT"})
     assert roles.PRIVILEGES[roles.OPERATOR_ROLE]["cto_control_event"] == frozenset({"SELECT"})
     assert roles.PRIVILEGES[roles.WORKER_ROLE]["cto_control_event"] == frozenset()
+    assert roles.PRIVILEGES[roles.APP_ROLE]["cto_scope"] == frozenset({"SELECT"})
+    assert roles.PRIVILEGES[roles.WORKER_ROLE]["cto_scope"] == frozenset()
+
+
+def test_cto_read_only_task_types_match_the_worker() -> None:
+    """0037's task-less exemption must name exactly the worker's no-write types."""
+    import re
+    from pathlib import Path
+
+    from command_center import agent_runner
+
+    sql = (Path(__file__).parents[2] / "command_center/db/sql/0037_cto_enforcement_scope.up.sql").read_text()
+    body = sql[sql.index("CREATE FUNCTION _cto_read_only"):sql.index("CREATE FUNCTION _cto_in_scope")]
+    arrays = re.findall(r"ARRAY\[([^\]]*)\]", body)
+    assert len(arrays) == 2
+    expected = agent_runner.READ_ONLY_TASK_TYPES | agent_runner.MODEL_ONLY_TASK_TYPES
+    for array in arrays:
+        assert set(re.findall(r"'([a-z_]+)'", array)) == expected
+    assert not expected & agent_runner.MUTATING_TASK_TYPES
 
 
 def test_only_operator_can_attest_delivery_release() -> None:

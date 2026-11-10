@@ -45,12 +45,14 @@ def cto_rig(admin_conn, psycopg, test_dsn, role_passwords, connect_as, request):
             (TASK,),
         ).fetchone()
         assert row[0]
-        # 0037 scopes activated enforcement to delivery-team-enrolled work, so
-        # every assertion in this module exercises the enrolled (scoped) path.
+        # 0037 applies activated enforcement only to the operator's explicit
+        # scope (an enrolled task the operator added), so every assertion in
+        # this module exercises that scoped path unless a test opts out.
         app.execute("SELECT * FROM delivery_team_sync(100,%s::jsonb)", (json.dumps([TASK]),))
-        assert app.execute(
-            "SELECT count(*) FROM delivery_team_stage WHERE task_id=%s", (TASK,)
-        ).fetchone()[0] > 0
+        if getattr(request, "param", None) != "unscoped":
+            assert operator.execute(
+                "SELECT cto_scope_add(%s,'pilot scope for tests')", (TASK,)
+            ).fetchone()[0]
         yield app, operator, worker, admin_conn
 
 
@@ -67,12 +69,12 @@ def assign(rig, payload=None):
     return row[2]
 
 
+def try_activate(rig):
+    return rig[1].execute("SELECT cto_activate('all workers test-compatible')").fetchone()[0]
+
+
 def activate(rig):
-    assert (
-        rig[1]
-        .execute("SELECT cto_activate('all workers test-compatible')")
-        .fetchone()[0]
-    )
+    assert try_activate(rig)
 
 
 def enqueue(rig, key="key", payload=None, task=TASK):
@@ -236,14 +238,18 @@ def test_revoke_after_authorized_start_preserves_same_attempt_drain(cto_rig):
     assert start(cto_rig, result[3])[0]
 
 
-def test_activation_only_grandfathers_active_attempt_identity(cto_rig):
+def test_activation_refuses_unbound_scoped_work_instead_of_grandfathering(cto_rig):
+    # 0037: ready/claimed scoped work admitted while enforcement was off is
+    # neither grandfathered nor left silently unclaimable; activation refuses.
     enqueue(cto_rig)
     result = claim(cto_rig)
     assert result[0]
     enqueue(cto_rig, key="waiting")
-    activate(cto_rig)
-    assert start(cto_rig, result[3])[0]
-    assert not claim(cto_rig)[0]
+    assert not try_activate(cto_rig)
+    assert cto_rig[0].execute(
+        "SELECT count(*) FROM cto_assignment_event WHERE action='activate' AND reason='unbound_scoped_work'"
+    ).fetchone()[0] == 1
+    assert not cto_rig[0].execute("SELECT enabled FROM cto_control").fetchone()[0]
 
 
 def test_operator_and_hidden_legacy_functions_are_not_reachable(cto_rig, psycopg):
@@ -282,10 +288,14 @@ def test_wrong_token_does_not_get_start_permission(cto_rig):
 
 @pytest.mark.parametrize("count", [1, 101])
 def test_unauthorized_prefix_does_not_starve_valid_work(cto_rig, count):
-    for n in range(count):
-        enqueue(cto_rig, key=f"old-{n}")
-    assign(cto_rig)
     activate(cto_rig)
+    # A denied prefix of revoked bound work (0037 forbids unbound scoped work).
+    for n in range(count):
+        prefix = {**PAYLOAD, "prompt": f"old-{n}"}
+        aid = assign(cto_rig, prefix)
+        assert enqueue(cto_rig, key=f"old-{n}", payload=prefix)
+        cto_rig[1].execute("SELECT cto_revoke(%s,'operator revoked prefix')", (aid,))
+    assign(cto_rig)
     wid = enqueue(cto_rig, key="approved")
     result = claim(cto_rig)
     assert result[0] and result[2] == wid
@@ -387,6 +397,7 @@ def test_rollback_denial_is_logged_without_creating_work(cto_rig):
     assert app.execute("SELECT count(*) FROM work_item").fetchone()[0] == 0
 
 
+@pytest.mark.parametrize("cto_rig", ["unscoped"], indirect=True)
 def test_disabled_downgrade_restores_existing_queue(cto_rig):
     cto_rig[3].execute(SCOPE_SQL.with_name("0037_cto_enforcement_scope.down.sql").read_text())
     cto_rig[3].execute(SQL.with_name("0036_cto_assignment_enforcement.down.sql").read_text())
@@ -493,13 +504,17 @@ def test_malformed_claim_hash_is_refused_without_claiming(cto_rig):
 
 @pytest.mark.parametrize("legacy", [False, True])
 def test_principal_revocation_prevents_another_start_even_for_drain(cto_rig, legacy):
-    if not legacy:
-        assign(cto_rig)
-        activate(cto_rig)
+    assign(cto_rig)
+    activate(cto_rig)
     enqueue(cto_rig)
     result = claim(cto_rig)
     if legacy:
+        # Re-activation snapshots the active attempt as a legacy drain.
+        assert cto_rig[1].execute("SELECT cto_deactivate('drain test')").fetchone()[0]
         activate(cto_rig)
+        assert cto_rig[3].execute(
+            "SELECT legacy_drain FROM cto_execution_start WHERE attempt_id=%s", (result[3],)
+        ).fetchone() == (True,)
     assert start(cto_rig, result[3])[0]
     cto_rig[3].execute(
         "UPDATE principal SET state='retired' WHERE principal_id='worker:test'"
@@ -702,10 +717,13 @@ def test_large_denied_prefix_uses_indexed_binding_selection_and_revoke_progresse
     cto_rig, connect_as, tmp_path
 ):
     app, operator, _, admin = cto_rig
-    # 5,000 legacy work items plus 2,000 revoked bindings are never eligible.
+    # 5,000 out-of-scope legacy items queued behind (priority -1), plus 2,000
+    # revoked bindings ahead that are never eligible. (0037: unbound scoped
+    # work cannot exist while enforcement is active.)
+    outside = "VOYN-CTO-OUTSIDE"
     app.execute(
-        "SELECT queue_enqueue('execution','legacy-'||n,%s::jsonb,%s,'repo-test') FROM generate_series(1,5000) n",
-        (json.dumps(PAYLOAD), TASK),
+        "SELECT queue_enqueue('execution','legacy-'||n,%s::jsonb,%s,'repo-test',3,-1) FROM generate_series(1,5000) n",
+        (json.dumps({**PAYLOAD, "backlog_task_id": outside}), outside),
     )
     activate(cto_rig)
     operator.execute(
@@ -765,7 +783,33 @@ def test_large_denied_prefix_uses_indexed_binding_selection_and_revoke_progresse
         n["Node Type"] in ("Index Scan", "Index Only Scan") for n in binding_nodes
     )
     assert sum(n["Actual Rows"] * n["Actual Loops"] for n in binding_nodes) == 1
+    # 0037's unbound (out-of-scope) selection: index order plus one binding
+    # probe per row, stopping at the first unbound row. Its cost is the 2,001
+    # bound rows ahead, never the 5,000 ready rows behind them.
+    unbound = source[source.index("    SELECT wi.* INTO unscoped FROM work_item wi") :]
+    unbound = unbound[: unbound.index("FOR UPDATE OF wi SKIP LOCKED LIMIT 1;")] + "LIMIT 1"
+    unbound = unbound.replace("SELECT wi.* INTO unscoped", "SELECT wi.*").replace("p_queue", "'execution'")
+    unbound_plan = admin.execute("EXPLAIN (ANALYZE,BUFFERS,FORMAT JSON) " + unbound).fetchone()[0]
+    unbound_nodes = []
+
+    def walk_unbound(node):
+        unbound_nodes.append(node)
+        for child in node.get("Plans", []):
+            walk_unbound(child)
+
+    walk_unbound(unbound_plan[0]["Plan"])
+    scanned = [n for n in unbound_nodes if n.get("Relation Name") == "work_item"]
+    assert scanned and all(n["Node Type"] in ("Index Scan", "Index Only Scan") for n in scanned)
+    examined = sum(
+        n["Actual Rows"] * n["Actual Loops"] + n.get("Rows Removed by Filter", 0) for n in scanned
+    )
+    assert examined <= 2001 + 2, examined
+    assert not any(n["Node Type"] == "Function Scan" for n in unbound_nodes)
+    started = time.monotonic()
     assert claim(cto_rig)[2] == approved
+    claim_ms = (time.monotonic() - started) * 1000
+    # Generous CI budget for one claim over 7,001 ready rows under the lock.
+    assert claim_ms < 2000, claim_ms
     # A second approved item races revocation. Both decisions must progress;
     # any granted claim still fails start after the winning revoke commits.
     race_payload = {**PAYLOAD, "prompt": "race tail"}
@@ -795,10 +839,14 @@ def test_large_denied_prefix_uses_indexed_binding_selection_and_revoke_progresse
     if outcome[0]:
         assert start(cto_rig, outcome[3])[0] is False
     artifact = {
-        "denied_items": 7000,
+        "denied_items": 2000,
+        "out_of_scope_ready_items": 5000,
         "plan_observer": "test admin, explicit principal literal; real worker claim separately verified",
         "nodes": nodes,
         "execution_ms": plan[0]["Execution Time"],
+        "unbound_execution_ms": unbound_plan[0]["Execution Time"],
+        "unbound_rows_examined": examined,
+        "claim_ms": claim_ms,
         "revoke_finished": True,
         "claim_won_race": outcome[0],
     }

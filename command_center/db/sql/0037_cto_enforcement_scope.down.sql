@@ -1,12 +1,23 @@
--- Restore the exact 0036 state. Downgrade is safe only while enforcement is
--- inactive: an active latch would otherwise widen back to fleet-wide 0036
--- enforcement or, via 0036.down, be removed. Neither is a reviewed decision.
+-- Restore the exact 0036 state, only when nothing would be lost or widened:
+--  * while enforcement is active a downgrade would either widen it back to
+--    fleet-wide 0036 enforcement or (via 0036.down) remove it;
+--  * once any switch or scope decision was recorded, dropping
+--    cto_control_event would destroy that audit history. A reviewed forward
+--    migration must retain it instead. A never-used 37 downgrades cleanly.
 DO $$ BEGIN
  PERFORM pg_advisory_xact_lock(73536001);
  IF (SELECT enabled FROM cto_control WHERE singleton) THEN
   RAISE EXCEPTION 'activated CTO authorization requires a reviewed forward migration';
  END IF;
+ IF EXISTS(SELECT 1 FROM cto_control_event) OR EXISTS(SELECT 1 FROM cto_scope) THEN
+  RAISE EXCEPTION 'recorded CTO switch history requires a reviewed forward migration';
+ END IF;
 END $$;
+DROP FUNCTION queue_redrive(text,integer);
+ALTER FUNCTION _cto_legacy_redrive(text,integer) RENAME TO queue_redrive;
+GRANT EXECUTE ON FUNCTION queue_redrive(text,integer) TO aicc_app;
+DROP FUNCTION cto_scope_remove(text,text);
+DROP FUNCTION cto_scope_add(text,text);
 DROP FUNCTION cto_deactivate(text);
 -- Verbatim 0036 definitions (CREATE OR REPLACE keeps owner and ACL).
 CREATE OR REPLACE FUNCTION cto_activate(p_reference text) RETURNS boolean
@@ -303,7 +314,11 @@ BEGIN
     RETURN QUERY SELECT v_id, NULL::text;
 END
 $$;
+DROP FUNCTION _cto_unbound_scoped_work(text);
 DROP FUNCTION _cto_work_in_scope(text);
 DROP FUNCTION _cto_in_scope(text,jsonb);
+DROP FUNCTION _cto_read_only(jsonb);
+DROP FUNCTION _cto_identities(text,jsonb);
+DROP TABLE cto_scope;
 DROP TABLE cto_control_event;
 DROP FUNCTION _cto_control_event_append_only();

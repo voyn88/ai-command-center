@@ -34,8 +34,10 @@ def test_review_payload_carries_the_two_step_cascade(monkeypatch):
     assert report.reviewed == [
         ("VOYN-W0-X", "https://github.com/o/ai-command-center/pull/7")
     ]
-    _queue, key, payload, task_id, max_attempts = calls[0]
+    _queue, key, payload, task_id, max_attempts, repository_id = calls[0]
     assert task_id == "VOYN-W0-X"
+    # 0037: the canonical repository named by the PR URL travels with the item.
+    assert repository_id == "ai-command-center"
     assert f":{review_merge._REVIEW_POLICY_VERSION}:base:" in key
     assert ":diff:" in key
     assert [link["executor"] for link in payload["cascade"]] == ["codex", "claude"]
@@ -181,7 +183,7 @@ def test_owner_alternatives_review_filters_keep_grok_4_6_exclude_cursor(monkeypa
     )
     assert report.skipped == []
     assert len(calls) == 1
-    _queue, _key, payload, task_id, max_attempts = calls[0]
+    _queue, _key, payload, task_id, max_attempts, _repository_id = calls[0]
     assert task_id == "VOYN-W0-X"
     assert [link["executor"] for link in payload["cascade"]] == ["grok"]
     assert payload["cascade"][0]["model"] == "grok-4.6"

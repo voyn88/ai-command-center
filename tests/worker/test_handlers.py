@@ -1134,7 +1134,7 @@ def test_same_head_review_transient_failure_cycle_is_non_terminal_and_bounded(
 
     items: dict[str, dict] = {}
 
-    def enqueue(_queue, key, payload, queued_task_id, max_attempts):
+    def enqueue(_queue, key, payload, queued_task_id, max_attempts, _repository_id=None):
         items.setdefault(
             key,
             {

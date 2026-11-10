@@ -1563,8 +1563,8 @@ def _review_once(
     task_id: str | None = None,
 ) -> LoopReport:
     """Enqueue a review run for each READY_TO_REVIEW task with a pr and no
-    review queued yet. ``enqueue(queue, key, payload, task_id, max_attempts)``
-    is the queue writer (control-plane privilege); passing it in keeps this
+    review queued yet. ``enqueue(queue, key, payload, task_id, max_attempts,
+    repository_id)`` is the queue writer (control-plane privilege); passing it in keeps this
     composable and testable without a live queue. The task_id is passed through to the
     enqueue call (not just embedded in the payload/prompt) so
     publish_review_verdicts can look the result back up by
@@ -1747,7 +1747,7 @@ def _review_once(
         # verification section comment above for why the eager full-context
         # pass of VOYN-W0-AICC-REVIEW-ADJUDICATE was retired).
         for review_key, payload in prepared:
-            enqueue(cfg.queue, review_key, payload, task_id, len(cascade))
+            enqueue(cfg.queue, review_key, payload, task_id, len(cascade), repo)
         report.reviewed.append((task_id, pr_url))
         actions += 1
     if scan_token is not None:
@@ -1901,7 +1901,9 @@ def reconcile_review_once(
                     "base_sha": snapshot.base, "head_sha": snapshot.head,
                     "diff_hash": snapshot.digest,
                 }
-            enqueue(cfg.queue, retry_key, payload, current_task_id, len(retry_cascade))
+            enqueue(
+                cfg.queue, retry_key, payload, current_task_id, len(retry_cascade), repo
+            )
             report.retried.append((current_task_id, retry_key))
             actions += 1
         if actions == retries_before:
@@ -2713,7 +2715,7 @@ def _verified_rejection_outcome(
             "head_sha": snapshot.head,
         },
     }
-    enqueue(cfg.queue, key, payload, task_id, len(cascade))
+    enqueue(cfg.queue, key, payload, task_id, len(cascade), repo)
     return "WAIT", "verification_enqueued"
 
 
@@ -4190,7 +4192,7 @@ def _enqueue_review_refresh(
                 "head_sha": snapshot.head,
                 "diff_hash": snapshot.digest,
             }
-        enqueue(cfg.queue, review_key, payload, task_id, len(cascade))
+        enqueue(cfg.queue, review_key, payload, task_id, len(cascade), repo)
     return None
 
 

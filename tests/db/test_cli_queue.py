@@ -94,12 +94,13 @@ def test_backlog_review_enqueues_ahead_of_implementation_dispatch() -> None:
 
     class _FakeStore:
         def enqueue(self, queue, *, idempotency_key, payload, task_id,
-                    max_attempts, priority):
+                    repository_id, max_attempts, priority):
             calls.append({
                 "queue": queue,
                 "idempotency_key": idempotency_key,
                 "payload": payload,
                 "task_id": task_id,
+                "repository_id": repository_id,
                 "max_attempts": max_attempts,
                 "priority": priority,
             })
@@ -114,12 +115,16 @@ def test_backlog_review_enqueues_ahead_of_implementation_dispatch() -> None:
         "idempotency_key": "key-1",
         "payload": {"kind": "review"},
         "task_id": "VOYN-W0-X",
+        "repository_id": None,
         "max_attempts": 1,
         # Assert the task's specified lane, not merely a positive value: a
         # wrong hard-coded priority must fail this starvation regression.
         "priority": 10,
     }]
     assert calls[0]["priority"] > 0
+    # 0037: the review producer's canonical repository reaches the queue.
+    enqueue("execution", "key-2", {"kind": "review"}, "VOYN-W0-X", 1, "ai-command-center")
+    assert calls[1]["repository_id"] == "ai-command-center"
 
 
 def test_backlog_pr_window_labels_without_opening_a_database(monkeypatch, capsys) -> None:

@@ -134,6 +134,7 @@ ALL_TABLES: tuple[str, ...] = (
     "cto_execution_start",
     "cto_assignment_event",
     "cto_control_event",
+    "cto_scope",
     "completion",
     "completion_event",
     "completion_validation",
@@ -343,6 +344,7 @@ _APP_BACKLOG_TABLES: dict[str, frozenset[str]] = {
     "cto_execution_start": _READ,
     "cto_assignment_event": _READ,
     "cto_control_event": _READ,
+    "cto_scope": _READ,
     "backlog_task": _READ,
     "backlog_dependency": _READ,
     "backlog_evidence": _READ,
@@ -369,6 +371,7 @@ _WORKER_BACKLOG_TABLES: dict[str, frozenset[str]] = {
     "cto_execution_start": _NONE,
     "cto_assignment_event": _NONE,
     "cto_control_event": _NONE,
+    "cto_scope": _NONE,
     "backlog_task": _NONE,
     "backlog_dependency": _NONE,
     "backlog_evidence": _NONE,
@@ -713,8 +716,11 @@ _OPERATOR_FUNCTIONS = (
     "cto_assign(text, bigint, text, jsonb, text)",
     "cto_revoke(text, text)",
     "cto_activate(text)",
-    # 0037: the audited off switch shares activation's operator-only boundary.
+    # 0037: the audited off switch and the explicit enforcement scope share
+    # activation's operator-only boundary.
     "cto_deactivate(text)",
+    "cto_scope_add(text, text)",
+    "cto_scope_remove(text, text)",
     "enroll_mint_ticket(text, text, text, inet, interval, text)",
     "enroll_revoke_ticket(text, text)",
     "enroll_sweep_expired()",
@@ -799,7 +805,7 @@ PRIVILEGES: MappingProxyType[str, MappingProxyType[str, frozenset[str]]] = (
                     {name: _READ for name in (
                         "cto_control", "cto_assignment", "cto_work_binding",
                         "cto_execution_start", "cto_assignment_event",
-                        "cto_control_event",
+                        "cto_control_event", "cto_scope",
                     )},
                 )
             ),

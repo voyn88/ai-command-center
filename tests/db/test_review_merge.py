@@ -269,7 +269,7 @@ def test_review_enqueues_one_run_per_ready_task(rig, _test_repo_routes, monkeypa
     calls = []
     report = review_once(
         app_factory,
-        lambda q, k, p, tid, attempts: calls.append((q, k, p, tid, attempts)),
+        lambda q, k, p, tid, attempts, _repo=None: calls.append((q, k, p, tid, attempts)),
         "/tmp",
     )
     assert ("VOYN-W0-R1", "https://github.com/x/repo-d2/pull/7") in report.reviewed
@@ -315,7 +315,7 @@ def test_review_skips_a_pr_whose_repo_has_no_route(rig):  # noqa: F811
     calls = []
     report = review_once(
         app_factory,
-        lambda q, k, p, tid, attempts: calls.append((q, k, p, tid, attempts)),
+        lambda q, k, p, tid, attempts, _repo=None: calls.append((q, k, p, tid, attempts)),
         "/tmp",
     )
     assert not calls
@@ -337,7 +337,7 @@ def test_review_skips_when_the_diff_fetch_fails(rig, _test_repo_routes, monkeypa
     calls = []
     report = review_once(
         app_factory,
-        lambda q, k, p, tid, attempts: calls.append((q, k, p, tid, attempts)),
+        lambda q, k, p, tid, attempts, _repo=None: calls.append((q, k, p, tid, attempts)),
         "/tmp",
     )
     assert not calls
@@ -379,7 +379,7 @@ def test_review_skips_closed_prs_as_pr_not_open_without_diff_fetch(rig, _test_re
 
     report = review_once(
         app_factory,
-        lambda q, k, p, tid, attempts: enqueued.append((q, k, p, tid, attempts)),
+        lambda q, k, p, tid, attempts, _repo=None: enqueued.append((q, k, p, tid, attempts)),
         "/tmp",
     )
 
@@ -422,7 +422,7 @@ def test_review_skips_prs_outside_the_active_review_window(rig, _test_repo_route
 
     report = review_once(
         app_factory,
-        lambda q, k, p, tid, attempts: enqueued.append((q, k, p, tid, attempts)),
+        lambda q, k, p, tid, attempts, _repo=None: enqueued.append((q, k, p, tid, attempts)),
         "/tmp",
     )
 
@@ -453,7 +453,7 @@ def test_review_chunks_a_diff_over_the_single_prompt_cap(rig, _test_repo_routes,
     calls = []
     report = review_once(
         app_factory,
-        lambda q, k, p, tid, attempts: calls.append((q, k, p, tid, attempts)),
+        lambda q, k, p, tid, attempts, _repo=None: calls.append((q, k, p, tid, attempts)),
         "/tmp",
     )
     chunks = review_merge._review_chunks(
@@ -1834,7 +1834,7 @@ def test_review_once_gives_a_second_push_to_the_same_task_its_own_fresh_review(r
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
     monkeypatch.setattr(review_merge, "_pr_diff_and_head", ORIGINAL_PR_SNAPSHOT)
     calls = []
-    def enqueue(q, k, p, tid, attempts):
+    def enqueue(q, k, p, tid, attempts, _repo=None):
         calls.append((q, k, p, tid, attempts))
 
     current_head = "a" * 40
@@ -1994,7 +1994,7 @@ def test_chunk_reject_enqueues_verification_and_waits(rig, monkeypatch):  # noqa
     enq = []
     report = publish_review_verdicts(
         app_factory, "/tmp",
-        enqueue=lambda q, k, pl, tid, mx: enq.append((q, k, pl, tid, mx)),
+        enqueue=lambda q, k, pl, tid, mx, _repo=None: enq.append((q, k, pl, tid, mx)),
     )
     assert ("VOYN-W0-ADJ-C", "verification_enqueued") in report.skipped
     assert not report.remediated
@@ -2070,7 +2070,7 @@ def test_single_chunk_reject_is_also_verification_gated(rig, monkeypatch, _test_
     enq = []
     report = publish_review_verdicts(
         app_factory, "/tmp",
-        enqueue=lambda q, k, pl, tid, mx: enq.append((q, k, pl, tid, mx)),
+        enqueue=lambda q, k, pl, tid, mx, _repo=None: enq.append((q, k, pl, tid, mx)),
     )
     assert ("VOYN-W0-ADJ-H", "verification_enqueued") in report.skipped
     assert not report.remediated and not posted
@@ -2299,7 +2299,7 @@ def test_review_once_no_longer_enqueues_an_eager_adjudication(rig, _test_repo_ro
     monkeypatch.setattr(review_merge, "_render_review_prompt", lambda t, p, s, c: "prompt")
     monkeypatch.setattr(review_merge, "_prompt_size_bytes", lambda s: 1)
     enq = []
-    report = review_once(app_factory, lambda q, k, pay, task_id, mx: enq.append(k), "/tmp")
+    report = review_once(app_factory, lambda q, k, pay, task_id, mx, _repo=None: enq.append(k), "/tmp")
     assert ("VOYN-W0-ADJ-D", pr_url) in report.reviewed
     assert len(enq) == 3
     assert all(":chunk:" in k for k in enq), enq
@@ -3484,7 +3484,7 @@ def test_permanent_skips_do_not_starve_the_review_window(rig, _test_repo_routes,
     calls = []
     report = review_once(
         app_factory,
-        lambda q, k, p, tid, attempts: calls.append((q, k, p, tid, attempts)),
+        lambda q, k, p, tid, attempts, _repo=None: calls.append((q, k, p, tid, attempts)),
         "/tmp",
         ReviewConfig(max_per_tick=2),
     )
@@ -3632,7 +3632,7 @@ def test_a_pending_verification_costs_no_tick_action(rig, monkeypatch):  # noqa:
     enq = []
     report = publish_review_verdicts(
         app_factory, "/tmp", ReviewConfig(max_per_tick=1),
-        enqueue=lambda q, k, pl, tid, mx: enq.append(k),
+        enqueue=lambda q, k, pl, tid, mx, _repo=None: enq.append(k),
     )
     assert posted == [pr_url], (report.skipped, report.remediated)
     assert report.remediated == []
@@ -4124,7 +4124,7 @@ def test_a_same_key_item_in_another_queue_is_not_pending_here(rig, monkeypatch):
     enq = []
     report = publish_review_verdicts(
         app_factory, "/tmp",
-        enqueue=lambda q, k, pl, tid, mx: enq.append((q, k)),
+        enqueue=lambda q, k, pl, tid, mx, _repo=None: enq.append((q, k)),
     )
     # The execution-queue verification WAS enqueued despite the same-key
     # item sitting in another-queue.
