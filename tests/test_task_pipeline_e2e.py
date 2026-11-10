@@ -533,6 +533,43 @@ def test_daily_spend_budget_gates_new_launches_only(tmp_path, api, fake_claude):
     assert [d.task_id for d in ungated.launched()] == ["s"]
 
 
+def test_daily_spend_measurement_failure_reports_unknown(
+    tmp_path, api, fake_claude, monkeypatch
+):
+    pipeline_settings.save_settings(
+        tmp_path,
+        PipelineSettings(
+            enabled=True,
+            auto_launch=True,
+            max_daily_spend_usd=1.0,
+            max_global_concurrency=2,
+            max_agent_concurrency=2,
+        ),
+    )
+    _remote, _work = _project_repo(tmp_path, "AIOS", "proj-u")
+    wt = tmp_path / "wt" / "u"
+    task = _task("u", "AIOS", wt, branch="task/u")
+    tasks_repository.save_tasks(tmp_path, [task])
+    execution_queue.enqueue_and_persist(tmp_path, task, {"u": task})
+
+    def _measurement_failure(_db_path):
+        raise RuntimeError("cost query unavailable")
+
+    monkeypatch.setattr(task_pipeline, "daily_spend_usd", _measurement_failure)
+
+    result = task_pipeline.tick(
+        tmp_path,
+        api,
+        project_config.load_project_configs(),
+        github=FakeGitHubClient(),
+        advance_wait_seconds=60,
+    )
+
+    assert result.launched() == []
+    assert result.launch_status == task_pipeline.LAUNCH_SPEND_UNKNOWN
+    assert result.launch_status != task_pipeline.LAUNCH_BUDGET_EXHAUSTED
+
+
 def test_daily_spend_usd_tolerates_dict_and_malformed_payloads(tmp_path, monkeypatch, caplog):
     """A `jsonb`-backed read (the PostgreSQL mirror, VOYN-W0-AICC-SRV-01B) hands
     back a `payload` that is already a decoded `dict`, not JSON text, and
