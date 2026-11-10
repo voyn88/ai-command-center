@@ -250,6 +250,100 @@ def test_migration_0030_keeps_shape_gate_and_does_not_reuse_0017():
     assert "v_malformed AND v_bad_returns >= 1" in up
 
 
+# ---------------------------------------------------------------------------
+# recover_stuck_pr_evidence_once (VOYN-W0-AICC-SRV-07d-STALL): a task
+# `reconcile_pr_evidence` could find neither `pr` evidence nor an open PR for
+# at all has nothing left to wait on and never will — close the loop by
+# calling the sanctioned 0018 recovery function instead of repeating the
+# identical skip every tick forever.
+# ---------------------------------------------------------------------------
+
+
+class _FakeCur:
+    def __init__(self, calls: list[tuple[str, tuple]], response) -> None:
+        self._calls = calls
+        self._response = response
+        self.description = True
+
+    def execute(self, sql, params=()):
+        self._calls.append((sql, params))
+
+    def fetchall(self):
+        return self._response
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _FakeConn:
+    def __init__(self, calls: list[tuple[str, tuple]], response) -> None:
+        self._calls = calls
+        self._response = response
+
+    def cursor(self):
+        return _FakeCur(self._calls, self._response)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def test_a_task_with_no_evidence_and_no_open_pr_is_recovered_to_open():
+    calls: list[tuple[str, tuple]] = []
+    factory = lambda: _FakeConn(calls, [(True, "OPEN")])  # noqa: E731
+
+    report = review_merge.recover_stuck_pr_evidence_once(
+        factory, [("VOYN-W0-STK", "no_open_pr_on_task_branch")]
+    )
+
+    assert report.recovered == [("VOYN-W0-STK", "OPEN")]
+    assert report.skipped == []
+    [(sql, params)] = calls
+    assert "backlog_recover_stuck_ready_to_review" in sql
+    assert params == ("VOYN-W0-STK",)
+
+
+def test_every_other_skip_reason_is_left_alone():
+    """Only the exact `no_open_pr_on_task_branch` reason is a proven dead
+    end; anything else (quota failure, ambiguous PRs, an unrouted repo) may
+    still resolve on its own and must never be bounced back to OPEN."""
+
+    def factory():
+        raise AssertionError("no other skip reason may call the recovery function")
+
+    report = review_merge.recover_stuck_pr_evidence_once(
+        factory,
+        [
+            ("VOYN-W0-A", "pr_list_failed"),
+            ("VOYN-W0-B", "ambiguous_open_prs_on_branch"),
+            ("VOYN-W0-C", "no_repo_route: 'ghost'"),
+        ],
+    )
+
+    assert report.recovered == []
+    assert report.skipped == []
+
+
+def test_a_refused_recovery_is_surfaced_not_swallowed():
+    """A task with `pr` evidence already recorded by the time this runs
+    belongs to review/merge, not recovery — `backlog_recover_stuck_ready_to_
+    review` refuses it, and that refusal must be visible, not dropped."""
+    calls: list[tuple[str, tuple]] = []
+    factory = lambda: _FakeConn(calls, [(False, "has_pr_evidence")])  # noqa: E731
+
+    report = review_merge.recover_stuck_pr_evidence_once(
+        factory, [("VOYN-W0-RACE", "no_open_pr_on_task_branch")]
+    )
+
+    assert report.recovered == []
+    assert report.skipped == [("VOYN-W0-RACE", "has_pr_evidence")]
+
+
 @pytest.mark.parametrize("url", [
     "https://github.com/owner?x/ai-command-center/pull/1",
     "https://github.com/owner/ai command center/pull/1",

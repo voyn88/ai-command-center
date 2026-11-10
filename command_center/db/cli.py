@@ -654,6 +654,7 @@ def main(argv: list[str] | None = None) -> int:
                     publish_review_verdicts,
                     reconcile_pr_evidence,
                     reconcile_review_once,
+                    recover_stuck_pr_evidence_once,
                     review_once,
                 )
 
@@ -678,6 +679,22 @@ def main(argv: list[str] | None = None) -> int:
                         print(f"PR-FOUND  {evidence_task_id} -> {pr}")
                     for evidence_task_id, reason in evidence.skipped:
                         print(f"PR-SKIP   {evidence_task_id}: {reason}")
+                    # A task `reconcile_pr_evidence` just proved has NO `pr`
+                    # evidence at all and no open PR on its branch either is
+                    # stuck, not waiting: ingest (0011/0030) never lands a
+                    # task in READY_TO_REVIEW without recording real `pr`
+                    # evidence in the same call, so nothing will ever fill
+                    # this in later. Recover it to OPEN now rather than let
+                    # the same skip repeat tick after tick until the
+                    # stall watchdog has to escalate it (VOYN-W0-AICC-
+                    # SRV-07d-STALL).
+                    recovery = recover_stuck_pr_evidence_once(
+                        lambda: _nc(conn), evidence.skipped
+                    )
+                    for recovered_task_id, verdict_reason in recovery.recovered:
+                        print(f"PR-RECOVER {recovered_task_id} -> {verdict_reason}")
+                    for recovered_task_id, reason in recovery.skipped:
+                        print(f"PR-RECOVER-SKIP {recovered_task_id}: {reason}")
                     report = review_once(
                         lambda: _nc(conn),
                         enqueue,

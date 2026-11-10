@@ -101,6 +101,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Iterable
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -374,6 +375,63 @@ def reconcile_pr_evidence(
             report.skipped.append((row_task_id, f"evidence_refused: {reason}"))
             continue
         report.recorded.append((row_task_id, pr_url))
+    return report
+
+
+@dataclass
+class StuckReviewRecoveryReport:
+    """See `recover_stuck_pr_evidence_once`."""
+
+    #: (task_id, new_status) sent back to OPEN this tick.
+    recovered: list[tuple[str, str]] = field(default_factory=list)
+    #: (task_id, reason) examined and left alone.
+    skipped: list[tuple[str, str]] = field(default_factory=list)
+
+
+def recover_stuck_pr_evidence_once(
+    factory: Any, skipped: Iterable[tuple[str, str]]
+) -> StuckReviewRecoveryReport:
+    """Unstick a READY_TO_REVIEW task `reconcile_pr_evidence` could not find
+    any evidence for at all (VOYN-W0-AICC-SRV-07d-STALL).
+
+    `reconcile_pr_evidence` is reporting-only by design: a task it skips
+    with `no_open_pr_on_task_branch` has NO `pr` evidence on record (that's
+    its own candidate query) and no open pull request on its exact branch
+    either, so it is left exactly as it was. For a task in that state there
+    is nothing left to discover -- ingest (0011/0030) now never transitions
+    into READY_TO_REVIEW without recording real `pr` evidence in the same
+    call, so the condition can only mean a completed-but-unpublished run
+    that predates that guard, or a future bug in the same corner. Either
+    way the task will sit forever: `backlog_transition` has no
+    READY_TO_REVIEW -> anything-but-DONE move and `backlog_return_to_pool`
+    only accepts IN_PROGRESS, so neither of the ordinary recovery paths can
+    reach it. That is exactly the gap the tick-stall watchdog caught on
+    VOYN-W0-AICC-SRV-07d: five consecutive ticks of the identical skip,
+    because nothing downstream of `reconcile_pr_evidence` ever called the
+    one function built to close it.
+
+    `backlog_recover_stuck_ready_to_review` (0018) is that sanctioned,
+    narrow, audited path: READY_TO_REVIEW with zero `pr` evidence -> OPEN,
+    refused outright for anything else (a task with `pr` evidence on record
+    belongs to review/merge, not recovery). Calling it here, keyed off the
+    exact reason `reconcile_pr_evidence` already proved, lets a fresh
+    dispatch take another real attempt at a PR instead of the task waiting
+    on an operator to run the recovery by hand.
+    """
+    report = StuckReviewRecoveryReport()
+    for task_id, reason in skipped:
+        if reason != "no_open_pr_on_task_branch":
+            continue
+        rows = _rows(
+            factory,
+            "SELECT ok, reason FROM backlog_recover_stuck_ready_to_review(%s)",
+            (task_id,),
+        )
+        ok, verdict_reason = rows[0] if rows else (False, "unknown")
+        if ok:
+            report.recovered.append((task_id, verdict_reason))
+        else:
+            report.skipped.append((task_id, verdict_reason or "unknown"))
     return report
 
 
