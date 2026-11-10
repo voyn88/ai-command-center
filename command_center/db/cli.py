@@ -111,6 +111,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Parse and report without touching the database.",
     )
     sub.add_parser("backlog-status", help="Task counts by status from the store.")
+    recover = sub.add_parser(
+        "backlog-recover-stuck-ready-to-review",
+        help="READY_TO_REVIEW -> OPEN for one task through the 0018 machine "
+        "gate (granted only when the task carries no `pr` evidence at all). "
+        "The sanctioned way out for a task the pr_evidence tick can only "
+        "ever skip -- e.g. its PR was never opened or was closed/merged "
+        "without evidence recorded, so `reconcile_pr_evidence` (which only "
+        "ever looks for an OPEN pull request) will report the same skip "
+        "forever without this.",
+    )
+    recover.add_argument("task_id", help="The stuck backlog task id.")
     export = sub.add_parser(
         "backlog-export",
         help=(
@@ -545,6 +556,18 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"{status}: {count}")
                 return 0
 
+            if args.command == "backlog-recover-stuck-ready-to-review":
+                from command_center.db.backlog_store import BacklogStore
+
+                ok, reason, revision = BacklogStore(
+                    lambda: nullcontext(conn)
+                ).recover_stuck_ready_to_review(args.task_id)
+                if not ok:
+                    print(f"REFUSED   {args.task_id}: {reason}", file=sys.stderr)
+                    return 1
+                print(f"RECOVERED {args.task_id} -> OPEN (revision {revision})")
+                return 0
+
             if args.command == "backlog-export":
                 from pathlib import Path as _Path
 
@@ -614,6 +637,8 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"INGESTED  {task_id}: {action}")
                 for task_id, park_reason in report.resumed:
                     print(f"RESUMED   {task_id}: {park_reason}")
+                for task_id in report.recovered_stuck_ready:
+                    print(f"RECOVERED {task_id}: no_pr_evidence")
                 for task_id, reason in report.skipped_by_wave_gate:
                     print(f"WAVE-GATE {task_id}: {reason}")
                 for task_id, reason in report.refused:
@@ -654,6 +679,7 @@ def main(argv: list[str] | None = None) -> int:
                     publish_review_verdicts,
                     reconcile_pr_evidence,
                     reconcile_review_once,
+                    recover_stuck_pr_evidence_once,
                     review_once,
                 )
 
@@ -676,8 +702,26 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     for evidence_task_id, pr in evidence.recorded:
                         print(f"PR-FOUND  {evidence_task_id} -> {pr}")
+                    for evidence_task_id in evidence.recovered:
+                        print(f"PR-RECOVER {evidence_task_id} -> OPEN")
                     for evidence_task_id, reason in evidence.skipped:
                         print(f"PR-SKIP   {evidence_task_id}: {reason}")
+                    # A task `reconcile_pr_evidence` just proved has NO `pr`
+                    # evidence at all and no open PR on its branch either is
+                    # stuck, not waiting: ingest (0011/0030) never lands a
+                    # task in READY_TO_REVIEW without recording real `pr`
+                    # evidence in the same call, so nothing will ever fill
+                    # this in later. Recover it to OPEN now rather than let
+                    # the same skip repeat tick after tick until the
+                    # stall watchdog has to escalate it (VOYN-W0-AICC-
+                    # SRV-07d-STALL).
+                    recovery = recover_stuck_pr_evidence_once(
+                        lambda: _nc(conn), evidence.skipped
+                    )
+                    for recovered_task_id, verdict_reason in recovery.recovered:
+                        print(f"PR-RECOVER {recovered_task_id} -> {verdict_reason}")
+                    for recovered_task_id, reason in recovery.skipped:
+                        print(f"PR-RECOVER-SKIP {recovered_task_id}: {reason}")
                     report = review_once(
                         lambda: _nc(conn),
                         enqueue,
