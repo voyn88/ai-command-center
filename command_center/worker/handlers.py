@@ -1772,10 +1772,28 @@ def _run_agent(
                         ),
                     )
             except workspace_provisioning.WorkspaceVerificationError as exc:
+                # A completed executor run must not leave an uncheckpointed
+                # clone at the live task path: the next delivery would reuse
+                # the same poisoned tree and spend another attempt before it
+                # could make progress. Preserve it outside the resume path.
+                quarantined = None
+                if isolated_workspace is not None:
+                    quarantined = workspace_provisioning.quarantine_task_workspace(
+                        isolated_workspace
+                    )
                 return HandlerOutcome(
                     ok=False,
-                    reason=f"guarded publish preparation failed at {exc.failed_step}: {exc.detail}",
+                    reason=(
+                        f"guarded publish preparation failed at {exc.failed_step}: "
+                        f"{exc.detail}; uncheckpointed clone "
+                        + (
+                            f"quarantined at {quarantined}"
+                            if quarantined
+                            else "could not be quarantined"
+                        )
+                    ),
                     retryable=True,
+                    infra_wait=quarantined is not None,
                 )
             result["publish"] = {
                 "ok": pub.ok,
