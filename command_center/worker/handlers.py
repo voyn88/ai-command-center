@@ -677,8 +677,20 @@ def _executor_preflight(executor: str, task_type: str) -> tuple[bool, str, str]:
         available, detail = agent_runner.claude_mac_preflight()
         return available, detail, "Claude Mac inference adapter unavailable"
     if agent_runner.principal_isolation_required():
+        if executor == "aider":
+            # The broker stages the mutating CLI under the isolated agent
+            # principal, while this worker-side probe additionally proves the
+            # exact benchmarked Ollama tag is locally available.
+            available, detail = agent_runner.aider_preflight(
+                binary=agent_runner.PRINCIPAL_EXECUTOR_BINARIES["aider"]
+            )
+            if not available:
+                return False, detail, "aider cli or ollama daemon unavailable"
         available, detail = agent_runner.principal_executor_preflight(executor)
         return available, detail, f"isolated {executor} cli unavailable"
+    if executor == "aider":
+        available, detail = agent_runner.aider_preflight()
+        return available, detail, "aider cli or ollama daemon unavailable"
     if executor == "codex":
         available, detail = agent_runner.claude_cli_preflight(agent_runner.CODEX_BINARY)
         return available, detail, "codex cli unavailable"
@@ -1812,10 +1824,28 @@ def _run_agent(
                         ),
                     )
             except workspace_provisioning.WorkspaceVerificationError as exc:
+                # A completed executor run must not leave an uncheckpointed
+                # clone at the live task path: the next delivery would reuse
+                # the same poisoned tree and spend another attempt before it
+                # could make progress. Preserve it outside the resume path.
+                quarantined = None
+                if isolated_workspace is not None:
+                    quarantined = workspace_provisioning.quarantine_task_workspace(
+                        isolated_workspace
+                    )
                 return HandlerOutcome(
                     ok=False,
-                    reason=f"guarded publish preparation failed at {exc.failed_step}: {exc.detail}",
+                    reason=(
+                        f"guarded publish preparation failed at {exc.failed_step}: "
+                        f"{exc.detail}; uncheckpointed clone "
+                        + (
+                            f"quarantined at {quarantined}"
+                            if quarantined
+                            else "could not be quarantined"
+                        )
+                    ),
                     retryable=True,
+                    infra_wait=quarantined is not None,
                 )
             result["publish"] = {
                 "ok": pub.ok,

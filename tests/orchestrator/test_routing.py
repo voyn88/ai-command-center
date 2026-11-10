@@ -2,17 +2,45 @@
 
 from __future__ import annotations
 
-from command_center import agent_runner
+from command_center import agent_runner, local_model_gates
 from command_center.orchestrator.planner import PlanLimits, _payload_for, repo_route
 from command_center.orchestrator.routing import (
+    BOUNDED_IMPLEMENTATION_TASK_CLASS,
     BILLING_MODE_API_METERED,
     BILLING_MODE_SUBSCRIPTION,
     BILLING_MODE_UNKNOWN,
     ROUTING_MATRIX,
     billing_mode_for_executor,
     cascade_for,
+    classify_task_class,
     metered_executors,
 )
+
+
+def test_bounded_implementation_is_fail_closed_until_promoted():
+    assert not local_model_gates.is_promoted(BOUNDED_IMPLEMENTATION_TASK_CLASS)
+    assert cascade_for(BOUNDED_IMPLEMENTATION_TASK_CLASS) == cascade_for(
+        "implementation"
+    )
+
+
+def test_promoted_bounded_implementation_leads_with_isolated_aider():
+    for _ in range(local_model_gates.PROMOTION_SAMPLE_FLOOR):
+        local_model_gates.record_benchmark_run(
+            BOUNDED_IMPLEMENTATION_TASK_CLASS, True
+        )
+    cascade = cascade_for(BOUNDED_IMPLEMENTATION_TASK_CLASS)
+    assert cascade[0] == {"executor": "aider", "task_type": "implementation"}
+    assert "aider" in agent_runner.PRINCIPAL_EXECUTOR_BINARIES
+
+
+def test_bounded_classification_is_explicit_title_only_opt_in():
+    assert (
+        classify_task_class("[docs] fix typo", "x")
+        == BOUNDED_IMPLEMENTATION_TASK_CLASS
+    )
+    assert classify_task_class("Refactor auth", "[docs] misleading") == "implementation"
+
 
 #: The executors the worker can actually run, read from the SAME table the
 #: worker itself gates on (`handlers._run_agent` refuses any executor absent

@@ -506,6 +506,102 @@ def test_dirty_no_commit_is_checkpointed_and_published(agent_with_publish, monke
     )
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permissions model unreadable caches")
+def test_dirty_checkpoint_skips_only_unreadable_untracked_pytest_cache(
+    agent_with_publish, monkeypatch
+):
+    run_agent, repo = agent_with_publish
+    caches: list[Path] = []
+
+    def leave_work_and_caches(**kwargs):
+        target = Path(kwargs["repository_path"])
+        (target / "uncommitted-agent-work.txt").write_text("preserve me\n")
+        unreadable = target / "a[b]" / ".pytest_cache"
+        unreadable.mkdir(parents=True)
+        cache_ignore = unreadable / ".gitignore"
+        cache_ignore.write_text("# Created by pytest automatically.\n*\n")
+        cache_ignore.chmod(0)
+        assert cache_ignore.stat().st_mode & 0o777 == 0
+        caches.append(unreadable)
+
+        readable = target / ".ruff_cache"
+        readable.mkdir()
+        (readable / "agent-work.txt").write_text("must not be discarded\n")
+        return _fake_run(commit=False)(**kwargs)
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", leave_work_and_caches)
+    try:
+        outcome = run_agent(_payload(), _event(), 1)
+    finally:
+        for cache in caches:
+            if cache.exists():
+                (cache / ".gitignore").chmod(0o600)
+
+    assert outcome.ok and outcome.result["publish"]["ok"] is True
+    assert outcome.result["publish"]["checkpointed_dirty_worktree"] is True
+    _git(repo, "fetch", "-q", "origin", "backlog/VOYN-TASK-A")
+    assert (
+        _git(repo, "show", "FETCH_HEAD:uncommitted-agent-work.txt").stdout
+        == "preserve me\n"
+    )
+    assert (
+        _git(repo, "show", "FETCH_HEAD:.ruff_cache/agent-work.txt").stdout
+        == "must not be discarded\n"
+    )
+    absent = subprocess.run(
+        ["git", "cat-file", "-e", "FETCH_HEAD:a[b]/.pytest_cache/.gitignore"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert absent.returncode != 0
+
+
+def test_unreadable_tracked_cache_is_never_excluded(tmp_path):
+    workspace = _make_repo(tmp_path / "workspace")
+    cache = workspace / "a[b]" / "__pycache__"
+    cache.mkdir(parents=True)
+    tracked = cache / "tracked.pyc"
+    tracked.write_bytes(b"old")
+    _git(workspace, "add", "--", "a[b]/__pycache__/tracked.pyc")
+    _git(workspace, "commit", "-q", "-m", "track cache payload")
+    tracked.write_bytes(b"new")
+    tracked.chmod(0)
+    publisher = tmp_path / "publisher"
+    subprocess.run(
+        ["git", "clone", "-q", str(workspace), str(publisher)], check=True
+    )
+    try:
+        exclusions = workspace_provisioning._safe_unreadable_cache_exclusions(
+            publisher, workspace, expected_branch="main"
+        )
+    finally:
+        tracked.chmod(0o600)
+
+    assert exclusions == []
+
+
+def test_unreadable_non_cache_path_remains_fail_closed(tmp_path):
+    workspace = _make_repo(tmp_path / "workspace")
+    unknown = workspace / ".agent-output" / ".gitignore"
+    unknown.parent.mkdir()
+    unknown.write_text("*\n")
+    unknown.chmod(0)
+    publisher = tmp_path / "publisher"
+    subprocess.run(
+        ["git", "clone", "-q", str(workspace), str(publisher)], check=True
+    )
+    try:
+        exclusions = workspace_provisioning._safe_unreadable_cache_exclusions(
+            publisher, workspace, expected_branch="main"
+        )
+    finally:
+        unknown.chmod(0o600)
+
+    assert exclusions == []
+
+
 @pytest.mark.skipif(os.name == "nt", reason="secure dirty checkpoint runs on Linux workers")
 def test_dirty_checkpoint_captures_file_modes_without_agent_git_execution(
     agent_with_publish, monkeypatch, tmp_path
@@ -737,10 +833,21 @@ def test_dirty_checkpoint_failure_is_retryable_and_preserves_clone(
     outcome = run_agent(_payload(), _event(), 1)
 
     assert not outcome.ok and outcome.retryable
+    assert outcome.infra_wait
     assert "dirty_checkpoint_object_write" in outcome.reason
     workspace = _workspace(repo)
-    assert workspace.is_dir()
-    assert (workspace / "uncommitted-agent-work.txt").read_text() == "preserve me\n"
+    assert not workspace.exists()
+    quarantined = [
+        path
+        for path in workspace.parent.joinpath(".aicc-quarantine").glob(
+            f"{workspace.name}.uncheckpointed.*"
+        )
+        if path.is_dir()
+    ]
+    assert len(quarantined) == 1
+    assert (
+        quarantined[0] / "uncommitted-agent-work.txt"
+    ).read_text() == "preserve me\n"
 
 
 def test_reused_clone_never_executes_agent_git_config_before_retry_publish(
@@ -975,8 +1082,16 @@ def test_candidate_change_after_validation_is_never_checkpointed_or_published(
     outcome = run_agent(_payload(), _event(), 1)
 
     assert not outcome.ok and outcome.retryable
+    assert outcome.infra_wait
     assert "task_workspace_checkpoint_candidate" in outcome.reason
-    assert _workspace(repo).is_dir()
+    workspace = _workspace(repo)
+    assert not workspace.exists()
+    assert any(
+        path.is_dir()
+        for path in workspace.parent.joinpath(".aicc-quarantine").glob(
+            f"{workspace.name}.uncheckpointed.*"
+        )
+    )
     remote = _git(repo, "ls-remote", "origin", "refs/heads/backlog/VOYN-TASK-A")
     assert remote.stdout.strip() == ""
 
