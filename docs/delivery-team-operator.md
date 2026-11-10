@@ -61,13 +61,15 @@ queue writer or expanded scope are supplied by this command.
 These are SQL functions, not commands of this CLI. Run them only through the trusted operator credential path described above: a non-superuser `aicc_operator` session, never app, worker, superuser or `SET ROLE`. Any other caller gets a denial or `false`, and the refusal is audited.
 
 1. `SELECT cto_scope_add('<task_id>', '<reference>')` puts one enrolled task under enforcement. Delivery-team enrollment alone never does this. Check the scope with `SELECT * FROM cto_scope`. Use `SELECT cto_scope_remove('<task_id>', '<reason>')` to take a task out of scope; its bound work stays enforced.
-2. Before activating, make sure no unassigned scoped work is ready or claimed. If any is, `cto_activate` returns `false` and audits `unbound_scoped_work`. Then call `SELECT cto_activate('<fleet verification reference>')`. Each scoped task's work then needs its own exact `cto_assign`; the work must carry its canonical repository. Ordinary PR reviews, retries and unscoped work are unaffected.
+2. Before activating, make sure no unassigned scoped work is ready or claimed. If any is, `cto_activate` returns `false` and audits `unbound_scoped_work` with the oldest blocking work item. Then call `SELECT cto_activate('<fleet verification reference>')`. Each scoped task's work that can change code, and each delivery-team stage, then needs its own exact `cto_assign`; the work must carry its canonical repository. Automatic PR reviews (chunks, retries, refresh, finding verification) of any task, scoped or not, and all unscoped work are unaffected.
 3. `SELECT cto_deactivate('<reason>')` turns enforcement off. A blank reason is refused and audited. Nothing is deleted or revoked.
 4. Every switch and scope change appends an immutable row to `cto_control_event`. Put the human or ticket in the reference: the actor column is always `aicc_operator`.
 
-Automatically generated review and verification payloads of a scoped task cannot be pre-assigned, because their digest depends on the PR diff. Keep a task in scope only while its stages are being assigned.
+5. If `cto_activate` or `cto_scope_add` keeps returning `false` because of a row nothing will ever claim (delayed far into the future, or in a queue no worker serves), read the row from the refusal: `SELECT work_item_id FROM cto_assignment_event WHERE reason = 'unbound_scoped_work' ORDER BY event_id DESC LIMIT 1`. Then, in one transaction, `SELECT cto_work_retire('<work_item_id>', '<reason>')` and repeat the refused call. The row is dead-lettered, not deleted. The same function retires a ready row whose assignment was revoked. It refuses claimed rows, live assigned work and PR-review jobs.
 
-Schema rollback is refused while enforcement is active. It is also refused once any switch or scope decision has been recorded. Use a reviewed forward migration instead.
+Automatic PR-review jobs of a scoped task need no assignment: they only read code and cannot change, publish or merge it. Each one admitted this way is audited as `review_class_exempt`. A task can stay in scope through its whole review cycle.
+
+Schema rollback is refused while enforcement is active. It is also refused once any switch, scope or retire decision has been recorded, including after deactivation. Use a reviewed forward migration instead.
 
 ## Existing Basic-auth edge
 

@@ -5,7 +5,9 @@
 -- every retry. Here the SAME 0036 checks apply, unchanged, but only to work in
 -- the operator's explicit enforcement scope (`cto_scope`), to task-less
 -- agent work that can write, and to work already bound to an assignment. All
--- other work keeps its pre-activation admission path. Replaced 0036 entry
+-- other work keeps its pre-activation admission path. Automatic PR-review jobs
+-- (`_cto_review_class`: they cannot write, publish or merge) are out of scope
+-- even for a scoped task (owner decision 2026-11-10). Replaced 0036 entry
 -- points keep signature, owner and ACL (CREATE OR REPLACE); 0037.down restores
 -- the exact 0036 bodies. Upgrade from a never-activated 36 is the release path.
 --
@@ -20,8 +22,9 @@
 -- Append-only switch history: who, when and why, for the latch and the scope.
 CREATE TABLE cto_control_event (
  event_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
- action text NOT NULL CHECK (action IN ('activate','deactivate','scope_add','scope_remove')),
+ action text NOT NULL CHECK (action IN ('activate','deactivate','scope_add','scope_remove','work_retire')),
  task_id text CHECK ((action IN ('scope_add','scope_remove')) = (task_id IS NOT NULL)),
+ work_item_id text CHECK ((action='work_retire') = (work_item_id IS NOT NULL)),
  reference text NOT NULL CHECK (length(btrim(reference))>0),
  actor text NOT NULL,
  recorded_at timestamptz NOT NULL DEFAULT clock_timestamp()
@@ -58,6 +61,35 @@ LANGUAGE sql IMMUTABLE SET search_path=pg_catalog,public AS $$
  CROSS JOIN LATERAL (SELECT nullif(lower(btrim(c.v,E' \t\r\n\f'||chr(11))),'') AS id) n
  WHERE n.id IS NOT NULL
 $$;
+-- Automatic PR-review job (review_merge: whole review, chunk, :retry:N,
+-- pre-merge refresh, finding verification). True only for a payload the worker
+-- can execute with no write, publish or merge capability, because the worker
+-- picks capabilities from exactly these fields:
+--  * kind agent_run; task_type and EVERY cascade entry's task_type are
+--    independent_review (model without tools) or verification_review
+--    (read-only checkout at the exact head). A test pins both to the worker's
+--    no-write sets. An entry without a task_type does not qualify;
+--  * untrusted is JSON true: the worker refuses a mutating type for it;
+--  * review_head pins a 40-hex head: the worker refuses a mutating type there;
+--  * no delivery_team / backlog_task_id / delivery_team_source_sha: delivery-
+--    team stages (task_type `review`, operator-known digest) and backlog work
+--    never qualify and stay assigned.
+-- CASE, not AND, guards jsonb_array_elements: AND gives no evaluation order.
+CREATE FUNCTION _cto_review_class(p_payload jsonb) RETURNS boolean
+LANGUAGE sql IMMUTABLE SET search_path=pg_catalog,public AS $$
+ SELECT CASE WHEN jsonb_typeof(p_payload) IS DISTINCT FROM 'object' THEN false ELSE coalesce(
+  p_payload->'kind'='"agent_run"'::jsonb
+  AND p_payload->'task_type' IN ('"independent_review"'::jsonb,'"verification_review"'::jsonb)
+  AND CASE WHEN NOT (p_payload ? 'cascade') THEN true
+       WHEN jsonb_typeof(p_payload->'cascade')<>'array' THEN false
+       ELSE NOT EXISTS(SELECT 1 FROM jsonb_array_elements(p_payload->'cascade') c
+        WHERE jsonb_typeof(c)<>'object' OR NOT coalesce(c->'task_type'
+         IN ('"independent_review"'::jsonb,'"verification_review"'::jsonb),false)) END
+  AND p_payload->'untrusted'='true'::jsonb
+  AND jsonb_typeof(p_payload#>'{review_head,head_sha}')='string'
+  AND p_payload#>>'{review_head,head_sha}' ~ '^[0-9a-f]{40}$'
+  AND NOT (p_payload ?| ARRAY['delivery_team','backlog_task_id','delivery_team_source_sha']),false) END
+$$;
 -- Read-only agent work: the payload task_type and every cascade entry's
 -- task_type are in the worker's read-only/model-only sets
 -- (agent_runner.READ_ONLY_TASK_TYPES | MODEL_ONLY_TASK_TYPES; a test pins the
@@ -73,7 +105,9 @@ LANGUAGE sql IMMUTABLE SET search_path=pg_catalog,public AS $$
       'architecture_review','verification_review','independent_review']))))
 $$;
 -- THE SCOPE RULE for a payload.
---  * Any identity naming a task in cto_scope -> in scope. A conflicting,
+--  * An automatic PR-review job (_cto_review_class) -> out of scope, whatever
+--    task it names: it cannot change any task.
+--  * Any other identity naming a task in cto_scope -> in scope. A conflicting,
 --    padded or case-variant identity cannot launder scoped work: in scope it
 --    fails 0036's exact-identity checks.
 --  * No identity at all, kind agent_run/simple_task, not read-only -> in
@@ -89,6 +123,7 @@ BEGIN
   RETURN jsonb_typeof(p_payload)='object' AND coalesce(p_payload->>'kind','') IN ('agent_run','simple_task')
    AND NOT _cto_read_only(p_payload);
  END IF;
+ IF _cto_review_class(p_payload) THEN RETURN false; END IF;
  RETURN EXISTS(SELECT 1 FROM cto_scope s WHERE lower(s.task_id)=ANY(ids));
 END $$;
 -- An existing work item is in scope when its identities are, or when it is
@@ -99,26 +134,32 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path=pg_catalog,public AS $$
  SELECT EXISTS(SELECT 1 FROM cto_work_binding b WHERE b.work_item_id=p_work)
   OR EXISTS(SELECT 1 FROM work_item i WHERE i.work_item_id=p_work AND _cto_in_scope(i.task_id,i.payload))
 $$;
--- Ready/claimed work that is in scope but has no binding. Its existence is
--- what would break the invariant; activation and scope growth refuse it.
-CREATE FUNCTION _cto_unbound_scoped_work(p_task text DEFAULT NULL) RETURNS boolean
+-- Ready/claimed work that is in scope (or would be, once p_task is added) but
+-- has no binding. Its existence is what would break the invariant; activation
+-- and scope growth refuse it. Returns the oldest such work item, NULL if none:
+-- the refusal audit names it so the operator can drain or cto_work_retire it.
+CREATE FUNCTION _cto_unbound_scoped_work(p_task text DEFAULT NULL) RETURNS text
 LANGUAGE sql STABLE SECURITY DEFINER SET search_path=pg_catalog,public AS $$
- SELECT EXISTS(SELECT 1 FROM work_item w WHERE w.state IN ('ready','claimed')
+ SELECT w.work_item_id FROM work_item w WHERE w.state IN ('ready','claimed')
   AND NOT EXISTS(SELECT 1 FROM cto_work_binding b WHERE b.work_item_id=w.work_item_id)
   AND CASE WHEN p_task IS NULL THEN _cto_in_scope(w.task_id,w.payload)
-      ELSE lower(p_task)=ANY(_cto_identities(w.task_id,w.payload)) END)
+      ELSE lower(p_task)=ANY(_cto_identities(w.task_id,w.payload))
+       AND NOT _cto_review_class(w.payload) END
+  ORDER BY w.created_at,w.work_item_id LIMIT 1
 $$;
 
 CREATE OR REPLACE FUNCTION cto_activate(p_reference text) RETURNS boolean
 LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,public AS $$
+DECLARE blocker text;
 BEGIN
  PERFORM pg_advisory_xact_lock(73536001);
  IF NOT _cto_operator() THEN PERFORM _cto_audit('activate','operator_required'); RETURN false; END IF;
  IF coalesce(length(btrim(p_reference)),0)=0 THEN PERFORM _cto_audit('activate','reason_required'); RETURN false; END IF;
  IF _cto_enabled() THEN RETURN true; END IF;
  -- Scoped work admitted while enforcement was off is neither grandfathered nor
- -- left silently unclaimable: drain, kill or re-admit it first.
- IF _cto_unbound_scoped_work() THEN PERFORM _cto_audit('activate','unbound_scoped_work'); RETURN false; END IF;
+ -- left silently unclaimable: drain, cto_work_retire or re-admit it first.
+ blocker:=_cto_unbound_scoped_work();
+ IF blocker IS NOT NULL THEN PERFORM _cto_audit('activate','unbound_scoped_work',NULL,blocker); RETURN false; END IF;
  -- Snapshot attempt identities, not work items: later retries are not legacy.
  INSERT INTO cto_execution_start(attempt_id,legacy_drain)
  SELECT a.attempt_id,true FROM work_attempt a JOIN work_item i
@@ -148,6 +189,7 @@ END $$;
 -- Put one enrolled canonical task under enforcement. Idempotent.
 CREATE FUNCTION cto_scope_add(p_task text,p_reference text) RETURNS boolean
 LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,public AS $$
+DECLARE blocker text;
 BEGIN
  PERFORM pg_advisory_xact_lock(73536001);
  IF NOT _cto_operator() THEN PERFORM _cto_audit('scope_add','operator_required'); RETURN false; END IF;
@@ -157,8 +199,9 @@ BEGIN
  IF NOT FOUND OR NOT EXISTS(SELECT 1 FROM delivery_team_stage s WHERE s.task_id=p_task) THEN
   PERFORM _cto_audit('scope_add','not_enrolled'); RETURN false;
  END IF;
- IF _cto_enabled() AND _cto_unbound_scoped_work(p_task) THEN
-  PERFORM _cto_audit('scope_add','unbound_scoped_work'); RETURN false;
+ IF _cto_enabled() THEN blocker:=_cto_unbound_scoped_work(p_task); END IF;
+ IF blocker IS NOT NULL THEN
+  PERFORM _cto_audit('scope_add','unbound_scoped_work',NULL,blocker); RETURN false;
  END IF;
  INSERT INTO cto_scope(task_id,reference,added_by) VALUES(p_task,p_reference,session_user)
  ON CONFLICT DO NOTHING;
@@ -181,12 +224,50 @@ BEGIN
  PERFORM _cto_audit('scope_remove','granted'); RETURN true;
 END $$;
 
+-- The operator's audited lever for a ready queue row that nothing else can
+-- remove: one that holds cto_activate / cto_scope_add in refusal (delayed far
+-- into the future, or parked in a queue no worker serves), or a bound row whose
+-- assignment can no longer be honoured (revoked, stale, mismatched). It
+-- dead-letters exactly that row; it cannot touch claimed work, live assigned
+-- work, PR-review jobs or work no enforcement rule could cover. The work row,
+-- its payload and history stay; queue_redrive remains the only way back and
+-- still refuses unbound in-scope work while enforcement is active. Called in
+-- one transaction with cto_activate / cto_scope_add it leaves no window for a
+-- new blocking row: every enqueue waits on the same advisory lock.
+CREATE FUNCTION cto_work_retire(p_work text,p_reason text) RETURNS boolean
+LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,public AS $$
+DECLARE i work_item%ROWTYPE; retirable boolean;
+BEGIN
+ PERFORM pg_advisory_xact_lock(73536001);
+ IF NOT _cto_operator() THEN PERFORM _cto_audit('retire','operator_required'); RETURN false; END IF;
+ IF coalesce(length(btrim(p_reason)),0)=0 THEN PERFORM _cto_audit('retire','reason_required'); RETURN false; END IF;
+ SELECT * INTO i FROM work_item WHERE work_item_id=p_work FOR UPDATE;
+ -- Never copy the caller's text into the audit for an unknown identity.
+ IF NOT FOUND THEN PERFORM _cto_audit('retire','unknown_work_item'); RETURN false; END IF;
+ IF i.state<>'ready' THEN PERFORM _cto_audit('retire','not_ready',NULL,i.work_item_id); RETURN false; END IF;
+ IF EXISTS(SELECT 1 FROM cto_work_binding b WHERE b.work_item_id=i.work_item_id) THEN
+  retirable:=_cto_work_reason(i.work_item_id,false) IS NOT NULL;
+ ELSE
+  -- In scope now, or naming an enrolled task the operator could add to scope.
+  retirable:=_cto_in_scope(i.task_id,i.payload) OR (NOT _cto_review_class(i.payload)
+   AND EXISTS(SELECT 1 FROM delivery_team_stage s
+    WHERE lower(s.task_id)=ANY(_cto_identities(i.task_id,i.payload))));
+ END IF;
+ IF NOT retirable THEN PERFORM _cto_audit('retire','not_retirable',NULL,i.work_item_id); RETURN false; END IF;
+ UPDATE work_item SET state='dead',current_attempt_id=NULL,dead_reason='cto_operator_retired',
+  dead_at=now(),updated_at=now() WHERE work_item_id=i.work_item_id;
+ PERFORM _queue_audit(i.work_item_id,NULL,'retire','granted','cto_operator_retired');
+ INSERT INTO cto_control_event(action,work_item_id,reference,actor)
+  VALUES('work_retire',i.work_item_id,p_reason,session_user);
+ PERFORM _cto_audit('retire','granted',NULL,i.work_item_id); RETURN true;
+END $$;
+
 CREATE OR REPLACE FUNCTION queue_enqueue(p_queue text,p_idempotency_key text,p_payload jsonb,
  p_task_id text DEFAULT NULL,p_repository_id text DEFAULT NULL,p_max_attempts integer DEFAULT 3,
  p_priority integer DEFAULT 0,p_delay_seconds integer DEFAULT 0,p_backoff_seconds integer DEFAULT 2)
 RETURNS text LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,public AS $$
 DECLARE aid text; wid text; rev bigint; old work_item%ROWTYPE; bound_work text; refusal text;
- scoped boolean:=false;
+ scoped boolean:=false; exempt boolean:=false;
 BEGIN
  PERFORM pg_advisory_xact_lock(73536001);
  IF _cto_enabled() THEN
@@ -194,6 +275,10 @@ BEGIN
   -- A key that already names in-scope work stays in scope whatever is resent.
   scoped:=_cto_in_scope(p_task_id,p_payload)
    OR (old.work_item_id IS NOT NULL AND _cto_work_in_scope(old.work_item_id));
+  -- A PR-review job of a scoped task is admitted without an assignment; the
+  -- first admission of each such identity is audited (replays are not).
+  exempt:=NOT scoped AND old.work_item_id IS NULL AND _cto_review_class(p_payload)
+   AND EXISTS(SELECT 1 FROM cto_scope s WHERE lower(s.task_id)=ANY(_cto_identities(p_task_id,p_payload)));
  END IF;
  IF scoped THEN
   IF old.work_item_id IS NOT NULL THEN
@@ -233,6 +318,7 @@ BEGIN
    PERFORM _cto_audit('enqueue','binding_conflict',aid,wid); RETURN NULL;
   END IF;
  END IF;
+ IF exempt AND wid IS NOT NULL THEN PERFORM _cto_audit('enqueue','review_class_exempt',NULL,wid); END IF;
  RETURN wid;
 END $$;
 
@@ -538,5 +624,5 @@ REVOKE ALL ON FUNCTION queue_redrive(text,integer) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION queue_redrive(text,integer) TO aicc_app;
 GRANT EXECUTE ON FUNCTION cto_authorize_start(text,text) TO aicc_worker;
 GRANT EXECUTE ON FUNCTION cto_assign(text,bigint,text,jsonb,text),cto_revoke(text,text),cto_activate(text),
- cto_deactivate(text),cto_scope_add(text,text),cto_scope_remove(text,text) TO aicc_operator;
+ cto_deactivate(text),cto_scope_add(text,text),cto_scope_remove(text,text),cto_work_retire(text,text) TO aicc_operator;
 GRANT SELECT ON cto_control_event,cto_scope TO aicc_app,aicc_operator;

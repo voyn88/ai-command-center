@@ -107,6 +107,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from command_center.db.work_queue_store import QueueAdmissionRefused
 from command_center.orchestrator import gh_access, github_app_auth
 from command_center.orchestrator.routing import cascade_for
 
@@ -167,6 +168,11 @@ class ReviewConfig:
     #: green -- absence of information is not a verdict
     #: (VOYN-W0-AICC-MERGE-TICK-REQUIRED-CHECKS-PRESENT).
     required_checks: tuple[str, ...] = _DEFAULT_REQUIRED_MERGE_CHECKS
+
+
+#: Skip reason for a task whose queue item the database refused to admit
+#: (CTO enforcement, idempotency conflict). The tick records it and continues.
+_ADMISSION_REFUSED = "queue_admission_refused"
 
 
 @dataclass
@@ -1746,8 +1752,16 @@ def _review_once(
         # findings themselves (VOYN-W0-AICC-REVIEW-AUTO-ACCEPT -- see the
         # verification section comment above for why the eager full-context
         # pass of VOYN-W0-AICC-REVIEW-ADJUDICATE was retired).
-        for review_key, payload in prepared:
-            enqueue(cfg.queue, review_key, payload, task_id, len(cascade), repo)
+        try:
+            for review_key, payload in prepared:
+                enqueue(cfg.queue, review_key, payload, task_id, len(cascade), repo)
+        except QueueAdmissionRefused:
+            # The database refused THIS task's review item (its audit row is
+            # already committed). One refused task must not stop the tick for
+            # every task after it, nor the retry/marker/watchdog steps that
+            # follow review_once: record the skip and carry on.
+            report.skipped.append((task_id, _ADMISSION_REFUSED))
+            continue
         report.reviewed.append((task_id, pr_url))
         actions += 1
     if scan_token is not None:
@@ -1901,9 +1915,15 @@ def reconcile_review_once(
                     "base_sha": snapshot.base, "head_sha": snapshot.head,
                     "diff_hash": snapshot.digest,
                 }
-            enqueue(
-                cfg.queue, retry_key, payload, current_task_id, len(retry_cascade), repo
-            )
+            try:
+                enqueue(
+                    cfg.queue, retry_key, payload, current_task_id,
+                    len(retry_cascade), repo,
+                )
+            except QueueAdmissionRefused:
+                report.skipped.append((current_task_id, _ADMISSION_REFUSED))
+                retries_before = -1  # this task has its skip reason already
+                break
             report.retried.append((current_task_id, retry_key))
             actions += 1
         if actions == retries_before:
@@ -2715,7 +2735,12 @@ def _verified_rejection_outcome(
             "head_sha": snapshot.head,
         },
     }
-    enqueue(cfg.queue, key, payload, task_id, len(cascade), repo)
+    try:
+        enqueue(cfg.queue, key, payload, task_id, len(cascade), repo)
+    except QueueAdmissionRefused:
+        # Not "verification_enqueued": nothing was queued and no action spent.
+        # WAIT, never REMEDIATE: a refused admission is not a verdict.
+        return "WAIT", _ADMISSION_REFUSED
     return "WAIT", "verification_enqueued"
 
 
@@ -4192,7 +4217,10 @@ def _enqueue_review_refresh(
                 "head_sha": snapshot.head,
                 "diff_hash": snapshot.digest,
             }
-        enqueue(cfg.queue, review_key, payload, task_id, len(cascade), repo)
+        try:
+            enqueue(cfg.queue, review_key, payload, task_id, len(cascade), repo)
+        except QueueAdmissionRefused:
+            return _ADMISSION_REFUSED
     return None
 
 

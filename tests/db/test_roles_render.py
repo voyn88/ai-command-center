@@ -427,6 +427,7 @@ def test_only_operator_can_switch_cto_enforcement() -> None:
         "cto_deactivate(text)",
         "cto_scope_add(text, text)",
         "cto_scope_remove(text, text)",
+        "cto_work_retire(text, text)",
     ):
         assert lever in roles.FUNCTION_PRIVILEGES[roles.OPERATOR_ROLE]
         assert lever not in roles.FUNCTION_PRIVILEGES[roles.APP_ROLE]
@@ -454,6 +455,30 @@ def test_cto_read_only_task_types_match_the_worker() -> None:
     for array in arrays:
         assert set(re.findall(r"'([a-z_]+)'", array)) == expected
     assert not expected & agent_runner.MUTATING_TASK_TYPES
+
+
+def test_review_class_types_are_pinned_to_worker_read_only_sets() -> None:
+    """0037's PR-review exemption names only types the worker runs without any
+    write capability, and none it treats as mutating. It is deliberately
+    narrower than `_cto_read_only`: `review`, `final_gate` and
+    `architecture_review` (delivery-team stages, audits) are not PR reviews."""
+    import re
+    from pathlib import Path
+
+    from command_center import agent_runner
+
+    sql = (Path(__file__).parents[2] / "command_center/db/sql/0037_cto_enforcement_scope.up.sql").read_text()
+    body = sql[sql.index("CREATE FUNCTION _cto_review_class"):sql.index("-- Read-only agent work")]
+    lists = re.findall(r"IN \(([^)]*)\)", body)
+    assert len(lists) == 2  # the payload's task_type and every cascade entry's
+    for found in lists:
+        types = set(re.findall(r"'\"([a-z_]+)\"'::jsonb", found))
+        assert types == {"independent_review", "verification_review"}
+        assert not types & agent_runner.MUTATING_TASK_TYPES
+        assert types <= agent_runner.READ_ONLY_TASK_TYPES | agent_runner.MODEL_ONLY_TASK_TYPES
+    # No other task-type literal sits anywhere in the rule.
+    assert set(re.findall(r"'\"([a-z_]+)\"'::jsonb", body)) == {
+        "agent_run", "independent_review", "verification_review"}
 
 
 def test_only_operator_can_attest_delivery_release() -> None:

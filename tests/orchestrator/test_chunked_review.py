@@ -341,6 +341,43 @@ def test_refusal_with_exit_zero_and_no_verdict_is_retried_not_permanently_succee
     assert payload["task_type"] == "independent_review"
 
 
+def test_refused_queue_admission_is_a_skip_in_retry_verification_and_refresh(monkeypatch):
+    """N1 (AICC-0037 review): the database refusing one item's admission is a
+    recorded skip, never an exception that aborts the tick around it."""
+    from command_center.db.work_queue_store import QueueAdmissionRefused
+
+    target, dispatched, _report = _refusal_reconcile_setup(
+        monkeypatch,
+        cascade=[
+            {"executor": "claude", "task_type": "independent_review"},
+            {"executor": "codex", "task_type": "independent_review"},
+        ],
+    )
+    assert len(dispatched) == 1  # the same world enqueues when admitted
+
+    def refuse(*_args):
+        raise QueueAdmissionRefused("queue admission refused")
+
+    retry = review_merge.reconcile_review_once(None, refuse, "/repo")
+    assert retry.retried == []
+    assert retry.skipped == [(TASK, "queue_admission_refused")]
+
+    snapshot = snap("diff --git a/a b/a\n" + "x\n" * 40_000)
+    cfg = review_merge.ReviewConfig()
+    monkeypatch.setattr(review_merge, "_latest_review_result", lambda *_: None)
+    assert review_merge._verified_rejection_outcome(
+        None, refuse, TASK, PR, snapshot, "a.py:1: finding", cfg
+    ) == ("WAIT", "queue_admission_refused")
+    assert review_merge._enqueue_review_refresh(
+        refuse, "/repo", TASK, PR, None, cfg
+    ) == "queue_admission_refused"
+    # Any other failure of the writer is still loud.
+    with pytest.raises(RuntimeError):
+        review_merge.reconcile_review_once(
+            None, lambda *_: (_ for _ in ()).throw(RuntimeError("db down")), "/repo"
+        )
+
+
 def test_retry_prefers_a_different_executor_than_the_one_that_refused(monkeypatch):
     """The retry's cascade must not put the refusing executor first again --
     a persistent single-executor refusal (a systemic policy/prompt reaction)

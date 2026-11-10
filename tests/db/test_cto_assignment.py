@@ -810,11 +810,12 @@ def test_large_denied_prefix_uses_indexed_binding_selection_and_revoke_progresse
     claim_ms = (time.monotonic() - started) * 1000
     # Generous CI budget for one claim over 7,001 ready rows under the lock.
     assert claim_ms < 2000, claim_ms
-    # A second approved item races revocation. Both decisions must progress;
-    # any granted claim still fails start after the winning revoke commits.
+    # A second approved item races revocation. Both decisions must progress,
+    # and whichever wins, the revoked item never gets a start.
     race_payload = {**PAYLOAD, "prompt": "race tail"}
     current = assign(cto_rig, race_payload)
-    assert enqueue(cto_rig, key="race-tail", payload=race_payload)
+    race_item = enqueue(cto_rig, key="race-tail", payload=race_payload)
+    assert race_item
     barrier = Barrier(2)
 
     def claimant():
@@ -836,8 +837,34 @@ def test_large_denied_prefix_uses_indexed_binding_selection_and_revoke_progresse
         rf = pool.submit(revoker)
         outcome = cf.result(timeout=10)
         assert rf.result(timeout=10)
-    if outcome[0]:
-        assert start(cto_rig, outcome[3])[0] is False
+    assert outcome[0], outcome
+    claim_won = outcome[2] == race_item
+    if claim_won:
+        # The claim took the approved item first: after the revoke commits its
+        # start is refused, by name.
+        refused = start(cto_rig, outcome[3])
+        assert refused[0] is False and refused[1] == "assignment_revoked"
+    else:
+        # The revoke committed first. Since 0037 the claim does not come back
+        # empty: it skips the revoked item and takes the next out-of-scope
+        # legacy item, whose start is the unchanged pre-activation decision.
+        assert app.execute(
+            "SELECT task_id,state FROM work_item WHERE work_item_id=%s", (outcome[2],)
+        ).fetchone() == (outside, "claimed")
+        assert app.execute(
+            "SELECT count(*) FROM cto_work_binding WHERE work_item_id=%s", (outcome[2],)
+        ).fetchone()[0] == 0
+        assert start(cto_rig, outcome[3])[0] is True
+        assert app.execute(
+            "SELECT state,attempt_count FROM work_item WHERE work_item_id=%s", (race_item,)
+        ).fetchone() == ("ready", 0)
+    # In both orders no start was ever granted for the revoked item, and no
+    # later claim hands it out.
+    assert app.execute(
+        "SELECT count(*) FROM cto_assignment_event WHERE action='start' AND reason='granted'"
+        " AND work_item_id=%s", (race_item,)
+    ).fetchone()[0] == 0
+    assert claim(cto_rig)[2] != race_item
     artifact = {
         "denied_items": 2000,
         "out_of_scope_ready_items": 5000,
@@ -848,7 +875,7 @@ def test_large_denied_prefix_uses_indexed_binding_selection_and_revoke_progresse
         "unbound_rows_examined": examined,
         "claim_ms": claim_ms,
         "revoke_finished": True,
-        "claim_won_race": outcome[0],
+        "claim_won_race": claim_won,
     }
     print("CTO_INDEXED_PLAN " + json.dumps(artifact, sort_keys=True))
     (tmp_path / "plan.json").write_text(json.dumps(artifact, indent=2))

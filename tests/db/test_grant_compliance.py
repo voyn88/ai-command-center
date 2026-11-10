@@ -402,18 +402,35 @@ def test_worker_cannot_call_queue_redrive_when_grants_are_applied(
                 cur.execute("SELECT public.queue_redrive('nonexistent_queue', 1)")
 
 
-def test_worker_can_call_queue_redrive_without_grants(
+def test_worker_reaches_queue_redrive_without_grants_only_before_0037(
     admin_conn, psycopg, test_dsn, role_passwords
 ):
-    """Without grants the PUBLIC EXECUTE default is still in place.
+    """The PUBLIC EXECUTE default on ``queue_redrive``, before and after 0037.
 
-    This test reproduces the defect described in the issue: ``aicc_worker`` can
-    reach ``queue_redrive`` (an app-only function) because migrations do not
-    revoke PUBLIC EXECUTE and ``aicc_worker`` inherits it through PUBLIC.
+    Up to schema 36 this reproduces the defect described in the issue:
+    ``aicc_worker`` can reach ``queue_redrive`` (an app-only function) because
+    migrations do not revoke PUBLIC EXECUTE and ``aicc_worker`` inherits it
+    through PUBLIC. 0037 wraps ``queue_redrive`` (it is the only dead->ready
+    path, so CTO enforcement must guard it) and revokes PUBLIC on the wrapper
+    itself, so from schema 37 the worker is denied by migrations alone.
     """
-    _migrate_only(admin_conn, psycopg, test_dsn, role_passwords)
+    roles.apply_bootstrap(admin_conn)
+    migrator_dsn = _as_role(test_dsn, roles.MIGRATOR_ROLE, role_passwords)
+    worker_dsn = _as_role(test_dsn, roles.WORKER_ROLE, role_passwords)
 
-    # queue_redrive exists in the database after migrations.
+    def worker_call() -> str | None:
+        with psycopg.connect(worker_dsn, autocommit=True) as conn:
+            try:
+                # A non-existent work item is fine: a denial must happen
+                # before any data check.
+                conn.execute("SELECT public.queue_redrive('nonexistent_queue', 1)")
+            except Exception as exc:  # noqa: BLE001 - the message is the assertion
+                return str(exc).lower()
+        return None
+
+    with psycopg.connect(migrator_dsn, autocommit=True) as conn:
+        migrations.upgrade(conn, target=36)
+    # Intentionally omitted throughout: roles.apply_table_grants(conn)
     with admin_conn.cursor() as cur:
         cur.execute(
             "SELECT p.proname FROM pg_proc p "
@@ -421,22 +438,20 @@ def test_worker_can_call_queue_redrive_without_grants(
             "WHERE n.nspname = 'public' AND p.proname = 'queue_redrive'"
         )
         assert cur.fetchone() is not None, "queue_redrive must exist after migrations"
+    before = worker_call()
+    assert before is None or "permission denied" not in before, (
+        f"Worker got permission denied at schema 36 even WITHOUT grants — "
+        f"the defect is already fixed there or the test setup is wrong: {before}"
+    )
 
-    # Without grants, worker reaches queue_redrive through PUBLIC EXECUTE.
-    # The call may succeed or fail for data reasons, but it must not fail
-    # with "permission denied" — that is the defect.
-    with psycopg.connect(
-        _as_role(test_dsn, roles.WORKER_ROLE, role_passwords),
-        autocommit=True,
-    ) as conn:
-        with conn.cursor() as cur:
-            try:
-                cur.execute("SELECT public.queue_redrive('nonexistent_queue', 1)")
-            except Exception as exc:
-                assert "permission denied" not in str(exc).lower(), (
-                    f"Worker got permission denied even WITHOUT grants — "
-                    f"the defect is already fixed or the test setup is wrong: {exc}"
-                )
+    with psycopg.connect(migrator_dsn, autocommit=True) as conn:
+        assert tuple(migrations.upgrade(conn)) == (37,)
+    after = worker_call()
+    assert after is not None and "permission denied" in after, after
+    # The renamed pre-0037 body is not a way around the wrapper either.
+    with psycopg.connect(worker_dsn, autocommit=True) as conn:
+        with pytest.raises(Exception, match="permission denied"):
+            conn.execute("SELECT public._cto_legacy_redrive('nonexistent_queue', 1)")
 
 
 # ---------------------------------------------------------------------------

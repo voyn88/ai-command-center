@@ -32,9 +32,20 @@ from typing import Any
 
 __all__ = [
     "ClaimedWork",
+    "QueueAdmissionRefused",
     "QueueRefusal",
     "WorkQueueStore",
 ]
+
+
+class QueueAdmissionRefused(ValueError):
+    """``queue_enqueue`` returned NULL: the database refused this one item.
+
+    The refusal and its audit row are already committed. It is a decision
+    about ONE work item, not a broken queue, so a producer looping over many
+    tasks (the review tick) records it and moves on instead of aborting.
+    A ``ValueError`` subclass: existing callers that catch that keep working.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -226,7 +237,7 @@ class WorkQueueStore:
         if row["work_item_id"] is None:
             # _call has committed the server refusal/audit before surfacing
             # it. Never turn SQL NULL into a fabricated work-item ID "None".
-            raise ValueError("queue admission refused")
+            raise QueueAdmissionRefused("queue admission refused")
         return str(row["work_item_id"])
 
     # -- plumbing -------------------------------------------------------------

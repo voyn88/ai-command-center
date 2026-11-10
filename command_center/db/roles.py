@@ -721,6 +721,9 @@ _OPERATOR_FUNCTIONS = (
     "cto_deactivate(text)",
     "cto_scope_add(text, text)",
     "cto_scope_remove(text, text)",
+    # 0037: dead-letters one ready row that blocks activation/scope growth or
+    # whose assignment can no longer be honoured. Audited, operator-only.
+    "cto_work_retire(text, text)",
     "enroll_mint_ticket(text, text, text, inet, interval, text)",
     "enroll_revoke_ticket(text, text)",
     "enroll_sweep_expired()",
