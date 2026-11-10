@@ -23,12 +23,14 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
+from enum import Enum
 from typing import Any, Iterable
 
 __all__ = [
     "MIRROR_UNAVAILABLE",
     "ColumnCodec",
+    "TimestampWriter",
     "divergence",
     "render_authority_timestamp",
     "to_instant",
@@ -65,22 +67,38 @@ def to_instant(value: str) -> datetime:
     return parsed if parsed.tzinfo is not None else parsed.astimezone()
 
 
-def render_authority_timestamp(value: datetime) -> str:
-    """Render `timestamptz` back into exactly what `models.iso_now()` emits.
+class TimestampWriter(Enum):
+    """Timestamp spellings used by authoritative stores.
 
-    Naive local, second precision, no offset. An earlier version rendered UTC
-    with a `Z` suffix "matching what the application writes" — it does not, and
-    the result was a divergence check that called every row different, which is
-    a cutover gate permanently red. A red gate nobody can satisfy is one
-    somebody eventually satisfies by loosening the comparison.
-
-    `timespec="seconds"` matches `iso_now` and is therefore lossless for every
-    column mirrored today. It is *not* the right renderer for a store that
-    writes `datetime.now(UTC).isoformat()` — eight of those are queued for
-    later waves, and copying this onto them reproduces the same class of defect
-    in reverse. Tracked as `VOYN-W0-AICC-MIRROR-RENDER-SHARED`, a declared
-    blocker on the first such table.
+    This belongs to the mirror schema because PostgreSQL's ``timestamptz``
+    preserves an instant, not the spelling the writer used for it.  A mirror
+    must therefore name the writer whose spelling it has to reconstruct.
     """
+
+    ISO_NOW = "iso_now"
+    AWARE_UTC = "aware_utc"
+
+
+def render_authority_timestamp(
+    value: datetime, writer: TimestampWriter = TimestampWriter.ISO_NOW
+) -> str:
+    """Render `timestamptz` in the authoritative writer's format.
+
+    The default writer uses naive local time, second precision, and no offset.
+    An earlier version rendered UTC with a `Z` suffix "matching what the
+    application writes" — it does not, and the result was a divergence check
+    that called every row different, which is a cutover gate permanently red.
+    A red gate nobody can satisfy is one somebody eventually satisfies by
+    loosening the comparison.
+
+    `TimestampWriter.ISO_NOW` reproduces naive local, second precision text.
+    `TimestampWriter.AWARE_UTC` reproduces `datetime.now(UTC).isoformat()`:
+    UTC with an offset and the writer's automatic microsecond precision.  The
+    choice is made by each `ColumnCodec`, next to the schema columns, instead
+    of being inferred from a value after `timestamptz` has erased its spelling.
+    """
+    if writer is TimestampWriter.AWARE_UTC:
+        return value.astimezone(UTC).isoformat()
     return value.astimezone().replace(tzinfo=None).isoformat(timespec="seconds")
 
 
@@ -117,6 +135,15 @@ class ColumnCodec:
     flags: frozenset[str] = field(default_factory=frozenset)
     #: Columns PostgreSQL declares `jsonb` while the authority stores JSON text.
     json_values: frozenset[str] = field(default_factory=frozenset)
+    #: Timestamp columns written by `datetime.now(UTC).isoformat()` rather than
+    #: the default `models.iso_now()` writer.
+    aware_utc_timestamps: frozenset[str] = field(default_factory=frozenset)
+
+    def __post_init__(self) -> None:
+        unknown = self.aware_utc_timestamps - self.timestamps
+        if unknown:
+            names = ", ".join(sorted(unknown))
+            raise ValueError(f"aware UTC writers must be timestamp columns: {names}")
 
     def to_column(self, name: str, value: Any) -> Any:
         """The authority's shape -> the PostgreSQL column's type.
@@ -160,7 +187,12 @@ class ColumnCodec:
         if name in self.flags:
             return None if value is None else int(bool(value))
         if name in self.timestamps and isinstance(value, datetime):
-            return render_authority_timestamp(value)
+            writer = (
+                TimestampWriter.AWARE_UTC
+                if name in self.aware_utc_timestamps
+                else TimestampWriter.ISO_NOW
+            )
+            return render_authority_timestamp(value, writer)
         return value
 
     def comparable(self, name: str, value: Any, *, side: str) -> Any:

@@ -28,7 +28,7 @@ export default function QuickActionButton({ label, badge }: QuickActionButtonPro
       }}
     >
       <span style={{ fontSize: '0.82rem', fontWeight: 600, color: 'var(--tx)' }}>{label}</span>
-      {badge && <span style={{ fontSize: '0.66rem', color: 'var(--tx3)' }}>{badge}</span>}
+      {badge && <span style={{ fontSize: '0.66rem', color: 'var(--tx3-aa)' }}>{badge}</span>}
     </button>
   )
 }

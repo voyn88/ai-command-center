@@ -14,13 +14,14 @@
 // 401 from the queue reads, because both mean the same thing — the stored
 // credential is missing or rejected.
 
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 import BackgroundSwitcher from '../components/BackgroundSwitcher'
 import GlassPanel from '../components/GlassPanel'
 import LangToggle from '../components/LangToggle'
 import NavItem from '../components/NavItem'
+import TechDetails from '../components/TechDetails'
 import { ExecutionIcon, HomeIcon, TasksIcon } from '../components/NavIcons'
 import { fetchHome } from '../lib/api'
 import type { Project } from '../lib/api'
@@ -32,22 +33,19 @@ import {
   setOwnerToken,
 } from '../lib/queueApi'
 import type { QueueItem, QueueItemDetail } from '../lib/queueApi'
+import { ATTEMPT_STATE_KEYS, formatOutcomeReason, humanStatus, QUEUE_STATE_KEYS, reasonLabel } from '../lib/labels'
 
 const STATUS_ORDER = ['ALL', 'ready', 'claimed', 'succeeded', 'dead'] as const
 
 function statusKey(state: string): string {
-  if (state === 'ready') return 'taskStatusReady'
-  if (state === 'claimed') return 'taskStatusClaimed'
-  if (state === 'succeeded') return 'taskStatusSucceeded'
-  if (state === 'dead') return 'taskStatusDead'
-  return 'unknownState'
+  return QUEUE_STATE_KEYS[state] ?? 'statusUnclear'
 }
 
 function statusTone(state: string): string {
   if (state === 'succeeded') return 'var(--ok)'
-  if (state === 'dead') return 'var(--bad)'
-  if (state === 'claimed') return 'var(--accent-2)'
-  return 'var(--tx3)'
+  if (state === 'dead') return 'var(--bad-text)'
+  if (state === 'claimed') return 'var(--accent-text)'
+  return 'var(--tx3-aa)'
 }
 
 function formatDate(value: string | null, language: string, fallback: string) {
@@ -60,9 +58,8 @@ function formatDate(value: string | null, language: string, fallback: string) {
 
 /** A human name for a queue item: the repository or task it concerns —
  * never its wki_* id. */
-function taskTitle(item: QueueItem, generic: string): string {
-  const subject = item.repository_id || item.task_id
-  return subject ? `${generic}: ${subject}` : generic
+function taskTitle(item: QueueItem, t: (key: string, opts?: Record<string, string>) => string): string {
+  return item.repository_id ? t('taskAuditTitle', { project: item.repository_id }) : t('taskGeneric')
 }
 
 function TaskDetails({ detail, fallback }: { detail: QueueItemDetail; fallback: string }) {
@@ -75,7 +72,8 @@ function TaskDetails({ detail, fallback }: { detail: QueueItemDetail; fallback: 
     <div className="task-details">
       {detail.dead_reason && (
         <p>
-          <span className="task-details-label">{t('taskReason')}</span> {detail.dead_reason}
+          <span className="task-details-label">{t('taskReason')}</span>{' '}
+          <span title={detail.dead_reason}>{reasonLabel(detail.dead_reason, t) ?? t('reasonUnclear')}</span>
         </p>
       )}
       {resultText && (
@@ -87,12 +85,28 @@ function TaskDetails({ detail, fallback }: { detail: QueueItemDetail; fallback: 
         <span className="task-details-label">{t('taskAttempts')}</span>{' '}
         {detail.attempts.length === 0
           ? fallback
-          : detail.attempts
-              .map((attempt) => `№${attempt.attempt_no} — ${attempt.state}${attempt.outcome_reason ? ` (${attempt.outcome_reason})` : ''}`)
-              .join('; ')}
+          : detail.attempts.map((attempt, i) => {
+              const state = humanStatus(ATTEMPT_STATE_KEYS, attempt.state, t)
+              return (
+                <span key={`${attempt.attempt_no}-${i}`} title={[attempt.state, attempt.outcome_reason].filter(Boolean).join(' · ')}>
+                  {i > 0 && '; '}
+                  {`№${attempt.attempt_no} — ${state.label}${attempt.outcome_reason ? ` (${formatOutcomeReason(attempt.outcome_reason, t)})` : ''}`}
+                </span>
+              )
+            })}
       </p>
-      {/* Технические идентификаторы — только здесь, моноширинно, для копирования в отчёт. */}
-      <p className="task-details-tech">{detail.work_item_id}</p>
+      {/* Raw ids and codes live only in the collapsed "Service data" block. */}
+      <TechDetails
+        title={t('techTitle')}
+        hint={t('techHint')}
+        items={[
+          [t('techWorkItem'), detail.work_item_id],
+          [t('techTask'), detail.task_id],
+          [t('techState'), detail.state],
+          [t('techReason'), detail.dead_reason],
+          [t('techAttempts'), detail.attempts.length ? detail.attempts.map((a, i) => <span key={i} style={{ display: 'block' }}>{`№${a.attempt_no} ${a.state}${a.outcome_reason ? ` / ${a.outcome_reason}` : ''}`}</span>) : null],
+        ]}
+      />
     </div>
   )
 }
@@ -115,19 +129,19 @@ function TaskRow({ item, language, fallback }: { item: QueueItem; language: stri
   return (
     <article className="task-row">
       <div className="task-row-head">
-        <span className="task-status" style={{ color: statusTone(item.state) }}>
+        <span className="task-status" title={item.state} style={{ color: statusTone(item.state) }}>
           {t(statusKey(item.state))}
         </span>
-        <strong>{taskTitle(item, t('taskGeneric'))}</strong>
+        <strong title={item.task_id ? `${t('taskIdLabel')}: ${item.task_id}` : undefined}>{taskTitle(item, t)}</strong>
         <span className="task-date">{formatDate(item.created_at, language, fallback)}</span>
-        <button type="button" className="task-toggle" onClick={toggle}>
+        <button type="button" className="task-toggle" aria-expanded={open} onClick={toggle}>
           {open ? t('taskHide') : t('taskDetails')}
         </button>
       </div>
       {open && (
         <>
           {!detail && !detailError && <p className="task-details">{t('loading')}</p>}
-          {detailError && <p className="task-details" style={{ color: 'var(--bad)' }}>{t('errorLoading')}</p>}
+          {detailError && <p className="task-details" role="alert" style={{ color: 'var(--bad-text)' }}>{t('taskDetailsError')}</p>}
           {detail && <TaskDetails detail={detail} fallback={t('notAvailable')} />}
         </>
       )}
@@ -230,7 +244,7 @@ function AuditLauncher({
           rows={2}
           style={{ width: '100%', resize: 'vertical', fontFamily: 'inherit' }}
         />
-        {status === 'error' && <p style={{ color: 'var(--bad)', margin: 0 }}>{t('auditError')}</p>}
+        {status === 'error' && <p style={{ color: 'var(--bad-text)', margin: 0 }}>{t('auditError')}</p>}
         {lastQueued && status === 'idle' && (
           <p style={{ color: 'var(--ok)', margin: 0 }}>{t('auditQueued')}</p>
         )}
@@ -244,8 +258,8 @@ function TokenGate({ notice, onUnlocked }: { notice?: string | null; onUnlocked:
   const [value, setValue] = useState('')
   return (
     <GlassPanel title={t('tokenPrompt')}>
-      {notice && <p style={{ color: 'var(--bad)', marginTop: 0 }}>{notice}</p>}
-      <p style={{ color: 'var(--tx3)', marginTop: 0 }}>{t('tokenHint')}</p>
+      {notice && <p style={{ color: 'var(--bad-text)', marginTop: 0 }}>{notice}</p>}
+      <p style={{ color: 'var(--tx3-aa)', marginTop: 0 }}>{t('tokenHint')}</p>
       <form
         style={{ display: 'flex', gap: '.6rem', flexWrap: 'wrap' }}
         onSubmit={(event) => {
@@ -276,6 +290,7 @@ export default function Tasks({ onNavigate }: { onNavigate: (screen: 'home' | 'e
   const [error, setError] = useState(false)
   const [filter, setFilter] = useState<string>('ALL')
   const [projects, setProjects] = useState<Project[]>([])
+  const mainRef = useRef<HTMLElement>(null)
   const [pendingAudit, setPendingAudit] = useState<AuditDraft | null>(null)
 
   const load = useCallback(() => {
@@ -331,15 +346,15 @@ export default function Tasks({ onNavigate }: { onNavigate: (screen: 'home' | 'e
           <NavItem label={t('execution')} icon={<ExecutionIcon />} onClick={() => onNavigate('execution')} />
           <NavItem label={t('tasks')} icon={<TasksIcon />} active onClick={() => onNavigate('tasks')} />
         </aside>
-        <main className="execution-main">
+        <main className="execution-main" tabIndex={-1} ref={mainRef}>
           {locked && (
             <TokenGate notice={pendingAudit ? t('auditLocked') : null} onUnlocked={load} />
           )}
-          {!locked && !items && !error && <GlassPanel>{t('loading')}</GlassPanel>}
+          {!locked && !items && !error && <GlassPanel><span role="status">{t('loading')}</span></GlassPanel>}
           {!locked && error && (
             <GlassPanel>
-              <p style={{ color: 'var(--bad)' }}>{t('errorLoading')}</p>
-              <button className="execution-back" onClick={load}>{t('retry')}</button>
+              <p role="alert" style={{ color: 'var(--bad-text)' }}>{t('errorLoading')} {t('errorLoadingHint')}</p>
+              <button className="execution-back" onClick={() => { mainRef.current?.focus(); load() }}>{t('retry')}</button>
             </GlassPanel>
           )}
           {!locked && items && (
@@ -356,6 +371,7 @@ export default function Tasks({ onNavigate }: { onNavigate: (screen: 'home' | 'e
                 {STATUS_ORDER.map((state) => (
                   <button
                     key={state}
+                    aria-pressed={filter === state}
                     className={filter === state ? 'active' : ''}
                     onClick={() => setFilter(state)}
                   >
@@ -365,7 +381,7 @@ export default function Tasks({ onNavigate }: { onNavigate: (screen: 'home' | 'e
               </div>
               <div className="execution-list">
                 {visible.length === 0 ? (
-                  <p style={{ color: 'var(--tx3)' }}>{t('taskEmpty')}</p>
+                  <div><p style={{ color: 'var(--tx3-aa)' }}>{t('taskEmpty')}</p>{filter !== 'ALL' && <button type="button" className="execution-back" onClick={() => setFilter('ALL')}>{t('resetFilters')}</button>}</div>
                 ) : (
                   visible.map((item) => (
                     <TaskRow key={item.work_item_id} item={item} language={i18n.language} fallback={t('notAvailable')} />
