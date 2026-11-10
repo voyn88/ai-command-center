@@ -111,6 +111,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Parse and report without touching the database.",
     )
     sub.add_parser("backlog-status", help="Task counts by status from the store.")
+    recover = sub.add_parser(
+        "backlog-recover-stuck-ready-to-review",
+        help="READY_TO_REVIEW -> OPEN for one task through the 0018 machine "
+        "gate (granted only when the task carries no `pr` evidence at all). "
+        "The sanctioned way out for a task the pr_evidence tick can only "
+        "ever skip -- e.g. its PR was never opened or was closed/merged "
+        "without evidence recorded, so `reconcile_pr_evidence` (which only "
+        "ever looks for an OPEN pull request) will report the same skip "
+        "forever without this.",
+    )
+    recover.add_argument("task_id", help="The stuck backlog task id.")
     export = sub.add_parser(
         "backlog-export",
         help=(
@@ -543,6 +554,18 @@ def main(argv: list[str] | None = None) -> int:
                     BacklogStore(lambda: nullcontext(conn)).counts_by_status().items()
                 ):
                     print(f"{status}: {count}")
+                return 0
+
+            if args.command == "backlog-recover-stuck-ready-to-review":
+                from command_center.db.backlog_store import BacklogStore
+
+                ok, reason, revision = BacklogStore(
+                    lambda: nullcontext(conn)
+                ).recover_stuck_ready_to_review(args.task_id)
+                if not ok:
+                    print(f"REFUSED   {args.task_id}: {reason}", file=sys.stderr)
+                    return 1
+                print(f"RECOVERED {args.task_id} -> OPEN (revision {revision})")
                 return 0
 
             if args.command == "backlog-export":
