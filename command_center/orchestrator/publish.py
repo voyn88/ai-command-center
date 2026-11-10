@@ -43,6 +43,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from command_center.observability.trace import log_span
 from command_center.worker import lease_client
 
 _PR_VIEW_DECODE_ERRORS = (TypeError, ValueError)
@@ -546,6 +547,7 @@ def publish_run(
     # redeliveries skip the gate: that head's verdict was taken before the
     # original push.
     if not already_durable:
+        log_span("tests", task_id=cfg.task, head_sha=head_sha)
         gate_failure = _static_quality_gate(repo_path, head_sha)
         if gate_failure is not None:
             return gate_failure
@@ -686,7 +688,7 @@ def publish_run(
                     reason="remote_branch_head_not_durable_after_push",
                     head_sha=head_sha,
                 )
-        return _verified_pr_result(
+        result = _verified_pr_result(
             repo_path,
             cfg,
             branch,
@@ -695,6 +697,15 @@ def publish_run(
             durable_env,
             sleep,
         )
+        if result.ok:
+            log_span(
+                "publish",
+                task_id=cfg.task,
+                branch=result.branch,
+                head_sha=result.head_sha,
+                pr_url=result.pr_url,
+            )
+        return result
     finally:
         if cfg.release_lease:
             _run(_lease_argv(cfg, "release", repo_path), repo_path)
