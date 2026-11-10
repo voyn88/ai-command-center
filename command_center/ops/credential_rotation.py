@@ -60,10 +60,21 @@ _READY = "aicc-ready"
 # that a rotation tick which fires anyway -- because its timer had already
 # elapsed before the rollout could stop it, or because it was started
 # directly rather than through the timer -- has a way to notice a rollout is
-# in flight and defer instead of racing it (live 2026-09-08 worker-01: a
-# rotate tick's `try-restart` collided with the rollout's own drain of the
+# in flight and wait for it instead of racing it (live 2026-09-08 worker-01:
+# a rotate tick's `try-restart` collided with the rollout's own drain of the
 # canary lane).
 DEFAULT_ROLLOUT_LOCK_PATH = Path("/run/aicc-staged-rollout.lock")
+# The worker release deploy takes the same marker on EVERY five-minute tick,
+# including the ~5 s "already at target" no-op and the ~125 s readiness wait
+# while lanes are down. A rotation tick that merely exited on seeing it lost
+# its whole timer period and let the one-hour credential expire (live
+# 2026-11-10 worker-01), so the tick waits out the marker, bounded, instead.
+DEFAULT_ROLLOUT_LOCK_WAIT_SECONDS = 300.0
+DEFAULT_ROLLOUT_LOCK_POLL_SECONDS = 5.0
+# EX_TEMPFAIL: the marker outlived the wait. Non-zero on purpose, so
+# Restart=on-failure retries on its two-minute cadence instead of the tick
+# vanishing as a "success" until the next timer period.
+ROLLOUT_LOCK_WAIT_EXPIRED_EXIT = 75
 
 # enroll_rotate_self() grants a fixed one-hour credential. Keep this contract
 # beside the protocol budget so a unit/test change cannot silently make a
@@ -1772,32 +1783,110 @@ def _parser() -> argparse.ArgumentParser:
         type=Path,
         default=DEFAULT_ROLLOUT_LOCK_PATH,
         help="Marker file the staged worker rollout holds for its duration; "
-        "a rotation tick that finds it present defers rather than racing "
-        "the rollout's own lane mutations.",
+        "a rotation tick that finds it present waits for it to clear rather "
+        "than racing the rollout's own lane mutations.",
+    )
+    parser.add_argument(
+        "--rollout-lock-wait",
+        type=float,
+        default=DEFAULT_ROLLOUT_LOCK_WAIT_SECONDS,
+        help="Longest time, in seconds, a rotation tick waits for the rollout "
+        "marker to clear before exiting non-zero without rotating.",
+    )
+    parser.add_argument(
+        "--rollout-lock-poll",
+        type=float,
+        default=DEFAULT_ROLLOUT_LOCK_POLL_SECONDS,
+        help="Interval, in seconds, between checks of the rollout marker.",
     )
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
+def wait_for_rollout_lock(
+    lock: Path,
+    audit: Audit,
+    *,
+    timeout: float,
+    poll_interval: float,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> bool:
+    """Wait, bounded, for the staged-rollout marker to disappear.
+
+    Returns True when the marker is absent (immediately, or after waiting)
+    and False when it is still present after ``timeout`` seconds. Runs before
+    the controller exists, so an expired wait never touches the lanes, the
+    database, or the failure circuit.
+    """
+    if not lock.exists():
+        return True
+    started = monotonic()
+    audit.emit(
+        "rotation_waiting_staged_rollout", lock=str(lock), timeout=timeout
+    )
+    while True:
+        waited = monotonic() - started
+        if waited >= timeout:
+            audit.emit(
+                "rotation_staged_rollout_wait_expired",
+                lock=str(lock),
+                waited=round(waited, 3),
+                timeout=timeout,
+            )
+            return False
+        sleep(min(poll_interval, timeout - waited))
+        if not lock.exists():
+            audit.emit(
+                "rotation_staged_rollout_cleared",
+                lock=str(lock),
+                waited=round(monotonic() - started, 3),
+            )
+            return True
+
+
+def main(
+    argv: list[str] | None = None,
+    *,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> int:
     args = _parser().parse_args(argv)
     try:
         worker_units = load_lane_registry(args.lane_registry)
     except RotationError as error:
         Audit(args.audit_file).emit("rotation_refused", error=str(error))
         return 78
+    if (
+        not math.isfinite(args.rollout_lock_wait)
+        or args.rollout_lock_wait < 0
+        or not math.isfinite(args.rollout_lock_poll)
+        or args.rollout_lock_poll <= 0
+    ):
+        Audit(args.audit_file).emit(
+            "rotation_refused",
+            error="rollout lock wait must be non-negative and poll positive",
+        )
+        return 78
     # A staged rollout mutates lanes directly and holds this marker for its
-    # duration; deferring here -- exit 0, not a failure -- keeps
-    # Restart=on-failure from treating a rollout in progress as an incident.
+    # duration, so rotation must not run under it. It WAITS for the marker
+    # rather than exiting: the release deploy holds it for a few seconds on
+    # every idle tick, and a tick that exited 0 here was not retried until
+    # the next timer period -- twice in a row outlives the credential. Only a
+    # marker that outlasts the bounded wait ends the tick, and then non-zero
+    # so Restart=on-failure retries; the failure circuit is not involved.
     # Recovery is exempt: it is cleaning up an ALREADY-interrupted rotation
     # (a durable phase journal), and leaving that fleet drained until the
     # rollout finishes is a worse outcome than finishing the recovery.
-    if not args.recover_only and args.rollout_lock is not None and (
-        args.rollout_lock.exists()
-    ):
-        Audit(args.audit_file).emit(
-            "rotation_deferred_staged_rollout", lock=str(args.rollout_lock)
-        )
-        return 0
+    if not args.recover_only and args.rollout_lock is not None:
+        if not wait_for_rollout_lock(
+            args.rollout_lock,
+            Audit(args.audit_file),
+            timeout=args.rollout_lock_wait,
+            poll_interval=args.rollout_lock_poll,
+            monotonic=monotonic,
+            sleep=sleep,
+        ):
+            return ROLLOUT_LOCK_WAIT_EXPIRED_EXIT
     # ExecStopPost recovery must finish inside systemd's stop window. Running
     # it under min(controller, stop) budget makes every existing bounded-
     # timeout check enforce that window; an over-large fleet fails closed with
