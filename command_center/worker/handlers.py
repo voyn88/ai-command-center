@@ -677,8 +677,20 @@ def _executor_preflight(executor: str, task_type: str) -> tuple[bool, str, str]:
         available, detail = agent_runner.claude_mac_preflight()
         return available, detail, "Claude Mac inference adapter unavailable"
     if agent_runner.principal_isolation_required():
+        if executor == "aider":
+            # The broker stages the mutating CLI under the isolated agent
+            # principal, while this worker-side probe additionally proves the
+            # exact benchmarked Ollama tag is locally available.
+            available, detail = agent_runner.aider_preflight(
+                binary=agent_runner.PRINCIPAL_EXECUTOR_BINARIES["aider"]
+            )
+            if not available:
+                return False, detail, "aider cli or ollama daemon unavailable"
         available, detail = agent_runner.principal_executor_preflight(executor)
         return available, detail, f"isolated {executor} cli unavailable"
+    if executor == "aider":
+        available, detail = agent_runner.aider_preflight()
+        return available, detail, "aider cli or ollama daemon unavailable"
     if executor == "codex":
         available, detail = agent_runner.claude_cli_preflight(agent_runner.CODEX_BINARY)
         return available, detail, "codex cli unavailable"

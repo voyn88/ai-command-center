@@ -86,6 +86,7 @@ EXECUTOR_BINARIES = {
     "cursor": "/opt/aicc/providers/cursor/agent",
     "claude": f"{TOOLCHAIN_BIN}/claude",
     "codex": f"{TOOLCHAIN_BIN}/codex",
+    "aider": f"{TOOLCHAIN_BIN}/aider",
 }
 SYSTEMD_RUN = "/usr/bin/systemd-run"
 SYSTEMCTL = "/usr/bin/systemctl"

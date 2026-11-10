@@ -1326,6 +1326,80 @@ def test_absent_cascade_keeps_the_single_executor_behaviour(handler) -> None:
     assert runs[-1]["task_type"] == _payload()["task_type"]
 
 
+# -- aider + local Ollama (AICC Fleet decision 2026-09-03): a free,
+# benchmark-gated executor for bounded_implementation. It is checked with
+# its own preflight (never the generic `claude_cli_preflight`). Under principal
+# isolation the worker verifies both the exact Ollama model and the broker's
+# fixed executable before dispatch.
+
+
+def test_aider_preflight_checks_the_aider_cli_and_ollama_daemon(handler, monkeypatch):
+    run_agent, runs = handler
+    checked = []
+
+    def preflight(**_kwargs):
+        checked.append("called")
+        return False, "aider cli not found"
+
+    monkeypatch.setattr(agent_runner, "aider_preflight", preflight)
+    payload = _cascade_payload()
+    payload["task_type"] = "implementation"
+    payload["cascade"] = [
+        {"executor": "aider", "task_type": "implementation"},
+        {"executor": "claude", "task_type": "implementation"},
+    ]
+    outcome = run_agent(payload, _event(), 1)
+    assert outcome.ok
+    assert checked == ["called"]
+    # The FULL run ledger, not just its last entry: a bug that dispatched
+    # aider anyway before falling through to claude on preflight failure
+    # would still pass an assertion on `runs[-1]` alone. aider mutates the
+    # worktree with no dry-run/read-only mode, so this is the
+    # safety-critical path -- it must never have executed anything before
+    # the fallback.
+    assert len(runs) == 1, runs
+    assert runs[0]["executor"] == "claude"
+
+
+def test_aider_is_available_when_its_preflight_passes(handler, monkeypatch):
+    run_agent, runs = handler
+    monkeypatch.setattr(agent_runner, "aider_preflight", lambda **_kwargs: (True, ""))
+    payload = _cascade_payload()
+    payload["task_type"] = "implementation"
+    payload["cascade"] = [{"executor": "aider", "task_type": "implementation"}]
+    outcome = run_agent(payload, _event(), 1)
+    assert outcome.ok, outcome.reason
+    assert len(runs) == 1
+    assert runs[0]["executor"] == "aider"
+
+
+def test_aider_uses_model_and_broker_preflights_under_principal_isolation(
+    handler, monkeypatch
+):
+    checked = []
+    monkeypatch.setattr(
+        agent_runner,
+        "aider_preflight",
+        lambda **kwargs: checked.append(("model", kwargs["binary"])) or (True, ""),
+    )
+    monkeypatch.setattr(
+        agent_runner,
+        "principal_executor_preflight",
+        lambda executor: checked.append(("broker", executor)) or (True, ""),
+    )
+    monkeypatch.setenv(agent_runner.PRINCIPAL_ISOLATION_REQUIRED_ENV, "required")
+    available, detail, reason = handlers_for_pin._executor_preflight(
+        "aider", "implementation"
+    )
+    assert available is True
+    assert detail == ""
+    assert reason == "isolated aider cli unavailable"
+    assert checked == [
+        ("model", agent_runner.PRINCIPAL_EXECUTOR_BINARIES["aider"]),
+        ("broker", "aider"),
+    ]
+
+
 # -- machine outcome extraction (BO-S3) ---------------------------------------
 
 
