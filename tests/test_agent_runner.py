@@ -1073,6 +1073,7 @@ def test_command_builders_table_covers_every_wired_executor(monkeypatch):
         "codex",
         "copilot",
         "openai_http",
+        "aider",
     }
     for name in agent_runner.COMMAND_BUILDERS:
         builder = agent_runner._command_builder(name)
@@ -1082,10 +1083,38 @@ def test_command_builders_table_covers_every_wired_executor(monkeypatch):
             command = builder(
                 "x", task_type="independent_review", model="groq/m"
             )
+        elif name == "aider":
+            command = builder("x", task_type="implementation")
         else:
             command = builder("x", task_type="review")
         assert isinstance(command, list) and command, name
         assert all(isinstance(part, str) for part in command), name
+
+
+def test_aider_command_is_mutating_only_and_keeps_prompt_as_one_argument():
+    prompt = "fix it; rm -rf / #$(whoami)`id`"
+    command = agent_runner.build_aider_command(prompt, task_type="implementation")
+    assert command[-1] == prompt
+    assert command[command.index("--model") + 1] == (
+        f"ollama_chat/{agent_runner.DEFAULT_AIDER_MODEL}"
+    )
+    with pytest.raises(ValueError):
+        agent_runner.build_aider_command("review", task_type="review")
+
+
+def test_aider_preflight_requires_the_exact_benchmarked_model(monkeypatch):
+    monkeypatch.setattr(agent_runner.shutil, "which", lambda _name: "/usr/bin/x")
+    listing = f"{agent_runner.DEFAULT_AIDER_MODEL}-instruct id size modified\n"
+    monkeypatch.setattr(
+        agent_runner.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args, 0, stdout=listing, stderr=""
+        ),
+    )
+    available, message = agent_runner.aider_preflight()
+    assert available is False
+    assert agent_runner.DEFAULT_AIDER_MODEL in message
 
 
 @pytest.mark.parametrize("executor", ["grok", "cursor"])
