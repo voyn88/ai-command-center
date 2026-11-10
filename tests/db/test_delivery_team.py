@@ -14,9 +14,13 @@ import pytest
 
 from command_center.db import roles
 from command_center.db.work_queue_store import ClaimedWork
+from tests.db import test_backlog_planner as _planner_fixtures
 from tests.db.test_backlog_planner import _task
 
-pytest_plugins = ("tests.db.test_backlog_planner",)
+# Borrow the planner rig by name. Registering that module through
+# `pytest_plugins` made its autouse route override global for the session.
+rig = _planner_fixtures.rig
+_test_repo_routes = _planner_fixtures._test_repo_routes
 
 pytestmark = [pytest.mark.serial, pytest.mark.usefixtures("role_passwords")]
 TASK = "VOYN-W0-TEAM-TEST"
