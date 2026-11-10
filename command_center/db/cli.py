@@ -151,6 +151,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Report the eligible set without dispatching.",
     )
     plan.add_argument(
+        "--wave-plan", action="store_true",
+        help="Report project waves and stages for the full backlog without dispatching.",
+    )
+    plan.add_argument(
         "--smoke",
         action="store_true",
         help="Deploy preflight: run backlog_dispatch_smoke() (0021) -- the read-only "
@@ -603,7 +607,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.command == "backlog-plan":
                 from contextlib import nullcontext as _nc
 
-                from command_center.orchestrator.planner import PlanLimits, plan_once
+                from command_center.orchestrator.planner import Planner, PlanLimits, plan_once
 
                 if args.smoke:
                     with conn.cursor() as cur:
@@ -622,6 +626,15 @@ def main(argv: list[str] | None = None) -> int:
                                 f"{task_id}  wave={wave} priority={priority or '-'} "
                                 f"{'dispatchable' if dispatchable else 'NO REPO'}"
                             )
+                    return 0
+                if args.wave_plan:
+                    for item in Planner(lambda: _nc(conn)).preview():
+                        print(
+                            f"{item.task['id']}  project={item.project} "
+                            f"wave={item.wave or '-'} stage={item.stage} "
+                            f"impact={item.impact} "
+                            f"blockers={','.join(item.blockers) or '-'}"
+                        )
                     return 0
                 report = plan_once(
                     lambda: _nc(conn), PlanLimits(wip_limit=args.wip_limit)

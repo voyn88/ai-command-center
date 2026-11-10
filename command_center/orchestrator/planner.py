@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass, field
@@ -41,6 +42,7 @@ from command_center.orchestrator.routing import (
     classify_task_class,
     metered_executors,
 )
+from command_center.orchestrator.wave_plan import SNAPSHOT_SQL, build_plan
 from command_center.worker.payloads import AGENT_RUN_SCHEMA_VERSION
 
 __all__ = [
@@ -52,6 +54,7 @@ __all__ = [
 ]
 
 _PLANNER_AUTHORITY = "planner:global"
+_LOG = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,6 +241,35 @@ def _split_requested(rows: Any, task_id: str) -> bool:
     return bool(row and row[0] and row[0][0])
 
 
+def _rank_project_candidates(candidates: list[tuple], decisions=()) -> list[tuple]:
+    """Improve ordering within a project, wave, class and explicit priority."""
+    by_id = {item.task["id"]: item for item in decisions}
+    groups: dict[tuple, list[int]] = {}
+    result = list(candidates)
+    for index, (_, wave, priority, _, _, repo, dispatchable, task_class) in enumerate(candidates):
+        route = repo_route(repo) if dispatchable and repo else None
+        if route is not None:
+            groups.setdefault((route[0], wave, task_class, priority), []).append(index)
+    def rank(task):
+        decision = by_id.get(task[0])
+        if decision is None:
+            return (False, False, 0, 0)
+        return (
+            decision.stage == "Проверить допуск", decision.wave is not None,
+            -(decision.wave or 0), sum(decision.impact),
+        )
+
+    for indices in groups.values():
+        ranked = sorted(
+            (candidates[index] for index in indices),
+            key=rank,
+            reverse=True,
+        )
+        for index, task in zip(indices, ranked, strict=True):
+            result[index] = task
+    return result
+
+
 def _payload_for(
     task: dict[str, Any], limits: PlanLimits, route: tuple[str, str], *, mode: str = "implement"
 ) -> tuple[dict[str, Any], int]:
@@ -419,6 +451,14 @@ class Planner:
     def _exec(self, sql: str, params: tuple[Any, ...] = ()) -> None:
         with self._factory() as conn, conn.cursor() as cur:
             cur.execute(sql, params)
+
+    def preview(self):
+        # A failed statement rolls back its transaction or savepoint before
+        # the dispatch caller can reuse the connection.
+        with self._factory() as conn, conn.transaction(), conn.cursor() as cur:
+            cur.execute(SNAPSHOT_SQL)
+            (snapshot,) = cur.fetchone()
+        return build_plan(snapshot, repo_route)
 
     def plan_once(self, limits: PlanLimits = _DEFAULT_PLAN_LIMITS) -> PlanReport:
         report = PlanReport()
@@ -617,6 +657,11 @@ class Planner:
                 spend_24h_usd = _metered_spend_24h_usd(self._rows)
             except Exception:  # noqa: BLE001 — fail closed for metered paths
                 spend_24h_usd = None
+            if limits.only_task_id is None:
+                try:
+                    candidates = _rank_project_candidates(candidates, self.preview())
+                except Exception:  # advisory plan must not stop dispatch
+                    _LOG.warning("Project wave plan unavailable; keeping eligible order", exc_info=True)
             # Advisory reorder from coordination v2 (Grok). Stale/unknown ids
             # are ignored; backlog_dispatch still re-checks eligibility under
             # the row lock. Missing/unreadable state → original order.

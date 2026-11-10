@@ -170,3 +170,21 @@ def test_parse_finops_excluded_executors_requires_strings():
     error = parse_agent_run(_payload(finops_excluded_executors=["cursor", 7]))
     assert isinstance(error, PayloadError)
     assert "finops_excluded_executors[1] must be a string" in error.reason
+
+
+@pytest.mark.parametrize("profile", ["owner-cascade", "owner-alternatives"])
+def test_subscription_only_independent_review_keeps_queued_route(
+    run_agent, monkeypatch, profile
+):
+    monkeypatch.setenv("AICC_EXECUTOR_PROFILE", profile)
+    payload = _payload(
+        task_type="independent_review",
+        cascade=[
+            {"executor": "claude", "task_type": "independent_review"},
+            {"executor": "codex", "task_type": "independent_review"},
+        ],
+    )
+    for attempt, expected in ((1, "claude"), (2, "codex"), (3, "claude")):
+        result = run_agent(payload, _event(), attempt)
+        assert result.ok
+        assert result.result["executor"] == expected
