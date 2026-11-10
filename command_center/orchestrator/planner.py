@@ -24,6 +24,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from command_center.observability.trace import log_span
 from command_center.orchestrator.coordination import (
     apply_advisory_order,
     coordination_enabled,
@@ -717,6 +718,13 @@ class Planner:
                 )
                 if ok:
                     report.dispatched.append((task_id, work_item_id))
+                    log_span(
+                        "plan",
+                        task_id=task_id,
+                        work_item_id=work_item_id,
+                        wave=wave,
+                        priority=priority,
+                    )
                 elif reason == "earlier_wave_has_eligible_work":
                     report.skipped_by_wave_gate.append((task_id, reason))
                 elif reason == "wip_exhausted":
