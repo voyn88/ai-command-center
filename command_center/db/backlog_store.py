@@ -25,7 +25,11 @@ from typing import Any
 
 from command_center.db.backlog_parser import ParsedTask, parse_backlog
 
-__all__ = ["BacklogStore", "ImportReport"]
+__all__ = ["BacklogStore", "DEFER_BUCKETS", "ImportReport"]
+
+#: The two buckets `backlog_defer_classification` (0035) ever assigns, in
+#: the order the report always shows them.
+DEFER_BUCKETS = ("infra_induced_safe_to_retry", "genuine_owner_decision")
 
 
 @dataclass(slots=True)
@@ -208,6 +212,52 @@ class BacklogStore:
             with conn.cursor() as cur:
                 cur.execute("SELECT status, count(*) FROM backlog_task GROUP BY status")
                 return {status: int(count) for status, count in cur.fetchall()}
+
+    def defer_classification(self) -> list[dict[str, Any]]:
+        """Every task currently in DEFER_TO_USER, bucketed by
+        ``backlog_defer_classification`` (0035) into
+        ``infra_induced_safe_to_retry`` (the 0014 gate would grant a
+        resume right now) or ``genuine_owner_decision`` (it would refuse,
+        with the exact reason) -- the read side of
+        VOYN-W0-AICC-DEFER-QUEUE-ROOT-CAUSE-SWEEP's "how many of these
+        actually need the owner" question."""
+        keys = (
+            "task_id",
+            "wave",
+            "priority",
+            "title",
+            "repo",
+            "park_reason",
+            "resumes_granted",
+            "bucket",
+            "classification_reason",
+        )
+        with self._connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT task_id, wave, priority, title, repo, park_reason, "
+                    "resumes_granted, bucket, classification_reason "
+                    "FROM backlog_defer_classification "
+                    "ORDER BY bucket, priority NULLS LAST, wave, task_id"
+                )
+                return [dict(zip(keys, row, strict=True)) for row in cur.fetchall()]
+
+    def defer_report(self) -> dict[str, int]:
+        """The explicit count `DEFER-QUEUE-ROOT-CAUSE-SWEEP` asks for:
+        genuine owner decisions vs. infra-induced failures safe to retry,
+        zero-filled so an empty bucket still reports 0 rather than vanishing.
+        Unknown buckets are retained, and a NULL classification is exposed as
+        ``unclassified``, so this operational count can never silently
+        understate the parked population."""
+        with self._connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT coalesce(bucket, 'unclassified'), count(*) "
+                    "FROM backlog_defer_classification "
+                    "GROUP BY bucket"
+                )
+                live = {bucket: int(count) for bucket, count in cur.fetchall()}
+        return {**{bucket: live.get(bucket, 0) for bucket in DEFER_BUCKETS}, **live}
 
     def list_tasks(
         self,

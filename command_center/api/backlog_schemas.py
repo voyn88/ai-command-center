@@ -60,3 +60,13 @@ class BacklogTaskDetail(BaseModel):
     task: BacklogTask
     events: list[BacklogEvent]
     evidence: list[BacklogEvidence]
+
+
+class BacklogDeferReport(BaseModel):
+    """The explicit split behind DEFER_TO_USER (VOYN-W0-AICC-DEFER-QUEUE-
+    ROOT-CAUSE-SWEEP): how many parked tasks are a genuine owner decision
+    vs. an infra-induced failure the 0014 gate would resume on its own,
+    zero-filled so an empty bucket reads as 0, not as absent."""
+
+    counts: dict[str, int]
+    total: int

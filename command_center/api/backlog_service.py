@@ -15,7 +15,7 @@ by ``AICC_PG_HOST`` — see ``app.py``) before any of these run.
 from __future__ import annotations
 
 from command_center.api import backlog_schemas as schemas
-from command_center.db.backlog_store import BacklogStore
+from command_center.db.backlog_store import BacklogStore, DEFER_BUCKETS
 
 #: Every status the backlog's own CHECK constraint allows
 #: (``backlog_task_status_vocabulary``, migration 0001/0005/0007/0008) —
@@ -48,6 +48,16 @@ def get_status_counts() -> schemas.BacklogStatusCounts:
     for status, count in live.items():
         counts.setdefault(status, count)
     return schemas.BacklogStatusCounts(counts=counts, total=sum(counts.values()))
+
+
+def get_defer_report() -> schemas.BacklogDeferReport:
+    live = BacklogStore().defer_report()
+    counts = {bucket: live.get(bucket, 0) for bucket in DEFER_BUCKETS}
+    # A bucket outside the known pair (a future migration's new value)
+    # still surfaces rather than being silently dropped.
+    for bucket, count in live.items():
+        counts.setdefault(bucket, count)
+    return schemas.BacklogDeferReport(counts=counts, total=sum(counts.values()))
 
 
 def list_tasks(
