@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { describe, test, expect, vi, beforeEach } from 'vitest'
 import Home from '../Home'
 import { fetchHome } from '../../lib/api'
@@ -98,5 +98,45 @@ describe('Home', () => {
     render(<Home />)
 
     await waitFor(() => expect(screen.getByText('Could not load dashboard data.')).toBeInTheDocument())
+  })
+
+  test('has no dead (disabled) controls, no New Task button and no fake sparkline', async () => {
+    vi.mocked(fetchHome).mockResolvedValue(baseHome)
+    const { container } = render(<Home />)
+
+    await waitFor(() => expect(screen.getByText('Desktop Architecture D1')).toBeInTheDocument())
+    expect(container.querySelectorAll('button:disabled')).toHaveLength(0)
+    expect(screen.queryByText('New Task')).not.toBeInTheDocument()
+    expect(container.querySelector('svg line')).toBeNull()
+    expect(screen.getByRole('button', { name: 'Home' })).toHaveAttribute('aria-current', 'page')
+  })
+
+  test('queue state is a plain label with the raw id in a tooltip', async () => {
+    vi.mocked(fetchHome).mockResolvedValue(baseHome)
+    render(<Home />)
+
+    const badge = await screen.findByText('Running now')
+    expect(badge).toHaveAttribute('title', 'RUNNING')
+    expect(badge).not.toHaveTextContent('RUNNING')
+    // raw code is in the collapsed per-panel "Service data" block
+    const details = Array.from(document.querySelectorAll('details.tech-details')) as HTMLDetailsElement[]
+    expect(details.length).toBeGreaterThanOrEqual(2)
+    expect(details.every((d) => !d.open)).toBe(true)
+    expect(details[0]).toHaveTextContent('Desktop Architecture D1')
+    expect(details[0]).toHaveTextContent('RUNNING')
+    fireEvent.click(details[0].querySelector('summary') as HTMLElement)
+    expect(details[0].open).toBe(true)
+  })
+
+  test('an unknown KPI meta_key renders nothing, never a raw i18n key', async () => {
+    vi.mocked(fetchHome).mockResolvedValue({
+      ...baseHome,
+      kpis: { ...baseHome.kpis, agents: { value: 4, meta_key: 'kpi.agents.meta', meta_n: 2 } },
+    })
+    render(<Home />)
+
+    await waitFor(() => expect(screen.getByText('Desktop Architecture D1')).toBeInTheDocument())
+    expect(screen.queryByText(/kpi\.agents\.meta/)).not.toBeInTheDocument()
+    expect(screen.getByText('1 pending')).toBeInTheDocument() // real keys still work
   })
 })

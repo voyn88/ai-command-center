@@ -1,18 +1,6 @@
+import { useTranslation } from 'react-i18next'
 import type { QueueItem } from '../lib/api'
-
-const STATE_COLOR: Record<string, string> = {
-  RUNNING: 'var(--run)',
-  QUEUED: 'var(--warn)',
-  PENDING: 'var(--warn)',
-  PREPARED: 'var(--warn)',
-  DONE: 'var(--ok)',
-  COMPLETE: 'var(--ok)',
-  COMPLETED: 'var(--ok)',
-  SUCCESS: 'var(--ok)',
-  FAILED: 'var(--bad)',
-  ERROR: 'var(--bad)',
-  CANCELLED: 'var(--bad)',
-}
+import { humanStatus, RUN_STATE_KEYS, runStateColor } from '../lib/labels'
 
 type QueueRowProps = {
   item: QueueItem
@@ -21,8 +9,10 @@ type QueueRowProps = {
 }
 
 export default function QueueRow({ item, projectLabel, unknownStateLabel }: QueueRowProps) {
+  const { t } = useTranslation()
   const state = (item.state || '').toUpperCase()
-  const color = STATE_COLOR[state] || 'var(--tx3)'
+  const color = runStateColor(state)
+  const status = humanStatus(RUN_STATE_KEYS, state, t)
   // `progress` always reports 0 today — no upstream progress signal exists
   // yet (see the `QueueItem` comment in lib/api.ts). Only render a bar/percent
   // when a value is actually nonzero, so today's real data never shows a
@@ -50,9 +40,9 @@ export default function QueueRow({ item, projectLabel, unknownStateLabel }: Queu
             whiteSpace: 'nowrap',
           }}
         >
-          {item.title}
+          <span title={item.title}>{item.title}</span>
         </div>
-        <div style={{ color: 'var(--tx3)', fontSize: '0.72rem', marginTop: '0.15rem' }}>{projectLabel}</div>
+        <div style={{ color: 'var(--tx3-aa)', fontSize: '0.75rem', marginTop: '0.15rem' }}>{projectLabel}</div>
       </div>
       {showProgress && (
         <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', width: 96 }}>
@@ -63,11 +53,10 @@ export default function QueueRow({ item, projectLabel, unknownStateLabel }: Queu
         </div>
       )}
       <span
+        title={status.raw || undefined}
         style={{
-          fontSize: '0.66rem',
+          fontSize: '0.75rem',
           fontWeight: 600,
-          letterSpacing: '0.04em',
-          textTransform: 'uppercase',
           color,
           border: `1px solid ${color}`,
           borderRadius: 999,
@@ -75,7 +64,7 @@ export default function QueueRow({ item, projectLabel, unknownStateLabel }: Queu
           whiteSpace: 'nowrap',
         }}
       >
-        {state || unknownStateLabel}
+        {state ? status.label : unknownStateLabel}
       </span>
     </div>
   )

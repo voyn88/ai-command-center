@@ -2,6 +2,8 @@ type KpiCardProps = {
   label: string
   value: number | string
   meta?: string
+  /** Opt-in decorative trend line; off by default (no real trend data exists). */
+  trend?: boolean
 }
 
 // Static, flat sparkline: no trend/history data exists anywhere in the
@@ -21,15 +23,15 @@ function FlatSparkline() {
   )
 }
 
-export default function KpiCard({ label, value, meta }: KpiCardProps) {
+export default function KpiCard({ label, value, meta, trend = false }: KpiCardProps) {
   return (
     <div className="glass" style={{ padding: '1.1rem' }}>
-      <div style={{ fontSize: '0.7rem', fontWeight: 600, letterSpacing: '0.04em', color: 'var(--tx3)', textTransform: 'uppercase' }}>
+      <div style={{ fontSize: '0.7rem', fontWeight: 600, letterSpacing: '0.04em', color: 'var(--tx3-aa)', textTransform: 'uppercase' }}>
         {label}
       </div>
       <div style={{ fontSize: '1.9rem', fontWeight: 700, color: 'var(--tx)', marginTop: '0.35rem' }}>{value}</div>
       {meta && <div style={{ fontSize: '0.78rem', color: 'var(--tx2)', marginTop: '0.2rem' }}>{meta}</div>}
-      <FlatSparkline />
+      {trend && <FlatSparkline />}
     </div>
   )
 }
