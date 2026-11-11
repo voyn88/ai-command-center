@@ -1,0 +1,35 @@
+# Disk guard: frees space on this host when it runs low, by removing only
+# provably regenerable things (see command_center/ops/disk_guard.py for the
+# full never-touch list).  Dry run by default: it journals what it WOULD
+# delete.  Which paths it may touch is host configuration
+# (/etc/aicc/ops-autonomy.env, OPS_CLONE_ROOTS / OPS_CACHE_DIRS /
+# OPS_OLLAMA_MODELS_DIR); the installer turns those into the ReadWritePaths of
+# a drop-in, so the sandbox below allows writes to exactly those roots.
+[Unit]
+Description=VOYN host disk guard (dry run unless the host settings say live)
+After=local-fs.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/aicc
+# gh reads the fleet GitHub App store, the same read-only layout the infra
+# monitor uses; it decides whether a task clone's pull request is closed.
+Environment=GH_CONFIG_DIR=/var/lib/aicc/github/gh
+ExecStart=/opt/aicc/.venv/bin/python -m command_center.ops.disk_guard
+TimeoutStartSec=20min
+Nice=10
+IOSchedulingClass=idle
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+# the journal directories let `journalctl --vacuum-size` work under the strict
+# sandbox (a leading dash ignores a path the host does not have)
+ReadWritePaths=/var/lib/voyn-ops /var/log/voyn-ops -/var/log/journal
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

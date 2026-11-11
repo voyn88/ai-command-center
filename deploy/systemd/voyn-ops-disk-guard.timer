@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the VOYN host disk guard every 30 minutes
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=30min
+AccuracySec=1min
+Persistent=false
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,29 @@
+# Status beacon: publishes a sanitised health document to a dedicated branch
+# of the fleet repository so the owner can read the host's state without ssh
+# (see command_center/ops/status_beacon.py).  Reads the GitHub App token the
+# host already mints; writes only the status branch and its own state files.
+[Unit]
+Description=VOYN host status beacon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/aicc
+Environment=GH_CONFIG_DIR=/var/lib/aicc/github/gh
+ExecStart=/opt/aicc/.venv/bin/python -m command_center.ops.status_beacon
+TimeoutStartSec=3min
+Nice=10
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/voyn-ops /var/log/voyn-ops
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

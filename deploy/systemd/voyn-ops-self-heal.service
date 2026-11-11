@@ -1,0 +1,26 @@
+# Self-heal: restarts tailscaled / ssh / allow-listed voyn-aicc-* units on
+# clear, twice-confirmed signs of a hang (see command_center/ops/self_heal.py
+# for the rules: cool-down, hourly cap, deny-list).  Dry run by default.
+[Unit]
+Description=VOYN host self-heal (dry run unless the host settings say live)
+After=local-fs.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/aicc
+ExecStart=/opt/aicc/.venv/bin/python -m command_center.ops.self_heal
+TimeoutStartSec=3min
+Nice=5
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/voyn-ops /var/log/voyn-ops
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
