@@ -10,7 +10,8 @@ what Desktop Increment 1 ships and what is still outstanding.
 
 AI Command Center is a **local-first, single-user developer control plane** for managing
 development projects, repositories, AI-agent sessions, execution runs, reports, and artifacts
-across the six projects it tracks (`AIOS`, `AICOS`, `BANK`, `LEGAL`, `BUSINESS`, `PERSONAL`).
+across the canonical nine-project registry: `AICC`, `AIOS`, `AICOS`, `PRODUCT`, `ECOSYSTEM`,
+`BANK`, `LEGAL`, `BUSINESS`, and `PERSONAL` ([ADR 0009](../adr/0009-canonical-project-registry-and-validating-task-import.md)).
 It is the tool a developer opens every day to see the state of their work: which repositories
 have uncommitted changes, which agent runs are active or finished, what a run's report said,
 and what to do next.
@@ -48,15 +49,18 @@ records already produced by `command_center.runtime`, and generated task/report 
 `generated/` and `reports/`.
 
 It is explicitly **not** described, marketed, or built as an enterprise AML operating platform.
-`BANK` and `LEGAL` are two of the six projects it tracks — like any other project, subject to
-the same sensitivity redaction already implemented in `command_center.workspace_home` — not a
-compliance system in their own right.
+`BANK` and `LEGAL` are the sensitive subset of the canonical nine-project registry recorded in
+[ADR 0009](../adr/0009-canonical-project-registry-and-validating-task-import.md) — like any
+other project, they are tracked by the control plane, with sensitivity redaction already
+implemented in `command_center.workspace_home`; they are not compliance systems in their own
+right.
 
 ## 5. Relationship to AIOS and AICOS
 
-- **AIOS** and **AICOS** are two of the six projects AI Command Center tracks, in exactly the
-  same way as `BANK`, `LEGAL`, `BUSINESS`, and `PERSONAL`: a repository path, a set of agent
-  runs, reports, and artifacts. AI Command Center does not implement AIOS or AICOS logic; it
+- **AIOS** and **AICOS** are two entries in the canonical nine-project registry recorded in
+  [ADR 0009](../adr/0009-canonical-project-registry-and-validating-task-import.md), tracked in
+  exactly the same way as the other seven entries: a repository path, a set of agent runs,
+  reports, and artifacts. AI Command Center does not implement AIOS or AICOS logic; it
   observes and orchestrates work *about* those repositories, the same way it does for every
   other project.
 - **AI Command Center is not AICOS.** AICOS is the operational AML workplace — a separate
