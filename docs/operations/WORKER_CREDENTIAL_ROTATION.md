@@ -53,7 +53,8 @@ left alone until the final bounded SIGKILL. Lease expiry and queue reaping stay
 the last-resort redelivery path.
 
 The controller has a 7200-second monotonic deadline. The systemd unit allows
-7800 seconds, leaving 600 seconds for audited recovery and clean exit. Before
+8100 seconds: up to 300 seconds waiting for a staged-rollout marker before the
+controller starts, then 600 seconds for audited recovery and clean exit. Before
 changing the database verifier, the controller proves that activation plus a
 complete fleet rollback still fits. The budget counts a canary followed by one
 systemd-managed fleet transaction and is independent of lane count; that
@@ -61,8 +62,25 @@ transaction never performs restart fallback. After
 issuance, every reload/readiness operation is bounded by both that controller
 deadline and the credential's expiry minus a five-minute safety margin.
 
-The normal timer runs 25 minutes after the service becomes inactive. A failed
-oneshot is retried after two minutes. The threshold proof includes the full
+The normal timer runs 8 minutes after the service becomes inactive. Most
+ticks only check: they exit with `rotation_deferred_not_due` until the
+remaining lifetime reaches the threshold, so the credential is still rotated
+roughly every 25-34 minutes. The short cadence exists so that one lost tick
+leaves further attempts inside the one-hour credential.
+
+A tick that finds the staged-rollout marker (`/run/aicc-staged-rollout.lock`)
+does not exit. The worker release deploy holds that marker for a few seconds
+on every five-minute check, so the tick logs `rotation_waiting_staged_rollout`,
+polls every 5 seconds for up to 300 seconds, logs
+`rotation_staged_rollout_cleared` and rotates in the same invocation. If the
+marker outlasts the wait, the tick logs `rotation_staged_rollout_wait_expired`
+with the waited duration and exits 75 without touching lanes, the database or
+the failure circuit; systemd retries it like any other failure. While a tick
+is waiting the service is active, so a real worker rollout that starts in that
+window refuses with `credential_rotation_not_idle` and retries on its next
+five-minute tick. `--recover-only` ignores the marker.
+
+A failed oneshot is retried after two minutes. The threshold proof includes the full
 worst-case duration of all three failures before mutation plus every declared
 retry delay, not just the delays themselves. A lost response once mutation may
 have happened switches to the separate new-credential activation/rollback

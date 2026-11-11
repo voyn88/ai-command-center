@@ -15,11 +15,11 @@ export default function LangToggle() {
         fontWeight: 600,
         letterSpacing: '0.04em',
         cursor: 'pointer',
-        background: 'rgba(255,255,255,0.02)',
+        background: 'var(--glass)',
       }}
       aria-label={t('toggleLanguage')}
     >
-      {i18n.language === 'ru' ? 'RU' : 'EN'}
+      {i18n.language === 'ru' ? 'EN' : 'RU'}
     </button>
   )
 }

@@ -5,6 +5,7 @@ import { fetchHome } from '../../lib/api'
 import type { HomeDTO } from '../../lib/api'
 import {
   enqueueAudit,
+  fetchQueueItem,
   fetchQueueItems,
   getOwnerToken,
   QueueAuthError,
@@ -148,7 +149,39 @@ describe('Tasks — one-button audit', () => {
 
     // The task list still renders (queue reads are independent of the
     // project picker), proving the screen settled before asserting absence.
-    await waitFor(() => expect(screen.getByText('Task: AICC')).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByText('Project check: AICC')).toBeInTheDocument())
     expect(screen.queryByText('Run audit')).not.toBeInTheDocument()
+  })
+
+  test('details show a plain reason and keep task_id reachable', async () => {
+    vi.mocked(fetchQueueItems).mockResolvedValue({ items: [{ ...oneItem[0], task_id: 'T-42', state: 'dead', dead_reason: 'brand_new_reason' }] })
+    vi.mocked(fetchQueueItem).mockResolvedValue({
+      ...oneItem[0], task_id: 'T-42', state: 'dead', dead_reason: 'brand_new_reason',
+      attempts: [{ attempt_no: 1, state: 'expired', outcome_reason: 'visibility_timeout' }],
+      result: null,
+    } as never)
+    render(<Tasks onNavigate={vi.fn()} />)
+
+    await screen.findByText('Project check: AICC')
+    expect(screen.getByText('Project check: AICC')).toHaveAttribute('title', 'Task id: T-42')
+    fireEvent.click(screen.getByText('Details'))
+    expect(await screen.findByText('being clarified')).toHaveAttribute('title', 'brand_new_reason')
+    const tech = document.querySelector('details.tech-details') as HTMLDetailsElement
+    expect(tech.open).toBe(false)
+    expect(tech).toHaveTextContent('brand_new_reason')
+    expect(tech).toHaveTextContent('wki_1')
+    expect(tech).toHaveTextContent('№1 expired / visibility_timeout')
+    expect(screen.getByText(/№1 — timed out \(did not finish in time\)/)).toBeInTheDocument()
+    expect(tech).toHaveTextContent('T-42')
+  })
+
+  test('an empty filtered list offers "Reset filters"', async () => {
+    vi.mocked(fetchQueueItems).mockImplementation(async (filter?: string) => ({ items: filter && filter !== 'ALL' ? [] : oneItem }))
+    render(<Tasks onNavigate={vi.fn()} />)
+    await screen.findByText('Project check: AICC')
+    fireEvent.click(screen.getByRole('button', { name: 'Done' }))
+    expect(await screen.findByText('No tasks yet.')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Reset filters' }))
+    expect(await screen.findByText('Project check: AICC')).toBeInTheDocument()
   })
 })

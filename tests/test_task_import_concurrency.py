@@ -29,7 +29,7 @@ from pathlib import Path
 
 import pytest
 
-from command_center import models, storage, task_import as ti, tasks_repository
+from command_center import models, portfolio_launch, storage, task_import as ti, tasks_repository
 
 
 def _task(task_id: str, **overrides) -> dict:
@@ -167,6 +167,69 @@ def test_import_lock_times_out_with_a_clear_error_instead_of_hanging(tmp_path):
     # Once released, an import proceeds normally — no manual recovery needed.
     result = ti.apply_task_package(tmp_path, parsed, validation)
     assert result.imported_ids == ["TIMEOUT-1"]
+
+
+@pytest.mark.serial
+def test_repository_and_registry_lock_inversion_ends_at_import_timeout(tmp_path):
+    """Bound the worst-case interaction with Portfolio's registry lock.
+
+    The two stores intentionally use different locks.  If future orchestration
+    ever holds them in opposite order, that is the classic shape of a lock
+    inversion: one thread owns ``tasks.lock`` and waits for ``registry.lock``
+    while a concurrent importer owns ``registry.lock`` and waits for
+    ``tasks.lock``.  The import timeout must break that cycle; neither thread
+    may remain wedged after the deadline.
+    """
+    parsed, validation = _package("LOCK-INVERSION-1")
+    both_outer_locks_held = threading.Barrier(2)
+    import_finished = threading.Event()
+    registry_acquired = threading.Event()
+    errors: list[BaseException] = []
+    elapsed: dict[str, float] = {}
+
+    def repository_then_registry() -> None:
+        try:
+            with tasks_repository.tasks_lock(tmp_path, timeout=2.0):
+                both_outer_locks_held.wait(timeout=2.0)
+                with portfolio_launch._registry_lock(tmp_path, timeout=2.0):
+                    registry_acquired.set()
+        except BaseException as exc:  # noqa: BLE001 - surfaced in the test thread
+            errors.append(exc)
+
+    def registry_then_import() -> None:
+        try:
+            with portfolio_launch._registry_lock(tmp_path, timeout=2.0):
+                both_outer_locks_held.wait(timeout=2.0)
+                started = time.monotonic()
+                with pytest.raises(ti.TaskImportError, match="блокировку"):
+                    ti.apply_task_package(tmp_path, parsed, validation, lock_timeout=0.2)
+                elapsed["import"] = time.monotonic() - started
+                import_finished.set()
+        except BaseException as exc:  # noqa: BLE001 - surfaced in the test thread
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=repository_then_registry),
+        threading.Thread(target=registry_then_import),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5.0)
+
+    assert not any(thread.is_alive() for thread in threads), "lock inversion exceeded its bounded deadline"
+    assert not errors, errors
+    assert import_finished.is_set(), "the importer did not terminate at its repository-lock timeout"
+    assert registry_acquired.is_set(), "the registry waiter did not resume after the importer released its lock"
+    assert elapsed["import"] < 1.5, "repository-lock timeout was not respected under lock inversion"
+
+    # The timed-out transaction must not leak a partial task, and both locks
+    # must be immediately reusable once the deliberately inverted holders end.
+    assert tasks_repository.load_tasks(tmp_path) == []
+    result = ti.apply_task_package(tmp_path, parsed, validation, lock_timeout=2.0)
+    assert result.imported_ids == ["LOCK-INVERSION-1"]
+    with portfolio_launch._registry_lock(tmp_path, timeout=0.5):
+        pass
 
 
 @pytest.mark.serial  # many concurrent registry writers on a lock deadline; flaky when xdist saturates all cores

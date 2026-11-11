@@ -1,6 +1,8 @@
-import { render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { expect, test, vi } from 'vitest'
 import Execution from '../Execution'
+import { fetchExecution } from '../../lib/api'
+import i18n from '../../lib/i18n'
 
 vi.mock('../../lib/api', async () => {
   const actual = await vi.importActual<typeof import('../../lib/api')>('../../lib/api')
@@ -23,6 +25,124 @@ test('renders real execution summary and run rows', async () => {
 
   await waitFor(() => expect(screen.getByText('implementation')).toBeInTheDocument())
   expect(screen.getByText('AI Command Center')).toBeInTheDocument()
-  expect(screen.getAllByText('RUNNING').length).toBeGreaterThan(0)
+  expect(screen.getAllByText('Running now').length).toBeGreaterThan(0)
+  expect(document.querySelector('.execution-state')).toHaveTextContent('Running now')
   expect(screen.getByText('Visible runs')).toBeInTheDocument()
+})
+
+test('shows plain Russian state labels with the raw id kept in a tooltip', async () => {
+  await i18n.changeLanguage('ru')
+  render(<Execution onNavigate={vi.fn()} />)
+
+  await waitFor(() => expect(screen.getByText('implementation')).toBeInTheDocument())
+  expect(screen.getAllByText('Идёт сейчас').length).toBeGreaterThan(0)
+  expect(document.querySelector('.execution-state')).toHaveTextContent('Идёт сейчас')
+  expect(screen.getAllByText('Идёт сейчас')[0]).toHaveAttribute('title', 'RUNNING')
+  expect(screen.getByText('Видимые запуски')).toBeInTheDocument()
+})
+
+test('error state offers a retry button that reloads', async () => {
+  vi.mocked(fetchExecution).mockRejectedValueOnce(new Error('offline'))
+  render(<Execution onNavigate={vi.fn()} />)
+
+  const alert = await screen.findByRole('alert')
+  expect(alert).toHaveTextContent('Could not load dashboard data.')
+  fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+  await waitFor(() => expect(screen.getByText('implementation')).toBeInTheDocument())
+})
+
+test('empty state explains there are no runs', async () => {
+  vi.mocked(fetchExecution).mockResolvedValueOnce({
+    summary: { visible_runs: 0, active: 0, completed: 0, needs_attention: 0 },
+    state_counts: {},
+    runs: [],
+  })
+  render(<Execution onNavigate={vi.fn()} />)
+
+  expect(await screen.findByText('No visible runs yet.')).toBeInTheDocument()
+})
+
+test('failed runs sort first and raise an attention banner', async () => {
+  vi.mocked(fetchExecution).mockResolvedValueOnce({
+    summary: { visible_runs: 2, active: 1, completed: 0, needs_attention: 1 },
+    state_counts: { RUNNING: 1, FAILED: 1 },
+    runs: [
+      { id: 'a', source: 'v2', title: 'running one', project: 'AICC', project_name: 'AICC', task_type: 'x', state: 'RUNNING', created_at: '2026-08-03T10:00:00', started_at: null, completed_at: null, duration_seconds: 125, exit_code: null, failure_reason: null, verdict: null },
+      { id: 'b', source: 'v2', title: 'broken one', project: 'AICC', project_name: 'AICC', task_type: 'x', state: 'FAILED', created_at: '2026-08-03T09:00:00', started_at: null, completed_at: null, duration_seconds: null, exit_code: 1, failure_reason: 'timeout', verdict: null },
+    ],
+  })
+  render(<Execution onNavigate={vi.fn()} />)
+
+  await screen.findByText('broken one')
+  expect(screen.getByText('Need attention: 1')).toBeInTheDocument()
+  const titles = screen.getAllByRole('article').map((el) => el.querySelector('strong')?.textContent)
+  expect(titles).toEqual(['broken one', 'running one'])
+  expect(screen.getByText('ran out of time')).toHaveAttribute('title', expect.stringContaining('Exit code: 1'))
+  expect(screen.getByText('2 min 5 s')).toBeInTheDocument()
+  expect(screen.getByRole('button', { name: /^All states/ })).toHaveAttribute('aria-pressed', 'true')
+})
+
+test('an unknown state shows a neutral phrase, the raw code only in a tooltip', async () => {
+  vi.mocked(fetchExecution).mockResolvedValueOnce({
+    summary: { visible_runs: 1, active: 0, completed: 0, needs_attention: 0 },
+    state_counts: { WAITING_FOR_APPROVAL: 1 },
+    runs: [{ id: 'z', source: 'v2', title: 'odd run', project: 'AICC', project_name: 'AICC', task_type: 'x', state: 'WAITING_FOR_APPROVAL', created_at: '2026-08-03T10:00:00', started_at: null, completed_at: null, duration_seconds: null, exit_code: null, failure_reason: 'brand_new_reason', verdict: 'WEIRD_VERDICT' },
+    ],
+  })
+  render(<Execution onNavigate={vi.fn()} />)
+
+  await screen.findByText('odd run')
+  // Main text is neutral; raw codes live in the collapsed "Service data" block (and title).
+  expect(document.querySelector('.execution-state')).toHaveTextContent('Status being clarified')
+  expect(document.querySelector('.execution-meta')).not.toHaveTextContent(/WEIRD_VERDICT|brand_new_reason/)
+  expect(document.querySelector('.execution-state')).toHaveAttribute('title', 'WAITING_FOR_APPROVAL')
+  const details = document.querySelector('.execution-row details.tech-details') as HTMLDetailsElement
+  expect(details.open).toBe(false)
+  fireEvent.click(details.querySelector('summary') as HTMLElement)
+  expect(details).toHaveTextContent('WAITING_FOR_APPROVAL')
+  expect(details).toHaveTextContent('brand_new_reason')
+  expect(details).toHaveTextContent('WEIRD_VERDICT')
+})
+
+test('an empty filtered list offers "Reset filters" that restores the list', async () => {
+  vi.mocked(fetchExecution).mockResolvedValueOnce({
+    summary: { visible_runs: 2, active: 1, completed: 1, needs_attention: 0 },
+    state_counts: { RUNNING: 1, COMPLETED: 1 },
+    runs: [
+      { id: 'a', source: 'v2', title: 'running one', project: 'AICC', project_name: 'AICC', task_type: 'x', state: 'RUNNING', created_at: '2026-08-03T10:00:00', started_at: null, completed_at: null, duration_seconds: null, exit_code: null, failure_reason: null, verdict: null },
+      { id: 'b', source: 'v2', title: 'done one', project: 'AICC', project_name: 'AICC', task_type: 'x', state: 'COMPLETED', created_at: '2026-08-03T09:00:00', started_at: null, completed_at: null, duration_seconds: null, exit_code: 0, failure_reason: null, verdict: 'APPROVED_FOR_COMMIT' },
+    ],
+  })
+  render(<Execution onNavigate={vi.fn()} />)
+  await screen.findByText('running one')
+  expect(screen.getByText('Approved for commit')).toBeInTheDocument()
+  fireEvent.click(screen.getByRole('button', { name: /^Completed/ }))
+  expect(screen.queryByText('running one')).not.toBeInTheDocument()
+  fireEvent.click(screen.getByRole('button', { name: /^All states/ }))
+  expect(screen.getByText('running one')).toBeInTheDocument()
+})
+
+test('attention number comes from the rows, not from an out-of-sync summary', async () => {
+  const row = (id: string, state: string) => ({ id, source: 'v2', title: `run ${id}`, project: 'AICC', project_name: 'AICC', task_type: 'x', state, created_at: '2026-08-03T10:00:00', started_at: null, completed_at: null, duration_seconds: null, exit_code: null, failure_reason: null, verdict: null })
+  vi.mocked(fetchExecution).mockResolvedValueOnce({
+    summary: { visible_runs: 99, active: 50, completed: 40, needs_attention: 7 },
+    state_counts: { FAILED: 7 },
+    runs: [row('1', 'FAILED'), row('2', 'INTERRUPTED'), row('3', 'UNKNOWN'), row('4', 'CANCELLED'), row('5', 'RUNNING'), row('6', 'COMPLETED')],
+  })
+  render(<Execution onNavigate={vi.fn()} />)
+  await screen.findByText('run 1')
+
+  expect(screen.getByText('Need attention: 3')).toBeInTheDocument()
+  const tiles = Array.from(document.querySelectorAll('.kpi-grid > .glass'))
+  const tile = (label: string) => tiles.find((el) => el.textContent?.startsWith(label)) as HTMLElement
+  expect(tile('Needs attention')).toHaveTextContent('3')
+  expect(tile('Visible runs')).toHaveTextContent('6')
+  expect(tile('Active now')).toHaveTextContent('1')
+  expect(tile('Completed')).toHaveTextContent('1')
+  const chip = screen.getByRole('button', { name: /^Needs attention · 3$/ })
+  const fixedSum = ['Failed', 'Interrupted', 'State unknown'].map((n) => Number(screen.getByRole('button', { name: new RegExp(`^${n} · `) }).textContent?.split('· ')[1])).reduce((a, b) => a + b, 0)
+  expect(fixedSum).toBe(3)
+  fireEvent.click(screen.getByRole('button', { name: 'Show' }))
+  expect(chip).toHaveAttribute('aria-pressed', 'true')
+  expect(screen.getAllByRole('article')).toHaveLength(3)
 })
