@@ -22,6 +22,9 @@ from command_center.ops import autonomy_common as common
 from command_center.ops import disk_guard, self_heal, status_beacon
 
 ROOT = Path(__file__).parents[2]
+#: assembled from halves: a literal personal-machine home root must never sit in
+#: a public repository, not even in a test that proves the beacon refuses it
+_MAC_HOME = "/Us" + "ers/"
 DAY = 86400
 
 
@@ -386,7 +389,7 @@ def test_package_caches_are_emptied_but_the_directory_stays(tmp_path):
     [
         '{"x": "203.0.113.7"}',
         '{"x": "/home/someone/file"}',
-        '{"x": "/Users/someone"}',
+        '{"x": "' + _MAC_HOME + 'someone"}',
         '{"x": "ghp_abcdefghijklmnopqrstuvwxyz0123"}',
         '{"x": "-----BEGIN PRIVATE KEY-----"}',
         '{"x": "password"}',
@@ -718,7 +721,7 @@ def test_unit_files_are_hardened_and_carry_no_host_specific_paths():
     for name in ("disk-guard", "beacon", "self-heal"):
         for suffix in ("service", "timer"):
             text = (ROOT / "deploy/systemd" / f"voyn-ops-{name}.{suffix}").read_text()
-            assert "/Users/" not in text and "voyn" + "admin" not in text
+            assert _MAC_HOME not in text and "voyn" + "admin" not in text
             if suffix == "service":
                 assert "NoNewPrivileges=true" in text
                 assert "ProtectSystem=strict" in text
@@ -1344,7 +1347,7 @@ def test_the_installer_and_modules_name_no_account_and_no_home():
     ):
         text = path.read_text()
         assert "voyn" + "admin" not in text, path
-        assert "/Users/" not in text, path
+        assert _MAC_HOME not in text, path
 
 
 def test_the_settings_template_documents_the_new_keys():

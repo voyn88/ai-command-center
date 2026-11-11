@@ -66,6 +66,9 @@ DEFAULT_UNITS = (
     "voyn-aicc-worker-release-deploy.timer",
 )
 
+#: pieces of the "a host or user path" pattern; the personal-machine home root
+#: is assembled from halves so the literal never sits in this public file
+_HOST_PATH_PARTS = ("/home/", "/Us" + "ers/", "/root/", "/srv/", "/var/lib/aicc")
 _FORBIDDEN = (
     (re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b"), "ipv4_address"),
     (re.compile(r"\b(?:[0-9a-fA-F]{1,4}:){2,7}[0-9a-fA-F]{0,4}\b"), "ipv6_address"),
@@ -75,7 +78,7 @@ _FORBIDDEN = (
         ),
         "domain_name",
     ),
-    (re.compile(r"/home/|/Us" r"ers/|/root/|/srv/|/var/lib/aicc"), "host_path"),
+    (re.compile("|".join(_HOST_PATH_PARTS)), "host_path"),
     (re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"), "github_token"),
     (re.compile(r"(?i)BEGIN [A-Z ]*PRIVATE KEY"), "private_key"),
     # A unit NAME may legitimately contain "token" (github-token.timer); what is
