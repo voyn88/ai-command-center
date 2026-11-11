@@ -13,11 +13,14 @@ Rules that keep it from becoming a second incident:
   the self-deploy unit are never restarted from here);
 - a signal must be seen on TWO CONSECUTIVE runs before anything happens (one
   bad probe is noise);
-- one action per key at most every 30 minutes, and at most three actions per
-  hour overall -- a restart that does not cure the fault is not repeated in a
-  loop;
+- one action per SERVICE at most every 30 minutes, at most three actions per
+  hour and six per day -- after that the guard halts itself for 24 hours and
+  the status beacon says so; a restart that does not cure the fault is not
+  repeated forever;
 - dry run is the default: it journals the action it WOULD take.
   ``OPS_SELF_HEAL_DRY_RUN=0`` turns it live;
+- a tailscaled that the owner stopped (or that needs a login) is left alone:
+  a restart cannot help and would only get in the way;
 - the tunnel signal fires only when the review port is HELD BY ``tailscaled``
   (the known fault).  A port nobody listens on means the owner's machine is
   away, which no restart here can fix.
@@ -26,6 +29,7 @@ Rules that keep it from becoming a second incident:
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sys
 import time
@@ -39,7 +43,7 @@ from command_center.ops.autonomy_common import (
     Journal,
     Runner,
     StateFile,
-    as_bool,
+    as_dry_run,
     as_int,
     exclusive_lock,
     load_settings,
@@ -49,6 +53,14 @@ from command_center.ops.status_beacon import _tcp_banner, tunnel_held_by
 
 COOLDOWN_SECONDS = 30 * 60
 MAX_ACTIONS_PER_HOUR = 3
+#: one hard stop per day: after this many restarts the guard halts itself for
+#: 24 hours and says so (finding C5); a restart that never cures is not retried
+#: forever.
+MAX_ACTIONS_PER_DAY = 6
+HALT_SECONDS = 24 * 3600
+#: tailscaled states that mean the OWNER stopped it or it needs a login: a
+#: restart cannot help and would only get in the way.
+OWNER_STOPPED_STATES = frozenset({"Stopped", "NeedsLogin", "NeedsMachineAuth"})
 CONFIRM_RUNS = 2
 ALLOWED_UNIT = re.compile(r"^(tailscaled|ssh|voyn-aicc-[a-z0-9._-]+)\.service$")
 DENIED_UNIT = re.compile(r"(worker@|self-deploy|pgtunnel|credential)")
@@ -65,9 +77,22 @@ def unit_allowed(unit: str) -> bool:
     return bool(ALLOWED_UNIT.match(unit)) and not DENIED_UNIT.search(unit)
 
 
+def tailscale_backend_state(runner: Runner) -> str | None:
+    code, out, _ = runner(["tailscale", "status", "--json"], 15)
+    if code != 0:
+        return None
+    try:
+        state = json.loads(out).get("BackendState")
+    except ValueError, AttributeError:
+        return None
+    return state if isinstance(state, str) else None
+
+
 def tailscale_unresponsive(runner: Runner) -> bool:
     code, out, _ = runner(["tailscale", "ip", "-4"], 15)
-    return code != 0 or not out.strip()
+    if code == 0 and out.strip():
+        return False
+    return tailscale_backend_state(runner) not in OWNER_STOPPED_STATES
 
 
 def tunnel_http_dead(runner: Runner, port: int) -> bool:
@@ -134,7 +159,11 @@ def run_heal(
     last_action: dict[str, float] = {
         k: float(v) for k, v in dict(data.get("last_action", {})).items()
     }
-    history = [float(t) for t in data.get("history", []) if now - float(t) < 3600]
+    history = [
+        float(t) for t in data.get("history", []) if now - float(t) < HALT_SECONDS
+    ]
+    halted_at = float(data.get("halted_at", 0) or 0)
+    halted = bool(halted_at) and now - halted_at < HALT_SECONDS
 
     signals = detect(settings, runner)
     # a signal that is gone resets its counter
@@ -147,25 +176,57 @@ def run_heal(
         if seen[key] < CONFIRM_RUNS:
             journal.write("signal_seen_once", key=key, reason=reason)
             continue
-        if key in last_action and now - last_action[key] < COOLDOWN_SECONDS:
-            journal.write("cooldown", key=key)
+        if halted:
+            journal.write("halted", key=key, since=int(halted_at))
             continue
-        if len(history) >= MAX_ACTIONS_PER_HOUR:
+        # cool-down and the hourly count are per SERVICE: two signals that
+        # lead to the same restart are one action (finding C5)
+        if unit in last_action and now - last_action[unit] < COOLDOWN_SECONDS:
+            journal.write("cooldown", key=key, unit=unit)
+            continue
+        if len([t for t in history if now - t < 3600]) >= MAX_ACTIONS_PER_HOUR:
             journal.write("hourly_cap", key=key, cap=MAX_ACTIONS_PER_HOUR)
+            continue
+        if len(history) >= MAX_ACTIONS_PER_DAY:
+            halted_at, halted = now, True
+            journal.write("halted_daily_cap", key=key, cap=MAX_ACTIONS_PER_DAY)
             continue
         record = {"key": key, "unit": unit, "reason": reason, "dry_run": dry_run}
         if dry_run:
             journal.write("would_restart", **record)
         else:
             if key.startswith("failed:"):
+                # keep the evidence before `reset-failed` erases it
+                _, before, _ = runner(
+                    [
+                        "systemctl",
+                        "show",
+                        unit,
+                        "-p",
+                        "Result",
+                        "-p",
+                        "ExecMainStatus",
+                        "-p",
+                        "ExecMainExitTimestamp",
+                    ],
+                    10,
+                )
+                journal.write("before_reset_failed", unit=unit, state=before[:300])
                 runner(["systemctl", "reset-failed", unit], 20)
             code, _, err = runner(["systemctl", "restart", unit], 60)
             record["ok"] = code == 0
             journal.write("restarted", **record, error=err[-160:])
-            last_action[key] = now
+            last_action[unit] = now
             history.append(now)
         actions.append(record)
-    state.save({"seen": seen, "last_action": last_action, "history": history})
+    state.save(
+        {
+            "seen": seen,
+            "last_action": last_action,
+            "history": history,
+            "halted_at": halted_at if halted else 0,
+        }
+    )
     if not signals:
         journal.write("healthy")
     return actions
@@ -180,7 +241,7 @@ def main(argv: list[str] | None = None) -> int:
     log_dir = Path(settings.get("OPS_LOG_DIR", str(DEFAULT_LOG_DIR)))
     state_dir = Path(settings.get("OPS_STATE_DIR", str(DEFAULT_STATE_DIR)))
     journal = Journal(log_dir / "self-heal.jsonl")
-    dry_run = not args.live and as_bool(settings.get("OPS_SELF_HEAL_DRY_RUN"), True)
+    dry_run = not args.live and as_dry_run(settings.get("OPS_SELF_HEAL_DRY_RUN"))
     with exclusive_lock(state_dir / "self-heal.lock") as got:
         if not got:
             journal.write("skipped_locked")

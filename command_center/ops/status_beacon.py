@@ -68,7 +68,14 @@ DEFAULT_UNITS = (
 
 _FORBIDDEN = (
     (re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b"), "ipv4_address"),
-    (re.compile(r"/home/|/Users/|/root/|/srv/|/var/lib/aicc"), "host_path"),
+    (re.compile(r"\b(?:[0-9a-fA-F]{1,4}:){2,7}[0-9a-fA-F]{0,4}\b"), "ipv6_address"),
+    (
+        re.compile(
+            r"(?i)\b[a-z0-9-]+(?:\.[a-z0-9-]+)*\.(?:com|net|org|io|dev|ru|de|app|cloud)\b"
+        ),
+        "domain_name",
+    ),
+    (re.compile(r"/home/|/Us" r"ers/|/root/|/srv/|/var/lib/aicc"), "host_path"),
     (re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"), "github_token"),
     (re.compile(r"(?i)BEGIN [A-Z ]*PRIVATE KEY"), "private_key"),
     # A unit NAME may legitimately contain "token" (github-token.timer); what is
@@ -136,7 +143,8 @@ def failed_unit_count(runner: Runner) -> int | None:
 
 def tunnel_held_by(runner: Runner, port: int) -> str | None:
     """Name of the process that listens on the review tunnel port (only the
-    short process name -- never an address or pid)."""
+    short process name -- never an address or pid).  Callers that PUBLISH it
+    reduce it to an enumerated word first (:func:`holder_word`)."""
     code, out, _ = runner(["ss", "-ltnpH"], 10)
     if code != 0:
         return None
@@ -144,6 +152,14 @@ def tunnel_held_by(runner: Runner, port: int) -> str | None:
         if f":{port} " in line + " " and 'users:(("' in line:
             return line.split('users:(("', 1)[1].split('"', 1)[0][:32]
     return None
+
+
+def holder_word(name: str | None) -> str | None:
+    """Free text from the host never reaches the public document: the holder
+    of the review port is one of a fixed set of words."""
+    if name is None:
+        return None
+    return "tailscaled" if name == "tailscaled" else "other"
 
 
 def queue_shape(repo: str, runner: Runner) -> dict[str, Any] | None:
@@ -276,7 +292,7 @@ def collect(
     doc["sshd"] = {"accepts": ssh_open, "banner": ssh_banner}
     doc["review_tunnel"] = {
         "listening": _tcp_open(port),
-        "held_by": tunnel_held_by(runner, port),
+        "held_by": holder_word(tunnel_held_by(runner, port)),
     }
     repo = settings.get("OPS_STATUS_REPO", "voyn88/ai-command-center")
     doc["queue"] = queue_shape(repo, runner)
@@ -288,7 +304,42 @@ def collect(
         if u.strip()
     ]
     doc["last_verdict_age_min"] = last_verdict_age_min(runner, verdict_units, now)
-    return doc
+    state_dir = Path(settings.get("OPS_STATE_DIR", str(DEFAULT_STATE_DIR)))
+    healed = StateFile(state_dir / "self-heal-state.json").load()
+    halted_at = float(healed.get("halted_at", 0) or 0)
+    doc["self_heal_halted"] = bool(halted_at) and now - halted_at < 24 * 3600
+    if settings.get("OPS_BEACON_DETAIL", "minimal") == "full":
+        return doc
+    return minimal_view(doc, as_int(settings.get("OPS_DISK_LOW_FREE_PCT"), 15))
+
+
+def minimal_view(doc: Mapping[str, Any], low_free_pct: int) -> dict[str, Any]:
+    """What a PUBLIC repository may show by default (security review M2): that
+    the host is alive, whether it is healthy, how full the disk is and how old
+    the control loop's last verdict is -- nothing about which services exist,
+    whether ssh or the tunnel is down, or the shape of the queue."""
+    reasons = 0
+    disk = doc.get("disk") or {}
+    free = disk.get("free_pct")
+    if isinstance(free, (int, float)) and free < low_free_pct:
+        reasons += 1
+    reasons += sum(1 for v in (doc.get("units") or {}).values() if v != "active")
+    reasons += 1 if (doc.get("failed_units") or 0) > 0 else 0
+    sshd = doc.get("sshd") or {}
+    reasons += 1 if not sshd.get("banner") else 0
+    reasons += (
+        1 if (doc.get("review_tunnel") or {}).get("held_by") == "tailscaled" else 0
+    )
+    reasons += 1 if doc.get("self_heal_halted") else 0
+    return {
+        "schema": SCHEMA,
+        "role": doc.get("role"),
+        "heartbeat_unix": doc.get("heartbeat_unix"),
+        "status": "ok" if reasons == 0 else "degraded",
+        "degraded_count": reasons,
+        "disk_free_pct": free,
+        "last_verdict_age_min": doc.get("last_verdict_age_min"),
+    }
 
 
 def render(doc: Mapping[str, Any]) -> str:
@@ -301,6 +352,19 @@ def render(doc: Mapping[str, Any]) -> str:
 # publishing (GitHub git-data API; injectable opener for tests)
 
 Opener = Callable[[urllib.request.Request], Any]
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """``urllib`` re-sends the Authorization header across a redirect; the API
+    host never redirects a git-data call, so any redirect is refused
+    (finding M5)."""
+
+    def redirect_request(self, *args: Any, **kwargs: Any):
+        return None
+
+
+def _default_open(request: urllib.request.Request) -> Any:
+    return urllib.request.build_opener(_NoRedirect).open(request, timeout=30)
 
 
 def _call(
@@ -337,7 +401,7 @@ def publish_branch(
     text: str,
     token: str,
     *,
-    opener: Opener = urllib.request.urlopen,
+    opener: Opener = _default_open,
 ) -> str:
     """Replace ``branch`` with one parentless commit holding ``status.json``.
     Returns the new commit sha; raises RuntimeError on any API refusal."""

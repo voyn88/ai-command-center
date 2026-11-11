@@ -7,10 +7,12 @@ console), so the hosts must look after themselves and report on their own.
 Three small timers do that; this module holds what they share so each of them
 stays short and reviewable:
 
-- a host-local settings file (``/etc/aicc/ops-autonomy.env``) -- every
-  absolute path and every owner-specific name lives THERE and never in the
-  repository (this is a public repository; its leak guard rightly refuses
-  home paths and host names);
+- a host-local settings file (``/etc/aicc/ops-autonomy.env``) -- the user
+  home paths, the owner's account name and the clone/cache roots live THERE
+  and not in the repository (this is a public repository; its leak guard
+  refuses home paths).  Generic deployment paths that other deploy files
+  already publish (the worker lane workspaces, the fleet token store) do
+  appear in code and units;
 - one JSON-lines journal per timer, one object per decision;
 - an exclusive lock so two runs of the same timer never overlap;
 - a tiny state file for "seen twice" and cool-down bookkeeping.
@@ -98,6 +100,36 @@ def as_bool(value: str | None, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+_EXPLICIT_LIVE = {"0", "false", "no", "off"}
+_EXPLICIT_DRY = {"1", "true", "yes", "on"}
+
+
+def as_dry_run(value: str | None) -> bool:
+    """Dry run unless the setting EXPLICITLY says live.
+
+    Security review finding N1: the first version treated only ``1/true/yes/
+    on`` as dry run, so a typo typed in the web console (``y``, ``dry``,
+    ``enabled``, a stray character) silently armed real deletion.  Now a
+    destructive mode needs one of ``0/false/no/off``; every other value,
+    including an empty or unknown one, stays a dry run.
+    """
+    if value is None:
+        return True
+    word = value.strip().lower()
+    if word in _EXPLICIT_LIVE:
+        return False
+    return True
+
+
+def dry_run_value_is_unclear(value: str | None) -> bool:
+    """True for a value that is neither an explicit dry nor an explicit live
+    word (journaled so the typo is visible)."""
+    if value is None or value == "":
+        return False
+    word = value.strip().lower()
+    return word not in _EXPLICIT_LIVE and word not in _EXPLICIT_DRY
+
+
 def as_int(value: str | None, default: int) -> int:
     try:
         return int(str(value).strip())
@@ -131,12 +163,25 @@ class Journal:
         if self.path is not None:
             try:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
+                self._rotate()
                 with self.path.open("a", encoding="utf-8") as handle:
                     handle.write(line + "\n")
             except OSError:
                 # The stdout copy above is already in the unit journal.
                 pass
         return record
+
+    #: the journal never grows past roughly this many bytes (one generation of
+    #: history is kept as ``<name>.1``)
+    MAX_BYTES = 5_000_000
+
+    def _rotate(self) -> None:
+        assert self.path is not None
+        try:
+            if self.path.stat().st_size > self.MAX_BYTES:
+                os.replace(self.path, self.path.with_name(self.path.name + ".1"))
+        except OSError:
+            pass
 
 
 @contextmanager

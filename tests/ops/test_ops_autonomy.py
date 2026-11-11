@@ -56,16 +56,27 @@ def _fake_runner(table: dict[str, dict], calls: list[list[str]] | None = None):
         argv = list(argv)
         if calls is not None:
             calls.append(argv)
-        if argv[0] == "git":
-            name = Path(argv[2]).name
+        if "git" in argv[:4]:
+            at = argv.index("-C")
+            name = Path(argv[at + 1]).name
             spec = table.get(name, {})
-            sub = argv[3:]
+            sub = argv[at + 2 :]
             if sub[:2] == ["rev-parse", "--git-dir"]:
                 return (0, ".git", "") if spec.get("git", True) else (128, "", "no")
             if sub[:3] == ["rev-parse", "--abbrev-ref", "HEAD"]:
                 return 0, spec.get("branch", f"backlog/{name}"), ""
             if sub[:2] == ["remote", "get-url"]:
-                return 0, spec.get("remote", "https://github.com/acme/widgets.git"), ""
+                return (
+                    0,
+                    spec.get("remote", "https://github.com/voyn88/widgets.git"),
+                    "",
+                )
+            if sub[:1] == ["status"]:
+                return 0, spec.get("dirty", ""), ""
+            if sub[:1] == ["rev-list"]:
+                return 0, spec.get("unpushed", "0"), ""
+            if sub[:2] == ["stash", "list"]:
+                return 0, spec.get("stash", ""), ""
         if argv[0] == "gh":
             branch = argv[argv.index("--head") + 1]
             name = branch.split("/", 1)[-1]
@@ -253,7 +264,7 @@ def test_dry_run_journals_but_removes_nothing(tmp_path):
 
 def test_default_settings_are_a_dry_run():
     assert disk_guard.Config.from_settings({}).dry_run is True
-    assert self_heal.as_bool(None, True) is True
+    assert common.as_dry_run(None) is True
 
 
 def test_does_nothing_while_the_disk_has_room(tmp_path):
@@ -354,7 +365,7 @@ def test_missing_manifests_means_no_orphans(tmp_path):
 
 
 def test_package_caches_are_emptied_but_the_directory_stays(tmp_path):
-    cache = tmp_path / "cache"
+    cache = tmp_path / "_cacache"
     (cache / "x").mkdir(parents=True)
     (cache / "x" / "f").write_bytes(b"c" * 100)
     (cache / "top").write_bytes(b"c" * 100)
@@ -432,7 +443,12 @@ def _beacon_runner(argv, timeout=30):
 
 
 def test_collect_builds_a_clean_allow_listed_document(tmp_path):
-    settings = {"OPS_HOST_ROLE": "control", "OPS_DISK_PATH": str(tmp_path)}
+    settings = {
+        "OPS_HOST_ROLE": "control",
+        "OPS_DISK_PATH": str(tmp_path),
+        "OPS_BEACON_DETAIL": "full",
+        "OPS_STATE_DIR": str(tmp_path),
+    }
     doc = status_beacon.collect(settings, runner=_beacon_runner)
     text = status_beacon.render(doc)  # raises if dirty
     assert doc["role"] == "control"
@@ -445,7 +461,10 @@ def test_collect_builds_a_clean_allow_listed_document(tmp_path):
 
 
 def test_an_unknown_role_falls_back_to_worker(tmp_path):
-    doc = status_beacon.collect({"OPS_HOST_ROLE": "evil/../x"}, runner=_beacon_runner)
+    doc = status_beacon.collect(
+        {"OPS_HOST_ROLE": "evil/../x", "OPS_STATE_DIR": str(tmp_path)},
+        runner=_beacon_runner,
+    )
     assert doc["role"] == "worker"
 
 
@@ -541,11 +560,15 @@ def test_an_api_refusal_is_an_error_not_a_silent_success():
 # self-heal
 
 
-def _heal_runner(*, ts_ok=True, held_by=None, tunnel_code="000", failed=()):
+def _heal_runner(
+    *, ts_ok=True, held_by=None, tunnel_code="000", failed=(), backend="Running"
+):
     def run(argv, timeout=30):
         argv = list(argv)
         if argv[:2] == ["tailscale", "ip"]:
             return (0, "100.64.0.1\n", "") if ts_ok else (124, "", "timeout")
+        if argv[:2] == ["tailscale", "status"]:
+            return 0, json.dumps({"BackendState": backend}), ""
         if argv[0] == "ss":
             if held_by:
                 return (
@@ -787,6 +810,11 @@ def test_install_is_idempotent_starts_in_dry_run_and_uninstalls_cleanly(tmp_path
     assert second.returncode == 0, second.stderr
     assert "OPS_DISK_LOW_FREE_PCT=11" in settings.read_text()
 
+    refused = _run_installer(env, "--live", "disk")
+    assert refused.returncode != 0 and "dry-run" in refused.stderr
+    logs = Path(env["AICC_OPS_LOG_DIR"])
+    (logs / "disk-guard.jsonl").write_text('{"event": "disk_ok"}\n')
+    (logs / "self-heal.jsonl").write_text('{"event": "healthy"}\n')
     live = _run_installer(env, "--live", "disk")
     assert live.returncode == 0, live.stderr
     values = common.parse_settings(settings.read_text())
@@ -818,3 +846,508 @@ def test_install_refuses_an_unknown_role(tmp_path):
     env = _fake_host(tmp_path)
     result = _run_installer(env, "--role", "owner")
     assert result.returncode != 0 and "role must be" in result.stderr
+
+
+# ==========================================================================
+# security review findings (team/security/ops-autonomy-review.md)
+
+
+# --- N1: a typo must never arm real deletion --------------------------------
+
+
+@pytest.mark.parametrize("word", ["0", "false", "no", "off", "OFF", " No "])
+def test_only_an_explicit_live_word_arms_real_work(word):
+    assert common.as_dry_run(word) is False
+
+
+@pytest.mark.parametrize(
+    "word", ["1", "true", "yes", "on", "", "y", "dry", "enabled", "да", "o", "00", "12"]
+)
+def test_every_other_value_stays_a_dry_run(word):
+    assert common.as_dry_run(word) is True
+
+
+def test_a_typo_is_journaled_and_the_disk_guard_stays_dry(tmp_path):
+    cfg = _cfg(tmp_path, OPS_DISK_GUARD_DRY_RUN="dry")
+    clone = _clone(cfg.clone_roots[0], "merged-old")
+    table = {"merged-old": {"pulls": [_pr("MERGED", 5)]}}
+    assert cfg.dry_run is True and cfg.dry_run_unclear is True
+    journal, lines = _journal(tmp_path)
+    disk_guard.run_guard(
+        cfg, runner=_fake_runner(table), journal=journal, cwds=[], free_pct=_low
+    )
+    assert clone.exists()
+    assert any("unclear" in line for line in lines)
+
+
+def test_a_dry_run_reports_would_act_not_acted(tmp_path):
+    cfg = _cfg(tmp_path, OPS_DISK_GUARD_DRY_RUN="1")
+    _clone(cfg.clone_roots[0], "merged-old")
+    table = {"merged-old": {"pulls": [_pr("MERGED", 5)]}}
+    journal, _ = _journal(tmp_path)
+    summary = disk_guard.run_guard(
+        cfg, runner=_fake_runner(table), journal=journal, cwds=[], free_pct=_low
+    )
+    assert summary["would_act"] is True and summary["acted"] is False
+
+
+# --- C4: roots and caches that are too broad are refused ---------------------
+
+
+@pytest.mark.parametrize(
+    ("path", "cache", "why"),
+    [
+        ("/", False, "too_broad"),
+        ("/home", False, "too_broad"),
+        ("/home/alice", False, "too_broad"),
+        ("/srv", False, "too_broad"),
+        ("/var", True, "too_broad"),
+        ("/var/lib", False, "too_shallow"),
+        ("/a/b/../c/d", False, "not_a_plain_absolute_path"),
+        ("relative/path/here", False, "not_a_plain_absolute_path"),
+        ("/home/alice/.cache/other", True, "not_a_known_cache_name"),
+        ("/home/alice/Projects/nightly-backup-x", False, "protected_name"),
+    ],
+)
+def test_too_broad_or_odd_paths_are_refused(path, cache, why):
+    assert disk_guard.refused_path(Path(path), cache=cache) == why
+
+
+@pytest.mark.parametrize(
+    ("path", "cache"),
+    [
+        ("/home/alice/.npm/_cacache", True),
+        ("/home/alice/.cache/pip", True),
+        ("/home/alice/.cache/uv", True),
+        ("/home/alice/Projects/task-clones", False),
+        ("/srv/workspaces/abc123", False),
+    ],
+)
+def test_ordinary_roots_and_known_caches_pass(path, cache):
+    assert disk_guard.refused_path(Path(path), cache=cache) is None
+
+
+def test_a_broad_cache_dir_in_the_settings_deletes_nothing(tmp_path):
+    victim = tmp_path / "keep"
+    victim.mkdir()
+    (victim / "data").write_text("precious")
+    cfg = _cfg(tmp_path, OPS_CACHE_DIRS=tmp_path, OPS_CLONE_ROOTS="")
+    journal, lines = _journal(tmp_path)
+    disk_guard.run_guard(
+        cfg, runner=_fake_runner({}), journal=journal, cwds=[], free_pct=_low
+    )
+    assert (victim / "data").exists()
+    assert any('"refused_path"' in line for line in lines)
+
+
+# --- C1: git runs as the clone's owner, with config hooks switched off -------
+
+
+def test_git_runs_as_the_clone_owner_when_the_guard_is_root(tmp_path, monkeypatch):
+    clone = _clone(tmp_path, "c1")
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr(
+        disk_guard.pwd,
+        "getpwuid",
+        lambda uid: type("P", (), {"pw_name": "agent"})(),
+    )
+    calls: list[list[str]] = []
+
+    def runner(argv, timeout=30):
+        calls.append(list(argv))
+        return 0, "x", ""
+
+    assert disk_guard._git(clone, ["status"], runner) == "x"
+    argv = calls[0]
+    assert argv[:4] == ["runuser", "-u", "agent", "--"]
+    assert "core.fsmonitor=false" in argv and "core.hooksPath=/dev/null" in argv
+    assert "--no-optional-locks" in argv
+
+
+def test_a_clone_owned_by_root_is_never_inspected_as_root(tmp_path, monkeypatch):
+    clone = _clone(tmp_path, "c1")
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    monkeypatch.setattr(
+        disk_guard.pwd, "getpwuid", lambda uid: type("P", (), {"pw_name": "root"})()
+    )
+    assert disk_guard._git(clone, ["status"], lambda *a, **k: (0, "x", "")) is None
+
+
+def test_an_unprivileged_run_does_not_wrap_git(tmp_path, monkeypatch):
+    clone = _clone(tmp_path, "c1")
+    monkeypatch.setattr(os, "geteuid", lambda: 1000)
+    seen: list[list[str]] = []
+    disk_guard._git(
+        clone, ["status"], lambda a, t=30: (seen.append(list(a)), (0, "", ""))[1]
+    )
+    assert seen[0][0] == "git"
+
+
+def test_a_pull_request_of_an_unlisted_owner_does_not_make_a_clone_deletable(tmp_path):
+    cfg = _cfg(tmp_path)
+    clone = _clone(cfg.clone_roots[0], "stranger")
+    table = {
+        "stranger": {
+            "remote": "https://github.com/somebody-else/widgets.git",
+            "pulls": [_pr("MERGED", 9)],
+        }
+    }
+    journal, _ = _journal(tmp_path)
+    disk_guard.run_guard(
+        cfg, runner=_fake_runner(table), journal=journal, cwds=[], free_pct=_low
+    )
+    assert clone.exists()
+
+
+# --- C2: work that exists nowhere else survives ------------------------------
+
+
+@pytest.mark.parametrize(
+    ("spec", "why"),
+    [
+        ({"dirty": " M file.py"}, "dirty_or_unpushed"),
+        ({"dirty": "?? notes.txt"}, "dirty_or_unpushed"),
+        ({"unpushed": "3"}, "dirty_or_unpushed"),
+        ({"unpushed": ""}, "dirty_or_unpushed"),
+        ({"stash": "stash@{0}: WIP"}, "has_stash"),
+    ],
+)
+def test_a_clone_holding_unsaved_work_is_kept(tmp_path, spec, why):
+    cfg = _cfg(tmp_path)
+    clone = _clone(cfg.clone_roots[0], "work")
+    table = {"work": {"pulls": [_pr("MERGED", 9)], **spec}}
+    verdict = disk_guard.clone_verdict(
+        clone,
+        now=time.time(),
+        min_age_days=3,
+        cwds=[],
+        runner=_fake_runner(table),
+    )
+    assert verdict == (False, why)
+
+
+def test_an_in_place_edit_deep_inside_counts_as_recent_activity(tmp_path):
+    cfg = _cfg(tmp_path)
+    clone = _clone(cfg.clone_roots[0], "deep")
+    nested = clone / "a" / "b"
+    nested.mkdir(parents=True)
+    _age(clone, 10)
+    (nested / "f.txt").write_text("edited now")  # directories stay old
+    assert disk_guard.newest_mtime(clone) > time.time() - 60
+    verdict = disk_guard.clone_verdict(
+        clone,
+        now=time.time(),
+        min_age_days=3,
+        cwds=[],
+        runner=_fake_runner({"deep": {"pulls": [_pr("MERGED", 9)]}}),
+    )
+    assert verdict == (False, "modified_inside_age_window")
+
+
+def test_a_running_git_operation_blocks_deletion(tmp_path):
+    cfg = _cfg(tmp_path)
+    clone = _clone(cfg.clone_roots[0], "busy-git")
+    (clone / ".git" / "index.lock").write_text("")
+    _age(clone, 10)
+    verdict = disk_guard.clone_verdict(
+        clone,
+        now=time.time(),
+        min_age_days=3,
+        cwds=[],
+        runner=_fake_runner({"busy-git": {"pulls": [_pr("MERGED", 9)]}}),
+    )
+    assert verdict == (False, "git_operation_in_progress")
+
+
+# --- C3: use checks, the process table, mounts, and a re-check ---------------
+
+
+def test_an_unreadable_process_table_is_not_nobody_using_it(tmp_path):
+    assert disk_guard.process_paths(tmp_path / "no-such-proc") is None
+    cfg = _cfg(tmp_path)
+    clone = _clone(cfg.clone_roots[0], "c")
+    verdict = disk_guard.clone_verdict(
+        clone,
+        now=time.time(),
+        min_age_days=3,
+        cwds=None,
+        runner=_fake_runner({"c": {"pulls": [_pr("MERGED", 9)]}}),
+    )
+    assert verdict == (False, "process_table_unreadable")
+
+
+def test_process_paths_includes_open_files_and_working_directories(tmp_path):
+    proc = tmp_path / "proc"
+    (proc / "42" / "fd").mkdir(parents=True)
+    (proc / "42" / "cwd").symlink_to("/somewhere/cwd")
+    (proc / "42" / "fd" / "3").symlink_to("/clones/c/file.txt")
+    paths = disk_guard.process_paths(proc)
+    assert paths and "/somewhere/cwd" in paths and "/clones/c/file.txt" in paths
+    assert disk_guard.in_use(Path(tmp_path), ["/clones/c/file.txt"]) is False
+
+
+def test_a_mount_point_inside_a_clone_blocks_deletion(tmp_path):
+    clone = _clone(tmp_path, "c")
+    assert disk_guard.has_mount_inside(clone, [str(clone / "inner")])
+    assert disk_guard.has_mount_inside(clone, [str(clone)])
+    assert not disk_guard.has_mount_inside(clone, [str(tmp_path / "other")])
+    assert disk_guard.mount_points(tmp_path / "missing") == []
+
+
+def test_the_verdict_is_taken_again_right_before_deleting(tmp_path):
+    cfg = _cfg(tmp_path)
+    clone = _clone(cfg.clone_roots[0], "late")
+    table = {"late": {"pulls": [_pr("MERGED", 5)]}}
+    planned, _ = disk_guard.plan_clones(
+        cfg,
+        now=time.time(),
+        runner=_fake_runner(table),
+        cwds=[],
+        fresh_cwds=lambda: [str(clone)],  # a process appeared after the plan
+    )
+    assert len(planned) == 1
+    assert planned[0].action() is False
+    assert clone.exists()
+
+
+# --- C5: one cool-down and one count per SERVICE, a daily stop ---------------
+
+
+def test_two_signals_for_one_service_are_one_restart(tmp_path):
+    runner = _Recorder(_heal_runner(ts_ok=False, held_by="tailscaled"))
+    for now in (1000, 1300, 1600):
+        _heal(tmp_path, runner, now=now)
+    assert runner.restarts == ["tailscaled.service"]
+
+
+def test_a_tailscaled_the_owner_stopped_is_left_alone(tmp_path):
+    for state in ("Stopped", "NeedsLogin", "NeedsMachineAuth"):
+        sub = tmp_path / state
+        sub.mkdir()
+        runner = _Recorder(_heal_runner(ts_ok=False, backend=state))
+        for now in (1000, 1300):
+            _heal(sub, runner, now=now)
+        assert runner.restarts == [], state
+
+
+def test_the_daily_cap_halts_self_heal_and_says_so(tmp_path):
+    state_file = common.StateFile(tmp_path / "state.json")
+    day = 24 * 3600
+    now = 10 * day
+    state_file.save(
+        {
+            "seen": {"tailscaled_unresponsive": 5},
+            "history": [now - 4000 - i for i in range(self_heal.MAX_ACTIONS_PER_DAY)],
+            "last_action": {},
+        }
+    )
+    runner = _Recorder(_heal_runner(ts_ok=False))
+    journal, lines = _journal(tmp_path)
+    self_heal.run_heal(
+        {}, runner=runner, journal=journal, state=state_file, dry_run=False, now=now
+    )
+    assert runner.restarts == []
+    assert any("halted_daily_cap" in line for line in lines)
+    assert state_file.load()["halted_at"] == now
+    # still halted an hour later, and free again after 24 hours
+    self_heal.run_heal(
+        {},
+        runner=runner,
+        journal=journal,
+        state=state_file,
+        dry_run=False,
+        now=now + 3600,
+    )
+    assert runner.restarts == []
+    self_heal.run_heal(
+        {},
+        runner=runner,
+        journal=journal,
+        state=state_file,
+        dry_run=False,
+        now=now + day + 100,
+    )
+    assert runner.restarts == ["tailscaled.service"]
+
+
+def test_the_failed_state_is_journaled_before_reset_failed(tmp_path):
+    inner = _heal_runner(failed=("voyn-aicc-review.service",))
+    order: list[str] = []
+
+    def runner(argv, timeout=30):
+        argv = list(argv)
+        if argv[:2] == ["systemctl", "show"]:
+            order.append("show")
+            return 0, "Result=exit-code\nExecMainStatus=1\n", ""
+        if argv[:2] == ["systemctl", "reset-failed"]:
+            order.append("reset")
+        return inner(argv, timeout)
+
+    journal, lines = _journal(tmp_path)
+    state = common.StateFile(tmp_path / "s.json")
+    for now in (1000, 1300):
+        self_heal.run_heal(
+            {"OPS_HEAL_UNITS": "voyn-aicc-review.service"},
+            runner=runner,
+            journal=journal,
+            state=state,
+            dry_run=False,
+            now=now,
+        )
+    assert order == ["show", "reset"]
+    assert any("before_reset_failed" in line and "exit-code" in line for line in lines)
+
+
+def test_the_beacon_shows_that_self_heal_halted(tmp_path):
+    common.StateFile(tmp_path / "self-heal-state.json").save(
+        {"halted_at": time.time() - 60}
+    )
+    doc = status_beacon.collect(
+        {"OPS_STATE_DIR": str(tmp_path), "OPS_BEACON_DETAIL": "full"},
+        runner=_beacon_runner,
+    )
+    assert doc["self_heal_halted"] is True
+
+
+# --- M2: a public repository shows the minimum by default --------------------
+
+
+def test_the_default_document_is_minimal_and_clean(tmp_path):
+    doc = status_beacon.collect(
+        {"OPS_STATE_DIR": str(tmp_path), "OPS_DISK_PATH": str(tmp_path)},
+        runner=_beacon_runner,
+    )
+    text = status_beacon.render(doc)
+    assert set(doc) == {
+        "schema",
+        "role",
+        "heartbeat_unix",
+        "status",
+        "degraded_count",
+        "disk_free_pct",
+        "last_verdict_age_min",
+    }
+    for hidden in ("units", "sshd", "review_tunnel", "queue", "failed_units"):
+        assert hidden not in text
+    assert doc["status"] in {"ok", "degraded"}
+
+
+def test_a_held_tunnel_port_makes_the_minimal_status_degraded(tmp_path):
+    doc = status_beacon.collect(
+        {"OPS_STATE_DIR": str(tmp_path)}, runner=_beacon_runner
+    )  # the fake host reports the port held by tailscaled
+    assert doc["status"] == "degraded" and doc["degraded_count"] >= 1
+
+
+def test_the_holder_of_the_tunnel_port_is_an_enumerated_word():
+    assert status_beacon.holder_word("tailscaled") == "tailscaled"
+    assert status_beacon.holder_word("anything-the-host-says") == "other"
+    assert status_beacon.holder_word(None) is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    ['{"x": "fe80::1:2:3:4"}', '{"x": "example.com"}', '{"x": "api.example.cloud"}'],
+)
+def test_ipv6_and_domain_names_are_refused(text):
+    with pytest.raises(status_beacon.DirtyStatus):
+        status_beacon.assert_clean(text)
+
+
+# --- M5: no redirect with the authorization header ---------------------------
+
+
+def test_a_redirect_is_refused_so_the_token_is_never_resent():
+    handler = status_beacon._NoRedirect()
+    assert handler.redirect_request() is None
+
+
+# --- M3 / M4 / journal rotation ----------------------------------------------
+
+
+def test_the_sandbox_drop_in_ignores_a_vanished_path(tmp_path):
+    env = _fake_host(tmp_path)
+    (tmp_path / "units").mkdir()
+    clones = tmp_path / "home" / "Projects" / "ai-command-center-task-clones"
+    clones.mkdir(parents=True)
+    env["AICC_OPS_OWNER"] = "nobody-here"
+    settings = Path(env["AICC_OPS_SETTINGS"])
+    settings.parent.mkdir(parents=True)
+    settings.write_text(f"OPS_CLONE_ROOTS={clones}\n")
+    result = _run_installer(env, "--role", "worker")
+    assert result.returncode == 0, result.stderr
+    dropin = (
+        tmp_path / "units" / "voyn-ops-disk-guard.service.d" / "paths.conf"
+    ).read_text()
+    assert f"ReadWritePaths=-{clones}" in dropin
+
+
+@pytest.mark.parametrize(
+    "manifest", ["[]", '{"layers": null}', '{"layers": [1]}', '{"config": 3}', "null"]
+)
+def test_an_odd_manifest_means_no_orphans_not_a_crash(tmp_path, manifest):
+    models = _models(tmp_path, referenced=["aa"], orphans={"old": 5})
+    (models / "manifests" / "reg" / "m" / "tag").write_text(manifest)
+    cfg = _cfg(tmp_path, OPS_OLLAMA_MODELS_DIR=models, OPS_CLONE_ROOTS="")
+    assert disk_guard.plan_ollama_orphans(cfg, now=time.time()) == []
+
+
+def test_the_journal_rotates_instead_of_growing_forever(tmp_path):
+    path = tmp_path / "j.jsonl"
+    journal = common.Journal(path, echo=lambda _l: None)
+    journal.MAX_BYTES = 200
+    for i in range(30):
+        journal.write("tick", n=i, pad="x" * 20)
+    assert path.with_name("j.jsonl.1").exists()
+    assert path.stat().st_size < 1000
+
+
+# --- installer details -------------------------------------------------------
+
+
+def test_a_missing_option_value_is_an_error_not_a_silent_exit(tmp_path):
+    env = _fake_host(tmp_path)
+    for option in ("--live", "--dry-run", "--role"):
+        result = _run_installer(env, option)
+        assert result.returncode != 0 and "needs" in result.stderr, option
+
+
+def test_live_is_refused_without_a_recent_dry_run_journal(tmp_path):
+    env = _fake_host(tmp_path)
+    (tmp_path / "units").mkdir()
+    assert _run_installer(env, "--role", "worker").returncode == 0
+    refused = _run_installer(env, "--live", "all")
+    assert refused.returncode != 0 and "dry-run" in refused.stderr
+    values = common.parse_settings(Path(env["AICC_OPS_SETTINGS"]).read_text())
+    assert values["OPS_DISK_GUARD_DRY_RUN"] == "1"
+
+
+def test_uninstall_puts_back_a_unit_that_install_replaced(tmp_path):
+    env = _fake_host(tmp_path)
+    units = tmp_path / "units"
+    units.mkdir()
+    (units / "voyn-ops-beacon.timer").write_text("# the previous version\n")
+    assert _run_installer(env, "--role", "worker").returncode == 0
+    assert "previous version" not in (units / "voyn-ops-beacon.timer").read_text()
+    assert _run_installer(env, "--uninstall").returncode == 0
+    assert (units / "voyn-ops-beacon.timer").read_text() == "# the previous version\n"
+
+
+def test_the_installer_and_modules_name_no_account_and_no_home():
+    for path in (
+        ROOT / "ops/install-ops-autonomy.sh",
+        *sorted((ROOT / "command_center/ops").glob("autonomy_common.py")),
+        ROOT / "command_center/ops/disk_guard.py",
+        ROOT / "command_center/ops/status_beacon.py",
+        ROOT / "command_center/ops/self_heal.py",
+        ROOT / "deploy/aicc/ops-autonomy.env",
+    ):
+        text = path.read_text()
+        assert "voyn" + "admin" not in text, path
+        assert "/Users/" not in text, path
+
+
+def test_the_settings_template_documents_the_new_keys():
+    values = common.parse_settings((ROOT / "deploy/aicc/ops-autonomy.env").read_text())
+    assert values["OPS_BEACON_DETAIL"] == "minimal"
+    assert values["OPS_REPO_OWNERS"] == "voyn88"

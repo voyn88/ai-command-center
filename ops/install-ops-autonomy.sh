@@ -57,10 +57,10 @@ EOF
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --role) role="${2:-}"; shift 2 ;;
+    --role) [ $# -ge 2 ] || die "--role needs worker or control"; role="$2"; shift 2 ;;
     --check) mode=check; shift ;;
-    --live) mode=live; live="${2:-}"; shift 2 ;;
-    --dry-run) mode=dry; live="${2:-}"; shift 2 ;;
+    --live) [ $# -ge 2 ] || die "--live needs disk, heal or all"; mode=live; live="$2"; shift 2 ;;
+    --dry-run) [ $# -ge 2 ] || die "--dry-run needs disk, heal or all"; mode=dry; live="$2"; shift 2 ;;
     --uninstall) mode=uninstall; shift ;;
     --help|-h) usage; exit 0 ;;
     *) usage >&2; die "unknown option: $1" ;;
@@ -93,10 +93,14 @@ detect_role() {
   esac
 }
 
-detect_owner() { # account that owns the working clones
-  if id voynadmin >/dev/null 2>&1; then echo voynadmin
-  elif [ -n "${SUDO_USER:-}" ]; then echo "$SUDO_USER"
-  else echo ""; fi
+detect_owner() { # account that owns the working clones (never a literal name)
+  local d
+  if [ -n "${AICC_OPS_OWNER:-}" ]; then echo "$AICC_OPS_OWNER"; return; fi
+  for d in /home/*/Projects/ai-command-center-task-clones /home/*/Projects/ai-command-center; do
+    [ -d "$d" ] || continue
+    stat -c %U "$d" 2>/dev/null && return
+  done
+  if [ -n "${SUDO_USER:-}" ]; then echo "$SUDO_USER"; else echo ""; fi
 }
 
 join_existing_dirs() { # prints colon-joined list of the arguments that are dirs
@@ -108,7 +112,24 @@ join_existing_dirs() { # prints colon-joined list of the arguments that are dirs
   printf '%s' "$out"
 }
 
+root_only_writable() { # PATH -> ok only if owned by root and not writable by group/other
+  [ "${AICC_OPS_ALLOW_NONROOT:-}" = 1 ] && return 0
+  local real owner mode
+  real="$(readlink -f "$1")"
+  owner="$(stat -c %U "$real" 2>/dev/null)" || return 1
+  mode="$(stat -c %a "$real" 2>/dev/null)" || return 1
+  [ "$owner" = root ] || return 1
+  local g="${mode: -2:1}" o="${mode: -1}"
+  [ $((g & 2)) -eq 0 ] && [ $((o & 2)) -eq 0 ]
+}
+
 preflight() {
+  # these run as root from systemd: whoever can write there controls root
+  local p
+  for p in "$RELEASE_DIR" "$APP_DIR/.venv" "$VENV_PY"; do
+    [ -e "$p" ] || continue
+    root_only_writable "$p" || die "$p must be owned by root and not writable by group or others before root timers may run code from it"
+  done
   [ -x "$VENV_PY" ] || die "no interpreter at $VENV_PY (is the fleet release deployed on this host?)"
   local u
   for u in "${UNITS[@]}"; do
@@ -166,13 +187,13 @@ write_disk_guard_dropin() {
   for p in $(get_key OPS_CLONE_ROOTS | tr ':' ' ') \
            $(get_key OPS_CACHE_DIRS | tr ':' ' ') \
            $(get_key OPS_OLLAMA_MODELS_DIR | tr ':' ' '); do
-    [ -d "$p" ] && paths="$paths $p"
+    [ -d "$p" ] && paths="$paths -$p"
   done
   mkdir -p "$dir"
   {
     echo "[Service]"
     echo "# written by install-ops-autonomy.sh from $SETTINGS"
-    [ -z "$paths" ] || echo "ReadWritePaths=$paths"
+    [ -z "$paths" ] || echo "ReadWritePaths=${paths# }"
   } >"$dir/paths.conf"
 }
 
@@ -207,9 +228,23 @@ install_all() {
   say "next: wait one day, read the dry-run journal, then:  bash $0 --live all"
 }
 
+dry_run_seen_recently() { # LOGFILE -> at least one run logged in the last 24 h
+  [ -n "$(find "$1" -mmin -1440 2>/dev/null)" ] && grep -q '"event"' "$1" 2>/dev/null
+}
+
 set_live() { # disk|heal|all  value 0|1
   need_root
   [ -f "$SETTINGS" ] || die "install first (no $SETTINGS)"
+  if [ "$1" = 0 ]; then
+    case "$live" in disk|all)
+      dry_run_seen_recently "$LOG_DIR/disk-guard.jsonl" \
+        || die "no dry-run of the disk guard in the last 24 hours: let it run in dry run first, read $LOG_DIR/disk-guard.jsonl, then try again" ;;
+    esac
+    case "$live" in heal|all)
+      dry_run_seen_recently "$LOG_DIR/self-heal.jsonl" \
+        || die "no dry-run of self-heal in the last 24 hours: let it run in dry run first" ;;
+    esac
+  fi
   case "$live" in
     disk) set_key OPS_DISK_GUARD_DRY_RUN "$1" ;;
     heal) set_key OPS_SELF_HEAL_DRY_RUN "$1" ;;
@@ -248,6 +283,13 @@ uninstall_all() {
     rm -f "$UNIT_DIR/$u.timer" "$UNIT_DIR/$u.service"
   done
   rm -rf "$UNIT_DIR/voyn-ops-disk-guard.service.d"
+  local newest f
+  newest="$(ls -d "$STATE_DIR"/backup-* 2>/dev/null | tail -n 1 || true)"
+  if [ -n "$newest" ]; then
+    for f in "$newest"/*; do
+      [ -f "$f" ] && cp -a "$f" "$UNIT_DIR/$(basename "$f")" && say "restored $(basename "$f")"
+    done
+  fi
   "$SYSTEMCTL" daemon-reload
   say "removed the timers and unit files; settings, logs and state are kept ($SETTINGS, $LOG_DIR, $STATE_DIR)"
 }
