@@ -1,0 +1,46 @@
+# Self-hosted PR-Agent (Qodo OSS) review companion
+# (VOYN-W0-AICC-PR-AGENT-INTEGRATION). Runs `pr_agent.cli ... review`
+# against every open, non-draft pull request this host has not already
+# reviewed at its current head. Posts only a plain PR comment -- the review
+# contour may read it as one more finding, but this unit never posts, and
+# has no credential or code path to post, the ACCEPTANCE/VERDICT marker
+# `voyn-aicc-review.timer` reads (see command_center/orchestrator/
+# pr_agent_review.py).
+#
+# Skips cleanly (exit 0) with neither GEMINI_API_KEY nor GROQ_API_KEY set in
+# the EnvironmentFile below -- this unit never acquires one on its own.
+[Unit]
+Description=AICC PR-Agent (Qodo OSS) review tick
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# The control plane's own principal, same as voyn-aicc-pr-window and
+# voyn-aicc-self-deploy -- this reads/writes GitHub and calls an LLM API
+# only, no database credential.
+User=voynadmin
+WorkingDirectory=/opt/aicc/current
+Environment=GH_REPO=voyn88/ai-command-center
+Environment=AICC_FLEET_REPO=/opt/aicc/source
+Environment=GIT_TERMINAL_PROMPT=0
+# GEMINI_API_KEY / GROQ_API_KEY (at most one) and GITHUB__USER_TOKEN (the
+# token PR-Agent's own GitHub provider posts comments with -- distinct from
+# the fleet App `gh` identity `gh_access` resolves for the listing call)
+# live here, never committed. Absent file or absent keys: the tick prints
+# "CREDENTIAL none" and exits 0 (see .env.example).
+EnvironmentFile=-/etc/aicc/pr-agent.env
+# StateDirectory, never a path under WorkingDirectory: the dedup bookkeeping
+# file this tick writes must resolve OUTSIDE the checkout, or
+# voyn-aicc-self-deploy's dirty-tree check would refuse every subsequent
+# deploy tick on this host (enforced in pr_agent_review._state_file, not
+# merely a deployment convention).
+StateDirectory=aicc-pr-agent-review
+StateDirectoryMode=0750
+ExecStart=/opt/aicc/current/.venv/bin/python -m command_center.db pr-agent-review --repo-path ${AICC_FLEET_REPO} --state-path /var/lib/aicc-pr-agent-review/state.json
+# Bounded: PrAgentConfig.timeout (600s default) per PR times pr_limit (20
+# default) PRs is the worst case: well inside this ceiling but never
+# unbounded.
+TimeoutStartSec=1800s
+NoNewPrivileges=true
+PrivateTmp=true

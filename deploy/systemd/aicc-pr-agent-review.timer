@@ -1,0 +1,9 @@
+[Unit]
+Description=Run the PR-Agent (Qodo OSS) review tick periodically (VOYN-W0-AICC-PR-AGENT-INTEGRATION)
+
+[Timer]
+OnBootSec=6min
+OnUnitActiveSec=20min
+
+[Install]
+WantedBy=timers.target
