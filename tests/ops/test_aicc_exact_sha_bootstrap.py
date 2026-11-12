@@ -636,7 +636,9 @@ def test_planted_attempts_symlink_cannot_redirect_the_bootstrap(tmp_path, monkey
     assert not any(elsewhere.iterdir()), "nothing may be created through the link"
 
 
-def _authority_fixture(monkeypatch, *, gid, groups, members=(), primary=()):
+def _authority_fixture(
+    monkeypatch, *, gid, groups, members=(), primary=(), extra=()
+):
     module = _module()
     monkeypatch.setattr(module, "_require_root_owned_directory_chain", lambda *a, **k: None)
     monkeypatch.setattr(
@@ -647,6 +649,15 @@ def _authority_fixture(monkeypatch, *, gid, groups, members=(), primary=()):
             if name in groups
             else (_ for _ in ()).throw(KeyError(name))
         ),
+    )
+    monkeypatch.setattr(
+        module.grp,
+        "getgrall",
+        lambda: [
+            SimpleNamespace(gr_name=n, gr_gid=g, gr_mem=list(members))
+            for n, g in groups.items()
+        ]
+        + [SimpleNamespace(gr_name=n, gr_gid=g, gr_mem=m) for n, g, m in extra],
     )
     monkeypatch.setattr(
         module.pwd,
@@ -694,3 +705,18 @@ def test_worker_profile_never_accepts_the_control_group(monkeypatch):
     module, path = _authority_fixture(monkeypatch, gid=300, groups=_GROUPS)
     with pytest.raises(module.BootstrapRefused):
         module._prepare_authority_file(path)
+
+
+def test_control_group_sharing_its_gid_with_another_group_is_refused(monkeypatch):
+    aliased = [("shadow-alias", 300, ["someone"])]
+    module, path = _authority_fixture(
+        monkeypatch, gid=300, groups=_GROUPS, extra=aliased
+    )
+    assert module._control_authority_gid() is None
+    with pytest.raises(module.BootstrapRefused):
+        module._prepare_authority_file(path, "control")
+    # an alias with no members still shares the gid: refused as well
+    module, path = _authority_fixture(
+        monkeypatch, gid=300, groups=_GROUPS, extra=[("alias2", 300, [])]
+    )
+    assert module._control_authority_gid() is None

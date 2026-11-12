@@ -778,6 +778,7 @@ def _fake_host(tmp_path: Path) -> dict[str, str]:
         "AICC_JOURNALD_DIR": str(tmp_path / "journald"),
         "AICC_SYSTEMCTL": str(systemctl),
         "AICC_OPS_ALLOW_NONROOT": "1",
+        "AICC_OPS_TRUST_OWNER": __import__("getpass").getuser(),
         "FAKE_SYSTEMCTL_LOG": str(tmp_path / "systemctl.log"),
         "PYTHONPATH": str(ROOT),
     }
@@ -1575,3 +1576,47 @@ def test_shipped_units_name_the_release_layout_not_a_separate_venv():
         assert "WorkingDirectory=/opt/aicc/current\n" in text
         assert "ExecStart=/opt/aicc/current/.venv/bin/python -m " in text
         assert "/opt/aicc/.venv" not in text
+
+
+def test_a_group_writable_parent_of_the_release_link_is_refused(tmp_path):
+    env = _releases_layout(tmp_path)
+    parent = Path(env["AICC_RELEASE_DIR"]).parent
+    parent.chmod(0o775)
+    (tmp_path / "units").mkdir()
+    done = _run_installer(env, "--role", "worker")
+    assert done.returncode != 0
+    assert str(parent) in done.stderr
+    assert "chmod 755" in done.stderr
+    assert not list((tmp_path / "units").glob("*.service"))
+    parent.chmod(0o755)
+    assert _run_installer(env, "--role", "worker").returncode == 0
+
+
+def test_a_group_writable_releases_directory_is_refused(tmp_path):
+    env = _releases_layout(tmp_path)
+    releases = Path(env["AICC_RELEASE_DIR"]).resolve().parent
+    releases.chmod(0o775)
+    (tmp_path / "units").mkdir()
+    done = _run_installer(env, "--role", "worker")
+    assert done.returncode != 0
+    assert str(releases) in done.stderr
+    releases.chmod(0o755)
+
+
+def test_an_untrusted_owner_is_refused_even_when_modes_are_tight(tmp_path):
+    env = _releases_layout(tmp_path)
+    env["AICC_OPS_TRUST_OWNER"] = "nobody-here"
+    (tmp_path / "units").mkdir()
+    done = _run_installer(env, "--role", "worker")
+    assert done.returncode != 0
+    assert "must be owned by root" in done.stderr
+
+
+def test_layout_paths_with_odd_characters_are_refused(tmp_path):
+    env = _releases_layout(tmp_path)
+    odd = tmp_path / "opt aicc"
+    odd.mkdir()
+    env["AICC_RELEASE_DIR"] = str(odd)
+    done = _run_installer(env, "--role", "worker")
+    assert done.returncode != 0
+    assert "letters, digits" in done.stderr

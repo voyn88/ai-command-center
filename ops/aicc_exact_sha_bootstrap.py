@@ -517,6 +517,12 @@ def _control_authority_gid() -> int | None:
         pass
     if control.gr_mem:
         return None
+    # another group name sharing this gid would share the key with its members
+    for other in grp.getgrall():
+        if other.gr_gid == control.gr_gid and (
+            other.gr_name != CONTROL_AUTHORITY_GROUP or other.gr_mem
+        ):
+            return None
     if any(account.pw_gid == control.gr_gid for account in pwd.getpwall()):
         return None
     return control.gr_gid
