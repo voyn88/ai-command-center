@@ -779,6 +779,7 @@ def _fake_host(tmp_path: Path) -> dict[str, str]:
         "AICC_SYSTEMCTL": str(systemctl),
         "AICC_OPS_ALLOW_NONROOT": "1",
         "AICC_OPS_TRUST_OWNER": __import__("getpass").getuser(),
+        "AICC_OPS_TEST_ROOT": str(tmp_path),
         "FAKE_SYSTEMCTL_LOG": str(tmp_path / "systemctl.log"),
         "PYTHONPATH": str(ROOT),
     }
@@ -1524,10 +1525,10 @@ def test_the_state_and_log_directories_are_readable_by_the_unprivileged_beacon(
         assert (tmp_path / name / "beacon").is_dir()
 
 
-def _releases_layout(tmp_path: Path) -> dict[str, str]:
+def _releases_layout(tmp_path: Path, base: Path | None = None) -> dict[str, str]:
     """The real fleet layout: current -> releases/<sha>, .venv -> runtime-venv."""
     env = _fake_host(tmp_path)
-    base = tmp_path / "opt-aicc"
+    base = base or tmp_path / "opt-aicc"
     sha_dir = base / "releases" / ("a" * 40)
     sha_dir.parent.mkdir(parents=True)
     __import__("shutil").copytree(env["AICC_RELEASE_DIR"], sha_dir)
@@ -1622,21 +1623,46 @@ def test_layout_paths_with_odd_characters_are_refused(tmp_path):
     assert "letters, digits" in done.stderr
 
 
-def test_a_sticky_world_writable_ancestor_like_tmp_is_passed(tmp_path):
-    env = _releases_layout(tmp_path)
-    base = Path(env["AICC_RELEASE_DIR"]).parent
+def test_a_sticky_parent_above_the_fixture_is_passed_in_tests(tmp_path):
+    sandbox = tmp_path / "sandbox"
+    fixture = sandbox / "fx"
+    fixture.mkdir(parents=True)
+    env = _releases_layout(tmp_path, base=fixture / "opt-aicc")
+    # the fixture lives below a sticky 1777 directory, like /tmp on a runner
+    sandbox.chmod(0o1777)
+    env["AICC_OPS_TEST_ROOT"] = str(fixture)
     (tmp_path / "units").mkdir()
-    base.chmod(0o1777)
     try:
-        assert _run_installer(env, "--check").returncode in (0, 1)
         done = _run_installer(env, "--role", "worker")
         assert done.returncode == 0, done.stdout + done.stderr
     finally:
-        base.chmod(0o755)
-    base.chmod(0o777)
-    try:
-        done = _run_installer(env, "--role", "worker")
-        assert done.returncode != 0
-        assert str(base) in done.stderr
-    finally:
-        base.chmod(0o755)
+        sandbox.chmod(0o755)
+
+
+def test_sticky_release_directories_are_refused_on_a_host(tmp_path):
+    for mode in (0o1777, 0o1775, 0o777):
+        for target in ("release", "venv", "releases", "base"):
+            env = _releases_layout(tmp_path / f"{mode}-{target}")
+            current = Path(env["AICC_RELEASE_DIR"])
+            real = current.resolve()
+            path = {
+                "release": real,
+                "venv": real / ".venv",
+                "releases": real.parent,
+                "base": current.parent,
+            }[target].resolve()
+            path.chmod(mode)
+            (tmp_path / f"{mode}-{target}" / "units").mkdir(exist_ok=True)
+            done = _run_installer(env, "--role", "worker")
+            path.chmod(0o755)
+            assert done.returncode != 0, (oct(mode), target)
+            assert str(path) in done.stderr, (oct(mode), target)
+
+
+def test_a_release_outside_trusted_ownership_is_refused_without_test_variables(tmp_path):
+    env = _releases_layout(tmp_path)
+    for name in ("AICC_OPS_TRUST_OWNER", "AICC_OPS_TEST_ROOT"):
+        env.pop(name)
+    done = _run_installer(env, "--role", "worker")
+    assert done.returncode != 0
+    assert "must be owned by root" in done.stderr

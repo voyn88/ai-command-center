@@ -125,16 +125,28 @@ file_mode() { stat -c %a "$1" 2>/dev/null || { stat -f %p "$1" 2>/dev/null | sed
 # is never set and only root is trusted.
 trusted_owner() { [ "$1" = root ] || [ -n "${AICC_OPS_TRUST_OWNER:-}" -a "$1" = "${AICC_OPS_TRUST_OWNER:-}" ]; }
 
-dir_or_file_safe() { # PATH -> owned by a trusted account, no group/other write
+above_test_root() { # DIR -> true only when DIR is a strict ancestor of the test fixture
+  local root
+  [ -n "${AICC_OPS_TEST_ROOT:-}" ] || return 1
+  root="$(readlink -f "$AICC_OPS_TEST_ROOT")" || return 1
+  case "$root/" in "${1%/}/"?*) return 0 ;; esac
+  return 1
+}
+
+dir_or_file_safe() { # PATH [ancestor] -> trusted owner, no group/other write
   local owner mode g o
   owner="$(file_owner "$1")" || return 1
   mode="$(file_mode "$1")" || return 1
   trusted_owner "$owner" || return 1
   while [ ${#mode} -lt 4 ]; do mode="0$mode"; done
   g="${mode:2:1}"; o="${mode:3:1}"
-  if [ -d "$1" ] && [ $((${mode:0:1} & 1)) -eq 1 ]; then
-    # sticky directory (/tmp style): writers cannot rename or replace entries
-    # they do not own, so a trusted-owner sticky directory is safe to pass
+  if [ "${2:-}" = ancestor ] && [ -d "$1" ] && [ $((${mode:0:1} & 1)) -eq 1 ] \
+      && above_test_root "$1"; then
+    # Test runs only: AICC_OPS_TEST_ROOT (never set on a host) names the
+    # fixture; the sticky temporary directories ABOVE it may be passed.  The
+    # release, its .venv, releases/ and /opt/aicc never get this, because
+    # `python -m` puts the working directory first on sys.path and a sticky
+    # directory still lets anyone add a file there.
     return 0
   fi
   [ $((g & 2)) -eq 0 ] && [ $((o & 2)) -eq 0 ]
@@ -146,11 +158,15 @@ root_only_writable() { # PATH -> the object AND every directory above it are roo
   # target (security review U2).
   local p="$1" real d
   real="$(readlink -f "$p")" || return 1
+  if [ -L "$p" ]; then
+    # the link itself (current): its owner decides who can repoint it
+    trusted_owner "$(file_owner "$p")" || { BAD_PATH="$p"; return 1; }
+  fi
   dir_or_file_safe "$real" || { BAD_PATH="$real"; return 1; }
   for d in "$(dirname "$p")" "$(dirname "$real")"; do
     d="$(readlink -f "$d")" || return 1
     while :; do
-      dir_or_file_safe "$d" || { BAD_PATH="$d"; return 1; }
+      dir_or_file_safe "$d" ancestor || { BAD_PATH="$d"; return 1; }
       [ "$d" = / ] && break
       d="$(dirname "$d")"
     done
