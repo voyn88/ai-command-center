@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import signal
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -33,6 +34,7 @@ def _work(payload: dict, attempt_id: str = "wat-1") -> ClaimedWork:
         visible_until="2026-01-01T00:00:00+00:00",
         payload=payload,
         claim_token="token-plain",
+        start_deadline=time.monotonic() + 60,
     )
 
 
@@ -53,6 +55,9 @@ class ScriptedStore:
     def heartbeat(self, work):
         self.calls.append(("heartbeat", work.attempt_id))
         return self.heartbeat_alive
+
+    def authorize_start(self, work):
+        return True
 
     def complete(self, work, result):
         self.calls.append(("complete", work.attempt_id, result))
@@ -78,6 +83,110 @@ def _run_until_idle(daemon: WorkerDaemon, store: ScriptedStore) -> None:
     # sleep is called with the idle backoff; use it as the stop trigger
     daemon._sleep = lambda _t: daemon.request_stop()  # type: ignore[method-assign]
     daemon.run_forever()
+
+
+@pytest.mark.parametrize("decision", [False, "unavailable", "missing_schema"])
+def test_cto_start_denial_never_invokes_handler_or_records_completion(decision, caplog):
+    work = _work({"kind": "echo", "actor": "cto", "executor": "trusted"})
+    store = ScriptedStore([])
+    handlers = []
+
+    def authorize(observed):
+        assert observed is work
+        if decision is not False:
+            raise RuntimeError("private diagnostic must not appear")
+        return False
+
+    if decision == "missing_schema":
+        store.authorize_start = None
+    else:
+        store.authorize_start = authorize
+    daemon = WorkerDaemon(store, {"echo": lambda *args: handlers.append(args)})
+    daemon._execute(work)
+    assert handlers == []
+    assert store.calls == []
+    assert "private diagnostic" not in caplog.text
+    assert "authorization" in caplog.text
+
+
+def test_cto_authorization_is_committed_before_handler_and_checked_per_attempt():
+    store = ScriptedStore([])
+    order = []
+    decisions = iter([True, False])
+
+    def authorize(work):
+        order.append(("authorize", work.attempt_id))
+        return next(decisions)
+
+    def handler(payload, lease_lost, attempt_no):
+        order.append(("handler", attempt_no))
+        return HandlerOutcome(ok=True, result={"observed": True})
+
+    store.authorize_start = authorize
+    daemon = WorkerDaemon(store, {"echo": handler})
+    daemon._execute(_work({"kind": "echo"}, "first"))
+    daemon._execute(_work({"kind": "echo"}, "retry"))
+    assert order == [("authorize", "first"), ("handler", 1), ("authorize", "retry")]
+    assert [call[1] for call in store.calls if call[0] == "complete"] == ["first"]
+
+
+@pytest.mark.parametrize("delay", [1.0, 2.0])
+def test_cto_delayed_start_permission_cannot_launch_after_lease_budget(monkeypatch, delay):
+    clock = [100.0]
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    work = replace(_work({"kind": "echo"}), start_deadline=101.0)
+    store = ScriptedStore([])
+    handlers = []
+
+    def authorize(work):
+        clock[0] += delay
+        return True
+
+    store.authorize_start = authorize
+    WorkerDaemon(store, {"echo": lambda *args: handlers.append(args)})._execute(work)
+    assert handlers == []
+    assert store.calls == []
+
+
+def test_cto_start_budget_rechecked_at_actual_handler_boundary(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    work = replace(_work({"kind": "echo"}), start_deadline=101.0)
+    store = ScriptedStore([])
+    handlers = []
+
+    class DelayedHandlers(dict):
+        def get(self, key):
+            clock[0] = 102.0
+            return lambda *args: handlers.append(args)
+
+    daemon = WorkerDaemon(store, {})
+    daemon._handlers = DelayedHandlers()
+    daemon._execute(work)
+    assert handlers == []
+    assert store.calls == []
+
+
+def test_cto_initial_heartbeat_keeps_budget_consumed_by_authorization(monkeypatch):
+    import threading
+
+    clock = [100.9]
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    work = replace(_work({}), start_deadline=101.0)
+    store = ScriptedStore([])
+    lost = threading.Event()
+    waits = []
+
+    class Stop:
+        def wait(self, interval):
+            waits.append(interval)
+            clock[0] += interval
+            return False
+
+    WorkerDaemon(store, {}, WorkerConfig(visibility_seconds=3))._heartbeat_loop(work, lost, Stop())
+    assert lost.is_set()
+    assert waits == [pytest.approx(0.1)]
+    assert store.calls == []
 
 
 def test_a_claimed_item_is_dispatched_and_completed() -> None:
@@ -349,11 +458,18 @@ class _FileLeaseStore:
             visible_until="bounded-by-test-clock",
             payload={"kind": "long"},
             claim_token=f"token-{attempt_no}",
+            start_deadline=now + float(visibility_seconds),
         )
 
     def heartbeat(self, work):
         self._publish(self.root / "lease", str(time.monotonic() + 1.0))
         return True
+
+    def authorize_start(self, work):
+        return (
+            (self.root / "claimed").read_text() == work.attempt_id
+            and float((self.root / "lease").read_text()) > time.monotonic()
+        )
 
     def _publish(self, path, text):
         # Atomic rename: a SIGKILL landing mid-write must never leave an
@@ -573,6 +689,77 @@ def test_persistent_heartbeat_errors_stop_the_work() -> None:
     daemon = WorkerDaemon(store, {"slow": slow}, WorkerConfig(visibility_seconds=3))
     _run_until_idle(daemon, store)
     assert not any(c[0] == "complete" for c in store.calls)
+
+
+@pytest.mark.parametrize("heartbeat_ok", [False, True])
+def test_slow_heartbeat_exhausts_the_visibility_window(monkeypatch, heartbeat_ok):
+    """Database call time consumes the lease even when only one beat ran."""
+    import threading
+
+    from command_center.worker import daemon as daemon_module
+
+    clock = [0.0]
+    monkeypatch.setattr(daemon_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(daemon_module.sdnotify, "watchdog_interval_seconds", lambda: None)
+    store = ScriptedStore([])
+
+    def slow_heartbeat(work):
+        clock[0] += 3.0
+        if not heartbeat_ok:
+            raise ConnectionError("slow database timeout")
+        return True
+
+    store.heartbeat = slow_heartbeat
+    lease_lost = threading.Event()
+
+    class OneBeat:
+        def wait(self, interval):
+            if clock[0] > 0:
+                return True
+            clock[0] += interval
+            return False
+
+    daemon = WorkerDaemon(store, {}, WorkerConfig(visibility_seconds=3))
+    daemon._heartbeat_loop(_work({}), lease_lost, OneBeat())
+
+    assert lease_lost.is_set(), "slow heartbeat left the handler running past expiry"
+
+
+def test_successful_heartbeat_rearms_recovery_without_forgetting_call_latency(monkeypatch):
+    import threading
+
+    from command_center.worker import daemon as daemon_module
+
+    clock = [0.0]
+    waits = []
+    monkeypatch.setattr(daemon_module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(daemon_module.sdnotify, "watchdog_interval_seconds", lambda: None)
+    store = ScriptedStore([])
+
+    def heartbeat(work):
+        store.calls.append(("heartbeat", work.attempt_id))
+        clock[0] += 0.25
+        if len(store.calls) == 2:
+            return True
+        raise ConnectionError("temporary database failure")
+
+    store.heartbeat = heartbeat
+    lease_lost = threading.Event()
+
+    class BeatStop:
+        def wait(self, interval):
+            waits.append(interval)
+            if len(waits) > 5:
+                return True
+            clock[0] += interval
+            return False
+
+    daemon = WorkerDaemon(store, {}, WorkerConfig(visibility_seconds=3))
+    daemon._heartbeat_loop(_work({}), lease_lost, BeatStop())
+
+    assert lease_lost.is_set()
+    assert len(store.calls) == 4, "recovery must renew the deadline after a successful beat"
+    assert waits == [1.0, 1.0, 1.0, 1.0, 0.25]
 
 
 # -- the systemd watchdog seam (SRV-06) --------------------------------------

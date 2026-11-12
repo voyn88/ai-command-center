@@ -128,6 +128,11 @@ ALL_TABLES: tuple[str, ...] = (
     "backlog_scan_cursor",
     "backlog_writer_lease",
     "coordinator_state",
+    "cto_control",
+    "cto_assignment",
+    "cto_work_binding",
+    "cto_execution_start",
+    "cto_assignment_event",
     "completion",
     "completion_event",
     "completion_validation",
@@ -136,6 +141,13 @@ ALL_TABLES: tuple[str, ...] = (
     "council_decision",
     "council_event",
     "council_vote",
+    "delivery_team_corrective_assignment",
+    "delivery_team_corrective_check",
+    "delivery_team_acceptance_check",
+    "delivery_team_incident",
+    "delivery_team_stage",
+    "delivery_team_evidence",
+    "delivery_team_release_receipt",
     "digest_item",
     "enrollment_ticket",
     "market_install_log",
@@ -194,11 +206,14 @@ ALL_VIEWS: tuple[str, ...] = (
 # the sequence in addition to INSERT on the table.
 IDENTITY_SEQUENCES: MappingProxyType[str, str] = MappingProxyType(
     {
+        "delivery_team_evidence": "delivery_team_evidence_evidence_id_seq",
+        "delivery_team_release_receipt": "delivery_team_release_receipt_receipt_id_seq",
         "backlog_event": "backlog_event_event_id_seq",
         "backlog_evidence": "backlog_evidence_evidence_id_seq",
         "completion_event": "completion_event_id_seq",
         "completion_validation": "completion_validation_id_seq",
         "council_event": "council_event_id_seq",
+        "cto_assignment_event": "cto_assignment_event_event_id_seq",
         "model_event": "model_event_id_seq",
         "principal_event": "principal_event_id_seq",
         "proposal_event": "proposal_event_id_seq",
@@ -311,6 +326,20 @@ _MONITOR_FINDING_TABLES: dict[str, frozenset[str]] = {
 # test_worker_can_call_backlog_resume_deferred_without_grants /
 # test_worker_cannot_call_backlog_resume_deferred_when_grants_are_applied).
 _APP_BACKLOG_TABLES: dict[str, frozenset[str]] = {
+    # Native delivery-team authority: app reads, functions own all writes.
+    "delivery_team_corrective_assignment": _READ,
+    "delivery_team_corrective_check": _READ,
+    "delivery_team_acceptance_check": _READ,
+    "delivery_team_incident": _READ,
+    "delivery_team_stage": _READ,
+    "delivery_team_evidence": _READ,
+    "delivery_team_release_receipt": _READ,
+
+    "cto_control": _READ,
+    "cto_assignment": _READ,
+    "cto_work_binding": _READ,
+    "cto_execution_start": _READ,
+    "cto_assignment_event": _READ,
     "backlog_task": _READ,
     "backlog_dependency": _READ,
     "backlog_evidence": _READ,
@@ -323,6 +352,19 @@ _APP_BACKLOG_TABLES: dict[str, frozenset[str]] = {
 }
 
 _WORKER_BACKLOG_TABLES: dict[str, frozenset[str]] = {
+    "delivery_team_corrective_assignment": _NONE,
+    "delivery_team_corrective_check": _NONE,
+    "delivery_team_acceptance_check": _NONE,
+    "delivery_team_incident": _NONE,
+    "delivery_team_stage": _NONE,
+    "delivery_team_evidence": _NONE,
+    "delivery_team_release_receipt": _NONE,
+
+    "cto_control": _NONE,
+    "cto_assignment": _NONE,
+    "cto_work_binding": _NONE,
+    "cto_execution_start": _NONE,
+    "cto_assignment_event": _NONE,
     "backlog_task": _NONE,
     "backlog_dependency": _NONE,
     "backlog_evidence": _NONE,
@@ -543,6 +585,7 @@ VIEW_PRIVILEGES: MappingProxyType[str, MappingProxyType[str, frozenset[str]]] = 
 # `GRANT EXECUTE ON FUNCTION queue_claim` would be ambiguous the moment an
 # overload appeared.
 _WORKER_FUNCTIONS = (
+    "cto_authorize_start(text, text)",
     "queue_claim(text, text, integer)",
     "queue_heartbeat(text, text)",
     "queue_complete(text, text, jsonb)",
@@ -614,6 +657,15 @@ _APP_BACKLOG_FUNCTIONS = (
     "backlog_record_provenance(text, text, jsonb)",
     "backlog_owner_decision(text, bigint, text, text)",
     "backlog_owner_lock(text)",
+    "delivery_team_sync(integer, jsonb)",
+    "delivery_team_candidates(integer, jsonb)",
+    "delivery_team_dispatch(text, bigint, text, text, jsonb, integer)",
+    "delivery_team_ingest(integer)",
+    "delivery_team_stage_current(text, bigint, text)",
+    "delivery_team_ready(text, bigint)",
+    "delivery_team_accepted(text, bigint)",
+    "delivery_team_retry(text, bigint, text, text)",
+    "delivery_team_record_incident(text, bigint, text, text, text, text, text, jsonb)",
     # Coordination v2 (0031): durable snapshot/in-flight CAS; no DML path.
     "coordinator_state_read(text)",
     "coordinator_enqueue(text, text, text, text, text, jsonb)",
@@ -654,6 +706,9 @@ _APP_ENROLMENT_FUNCTIONS = (
 # readmitting a retired host (through a `re_enroll` mint, gated inside the
 # function on the caller's tier) and revoking one.
 _OPERATOR_FUNCTIONS = (
+    "cto_assign(text, bigint, text, jsonb, text)",
+    "cto_revoke(text, text)",
+    "cto_activate(text)",
     "enroll_mint_ticket(text, text, text, inet, interval, text)",
     "enroll_revoke_ticket(text, text)",
     "enroll_sweep_expired()",
@@ -669,7 +724,13 @@ FUNCTION_PRIVILEGES: MappingProxyType[str, tuple[str, ...]] = MappingProxyType(
         # is silent in each task's own suite.
         APP_ROLE: _APP_FUNCTIONS + _APP_ENROLMENT_FUNCTIONS + _APP_BACKLOG_FUNCTIONS,
         WORKER_ROLE: _WORKER_FUNCTIONS + _WORKER_ENROLMENT_FUNCTIONS,
-        OPERATOR_ROLE: _OPERATOR_FUNCTIONS,
+        OPERATOR_ROLE: _OPERATOR_FUNCTIONS + (
+            "delivery_team_assign_correction(text, bigint, text, jsonb, text)",
+            "delivery_team_record_corrective_check(text, bigint, text, text, bigint, text, text, text, text, timestamptz)",
+            "delivery_team_release_scope(text, bigint)",
+            "delivery_team_record_acceptance(text, bigint, text, text, text, text, timestamptz)",
+            "delivery_team_record_release(text, bigint, text, text, jsonb, text)",
+        ),
     }
 )
 
@@ -726,7 +787,14 @@ PRIVILEGES: MappingProxyType[str, MappingProxyType[str, frozenset[str]]] = (
             # folding the default in would hand the admission lever DML on every
             # domain table in the schema.
             OPERATOR_ROLE: MappingProxyType(
-                merge_privileges(_OPERATOR_ENROLMENT_TABLES, _FINALIZATION_CLAIM_TABLES)
+                merge_privileges(
+                    _OPERATOR_ENROLMENT_TABLES,
+                    _FINALIZATION_CLAIM_TABLES,
+                    {name: _READ for name in (
+                        "cto_control", "cto_assignment", "cto_work_binding",
+                        "cto_execution_start", "cto_assignment_event",
+                    )},
+                )
             ),
         }
     )

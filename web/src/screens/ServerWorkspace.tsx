@@ -5,6 +5,7 @@ import GlassPanel from '../components/GlassPanel'
 import KpiCard from '../components/KpiCard'
 import NavItem from '../components/NavItem'
 import OwnerTaskActions from '../components/OwnerTaskActions'
+import DeliveryTeamPanel from '../components/DeliveryTeamPanel'
 import TechDetails from '../components/TechDetails'
 import { HomeIcon, TasksIcon, ExecutionIcon } from '../components/NavIcons'
 import { fetchBacklog, statusName } from '../lib/backlogApi'
@@ -16,8 +17,8 @@ import '../theme/serverWorkspace.css'
 // Server mode is Russian regardless of the saved UI language.
 const tRu = i18n.getFixedT('ru')
 
-type Screen = 'home' | 'tasks' | 'execution'
-const initialScreen = (): Screen => window.location.hash === '#tasks' || window.location.search.includes('master_backlog') ? 'tasks' : window.location.hash === '#execution' ? 'execution' : 'home'
+type Screen = 'home' | 'tasks' | 'execution' | 'team'
+const initialScreen = (): Screen => window.location.hash === '#team' ? 'team' : window.location.hash === '#tasks' || window.location.search.includes('master_backlog') ? 'tasks' : window.location.hash === '#execution' ? 'execution' : 'home'
 const idleDays = (task: BacklogTask) => stalledDays(task.status, task.updated_at)
 const isStalled = (task: BacklogTask) => idleDays(task) !== null
 const STALLED = 'STALLED'
@@ -105,12 +106,14 @@ export default function ServerWorkspace() {
       <NavItem label="Обзор" icon={<HomeIcon />} active={screen === 'home'} onClick={() => navigate('home')} />
       <NavItem label="Задачи" icon={<TasksIcon />} active={screen === 'tasks'} onClick={() => navigate('tasks')} />
       <NavItem label="В работе" icon={<ExecutionIcon />} active={screen === 'execution'} onClick={() => navigate('execution')} />
+      <NavItem label="Команда" icon={<ExecutionIcon />} active={screen === 'team'} onClick={() => navigate('team')} />
     </nav>
     <main tabIndex={-1}>
-      {error && <div role="alert" className="owner-notice">{data ? RU.errorWithData : RU.errorNoData}<button className="owner-button" onClick={retry}>{RU.retry}</button></div>}
-      {data?.stale && <div role="alert" className="owner-notice">Список давно не обновлялся. Статусы могут быть неактуальны.</div>}
-      {!data && !error && <div role="status" aria-label={RU.loadingTasks}><p className="owner-muted">{RU.loadingTasks}</p><div className="owner-skeleton" /><div className="owner-skeleton" /><div className="owner-skeleton" /></div>}
-      {data && <>
+      {screen === 'team' && <DeliveryTeamPanel refresh={refresh} />}
+      {screen !== 'team' && error && <div role="alert" className="owner-notice">{data ? RU.errorWithData : RU.errorNoData}<button className="owner-button" onClick={retry}>{RU.retry}</button></div>}
+      {screen !== 'team' && data?.stale && <div role="alert" className="owner-notice">Список давно не обновлялся. Статусы могут быть неактуальны.</div>}
+      {screen !== 'team' && !data && !error && <div role="status" aria-label={RU.loadingTasks}><p className="owner-muted">{RU.loadingTasks}</p><div className="owner-skeleton" /><div className="owner-skeleton" /><div className="owner-skeleton" /></div>}
+      {screen !== 'team' && data && <>
         <div className="owner-page-heading"><h1>{screen === 'home' ? 'Обзор разработки' : screen === 'tasks' ? 'Задачи' : 'В работе и на проверке'}</h1><p>Обновлено {displayDate(data.updated_at)} · {data.commands_enabled ? 'Действия доступны в карточках' : 'Только просмотр'}</p></div>
         {screen === 'home' ? <>
           <GlassPanel title={RU.ownerWaitingTitle}>

@@ -69,6 +69,97 @@ class Exclusion:
 # ---------------------------------------------------------------------------
 
 UNMIRRORED_SCHEMA_TABLES: dict[str, Exclusion] = {
+    # CTO-AICC-ENFORCEMENT-01 delegates this PostgreSQL-native authority
+    # within the existing VOYN-W0-AICC-DELIVERY-TEAM work package.
+    "cto_control": Exclusion(
+        reason=(
+            "The activation latch is PostgreSQL-native authorization state; no SQLite "
+            "authority exists. Restore the same recovery point as assignments and queue "
+            "attempts; never reset activation to bypass enforcement. "
+        ),
+        task="VOYN-W0-AICC-DELIVERY-TEAM",
+    ),
+    "cto_assignment": Exclusion(
+        reason=(
+            "Operator-issued exact task/revision/principal/payload authority is "
+            "PostgreSQL-native and has no SQLite source. Recover assignments and "
+            "revocations together with canonical tasks, principals and queue bindings. "
+        ),
+        task="VOYN-W0-AICC-DELIVERY-TEAM",
+    ),
+    "cto_work_binding": Exclusion(
+        reason=(
+            "The one-assignment/one-work binding is atomic PostgreSQL queue authority, "
+            "not a SQLite projection. Restore it with assignments and work_item; "
+            "reconstructing it could replay an approved execution. "
+        ),
+        task="VOYN-W0-AICC-DELIVERY-TEAM",
+    ),
+    "cto_execution_start": Exclusion(
+        reason=(
+            "Committed start decisions and exact legacy-drain attempt identities exist "
+            "only in PostgreSQL. Restore with the fenced work attempts and activation "
+            "latch; a host-local mirror cannot preserve their authorization semantics. "
+        ),
+        task="VOYN-W0-AICC-DELIVERY-TEAM",
+    ),
+    "cto_assignment_event": Exclusion(
+        reason=(
+            "The append-only CTO decision audit is PostgreSQL-native with no SQLite "
+            "source. Retain it in the same backup/recovery point as assignment state and "
+            "preserve server-log denial retention separately; exclusion is not permission "
+            "to discard audit. "
+        ),
+        task="VOYN-W0-AICC-DELIVERY-TEAM",
+    ),
+    "delivery_team_corrective_assignment": Exclusion(
+        reason=("PostgreSQL-native operator corrective authority has no SQLite source; "
+                "restore it with canonical remediation lineage and incident evidence."),
+        task="VOYN-W0-AICC-DELIVERY-TEAM",
+    ),
+    "delivery_team_corrective_check": Exclusion(
+        reason=("PostgreSQL-native operator corrective authority has no SQLite source; "
+                "restore it with canonical remediation lineage and incident evidence."),
+        task="VOYN-W0-AICC-DELIVERY-TEAM",
+    ),
+    "delivery_team_acceptance_check": Exclusion(
+        reason=("PostgreSQL-native operator acceptance evidence has no SQLite source; "
+                "restore it together with its immutable release receipt and canonical task."),
+        task="VOYN-W0-AICC-DELIVERY-TEAM",
+    ),
+    "delivery_team_incident": Exclusion(
+        reason=(
+            "PostgreSQL-native append-only incident authority from migration 0035: "
+            "no SQLite database owns these records; recover them consistently "
+            "with canonical backlog tasks and delivery-team evidence."
+        ),
+        task="VOYN-W0-AICC-DELIVERY-TEAM",
+    ),
+    "delivery_team_stage": Exclusion(
+        reason=(
+            "PostgreSQL-native delivery-team authority from birth (0035): "
+            "stage gates and append-only evidence have no SQLite source to "
+            "mirror; recover consistently with backlog and fenced work queue."
+        ),
+        task="VOYN-W0-AICC-DELIVERY-TEAM",
+    ),
+    "delivery_team_evidence": Exclusion(
+        reason=(
+            "PostgreSQL-native delivery-team authority from birth (0035): "
+            "stage gates and append-only evidence have no SQLite source to "
+            "mirror; recover consistently with backlog and fenced work queue."
+        ),
+        task="VOYN-W0-AICC-DELIVERY-TEAM",
+    ),
+    "delivery_team_release_receipt": Exclusion(
+        reason=(
+            "PostgreSQL-native delivery-team authority from birth (0035): "
+            "stage gates and append-only evidence have no SQLite source to "
+            "mirror; recover consistently with backlog and fenced work queue."
+        ),
+        task="VOYN-W0-AICC-DELIVERY-TEAM",
+    ),
+
     "coordinator_state": Exclusion(
         reason=(
             "PostgreSQL-native durable control-plane authority from birth (0032): "

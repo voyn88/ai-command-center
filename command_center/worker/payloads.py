@@ -88,6 +88,9 @@ class AgentRunRequest:
     #: handler); absent keeps the historical behaviour byte-for-byte.
     review_head_pr_number: str | None = None
     review_head_sha: str | None = None
+    #: Native delivery-team review identity; never a mutating backlog run.
+    delivery_team: dict[str, Any] | None = None
+    delivery_team_source_sha: str | None = None
 
 
 def _string(payload: dict[str, Any], key: str) -> str | None:
@@ -217,6 +220,34 @@ def parse_agent_run(payload: dict[str, Any]) -> AgentRunRequest | PayloadError:
         review_head_pr_number = pr_number
         review_head_sha = head_sha
 
+    delivery_team = payload.get("delivery_team")
+    if delivery_team is not None:
+        from command_center.orchestrator.delivery_team import (
+            TeamResultError,
+            validate_role_request,
+        )
+
+        try:
+            delivery_team = validate_role_request(delivery_team)
+        except (TeamResultError, TypeError) as exc:
+            return PayloadError(reason=f"invalid delivery_team: {exc}")
+        if task_type != "review" or backlog_task_id is not None:
+            return PayloadError(reason="delivery_team requires a separate read-only review")
+        if not cascade or any(
+            link.get("executor") not in {"claude", "codex"}
+            or link.get("task_type") != "review"
+            for link in cascade
+        ):
+            return PayloadError(reason="delivery_team requires a subscription read-only cascade")
+
+    team_source_sha = payload.get("delivery_team_source_sha")
+    post_code = delivery_team is not None and delivery_team["stage"] in {"independent_reviewer", "devops", "production_qa"}
+    if post_code or team_source_sha is not None:
+        if not post_code or not isinstance(team_source_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", team_source_sha):
+            return PayloadError(reason="post-code delivery team requires immutable source SHA")
+        if review_head is not None:
+            return PayloadError(reason="delivery team commit pin cannot replace PR currency pin")
+
     return AgentRunRequest(
         project_id=project_id,
         repository_path=repository_path,
@@ -230,4 +261,6 @@ def parse_agent_run(payload: dict[str, Any]) -> AgentRunRequest | PayloadError:
         backlog_task_id=backlog_task_id,
         review_head_pr_number=review_head_pr_number,
         review_head_sha=review_head_sha,
+        delivery_team=delivery_team,
+        delivery_team_source_sha=team_source_sha,
     )

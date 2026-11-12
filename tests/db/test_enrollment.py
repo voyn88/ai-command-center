@@ -1142,6 +1142,13 @@ def test_the_operator_role_holds_no_dml_on_any_domain_table() -> None:
         "principal_credential",
         "enrollment_ticket",
         "worker_host_fingerprint",
+        # CTO authority is observable by the operator; all mutations still
+        # require its SECURITY DEFINER APIs, never direct table DML.
+        "cto_control",
+        "cto_assignment",
+        "cto_work_binding",
+        "cto_execution_start",
+        "cto_assignment_event",
         # Explicit zero-grant declaration for the reserved finalization
         # fencing table.  Presence in the matrix is not access: the empty
         # privilege set proves the operator cannot read or mutate it.
