@@ -1,0 +1,11 @@
+[Unit]
+Description=Publish the VOYN host status every 10 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=10min
+AccuracySec=30s
+Persistent=false
+
+[Install]
+WantedBy=timers.target
