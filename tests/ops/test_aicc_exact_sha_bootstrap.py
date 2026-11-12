@@ -491,7 +491,9 @@ def test_installer_failure_leaves_no_completed_marker(tmp_path, monkeypatch):
             attempt_id=attempt_id,
         ),
     )
-    monkeypatch.setattr(module, "_prepare_authority_file", lambda path: None)
+    monkeypatch.setattr(
+        module, "_prepare_authority_file", lambda path, profile="worker": None
+    )
     monkeypatch.setattr(module, "_run", fake_run)
     monkeypatch.setattr(module.os, "geteuid", lambda: 0)
     monkeypatch.setattr(module.os, "chown", lambda *a: None)
@@ -632,3 +634,63 @@ def test_planted_attempts_symlink_cannot_redirect_the_bootstrap(tmp_path, monkey
 
     assert (state / "attempts").is_symlink(), "the link must not have been replaced"
     assert not any(elsewhere.iterdir()), "nothing may be created through the link"
+
+
+def _authority_fixture(monkeypatch, *, gid, groups, members=(), primary=()):
+    module = _module()
+    monkeypatch.setattr(module, "_require_root_owned_directory_chain", lambda *a, **k: None)
+    monkeypatch.setattr(
+        module.grp,
+        "getgrnam",
+        lambda name: (
+            SimpleNamespace(gr_gid=groups[name], gr_mem=list(members))
+            if name in groups
+            else (_ for _ in ()).throw(KeyError(name))
+        ),
+    )
+    monkeypatch.setattr(
+        module.pwd,
+        "getpwall",
+        lambda: [SimpleNamespace(pw_gid=g) for g in primary],
+    )
+    info = SimpleNamespace(
+        st_mode=stat.S_IFREG | 0o640, st_nlink=1, st_uid=0, st_gid=gid
+    )
+    path = SimpleNamespace(
+        parent=Path("/etc/aicc"), exists=lambda: True, lstat=lambda: info
+    )
+    return module, path
+
+
+_GROUPS = {"aicc-publisher": 200, "aicc-control-authority": 300}
+
+
+def test_control_reinstall_accepts_file_owned_by_clean_control_group(monkeypatch):
+    module, path = _authority_fixture(monkeypatch, gid=300, groups=_GROUPS)
+    module._prepare_authority_file(path, "control")
+
+
+def test_control_reinstall_refuses_any_other_group(monkeypatch):
+    module, path = _authority_fixture(monkeypatch, gid=999, groups=_GROUPS)
+    with pytest.raises(module.BootstrapRefused):
+        module._prepare_authority_file(path, "control")
+
+
+def test_control_group_with_members_or_publisher_gid_is_refused(monkeypatch):
+    module, path = _authority_fixture(
+        monkeypatch, gid=300, groups=_GROUPS, members=("someone",)
+    )
+    with pytest.raises(module.BootstrapRefused):
+        module._prepare_authority_file(path, "control")
+    module, path = _authority_fixture(monkeypatch, gid=300, groups=_GROUPS, primary=(300,))
+    with pytest.raises(module.BootstrapRefused):
+        module._prepare_authority_file(path, "control")
+    same = {"aicc-publisher": 300, "aicc-control-authority": 300}
+    module, _ = _authority_fixture(monkeypatch, gid=300, groups=same)
+    assert module._control_authority_gid() is None
+
+
+def test_worker_profile_never_accepts_the_control_group(monkeypatch):
+    module, path = _authority_fixture(monkeypatch, gid=300, groups=_GROUPS)
+    with pytest.raises(module.BootstrapRefused):
+        module._prepare_authority_file(path)

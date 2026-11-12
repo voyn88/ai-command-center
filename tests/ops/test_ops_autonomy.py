@@ -770,7 +770,6 @@ def _fake_host(tmp_path: Path) -> dict[str, str]:
     return {
         **os.environ,
         "AICC_RELEASE_DIR": str(release),
-        "AICC_APP_DIR": str(ROOT),
         "AICC_VENV_PYTHON": sys.executable,
         "AICC_OPS_SETTINGS": str(tmp_path / "etc" / "ops-autonomy.env"),
         "AICC_OPS_STATE_DIR": str(tmp_path / "state"),
@@ -1522,3 +1521,57 @@ def test_the_state_and_log_directories_are_readable_by_the_unprivileged_beacon(
         mode = (tmp_path / name).stat().st_mode & 0o777
         assert mode == 0o755, (name, oct(mode))
         assert (tmp_path / name / "beacon").is_dir()
+
+
+def _releases_layout(tmp_path: Path) -> dict[str, str]:
+    """The real fleet layout: current -> releases/<sha>, .venv -> runtime-venv."""
+    env = _fake_host(tmp_path)
+    base = tmp_path / "opt-aicc"
+    sha_dir = base / "releases" / ("a" * 40)
+    sha_dir.parent.mkdir(parents=True)
+    __import__("shutil").copytree(env["AICC_RELEASE_DIR"], sha_dir)
+    (sha_dir / "command_center").symlink_to(ROOT / "command_center")
+    runtime = base / "runtime-venv"
+    (runtime / "bin").mkdir(parents=True)
+    (runtime / "bin" / "python").symlink_to(sys.executable)
+    (sha_dir / ".venv").symlink_to(runtime)
+    (base / "current").symlink_to(sha_dir)
+    env.pop("PYTHONPATH")
+    env.pop("AICC_VENV_PYTHON")
+    env["AICC_RELEASE_DIR"] = str(base / "current")
+    return env
+
+
+def test_installer_uses_the_release_venv_and_imports_from_the_release(tmp_path):
+    env = _releases_layout(tmp_path)
+    (tmp_path / "units").mkdir()
+    done = _run_installer(env, "--role", "control")
+    assert done.returncode == 0, done.stdout + done.stderr
+    # an overridden layout is written into a drop-in per unit
+    current = env["AICC_RELEASE_DIR"]
+    for unit, module in (
+        ("voyn-ops-disk-guard", "disk_guard"),
+        ("voyn-ops-beacon", "status_beacon"),
+        ("voyn-ops-self-heal", "self_heal"),
+    ):
+        text = (tmp_path / "units" / f"{unit}.service.d" / "layout.conf").read_text()
+        assert f"WorkingDirectory={current}\n" in text
+        assert f"ExecStart={current}/.venv/bin/python -m command_center.ops.{module}" in text
+    assert _run_installer(env, "--uninstall").returncode == 0
+    assert not list((tmp_path / "units").glob("*.service.d"))
+
+
+def test_installer_stops_when_the_release_has_no_interpreter(tmp_path):
+    env = _releases_layout(tmp_path)
+    (Path(env["AICC_RELEASE_DIR"]) / ".venv").unlink()
+    done = _run_installer(env, "--role", "worker")
+    assert done.returncode != 0
+    assert "no interpreter" in done.stderr
+
+
+def test_shipped_units_name_the_release_layout_not_a_separate_venv():
+    for unit in ("disk-guard", "beacon", "self-heal"):
+        text = (ROOT / f"deploy/systemd/voyn-ops-{unit}.service").read_text()
+        assert "WorkingDirectory=/opt/aicc/current\n" in text
+        assert "ExecStart=/opt/aicc/current/.venv/bin/python -m " in text
+        assert "/opt/aicc/.venv" not in text

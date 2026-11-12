@@ -21,12 +21,17 @@
 #      files of the same name are saved first), writes the disk guard's
 #      sandbox drop-in from the settings, enables the timers;
 #   4. changes nothing else: no package, no firewall, no user, no secret.
+# Layout: units run in /opt/aicc/current (-> releases/<sha>) with its .venv;
+# AICC_RELEASE_DIR / AICC_VENV_PYTHON override both (written as unit drop-ins).
 # Rollback: --uninstall removes exactly what install added.
 set -euo pipefail
 
-RELEASE_DIR="${AICC_RELEASE_DIR:-/opt/aicc/current}"
-APP_DIR="${AICC_APP_DIR:-/opt/aicc}"
-VENV_PY="${AICC_VENV_PYTHON:-$APP_DIR/.venv/bin/python}"
+# Layout of a fleet host: /opt/aicc/current -> releases/<sha>, and the
+# interpreter is the release's own .venv (on a worker that is a link to the
+# runtime venv).  There is no /opt/aicc/.venv.  Both are overridable.
+DEFAULT_RELEASE_DIR=/opt/aicc/current
+RELEASE_DIR="${AICC_RELEASE_DIR:-$DEFAULT_RELEASE_DIR}"
+VENV_PY="${AICC_VENV_PYTHON:-$RELEASE_DIR/.venv/bin/python}"
 SETTINGS="${AICC_OPS_SETTINGS:-/etc/aicc/ops-autonomy.env}"
 STATE_DIR="${AICC_OPS_STATE_DIR:-/var/lib/voyn-ops}"
 LOG_DIR="${AICC_OPS_LOG_DIR:-/var/log/voyn-ops}"
@@ -127,7 +132,7 @@ root_only_writable() { # PATH -> ok only if owned by root and not writable by gr
 preflight() {
   # these run as root from systemd: whoever can write there controls root
   local p
-  for p in "$RELEASE_DIR" "$APP_DIR/.venv" "$VENV_PY"; do
+  for p in "$RELEASE_DIR" "$RELEASE_DIR/.venv" "$VENV_PY"; do
     [ -e "$p" ] || continue
     root_only_writable "$p" || die "$p must be owned by root and not writable by group or others before root timers may run code from it"
   done
@@ -137,7 +142,7 @@ preflight() {
     [ -f "$RELEASE_DIR/deploy/systemd/$u.service" ] && [ -f "$RELEASE_DIR/deploy/systemd/$u.timer" ] \
       || die "release $RELEASE_DIR has no $u unit files yet: wait until this host has deployed the release that contains them, then run this again"
   done
-  (cd "$APP_DIR" && "$VENV_PY" - <<'PY') || die "the deployed release does not import the self-care modules"
+  (cd "$RELEASE_DIR" && "$VENV_PY" - <<'PY') || die "the deployed release does not import the self-care modules"
 import command_center.ops.disk_guard
 import command_center.ops.status_beacon
 import command_center.ops.self_heal
@@ -196,6 +201,32 @@ write_disk_guard_dropin() {
     echo "# written by install-ops-autonomy.sh from $SETTINGS"
     [ -z "$paths" ] || echo "ReadWritePaths=${paths# }"
   } >"$dir/paths.conf"
+}
+
+write_layout_dropins() {
+  # The shipped units name /opt/aicc/current and its .venv.  A host (or a
+  # test) that overrides either gets the same paths written into a drop-in.
+  local u dir mod
+  for u in "${UNITS[@]}"; do
+    dir="$UNIT_DIR/$u.service.d"
+    case "$u" in
+      voyn-ops-disk-guard) mod=disk_guard ;;
+      voyn-ops-beacon) mod=status_beacon ;;
+      *) mod=self_heal ;;
+    esac
+    if [ "$RELEASE_DIR" = "$DEFAULT_RELEASE_DIR" ] && [ "$VENV_PY" = "$DEFAULT_RELEASE_DIR/.venv/bin/python" ]; then
+      rm -f "$dir/layout.conf"
+      continue
+    fi
+    mkdir -p "$dir"
+    {
+      echo "[Service]"
+      echo "# written by install-ops-autonomy.sh: this host's release layout"
+      echo "WorkingDirectory=$RELEASE_DIR"
+      echo "ExecStart="
+      echo "ExecStart=$VENV_PY -m command_center.ops.$mod"
+    } >"$dir/layout.conf"
+  done
 }
 
 prepare_beacon_account() {
@@ -258,6 +289,7 @@ install_all() {
     done
   done
   write_disk_guard_dropin
+  write_layout_dropins
   "$SYSTEMCTL" daemon-reload
   for u in "${UNITS[@]}"; do
     "$SYSTEMCTL" enable --now "$u.timer"
@@ -320,7 +352,7 @@ uninstall_all() {
     "$SYSTEMCTL" disable --now "$u.timer" 2>/dev/null || true
     rm -f "$UNIT_DIR/$u.timer" "$UNIT_DIR/$u.service"
   done
-  rm -rf "$UNIT_DIR/voyn-ops-disk-guard.service.d" "$UNIT_DIR/voyn-ops-beacon.service.d"
+  rm -rf "$UNIT_DIR/voyn-ops-disk-guard.service.d" "$UNIT_DIR/voyn-ops-beacon.service.d" "$UNIT_DIR/voyn-ops-self-heal.service.d"
   if [ -f "$JOURNALD_DIR/voyn-ops.conf" ]; then
     rm -f "$JOURNALD_DIR/voyn-ops.conf"
     "$SYSTEMCTL" restart systemd-journald

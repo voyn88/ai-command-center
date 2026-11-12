@@ -18,13 +18,13 @@ Type=oneshot
 User=aicc-worker
 Group=aicc-worker
 SupplementaryGroups=systemd-journal
-WorkingDirectory=/opt/aicc
+WorkingDirectory=/opt/aicc/current
 UMask=0022
 Environment=GH_CONFIG_DIR=/var/lib/aicc/github/gh
 Environment=OPS_LOG_DIR=/var/log/voyn-ops/beacon
 Environment=OPS_STATE_DIR=/var/lib/voyn-ops/beacon
 Environment=OPS_HEAL_STATE_DIR=/var/lib/voyn-ops
-ExecStart=/opt/aicc/.venv/bin/python -m command_center.ops.status_beacon
+ExecStart=/opt/aicc/current/.venv/bin/python -m command_center.ops.status_beacon
 TimeoutStartSec=3min
 Nice=10
 

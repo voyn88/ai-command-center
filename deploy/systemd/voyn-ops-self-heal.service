@@ -8,8 +8,8 @@ After=local-fs.target
 [Service]
 Type=oneshot
 User=root
-WorkingDirectory=/opt/aicc
-ExecStart=/opt/aicc/.venv/bin/python -m command_center.ops.self_heal
+WorkingDirectory=/opt/aicc/current
+ExecStart=/opt/aicc/current/.venv/bin/python -m command_center.ops.self_heal
 TimeoutStartSec=3min
 Nice=5
 

@@ -16,6 +16,7 @@ import grp
 import hashlib
 import json
 import os
+import pwd
 import re
 import secrets
 import stat
@@ -495,7 +496,33 @@ def _authority_file_is_safe(info: os.stat_result, allowed_gids: set[int]) -> boo
     )
 
 
-def _prepare_authority_file(path: Path) -> None:
+CONTROL_AUTHORITY_GROUP = "aicc-control-authority"
+
+
+def _control_authority_gid() -> int | None:
+    """gid of the control profile's own authority group, only if it is clean.
+
+    Mirrors what ``validate-control-authority`` requires of that group: it
+    exists, is not the publisher gid, and has no supplementary or primary
+    members.  Anything else returns None, so the file is refused as before.
+    """
+    try:
+        control = grp.getgrnam(CONTROL_AUTHORITY_GROUP)
+    except KeyError:
+        return None
+    try:
+        if grp.getgrnam("aicc-publisher").gr_gid == control.gr_gid:
+            return None
+    except KeyError:
+        pass
+    if control.gr_mem:
+        return None
+    if any(account.pw_gid == control.gr_gid for account in pwd.getpwall()):
+        return None
+    return control.gr_gid
+
+
+def _prepare_authority_file(path: Path, profile: str = "worker") -> None:
     _require_root_owned_directory_chain(path.parent, create=True)
     if path.exists():
         info = path.lstat()
@@ -504,6 +531,12 @@ def _prepare_authority_file(path: Path) -> None:
             allowed_gids.add(grp.getgrnam("aicc-publisher").gr_gid)
         except KeyError:
             pass
+        if profile == "control":
+            # a re-install finds the file the previous control install moved
+            # to root:aicc-control-authority; that is not "unsafe"
+            control_gid = _control_authority_gid()
+            if control_gid is not None:
+                allowed_gids.add(control_gid)
         if not _authority_file_is_safe(info, allowed_gids):
             raise BootstrapRefused("existing workspace authority file is unsafe")
         return
@@ -703,7 +736,7 @@ def main(
         }
         if args.action == "install":
             _refuse_unfinished_uninstall()
-            _prepare_authority_file(args.authority_env)
+            _prepare_authority_file(args.authority_env, args.profile)
         installer_argv = [str(repo / "deploy/install-agent-principal-isolation.sh")]
         if args.action == "uninstall":
             installer_argv.append("--uninstall")
