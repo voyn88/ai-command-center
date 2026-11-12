@@ -1485,7 +1485,7 @@ def test_the_installer_caps_the_journal_through_journald_and_removes_it_again(tm
     assert not cap.exists()
 
 
-def test_an_existing_journald_cap_is_left_alone(tmp_path):
+def test_the_installer_rewrites_only_its_own_journald_file(tmp_path):
     env = _fake_host(tmp_path)
     (tmp_path / "units").mkdir()
     own = tmp_path / "etc-journald.conf"
