@@ -7,6 +7,7 @@ Hermetic: no PostgreSQL, no psql, no network. The database side is a fake
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -14,7 +15,9 @@ import pytest
 from command_center.db import cli, voyn_task_source as src
 from command_center.db.backlog_parser import parse_backlog
 
-FIX = Path(__file__).parent / "fixtures" / "voyn_task_source"
+ROOT = Path(__file__).parent / "fixtures" / "voyn_task_source"
+FIX = ROOT / "equivalence"
+REAL = ROOT / "real" / "tasks"
 FIELDS = ("task_id", "wave", "priority", "status", "kind", "title", "repo")
 
 
@@ -155,3 +158,159 @@ def test_missing_dsn_names_variables_only():
     with pytest.raises(src.SourceError) as err:
         src.fetch_states_psql({})
     assert "VOYN_TASK_READER_DSN" in str(err.value)
+
+
+# ---- stage 3b: dependencies, evidence, reviewer, no-wave, real-derived fixture
+
+
+def _real():
+    return src.build_report(src.load_definitions(REAL), {})
+
+
+def test_real_fixture_is_closed_and_loses_nothing():
+    defs = src.load_definitions(REAL)
+    report = _real()
+    assert len(defs) == 21
+    assert len(report.tasks) + len(report.unparsed) == len(defs)
+    mapped = {t.task_id for t in report.tasks}
+    for task_id, deps in report.dependencies.items():
+        assert set(deps) <= set(defs), f"{task_id} depends outside the fixture"
+        assert set(deps) <= mapped | set(report.no_wave)
+
+
+def test_real_fixture_gates_and_dependencies():
+    report = _real()
+    by_id = {t.task_id: t for t in report.tasks}
+    gate = by_id["VOYN-W0-AICC-SRV-G0"]
+    assert gate.kind == "gate"
+    assert report.dependencies["VOYN-W0-AICC-SRV-G0"] == tuple(
+        f"VOYN-W0-AICC-SRV-0{n}" for n in range(1, 10)
+    )
+    assert all(t.kind == "task" for t in report.tasks if not t.task_id.endswith(("-G0", "-G1")))
+
+
+def test_real_fixture_blocked_tasks_map_to_needs_refinement():
+    defs = src.load_definitions(REAL)
+    native_blocked = {i for i, d in defs.items() if d.get("status") == "BLOCKED"}
+    assert native_blocked
+    by_id = {t.task_id: t for t in _real().tasks}
+    for task_id in native_blocked & set(by_id):
+        assert by_id[task_id].status == "NEEDS_REFINEMENT"
+
+
+def test_reviewer_unassigned_is_not_a_reviewer():
+    assert src.effective_reviewer("reviewer-unassigned") is None
+    assert src.effective_reviewer("Reviewer-Unassigned") is None
+    assert src.effective_reviewer("") is None
+    assert src.effective_reviewer(None) is None
+    assert src.effective_reviewer("qa_agent") == "qa_agent"
+    report = _real()
+    assert report.reviewers and all(v is None for v in report.reviewers.values())
+
+
+def test_tasks_without_wave_are_reported_explicitly():
+    report = _real()
+    assert "VOYN-OPS-PYTEST-IMPACT-01" in report.no_wave
+    assert "VOYN-OPS-PYTEST-IMPACT-01" not in {t.task_id for t in report.tasks}
+    assert any(r.startswith("no wave") for _l, r, _e in report.unparsed)
+
+
+def test_cli_prints_no_wave(monkeypatch, capsys):
+    monkeypatch.setenv(src.FLAG_ENV, "1")
+    monkeypatch.setenv(src.TASKS_DIR_ENV, str(REAL))
+    monkeypatch.setattr(src, "fetch_states_psql", lambda env=None: {})
+    assert cli.main(["backlog-import-voyn-task", "--parse-only"]) == 0
+    out = capsys.readouterr().out
+    assert "NO-WAVE VOYN-OPS-PYTEST-IMPACT-01" in out
+
+
+def test_evidence_mapping_and_db_evidence_wins():
+    defs = {
+        "VOYN-X-1": {
+            "id": "VOYN-X-1", "wave": "0", "status": "OPEN", "priority": "P1", "title": "t",
+            "evidence": {"pr": "#1", "sha": "abcdef1", "test": "yaml proof"},
+        },
+        "VOYN-X-2": {
+            "id": "VOYN-X-2", "wave": "0", "status": "OPEN", "priority": "P1", "title": "t",
+            "evidence": {"pr": "#2"},
+        },
+    }
+    states = {"VOYN-X-2": {"task_id": "VOYN-X-2", "status": "DONE", "revision": 1,
+                           "evidence": {"pr": "#99", "test": "db proof"}}}
+    report = src.build_report(defs, states)
+    assert report.evidence["VOYN-X-1"] == (("pr", "#1"), ("sha", "abcdef1"), ("acceptance", "yaml proof"))
+    assert report.evidence["VOYN-X-2"] == (("pr", "#99"), ("acceptance", "db proof"))
+
+
+class _FakeStore:
+    def __init__(self):
+        self.calls = []
+
+    def import_parsed(self, parsed):
+        from command_center.db.backlog_store import ImportReport
+
+        self.calls.append(("import", len(parsed.tasks)))
+        return ImportReport(inserted=len(parsed.tasks))
+
+    def add_dependency(self, task_id, dep):
+        self.calls.append(("dep", task_id, dep))
+        return (dep != "VOYN-BAD-DEP", "cycle", None)
+
+    def record_evidence(self, task_id, kind, value):
+        self.calls.append(("ev", task_id, kind, value))
+        return True, ""
+
+
+def test_apply_report_writes_tasks_then_dependencies_then_evidence():
+    report = _real()
+    store = _FakeStore()
+    result = src.apply_report(store, report)
+    kinds = [c[0] for c in store.calls]
+    assert kinds[0] == "import"
+    assert kinds.index("dep") > 0 and "ev" in kinds
+    assert max(i for i, k in enumerate(kinds) if k == "dep") < min(i for i, k in enumerate(kinds) if k == "ev")
+    assert ("dep", "VOYN-W0-AICC-SRV-G0", "VOYN-W0-AICC-SRV-01") in store.calls
+    assert ("ev", "VOYN-OPS-CI-MANDATORY-GATES", "pr", "#229") in store.calls
+    assert result.refused == [] or all("not in the mapped set" in r for _t, r in result.refused)
+
+
+def test_apply_report_reports_refused_dependency():
+    defs = {
+        "VOYN-X-1": {"id": "VOYN-X-1", "wave": "0", "status": "OPEN", "priority": "P1", "title": "t",
+                     "depends_on": ["VOYN-BAD-DEP", "VOYN-MISSING-1"]},
+        "VOYN-BAD-DEP": {"id": "VOYN-BAD-DEP", "wave": "0", "status": "OPEN", "priority": "P1", "title": "t"},
+    }
+    result = src.apply_report(_FakeStore(), src.build_report(defs, {}))
+    reasons = " ".join(r for _t, r in result.refused)
+    assert "VOYN-BAD-DEP: cycle" in reasons and "VOYN-MISSING-1: not in the mapped set" in reasons
+
+
+def test_flag_off_cli_opens_neither_config_nor_pool(monkeypatch, capsys):
+    def boom(*a, **k):
+        raise AssertionError("config/pool touched while the flag is off")
+
+    monkeypatch.delenv(src.FLAG_ENV, raising=False)
+    monkeypatch.setattr(cli, "load_config", boom)
+    monkeypatch.setattr(cli.pool, "open_pool", boom)
+    monkeypatch.setattr(cli.pool, "connection", boom)
+    assert cli.main(["backlog-import-voyn-task"]) == 0
+    assert cli.main(["backlog-import-voyn-task", "--parse-only"]) == 0
+
+
+@pytest.mark.skipif(
+    not os.environ.get("VOYN_BACKLOG_TASKS_DIR"),
+    reason="VOYN_BACKLOG_TASKS_DIR (the real voyn-backlog tasks/ checkout) is not set",
+)
+def test_real_backlog_all_tasks_accounted_for():
+    tasks_dir = Path(os.environ["VOYN_BACKLOG_TASKS_DIR"])
+    files = [p for p in tasks_dir.glob("*.yaml") if p.name != "EXAMPLE.yaml"]
+    defs = src.load_definitions(tasks_dir)
+    assert len(defs) == len(files), "duplicate or id-less YAML files"
+    report = src.build_report(defs, {})
+    imported = {t.task_id for t in report.tasks}
+    reported = {e for _l, _r, e in report.unparsed}
+    assert imported | reported == set(defs)
+    assert not imported & reported
+    assert set(report.no_wave) <= reported
+    for task_id, deps in report.dependencies.items():
+        assert set(deps) <= set(defs)

@@ -1,0 +1,14 @@
+# Мигрировано из outputs/VOYN_TASKS_BACKLOG.md скриптом tools/migrate_backlog.py. Строка оригинала: 199.
+id: "VOYN-OPS-WRITER-LEASE-REGISTRY"
+project: "aios"
+title: "Правило «один писатель на репозиторий» (проектные CLAUDE.md в aios и ai-command-center) не подкреплено…"
+why: "Правило «один писатель на репозиторий» (проектные `CLAUDE.md` в `aios` и `ai-command-center`) не подкреплено механизмом, поэтому два агента не видят друг друга. Обнаружено при попытке взять `VOYN-W0-F3`: в `~/Projects/ai-command-center` уже существуют ветки `feat/w0-design-tokens` (коммит `137e879` «W0/F-3 canonical design-token + primitives package») и `feat/w0-api-layer`, а также шесть заблокированных worktree `.claude/worktrees/voyn-{be-acc-live,ci-fixtures,ci-image,ci-impact,ci-no-sleep,ux-aicc-execution}` — то есть другая сессия активно держит задачи VOYN в этом репозитории."
+priority: "P2"
+owner: "Ops / Platform"
+reviewer: "reviewer-unassigned"
+acceptance: "перед выбором задачи агент обязан взять lease (владелец, задача, репозиторий, ветка, expiry, heartbeat) в общем реестре и отказаться от задачи с активным чужим lease; истёкший lease освобождается автоматически без дублирующего исполнения. Смежные: `VOYN-OPS-LEASE-RECOVERY`, `VOYN-BE-TASK-SCHEMA-V2`."
+status: "READY_TO_REVIEW"
+wave: "0"
+depends_on: []
+evidence:
+  test: "ссылок на PR/коммит в тексте нет; см. строку 199 в outputs/VOYN_TASKS_BACKLOG.md"

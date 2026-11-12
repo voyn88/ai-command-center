@@ -1,0 +1,15 @@
+# Мигрировано из outputs/VOYN_TASKS_BACKLOG.md скриптом tools/migrate_backlog.py. Строка оригинала: 258.
+id: "VOYN-OPS-CI-MANDATORY-GATES"
+project: "aios"
+title: "Тяжёлые джобы Tests (pytest), Type check (mypy), Package build, Register conformance выполнялись только при…"
+why: "Тяжёлые джобы `Tests (pytest)`, `Type check (mypy)`, `Package build`, `Register conformance` выполнялись только при метке `full-ci`, поэтому PR с изменением `src/` мог показать зелёный CI при незапущенных тестах и типизации (PR #227, run 31652612853). Метка при этом не была триггером."
+priority: "P2"
+owner: "Platform / SRE"
+reviewer: "reviewer-unassigned"
+acceptance: "изменение путей `src/`, `tests/`, `pyproject.toml`, `uv.lock` обязательно запускает pytest и mypy на `pull_request` без ручной метки, либо `full-ci` добавлен в триггеры `on: pull_request: types` и требуется branch protection. Доказательство: PR, меняющий `src/`, не может получить зелёный статус без выполненных pytest и mypy."
+status: "DONE"
+wave: "0"
+depends_on: []
+evidence:
+  pr: "#229"
+  sha: "10fc48f"

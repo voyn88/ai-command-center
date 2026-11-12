@@ -1,0 +1,14 @@
+# Мигрировано из outputs/VOYN_TASKS_BACKLOG.md скриптом tools/migrate_backlog.py. Строка оригинала: 1362.
+id: "VOYN-W0-AICC-SRV-03"
+project: "aicc"
+title: "Реализовать регистрацию worker с одноразовым enrollment token, уникальной service identity, отзывом и…"
+why: "Реализовать регистрацию worker с одноразовым enrollment token, уникальной service identity, отзывом и автоматической ротацией credentials."
+priority: "P0"
+owner: "Worker Platform"
+reviewer: "reviewer-unassigned"
+acceptance: "секреты не хранятся в backlog/logs; повторное использование и отозванный credential отклоняются; worker identity связана с host/capabilities."
+status: "OPEN"
+wave: "0"
+depends_on:
+  - "VOYN-W0-AICC-SRV-01"
+  - "VOYN-W0-AICC-SRV-02"

@@ -1,0 +1,17 @@
+# Мигрировано из outputs/VOYN_TASKS_BACKLOG.md скриптом tools/migrate_backlog.py. Строка оригинала: 1380.
+id: "VOYN-W0-AICC-SRV-09"
+project: "aicc"
+title: "Провести shadow/dual-read reconciliation, контролируемый cutover на PostgreSQL/server mode и отключить…"
+why: "Провести shadow/dual-read reconciliation, контролируемый cutover на PostgreSQL/server mode и отключить локальные writable authorities."
+priority: "P0"
+owner: "Release Engineering"
+reviewer: "reviewer-unassigned"
+acceptance: "zero-loss reconciliation; rollback rehearsed; AICC UI, API и worker читают один authority; laptop offline не останавливает очередь минимум 24 часа."
+status: "OPEN"
+wave: "0"
+depends_on:
+  - "VOYN-W0-AICC-SRV-02"
+  - "VOYN-W0-AICC-SRV-05"
+  - "VOYN-W0-AICC-SRV-06"
+  - "VOYN-W0-AICC-SRV-07"
+  - "VOYN-W0-AICC-SRV-08"

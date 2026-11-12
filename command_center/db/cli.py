@@ -445,7 +445,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"UNREGISTERED {task_id}: no task_state row, status taken from YAML")
         for task_id in voyn_report.orphan_states:
             print(f"ORPHAN-STATE {task_id}: state without a YAML definition, ignored")
+        for task_id in voyn_report.no_wave:
+            print(f"NO-WAVE {task_id}: not imported, backlog_task.wave is required")
         for _line, reason, excerpt in voyn_report.unparsed:
+            if reason.startswith("no wave"):
+                continue
             print(f"UNPARSED {excerpt}: {reason}")
         if args.parse_only:
             return 0
@@ -599,9 +603,12 @@ def main(argv: list[str] | None = None) -> int:
                 return 1 if report.refused else 0
 
             if args.command == "backlog-import-voyn-task":
+                from command_center.db import voyn_task_source
                 from command_center.db.backlog_store import BacklogStore
 
-                report = BacklogStore(lambda: nullcontext(conn)).import_parsed(voyn_report)
+                report = voyn_task_source.apply_report(
+                    BacklogStore(lambda: nullcontext(conn)), voyn_report
+                )
                 print(
                     f"inserted {report.inserted}, updated {report.updated}, "
                     f"unchanged {report.unchanged}"
