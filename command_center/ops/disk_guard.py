@@ -5,11 +5,14 @@ shell (the mobile network cuts SSH/Tailscale; root is only in the provider's
 web console).  This timer watches free space and, below a threshold, removes
 things that are provably regenerable, in the order that costs least:
 
-1. systemd journal beyond a size cap,
-2. package caches (npm, pip, uv) -- the configured cache directories only,
-3. orphaned model blobs of the local model server (blobs no manifest names),
-4. per-task clones whose pull request is MERGED or CLOSED for at least
+1. package caches (npm, pip, uv) -- the configured cache directories only,
+2. orphaned model blobs of the local model server (blobs no manifest names),
+3. per-task clones whose pull request is MERGED or CLOSED for at least
    ``min_age_days`` and that nothing is using.
+
+The systemd journal is NOT vacuumed here (that would need full root): the
+installer writes a journald size cap instead (``SystemMaxUse``), so the guard
+runs with a narrow capability set (security review M1).
 
 It stops as soon as the target free percentage is projected/reached.
 
@@ -129,7 +132,6 @@ class Config:
     clone_roots: list[Path]
     cache_dirs: list[Path]
     ollama_models: Path | None
-    journal_max_mb: int
     max_clones: int
     max_delete_gb: int
     dry_run: bool
@@ -149,7 +151,6 @@ class Config:
             clone_roots=as_paths(values.get("OPS_CLONE_ROOTS")),
             cache_dirs=as_paths(values.get("OPS_CACHE_DIRS")),
             ollama_models=Path(models) if models.startswith("/") else None,
-            journal_max_mb=as_int(values.get("OPS_JOURNAL_MAX_MB"), 500),
             max_clones=as_int(values.get("OPS_DISK_MAX_CLONES"), 25),
             max_delete_gb=as_int(values.get("OPS_DISK_MAX_GB"), 40),
             dry_run=as_dry_run(values.get("OPS_DISK_GUARD_DRY_RUN")),
@@ -686,17 +687,6 @@ def run_guard(
 
     def want_more() -> bool:
         return projected_free < target_bytes and freed < budget_bytes
-
-    # 1. journal -------------------------------------------------------------
-    if want_more() and cfg.journal_max_mb > 0:
-        if cfg.dry_run:
-            journal.write("would_vacuum_journal", max_mb=cfg.journal_max_mb)
-        else:
-            code, _, err = runner(
-                ["journalctl", f"--vacuum-size={cfg.journal_max_mb}M"], 60
-            )
-            journal.write("vacuum_journal", ok=code == 0, error=err[-200:])
-        summary["would_act" if cfg.dry_run else "acted"] = True
 
     # 2-4. candidates ---------------------------------------------------------
     candidates: list[Candidate] = []

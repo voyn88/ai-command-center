@@ -18,9 +18,18 @@ PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/var/lib/voyn-ops /var/log/voyn-ops
+# Security review M1: uid 0 is needed only so systemd accepts `systemctl
+# restart`; the capability set is cut to what `ss -p` needs to name the holder
+# of the review port (read other accounts' processes).  No file, mount,
+# network-admin or module capability remains.
+CapabilityBoundingSet=CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+AmbientCapabilities=
+PrivateDevices=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
 ProtectControlGroups=true
 ProtectKernelModules=true
 ProtectKernelTunables=true
 RestrictSUIDSGID=true
 LockPersonality=true
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK

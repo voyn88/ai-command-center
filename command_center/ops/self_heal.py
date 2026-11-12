@@ -49,7 +49,7 @@ from command_center.ops.autonomy_common import (
     load_settings,
     run_command,
 )
-from command_center.ops.status_beacon import _tcp_banner, tunnel_held_by
+from command_center.ops.status_beacon import _tcp_banner, holder_word, tunnel_held_by
 
 COOLDOWN_SECONDS = 30 * 60
 MAX_ACTIONS_PER_HOUR = 3
@@ -225,6 +225,10 @@ def run_heal(
             "last_action": last_action,
             "history": history,
             "halted_at": halted_at if halted else 0,
+            # the unprivileged beacon cannot see other users' processes
+            "tunnel_holder": holder_word(
+                tunnel_held_by(runner, as_int(settings.get("OPS_TUNNEL_PORT"), 17443))
+            ),
         }
     )
     if not signals:

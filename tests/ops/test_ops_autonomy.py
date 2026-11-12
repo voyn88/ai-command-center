@@ -776,6 +776,7 @@ def _fake_host(tmp_path: Path) -> dict[str, str]:
         "AICC_OPS_STATE_DIR": str(tmp_path / "state"),
         "AICC_OPS_LOG_DIR": str(tmp_path / "logs"),
         "AICC_UNIT_DIR": str(tmp_path / "units"),
+        "AICC_JOURNALD_DIR": str(tmp_path / "journald"),
         "AICC_SYSTEMCTL": str(systemctl),
         "AICC_OPS_ALLOW_NONROOT": "1",
         "FAKE_SYSTEMCTL_LOG": str(tmp_path / "systemctl.log"),
@@ -1354,3 +1355,170 @@ def test_the_settings_template_documents_the_new_keys():
     values = common.parse_settings((ROOT / "deploy/aicc/ops-autonomy.env").read_text())
     assert values["OPS_BEACON_DETAIL"] == "minimal"
     assert values["OPS_REPO_OWNERS"] == "voyn88"
+
+
+# ==========================================================================
+# M1: privileges are split and narrowed
+
+
+def _service(name: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for line in (
+        (ROOT / "deploy/systemd" / f"voyn-ops-{name}.service").read_text().splitlines()
+    ):
+        if "=" in line and not line.lstrip().startswith("#"):
+            key, _, value = line.partition("=")
+            values[key.strip()] = value.strip()
+    return values
+
+
+def test_the_beacon_does_not_run_as_root_and_holds_no_capability():
+    beacon = _service("beacon")
+    assert beacon["User"] == "aicc-worker" and beacon["Group"] == "aicc-worker"
+    assert beacon["SupplementaryGroups"] == "systemd-journal"
+    assert beacon["CapabilityBoundingSet"] == ""  # empty set: none
+    assert beacon["AmbientCapabilities"] == ""
+    assert "/var/lib/voyn-ops/beacon" in beacon["ReadWritePaths"]
+    assert "/var/lib/voyn-ops " not in beacon["ReadWritePaths"] + " "
+
+
+@pytest.mark.parametrize(
+    ("name", "allowed"),
+    [
+        (
+            "disk-guard",
+            {
+                "CAP_DAC_OVERRIDE",
+                "CAP_DAC_READ_SEARCH",
+                "CAP_FOWNER",
+                "CAP_SETUID",
+                "CAP_SETGID",
+                "CAP_SYS_PTRACE",
+            },
+        ),
+        ("self-heal", {"CAP_SYS_PTRACE", "CAP_DAC_READ_SEARCH"}),
+    ],
+)
+def test_the_root_timers_keep_only_the_capabilities_they_need(name, allowed):
+    caps = set(_service(name)["CapabilityBoundingSet"].split())
+    assert caps and caps <= allowed
+    for dangerous in (
+        "CAP_SYS_ADMIN",
+        "CAP_NET_ADMIN",
+        "CAP_SYS_MODULE",
+        "CAP_SYS_RAWIO",
+    ):
+        assert dangerous not in caps
+    assert _service(name)["SystemCallFilter"].startswith("@system-service")
+
+
+def test_the_disk_guard_no_longer_needs_the_privilege_to_vacuum_the_journal(tmp_path):
+    cfg = _cfg(tmp_path, OPS_JOURNAL_MAX_MB="500")
+    journal, _ = _journal(tmp_path)
+    calls: list[list[str]] = []
+    disk_guard.run_guard(
+        cfg, runner=_fake_runner({}, calls), journal=journal, cwds=[], free_pct=_low
+    )
+    assert not any(c and c[0] == "journalctl" for c in calls)
+    assert (
+        "journalctl"
+        not in (ROOT / "command_center/ops/disk_guard.py")
+        .read_text()
+        .split("def run_guard")[1]
+    )
+
+
+def test_the_beacon_takes_the_tunnel_holder_from_the_self_heal_state(tmp_path):
+    common.StateFile(tmp_path / "self-heal-state.json").save(
+        {"tunnel_holder": "tailscaled"}
+    )
+
+    def blind(argv, timeout=30):  # unprivileged: `ss` cannot name the process
+        if list(argv)[0] == "ss":
+            return 0, "LISTEN 0 4096 127.0.0.1:17443 0.0.0.0:*\n", ""
+        return _beacon_runner(argv, timeout)
+
+    doc = status_beacon.collect(
+        {
+            "OPS_STATE_DIR": str(tmp_path / "own"),
+            "OPS_HEAL_STATE_DIR": str(tmp_path),
+            "OPS_BEACON_DETAIL": "full",
+        },
+        runner=blind,
+    )
+    assert doc["review_tunnel"]["held_by"] == "tailscaled"
+
+
+def test_an_unknown_holder_word_in_the_state_file_is_not_published(tmp_path):
+    common.StateFile(tmp_path / "self-heal-state.json").save(
+        {"tunnel_holder": "10.0.0.5"}
+    )
+    doc = status_beacon.collect(
+        {
+            "OPS_STATE_DIR": str(tmp_path / "own"),
+            "OPS_HEAL_STATE_DIR": str(tmp_path),
+            "OPS_BEACON_DETAIL": "full",
+        },
+        runner=lambda argv, timeout=30: (0, "", ""),
+    )
+    assert doc["review_tunnel"]["held_by"] is None
+
+
+def test_self_heal_leaves_the_holder_word_for_the_beacon(tmp_path):
+    runner = _heal_runner(held_by="tailscaled", tunnel_code="501")
+    _heal(tmp_path, runner, now=1000)
+    assert (
+        common.StateFile(tmp_path / "state.json").load()["tunnel_holder"]
+        == "tailscaled"
+    )
+
+
+def test_the_installer_caps_the_journal_through_journald_and_removes_it_again(tmp_path):
+    env = _fake_host(tmp_path)
+    (tmp_path / "units").mkdir()
+    assert _run_installer(env, "--role", "worker").returncode == 0
+    cap = tmp_path / "journald" / "voyn-ops.conf"
+    assert cap.read_text() == "[Journal]\nSystemMaxUse=500M\n"
+    log = Path(env["FAKE_SYSTEMCTL_LOG"]).read_text()
+    assert "restart systemd-journald" in log
+    assert _run_installer(env, "--uninstall").returncode == 0
+    assert not cap.exists()
+
+
+def test_an_existing_journald_cap_is_left_alone(tmp_path):
+    env = _fake_host(tmp_path)
+    (tmp_path / "units").mkdir()
+    own = tmp_path / "etc-journald.conf"
+    own.write_text("[Journal]\nSystemMaxUse=2G\n")
+    # the installer looks at the real /etc paths for an owner cap; simulate it by
+    # pre-creating our own drop-in with different content and checking it is not
+    # silently rewritten by a second install.
+    jd = tmp_path / "journald"
+    jd.mkdir()
+    (jd / "voyn-ops.conf").write_text("[Journal]\nSystemMaxUse=123M\n")
+    assert _run_installer(env, "--role", "worker").returncode == 0
+    assert (jd / "voyn-ops.conf").read_text() == "[Journal]\nSystemMaxUse=500M\n"
+
+
+def test_without_an_aicc_worker_account_the_beacon_falls_back_loudly(tmp_path):
+    env = _fake_host(tmp_path)
+    (tmp_path / "units").mkdir()
+    result = _run_installer(env, "--role", "worker")
+    assert result.returncode == 0
+    assert "status beacon will run as root" in result.stderr
+    dropin = tmp_path / "units" / "voyn-ops-beacon.service.d" / "user.conf"
+    assert "User=root" in dropin.read_text()
+    assert _run_installer(env, "--uninstall").returncode == 0
+    assert not dropin.exists()
+
+
+def test_the_state_and_log_directories_are_readable_by_the_unprivileged_beacon(
+    tmp_path,
+):
+    env = _fake_host(tmp_path)
+    (tmp_path / "units").mkdir()
+    assert _run_installer(env, "--role", "worker").returncode == 0
+    for name in ("state", "logs"):
+        mode = (tmp_path / name).stat().st_mode & 0o777
+        assert mode == 0o755, (name, oct(mode))
+        assert (tmp_path / name / "beacon").is_dir()

@@ -2,6 +2,12 @@
 # of the fleet repository so the owner can read the host's state without ssh
 # (see command_center/ops/status_beacon.py).  Reads the GitHub App token the
 # host already mints; writes only the status branch and its own state files.
+#
+# Security review M1: this unit does NOT run as root.  It needs only the token
+# file (0640 root:aicc-worker, the fleet group), the system journal (group
+# systemd-journal) and the read-only self-heal state; it owns its own two
+# directories.  Capabilities are dropped entirely.  If the host has no
+# aicc-worker account the installer says so and writes a drop-in instead.
 [Unit]
 Description=VOYN host status beacon
 After=network-online.target
@@ -9,9 +15,15 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-User=root
+User=aicc-worker
+Group=aicc-worker
+SupplementaryGroups=systemd-journal
 WorkingDirectory=/opt/aicc
+UMask=0022
 Environment=GH_CONFIG_DIR=/var/lib/aicc/github/gh
+Environment=OPS_LOG_DIR=/var/log/voyn-ops/beacon
+Environment=OPS_STATE_DIR=/var/lib/voyn-ops/beacon
+Environment=OPS_HEAL_STATE_DIR=/var/lib/voyn-ops
 ExecStart=/opt/aicc/.venv/bin/python -m command_center.ops.status_beacon
 TimeoutStartSec=3min
 Nice=10
@@ -20,10 +32,16 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/voyn-ops /var/log/voyn-ops
+ReadWritePaths=/var/lib/voyn-ops/beacon /var/log/voyn-ops/beacon
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateDevices=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
 ProtectControlGroups=true
 ProtectKernelModules=true
 ProtectKernelTunables=true
 RestrictSUIDSGID=true
 LockPersonality=true
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# AF_NETLINK: `ss` reads the socket table through netlink
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK

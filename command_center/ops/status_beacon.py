@@ -293,9 +293,18 @@ def collect(
     doc["failed_units"] = failed_unit_count(runner)
     ssh_open, ssh_banner = _tcp_banner(as_int(settings.get("OPS_SSH_PORT"), 22))
     doc["sshd"] = {"accepts": ssh_open, "banner": ssh_banner}
+    # The beacon runs unprivileged and cannot name another user's process; the
+    # self-heal timer (which can) leaves the holder word in its state file.
+    heal_dir = Path(
+        settings.get(
+            "OPS_HEAL_STATE_DIR", settings.get("OPS_STATE_DIR", str(DEFAULT_STATE_DIR))
+        )
+    )
+    heal_state = StateFile(heal_dir / "self-heal-state.json").load()
+    held = holder_word(tunnel_held_by(runner, port)) or heal_state.get("tunnel_holder")
     doc["review_tunnel"] = {
         "listening": _tcp_open(port),
-        "held_by": holder_word(tunnel_held_by(runner, port)),
+        "held_by": held if held in {"tailscaled", "other"} else None,
     }
     repo = settings.get("OPS_STATUS_REPO", "voyn88/ai-command-center")
     doc["queue"] = queue_shape(repo, runner)
@@ -307,9 +316,7 @@ def collect(
         if u.strip()
     ]
     doc["last_verdict_age_min"] = last_verdict_age_min(runner, verdict_units, now)
-    state_dir = Path(settings.get("OPS_STATE_DIR", str(DEFAULT_STATE_DIR)))
-    healed = StateFile(state_dir / "self-heal-state.json").load()
-    halted_at = float(healed.get("halted_at", 0) or 0)
+    halted_at = float(heal_state.get("halted_at", 0) or 0)
     doc["self_heal_halted"] = bool(halted_at) and now - halted_at < 24 * 3600
     if settings.get("OPS_BEACON_DETAIL", "minimal") == "full":
         return doc

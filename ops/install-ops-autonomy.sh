@@ -31,6 +31,7 @@ SETTINGS="${AICC_OPS_SETTINGS:-/etc/aicc/ops-autonomy.env}"
 STATE_DIR="${AICC_OPS_STATE_DIR:-/var/lib/voyn-ops}"
 LOG_DIR="${AICC_OPS_LOG_DIR:-/var/log/voyn-ops}"
 UNIT_DIR="${AICC_UNIT_DIR:-/etc/systemd/system}"
+JOURNALD_DIR="${AICC_JOURNALD_DIR:-/etc/systemd/journald.conf.d}"
 UNITS=(voyn-ops-disk-guard voyn-ops-beacon voyn-ops-self-heal)
 SYSTEMCTL="${AICC_SYSTEMCTL:-systemctl}"
 
@@ -75,7 +76,7 @@ need_root() {
 }
 
 get_key() { # KEY -> value from the settings file (never sourced/executed)
-  grep -E "^$1=" "$SETTINGS" 2>/dev/null | tail -n 1 | cut -d= -f2-
+  { grep -E "^$1=" "$SETTINGS" 2>/dev/null || true; } | tail -n 1 | cut -d= -f2-
 }
 
 set_key() { # KEY VALUE  (portable: no sed -i; the key moves to the end)
@@ -197,15 +198,52 @@ write_disk_guard_dropin() {
   } >"$dir/paths.conf"
 }
 
+prepare_beacon_account() {
+  # Security review M1: the beacon runs as the fleet account, not as root.
+  local dir="$UNIT_DIR/voyn-ops-beacon.service.d"
+  if getent passwd aicc-worker >/dev/null 2>&1; then
+    [ "${AICC_OPS_ALLOW_NONROOT:-}" = 1 ] || chown aicc-worker:aicc-worker "$STATE_DIR/beacon" "$LOG_DIR/beacon"
+    rm -rf "$dir"
+  else
+    warn "no aicc-worker account on this host: the status beacon will run as root (weaker); create the account or accept this"
+    mkdir -p "$dir"
+    printf '[Service]\nUser=root\nGroup=root\nSupplementaryGroups=\n' >"$dir/user.conf"
+  fi
+}
+
+write_journald_cap() {
+  # The journal is capped by journald itself (SystemMaxUse), so no timer needs
+  # the privilege to vacuum it.  Existing owner configuration is never replaced.
+  local mb file="$JOURNALD_DIR/voyn-ops.conf" want
+  mb="$(get_key OPS_JOURNAL_MAX_MB)"
+  case "$mb" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$mb" -gt 0 ] || return 0
+  want="[Journal]
+SystemMaxUse=${mb}M"
+  mkdir -p "$JOURNALD_DIR"
+  if [ -f "$file" ] && [ "$(cat "$file")" = "$want" ]; then return 0; fi
+  if grep -rqs '^SystemMaxUse=' /etc/systemd/journald.conf /etc/systemd/journald.conf.d 2>/dev/null && [ ! -f "$file" ]; then
+    say "journald already has a size cap: left as it is"
+    return 0
+  fi
+  printf '%s\n' "$want" >"$file"
+  "$SYSTEMCTL" restart systemd-journald
+  say "journal capped at ${mb}M ($file)"
+}
+
 install_all() {
   need_root
   [ -z "$role" ] || case "$role" in worker|control) ;; *) die "role must be worker or control" ;; esac
   [ -n "$role" ] || role="$(detect_role)"
   [ -n "$role" ] || die "cannot tell the host role from its name: add --role worker or --role control"
   preflight
-  mkdir -p "$STATE_DIR" "$LOG_DIR"
-  chmod 0750 "$STATE_DIR" "$LOG_DIR"
+  mkdir -p "$STATE_DIR/beacon" "$LOG_DIR/beacon"
+  # World-readable on purpose: the unprivileged beacon reads the self-heal
+  # state, and neither directory holds a secret (decisions and counters only).
+  chmod 0755 "$STATE_DIR" "$LOG_DIR"
   write_settings_once
+  prepare_beacon_account
+  write_journald_cap
   local stamp backup u f own=(-o root -g root)
   [ "${AICC_OPS_ALLOW_NONROOT:-}" != 1 ] || own=()
   stamp="$(date +%Y%m%d%H%M%S)"
@@ -282,7 +320,11 @@ uninstall_all() {
     "$SYSTEMCTL" disable --now "$u.timer" 2>/dev/null || true
     rm -f "$UNIT_DIR/$u.timer" "$UNIT_DIR/$u.service"
   done
-  rm -rf "$UNIT_DIR/voyn-ops-disk-guard.service.d"
+  rm -rf "$UNIT_DIR/voyn-ops-disk-guard.service.d" "$UNIT_DIR/voyn-ops-beacon.service.d"
+  if [ -f "$JOURNALD_DIR/voyn-ops.conf" ]; then
+    rm -f "$JOURNALD_DIR/voyn-ops.conf"
+    "$SYSTEMCTL" restart systemd-journald
+  fi
   local newest f
   newest="$(ls -d "$STATE_DIR"/backup-* 2>/dev/null | tail -n 1 || true)"
   if [ -n "$newest" ]; then

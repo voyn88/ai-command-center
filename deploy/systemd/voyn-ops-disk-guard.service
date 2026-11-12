@@ -26,7 +26,19 @@ PrivateTmp=true
 ProtectSystem=strict
 # the journal directories let `journalctl --vacuum-size` work under the strict
 # sandbox (a leading dash ignores a path the host does not have)
-ReadWritePaths=/var/lib/voyn-ops /var/log/voyn-ops -/var/log/journal
+ReadWritePaths=/var/lib/voyn-ops /var/log/voyn-ops
+# Security review M1: still uid 0 (it deletes files other accounts own and runs
+# git as the clone's owner) but with ONLY the capabilities that needs:
+#   DAC_OVERRIDE/DAC_READ_SEARCH/FOWNER  remove files of other accounts
+#   SETUID/SETGID                        `runuser` to the clone owner
+#   SYS_PTRACE                           read other accounts' /proc/<pid>/cwd,fd
+# Everything else (network admin, mounts, module loading, ...) is gone.  The
+# journal is capped by journald itself, not by this unit.
+CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER CAP_SETUID CAP_SETGID CAP_SYS_PTRACE
+AmbientCapabilities=
+PrivateDevices=true
+SystemCallFilter=@system-service @privileged
+SystemCallErrorNumber=EPERM
 ProtectControlGroups=true
 ProtectKernelModules=true
 ProtectKernelTunables=true
