@@ -1930,10 +1930,6 @@ def _review_once(
         if not cascade:
             report.skipped.append((task_id, "no_review_executor_route"))
             continue
-        task_cascade, defer_reason = _review_cascade_for_task(factory, task_id, cascade)
-        if not task_cascade:
-            report.skipped.append((task_id, defer_reason or "no_review_executor_route"))
-            continue
         repo = _repo_from_pr_url(pr_url)
         if repo is None:
             # Not even shaped like a GitHub PR URL -- can never resolve
@@ -1948,6 +1944,13 @@ def _review_once(
         route = repo_route(repo)
         if route is None:
             report.skipped.append((task_id, f"no_repo_route: {pr_url!r}"))
+            continue
+        # Looked up only once the PR URL and its repo route are known good:
+        # the implementer lookup reads the database, and evidence hygiene
+        # above (malformed URL, missing route) must not depend on it.
+        task_cascade, defer_reason = _review_cascade_for_task(factory, task_id, cascade)
+        if not task_cascade:
+            report.skipped.append((task_id, defer_reason or "no_review_executor_route"))
             continue
         window = _review_window_read_decision(
             repo_path, pr_url, recovery_budget
