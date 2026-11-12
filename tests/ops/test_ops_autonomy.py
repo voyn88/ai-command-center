@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 
-from command_center.ops import autonomy_common as common
+from command_center.ops import host_care_common as common
 from command_center.ops import disk_guard, self_heal, status_beacon
 
 ROOT = Path(__file__).parents[2]
@@ -1340,7 +1340,7 @@ def test_uninstall_puts_back_a_unit_that_install_replaced(tmp_path):
 def test_the_installer_and_modules_name_no_account_and_no_home():
     for path in (
         ROOT / "ops/install-ops-autonomy.sh",
-        *sorted((ROOT / "command_center/ops").glob("autonomy_common.py")),
+        *sorted((ROOT / "command_center/ops").glob("host_care_common.py")),
         ROOT / "command_center/ops/disk_guard.py",
         ROOT / "command_center/ops/status_beacon.py",
         ROOT / "command_center/ops/self_heal.py",

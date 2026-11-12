@@ -37,7 +37,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from command_center.ops.autonomy_common import (
+from command_center.ops.host_care_common import (
     DEFAULT_LOG_DIR,
     DEFAULT_STATE_DIR,
     Journal,
