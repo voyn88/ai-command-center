@@ -119,7 +119,7 @@ join_existing_dirs() { # prints colon-joined list of the arguments that are dirs
 }
 
 file_owner() { stat -c %U "$1" 2>/dev/null || stat -f %Su "$1" 2>/dev/null; }
-file_mode() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1" 2>/dev/null; }
+file_mode() { stat -c %a "$1" 2>/dev/null || { stat -f %p "$1" 2>/dev/null | sed 's/.*\(....\)$/\1/'; }; }
 
 # AICC_OPS_TRUST_OWNER lets the test suite trust its own account; on a host it
 # is never set and only root is trusted.
@@ -130,11 +130,12 @@ dir_or_file_safe() { # PATH -> owned by a trusted account, no group/other write
   owner="$(file_owner "$1")" || return 1
   mode="$(file_mode "$1")" || return 1
   trusted_owner "$owner" || return 1
-  mode="$(printf '%04d' "$mode")"
+  while [ ${#mode} -lt 4 ]; do mode="0$mode"; done
   g="${mode:2:1}"; o="${mode:3:1}"
   if [ -d "$1" ] && [ $((${mode:0:1} & 1)) -eq 1 ]; then
-    # sticky directory: others may write but cannot replace entries
-    [ $((g & 2)) -eq 0 ]; return
+    # sticky directory (/tmp style): writers cannot rename or replace entries
+    # they do not own, so a trusted-owner sticky directory is safe to pass
+    return 0
   fi
   [ $((g & 2)) -eq 0 ] && [ $((o & 2)) -eq 0 ]
 }

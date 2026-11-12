@@ -1620,3 +1620,23 @@ def test_layout_paths_with_odd_characters_are_refused(tmp_path):
     done = _run_installer(env, "--role", "worker")
     assert done.returncode != 0
     assert "letters, digits" in done.stderr
+
+
+def test_a_sticky_world_writable_ancestor_like_tmp_is_passed(tmp_path):
+    env = _releases_layout(tmp_path)
+    base = Path(env["AICC_RELEASE_DIR"]).parent
+    (tmp_path / "units").mkdir()
+    base.chmod(0o1777)
+    try:
+        assert _run_installer(env, "--check").returncode in (0, 1)
+        done = _run_installer(env, "--role", "worker")
+        assert done.returncode == 0, done.stdout + done.stderr
+    finally:
+        base.chmod(0o755)
+    base.chmod(0o777)
+    try:
+        done = _run_installer(env, "--role", "worker")
+        assert done.returncode != 0
+        assert str(base) in done.stderr
+    finally:
+        base.chmod(0o755)
