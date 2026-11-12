@@ -12,4 +12,4 @@ wave: "0"
 depends_on: []
 evidence:
   pr: "https://github.com/voyn88/voyn-backlog/pull/4"
-  sha: "7c9badcd67c48c2fa899d74d3ca43f4ec897e744"
+  sha: "7c9badc"
