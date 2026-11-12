@@ -1,0 +1,11 @@
+id: VOYN-W0-A5-G1
+project: aicc
+title: epsilon-gate
+why: "Why epsilon-gate is needed. Target repo: `ai-command-center`."
+priority: P0
+owner: dev
+reviewer: rev
+acceptance: Measurable acceptance criterion here.
+status: OPEN
+wave: "0"
+gate: true

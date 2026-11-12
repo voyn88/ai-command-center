@@ -1,0 +1,8 @@
+[
+ {"task_id":"VOYN-W0-A1","status":"OPEN","revision":0},
+ {"task_id":"VOYN-W0-A2","status":"IN_PROGRESS","revision":1},
+ {"task_id":"VOYN-W0.5-A3","status":"READY_TO_REVIEW","revision":2},
+ {"task_id":"VOYN-COM-A4","status":"DONE","revision":3},
+ {"task_id":"VOYN-W0-A5-G1","status":"OPEN","revision":0},
+ {"task_id":"VOYN-W0-A6","status":"BLOCKED","revision":4}
+]

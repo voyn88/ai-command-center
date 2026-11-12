@@ -1,0 +1,10 @@
+id: VOYN-W0.5-A3
+project: aios
+title: gamma-review
+why: "Why gamma-review is needed. Target repo: `aios`."
+priority: P0
+owner: dev
+reviewer: rev
+acceptance: Measurable acceptance criterion here.
+status: READY_TO_REVIEW
+wave: "0.5"

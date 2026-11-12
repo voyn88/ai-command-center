@@ -292,7 +292,10 @@ class BacklogStore:
         once, at the moment the row is created. A later re-import of the
         same task updates the row through this same path but never restamps
         it — the row was migrated once, not once per import run."""
-        parsed = parse_backlog(text)
+        return self.import_parsed(parse_backlog(text))
+
+    def import_parsed(self, parsed: Any) -> ImportReport:
+        """Upsert an already-parsed report (Markdown or voyn-task source)."""
         report = ImportReport(unparsed=list(parsed.unparsed))
         for task in parsed.tasks:
             ok, reason, changed = self.upsert_task(task)
@@ -303,7 +306,9 @@ class BacklogStore:
             elif reason == "inserted":
                 report.inserted += 1
                 self.record_provenance(
-                    task.task_id, "markdown_import", {"line_no": task.line_no}
+                    task.task_id,
+                    "markdown_import" if task.line_no else "voyn_task_import",
+                    {"line_no": task.line_no} if task.line_no else {},
                 )
             else:
                 report.updated += 1

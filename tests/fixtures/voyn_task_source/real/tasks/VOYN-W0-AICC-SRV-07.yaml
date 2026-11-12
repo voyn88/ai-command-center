@@ -1,0 +1,13 @@
+# Мигрировано из outputs/VOYN_TASKS_BACKLOG.md скриптом tools/migrate_backlog.py. Строка оригинала: 1374.
+id: "VOYN-W0-AICC-SRV-07"
+project: "aicc"
+title: "Выполнить проверяемую миграцию текущих SQLite/JSON/JSONL данных в PostgreSQL через snapshot, checksum…"
+why: "Выполнить проверяемую миграцию текущих SQLite/JSON/JSONL данных в PostgreSQL через snapshot, checksum, deterministic import и reconciliation report."
+priority: "P0"
+owner: "Data Migration"
+reviewer: "reviewer-unassigned"
+acceptance: "counts, IDs, relations and event order совпадают; повторный импорт идемпотентен; rollback сохранён; ни одна legacy-копия не остаётся writable authority."
+status: "OPEN"
+wave: "0"
+depends_on:
+  - "VOYN-W0-AICC-SRV-01"
