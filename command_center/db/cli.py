@@ -110,6 +110,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Parse and report without touching the database.",
     )
+    vt = sub.add_parser(
+        "backlog-import-voyn-task",
+        help="Read-only stage 3: reconcile voyn-backlog (YAML definitions + "
+        "voyn_coordination state) into the store. OFF unless "
+        "AICC_VOYN_TASK_SOURCE=1; when off nothing is read.",
+    )
+    vt.add_argument(
+        "--parse-only",
+        action="store_true",
+        help="Map and report without touching the AICC database.",
+    )
     sub.add_parser("backlog-status", help="Task counts by status from the store.")
     recover = sub.add_parser(
         "backlog-recover-stuck-ready-to-review",
@@ -414,6 +425,35 @@ def main(argv: list[str] | None = None) -> int:
             print(window.quota.line())
         return 0
 
+    voyn_report = None
+    if args.command == "backlog-import-voyn-task":
+        # Before any AICC database configuration: the gate must hold on a host
+        # that has no AICC DB role, and while the flag is off NOTHING is read
+        # (no voyn-task DSN, no tasks/ directory, no psql).
+        from command_center.db import voyn_task_source
+
+        if not voyn_task_source.is_enabled():
+            print(f"voyn-task source disabled ({voyn_task_source.FLAG_ENV} is off); nothing read")
+            return 0
+        try:
+            voyn_report = voyn_task_source.load_from_voyn_task()
+        except voyn_task_source.SourceError as exc:
+            print(f"voyn-task source error: {exc}", file=sys.stderr)
+            return 1
+        print(f"mapped: {len(voyn_report.tasks)} tasks")
+        for task_id in voyn_report.unregistered:
+            print(f"UNREGISTERED {task_id}: no task_state row, status taken from YAML")
+        for task_id in voyn_report.orphan_states:
+            print(f"ORPHAN-STATE {task_id}: state without a YAML definition, ignored")
+        for task_id in voyn_report.no_wave:
+            print(f"NO-WAVE {task_id}: not imported, backlog_task.wave is required")
+        for _line, reason, excerpt in voyn_report.unparsed:
+            if reason.startswith("no wave"):
+                continue
+            print(f"UNPARSED {excerpt}: {reason}")
+        if args.parse_only:
+            return 0
+
     try:
         config = load_config()
     except ConfigError as exc:
@@ -560,6 +600,23 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"UNPARSED line {line_no}: {reason} :: {excerpt}")
                 # Refused records are a defect of the file or the vocabulary;
                 # surface them in the exit code so a timer/CI run goes red.
+                return 1 if report.refused else 0
+
+            if args.command == "backlog-import-voyn-task":
+                from command_center.db import voyn_task_source
+                from command_center.db.backlog_store import BacklogStore
+
+                report = voyn_task_source.apply_report(
+                    BacklogStore(lambda: nullcontext(conn)), voyn_report
+                )
+                print(
+                    f"inserted {report.inserted}, existing (untouched) {report.existing}, "
+                    f"dependencies {report.dependencies}, evidence {report.evidence}"
+                )
+                for task_id, name, ours, theirs in report.differences:
+                    print(f"DIFF {task_id} {name}: aicc={ours} voyn-task={theirs} (not written)")
+                for task_id, reason in report.refused:
+                    print(f"REFUSED {task_id}: {reason}")
                 return 1 if report.refused else 0
 
             if args.command == "backlog-status":

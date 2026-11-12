@@ -1,0 +1,13 @@
+# Мигрировано из outputs/VOYN_TASKS_BACKLOG.md скриптом tools/migrate_backlog.py. Строка оригинала: 1377.
+id: "VOYN-W0-AICC-SRV-08"
+project: "aicc"
+title: "Добавить metrics/logs/traces, queue lag, lease age, worker liveness, cost/resource telemetry, alerts…"
+why: "Добавить metrics/logs/traces, queue lag, lease age, worker liveness, cost/resource telemetry, alerts, encrypted backups и recovery runbook."
+priority: "P0"
+owner: "SRE"
+reviewer: "reviewer-unassigned"
+acceptance: "dashboard показывает control/worker/task/SHA/lease; alert срабатывает на потерю worker; восстановление на чистом control доказано."
+status: "OPEN"
+wave: "0"
+depends_on:
+  - "VOYN-W0-AICC-SRV-04"

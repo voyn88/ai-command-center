@@ -1,0 +1,15 @@
+# Мигрировано из outputs/VOYN_TASKS_BACKLOG.md скриптом tools/migrate_backlog.py. Строка оригинала: 1402.
+id: "VOYN-INFRA-WORKER-14"
+project: "aios"
+title: "voyn-backlog-required-ci | Добавить обязательные GitHub CI-гейты в dimastov-lab/voyn-backlog, где PR ранее…"
+why: "voyn-backlog-required-ci | Добавить обязательные GitHub CI-гейты в dimastov-lab/voyn-backlog, где PR ранее принимались только по локальным и серверным аварийным тестам."
+priority: "P0"
+owner: "Release Engineering"
+reviewer: "reviewer-unassigned"
+acceptance: "каждый PR и push в main выполняет статическую проверку Python/shell/systemd и конкурентные lease-тесты против реального PostgreSQL 17; оба check-контекста обязательны для merge, отсутствие или красный результат fail-closed."
+status: "DONE"
+wave: "0"
+depends_on: []
+evidence:
+  pr: "https://github.com/voyn88/voyn-backlog/pull/4"
+  sha: "7c9badc"

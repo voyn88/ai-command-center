@@ -1,0 +1,15 @@
+# Мигрировано из outputs/VOYN_TASKS_BACKLOG.md скриптом tools/migrate_backlog.py. Строка оригинала: 119.
+id: "VOYN-W0-G0"
+project: "aios"
+title: "Проверка нет прямого доменного доступа из UI и автопроход smoke-гейтов."
+why: "Проверка нет прямого доменного доступа из UI и автопроход smoke-гейтов."
+priority: "P0"
+owner: "Product Owner"
+reviewer: "reviewer-unassigned"
+acceptance: "`G0` в состоянии `ПРОЙТИ`."
+status: "READY_TO_REVIEW"
+wave: "0"
+gate: true
+depends_on: []
+evidence:
+  test: "ссылок на PR/коммит в тексте нет; см. строку 119 в outputs/VOYN_TASKS_BACKLOG.md"

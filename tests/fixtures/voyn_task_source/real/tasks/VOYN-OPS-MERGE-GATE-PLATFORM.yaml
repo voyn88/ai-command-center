@@ -1,0 +1,12 @@
+# Мигрировано из outputs/VOYN_TASKS_BACKLOG.md скриптом tools/migrate_backlog.py. Строка оригинала: 217.
+id: "VOYN-OPS-MERGE-GATE-PLATFORM"
+project: "aios"
+title: "Владелец запросил включение защиты ветки 2026-08-13; включить технически невозможно."
+why: "[Исходный статус в Markdown: DEFER_TO_USER; в схеме такого статуса нет] Владелец запросил включение защиты ветки 2026-08-13; включить технически невозможно. Проверено: `GET /repos/dimastov-lab/aios/branches/main/protection` → `403 Upgrade to GitHub Pro or make this repository public`; `GET /repos/dimastov-lab/aios/rulesets` → тот же 403. Права агента достаточны (`permissions.admin=true`), владелец `dimastov-lab` — личный аккаунт без Pro (`plan: n/a`), репозиторий приватный."
+priority: "P2"
+owner: "Product Owner"
+reviewer: "reviewer-unassigned"
+acceptance: "Критерий приёмки в исходном Markdown не указан; уточнить у владельца"
+status: "BLOCKED"
+wave: "0"
+depends_on: []

@@ -1,0 +1,13 @@
+# Мигрировано из outputs/VOYN_TASKS_BACKLOG.md скриптом tools/migrate_backlog.py. Строка оригинала: 1359.
+id: "VOYN-W0-AICC-SRV-02"
+project: "aicc"
+title: "Реализовать серверную аутентификацию пользователей и RBAC для UI/API"
+why: "Реализовать серверную аутентификацию пользователей и RBAC для UI/API: owner, operator, reviewer, worker-service."
+priority: "P0"
+owner: "Security Platform"
+reviewer: "reviewer-unassigned"
+acceptance: "OIDC/WebAuthn или эквивалентный production-grade вход; secure sessions, CSRF, rate limits, audit; anonymous и cross-role доступ fail-closed."
+status: "OPEN"
+wave: "0"
+depends_on:
+  - "VOYN-W0-AICC-SRV-01"
