@@ -767,10 +767,15 @@ def _fake_host(tmp_path: Path) -> dict[str, str]:
     systemctl = bin_dir / "systemctl"
     systemctl.write_text('#!/bin/sh\necho "$@" >> "$FAKE_SYSTEMCTL_LOG"\n')
     systemctl.chmod(0o755)
+    wrapper_dir = tmp_path / "interpreter"
+    wrapper_dir.mkdir()
+    wrapper = wrapper_dir / "python"
+    wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+    wrapper.chmod(0o755)
     return {
         **os.environ,
         "AICC_RELEASE_DIR": str(release),
-        "AICC_VENV_PYTHON": sys.executable,
+        "AICC_VENV_PYTHON": str(wrapper),
         "AICC_OPS_SETTINGS": str(tmp_path / "etc" / "ops-autonomy.env"),
         "AICC_OPS_STATE_DIR": str(tmp_path / "state"),
         "AICC_OPS_LOG_DIR": str(tmp_path / "logs"),
@@ -1535,7 +1540,11 @@ def _releases_layout(tmp_path: Path, base: Path | None = None) -> dict[str, str]
     (sha_dir / "command_center").symlink_to(ROOT / "command_center")
     runtime = base / "runtime-venv"
     (runtime / "bin").mkdir(parents=True)
-    (runtime / "bin" / "python").symlink_to(sys.executable)
+    # a wrapper inside the sandbox: the installer follows links, and the real
+    # interpreter (a CI toolcache, a Homebrew cellar) is not ours to own
+    wrapper = runtime / "bin" / "python"
+    wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+    wrapper.chmod(0o755)
     (sha_dir / ".venv").symlink_to(runtime)
     (base / "current").symlink_to(sha_dir)
     env.pop("PYTHONPATH")
