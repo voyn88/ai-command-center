@@ -17,6 +17,10 @@ import pytest
 from command_center.db.config import load_config
 from command_center.ops.credential_rotation import (
     CREDENTIAL_SAFETY_MARGIN_SECONDS,
+    DEFAULT_ROLLOUT_LOCK_PATH,
+    DEFAULT_ROLLOUT_LOCK_POLL_SECONDS,
+    DEFAULT_ROLLOUT_LOCK_WAIT_SECONDS,
+    ROLLOUT_LOCK_WAIT_EXPIRED_EXIT,
     SELF_CREDENTIAL_TTL_SECONDS,
     SYSTEMD_EXIT_MARGIN_SECONDS,
     Audit,
@@ -1134,42 +1138,152 @@ def test_missing_environment_is_audited_nonzero_not_silently_skipped(
     assert "cannot read credential file" in output
 
 
-def test_cli_defers_to_a_staged_rollout_without_touching_the_controller(
-    tmp_path: Path, monkeypatch, capsys
+class _RolloutLockClock:
+    """Fake monotonic clock whose sleep() advances time and releases the
+    staged-rollout marker once ``release_after`` seconds have passed."""
+
+    def __init__(self, lock: Path, release_after: float | None) -> None:
+        self.lock = lock
+        self.release_after = release_after
+        self.now = 1000.0
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        assert seconds > 0
+        self.sleeps.append(seconds)
+        self.now += seconds
+        if self.release_after is not None and self.now - 1000.0 >= self.release_after:
+            self.lock.unlink(missing_ok=True)
+
+
+def _rollout_lock_argv(tmp_path: Path, monkeypatch, lock: Path) -> list[str]:
+    return [
+        "--env-file",
+        str(_environment(tmp_path / "worker.env")),
+        "--lock-file",
+        str(tmp_path / "rotation.lock"),
+        "--phase-file",
+        str(tmp_path / "phase.json"),
+        "--circuit-file",
+        str(tmp_path / "circuit.json"),
+        "--tunnel-unit",
+        TUNNEL,
+        "--lane-registry",
+        str(_lane_registry(tmp_path, monkeypatch)),
+        "--rollout-lock",
+        str(lock),
+    ]
+
+
+def _events(output: str) -> list[dict]:
+    return [json.loads(line) for line in output.splitlines() if line.startswith("{")]
+
+
+@pytest.mark.parametrize("held_seconds", [5.0, 125.0, 299.0])
+def test_cli_waits_out_a_held_rollout_lock_and_rotates_in_the_same_run(
+    tmp_path: Path, monkeypatch, capsys, held_seconds: float
 ) -> None:
-    """A rotation tick that fires while the staged rollout holds the lock
-    must defer -- exit 0, audited, no controller mutation -- not race the
-    rollout's own lane stop/start (live worker-01 2026-09-08)."""
+    """The worker release deploy holds the marker ~5 s on every idle check
+    and ~125 s while lanes are down. A tick that lands inside either must
+    rotate once the marker clears, not exit and lose its timer period
+    (worker-01 credential expiry, 2026-11-10)."""
     lock = tmp_path / "aicc-staged-rollout.lock"
     lock.write_text("12345\n", encoding="utf-8")
+    clock = _RolloutLockClock(lock, release_after=held_seconds)
+    rotated: list[bool] = []
+
+    def rotate(self) -> None:
+        assert not lock.exists(), "rotate() must not run under the rollout lock"
+        rotated.append(True)
+
+    monkeypatch.setattr(RotationController, "rotate", rotate)
+    result = main(
+        _rollout_lock_argv(tmp_path, monkeypatch, lock),
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+
+    assert result == 0
+    assert rotated == [True]
+    events = _events(capsys.readouterr().out)
+    names = [event["event"] for event in events]
+    assert "rotation_deferred_staged_rollout" not in names
+    assert "rotation_staged_rollout_wait_expired" not in names
+    assert names[0] == "rotation_waiting_staged_rollout"
+    cleared = next(e for e in events if e["event"] == "rotation_staged_rollout_cleared")
+    assert held_seconds <= cleared["waited"] < held_seconds + 5.0
+    assert max(clock.sleeps) <= 5.0, "the marker is polled at the short interval"
+
+
+def test_cli_exits_nonzero_when_the_rollout_lock_outlasts_the_wait(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """A marker that never clears ends the tick WITHOUT rotating, but loudly:
+    a dedicated event carrying the waited duration and a non-zero exit so
+    Restart=on-failure retries -- never the old silent exit 0. The failure
+    circuit is untouched: no controller ran, nothing failed against the
+    database."""
+    lock = tmp_path / "aicc-staged-rollout.lock"
+    lock.write_text("12345\n", encoding="utf-8")
+    clock = _RolloutLockClock(lock, release_after=None)
 
     def fail(self) -> None:
         raise AssertionError("rotate() must not run while the rollout lock is held")
 
     monkeypatch.setattr(RotationController, "rotate", fail)
+    monkeypatch.setattr(RotationController, "record_failure", fail)
     result = main(
-        [
-            "--env-file",
-            str(_environment(tmp_path / "worker.env")),
-            "--lock-file",
-            str(tmp_path / "rotation.lock"),
-            "--phase-file",
-            str(tmp_path / "phase.json"),
-            "--circuit-file",
-            str(tmp_path / "circuit.json"),
-            "--tunnel-unit",
-            TUNNEL,
-            "--lane-registry",
-            str(_lane_registry(tmp_path, monkeypatch)),
-            "--rollout-lock",
-            str(lock),
-        ]
+        _rollout_lock_argv(tmp_path, monkeypatch, lock),
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
     )
 
-    assert result == 0
-    output = capsys.readouterr().out
-    assert '"event":"rotation_deferred_staged_rollout"' in output
-    assert str(lock) in output
+    assert result == ROLLOUT_LOCK_WAIT_EXPIRED_EXIT
+    assert result not in (0, 78), "retried by Restart=on-failure, not parked"
+    events = _events(capsys.readouterr().out)
+    names = [event["event"] for event in events]
+    assert names == [
+        "rotation_waiting_staged_rollout",
+        "rotation_staged_rollout_wait_expired",
+    ]
+    expired = events[-1]
+    assert expired["lock"] == str(lock)
+    assert expired["waited"] == DEFAULT_ROLLOUT_LOCK_WAIT_SECONDS == 300.0
+    assert expired["timeout"] == 300.0
+    assert clock.now - 1000.0 == 300.0, "the wait is bounded, never longer"
+    assert lock.exists()
+    assert not (tmp_path / "circuit.json").exists(), "circuit must not count this"
+    assert not (tmp_path / "phase.json").exists()
+
+
+def test_cli_rollout_lock_wait_is_configurable_and_validated(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    lock = tmp_path / "aicc-staged-rollout.lock"
+    lock.write_text("12345\n", encoding="utf-8")
+    clock = _RolloutLockClock(lock, release_after=None)
+    monkeypatch.setattr(
+        RotationController,
+        "rotate",
+        lambda self: pytest.fail("rotate() must not run under the rollout lock"),
+    )
+    argv = _rollout_lock_argv(tmp_path, monkeypatch, lock)
+
+    result = main(
+        [*argv, "--rollout-lock-wait", "12", "--rollout-lock-poll", "5"],
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+    assert result == ROLLOUT_LOCK_WAIT_EXPIRED_EXIT
+    assert clock.sleeps == [5.0, 5.0, 2.0]
+    capsys.readouterr()
+
+    for bad in (["--rollout-lock-wait", "-1"], ["--rollout-lock-poll", "0"]):
+        assert main([*argv, *bad], monotonic=clock.monotonic, sleep=clock.sleep) == 78
+        assert '"event":"rotation_refused"' in capsys.readouterr().out
 
 
 def test_cli_recover_only_ignores_the_rollout_lock(
@@ -1200,18 +1314,24 @@ def test_cli_recover_only_ignores_the_rollout_lock(
             "--rollout-lock",
             str(lock),
             "--recover-only",
-        ]
+        ],
+        sleep=lambda seconds: pytest.fail("recovery must not wait for the lock"),
     )
 
     assert result == 0
     output = capsys.readouterr().out
     assert '"event":"rotation_deferred_staged_rollout"' not in output
+    assert "staged_rollout" not in output
+    assert lock.exists()
 
 
 def test_cli_proceeds_when_no_rollout_is_in_progress(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
-    monkeypatch.setattr(RotationController, "rotate", lambda self: None)
+    rotated: list[bool] = []
+    monkeypatch.setattr(
+        RotationController, "rotate", lambda self: rotated.append(True)
+    )
 
     result = main(
         [
@@ -1229,11 +1349,13 @@ def test_cli_proceeds_when_no_rollout_is_in_progress(
             str(_lane_registry(tmp_path, monkeypatch)),
             "--rollout-lock",
             str(tmp_path / "no-such-lock"),
-        ]
+        ],
+        sleep=lambda seconds: pytest.fail("a free lock must not cause any wait"),
     )
 
     assert result == 0
-    assert '"event":"rotation_deferred_staged_rollout"' not in capsys.readouterr().out
+    assert rotated == [True]
+    assert "staged_rollout" not in capsys.readouterr().out
 
 
 def test_environment_update_preserves_unrelated_lines_and_mode(tmp_path: Path) -> None:
@@ -1361,7 +1483,18 @@ def test_versioned_units_pin_drain_shutdown_and_non_overlapping_timer(
     complete_rotation = (
         2 * prerequisite_timeout + 3 * authority_timeout + safe_post_rotation
     )
-    assert systemd_timeout >= controller_timeout + SYSTEMD_EXIT_MARGIN_SECONDS
+    rollout_lock_wait = option("--rollout-lock-wait")
+    assert rollout_lock_wait == DEFAULT_ROLLOUT_LOCK_WAIT_SECONDS == 300.0
+    assert option("--rollout-lock-poll") == DEFAULT_ROLLOUT_LOCK_POLL_SECONDS == 5.0
+    assert argv[argv.index("--rollout-lock") + 1] == str(DEFAULT_ROLLOUT_LOCK_PATH)
+    # The marker wait happens before the controller's own deadline starts.
+    assert systemd_timeout >= (
+        rollout_lock_wait + controller_timeout + SYSTEMD_EXIT_MARGIN_SECONDS
+    )
+    assert "ExecCondition" not in lines, (
+        "a skipped ExecCondition is a silent exit 0 that is not retried until "
+        "the next timer period; ExecStart waits for the rollout marker itself"
+    )
     assert controller_timeout >= complete_rotation
     assert SELF_CREDENTIAL_TTL_SECONDS >= authority_timeout + safe_post_rotation
     assert (
@@ -1386,18 +1519,50 @@ def test_versioned_units_pin_drain_shutdown_and_non_overlapping_timer(
         "GRANT EXECUTE ON FUNCTION identity_current_credential(text) TO aicc_worker"
         in (expiry_migration)
     )
-    assert "OnUnitInactiveSec=25min" in timer
+    timer_lines = _directives(timer)
+    assert timer_lines["OnUnitInactiveSec"] == ["8min"]
+    assert timer_lines["RandomizedDelaySec"] == ["60s"]
+    assert timer_lines["AccuracySec"] == ["15s"]
     rotation_threshold = option("--rotation-threshold")
     retry_window = option("--failure-retry-window")
     retry_attempts = int(option("--circuit-failure-threshold"))
     failed_pre_mutation = 2 * prerequisite_timeout + 2 * authority_timeout
-    assert retry_window >= retry_attempts * 120, (
+    restart_delay = 120
+    assert lines["RestartSec"] == ["2min"]
+    assert retry_window >= retry_attempts * restart_delay, (
         "retry window must include every two-minute RestartSec delay"
     )
-    normal_delay = 25 * 60
-    timer_slack = 60 + 15
-    remaining_at_next_tick = SELF_CREDENTIAL_TTL_SECONDS - normal_delay - timer_slack
-    assert remaining_at_next_tick <= rotation_threshold
+    # Longest gap between the service going inactive and the next tick.
+    tick_period = 8 * 60 + 60 + 15
+    # The tick is a check, not a rotation: a tick on a fresh credential is
+    # above the threshold and defers (rotation_deferred_not_due), so the
+    # short cadence does not rotate more often than the threshold allows.
+    assert SELF_CREDENTIAL_TTL_SECONDS - tick_period > rotation_threshold
+    # Ticks are closer together than the due window is wide, so the first
+    # tick at or below the threshold still has at least this much lifetime.
+    first_due_remaining = rotation_threshold - tick_period
+    minimum_attempt = (
+        prerequisite_timeout + 2 * authority_timeout + CREDENTIAL_SAFETY_MARGIN_SECONDS
+    )
+    # From that first due tick, every failed pre-mutation attempt at its full
+    # timeout plus the restart delays between them still ends before the
+    # credential's safety margin. (A full marker wait on top of three such
+    # failures is NOT covered by this bound; the lost-tick case below is.)
+    assert (
+        retry_attempts * failed_pre_mutation
+        + (retry_attempts - 1) * restart_delay
+        + CREDENTIAL_SAFETY_MARGIN_SECONDS
+        <= first_due_remaining
+    )
+    # Worst case from the 2026-11-10 expiry: the first due tick is lost
+    # ENTIRELY -- it waits the full marker timeout, does nothing, and is not
+    # retried -- and the following tick arrives a full period later. That
+    # tick must still clear the controller's minimum-lifetime gate (500 s
+    # with the deployed 40 s authority timeout). At the old 25-minute cadence
+    # this left 450-540 s: a coin flip.
+    after_one_lost_tick = first_due_remaining - rollout_lock_wait - tick_period
+    assert after_one_lost_tick >= minimum_attempt
+    assert after_one_lost_tick >= 500.0
     assert (
         retry_attempts * failed_pre_mutation
         + retry_window

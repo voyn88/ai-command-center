@@ -33,6 +33,7 @@ from pathlib import Path
 from command_center.runtime.db import (
     TERMINAL_STATES,
     connect,
+    free_page_ratio,
     retention_cutoff,
     transaction,
 )
@@ -85,10 +86,24 @@ def archive_and_prune(
     retention_days: int,
     archive_dir: Path,
     vacuum: bool = False,
+    vacuum_free_ratio: float | None = None,
 ) -> dict:
-    """Run the full sequence against `db_path` and return a truthful report."""
+    """Run the full sequence against `db_path` and return a truthful report.
+
+    `vacuum=True` always reclaims disk afterward. `vacuum_free_ratio` is the
+    threshold alternative for a scheduled/unattended run: VACUUM only fires
+    when the post-prune freelist share of the file (see `db.free_page_ratio`)
+    is at or above it, so an archive run against a database that is not
+    meaningfully bloated does not pay for a full exclusive-lock rewrite
+    (VOYN-W0-AICC-RUNTIME-DB-BLOAT). `vacuum=True` takes precedence when both
+    are given.
+    """
     if retention_days <= 0:
         raise MaintenanceError("retention_days must be positive")
+    if vacuum_free_ratio is not None and not (0 < vacuum_free_ratio <= 1):
+        raise MaintenanceError(
+            "vacuum_free_ratio must be greater than 0 and at most 1"
+        )
     db_path = Path(db_path)
     archive_dir = Path(archive_dir)
     stamp = _timestamp()
@@ -135,7 +150,16 @@ def archive_and_prune(
     if not integrity:
         raise MaintenanceError("integrity_check failed after prune")
 
-    if vacuum:
+    free_ratio_after_prune = None
+    ran_vacuum = bool(vacuum)
+    if not ran_vacuum and vacuum_free_ratio is not None:
+        free_ratio_after_prune = free_page_ratio(db_path)
+        ran_vacuum = (
+            free_ratio_after_prune is not None
+            and free_ratio_after_prune >= vacuum_free_ratio
+        )
+
+    if ran_vacuum:
         with sqlite3.connect(db_path) as conn:
             conn.execute("VACUUM")
 
@@ -151,7 +175,9 @@ def archive_and_prune(
         "archived_events": archived,
         "pruned_events": archived,
         "integrity_check": "ok",
-        "vacuum": bool(vacuum),
+        "vacuum": ran_vacuum,
+        "vacuum_free_ratio": vacuum_free_ratio,
+        "free_page_ratio_before_vacuum": free_ratio_after_prune,
     }
 
 
@@ -161,6 +187,7 @@ def rehearse(
     retention_days: int,
     archive_dir: Path,
     vacuum: bool = False,
+    vacuum_free_ratio: float | None = None,
 ) -> dict:
     """Run the identical sequence against a copy; prove the original intact."""
     db_path = Path(db_path)
@@ -175,6 +202,7 @@ def rehearse(
             retention_days=retention_days,
             archive_dir=archive_dir,
             vacuum=vacuum,
+            vacuum_free_ratio=vacuum_free_ratio,
         )
     finally:
         after = hashlib.sha256(db_path.read_bytes()).hexdigest()

@@ -80,8 +80,10 @@ one is, it is an additive, reviewed change to that existing module, not a fork o
 **Dependencies**: D1 complete (shell, navigation, theming).
 
 **Acceptance criteria**: every item in `WORKSPACE_HOME_SPEC.md` §15's edge-state table renders
-correctly, including the all-six-projects-unconfigured default; the dual-layer BANK/LEGAL
-redaction regression (`WORKSPACE_HOME_SPEC.md` §10) passes; manual refresh (§12) works via a
+correctly, including the default in which every canonical-registry project is unconfigured, as
+recorded in [ADR 0009](../adr/0009-canonical-project-registry-and-validating-task-import.md);
+the dual-layer BANK/LEGAL redaction regression (`WORKSPACE_HOME_SPEC.md` §10) passes; manual
+refresh (§12) works via a
 `QThreadPool` worker with no GUI-thread blocking; `task_count` is labeled "Tasks" (never
 "Kanban"/"Open tasks," per `WORKSPACE_HOME_SPEC.md` §11); loading/stale-data indication (§13/§14
 of `WORKSPACE_HOME_SPEC.md`) is visible.

@@ -18,4 +18,4 @@ export const statusNames: Record<string, string> = {
   DECIDED: 'Решение принято', NEEDS_REFINEMENT: 'Нужно уточнить',
   UNTRIAGED: 'Новая задача', SPLIT: 'Разделено на задачи', 'PO-Approved': 'Одобрено',
 }
-export const statusName = (status: string) => statusNames[status] || status
+export const statusName = (status: string) => statusNames[status] || 'Статус уточняется'

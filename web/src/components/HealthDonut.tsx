@@ -2,12 +2,13 @@ type HealthDonutProps = {
   healthy: number
   total: number
   size?: number
+  label?: string
 }
 
 // Pure SVG stroke-dasharray donut rendering the REAL workspace rollup
 // (`health.projects_healthy` / `health.projects_total`) — never the
 // fabricated 94%-style per-dimension score from the original mockup.
-export default function HealthDonut({ healthy, total, size = 120 }: HealthDonutProps) {
+export default function HealthDonut({ healthy, total, size = 120, label }: HealthDonutProps) {
   const percent = total > 0 ? Math.round((healthy / total) * 100) : 0
   const stroke = 10
   const radius = (size - stroke) / 2
@@ -15,7 +16,7 @@ export default function HealthDonut({ healthy, total, size = 120 }: HealthDonutP
   const dash = (percent / 100) * circumference
 
   return (
-    <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} role="img" aria-label={`${percent}%`}>
+    <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} role="img" aria-label={label ?? `${percent}%`}>
       <circle cx={size / 2} cy={size / 2} r={radius} fill="none" stroke="var(--gline)" strokeWidth={stroke} />
       <circle
         cx={size / 2}

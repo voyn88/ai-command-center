@@ -235,7 +235,7 @@ condition:
 | Invalid path | `repository_state == "invalid_path"` | §3 — "Path no longer valid" badge |
 | Non-git repository | `repository_state == "not_git_repo"` | §3 — "Not a git repository" badge |
 | Detached HEAD | `git_info`'s `"(detached HEAD)"` branch string | §4 — rendered verbatim in the `WorktreeRow`'s branch field |
-| Empty install (all six projects unconfigured) | the default fresh-checkout state (`WORKSPACE_HOME_ARCHITECTURE.md` §7.1) | Every `ProjectCard` shows "Not configured"; this is the **primary** scenario the page must be verified against, not a fallback edge case |
+| Empty install (every project in the canonical registry unconfigured; [ADR 0009](../adr/0009-canonical-project-registry-and-validating-task-import.md)) | the default fresh-checkout state (`WORKSPACE_HOME_ARCHITECTURE.md` §7.1) | Every `ProjectCard` shows "Not configured"; this is the **primary** scenario the page must be verified against, not a fallback edge case |
 | Per-project failure isolation | `build_workspace_home_snapshot`'s per-project loop already isolates each project's data gathering | One project's git-discovery or report-join failure must not raise past its own `ProjectCard`/section — every other project's cards and sections render normally. Verified by the native page's own test suite injecting a single-project failure into a multi-project scenario. |
 
 ## 16. Non-goals for this spec
