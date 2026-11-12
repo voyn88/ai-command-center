@@ -1,0 +1,11 @@
+id: VOYN-W0-A1
+project: aicc
+title: alpha-open
+why: Why alpha-open is needed.
+priority: P0
+owner: dev
+reviewer: rev
+acceptance: Measurable acceptance criterion here.
+status: OPEN
+wave: "0"
+

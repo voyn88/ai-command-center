@@ -1,0 +1,11 @@
+id: VOYN-W0-A6
+project: aicc
+title: zeta-blocked
+why: Why zeta-blocked is needed.
+priority: P1
+owner: dev
+reviewer: rev
+acceptance: Measurable acceptance criterion here.
+status: OPEN
+wave: "0"
+

@@ -1,0 +1,11 @@
+id: VOYN-COM-A4
+project: other
+title: delta-done
+why: Why delta-done is needed.
+priority: P2
+owner: dev
+reviewer: rev
+acceptance: Measurable acceptance criterion here.
+status: DONE
+wave: "COM"
+

@@ -1,0 +1,11 @@
+id: VOYN-W0-A2
+project: crm
+title: beta-progress
+why: Why beta-progress is needed.
+priority: P1
+owner: dev
+reviewer: rev
+acceptance: Measurable acceptance criterion here.
+status: IN_PROGRESS
+wave: "0"
+
