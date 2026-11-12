@@ -220,7 +220,7 @@ def queue_shape(repo: str, runner: Runner) -> dict[str, Any] | None:
             if stamp:
                 parsed = time.mktime(time.strptime(stamp[:19], "%Y-%m-%dT%H:%M:%S"))
                 shape["last_merge_age_min"] = max(0, int((time.time() - parsed) / 60))
-        except ValueError, KeyError, IndexError, TypeError:
+        except (ValueError, KeyError, IndexError, TypeError):
             pass
     return shape
 
@@ -287,7 +287,7 @@ def collect(
         doc["load1"] = float(reader("/proc/loadavg").split()[0])
         doc["mem_available_mb"] = _meminfo_available_mb(reader("/proc/meminfo"))
         doc["uptime_days"] = round(float(reader("/proc/uptime").split()[0]) / 86400, 1)
-    except OSError, ValueError, IndexError:
+    except (OSError, ValueError, IndexError):
         doc.setdefault("load1", None)
     doc["units"] = {unit: unit_state(unit, runner) for unit in units}
     doc["failed_units"] = failed_unit_count(runner)

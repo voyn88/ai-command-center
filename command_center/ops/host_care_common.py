@@ -133,7 +133,7 @@ def dry_run_value_is_unclear(value: str | None) -> bool:
 def as_int(value: str | None, default: int) -> int:
     try:
         return int(str(value).strip())
-    except TypeError, ValueError:
+    except (TypeError, ValueError):
         return default
 
 
@@ -212,7 +212,7 @@ class StateFile:
     def load(self) -> dict[str, Any]:
         try:
             loaded = json.loads(self.path.read_text(encoding="utf-8"))
-        except OSError, ValueError:
+        except (OSError, ValueError):
             return {}
         return loaded if isinstance(loaded, dict) else {}
 

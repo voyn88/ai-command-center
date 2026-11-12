@@ -83,7 +83,7 @@ def tailscale_backend_state(runner: Runner) -> str | None:
         return None
     try:
         state = json.loads(out).get("BackendState")
-    except ValueError, AttributeError:
+    except (ValueError, AttributeError):
         return None
     return state if isinstance(state, str) else None
 

@@ -210,7 +210,7 @@ def is_protected(path: Path) -> bool:
 def _inside(path: Path, root: Path) -> bool:
     try:
         path.resolve().relative_to(root.resolve())
-    except ValueError, OSError:
+    except (ValueError, OSError):
         return False
     return True
 
@@ -375,7 +375,7 @@ def _git(path: Path, args: list[str], runner: Runner) -> str | None:
     if os.geteuid() == 0:
         try:
             owner = pwd.getpwuid(path.lstat().st_uid).pw_name
-        except KeyError, OSError:
+        except (KeyError, OSError):
             return None
         if owner == "root":
             return None
@@ -594,7 +594,7 @@ def referenced_blobs(models_dir: Path) -> set[str] | None:
                 if digest.startswith("sha256:"):
                     names.add("sha256-" + digest.split(":", 1)[1])
                     named += 1
-        except OSError, ValueError, TypeError:
+        except (OSError, ValueError, TypeError):
             return None
         if named == 0:
             # a manifest that names nothing is not a manifest we understand;
