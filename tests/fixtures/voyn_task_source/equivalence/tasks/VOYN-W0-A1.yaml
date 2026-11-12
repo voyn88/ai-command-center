@@ -1,7 +1,7 @@
 id: VOYN-W0-A1
 project: aicc
 title: alpha-open
-why: Why alpha-open is needed.
+why: "Why alpha-open is needed. Target repo: `ai-command-center`."
 priority: P0
 owner: dev
 reviewer: rev

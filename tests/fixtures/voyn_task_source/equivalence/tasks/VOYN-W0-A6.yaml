@@ -1,7 +1,7 @@
 id: VOYN-W0-A6
 project: aicc
 title: zeta-blocked
-why: Why zeta-blocked is needed.
+why: "Why zeta-blocked is needed. Target repo: `ai-command-center`."
 priority: P1
 owner: dev
 reviewer: rev

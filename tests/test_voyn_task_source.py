@@ -238,18 +238,23 @@ def test_evidence_mapping_and_db_evidence_wins():
     states = {"VOYN-X-2": {"task_id": "VOYN-X-2", "status": "DONE", "revision": 1,
                            "evidence": {"pr": "#99", "test": "db proof"}}}
     report = src.build_report(defs, states)
-    assert report.evidence["VOYN-X-1"] == (("pr", "#1"), ("sha", "abcdef1"), ("acceptance", "yaml proof"))
-    assert report.evidence["VOYN-X-2"] == (("pr", "#99"), ("acceptance", "db proof"))
+    assert report.evidence["VOYN-X-1"] == (("acceptance", "pr: #1"), ("sha", "abcdef1"), ("acceptance", "yaml proof"))
+    assert report.evidence["VOYN-X-2"] == (("acceptance", "pr: #99"), ("acceptance", "db proof"))
 
 
 class _FakeStore:
-    def __init__(self):
+    def __init__(self, existing=None):
         self.calls = []
+        self.existing = existing or {}
+
+    def get_task(self, task_id):
+        return self.existing.get(task_id)
 
     def import_parsed(self, parsed):
         from command_center.db.backlog_store import ImportReport
 
         self.calls.append(("import", len(parsed.tasks)))
+        self.imported = [t.task_id for t in parsed.tasks]
         return ImportReport(inserted=len(parsed.tasks))
 
     def add_dependency(self, task_id, dep):
@@ -270,7 +275,7 @@ def test_apply_report_writes_tasks_then_dependencies_then_evidence():
     assert kinds.index("dep") > 0 and "ev" in kinds
     assert max(i for i, k in enumerate(kinds) if k == "dep") < min(i for i, k in enumerate(kinds) if k == "ev")
     assert ("dep", "VOYN-W0-AICC-SRV-G0", "VOYN-W0-AICC-SRV-01") in store.calls
-    assert ("ev", "VOYN-OPS-CI-MANDATORY-GATES", "pr", "#229") in store.calls
+    assert ("ev", "VOYN-OPS-CI-MANDATORY-GATES", "acceptance", "pr: #229") in store.calls
     assert result.refused == [] or all("not in the mapped set" in r for _t, r in result.refused)
 
 
@@ -314,3 +319,125 @@ def test_real_backlog_all_tasks_accounted_for():
     assert set(report.no_wave) <= reported
     for task_id, deps in report.dependencies.items():
         assert set(deps) <= set(defs)
+
+
+# ---- review blockers: repo routing, existing rows untouched, psql hardening
+
+SLICE = ROOT / "real_slice.json"
+
+
+def _slice_defs():
+    rows = json.loads(SLICE.read_text(encoding="utf-8"))
+    return {
+        r["id"]: {
+            "id": r["id"], "project": r["project"], "status": r["status"], "wave": r["wave"],
+            "priority": "P1", "title": r["id"], "depends_on": r["depends_on"], "gate": r["gate"],
+        }
+        for r in rows
+    }
+
+
+def test_slice_covers_all_real_tasks_without_loss():
+    defs = _slice_defs()
+    assert len(defs) == 647
+    report = src.build_report(defs, {})
+    assert len(report.tasks) == 640 and len(report.no_wave) == 7
+    assert {t.task_id for t in report.tasks} | set(report.no_wave) == set(defs)
+    mapped = {t.task_id for t in report.tasks}
+    for task_id, deps in report.dependencies.items():
+        assert set(deps) <= set(defs)
+        assert task_id in mapped
+
+
+def test_repo_follows_the_markdown_family_rule_not_yaml_project():
+    from command_center.db.backlog_parser import infer_repo
+
+    defs = _slice_defs()
+    report = src.build_report(defs, {})
+    for t in report.tasks:
+        assert t.repo == infer_repo(t.task_id)
+    # the coarse YAML ``project`` would route differently for most tasks:
+    # that is exactly what the adapter must not use
+    coarse = {"aicc": "ai-command-center", "crm": "voyn-logistics-crm", "aios": "aios"}
+    assert sum(1 for t in report.tasks if coarse.get(defs[t.task_id]["project"]) != t.repo) > 100
+
+
+def test_target_repo_hint_in_text_wins():
+    defs = {"VOYN-OPS-X-1": {"id": "VOYN-OPS-X-1", "wave": "0", "status": "OPEN", "title": "t",
+                             "priority": "P1", "project": "aios",
+                             "why": "Target repo: `some-repo`."}}
+    assert src.build_report(defs, {}).tasks[0].repo == "some-repo"
+
+
+def test_existing_rows_are_not_rewritten_and_differences_are_reported():
+    report = _real()
+    by_id = {t.task_id: t for t in report.tasks}
+    t = by_id["VOYN-W0-AICC-SRV-01"]
+    existing = {
+        t.task_id: {"task_id": t.task_id, "wave": t.wave, "priority": t.priority,
+                    "status": "DEFER_TO_USER", "kind": t.kind, "title": "slug", "repo": "other-repo",
+                    "revision": 5},
+    }
+    store = _FakeStore(existing)
+    result = src.apply_report(store, report)
+    assert t.task_id not in store.imported  # never upserted
+    assert len(store.imported) == len(report.tasks) - 1
+    assert result.existing == 1 and result.inserted == len(report.tasks) - 1
+    fields = {(i, f) for i, f, *_ in result.differences}
+    assert (t.task_id, "status") in fields and (t.task_id, "repo") in fields
+    assert (t.task_id, "wave") not in fields
+    assert not any(f == "title" for _i, f, *_ in result.differences)
+
+
+def test_cli_prints_differences(monkeypatch, capsys):
+    import contextlib
+
+    monkeypatch.setenv(src.FLAG_ENV, "1")
+    monkeypatch.setenv(src.TASKS_DIR_ENV, str(REAL))
+    monkeypatch.setattr(src, "fetch_states_psql", lambda env=None: {})
+    t = _real().tasks[0]
+    store = _FakeStore({t.task_id: {"status": "UNTRIAGED", "repo": t.repo, "wave": t.wave,
+                                     "priority": t.priority, "kind": t.kind}})
+    monkeypatch.setattr(cli, "load_config", lambda: object())
+    monkeypatch.setattr(cli.pool, "open_pool", lambda c: None)
+    monkeypatch.setattr(cli.pool, "close_pool", lambda: None, raising=False)
+    monkeypatch.setattr(cli.pool, "connection", lambda: contextlib.nullcontext(object()))
+    import command_center.db.backlog_store as bs
+
+    monkeypatch.setattr(bs, "BacklogStore", lambda factory: store)
+    cli.main(["backlog-import-voyn-task"])
+    out = capsys.readouterr().out
+    assert f"DIFF {t.task_id} status: aicc=UNTRIAGED" in out and "(not written)" in out
+
+
+@pytest.mark.parametrize(
+    "dsn",
+    [
+        "postgresql://u:pw%21@h:5432/d",
+        "postgresql://u@h/d?password=pw!&sslmode=require",
+        "host=h port=5432 dbname=d user=u password=pw!",
+    ],
+)
+def test_password_never_in_argv(dsn):
+    target, env = src._psql_target(dsn)
+    assert "pw" not in target
+    assert env == {"PGPASSWORD": "pw!"}
+
+
+def test_child_env_drops_inherited_pg_and_is_read_only(monkeypatch):
+    for k in ("PGPASSWORD", "PGHOST", "PGSERVICE", "VOYN_TASK_DSN"):
+        monkeypatch.setenv(k, "leak")
+    env = src._child_env({}, {"PGPASSWORD": "mine"})
+    assert env["PGPASSWORD"] == "mine"
+    assert "PGHOST" not in env and "PGSERVICE" not in env and "VOYN_TASK_DSN" not in env
+    assert "default_transaction_read_only=on" in env["PGOPTIONS"]
+
+
+def test_pr_evidence_only_when_full_github_url():
+    defs = {"VOYN-X-1": {"id": "VOYN-X-1", "wave": "0", "status": "OPEN", "title": "t", "priority": "P1",
+                         "evidence": {"pr": "#229", "sha": "10fc48f"}},
+            "VOYN-X-2": {"id": "VOYN-X-2", "wave": "0", "status": "OPEN", "title": "t", "priority": "P1",
+                         "evidence": {"pr": "https://github.com/o/r/pull/7"}}}
+    report = src.build_report(defs, {})
+    assert report.evidence["VOYN-X-1"] == (("acceptance", "pr: #229"), ("sha", "10fc48f"))
+    assert report.evidence["VOYN-X-2"] == (("pr", "https://github.com/o/r/pull/7"),)

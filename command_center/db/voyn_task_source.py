@@ -71,19 +71,21 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import subprocess
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qsl, unquote, urlencode, urlsplit
 
-from command_center.db.backlog_parser import ParsedTask, ParseReport
+from command_center.db.backlog_parser import ParsedTask, ParseReport, infer_repo
 
 __all__ = [
     "FLAG_ENV",
     "STATUS_MAP",
     "SourceError",
+    "ApplyResult",
     "SourceReport",
     "apply_report",
     "effective_reviewer",
@@ -106,14 +108,9 @@ STATUS_MAP: dict[str, str] = {
     "BLOCKED": "NEEDS_REFINEMENT",
 }
 
-#: voyn-task ``project`` -> AICC ``repo`` (the value the Markdown path infers
-#: from the id family or a ``Target repo`` hint). Unknown projects map to None:
-#: unrouted and visible, never guessed.
-REPO_BY_PROJECT: dict[str, str | None] = {
-    "aicc": "ai-command-center",
-    "crm": "voyn-logistics-crm",
-    "aios": "aios",
-}
+_PR_URL = re.compile(
+    r"^https://github\.com/[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+/pull/[1-9][0-9]*$"
+)
 
 _WAVE = re.compile(r"^[0-9]+(?:\.[0-9]+)?$|^(?:COM|WOW|AICOS|W1|W7|P1|P0\.5)$")
 _PRIORITY = re.compile(r"^P[0-9]$")
@@ -174,20 +171,56 @@ def load_definitions(tasks_dir: Path) -> dict[str, dict[str, Any]]:
 # ------------------------------------------------------------------------ state
 
 def _psql_target(dsn: str) -> tuple[str, dict[str, str]]:
-    """Return (argv-safe DSN, extra env). A URL password goes to PGPASSWORD."""
+    """Return (argv-safe DSN, extra env). A password never stays in argv:
+    URL userinfo, URL ``?password=`` and key=value ``password=`` all move to
+    ``PGPASSWORD``."""
     env: dict[str, str] = {}
-    target = dsn
     if dsn.startswith(("postgresql://", "postgres://")):
         parts = urlsplit(dsn)
-        if parts.password:
-            env["PGPASSWORD"] = unquote(parts.password)
-            host = parts.hostname or ""
-            if ":" in host:
-                host = f"[{host}]"
-            user = f"{parts.username}@" if parts.username else ""
-            port = f":{parts.port}" if parts.port else ""
-            target = parts._replace(netloc=f"{user}{host}{port}").geturl()
-    return target, env
+        query = parse_qsl(parts.query, keep_blank_values=True)
+        pw = unquote(parts.password) if parts.password else None
+        kept = []
+        for key, value in query:
+            if key.lower() == "password":
+                pw = value
+            else:
+                kept.append((key, value))
+        host = parts.hostname or ""
+        if ":" in host:
+            host = f"[{host}]"
+        user = f"{parts.username}@" if parts.username else ""
+        port = f":{parts.port}" if parts.port else ""
+        target = parts._replace(netloc=f"{user}{host}{port}", query=urlencode(kept)).geturl()
+        if pw:
+            env["PGPASSWORD"] = pw
+        return target, env
+    # key=value conninfo
+    try:
+        words = shlex.split(dsn)
+    except ValueError as exc:
+        raise SourceError("DSN is not a valid conninfo string") from exc
+    kept_words = []
+    for word in words:
+        if word.lower().startswith("password="):
+            env["PGPASSWORD"] = word.split("=", 1)[1]
+        else:
+            kept_words.append(word)
+    return " ".join(shlex.quote(w) if " " in w else w for w in kept_words), env
+
+
+def _child_env(source: Mapping[str, str], extra: Mapping[str, str]) -> dict[str, str]:
+    """Environment for ``psql``: nothing PG*-shaped is inherited (AICC's own
+    PGPASSWORD / PGHOST / PGSERVICE must not reach the voyn-task server), the
+    session is forced read-only as a second barrier behind the reader role."""
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.upper().startswith("PG") and k not in ("VOYN_TASK_DSN", "VOYN_TASK_READER_DSN")
+    }
+    env.update(extra)
+    env["PGOPTIONS"] = "-c default_transaction_read_only=on"
+    env["PGCONNECT_TIMEOUT"] = "15"
+    return env
 
 
 def fetch_states_psql(env: Mapping[str, str] | None = None) -> dict[str, dict[str, Any]]:
@@ -198,8 +231,6 @@ def fetch_states_psql(env: Mapping[str, str] | None = None) -> dict[str, dict[st
         raise SourceError("neither VOYN_TASK_READER_DSN nor VOYN_TASK_DSN is set")
     target, extra = _psql_target(dsn)
     custom = source.get("VOYN_PSQL")
-    import shlex
-
     cmd = (shlex.split(custom) if custom else ["psql"]) + [
         "-X", "-qAt", "-v", "ON_ERROR_STOP=1", target,
     ]
@@ -210,7 +241,7 @@ def fetch_states_psql(env: Mapping[str, str] | None = None) -> dict[str, dict[st
     )
     try:
         result = subprocess.run(
-            cmd, input=sql, text=True, capture_output=True, env={**os.environ, **extra},
+            cmd, input=sql, text=True, capture_output=True, env=_child_env(source, extra),
             timeout=60, check=False,
         )
     except FileNotFoundError as exc:
@@ -249,7 +280,15 @@ def _evidence(definition: Mapping[str, Any], state: Mapping[str, Any] | None) ->
     for key, kind in EVIDENCE_KIND.items():
         value = (raw or {}).get(key)
         if isinstance(value, str) and value.strip():
-            out.append((kind, value.strip()))
+            value = value.strip()
+            if key == "pr" and not _PR_URL.match(value):
+                # AICC's gates resolve ``pr`` evidence through the GitHub API and
+                # migration 0030 clears values that are not a full PR URL (and may
+                # send a READY_TO_REVIEW task back). A bare "#229" is kept only as
+                # free-text acceptance evidence, never as ``pr``.
+                out.append(("acceptance", f"pr: {value}"))
+                continue
+            out.append((kind, value))
     return tuple(out)
 
 
@@ -301,12 +340,12 @@ def build_report(
             refuse(f"priority does not normalize: {priority!r}")
             continue
         title = d.get("title") if isinstance(d.get("title"), str) and d["title"].strip() else task_id
-        project = d.get("project")
         gate = d.get("gate") is True or bool(_GATE_ID.search(task_id))
         if state is None:
             report.unregistered.append(task_id)
         else:
             report.revisions[task_id] = int(state.get("revision", 0))
+        body = _body(d, native)
         deps = d.get("depends_on") or []
         report.dependencies[task_id] = tuple(x for x in deps if isinstance(x, str))
         report.evidence[task_id] = _evidence(d, state)
@@ -319,8 +358,8 @@ def build_report(
                 status=STATUS_MAP[native],
                 kind="gate" if gate else "task",
                 title=title,
-                body=_body(d, native),
-                repo=REPO_BY_PROJECT.get(project) if isinstance(project, str) else None,
+                body=body,
+                repo=infer_repo(task_id, f"{d.get('why') or ''}\n{d.get('acceptance') or ''}"),
                 line_no=0,
             )
         )
@@ -344,12 +383,53 @@ def load_from_voyn_task(
     return build_report(definitions, states)
 
 
-def apply_report(store: Any, report: SourceReport) -> Any:
-    """Write a mapped report through ``BacklogStore``: tasks first, then
-    dependencies, then evidence. Returns the store's ``ImportReport`` with
-    dependency / evidence refusals appended to ``refused``. A dependency whose
-    target was not mapped is reported, not invented."""
-    result = store.import_parsed(report)
+@dataclass(slots=True)
+class ApplyResult:
+    inserted: int = 0
+    #: Rows that already exist in ``backlog_task``: left untouched.
+    existing: int = 0
+    dependencies: int = 0
+    evidence: int = 0
+    refused: list[tuple[str, str]] = field(default_factory=list)
+    #: (task_id, field, aicc_value, voyn_task_value): shown, never written.
+    differences: list[tuple[str, str, str, str]] = field(default_factory=list)
+
+
+#: Compared on existing rows. ``title`` is deliberately not compared: Markdown
+#: stores a slug, YAML a human heading, so it always differs (known difference).
+COMPARED_FIELDS = ("status", "repo", "wave", "priority", "kind")
+
+
+def apply_report(store: Any, report: SourceReport) -> ApplyResult:
+    """Reconcile-first write.
+
+    * A task absent from ``backlog_task`` is inserted (through the store's
+      upsert, with provenance).
+    * A task that already exists is **never rewritten**: ``backlog_upsert_task``
+      sets status directly, bypassing AICC's state machine, and would replace
+      repo / wave / title / body that AICC (or the Markdown path) owns. Any
+      difference in status, repo, wave, priority or kind is returned in
+      ``differences`` for the operator.
+    * Dependencies and evidence are additive and idempotent, for new and
+      existing rows alike (a dependency whose target is not mapped is refused
+      in the report, not invented).
+    """
+    result = ApplyResult()
+    new = ParseReport()
+    for task in report.tasks:
+        row = store.get_task(task.task_id)
+        if row is None:
+            new.tasks.append(task)
+            continue
+        result.existing += 1
+        for name in COMPARED_FIELDS:
+            ours, theirs = row.get(name), getattr(task, name)
+            if ours != theirs:
+                result.differences.append((task.task_id, name, str(ours), str(theirs)))
+    if new.tasks:
+        imported = store.import_parsed(new)
+        result.inserted = imported.inserted
+        result.refused.extend(imported.refused)
     mapped = {t.task_id for t in report.tasks}
     for task_id, deps in report.dependencies.items():
         for dep in deps:
@@ -357,11 +437,15 @@ def apply_report(store: Any, report: SourceReport) -> Any:
                 result.refused.append((task_id, f"dependency {dep}: not in the mapped set"))
                 continue
             ok, reason, _path = store.add_dependency(task_id, dep)
-            if not ok:
+            if ok:
+                result.dependencies += 1
+            else:
                 result.refused.append((task_id, f"dependency {dep}: {reason}"))
     for task_id, items in report.evidence.items():
         for kind, value in items:
             ok, reason = store.record_evidence(task_id, kind, value)
-            if not ok:
+            if ok:
+                result.evidence += 1
+            else:
                 result.refused.append((task_id, f"evidence {kind}: {reason}"))
     return result

@@ -610,9 +610,11 @@ def main(argv: list[str] | None = None) -> int:
                     BacklogStore(lambda: nullcontext(conn)), voyn_report
                 )
                 print(
-                    f"inserted {report.inserted}, updated {report.updated}, "
-                    f"unchanged {report.unchanged}"
+                    f"inserted {report.inserted}, existing (untouched) {report.existing}, "
+                    f"dependencies {report.dependencies}, evidence {report.evidence}"
                 )
+                for task_id, name, ours, theirs in report.differences:
+                    print(f"DIFF {task_id} {name}: aicc={ours} voyn-task={theirs} (not written)")
                 for task_id, reason in report.refused:
                     print(f"REFUSED {task_id}: {reason}")
                 return 1 if report.refused else 0
