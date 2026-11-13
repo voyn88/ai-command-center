@@ -77,7 +77,21 @@ PROTECTED_TOKENS = (
     "credential",
     "/etc/",
     "aicc-keep",
+    # CRM production data and release machinery (CTO condition for --live):
+    "pgbackrest",
+    "pg_wal",
+    "/.local/state/voyn-crm",
+    "actions-runner",
+    "/attachments",
+    "/uploads",
+    "/releases",
+    "/var/lib/docker",
+    "/var/lib/containers",
 )
+#: Names that, present as an IGNORED file inside a clone, mean the clone holds
+#: data that exists nowhere else (``git status`` does not list ignored files).
+SENSITIVE_IGNORED_NAMES = (".env", ".sqlite", ".sqlite3", ".db", ".pem", ".key")
+SENSITIVE_IGNORED_DIRS = ("pgdata", "attachments", "uploads", "backups", "backup")
 KEEP_MARKER = ".aicc-keep"
 #: Roots and caches must be at least this deep (``/a/b/c``) and never one of
 #: these: a typo in the settings file must not widen what may be deleted
@@ -141,6 +155,9 @@ class Config:
     lock_file: Path
     allowed_owners: tuple[str, ...] = DEFAULT_REPO_OWNERS
     dry_run_unclear: bool = False
+    #: explicit absolute paths the guard must never touch: a candidate is
+    #: refused if it IS one, lies INSIDE one, or CONTAINS one.
+    never_paths: tuple[Path, ...] = ()
 
     @classmethod
     def from_settings(cls, values: Mapping[str, str]) -> Config:
@@ -156,6 +173,7 @@ class Config:
             max_clones=as_int(values.get("OPS_DISK_MAX_CLONES"), 25),
             max_delete_gb=as_int(values.get("OPS_DISK_MAX_GB"), 40),
             dry_run=as_dry_run(values.get("OPS_DISK_GUARD_DRY_RUN")),
+            never_paths=tuple(as_paths(values.get("OPS_DISK_NEVER_PATHS"))),
             dry_run_unclear=dry_run_value_is_unclear(
                 values.get("OPS_DISK_GUARD_DRY_RUN")
             ),
@@ -207,6 +225,46 @@ def dir_size(path: Path) -> int:
 def is_protected(path: Path) -> bool:
     text = str(path).lower()
     return any(token in text for token in PROTECTED_TOKENS)
+
+
+def never_reason(path: Path, cfg: Config) -> str | None:
+    """Last gate before anything is planned, reported or deleted: the protected
+    name tokens and the explicit never-paths (the path, anything under it, or
+    anything that contains it).  ``None`` = nothing forbids it."""
+    if is_protected(path):
+        return "protected_name"
+    try:
+        real = path.resolve()
+    except OSError:
+        return "unresolvable"
+    if is_protected(real):
+        return "protected_name"
+    for never in cfg.never_paths:
+        try:
+            other = never.resolve()
+        except OSError:
+            continue
+        if real == other or other in real.parents or real in other.parents:
+            return "never_path"
+    return None
+
+
+def sensitive_ignored(listing: str) -> str | None:
+    """First ignored file name in a ``git ls-files --others --ignored`` listing
+    that marks irreplaceable local data (env files, databases, keys)."""
+    for line in listing.splitlines():
+        parts = [part.lower() for part in line.split("/") if part]
+        if not parts:
+            continue
+        name = parts[-1]
+        if name == ".env" or name.startswith(".env."):
+            if not name.endswith((".example", ".sample", ".template")):
+                return line
+        elif name.endswith(SENSITIVE_IGNORED_NAMES[1:]):
+            return line
+        if any(part in SENSITIVE_IGNORED_DIRS for part in parts[:-1]):
+            return line
+    return None
 
 
 def _inside(path: Path, root: Path) -> bool:
@@ -434,6 +492,14 @@ def clone_verdict(
         return False, "dirty_or_unpushed"
     if _git(path, ["stash", "list"], runner):
         return False, "has_stash"
+    # ignored files are invisible to `status`: .env, local databases, keys
+    ignored = _git(
+        path, ["ls-files", "--others", "--ignored", "--exclude-standard"], runner
+    )
+    if ignored is None:
+        return False, "ignored_files_unreadable"
+    if sensitive_ignored(ignored):
+        return False, "sensitive_ignored_file"
     remote = _git(path, ["remote", "get-url", "origin"], runner) or ""
     slug = repo_slug(remote)
     if slug is None:
@@ -709,6 +775,10 @@ def run_guard(
     for cand in candidates:
         if not want_more():
             break
+        forbidden = never_reason(Path(cand.path), cfg)
+        if forbidden:
+            journal.write("never_path", path=cand.path, why=forbidden)
+            continue
         if cand.kind == "clone" and clones_done >= cfg.max_clones:
             journal.write("clone_cap_reached", cap=cfg.max_clones)
             continue
