@@ -1777,3 +1777,42 @@ def test_the_mac_path_commands_use_only_console_safe_characters():
         if line.startswith("#   bash /opt/aicc/current/ops/mac-path.sh"):
             command = line.removeprefix("#   ").split("  ")[0]
             assert all(ch.islower() or ch.isdigit() or ch in " -./" for ch in command)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        'AICC_CLAUDE_MAC_ENABLED="1"',
+        "export AICC_CLAUDE_MAC_ENABLED=1",
+        "AICC_CLAUDE_MAC_ENABLED=1 # owner",
+        "AICC_CLAUDE_MAC_ENABLED=yes",
+    ],
+)
+def test_mac_path_off_refuses_to_call_an_unusual_line_switched_off(tmp_path, line):
+    env, control, _ = _mac_env(tmp_path)
+    control.write_text(f"A=1\n{line}\nB=2\n")
+    done = _mac(env, "off")
+    assert done.returncode != 0
+    assert "NOT switched off" in done.stdout
+    assert control.read_text() == f"A=1\n{line}\nB=2\n"  # left exactly as it was
+    assert not list(tmp_path.glob("executor-routing.env.before-mac-off-*"))
+
+
+def test_mac_path_leaves_no_temporary_copy_and_ignores_the_file_override_off_the_switch(
+    tmp_path,
+):
+    env, control, _ = _mac_env(tmp_path)
+    assert _mac(env, "off").returncode == 0
+    assert not list(tmp_path.glob("*.tmp.*"))
+    env.pop("AICC_OPS_ALLOW_NONROOT")
+    done = _mac(env, "status")
+    assert done.returncode != 0  # root is required first; the override is moot
+
+
+def test_mac_path_on_does_not_invent_a_missing_line(tmp_path):
+    env, control, _ = _mac_env(tmp_path)
+    assert _mac(env, "off").returncode == 0
+    control.write_text("ONLY=this\n")
+    done = _mac(env, "on")
+    assert "no AICC_CLAUDE_MAC_ENABLED line now" in done.stdout
+    assert control.read_text() == "ONLY=this\n"
