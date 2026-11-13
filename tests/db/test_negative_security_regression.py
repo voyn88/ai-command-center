@@ -210,6 +210,9 @@ def test_stale_self_reported_sha_is_never_accepted(rig, monkeypatch):  # noqa: F
         if argv[:2] == ["pr", "view"]:
             body = json.dumps({"headRefOid": current_head, "reviews": []})
             return sp.CompletedProcess(argv, 0, body, "")
+        if argv[0] == "api" and "--method" not in argv:
+            # A read-only `gh api` GET (main re-reads the PR) is not a post.
+            return sp.CompletedProcess(argv, 0, "", "")
         posted.append(argv)
         return sp.CompletedProcess(argv, 0, "", "")
 
