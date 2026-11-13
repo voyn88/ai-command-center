@@ -327,7 +327,14 @@ def minimal_view(doc: Mapping[str, Any], low_free_pct: int) -> dict[str, Any]:
     """What a PUBLIC repository may show by default (security review M2): that
     the host is alive, whether it is healthy, how full the disk is and how old
     the control loop's last verdict is -- nothing about which services exist,
-    whether ssh or the tunnel is down, or the shape of the queue."""
+    whether ssh is down, or the shape of the queue.
+
+    One deliberate exception to "nothing about the tunnel" (security review of
+    PR 1210, requested by the CTO as the first step of moving reviews off the
+    owner's Mac): on a worker, ``review_link`` is ``up`` or ``down``.  It shows
+    that an external review channel exists and when it is unreachable; it is a
+    fixed word, never an address, port or reason, and it does not count as a
+    degraded reason.  On any other host the key is absent."""
     reasons = 0
     disk = doc.get("disk") or {}
     free = disk.get("free_pct")
@@ -341,7 +348,7 @@ def minimal_view(doc: Mapping[str, Any], low_free_pct: int) -> dict[str, Any]:
         1 if (doc.get("review_tunnel") or {}).get("held_by") == "tailscaled" else 0
     )
     reasons += 1 if doc.get("self_heal_halted") else 0
-    return {
+    view: dict[str, Any] = {
         "schema": SCHEMA,
         "role": doc.get("role"),
         "heartbeat_unix": doc.get("heartbeat_unix"),
@@ -350,6 +357,23 @@ def minimal_view(doc: Mapping[str, Any], low_free_pct: int) -> dict[str, Any]:
         "disk_free_pct": free,
         "last_verdict_age_min": doc.get("last_verdict_age_min"),
     }
+    link = review_link_word(doc)
+    if link is not None:
+        view["review_link"] = link
+    return view
+
+
+def review_link_word(doc: Mapping[str, Any]) -> str | None:
+    """Is the external review channel up?  ``up`` / ``down`` on a worker (its
+    loopback is where the tunnel ends), ``None`` elsewhere.  A fixed word, no
+    address; it does not count as a degraded reason: once reviews no longer
+    depend on this channel, ``down`` is the expected state."""
+    if doc.get("role") != "worker":
+        return None
+    listening = (doc.get("review_tunnel") or {}).get("listening")
+    if listening is None:
+        return None
+    return "up" if listening else "down"
 
 
 def render(doc: Mapping[str, Any]) -> str:
