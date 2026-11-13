@@ -1236,6 +1236,7 @@ def test_the_default_document_is_minimal_and_clean(tmp_path):
         "degraded_count",
         "disk_free_pct",
         "last_verdict_age_min",
+        "review_link",  # the fake host is a worker with the review port open
     }
     for hidden in ("units", "sshd", "review_tunnel", "queue", "failed_units"):
         assert hidden not in text
