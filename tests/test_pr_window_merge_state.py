@@ -6,6 +6,11 @@ from command_center.orchestrator import review_merge
 from command_center.orchestrator.review_merge import PrWindowConfig, reconcile_pr_window
 
 
+@pytest.fixture(autouse=True)
+def isolated_window_cache(monkeypatch, tmp_path):
+    monkeypatch.setenv(review_merge.gh_access.CACHE_DIR_ENV, str(tmp_path))
+
+
 def _pr(number: int, head: str, *, label: str | None = None, merge_state: str = "CLEAN"):
     return {
         "number": number,
@@ -377,6 +382,134 @@ def test_blocked_refresh_budget_leaves_old_blocked_tail_untouched(monkeypatch):
     assert report.blocked == [(1, "checks_stale")]
     assert report.unchecked == [(2, "2" * 40), (3, "3" * 40)]
     assert labels == [(4, "review-window:active"), (1, "review-window:blocked")]
+
+
+@pytest.fixture
+def blocked_window(monkeypatch, tmp_path):
+    def setup(count, *, cached=True, green=None, extra=(), ttl=1800):
+        clock = [review_merge.time.time()]
+        fetched = []
+        writes = []
+        prs = []
+
+        def new_cache():
+            # Each tick gets a new handle, as in production; only disk survives.
+            cache = review_merge.gh_access.PrDetailCache(
+                tmp_path, ttl, now=lambda: clock[0]
+            )
+            cache.prune()
+            return cache
+
+        for number in range(1, count + 1):
+            pr = _pr(number, f"{number:040x}", label="review-window:blocked")
+            pr["createdAt"] = "2026-01-01T00:00:00Z"
+            pr["statusCheckRollup"] = [
+                {"name": "gate", "conclusion": "FAILURE"}
+            ]
+            if cached:
+                new_cache().put("x/repo", number, pr["headRefOid"], {
+                    key: pr[key]
+                    for key in ("reviews", "statusCheckRollup", "commits")
+                })
+            prs.append({
+                key: value for key, value in pr.items()
+                if key not in ("reviews", "statusCheckRollup", "commits", "mergeStateStatus")
+            })
+
+        def checks(_path, _owner, _repo, head):
+            number = int(head, 16)
+            fetched.append(number)
+            return [{
+                "name": "gate",
+                "conclusion": "SUCCESS" if number == green else "FAILURE",
+            }]
+
+        def labels(_path, pr, _cfg, desired):
+            writes.append((pr["number"], desired))
+            live = next(item for item in prs if item["number"] == pr["number"])
+            live["labels"] = [{"name": desired}]
+            return True
+
+        prs.extend(extra)
+        monkeypatch.setattr(review_merge, "_list_open_pulls", lambda *_: (list(reversed(prs)), None))
+        monkeypatch.setattr(review_merge.gh_access, "detail_cache", new_cache)
+        monkeypatch.setattr(review_merge, "_rest_check_rollup", checks)
+        monkeypatch.setattr(review_merge, "_rest_reviews", lambda *_: [])
+        monkeypatch.setattr(review_merge, "_head_commit_committed_date", lambda *_: "2099-01-01T00:00:00Z")
+        monkeypatch.setattr(review_merge, "_rest_merge_state", lambda *_: "CLEAN")
+        monkeypatch.setattr(review_merge, "_set_pr_window_labels", labels)
+        monkeypatch.setattr(review_merge, "_remove_pr_window_labels", lambda *_: True)
+        monkeypatch.setattr(review_merge.time, "time", lambda: clock[0])
+        return clock, fetched, writes
+
+    return setup
+
+
+@pytest.mark.parametrize("cached", [True, False])
+def test_blocked_refresh_rotation_promotes_recovered_tail_within_three_ticks(blocked_window, cached):
+    clock, fetched, writes = blocked_window(12, cached=cached, green=12)
+    cfg = PrWindowConfig(max_active=1, blocked_refresh_budget=5)
+    reports = []
+
+    for _ in range(3):
+        reports.append(reconcile_pr_window("/repo", cfg))
+        clock[0] += 300
+
+    assert (12, "review-window:active") in writes
+    assert any((12, f"{12:040x}") in report.active for report in reports)
+    assert not set(range(1, 6)) & {number for number, label in writes if label == cfg.label_active}
+    assert 12 in fetched
+
+
+@pytest.mark.parametrize("cached", [True, False])
+@pytest.mark.parametrize("count,budget,ttl", [
+    (12, 5, 1800), (10, 5, 1800), (3, 5, 1800), (5, 1, 1800),
+    (12, 5, 1), (12, 5, 0),
+])
+def test_blocked_refresh_rotation_covers_every_pr_within_budget_bound(blocked_window, cached, count, budget, ttl):
+    clock, fetched, _writes = blocked_window(count, cached=cached, ttl=ttl)
+    cfg = PrWindowConfig(blocked_refresh_budget=budget)
+    ticks = (count + budget - 1) // budget
+
+    # Check consecutive rounds too, including the wrap for a partial last batch.
+    for _ in range(2):
+        seen = set()
+        for _ in range(ticks):
+            start = len(fetched)
+            reconcile_pr_window("/repo", cfg)
+            refreshed = fetched[start:]
+            assert len(refreshed) <= budget
+            assert len(refreshed) == len(set(refreshed))
+            seen.update(refreshed)
+            clock[0] += 300
+        assert seen == set(range(1, count + 1))
+
+
+def test_blocked_refresh_rotation_preserves_non_blocked_order(blocked_window):
+    extra = [
+        _pr(21, "a" * 40, label="review-window:waiting"),
+        _pr(22, "b" * 40),
+        _pr(23, "c" * 40, label="review-window:active"),
+        _pr(24, "d" * 40, label="queue-active"),
+        _pr(25, "e" * 40, label="queue-waiting-review"),
+    ]
+    for pr in extra:
+        pr["createdAt"] = "2026-01-01T00:00:00Z"
+    clock, _fetched, writes = blocked_window(12, extra=extra)
+    cfg = PrWindowConfig(max_active=3, blocked_refresh_budget=5)
+
+    for tick in range(3):
+        start = len(writes)
+        report = reconcile_pr_window("/repo", cfg)
+        assert report.active == (
+            [(23, "c" * 40), (24, "d" * 40), (21, "a" * 40)] if tick == 0
+            else [(21, "a" * 40), (23, "c" * 40), (24, "d" * 40)]
+        )
+        assert report.waiting == [(22, "b" * 40), (25, "e" * 40)]
+        assert [number for number, _label in writes[start:] if number > 12] == (
+            [23, 21, 22] if tick == 0 else [21, 23, 22]
+        )
+        clock[0] += 300
 
 
 def test_in_progress_checks_keep_the_active_window_label(monkeypatch):

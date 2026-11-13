@@ -5574,9 +5574,36 @@ def _reconcile_pr_window(
     now = time.time()
     listed_prs = list(prs)
     # Sticky active first, then ordinary candidates, then the old blocked
-    # tail. This keeps FIFO order inside each bucket without letting stale
-    # blocked PRs starve fresh work out of the window.
+    # tail. Only the blocked tail rotates; active/waiting retain their order.
     listed_prs.sort(key=lambda pr: _pr_window_order_key(pr, cfg))
+    blocked_start = next(
+        (i for i, pr in enumerate(listed_prs) if _pr_window_order_key(pr, cfg)[0] == 2),
+        len(listed_prs),
+    )
+    cursor_path = None
+    last_refreshed = None
+    if blocked_start < len(listed_prs) and cfg.blocked_refresh_budget > 0:
+        # Persist beside the detail cache, including when detail TTL is zero.
+        # A .cursor file survives cache.prune() and short detail TTLs.
+        directory = getattr(cache, "directory", None) or gh_access._cache_root()
+        if directory is not None:
+            digest = hashlib.sha256(os.fsencode(repo_path)).hexdigest()
+            cursor_path = Path(directory) / f"pr-window-blocked-{digest}.cursor"
+            try:
+                after = json.loads(cursor_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                after = None
+            if (
+                isinstance(after, list) and len(after) == 2
+                and isinstance(after[0], str) and isinstance(after[1], int)
+            ):
+                tail = listed_prs[blocked_start:]
+                offset = next(
+                    (i for i, pr in enumerate(tail)
+                     if _pr_window_order_key(pr, cfg)[1:] > tuple(after)),
+                    0,
+                )
+                listed_prs[blocked_start:] = tail[offset:] + tail[:offset]
 
     selected = 0
     details_used = 0
@@ -5625,9 +5652,27 @@ def _reconcile_pr_window(
         # A cache hit costs no API call, so it costs no detail budget
         # either: the budget exists to bound this tick's GitHub traffic, and
         # a PR whose head has not moved since the last tick generates none.
-        detailed = _pr_window_details(
-            repo_path, pr, cache, fetch=False, include_reviews=False
+        refreshed_blocked = (
+            blocked_now
+            and blocked_refreshes_used < blocked_refresh_budget
+            and details_used < max(cfg.detail_budget, 0)
         )
+        if refreshed_blocked:
+            blocked_refreshes_used += 1
+            details_used += 1
+            # Advance even after a failed lookup, so an unreadable PR cannot
+            # monopolize the budget. One blocked PR costs at most one refresh.
+            last_refreshed = _pr_window_order_key(pr, cfg)[1:]
+            detailed = _pr_window_details(
+                repo_path, pr, cache, refresh=True, include_reviews=False
+            )
+            if detailed is None:
+                report.unreadable.append((number, head))
+                continue
+        else:
+            detailed = _pr_window_details(
+                repo_path, pr, cache, fetch=False, include_reviews=False
+            )
         if (
             blocked_now
             and detailed is None
@@ -5674,6 +5719,7 @@ def _reconcile_pr_window(
             reason = _window_block_reason(detailed, cfg, age_seconds=age_seconds)
         if (
             reason == "checks_stale"
+            and not refreshed_blocked
             and details_used < max(cfg.detail_budget, 0)
         ):
             if (
@@ -5753,6 +5799,17 @@ def _reconcile_pr_window(
             )
         else:
             _set_pr_window_labels(repo_path, detailed, cfg, cfg.label_active)
+
+    if cursor_path is not None and last_refreshed is not None:
+        tmp = cursor_path.with_name(cursor_path.name + f".{os.getpid()}.tmp")
+        try:
+            tmp.write_text(json.dumps(last_refreshed), encoding="utf-8")
+            os.replace(tmp, cursor_path)
+        except OSError:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 #: One REST page of pull requests. GitHub's ceiling for `per_page`, so a
