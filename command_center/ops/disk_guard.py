@@ -704,7 +704,13 @@ def run_guard(
         fresh_cwds=process_paths if live_processes else None,
     )
     candidates += clone_list
-    journal.write("skipped_clones", count=len(skipped), sample=skipped[:15])
+    by_reason: dict[str, int] = {}
+    for item in skipped:
+        why = str(item.get("why", "?"))
+        by_reason[why] = by_reason.get(why, 0) + 1
+    journal.write(
+        "skipped_clones", count=len(skipped), by_reason=by_reason, sample=skipped[:15]
+    )
 
     for cand in candidates:
         if not want_more():
@@ -744,6 +750,68 @@ def run_guard(
     return summary
 
 
+def run_probe(args: argparse.Namespace) -> int:
+    """Owner-run report: what the guard WOULD remove at raised thresholds.
+
+    Safe by construction, not by configuration: ``dry_run`` is forced to True
+    after the settings (file and environment) are read, ``--live`` is refused
+    together with ``--probe``, nothing is written to the journal file, and the
+    thresholds come only from the command line."""
+    values = load_settings(args.settings)
+    cfg = Config.from_settings(values)
+    cfg.dry_run = True  # after the settings: no OPS_* variable can undo this
+    cfg.dry_run_unclear = False
+    cfg.low_free_pct = args.low_free_pct
+    cfg.target_free_pct = args.target_free_pct
+    # list EVERYTHING eligible, not what a real pass would stop at
+    cfg.max_clones = 100_000
+    cfg.max_delete_gb = 1_000_000
+    cfg.log_file = None
+    events: list[dict[str, Any]] = []
+    journal = Journal(None, echo=lambda line: events.append(json.loads(line)))
+    with exclusive_lock(cfg.lock_file) as got:
+        if not got:
+            print("another disk guard run holds the lock; try again in a minute")
+            return 1
+        summary = run_guard(cfg, journal=journal)
+    if not cfg.dry_run or summary.get("acted"):
+        raise RuntimeError("probe must never act")  # unreachable by construction
+    print(render_probe(cfg, summary, events))
+    return 0
+
+
+def render_probe(
+    cfg: Config, summary: Mapping[str, Any], events: list[dict[str, Any]]
+) -> str:
+    lines = [
+        "PROBE (dry run: nothing was deleted, no setting or timer was changed)",
+        f"thresholds used: low={cfg.low_free_pct}% target={cfg.target_free_pct}%"
+        f"  free now: {summary.get('free_pct_before')}%",
+    ]
+    wanted = list(summary.get("would_remove") or [])
+    if not wanted and summary.get("free_pct_before", 0) >= cfg.low_free_pct:
+        lines.append("the low threshold was not crossed: raise --low-free-pct")
+    wanted.sort(key=lambda e: float(e.get("gb", 0)), reverse=True)
+    total = sum(float(e.get("gb", 0)) for e in wanted)
+    lines.append(f"would_remove: {len(wanted)} entries, {total:.2f} GB")
+    for entry in wanted:
+        lines.append(
+            f"  {float(entry.get('gb', 0)):9.2f} GB  {entry.get('kind'):<11}"
+            f" {entry.get('path')}  ({entry.get('reason')})"
+        )
+    for event in events:
+        if event.get("event") == "skipped_clones":
+            lines.append(f"kept clones: {event.get('count')} by reason:")
+            for why, count in sorted((event.get("by_reason") or {}).items()):
+                lines.append(f"  {count:5d}  {why}")
+        elif event.get("event") in {"never_path", "refused_path", "clone_cap_reached"}:
+            lines.append(
+                "  note: "
+                + " ".join(f"{k}={v}" for k, v in event.items() if k != "ts")
+            )
+    return "\n".join(lines)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument(
@@ -751,8 +819,29 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="really delete (overrides the dry-run default for this run only)",
     )
+    parser.add_argument(
+        "--probe",
+        action="store_true",
+        help="owner report of what WOULD be removed at raised thresholds; "
+        "always a dry run, writes nothing",
+    )
+    parser.add_argument("--low-free-pct", type=int, default=45)
+    parser.add_argument("--target-free-pct", type=int, default=60)
     parser.add_argument("--settings", type=Path, default=None)
     args = parser.parse_args(argv)
+    if args.probe and args.live:
+        parser.error("--probe is always a dry run and cannot be combined with --live")
+    if not args.probe and (
+        "--low-free-pct" in (argv or sys.argv[1:])
+        or "--target-free-pct" in (argv or sys.argv[1:])
+    ):
+        parser.error("--low-free-pct and --target-free-pct belong to --probe")
+    if args.probe:
+        if not (1 <= args.low_free_pct <= 100 and 1 <= args.target_free_pct <= 100):
+            parser.error("thresholds must be between 1 and 100")
+        if args.target_free_pct < args.low_free_pct:
+            parser.error("--target-free-pct must not be below --low-free-pct")
+        return run_probe(args)
     values = load_settings(args.settings)
     cfg = Config.from_settings(values)
     if args.live:
