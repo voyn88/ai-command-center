@@ -2373,9 +2373,9 @@ def test_priority_review_precedes_rotation_and_keeps_rotation_share(
     rig, _test_repo_routes, monkeypatch  # noqa: F811
 ):
     app_factory, store, _ = rig
-    rotation = ("VOYN-W0-AAA-ROT", "https://github.com/x/y/pull/400")
+    rotation = ("VOYN-W0-AAA-ROT", "https://github.com/x/repo-d2/pull/400")
     priorities = [
-        (f"VOYN-W0-ZZZ-PRIO-{i}", f"https://github.com/x/y/pull/{410 + i}")
+        (f"VOYN-W0-ZZZ-PRIO-{i}", f"https://github.com/x/repo-d2/pull/{410 + i}")
         for i in range(3)
     ]
     head = "e" * 40
