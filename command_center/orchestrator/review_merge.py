@@ -101,12 +101,14 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Iterable
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from command_center.observability.trace import log_span
 from command_center.orchestrator import gh_access, github_app_auth
 from command_center.orchestrator.routing import cascade_for
 
@@ -244,10 +246,12 @@ class ReconcileReport:
 
 @dataclass
 class PrEvidenceReport:
-    """See `reconcile_pr_evidence`. Records evidence; never changes a status."""
+    """See `reconcile_pr_evidence`. Records evidence or recovers a stuck task."""
 
     #: (task_id, pr_url) newly recorded from the task's own branch.
     recorded: list[tuple[str, str]] = field(default_factory=list)
+    #: Task ids returned to OPEN after GitHub proved the branch has no open PR.
+    recovered: list[str] = field(default_factory=list)
     #: (task_id, reason) examined and deliberately left alone.
     skipped: list[tuple[str, str]] = field(default_factory=list)
 
@@ -300,9 +304,11 @@ def reconcile_pr_evidence(
     origin of that checkout and nothing else, so a task can never be attached
     to a pull request in another repository.
 
-    Reporting only: no status is changed here. A task becomes reviewable
-    because it is `READY_TO_REVIEW` and now has evidence, through the same
-    path it always did.
+    An exact empty result proves the evidence-free READY_TO_REVIEW task cannot
+    enter the review pipeline. In that case the existing, narrowly gated
+    ``backlog_recover_stuck_ready_to_review`` operation returns it to OPEN for
+    a fresh dispatch. Failed lookups and non-empty results that do not pass
+    the exact-branch checks remain non-mutating.
     """
     # Imported here, as  does, so this module keeps its
     # import-time independence from the planner.
@@ -351,8 +357,28 @@ def reconcile_pr_evidence(
             and isinstance(entry.get("url"), str)
             and entry["url"]
         ]
-        if not matches:
+        if not matches and decoded:
             report.skipped.append((row_task_id, "no_open_pr_on_task_branch"))
+            continue
+        if not matches:
+            # READY_TO_REVIEW without evidence is already an invalid terminal
+            # corner: every downstream review/merge query requires a `pr`
+            # evidence row. GitHub has now proved there is no open PR to
+            # adopt, so use the audited recovery gate introduced specifically
+            # for this state instead of emitting the same unactionable skip
+            # forever. The function locks and rechecks the row/evidence, so a
+            # concurrent publisher wins safely with `has_pr_evidence`.
+            with factory() as conn, conn.cursor() as cur:
+                cur.execute(
+                    "SELECT * FROM backlog_recover_stuck_ready_to_review(%s)",
+                    (row_task_id,),
+                )
+                verdict = cur.fetchone()
+            if verdict and verdict[0]:
+                report.recovered.append(row_task_id)
+            else:
+                reason = (verdict[1] if verdict and len(verdict) > 1 else "") or "unknown"
+                report.skipped.append((row_task_id, f"recovery_refused: {reason}"))
             continue
         if len(matches) > 1:
             report.skipped.append((row_task_id, "ambiguous_open_prs_on_branch"))
@@ -378,6 +404,63 @@ def reconcile_pr_evidence(
             report.skipped.append((row_task_id, f"evidence_refused: {reason}"))
             continue
         report.recorded.append((row_task_id, pr_url))
+    return report
+
+
+@dataclass
+class StuckReviewRecoveryReport:
+    """See `recover_stuck_pr_evidence_once`."""
+
+    #: (task_id, new_status) sent back to OPEN this tick.
+    recovered: list[tuple[str, str]] = field(default_factory=list)
+    #: (task_id, reason) examined and left alone.
+    skipped: list[tuple[str, str]] = field(default_factory=list)
+
+
+def recover_stuck_pr_evidence_once(
+    factory: Any, skipped: Iterable[tuple[str, str]]
+) -> StuckReviewRecoveryReport:
+    """Unstick a READY_TO_REVIEW task `reconcile_pr_evidence` could not find
+    any evidence for at all (VOYN-W0-AICC-SRV-07d-STALL).
+
+    `reconcile_pr_evidence` is reporting-only by design: a task it skips
+    with `no_open_pr_on_task_branch` has NO `pr` evidence on record (that's
+    its own candidate query) and no open pull request on its exact branch
+    either, so it is left exactly as it was. For a task in that state there
+    is nothing left to discover -- ingest (0011/0030) now never transitions
+    into READY_TO_REVIEW without recording real `pr` evidence in the same
+    call, so the condition can only mean a completed-but-unpublished run
+    that predates that guard, or a future bug in the same corner. Either
+    way the task will sit forever: `backlog_transition` has no
+    READY_TO_REVIEW -> anything-but-DONE move and `backlog_return_to_pool`
+    only accepts IN_PROGRESS, so neither of the ordinary recovery paths can
+    reach it. That is exactly the gap the tick-stall watchdog caught on
+    VOYN-W0-AICC-SRV-07d: five consecutive ticks of the identical skip,
+    because nothing downstream of `reconcile_pr_evidence` ever called the
+    one function built to close it.
+
+    `backlog_recover_stuck_ready_to_review` (0018) is that sanctioned,
+    narrow, audited path: READY_TO_REVIEW with zero `pr` evidence -> OPEN,
+    refused outright for anything else (a task with `pr` evidence on record
+    belongs to review/merge, not recovery). Calling it here, keyed off the
+    exact reason `reconcile_pr_evidence` already proved, lets a fresh
+    dispatch take another real attempt at a PR instead of the task waiting
+    on an operator to run the recovery by hand.
+    """
+    report = StuckReviewRecoveryReport()
+    for task_id, reason in skipped:
+        if reason != "no_open_pr_on_task_branch":
+            continue
+        rows = _rows(
+            factory,
+            "SELECT ok, reason FROM backlog_recover_stuck_ready_to_review(%s)",
+            (task_id,),
+        )
+        ok, verdict_reason = rows[0] if rows else (False, "unknown")
+        if ok:
+            report.recovered.append((task_id, verdict_reason))
+        else:
+            report.skipped.append((task_id, verdict_reason or "unknown"))
     return report
 
 
@@ -1273,6 +1356,24 @@ def _chunk_key_prefix(task_id: str, pr_url: str, snapshot: _PRSnapshot) -> str |
 _MAX_RESULT_RETRY_ATTEMPTS = 2
 _RETRY_KEY_SUFFIX = re.compile(r":retry:([0-9]+)\Z")
 
+# A review item that was dead-lettered because every executor was unavailable
+# (`infra_wait_exhausted:` / `lease_wait_exhausted:`) never reached a model, so
+# it carries no verdict and spent no inference.  Its exact-head identity is
+# nevertheless terminal, and without a fresh identity the pull request keeps
+# its review-window slot forever (`no_accept_marker_on_head`); five such pull
+# requests held the whole window from 2026-11-08.  Such an item gets a new
+# identity too -- bounded, and only after a growing cool-down so an outage is
+# not hammered.  Every other dead reason (`max_attempts_exhausted`,
+# `review_pin_stale`, `non_retryable`) stays fail-closed.
+_INFRA_DEAD_REASON_PREFIXES = ("infra_wait_exhausted:", "lease_wait_exhausted:")
+# The two retry reasons are bounded independently, each on the number of
+# identities that ended that way (derived from the existing rows, key format
+# unchanged): at most 12 infra retries + 2 malformed-result retries = 14
+# retries (15 identities, highest suffix `:retry:14`) per base key.
+_MAX_INFRA_DEAD_RETRY_ATTEMPTS = 12
+_INFRA_DEAD_RETRY_BASE_SECONDS = 900
+_INFRA_DEAD_RETRY_MAX_SECONDS = 4 * 3600
+
 
 def _retry_attempt(key: str) -> tuple[str, int]:
     match = _RETRY_KEY_SUFFIX.search(key)
@@ -1303,6 +1404,61 @@ def _latest_attempt(
     return max(candidates, key=lambda item: item[0]) if candidates else None
 
 
+def _attempt_history(
+    factory: Any, task_id: str, base_key: str
+) -> list[tuple[int, str, Any, Any]]:
+    """Every identity of ``base_key`` (``base`` and ``base:retry:N``) as
+    ``(attempt, state, dead_reason, result_payload)``, oldest first.  The key
+    format is untouched: the retry *reasons* are derived from these rows."""
+    pattern = re.compile(rf"\A{re.escape(base_key)}(?::retry:[0-9]+)?\Z")
+    rows = _rows(
+        factory,
+        "SELECT i.idempotency_key, i.state, i.dead_reason, wr.payload "
+        "FROM work_item i LEFT JOIN work_result wr ON wr.result_id = i.result_id "
+        "WHERE i.task_id = %s AND left(i.idempotency_key, char_length(%s)) = %s",
+        (task_id, base_key, base_key),
+    )
+    history = [
+        (_retry_attempt(row_key)[1], state, dead_reason, payload)
+        for row_key, state, dead_reason, payload in rows
+        if pattern.fullmatch(row_key)
+    ]
+    return sorted(history, key=lambda item: item[0])
+
+
+def _is_infra_dead(state: Any, dead_reason: Any) -> bool:
+    return (
+        state == "dead"
+        and isinstance(dead_reason, str)
+        and dead_reason.startswith(_INFRA_DEAD_REASON_PREFIXES)
+    )
+
+
+def _is_malformed_success(state: Any, payload_value: Any, expected_head: str) -> bool:
+    if state != "succeeded":
+        return False
+    result = _json_object(payload_value)
+    parsed = _parse_review_verdict((result or {}).get("result_text") or "")
+    return parsed is None or parsed[1] != expected_head
+
+
+def _retry_reason_counts(
+    factory: Any, task_id: str, base_key: str, expected_head: str
+) -> tuple[int, int]:
+    """(identities that ended infra-dead, identities that succeeded without a
+    valid verdict for ``expected_head``).  Each reason is bounded on its own
+    count, so infra retries never consume the malformed-result budget."""
+    infra = malformed = 0
+    for _attempt, state, dead_reason, payload_value in _attempt_history(
+        factory, task_id, base_key
+    ):
+        if _is_infra_dead(state, dead_reason):
+            infra += 1
+        elif _is_malformed_success(state, payload_value, expected_head):
+            malformed += 1
+    return infra, malformed
+
+
 def _next_retry_key(
     factory: Any, task_id: str, base_key: str, expected_head: str
 ) -> str | None:
@@ -1310,13 +1466,72 @@ def _next_retry_key(
     if latest is None:
         return None
     attempt, state, payload_value = latest
-    if state != "succeeded" or attempt >= _MAX_RESULT_RETRY_ATTEMPTS:
+    # Hard ceiling on the raw suffix: the two per-reason bounds below can never
+    # produce a larger one (12 infra + 2 malformed retries).
+    if attempt >= _MAX_INFRA_DEAD_RETRY_ATTEMPTS + _MAX_RESULT_RETRY_ATTEMPTS:
         return None
-    result = _json_object(payload_value)
-    parsed = _parse_review_verdict((result or {}).get("result_text") or "")
-    if parsed is not None and parsed[1] == expected_head:
+    if state == "dead":
+        if not _infra_dead_retry_due(factory, task_id, base_key, attempt):
+            return None
+        infra, _malformed = _retry_reason_counts(
+            factory, task_id, base_key, expected_head
+        )
+        # ``infra`` includes the latest dead identity: N infra-dead identities
+        # have used N-1 infra retries, so up to 12 retries are granted.
+        if infra > _MAX_INFRA_DEAD_RETRY_ATTEMPTS:
+            return None
+        return f"{base_key}:retry:{attempt + 1}"
+    if state != "succeeded":
+        return None
+    if not _is_malformed_success(state, payload_value, expected_head):
+        return None
+    _infra, malformed = _retry_reason_counts(factory, task_id, base_key, expected_head)
+    if malformed > _MAX_RESULT_RETRY_ATTEMPTS:
         return None
     return f"{base_key}:retry:{attempt + 1}"
+
+
+def _infra_retries_exhausted(factory: Any, task_id: str, base_key: str) -> bool:
+    """The latest identity is dead from executor infrastructure and the infra
+    retry bound is spent: terminal, and an operator has to redrive it."""
+    history = _attempt_history(factory, task_id, base_key)
+    if not history:
+        return False
+    _attempt, state, dead_reason, _payload = history[-1]
+    if not _is_infra_dead(state, dead_reason):
+        return False
+    infra = sum(1 for _a, st, dr, _p in history if _is_infra_dead(st, dr))
+    return infra > _MAX_INFRA_DEAD_RETRY_ATTEMPTS
+
+
+def _infra_dead_retry_delay(attempt: int) -> int:
+    return min(_INFRA_DEAD_RETRY_BASE_SECONDS * (2 ** max(attempt, 0)),
+               _INFRA_DEAD_RETRY_MAX_SECONDS)
+
+
+def _infra_dead_retry_due(
+    factory: Any, task_id: str, base_key: str, attempt: int
+) -> bool:
+    """Whether the dead latest identity of ``base_key`` died on executor
+    infrastructure and is past its cool-down (the retry bound is applied by
+    the caller from the per-reason counts).
+    The database clock decides the cool-down; an unreadable row is not due."""
+    key = base_key if attempt == 0 else f"{base_key}:retry:{attempt}"
+    rows = _rows(
+        factory,
+        "SELECT dead_reason, EXTRACT(EPOCH FROM (now() - dead_at)) "
+        "FROM work_item WHERE task_id = %s AND idempotency_key = %s AND state = 'dead'",
+        (task_id, key),
+    )
+    if len(rows) != 1:
+        return False
+    reason, age = rows[0]
+    if not isinstance(reason, str) or not reason.startswith(_INFRA_DEAD_REASON_PREFIXES):
+        return False
+    try:
+        return float(age) >= _infra_dead_retry_delay(attempt)
+    except (TypeError, ValueError):
+        return False
 
 
 def _latest_attempt_executor(factory: Any, task_id: str, base_key: str) -> str | None:
@@ -1334,6 +1549,68 @@ def _latest_attempt_executor(factory: Any, task_id: str, base_key: str) -> str |
     result = _json_object(payload_value)
     executor = (result or {}).get("executor")
     return executor if isinstance(executor, str) and executor else None
+
+
+# Independence (VOYN-W0-AICC-REVIEW-EXECUTOR-INDEPENDENCE): a review must
+# never be handed to the executor that wrote the change under review. The
+# implementer is read from real attempt history, never from the static
+# routing plan -- the plan only says what the implementation cascade WOULD
+# try; the escalation link in `ROUTING_MATRIX["implementation"]` means the
+# executor that actually landed the work is not always the cascade's first
+# entry (e.g. codex, when claude's subscription window was exhausted).
+def _implementation_executor(factory: Any, task_id: str) -> str | None:
+    """The executor that produced the latest ``succeeded`` implementation
+    (or remediation) run for ``task_id`` -- read from
+    ``work_result.payload["executor"]``, the same field every completed run
+    records (`command_center/worker/handlers.py`). None means no
+    implementation history was found, or it named no executor, which leaves
+    the review cascade unfiltered rather than refusing it: an unknown
+    implementer is not evidence of a conflict."""
+    rows = _rows(
+        factory,
+        "SELECT wr.payload FROM work_result wr JOIN work_item i "
+        "ON i.result_id = wr.result_id "
+        "WHERE i.task_id = %s AND i.state = 'succeeded' "
+        "AND i.payload ->> 'task_type' IN ('implementation', 'remediation') "
+        "ORDER BY i.updated_at DESC LIMIT 1",
+        (task_id,),
+    )
+    if not rows:
+        return None
+    result = _json_object(rows[0][0])
+    executor = (result or {}).get("executor")
+    return executor if isinstance(executor, str) and executor else None
+
+
+def _review_cascade_for_task(
+    factory: Any, task_id: str, cascade: list[dict[str, Any]]
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Drop ``task_id``'s own implementer from its review cascade.
+
+    If that exclusion would empty the cascade there is no self-review
+    fallback: the caller must defer with the returned reason rather than
+    ever re-admitting the implementer. Claude's only model-only (zero-tool)
+    review transport today is the opt-in Mac bridge
+    (`docs/operations/CLAUDE_MAC_REVIEWS.md`) gated by
+    ``AICC_CLAUDE_MAC_ENABLED``; when that is off and claude is the sole
+    independent link left after exclusion, claude is unreachable too, and
+    the review must wait rather than fall back to the implementer.
+    """
+    implementer = _implementation_executor(factory, task_id)
+    if not implementer:
+        return cascade, None
+    filtered = [link for link in cascade if link.get("executor") != implementer]
+    if len(filtered) == len(cascade):
+        return cascade, None
+    if not filtered:
+        return [], "self_review_excluded:no_independent_reviewer"
+    if (
+        len(filtered) == 1
+        and filtered[0].get("executor") == "claude"
+        and os.environ.get("AICC_CLAUDE_MAC_ENABLED") != "1"
+    ):
+        return [], "self_review_excluded:claude_mac_unreachable"
+    return filtered, None
 
 
 def _failover_cascade(
@@ -1693,6 +1970,13 @@ def _review_once(
         if route is None:
             report.skipped.append((task_id, f"no_repo_route: {pr_url!r}"))
             continue
+        # Looked up only once the PR URL and its repo route are known good:
+        # the implementer lookup reads the database, and evidence hygiene
+        # above (malformed URL, missing route) must not depend on it.
+        task_cascade, defer_reason = _review_cascade_for_task(factory, task_id, cascade)
+        if not task_cascade:
+            report.skipped.append((task_id, defer_reason or "no_review_executor_route"))
+            continue
         window = _review_window_read_decision(
             repo_path, pr_url, recovery_budget
         )
@@ -1740,7 +2024,7 @@ def _review_once(
                 "prompt": prompt,
                 "timeout_seconds": cfg.review_timeout,
                 "untrusted": True,
-                "cascade": cascade,
+                "cascade": task_cascade,
                 # Worker re-checks open+exact head before any model call;
                 # scheduling's snapshot guard does not cover the queue delay.
                 "review_head": {
@@ -1776,8 +2060,9 @@ def _review_once(
         # verification section comment above for why the eager full-context
         # pass of VOYN-W0-AICC-REVIEW-ADJUDICATE was retired).
         for review_key, payload in prepared:
-            enqueue(cfg.queue, review_key, payload, task_id, len(cascade))
+            enqueue(cfg.queue, review_key, payload, task_id, len(task_cascade))
         report.reviewed.append((task_id, pr_url))
+        log_span("review", task_id=task_id, pr_url=pr_url, chunks=len(prepared))
         actions += 1
     if scan_token is not None:
         _scan_commit(factory, "scan:review_once", scan_token, last_processed)
@@ -1934,9 +2219,21 @@ def reconcile_review_once(
             report.retried.append((current_task_id, retry_key))
             actions += 1
         if actions == retries_before:
-            report.skipped.append(
-                (current_task_id, "no_malformed_review_result_eligible_for_retry")
-            )
+            exhausted = False
+            for chunk in chunks:
+                base_key = key if chunk.count == 1 else _chunk_review_key(
+                    current_task_id, pr_url, snapshot, chunk
+                )
+                if base_key is not None and _infra_retries_exhausted(
+                    factory, current_task_id, base_key
+                ):
+                    exhausted = True
+                    break
+            report.skipped.append((
+                current_task_id,
+                "review_infra_retries_exhausted" if exhausted
+                else "no_malformed_review_result_eligible_for_retry",
+            ))
     if scan_token is not None:
         _scan_commit(factory, "scan:reconcile_review_once", scan_token, last_processed)
     return report
@@ -4804,6 +5101,7 @@ def _merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -
                     conn.commit()
                     finished_tasks.add(task_id)
                     report.merged.append((task_id, head))
+                    log_span("merge", task_id=task_id, head_sha=head)
                 else:
                     conn.rollback()
                     report.skipped.append((task_id, f"transition:{reason}"))

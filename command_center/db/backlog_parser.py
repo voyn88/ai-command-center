@@ -127,6 +127,15 @@ def _infer_repo(task_id: str) -> str | None:
     return None
 
 
+def infer_repo(task_id: str, body: str = "") -> str | None:
+    """The Markdown path's routing rule, reusable by other sources: an explicit
+    ``Target repo`` hint in the text wins, else the task-id family."""
+    hint = _REPO_HINT.search(body)
+    if hint:
+        return hint.group(1).strip()
+    return _infer_repo(task_id)
+
+
 def parse_backlog(text: str) -> ParseReport:
     report = ParseReport()
     seen: dict[str, int] = {}

@@ -1,0 +1,12 @@
+# Мигрировано из outputs/VOYN_TASKS_BACKLOG.md скриптом tools/migrate_backlog.py. Строка оригинала: 503.
+id: "VOYN-AGT-DRIFT"
+project: "ideas"
+title: "Обнаружение деградации качества и “замораживание” агента при падении порогов."
+why: "Обнаружение деградации качества и “замораживание” агента при падении порогов."
+priority: "P2"
+owner: "QA / Data"
+reviewer: "reviewer-unassigned"
+acceptance: "при отклонении метрики >10% в 2 окнах подряд агент уходит в quarantine."
+status: "OPEN"
+wave: "W7"
+depends_on: []

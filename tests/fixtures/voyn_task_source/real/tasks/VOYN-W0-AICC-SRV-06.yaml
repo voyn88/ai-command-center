@@ -1,0 +1,14 @@
+# Мигрировано из outputs/VOYN_TASKS_BACKLOG.md скриптом tools/migrate_backlog.py. Строка оригинала: 1371.
+id: "VOYN-W0-AICC-SRV-06"
+project: "aicc"
+title: "Реализовать классифицированные retry/backoff, retry budget, dead-letter, idempotency keys, resume и…"
+why: "Реализовать классифицированные retry/backoff, retry budget, dead-letter, idempotency keys, resume и supervisor watchdog."
+priority: "P0"
+owner: "Reliability Platform"
+reviewer: "reviewer-unassigned"
+acceptance: "transient failures перезапускаются без человека; permanent failures не зацикливаются; reboot/control restart/worker loss проходят recovery acceptance."
+status: "OPEN"
+wave: "0"
+depends_on:
+  - "VOYN-W0-AICC-SRV-04"
+  - "VOYN-W0-AICC-SRV-05"

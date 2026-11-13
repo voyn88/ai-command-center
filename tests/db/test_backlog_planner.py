@@ -1024,6 +1024,131 @@ def test_plan_once_reconciles_technical_parks_without_audit_spam(rig) -> None:
     assert store.get_task("VOYN-W0-RZ")["status"] == "DEFER_TO_USER"
 
 
+# --- max_stuck_ready_recoveries_per_tick: READY_TO_REVIEW with no `pr`
+# evidence at all is otherwise a dead end -- reconcile_pr_evidence only ever
+# RECORDS evidence it finds on the task's own branch, so a task with none to
+# find there (VOYN-W0-AICC-TICK-STALL-WATCHDOG, live shape: VOYN-W0-AICC-
+# SRV-07a) was skipped `no_open_pr_on_task_branch` every tick forever, with
+# nothing in the pipeline ever revisiting it. 0018's
+# `backlog_recover_stuck_ready_to_review` is the sanctioned READY_TO_REVIEW
+# -> OPEN exit but had no automated caller before this reconcile.
+
+
+def _ready_to_review_without_pr(app_factory, store, admin_conn, task_id, *, age_seconds=0) -> None:
+    """READY_TO_REVIEW with no `pr` evidence on record -- the stuck shape a
+    completed-but-unpublished run (or any bug/manual edit reproducing the
+    same gap) leaves behind. `age_seconds` backdates `updated_at` so a test
+    can simulate a task that has sat this way for a while -- `updated_at` has
+    no app-role DML path, exactly like `created_at` above, so backdating it
+    goes through `admin_conn`."""
+    assert store.upsert_task(_task(task_id, status="OPEN"))[0]
+    with app_factory() as conn:
+        with conn.cursor() as cur:
+            def _rev():
+                cur.execute(
+                    "SELECT revision FROM backlog_task WHERE task_id=%s", (task_id,)
+                )
+                return cur.fetchone()[0]
+            cur.execute(
+                "SELECT ok FROM backlog_transition(%s,'IN_PROGRESS',%s)",
+                (task_id, _rev()),
+            )
+            cur.execute(
+                "SELECT ok FROM backlog_transition(%s,'READY_TO_REVIEW',%s)",
+                (task_id, _rev()),
+            )
+    if age_seconds:
+        with admin_conn.cursor() as cur:
+            cur.execute(
+                "UPDATE backlog_task SET updated_at = now() - (%s * interval '1 second') "
+                "WHERE task_id = %s",
+                (age_seconds, task_id),
+            )
+        admin_conn.commit()
+
+
+def test_plan_once_recovers_a_long_stuck_ready_to_review_task_with_no_pr(rig, admin_conn) -> None:
+    app_factory, store, _worker = rig
+    _ready_to_review_without_pr(app_factory, store, admin_conn, "VOYN-W0-SK1", age_seconds=7200)
+
+    report = plan_once(app_factory, PlanLimits(wip_limit=4))
+
+    assert "VOYN-W0-SK1" in report.recovered_stuck_ready
+    # The reconcile lands the task on OPEN; the same tick's dispatch phase,
+    # running right after, may immediately pick it up for a fresh attempt --
+    # exactly the intended "another attempt at a real PR" (0018's own
+    # rationale), not a second bug. Same allowance as the DEFER_TO_USER
+    # resume reconcile's own test above.
+    assert store.get_task("VOYN-W0-SK1")["status"] in ("OPEN", "IN_PROGRESS")
+    with app_factory() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT reason FROM backlog_event WHERE task_id = %s "
+            "AND event = 'recover_stuck_ready_to_review' AND outcome = 'granted'",
+            ("VOYN-W0-SK1",),
+        )
+        assert cur.fetchone()[0] == "no_pr_evidence"
+
+
+def test_plan_once_leaves_a_fresh_stuck_candidate_alone_until_the_age_floor(rig, admin_conn) -> None:
+    """A task that JUST reached READY_TO_REVIEW with no `pr` evidence must
+    not be yanked back to OPEN on the very next tick -- a publish genuinely
+    still in flight, or an operator mid-way through hand-opening the PR
+    `reconcile_pr_evidence` is meant to pick up, must get its window."""
+    app_factory, store, _worker = rig
+    _ready_to_review_without_pr(app_factory, store, admin_conn, "VOYN-W0-SK2")
+
+    report = plan_once(app_factory, PlanLimits(wip_limit=4))
+
+    assert "VOYN-W0-SK2" not in report.recovered_stuck_ready
+    assert store.get_task("VOYN-W0-SK2")["status"] == "READY_TO_REVIEW"
+
+
+def test_plan_once_never_touches_ready_to_review_carrying_pr_evidence(rig, admin_conn) -> None:
+    """A task with `pr` evidence on record -- genuinely reviewable, or
+    already rejected/merged through that path -- is never a recovery
+    candidate, however stale, regardless of the age floor."""
+    app_factory, store, _worker = rig
+    _ready_to_review_with_pr(app_factory, store, "VOYN-W0-SK3", "https://github.com/x/y/pull/1")
+    with admin_conn.cursor() as cur:
+        cur.execute(
+            "UPDATE backlog_task SET updated_at = now() - interval '1 year' "
+            "WHERE task_id = %s",
+            ("VOYN-W0-SK3",),
+        )
+    admin_conn.commit()
+
+    report = plan_once(app_factory, PlanLimits(wip_limit=4))
+
+    assert "VOYN-W0-SK3" not in report.recovered_stuck_ready
+    assert store.get_task("VOYN-W0-SK3")["status"] == "READY_TO_REVIEW"
+
+
+def test_stuck_ready_recovery_budget_is_bounded(rig, admin_conn) -> None:
+    app_factory, store, _worker = rig
+    for n in range(3):
+        _ready_to_review_without_pr(
+            app_factory, store, admin_conn, f"VOYN-W0-SKB{n}", age_seconds=7200
+        )
+
+    report = plan_once(
+        app_factory, PlanLimits(wip_limit=4, max_stuck_ready_recoveries_per_tick=2)
+    )
+
+    assert len(report.recovered_stuck_ready) == 2
+
+
+def test_stuck_ready_recovery_zero_cap_disables_it(rig, admin_conn) -> None:
+    app_factory, store, _worker = rig
+    _ready_to_review_without_pr(app_factory, store, admin_conn, "VOYN-W0-SKZ", age_seconds=7200)
+
+    report = plan_once(
+        app_factory, PlanLimits(wip_limit=4, max_stuck_ready_recoveries_per_tick=0)
+    )
+
+    assert report.recovered_stuck_ready == []
+    assert store.get_task("VOYN-W0-SKZ")["status"] == "READY_TO_REVIEW"
+
+
 # --- review_backlog_limit: dispatch-only backpressure, not a whole-tick gate
 
 

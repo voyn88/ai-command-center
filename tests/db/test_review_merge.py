@@ -2294,6 +2294,21 @@ def test_review_once_no_longer_enqueues_an_eager_adjudication(rig, _test_repo_ro
     head = "d" * 40
     snap = _snapshot(head)
     SNAPSHOTS[pr_url] = snap
+    # The window lookup is a separate GitHub read from the snapshot below.
+    # Keep this live-PostgreSQL test off the network, like the other ticks.
+    import subprocess
+
+    window_reads = []
+
+    def fake_gh(argv, repo):
+        assert repo == "/tmp"
+        assert argv == ["api", "repos/x/repo-d2/pulls/31"]
+        window_reads.append(argv)
+        body = {"state": "open", "head": {"sha": head},
+                "labels": [{"name": "review-window:active"}]}
+        return subprocess.CompletedProcess(argv, 0, json.dumps(body), "")
+
+    monkeypatch.setattr(review_merge, "_gh", fake_gh)
     monkeypatch.setattr(review_merge, "_pr_diff_and_head", lambda _r, _p: snap)
     monkeypatch.setattr(review_merge, "_review_chunks", lambda s, t, p: review_merge._make_diff_chunks(["a", "b", "c"]))
     monkeypatch.setattr(review_merge, "_render_review_prompt", lambda t, p, s, c: "prompt")
@@ -2303,6 +2318,7 @@ def test_review_once_no_longer_enqueues_an_eager_adjudication(rig, _test_repo_ro
     assert ("VOYN-W0-ADJ-D", pr_url) in report.reviewed
     assert len(enq) == 3
     assert all(":chunk:" in k for k in enq), enq
+    assert window_reads == [["api", "repos/x/repo-d2/pulls/31"]]
 
 
 # --- VOYN-W0-AICC-MERGE-TRAIN-COORDINATOR: keep behind PRs from gridlocking --
@@ -4430,6 +4446,29 @@ def test_a_task_adopts_only_its_own_branch_never_a_prefix_match(rig, _test_repo_
 
     assert _pr_rows(app_factory, task_id) == []
     assert (task_id, "no_open_pr_on_task_branch") in report.skipped
+
+
+def test_no_open_pr_recovers_evidence_free_ready_task_to_open(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501
+    """An authoritative empty result must use the existing audited recovery
+    path instead of producing an identical skip on every review tick."""
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-PRE-NO-PR"
+    _ready_without_pr(store, app_factory, task_id)
+    monkeypatch.setattr(review_merge, "_gh", _fake_pr_list([]))
+
+    report = reconcile_pr_evidence(app_factory, REPO)
+
+    assert report.recovered == [task_id]
+    assert report.skipped == []
+    assert _pr_rows(app_factory, task_id) == []
+    assert store.get_task(task_id)["status"] == "OPEN"
+    with app_factory() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT reason FROM backlog_event WHERE task_id=%s "
+            "AND event='recover_stuck_ready_to_review' AND outcome='granted'",
+            (task_id,),
+        )
+        assert cur.fetchone()[0] == "no_pr_evidence"
 
 
 def test_two_open_prs_on_one_branch_are_refused_rather_than_guessed(rig, _test_repo_routes, monkeypatch):  # noqa: F811, E501

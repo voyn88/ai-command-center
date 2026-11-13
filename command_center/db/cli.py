@@ -110,7 +110,29 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Parse and report without touching the database.",
     )
+    vt = sub.add_parser(
+        "backlog-import-voyn-task",
+        help="Read-only stage 3: reconcile voyn-backlog (YAML definitions + "
+        "voyn_coordination state) into the store. OFF unless "
+        "AICC_VOYN_TASK_SOURCE=1; when off nothing is read.",
+    )
+    vt.add_argument(
+        "--parse-only",
+        action="store_true",
+        help="Map and report without touching the AICC database.",
+    )
     sub.add_parser("backlog-status", help="Task counts by status from the store.")
+    recover = sub.add_parser(
+        "backlog-recover-stuck-ready-to-review",
+        help="READY_TO_REVIEW -> OPEN for one task through the 0018 machine "
+        "gate (granted only when the task carries no `pr` evidence at all). "
+        "The sanctioned way out for a task the pr_evidence tick can only "
+        "ever skip -- e.g. its PR was never opened or was closed/merged "
+        "without evidence recorded, so `reconcile_pr_evidence` (which only "
+        "ever looks for an OPEN pull request) will report the same skip "
+        "forever without this.",
+    )
+    recover.add_argument("task_id", help="The stuck backlog task id.")
     export = sub.add_parser(
         "backlog-export",
         help=(
@@ -297,6 +319,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--reason", required=True, help="Audited reason for the suspension."
     )
 
+    slo = sub.add_parser(
+        "slo-check",
+        help="Evaluate pipeline SLOs over the queue and backlog tables -- "
+        "duplicate mutating attempts on one worktree, active attempts with "
+        "no heartbeat, review cycles stuck past their SLA -- and alert "
+        "(ERROR-level structured log lines) on any violation "
+        "(aicc-slo-check.timer). Report-only: never mutates state.",
+    )
+    slo.add_argument(
+        "--review-sla-seconds",
+        type=float,
+        default=None,
+        help="Override the review-cycle SLA (default 14400s = 4h).",
+    )
+
     down = sub.add_parser("downgrade", help="Revert migrations down to a version.")
     down.add_argument(
         "--to",
@@ -387,6 +424,35 @@ def main(argv: list[str] | None = None) -> int:
         if window.quota is not None:
             print(window.quota.line())
         return 0
+
+    voyn_report = None
+    if args.command == "backlog-import-voyn-task":
+        # Before any AICC database configuration: the gate must hold on a host
+        # that has no AICC DB role, and while the flag is off NOTHING is read
+        # (no voyn-task DSN, no tasks/ directory, no psql).
+        from command_center.db import voyn_task_source
+
+        if not voyn_task_source.is_enabled():
+            print(f"voyn-task source disabled ({voyn_task_source.FLAG_ENV} is off); nothing read")
+            return 0
+        try:
+            voyn_report = voyn_task_source.load_from_voyn_task()
+        except voyn_task_source.SourceError as exc:
+            print(f"voyn-task source error: {exc}", file=sys.stderr)
+            return 1
+        print(f"mapped: {len(voyn_report.tasks)} tasks")
+        for task_id in voyn_report.unregistered:
+            print(f"UNREGISTERED {task_id}: no task_state row, status taken from YAML")
+        for task_id in voyn_report.orphan_states:
+            print(f"ORPHAN-STATE {task_id}: state without a YAML definition, ignored")
+        for task_id in voyn_report.no_wave:
+            print(f"NO-WAVE {task_id}: not imported, backlog_task.wave is required")
+        for _line, reason, excerpt in voyn_report.unparsed:
+            if reason.startswith("no wave"):
+                continue
+            print(f"UNPARSED {excerpt}: {reason}")
+        if args.parse_only:
+            return 0
 
     try:
         config = load_config()
@@ -536,6 +602,23 @@ def main(argv: list[str] | None = None) -> int:
                 # surface them in the exit code so a timer/CI run goes red.
                 return 1 if report.refused else 0
 
+            if args.command == "backlog-import-voyn-task":
+                from command_center.db import voyn_task_source
+                from command_center.db.backlog_store import BacklogStore
+
+                report = voyn_task_source.apply_report(
+                    BacklogStore(lambda: nullcontext(conn)), voyn_report
+                )
+                print(
+                    f"inserted {report.inserted}, existing (untouched) {report.existing}, "
+                    f"dependencies {report.dependencies}, evidence {report.evidence}"
+                )
+                for task_id, name, ours, theirs in report.differences:
+                    print(f"DIFF {task_id} {name}: aicc={ours} voyn-task={theirs} (not written)")
+                for task_id, reason in report.refused:
+                    print(f"REFUSED {task_id}: {reason}")
+                return 1 if report.refused else 0
+
             if args.command == "backlog-status":
                 from command_center.db.backlog_store import BacklogStore
 
@@ -543,6 +626,18 @@ def main(argv: list[str] | None = None) -> int:
                     BacklogStore(lambda: nullcontext(conn)).counts_by_status().items()
                 ):
                     print(f"{status}: {count}")
+                return 0
+
+            if args.command == "backlog-recover-stuck-ready-to-review":
+                from command_center.db.backlog_store import BacklogStore
+
+                ok, reason, revision = BacklogStore(
+                    lambda: nullcontext(conn)
+                ).recover_stuck_ready_to_review(args.task_id)
+                if not ok:
+                    print(f"REFUSED   {args.task_id}: {reason}", file=sys.stderr)
+                    return 1
+                print(f"RECOVERED {args.task_id} -> OPEN (revision {revision})")
                 return 0
 
             if args.command == "backlog-export":
@@ -614,6 +709,8 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"INGESTED  {task_id}: {action}")
                 for task_id, park_reason in report.resumed:
                     print(f"RESUMED   {task_id}: {park_reason}")
+                for task_id in report.recovered_stuck_ready:
+                    print(f"RECOVERED {task_id}: no_pr_evidence")
                 for task_id, reason in report.skipped_by_wave_gate:
                     print(f"WAVE-GATE {task_id}: {reason}")
                 for task_id, reason in report.refused:
@@ -654,6 +751,7 @@ def main(argv: list[str] | None = None) -> int:
                     publish_review_verdicts,
                     reconcile_pr_evidence,
                     reconcile_review_once,
+                    recover_stuck_pr_evidence_once,
                     review_once,
                 )
 
@@ -676,8 +774,26 @@ def main(argv: list[str] | None = None) -> int:
                     )
                     for evidence_task_id, pr in evidence.recorded:
                         print(f"PR-FOUND  {evidence_task_id} -> {pr}")
+                    for evidence_task_id in evidence.recovered:
+                        print(f"PR-RECOVER {evidence_task_id} -> OPEN")
                     for evidence_task_id, reason in evidence.skipped:
                         print(f"PR-SKIP   {evidence_task_id}: {reason}")
+                    # A task `reconcile_pr_evidence` just proved has NO `pr`
+                    # evidence at all and no open PR on its branch either is
+                    # stuck, not waiting: ingest (0011/0030) never lands a
+                    # task in READY_TO_REVIEW without recording real `pr`
+                    # evidence in the same call, so nothing will ever fill
+                    # this in later. Recover it to OPEN now rather than let
+                    # the same skip repeat tick after tick until the
+                    # stall watchdog has to escalate it (VOYN-W0-AICC-
+                    # SRV-07d-STALL).
+                    recovery = recover_stuck_pr_evidence_once(
+                        lambda: _nc(conn), evidence.skipped
+                    )
+                    for recovered_task_id, verdict_reason in recovery.recovered:
+                        print(f"PR-RECOVER {recovered_task_id} -> {verdict_reason}")
+                    for recovered_task_id, reason in recovery.skipped:
+                        print(f"PR-RECOVER-SKIP {recovered_task_id}: {reason}")
                     report = review_once(
                         lambda: _nc(conn),
                         enqueue,
@@ -829,6 +945,58 @@ def main(argv: list[str] | None = None) -> int:
                 # Non-zero exit surfaces a real finding to a human/CI without
                 # ever touching the database -- report-only stays report-only.
                 return 1 if report.suspect else 0
+
+            if args.command == "slo-check":
+                from datetime import datetime, timezone
+
+                from command_center.observability.slo import (
+                    DEFAULT_REVIEW_SLA_SECONDS,
+                    evaluate_slos,
+                    fire_alerts,
+                )
+
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT wi.task_id, wi.work_item_id, wa.attempt_id, "
+                        "wa.state, wa.visibility_seconds, wa.heartbeat_at, "
+                        "wa.created_at "
+                        "FROM work_item_public wi "
+                        "JOIN work_attempt_public wa "
+                        "  ON wa.work_item_id = wi.work_item_id "
+                        "WHERE wi.state = 'claimed' AND wa.state = 'active'"
+                    )
+                    columns = [d[0] for d in cur.description]
+                    attempts = [
+                        dict(zip(columns, row, strict=True)) for row in cur.fetchall()
+                    ]
+
+                    cur.execute(
+                        "SELECT task_id, status, updated_at FROM backlog_task "
+                        "WHERE status = 'READY_TO_REVIEW'"
+                    )
+                    columns = [d[0] for d in cur.description]
+                    tasks = [
+                        dict(zip(columns, row, strict=True)) for row in cur.fetchall()
+                    ]
+
+                violations = evaluate_slos(
+                    attempts=attempts,
+                    tasks=tasks,
+                    now=datetime.now(timezone.utc),
+                    review_sla_seconds=(
+                        args.review_sla_seconds
+                        if args.review_sla_seconds is not None
+                        else DEFAULT_REVIEW_SLA_SECONDS
+                    ),
+                )
+                fire_alerts(violations)
+                for violation in violations:
+                    print(f"ALERT  {violation.slo}  task={violation.task_id}: {violation.detail}")
+                if not violations:
+                    print("no SLO violations")
+                # Non-zero exit surfaces a real finding to a human/CI/systemd
+                # OnFailure= without this command ever touching a row.
+                return 1 if violations else 0
 
             if args.command == "downgrade":
                 if not args.confirmed:

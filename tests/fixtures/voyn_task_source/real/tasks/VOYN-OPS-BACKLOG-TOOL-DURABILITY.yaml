@@ -1,0 +1,14 @@
+# Мигрировано из outputs/VOYN_TASKS_BACKLOG.md скриптом tools/migrate_backlog.py. Строка оригинала: 196.
+id: "VOYN-OPS-BACKLOG-TOOL-DURABILITY"
+project: "aios"
+title: "Инструмент атомарной записи в бэклог (snapshot -> lock -> revision check -> os.replace) был создан в…"
+why: "Инструмент атомарной записи в бэклог (`snapshot -> lock -> revision check -> os.replace`) был создан в сессионном scratch-каталоге `/private/tmp/...` и исчез вместе с его очисткой посреди работы. Гарантия, которая испаряется, гарантией не является."
+priority: "P2"
+owner: "Ops / Platform"
+reviewer: "reviewer-unassigned"
+acceptance: "Критерий приёмки в исходном Markdown не указан; уточнить у владельца"
+status: "DONE"
+wave: "0"
+depends_on: []
+evidence:
+  test: "ссылок на PR/коммит в тексте нет; см. строку 196 в outputs/VOYN_TASKS_BACKLOG.md"

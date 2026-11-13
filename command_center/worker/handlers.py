@@ -49,10 +49,12 @@ from pathlib import Path
 from typing import Any
 
 from command_center import agent_runner, project_config, workspace_provisioning
+from command_center.observability.trace import log_span
 from command_center.ops.source_clone_refresh import refresh_source_clone
 from command_center.orchestrator import gh_access
 from command_center.orchestrator.publish import PublishConfig, publish_run
 from command_center.orchestrator.routing import cascade_for
+from command_center import prepush_prescreen
 from command_center.worker import admission, writer_lease
 from command_center.worker.daemon import Handler, HandlerOutcome
 from command_center.worker.payloads import PayloadError, parse_agent_run
@@ -677,8 +679,20 @@ def _executor_preflight(executor: str, task_type: str) -> tuple[bool, str, str]:
         available, detail = agent_runner.claude_mac_preflight()
         return available, detail, "Claude Mac inference adapter unavailable"
     if agent_runner.principal_isolation_required():
+        if executor == "aider":
+            # The broker stages the mutating CLI under the isolated agent
+            # principal, while this worker-side probe additionally proves the
+            # exact benchmarked Ollama tag is locally available.
+            available, detail = agent_runner.aider_preflight(
+                binary=agent_runner.PRINCIPAL_EXECUTOR_BINARIES["aider"]
+            )
+            if not available:
+                return False, detail, "aider cli or ollama daemon unavailable"
         available, detail = agent_runner.principal_executor_preflight(executor)
         return available, detail, f"isolated {executor} cli unavailable"
+    if executor == "aider":
+        available, detail = agent_runner.aider_preflight()
+        return available, detail, "aider cli or ollama daemon unavailable"
     if executor == "codex":
         available, detail = agent_runner.claude_cli_preflight(agent_runner.CODEX_BINARY)
         return available, detail, "codex cli unavailable"
@@ -1121,6 +1135,12 @@ def _run_agent(
                     # only once, when `stack.close()` runs in this function's
                     # own `finally`.
                     full_lifecycle_lease_held = True
+                    log_span(
+                        "lease",
+                        task_id=backlog_task,
+                        repository=str(repository),
+                        isolated_workspace=str(isolated_workspace),
+                    )
                 except writer_lease.WriterLeaseUnavailable as exc:
                     # Another writer already holds this task's lease, or the
                     # authority refused/could not be reached: a data refusal,
@@ -1242,6 +1262,13 @@ def _run_agent(
                     retryable=True,
                 )
             run_repository = Path(evidence.workspace_path)
+            log_span(
+                "workspace",
+                task_id=backlog_task,
+                workspace_path=evidence.workspace_path,
+                expected_branch=evidence.expected_branch,
+                provision_outcome=evidence.provision_outcome,
+            )
 
         # VOYN-W0-AICC-FORCED-AGENT-CANCELLATION: the same `lease_lost` event
         # this function already checked once, above, *before* starting the
@@ -1262,6 +1289,13 @@ def _run_agent(
         # visibility-window expiry / supersession in `work_queue_store`,
         # unaffected by this change — it closes the narrower, previously-open
         # gap that the OS process kept running regardless of that decision.
+        log_span(
+            "agent",
+            task_id=backlog_task,
+            executor=executor,
+            task_type=task_type,
+            model=model,
+        )
         route_failovers: list[dict[str, Any]] = []
         tried_steps: set[int] = set()
         while True:
@@ -1681,6 +1715,18 @@ def _run_agent(
                     reason="guarded publish authority is incomplete",
                     retryable=True,
                 )
+            # VOYN-W0-AICC-PREPUSH-LOCAL-PRESCREEN: a bounded, best-effort local
+            # pass over the agent's own (still dirty) workspace, run before the
+            # checkpoint commit below so any ruff/aider fix it applies is swept
+            # into that same commit rather than needing one of its own. Runs
+            # only on the path that is actually about to push -- the local-only
+            # (`deploy_key` unset) branch further down never publishes, so there
+            # is nothing here for a prescreen to protect. Never raises and never
+            # blocks: `prepush_prescreen.run_prepush_prescreen`'s contract is
+            # advisory-only, matching `command_center.audit.checks.base.Check`.
+            result["prepush_prescreen"] = prepush_prescreen.run_prepush_prescreen(
+                run_repository, base_sha=evidence.base_sha
+            ).as_payload()
             try:
                 candidate_sha, checkpointed_dirty_worktree = (
                     workspace_provisioning.checkpoint_dirty_task_workspace(
@@ -1772,10 +1818,28 @@ def _run_agent(
                         ),
                     )
             except workspace_provisioning.WorkspaceVerificationError as exc:
+                # A completed executor run must not leave an uncheckpointed
+                # clone at the live task path: the next delivery would reuse
+                # the same poisoned tree and spend another attempt before it
+                # could make progress. Preserve it outside the resume path.
+                quarantined = None
+                if isolated_workspace is not None:
+                    quarantined = workspace_provisioning.quarantine_task_workspace(
+                        isolated_workspace
+                    )
                 return HandlerOutcome(
                     ok=False,
-                    reason=f"guarded publish preparation failed at {exc.failed_step}: {exc.detail}",
+                    reason=(
+                        f"guarded publish preparation failed at {exc.failed_step}: "
+                        f"{exc.detail}; uncheckpointed clone "
+                        + (
+                            f"quarantined at {quarantined}"
+                            if quarantined
+                            else "could not be quarantined"
+                        )
+                    ),
                     retryable=True,
+                    infra_wait=quarantined is not None,
                 )
             result["publish"] = {
                 "ok": pub.ok,

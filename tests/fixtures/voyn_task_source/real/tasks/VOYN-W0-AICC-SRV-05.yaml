@@ -1,0 +1,14 @@
+# Мигрировано из outputs/VOYN_TASKS_BACKLOG.md скриптом tools/migrate_backlog.py. Строка оригинала: 1368.
+id: "VOYN-W0-AICC-SRV-05"
+project: "aicc"
+title: "Установить headless worker service для Claude/Codex с systemd restart, capability routing, isolated…"
+why: "Установить headless worker service для Claude/Codex с systemd restart, capability routing, isolated worktrees, resource limits и sandbox policy."
+priority: "P0"
+owner: "Runtime Platform"
+reviewer: "reviewer-unassigned"
+acceptance: "worker после reboot автоматически регистрируется, берёт следующую допустимую задачу, публикует heartbeat/provenance и не требует открытого ноутбука."
+status: "OPEN"
+wave: "0"
+depends_on:
+  - "VOYN-W0-AICC-SRV-03"
+  - "VOYN-W0-AICC-SRV-04"

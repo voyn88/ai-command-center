@@ -1,9 +1,12 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
+import type { TFunction } from 'i18next'
+import { kpiMeta } from '../lib/labels'
 import { fetchHome } from '../lib/api'
 import type { HomeDTO, Kpi } from '../lib/api'
 import GlassPanel from '../components/GlassPanel'
+import TechDetails from '../components/TechDetails'
 import KpiCard from '../components/KpiCard'
 import QueueRow from '../components/QueueRow'
 import HealthDonut from '../components/HealthDonut'
@@ -27,6 +30,10 @@ import {
   ReviewCenterIcon,
   SettingsIcon,
 } from '../components/NavIcons'
+
+// Preview-only panels (quick actions, AI assistant) have no backend yet.
+// Flip to true to bring the previous layout back.
+const SHOW_PREVIEW_PANELS = false
 
 const NAV_KEYS = [
   'home',
@@ -58,9 +65,10 @@ const NAV_ICONS = [
 // Pairs `meta_n` with `meta_key` for the agents/tasks/reviews KPIs
 // ("2 running", "5 in progress", "1 pending"). NOT used for the Projects
 // KPI — see `formatProjectsMeta` below.
-function formatKpiMeta(kpi: Kpi, t: (key: string) => string): string {
-  if (kpi.meta_n !== undefined) return `${kpi.meta_n} ${t(kpi.meta_key)}`
-  return t(kpi.meta_key)
+// Backend meta_key values are mapped in lib/labels.ts (KPI_META_KEYS); an
+// unknown key renders nothing rather than a raw i18n key.
+function formatKpiMeta(kpi: Kpi, t: TFunction): string {
+  return kpiMeta(kpi.meta_key, kpi.meta_n, t)
 }
 
 // The backend's `kpis.projects.meta_key` is ALWAYS the literal string
@@ -71,13 +79,13 @@ function formatKpiMeta(kpi: Kpi, t: (key: string) => string): string {
 // `health.{projects_healthy,projects_total}` (the same source
 // `HealthDonut` uses), so we derive the Projects KPI's meta text from that
 // instead of from `meta_key`.
-function formatProjectsMeta(healthy: number, total: number, t: (key: string) => string): string {
+function formatProjectsMeta(healthy: number, total: number, t: TFunction): string {
   if (total > 0 && healthy === total) return t('all_healthy')
   return `${healthy} ${t('healthyCount')}`
 }
 
 function EmptyState({ label }: { label: string }) {
-  return <div style={{ color: 'var(--tx3)', fontSize: '0.8rem', padding: '0.75rem 0' }}>{label}</div>
+  return <div style={{ color: 'var(--tx3-aa)', fontSize: '0.8rem', padding: '0.75rem 0' }}>{label}</div>
 }
 
 function CenteredPanel({ children }: { children: ReactNode }) {
@@ -93,6 +101,7 @@ export default function Home({ onNavigate = () => undefined }: { onNavigate?: (s
   const [data, setData] = useState<HomeDTO | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
+  const restoreFocus = useRef(false)
 
   function load() {
     setLoading(true)
@@ -109,19 +118,28 @@ export default function Home({ onNavigate = () => undefined }: { onNavigate?: (s
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  // After "Retry" the button that had focus is gone; hand focus to <main>.
+  useEffect(() => {
+    if (!loading && data && restoreFocus.current) {
+      restoreFocus.current = false
+      document.querySelector('main')?.focus()
+    }
+  }, [loading, data])
+
   if (loading) {
-    return <CenteredPanel>{t('loading')}</CenteredPanel>
+    return <CenteredPanel><span role="status">{t('loading')}</span></CenteredPanel>
   }
 
   if (error || !data) {
     return (
       <CenteredPanel>
-        <div style={{ color: 'var(--bad)', marginBottom: '0.75rem' }}>{error || t('errorLoading')}</div>
+        <div role="alert" style={{ color: 'var(--bad-text)', marginBottom: '0.25rem' }}>{error || t('errorLoading')}</div>
+        <div style={{ color: 'var(--tx2)', fontSize: '0.8rem', marginBottom: '0.75rem' }}>{t('errorLoadingHint')}</div>
         <button
           type="button"
-          onClick={load}
+          onClick={() => { restoreFocus.current = true; load() }}
           className="glass"
-          style={{ padding: '0.4rem 0.9rem', color: 'var(--tx)', cursor: 'pointer', background: 'rgba(255,255,255,0.02)' }}
+          style={{ padding: '0.4rem 0.9rem', color: 'var(--tx)', cursor: 'pointer', background: 'var(--glass)' }}
         >
           {t('retry')}
         </button>
@@ -140,41 +158,45 @@ export default function Home({ onNavigate = () => undefined }: { onNavigate?: (s
           <div>
             <div style={{ color: 'var(--tx)', fontWeight: 700, fontSize: '1rem' }}>AI Command Center</div>
             <div style={{ color: 'var(--tx2)', fontSize: '0.8rem', marginTop: '0.15rem' }}>{t('greeting')}</div>
-            <div style={{ color: 'var(--tx3)', fontSize: '0.72rem' }}>{t('greetingSub')}</div>
+            <div style={{ color: 'var(--tx3-aa)', fontSize: '0.72rem' }}>{t('greetingSub')}</div>
           </div>
         </div>
-        <button
-          type="button"
-          disabled
-          title={t('comingSoon')}
-          style={{
-            background: 'linear-gradient(135deg, var(--accent-1), var(--accent-2))',
-            color: '#fff',
-            border: 'none',
-            borderRadius: 10,
-            padding: '0.55rem 1.1rem',
-            fontSize: '0.82rem',
-            fontWeight: 600,
-            cursor: 'not-allowed',
-            opacity: 0.85,
-          }}
-        >
-          {t('newTask')}
-        </button>
+        {SHOW_PREVIEW_PANELS && (
+          <button
+            type="button"
+            disabled
+            title={t('comingSoon')}
+            style={{
+              background: 'linear-gradient(135deg, var(--accent-1), var(--accent-2))',
+              color: 'var(--tx)',
+              border: 'none',
+              borderRadius: 10,
+              padding: '0.55rem 1.1rem',
+              fontSize: '0.82rem',
+              fontWeight: 600,
+              cursor: 'not-allowed',
+              opacity: 0.85,
+            }}
+          >
+            {t('newTask')}
+          </button>
+        )}
       </header>
 
-      <div className="layout-grid">
+      <div className={SHOW_PREVIEW_PANELS ? 'layout-grid' : 'layout-grid layout-grid--two'}>
         <aside
           className="glass"
           style={{ padding: '1rem', display: 'flex', flexDirection: 'column', gap: '0.25rem', position: 'sticky', top: '1.5rem' }}
         >
           {NAV_KEYS.map((key, i) => {
             const Icon = NAV_ICONS[i]
-            return <NavItem key={key} label={t(key)} icon={<Icon />} active={i === 0} onClick={key === 'home' || key === 'execution' || key === 'tasks' ? () => onNavigate(key) : undefined} />
+            // Only entries that actually go somewhere are shown.
+            if (key !== 'home' && key !== 'execution' && key !== 'tasks') return null
+            return <NavItem key={key} label={t(key)} icon={<Icon />} active={i === 0} onClick={() => onNavigate(key)} />
           })}
         </aside>
 
-        <main style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem', minWidth: 0 }}>
+        <main tabIndex={-1} style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem', minWidth: 0 }}>
           <div className="kpi-grid">
             <KpiCard
               label={t('projects')}
@@ -200,11 +222,12 @@ export default function Home({ onNavigate = () => undefined }: { onNavigate?: (s
                   />
                 ))
               )}
+              <TechDetails title={t('techTitle')} hint={t('techHint')} items={data.queue.map((item) => [item.title, item.state])} />
             </GlassPanel>
 
             <GlassPanel title={t('projectHealth')}>
               <div style={{ display: 'flex', justifyContent: 'center', marginBottom: '0.9rem' }}>
-                <HealthDonut healthy={data.health.projects_healthy} total={data.health.projects_total} />
+                <HealthDonut healthy={data.health.projects_healthy} total={data.health.projects_total} label={t('healthLabel', { healthy: data.health.projects_healthy, total: data.health.projects_total })} />
               </div>
               {data.projects.length === 0 ? (
                 <EmptyState label={t('noProjects')} />
@@ -222,9 +245,9 @@ export default function Home({ onNavigate = () => undefined }: { onNavigate?: (s
                   >
                     <span style={{ color: 'var(--tx)', fontSize: '0.82rem' }}>{p.name}</span>
                     {p.redacted ? (
-                      <span style={{ fontSize: '0.68rem', color: 'var(--tx3)' }}>{t('restricted')}</span>
+                      <span style={{ fontSize: '0.75rem', color: 'var(--tx3-aa)' }}>{t('restricted')}</span>
                     ) : (
-                      <span style={{ fontSize: '0.68rem', color: p.healthy ? 'var(--ok)' : 'var(--bad)' }}>
+                      <span style={{ fontSize: '0.75rem', color: p.healthy ? 'var(--ok)' : 'var(--bad-text)' }}>
                         {p.healthy ? t('healthy') : t('needsAttention')}
                       </span>
                     )}
@@ -240,9 +263,10 @@ export default function Home({ onNavigate = () => undefined }: { onNavigate?: (s
                 <EmptyState label={t('activityEmpty')} />
               ) : (
                 data.activity.map((item, i) => (
-                  <ActivityRow key={item.id || `${item.ts || ''}-${i}`} item={item} fallbackLabel={t('activityEmpty')} />
+                  <ActivityRow key={item.id || `${item.ts || ''}-${i}`} item={item} fallbackLabel={t('activityGeneric')} projectLabel={item.project ? projectLabel(item.project) : undefined} />
                 ))
               )}
+              <TechDetails title={t('techTitle')} hint={t('techHint')} items={data.activity.map((item) => [item.project ? projectLabel(item.project) : t('techEvent'), item.event_type || item.type])} />
             </GlassPanel>
 
             <GlassPanel title={t('systemStatus')}>
@@ -258,6 +282,7 @@ export default function Home({ onNavigate = () => undefined }: { onNavigate?: (s
                   />
                 ))
               )}
+              <TechDetails title={t('techTitle')} hint={t('techHint')} items={data.status.map((s) => [projectLabel(s.project), s.repository_state])} />
             </GlassPanel>
           </div>
 
@@ -269,6 +294,7 @@ export default function Home({ onNavigate = () => undefined }: { onNavigate?: (s
             </div>
           </GlassPanel>
 
+          {SHOW_PREVIEW_PANELS && (
           <GlassPanel title={t('quickActions')}>
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: '0.75rem' }}>
               <QuickActionButton label={t('newTask')} badge={t('comingSoon')} />
@@ -277,8 +303,10 @@ export default function Home({ onNavigate = () => undefined }: { onNavigate?: (s
               <QuickActionButton label={t('reviewCenter')} badge={t('comingSoon')} />
             </div>
           </GlassPanel>
+          )}
         </main>
 
+        {SHOW_PREVIEW_PANELS && (
         <aside style={{ position: 'sticky', top: '1.5rem' }}>
           <AssistantPanel
             title={t('assistant')}
@@ -289,6 +317,7 @@ export default function Home({ onNavigate = () => undefined }: { onNavigate?: (s
             tools={[t('toolCodeReview'), t('toolTaskTriage'), t('toolGitOps')]}
           />
         </aside>
+        )}
       </div>
 
       <footer className="glass" style={{ padding: '0.75rem 1.25rem', display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '0.75rem' }}>

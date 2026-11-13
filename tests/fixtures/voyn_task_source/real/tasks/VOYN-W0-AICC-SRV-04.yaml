@@ -1,0 +1,14 @@
+# Мигрировано из outputs/VOYN_TASKS_BACKLOG.md скриптом tools/migrate_backlog.py. Строка оригинала: 1365.
+id: "VOYN-W0-AICC-SRV-04"
+project: "aicc"
+title: "Реализовать PostgreSQL-очередь и атомарный claim/lease протокол с fencing token, heartbeat, expiry и защитой…"
+why: "Реализовать PostgreSQL-очередь и атомарный claim/lease протокол с fencing token, heartbeat, expiry и защитой от двойного исполнения."
+priority: "P0"
+owner: "Dispatch Platform"
+reviewer: "reviewer-unassigned"
+acceptance: "два worker не могут владеть одной попыткой; stale owner не может записать результат; SIGKILL/network-partition сценарии восстанавливаются автоматически."
+status: "OPEN"
+wave: "0"
+depends_on:
+  - "VOYN-W0-AICC-SRV-01"
+  - "VOYN-W0-AICC-SRV-03"

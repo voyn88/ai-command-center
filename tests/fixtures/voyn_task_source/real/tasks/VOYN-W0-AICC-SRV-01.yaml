@@ -1,0 +1,15 @@
+# Мигрировано из outputs/VOYN_TASKS_BACKLOG.md скриптом tools/migrate_backlog.py. Строка оригинала: 1050.
+id: "VOYN-W0-AICC-SRV-01"
+project: "aicc"
+title: "VOYN-W0-AICC-SRV-01"
+why: "Описание в исходнике повреждено (на его месте '`server-postgres-foundation` |\\\\1'); см. строку 1050 оригинала"
+priority: "P0"
+owner: "AICC Platform"
+reviewer: "reviewer-unassigned"
+acceptance: "новая установка поднимается без SQLite/JSON как authority; migrations forward/backward проверены; PostgreSQL доступен только control/private network; backup restore drill доказан."
+status: "IN_PROGRESS"
+wave: "0"
+depends_on: []
+evidence:
+  pr: "https://github.com/dimastov-lab/ai-command-center/pull/284"
+  sha: "4135b74"

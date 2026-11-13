@@ -16,6 +16,7 @@ import pytest
 from command_center.db.mirror_support import (
     MIRROR_UNAVAILABLE,
     ColumnCodec,
+    TimestampWriter,
     divergence,
     render_authority_timestamp,
     to_instant,
@@ -75,10 +76,25 @@ def test_the_render_survives_a_mirror_read_in_another_zone() -> None:
     assert render_authority_timestamp(elsewhere) == written
 
 
+def test_the_render_reproduces_an_aware_utc_writer_with_microseconds() -> None:
+    """The writer, not a global mirror default, owns the timestamp spelling."""
+    written = "2026-08-13T12:00:00.784317+00:00"
+    elsewhere = to_instant(written).astimezone(timezone(timedelta(hours=-7)))
+
+    assert (
+        render_authority_timestamp(elsewhere, TimestampWriter.AWARE_UTC) == written
+    )
+
+
 # --- the per-column codec ---------------------------------------------------
 
 
 CODEC = ColumnCodec(timestamps=frozenset({"created_at"}), flags=frozenset({"done"}))
+
+AWARE_UTC_CODEC = ColumnCodec(
+    timestamps=frozenset({"created_at"}),
+    aware_utc_timestamps=frozenset({"created_at"}),
+)
 
 
 def test_flags_and_timestamps_round_trip_through_their_column_types() -> None:
@@ -88,6 +104,19 @@ def test_flags_and_timestamps_round_trip_through_their_column_types() -> None:
 
     stored = CODEC.to_column("created_at", "2026-08-13T00:00:00")
     assert CODEC.to_authority("created_at", stored) == "2026-08-13T00:00:00"
+
+
+def test_timestamp_format_is_selected_by_the_codec_schema() -> None:
+    written = "2026-08-13T12:00:00.784317+00:00"
+
+    stored = AWARE_UTC_CODEC.to_column("created_at", written)
+
+    assert AWARE_UTC_CODEC.to_authority("created_at", stored) == written
+
+
+def test_aware_utc_writer_must_name_a_timestamp_column() -> None:
+    with pytest.raises(ValueError, match="created_at"):
+        ColumnCodec(aware_utc_timestamps=frozenset({"created_at"}))
 
 
 def test_a_null_stays_null_in_both_directions() -> None:

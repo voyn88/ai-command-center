@@ -3,6 +3,7 @@ data/tasks.json
 data/runs.jsonl
 data/chats.json
 data/activity.jsonl
+data/local_model_gates.jsonl
 data/project_config.json
 data/execution_queue.json
 data/portfolio_config.json
