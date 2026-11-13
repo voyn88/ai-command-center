@@ -370,6 +370,55 @@ def test_dependency_manifest_changes_refuse(pair, calls, tmp_path):
     assert _git(clone, "rev-parse", "HEAD") == first  # checkout untouched
 
 
+def _install_release(release_root, sha):
+    (release_root / "releases" / sha).mkdir(parents=True)
+    (release_root / "current").symlink_to(f"releases/{sha}")
+
+
+def test_a_dependency_change_already_installed_by_hand_does_not_refuse_forever(
+    pair, calls, tmp_path
+):
+    """Live 2026-11-13: a manual bootstrap installed a manifest change; the
+    source clone stayed behind, so `HEAD..origin` kept containing it."""
+    origin, clone, first = pair
+    bumped = _commit(origin, "bump deps", filename="uv.lock", content="lock v2")
+    new = _commit(origin, "advance")  # no manifest change after the install
+    release_root = tmp_path / "opt-aicc"
+    _install_release(release_root, bumped)  # the operator installed `bumped`
+    runtime_venv = tmp_path / "runtime-venv"
+    runtime_venv.mkdir()
+    report = self_deploy_once(
+        str(clone),
+        _cfg(tmp_path, release_root=str(release_root), release_venv=str(runtime_venv)),
+    )
+    assert (report.outcome, report.detail) == ("deployed", new)
+
+
+def test_a_manifest_change_after_the_deployed_release_still_refuses(
+    pair, calls, tmp_path
+):
+    origin, clone, first = pair
+    _commit(origin, "bump deps", filename="uv.lock", content="lock v2")
+    release_root = tmp_path / "opt-aicc"
+    _install_release(release_root, first)  # deployed is the OLD sha
+    report = self_deploy_once(
+        str(clone), _cfg(tmp_path, release_root=str(release_root))
+    )
+    assert report.outcome == "refused"
+    assert "dependency_change_requires_manual_deploy" in report.detail
+
+
+def test_an_unknown_deployed_sha_keeps_the_strict_base(pair, calls, tmp_path):
+    origin, clone, first = pair
+    _commit(origin, "bump deps", filename="uv.lock", content="lock v2")
+    release_root = tmp_path / "opt-aicc"
+    _install_release(release_root, "f" * 40)  # not a commit this clone has
+    report = self_deploy_once(
+        str(clone), _cfg(tmp_path, release_root=str(release_root))
+    )
+    assert report.outcome == "refused"
+
+
 def test_failed_smoke_rolls_back_before_anything_else_ran(pair, calls, tmp_path):
     """Smoke runs FIRST (review of cff672a): a broken tree is discovered
     while the database is untouched and no service was restarted -- the

@@ -208,6 +208,43 @@ def _point_current_at(current_link: Path, selector: str) -> None:
     os.replace(tmp, current_link)
 
 
+def _deployed_release_sha(release_root: Path) -> str | None:
+    """The sha of the release `<release_root>/current` points at, or None when
+    it is absent, not an immutable `releases/<sha>` selector, or unreadable."""
+    try:
+        selector = _current_selector(release_root / "current")
+    except (OSError, RuntimeError):
+        return None
+    match = re.fullmatch(r"releases/([0-9a-f]{40})", selector)
+    return match.group(1) if match else None
+
+
+def _manifest_base(
+    repo_path: str, cfg: SelfDeployConfig, target_sha: str, timeout: int
+) -> str:
+    """What dependency manifests are compared AGAINST.
+
+    The environment that matters is the DEPLOYED one: a dependency change that
+    an operator already installed by hand (bootstrap) is not pending, even when
+    this source clone's HEAD is older than that install.  Using the clone HEAD
+    refused every tick forever after a manual install.  The deployed sha is
+    used only when it is a commit this clone has and an ancestor of the target;
+    otherwise the old, stricter base (the clone's HEAD) stays."""
+    head = "HEAD"
+    if cfg.release_root is None:
+        return head
+    deployed = _deployed_release_sha(Path(cfg.release_root))
+    if deployed is None:
+        return head
+    known = _git(repo_path, ["cat-file", "-e", f"{deployed}^{{commit}}"], timeout)
+    if known.returncode != 0:
+        return head
+    ancestor = _git(
+        repo_path, ["merge-base", "--is-ancestor", deployed, target_sha], timeout
+    )
+    return deployed if ancestor.returncode == 0 else head
+
+
 def _tracked_files(repo_path: str, timeout: int) -> list[str]:
     listed = _git(repo_path, ["ls-files", "-z"], timeout)
     if listed.returncode != 0:
@@ -343,9 +380,10 @@ def self_deploy_once(
     dirty = _git(repo_path, ["status", "--porcelain"], timeout)
     if dirty.returncode != 0 or dirty.stdout.strip():
         return finish("refused", "checkout_dirty")
+    base = _manifest_base(repo_path, cfg, report.target_sha, timeout)
     changed = _git(
         repo_path,
-        ["diff", "--name-only", f"HEAD..{report.target_sha}"],
+        ["diff", "--name-only", f"{base}..{report.target_sha}"],
         timeout,
     )
     if changed.returncode != 0:
