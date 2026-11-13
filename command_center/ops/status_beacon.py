@@ -366,8 +366,8 @@ def minimal_view(doc: Mapping[str, Any], low_free_pct: int) -> dict[str, Any]:
 def review_link_word(doc: Mapping[str, Any]) -> str | None:
     """Is the external review channel up?  ``up`` / ``down`` on a worker (its
     loopback is where the tunnel ends), ``None`` elsewhere.  A fixed word, no
-    address; it does not count as a degraded reason: after the Mac path is
-    switched off, ``down`` is the expected state."""
+    address; it does not count as a degraded reason: once reviews no longer
+    depend on this channel, ``down`` is the expected state."""
     if doc.get("role") != "worker":
         return None
     listening = (doc.get("review_tunnel") or {}).get("listening")

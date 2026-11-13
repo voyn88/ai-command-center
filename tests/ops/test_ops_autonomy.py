@@ -1519,7 +1519,7 @@ def test_without_an_aicc_worker_account_the_beacon_falls_back_loudly(tmp_path):
     assert not dropin.exists()
 
 
-def test_the_state_and_log_directories_are_readable_by_the_unprivileged_beacon(
+def test_the_state_and_log_directories_are_not_world_readable(
     tmp_path,
 ):
     env = _fake_host(tmp_path)
@@ -1527,7 +1527,7 @@ def test_the_state_and_log_directories_are_readable_by_the_unprivileged_beacon(
     assert _run_installer(env, "--role", "worker").returncode == 0
     for name in ("state", "logs"):
         mode = (tmp_path / name).stat().st_mode & 0o777
-        assert mode == 0o755, (name, oct(mode))
+        assert mode == 0o750, (name, oct(mode))
         assert (tmp_path / name / "beacon").is_dir()
 
 
@@ -1701,3 +1701,24 @@ def test_the_review_link_key_is_absent_when_unknown_and_present_on_a_worker():
     )
     worker = {**base, "role": "worker", "review_tunnel": {"listening": True}}
     assert status_beacon.minimal_view(worker, 15)["review_link"] == "up"
+
+def test_test_variables_do_nothing_without_the_nonroot_switch(tmp_path):
+    env = _releases_layout(tmp_path)
+    env.pop("AICC_OPS_ALLOW_NONROOT")
+    done = _run_installer(env, "--role", "worker")
+    assert done.returncode != 0
+    assert "run as root" in done.stderr or "must be owned by root" in done.stderr
+
+
+def test_an_intermediate_symlink_with_an_untrusted_owner_is_refused(tmp_path):
+    env = _releases_layout(tmp_path)
+    base = Path(env["AICC_RELEASE_DIR"]).parent
+    hop = tmp_path / "hop"
+    hop.symlink_to(base)
+    env["AICC_RELEASE_DIR"] = str(hop / "current")
+    (tmp_path / "units").mkdir()
+    assert _run_installer(env, "--role", "worker").returncode == 0
+    env["AICC_OPS_TRUST_OWNER"] = "nobody-here"
+    done = _run_installer(env, "--role", "worker")
+    assert done.returncode != 0
+    assert str(hop) in done.stderr or "must be owned by root" in done.stderr
