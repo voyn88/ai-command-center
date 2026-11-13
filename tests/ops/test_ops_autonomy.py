@@ -1237,6 +1237,7 @@ def test_the_default_document_is_minimal_and_clean(tmp_path):
         "degraded_count",
         "disk_free_pct",
         "last_verdict_age_min",
+        "review_link",  # the fake host is a worker with the review port open
     }
     for hidden in ("units", "sshd", "review_tunnel", "queue", "failed_units"):
         assert hidden not in text
@@ -1682,6 +1683,30 @@ def test_a_release_outside_trusted_ownership_is_refused_without_test_variables(
     assert done.returncode != 0
     assert "must be owned by root" in done.stderr
 
+
+def test_the_review_link_is_a_fixed_word_and_not_a_degraded_reason():
+    up = {"role": "worker", "review_tunnel": {"listening": True}}
+    down = {"role": "worker", "review_tunnel": {"listening": False}}
+    control = {"role": "control", "review_tunnel": {"listening": False}}
+    unknown = {"role": "worker", "review_tunnel": {}}
+    assert status_beacon.review_link_word(up) == "up"
+    assert status_beacon.review_link_word(down) == "down"
+    assert status_beacon.review_link_word(control) is None
+    assert status_beacon.review_link_word(unknown) is None
+    healthy = {"role": "worker", "disk": {"free_pct": 50}, "sshd": {"banner": True}}
+    view_up = status_beacon.minimal_view({**healthy, **up}, 15)
+    view_down = status_beacon.minimal_view({**healthy, **down}, 15)
+    assert view_up["status"] == view_down["status"] == "ok"
+    assert view_down["review_link"] == "down"
+
+
+def test_the_review_link_key_is_absent_when_unknown_and_present_on_a_worker():
+    base = {"role": "control", "disk": {"free_pct": 50}, "sshd": {"banner": True}}
+    assert "review_link" not in status_beacon.minimal_view(
+        {**base, "review_tunnel": {"listening": True}}, 15
+    )
+    worker = {**base, "role": "worker", "review_tunnel": {"listening": True}}
+    assert status_beacon.minimal_view(worker, 15)["review_link"] == "up"
 
 # --------------------------------------------------------------------------
 # CTO condition for --live: data the guard must never list as removable
