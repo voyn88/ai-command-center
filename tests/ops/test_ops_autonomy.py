@@ -1567,7 +1567,10 @@ def test_installer_uses_the_release_venv_and_imports_from_the_release(tmp_path):
     ):
         text = (tmp_path / "units" / f"{unit}.service.d" / "layout.conf").read_text()
         assert f"WorkingDirectory={current}\n" in text
-        assert f"ExecStart={current}/.venv/bin/python -m command_center.ops.{module}" in text
+        assert (
+            f"ExecStart={current}/.venv/bin/python -m command_center.ops.{module}"
+            in text
+        )
     assert _run_installer(env, "--uninstall").returncode == 0
     assert not list((tmp_path / "units").glob("*.service.d"))
 
@@ -1668,7 +1671,9 @@ def test_sticky_release_directories_are_refused_on_a_host(tmp_path):
             assert str(path) in done.stderr, (oct(mode), target)
 
 
-def test_a_release_outside_trusted_ownership_is_refused_without_test_variables(tmp_path):
+def test_a_release_outside_trusted_ownership_is_refused_without_test_variables(
+    tmp_path,
+):
     env = _releases_layout(tmp_path)
     for name in ("AICC_OPS_TRUST_OWNER", "AICC_OPS_TEST_ROOT"):
         env.pop(name)
@@ -1676,6 +1681,131 @@ def test_a_release_outside_trusted_ownership_is_refused_without_test_variables(t
     assert done.returncode != 0
     assert "must be owned by root" in done.stderr
 
+
+# --------------------------------------------------------------------------
+# CTO condition for --live: data the guard must never list as removable
+
+#: one example path per thing the CRM CTO named as untouchable
+_NEVER_EXAMPLES = [
+    "/var/lib/postgresql/16/main",
+    "/var/lib/pgbackrest/archive",
+    "/etc/pgbackrest/pgbackrest.conf",
+    "/home/svc/.local/state/voyn-crm/migrations",
+    "/opt/voyn-crm/releases/20261113",
+    "/srv/voyn/attachments/2026",
+    "/home/svc/actions-runner/_work",
+    "/var/lib/docker/overlay2",
+]
+
+
+@pytest.mark.parametrize("example", _NEVER_EXAMPLES)
+def test_named_data_paths_are_protected_by_name(example, tmp_path):
+    assert disk_guard.is_protected(Path(example))
+    assert disk_guard.refused_path(Path(example), cache=False) is not None
+    assert disk_guard.never_reason(Path(example), _cfg(tmp_path)) == "protected_name"
+
+
+def test_a_configured_never_path_blocks_itself_its_children_and_its_parents(tmp_path):
+    keep = tmp_path / "area" / "data-store"
+    keep.mkdir(parents=True)
+    cfg = _cfg(tmp_path, OPS_DISK_NEVER_PATHS=str(keep))
+    assert disk_guard.never_reason(keep, cfg) == "never_path"
+    assert disk_guard.never_reason(keep / "child", cfg) == "never_path"
+    assert disk_guard.never_reason(tmp_path / "area", cfg) == "never_path"
+    assert disk_guard.never_reason(tmp_path / "elsewhere", cfg) is None
+
+
+def test_a_never_path_clone_is_not_reported_as_removable_even_in_dry_run(tmp_path):
+    cfg = _cfg(tmp_path, OPS_DISK_GUARD_DRY_RUN="1")
+    clone = _clone(tmp_path / "clones", "ok-clone")
+    cfg.never_paths = (clone,)
+    journal, lines = _journal(tmp_path)
+    run = _fake_runner({"ok-clone": {"pulls": [_pr("MERGED", 10)]}})
+    result = disk_guard.run_guard(
+        cfg, runner=run, journal=journal, free_pct=_low, cwds=[], mounts=[]
+    )
+    assert result["would_remove"] == []
+    assert clone.exists()
+    assert any('"never_path"' in line for line in lines)
+
+
+@pytest.mark.parametrize(
+    "ignored",
+    [
+        ".env",
+        "app/.env.production",
+        "data/app.sqlite3",
+        "db/local.db",
+        "keys/x.pem",
+        "pgdata/PG_VERSION",
+        "\u043a\u043b\u044e\u0447.pem",
+        "certs/a.p12",
+        "dump/prod.sql",
+        "home/id_rsa",
+        "cfg/credentials.json",
+        "prod.env",
+    ],
+)
+def test_a_clone_with_sensitive_ignored_files_is_kept(tmp_path, ignored):
+    assert disk_guard.sensitive_ignored(ignored)
+    root = tmp_path / "clones"
+    root.mkdir()
+    _clone(root, "local-data")
+
+    def run(argv, timeout=30):
+        if "ls-files" in argv:
+            return 0, "node_modules/a.js\0" + ignored + "\0", ""
+        return _fake_runner({"local-data": {"pulls": [_pr("MERGED", 10)]}})(
+            argv, timeout
+        )
+
+    cfg = _cfg(tmp_path)
+    candidates, skipped = disk_guard.plan_clones(
+        cfg, now=time.time(), runner=run, cwds=[], mounts=[]
+    )
+    assert candidates == []
+    assert skipped[0]["why"] == "sensitive_ignored_file"
+
+
+def test_ordinary_ignored_files_and_example_env_files_do_not_block(tmp_path):
+    assert (
+        disk_guard.sensitive_ignored("node_modules/x/index.js\n.env.example\n") is None
+    )
+
+
+def test_unreadable_ignored_listing_keeps_the_clone(tmp_path):
+    root = tmp_path / "clones"
+    root.mkdir()
+    _clone(root, "odd")
+
+    def run(argv, timeout=30):
+        if "ls-files" in argv:
+            return 1, "", "boom"
+        return _fake_runner({"odd": {"pulls": [_pr("MERGED", 10)]}})(argv, timeout)
+
+    candidates, skipped = disk_guard.plan_clones(
+        _cfg(tmp_path), now=time.time(), runner=run, cwds=[], mounts=[]
+    )
+    assert candidates == [] and skipped[0]["why"] == "ignored_files_unreadable"
+
+
+def test_the_ignored_listing_is_requested_nul_separated_so_names_are_never_quoted(
+    tmp_path,
+):
+    seen: list[list[str]] = []
+
+    def run(argv, timeout=30):
+        seen.append(list(argv))
+        return _fake_runner({"c": {"pulls": [_pr("MERGED", 10)]}})(argv, timeout)
+
+    root = tmp_path / "clones"
+    root.mkdir()
+    _clone(root, "c")
+    disk_guard.plan_clones(
+        _cfg(tmp_path), now=time.time(), runner=run, cwds=[], mounts=[]
+    )
+    listing = [a for a in seen if "ls-files" in a]
+    assert listing and "-z" in listing[0]
 
 def test_test_variables_do_nothing_without_the_nonroot_switch(tmp_path):
     env = _releases_layout(tmp_path)
