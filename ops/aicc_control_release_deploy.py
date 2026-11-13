@@ -52,27 +52,30 @@ _SHA = re.compile(r"^[0-9a-f]{40}$")
 _SELECTOR = re.compile(r"^releases/([0-9a-f]{40})$")
 
 #: Paths whose change must never be deployed unattended (see module docstring).
+#: Whole directories, not file lists: root units run `python -m command_center.ops.*`
+#: with the release directory as working directory, so the release root is on
+#: sys.path under root, and anything under these prefixes can run as root.
 _MECHANISM = re.compile(
     "|".join(
         (
-            r"^ops/aicc_control_release_deploy\.py$",
-            r"^ops/aicc_release_deploy\.py$",
-            r"^ops/aicc_install_transaction\.py$",
-            r"^ops/aicc_exact_sha_bootstrap\.py$",
-            r"^ops/aicc_staged_worker_rollout\.py$",
-            r"^ops/[^/]*\.sh$",
-            r"^deploy/systemd/",
-            r"^deploy/sudoers\.d/",
-            r"^deploy/sysusers\.d/",
-            r"^deploy/tmpfiles\.d/",
-            r"^deploy/install-[^/]*\.sh$",
-            r"^deploy/aicc/",
-            r"^command_center/ops/(disk_guard|self_heal|status_beacon|host_care_common)\.py$",
+            r"^ops/",
+            r"^deploy/",
+            r"^command_center/ops/",
+            r"^command_center/__init__\.py$",
+            r"^command_center/deployment/",
+            r"^[^/]+\.(pth|pyc|so)$",
+            r"^\.github/",
         )
     )
 )
+#: Top-level names Python itself looks for first; a stdlib-named module or a
+#: start-up hook in the release root would shadow the real one under root.
+_STARTUP_HOOKS = frozenset({"sitecustomize", "usercustomize"})
 _DEPENDENCY = re.compile(
-    r"(^|/)(uv\.lock|pyproject\.toml|requirements[^/]*\.txt|package(-lock)?\.json)$"
+    r"(^|/)("
+    r"uv\.lock|pyproject\.toml|requirements[^/]*\.(txt|lock|in)|constraints[^/]*"
+    r"|setup\.(py|cfg)|Pipfile(\.lock)?|poetry\.lock|\.python-version|\.tool-versions"
+    r"|package(-lock)?\.json)$"
 )
 _MIGRATION = re.compile(r"^command_center/db/(sql/|migrations\.py$)")
 
@@ -107,7 +110,7 @@ class ControlConfig:
     aicc_root: Path = Path("/opt/aicc")
     release_root: Path = Path("/opt/aicc/releases")
     state_dir: Path = Path("/var/lib/aicc-principal-isolation")
-    lock_path: Path = Path("/run/aicc-control-release.lock")
+    lock_path: Path = Path("/run/aicc-control-release/lock")
     rollout_lock: Path = Path("/run/aicc-staged-rollout.lock")
     remote_url: str = REMOTE_URL
     branch: str = "main"
@@ -241,9 +244,16 @@ def resolve_target(cfg: ControlConfig) -> str:
 # policy (pure given the changed-file list)
 
 
+def _shadows_python(path: str) -> bool:
+    first = path.split("/", 1)[0]
+    stem = first[:-3] if first.endswith(".py") else first
+    stdlib = getattr(sys, "stdlib_module_names", frozenset())
+    return stem in _STARTUP_HOOKS or (stem in stdlib and (first != stem or "/" in path))
+
+
 def classify_change(paths: list[str]) -> str | None:
     """None when the change may be deployed unattended, else why not."""
-    mechanism = [p for p in paths if _MECHANISM.search(p)]
+    mechanism = [p for p in paths if _MECHANISM.search(p) or _shadows_python(p)]
     if mechanism:
         return f"deploy_mechanism_changed: {mechanism[:3]}"
     deps = [p for p in paths if _DEPENDENCY.search(p)]
@@ -308,6 +318,31 @@ def _trusted_venv(cfg: ControlConfig, sha: str) -> Path:
     return venv
 
 
+def _stale_pointers(venv: Path, own_release: Path) -> list[str]:
+    """Venv files that make Python import from, or run, a DIFFERENT release
+    directory (a copied venv keeps the absolute paths it was created with)."""
+    found: list[str] = []
+    marker = "/releases/"
+    own = str(own_release)
+    for current, _dirs, files in os.walk(venv, followlinks=False):
+        for name in files:
+            if not (name.endswith((".pth", ".egg-link")) or name == "pyvenv.cfg"):
+                continue
+            path = Path(current) / name
+            try:
+                text = path.read_text(errors="replace")
+            except OSError:
+                continue
+            for line in text.splitlines():
+                if marker in line and own not in line and line.strip().startswith("/"):
+                    found.append(str(path.relative_to(venv)))
+                    break
+                if name == "pyvenv.cfg" and marker in line and own not in line:
+                    found.append(str(path.relative_to(venv)))
+                    break
+    return found
+
+
 def stage_release(cfg: ControlConfig, sha: str, current: str, install_tx) -> Path:
     manifest = cfg.state_dir / "releases" / f"{sha}.json"
     release_dir = cfg.release_root / sha
@@ -358,6 +393,9 @@ def stage_release(cfg: ControlConfig, sha: str, current: str, install_tx) -> Pat
             raise RuntimeError("archive unexpectedly contains .venv")
         _check_tree(staging)
         shutil.copytree(source_venv, staging / ".venv", symlinks=True)
+        stale = _stale_pointers(staging / ".venv", release_dir)
+        if stale:
+            raise RuntimeError(f"copied venv points at another release: {stale[:3]}")
         _freeze(staging, uid=cfg.trusted_uid, gid=cfg.trusted_gid)
         manifest.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
         install_tx.record_release_manifest(
@@ -398,7 +436,8 @@ def stage_release(cfg: ControlConfig, sha: str, current: str, install_tx) -> Pat
 
 def health_check(cfg: ControlConfig, sha: str) -> tuple[bool, str]:
     """Run the NEW code only as an unprivileged account with an empty
-    environment (never as root)."""
+    environment (never as root), and require that it really runs from the new
+    release: ``command_center`` and the interpreter prefix must lie inside it."""
     release = cfg.release_root / sha
     done = _run(
         [
@@ -413,13 +452,22 @@ def health_check(cfg: ControlConfig, sha: str) -> tuple[bool, str]:
             str(release / ".venv" / "bin" / "python"),
             "-B",
             "-c",
-            "import command_center, command_center.db",
+            "import sys, command_center, command_center.db; "
+            "print(command_center.__file__); print(sys.prefix)",
         ],
         timeout=120,
         env={"PATH": "/usr/bin:/bin"},
         cwd=str(release),
     )
-    return done.returncode == 0, (done.stderr or done.stdout).strip()[:160]
+    if done.returncode != 0:
+        return False, (done.stderr or done.stdout).strip()[:160]
+    lines = done.stdout.split("\n")
+    where, prefix = (lines + ["", ""])[:2]
+    base = str(release.resolve())
+    inside = lambda text: text == base or text.startswith(base + "/")  # noqa: E731
+    if not (inside(where) and inside(prefix)):
+        return False, "new release does not run from itself"
+    return True, ""
 
 
 def deploy_once(

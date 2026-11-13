@@ -182,7 +182,7 @@ def test_noop_when_current_is_the_target(host):
         ("deploy/sudoers.d/x", "deploy_mechanism_changed"),
         ("command_center/ops/disk_guard.py", "deploy_mechanism_changed"),
         ("uv.lock", "dependencies_changed"),
-        ("deploy/agent-toolchain/package-lock.json", "dependencies_changed"),
+        ("deploy/agent-toolchain/package-lock.json", "deploy_mechanism_changed"),
         ("command_center/db/sql/0099_x.up.sql", "migrations_changed"),
     ],
 )
@@ -340,3 +340,121 @@ def test_the_unit_takes_no_environment_or_arguments_and_is_sandboxed():
     assert "CAP_SYS_ADMIN" not in caps and "CAP_NET_ADMIN" not in caps
     timer = (ROOT / "deploy/systemd/voyn-aicc-control-release-deploy.timer").read_text()
     assert "Not enabled by any installer" in timer
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "json.py",
+        "re.py",
+        "typing.py",
+        "sitecustomize.py",
+        "usercustomize.py",
+        "evil.pth",
+        "json/__init__.py",
+        "command_center/__init__.py",
+        "command_center/ops/__init__.py",
+        "command_center/ops/anything_new.py",
+        "command_center/deployment/self_deploy.py",
+        "ops/anything.py",
+        "deploy/anything",
+        ".github/workflows/ci.yml",
+    ],
+)
+def test_anything_that_can_run_as_root_is_manual(path):
+    assert deploy.classify_change([path]) is not None
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "requirements-ci-linux.lock",
+        "constraints-ci.txt",
+        "setup.py",
+        "setup.cfg",
+        "Pipfile",
+        "Pipfile.lock",
+        "poetry.lock",
+        ".python-version",
+        "deploy/agent-toolchain/package.json",
+    ],
+)
+def test_every_dependency_pinning_file_is_manual(path):
+    assert deploy.classify_change([path]) is not None
+
+
+def test_ordinary_application_files_are_deployed_unattended():
+    for path in (
+        "command_center/orchestrator/review_merge.py",
+        "command_center/worker/handlers.py",
+        "tests/x.py",
+        "docs/x.md",
+        "app.py",
+    ):
+        assert deploy.classify_change([path]) is None, path
+
+
+def test_every_root_launch_path_in_the_shipped_units_is_covered_by_the_policy():
+    """Whatever a root unit starts from the release must be MANUAL when it
+    changes: derived from the shipped units, so a new root unit cannot slip by."""
+    import re as _re
+
+    checked = 0
+    for unit in sorted((ROOT / "deploy/systemd").glob("*.service")):
+        text = unit.read_text()
+        if "User=root" not in text and "\nUser=" in text:
+            continue  # a non-root unit
+        for match in _re.finditer(
+            r"ExecStart=\S*python\S*(?:\s+-\S+)*\s+-m\s+(command_center[\w.]*)", text
+        ):
+            module = match.group(1)
+            parts = module.split(".")
+            for depth in range(1, len(parts) + 1):
+                rel = "/".join(parts[:depth])
+                candidates = [f"{rel}.py", f"{rel}/__init__.py"]
+                for candidate in candidates:
+                    if (ROOT / candidate).exists():
+                        assert deploy.classify_change([candidate]) is not None, (
+                            unit.name,
+                            candidate,
+                        )
+                        checked += 1
+        for match in _re.finditer(r"/opt/aicc/current/([\w./-]+\.py)", text):
+            assert deploy.classify_change([match.group(1)]) is not None, (
+                unit.name,
+                match.group(1),
+            )
+            checked += 1
+    assert checked >= 6
+
+
+def test_a_copied_venv_that_points_at_another_release_is_refused(host):
+    origin, mirror, cfg, first = host
+    _advance(origin, mirror, "advance")
+    (cfg.release_root / first / ".venv").chmod(0o755)
+    pth = cfg.release_root / first / ".venv" / "lib" / "site-packages"
+    pth.mkdir(parents=True)
+    (pth / "x.pth").write_text(f"{cfg.release_root}/{first}\n")
+    report = _run(cfg, FakeTx(cfg))
+    assert report.outcome == "REFUSED" and "points at another release" in report.detail
+    assert not list(cfg.release_root.glob(".stage-*"))
+
+
+def test_the_health_check_requires_the_new_release_to_run_from_itself(host, monkeypatch):
+    origin, mirror, cfg, first = host
+    release = cfg.release_root / first
+    base = str(release.resolve())
+
+    def fake(outputs):
+        def run(argv, **kw):
+            return subprocess.CompletedProcess(argv, 0, outputs, "")
+
+        return run
+
+    monkeypatch.setattr(deploy, "_run", fake(f"{base}/command_center/__init__.py\n{base}/.venv\n"))
+    assert deploy.health_check(cfg, first) == (True, "")
+    monkeypatch.setattr(deploy, "_run", fake(f"/elsewhere/command_center/__init__.py\n{base}/.venv\n"))
+    ok, why = deploy.health_check(cfg, first)
+    assert not ok and "does not run from itself" in why
+    monkeypatch.setattr(deploy, "_run", fake(f"{base}/command_center/__init__.py\n/usr\n"))
+    assert deploy.health_check(cfg, first)[0] is False

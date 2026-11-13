@@ -31,7 +31,8 @@ PrivateTmp=true
 PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=/opt/aicc /var/lib/aicc-principal-isolation /run
+RuntimeDirectory=aicc-control-release
+ReadWritePaths=/opt/aicc /var/lib/aicc-principal-isolation
 # chown/chmod the staged tree, read other accounts' files, `runuser` for the
 # unprivileged health check; nothing else.
 CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER CAP_SETUID CAP_SETGID
