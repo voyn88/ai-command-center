@@ -164,6 +164,12 @@ ALL_TABLES: tuple[str, ...] = (
     "schema_migration",
     "session",
     "task",
+    # The tick-stall watchdog's observability ledgers (0034): plain
+    # append-only data with no state machine to defend, so they take the
+    # blanket app-role default below rather than the function-only idiom.
+    "tick_observation",
+    "tick_skip_event",
+    "tick_stall_escalation",
     "work_attempt",
     "work_event",
     "work_item",
@@ -198,6 +204,9 @@ IDENTITY_SEQUENCES: MappingProxyType[str, str] = MappingProxyType(
         "proposal_event": "proposal_event_id_seq",
         "proposal_evidence": "proposal_evidence_id_seq",
         "run_event": "run_event_id_seq",
+        "tick_observation": "tick_observation_id_seq",
+        "tick_skip_event": "tick_skip_event_id_seq",
+        "tick_stall_escalation": "tick_stall_escalation_id_seq",
         "work_event": "work_event_id_seq",
         "worker_host_fingerprint": "worker_host_fingerprint_id_seq",
     }
@@ -541,6 +550,7 @@ _WORKER_FUNCTIONS = (
     # 0021: the worker-host fail-closed probe records what it measured.
     "monitor_record_finding(text, text, jsonb)",
     "monitor_clear_finding(text)",
+    "monitor_clear_resolved_findings(text, jsonb, timestamptz)",
     # A second, narrower fail path for a refusal that names no fault in the
     # work itself (VOYN-W0-AICC-PUBLISH-LEASE-CONTENTION-BURNS-ATTEMPT) --
     # see 0022_queue_fail_lease_wait.
@@ -597,6 +607,7 @@ _APP_BACKLOG_FUNCTIONS = (
     "backlog_set_task_class(text, text)",
     "monitor_record_finding(text, text, jsonb)",
     "monitor_clear_finding(text)",
+    "monitor_clear_resolved_findings(text, jsonb, timestamptz)",
     "monitor_link_task(bigint, text)",
     # Audit trail for where a record came from (0020); the importer's stamp
     # that a row was migrated rather than authored directly in the store.

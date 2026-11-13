@@ -475,9 +475,16 @@ def test_findings_are_recorded_and_cleared_through_the_definer_functions(
         == infra_monitor.finding_key("dead_letter_growth:54>0")
         == "dead_letter_growth"
     )
+    cleared = [c for c in calls if "monitor_clear_resolved_findings" in c[0]]
+    assert cleared[0][1][0] == "worker-01:infra"
+    assert json.loads(cleared[0][1][1]) == ["active_workers"]
+    assert calls.index(recorded[0]) < calls.index(cleared[0])
     calls.clear()
-    infra_monitor.record_findings("worker-01:infra", (), {})
-    assert any("monitor_clear_finding" in c[0] for c in calls)
+    observed_at = "2026-11-04T06:00:00+00:00"
+    infra_monitor.record_findings("worker-01:infra", (), {"observed_at": observed_at})
+    cleared = [c for c in calls if "monitor_clear_resolved_findings" in c[0]]
+    assert cleared[0][1] == ("worker-01:infra", "[]", observed_at)
+    assert not any("monitor_record_finding" in c[0] for c in calls)
 
 
 def test_main_exits_non_zero_when_findings_cannot_be_recorded_even_if_healthy(
@@ -750,8 +757,10 @@ def test_the_control_probe_watches_the_pr_window_and_records_its_findings() -> N
     """The probe rides the control-host unit because that is where the
     backlog database (the `pr` evidence) and the fleet's gh identity are; the
     worker probe has neither. It is switched on by environment rather than by
-    a flag: that unit's ExecStart names an absolute home path, which a public
-    repository cannot restate in an added line (leak_guard.sh). Its finding
+    a flag -- originally because that unit's ExecStart names an absolute home
+    path and the leak guard refused any added line restating one, a
+    restriction its allowlist has since lifted for deploy/systemd/**; the
+    knob stays put because the two spellings are equivalent. Its finding
     then reaches the planner through that unit's own --record-findings source,
     exactly like every other failure class."""
     queue_unit = Path("deploy/systemd/voyn-queue-monitor.service").read_text()
@@ -1623,3 +1632,152 @@ def test_main_reports_the_host_probes_when_enabled(monkeypatch, capsys) -> None:
     assert any(f.startswith("crash_loop:") for f in payload["failures"])
     assert any(f.startswith("deploy_lag:") for f in payload["failures"])
     assert result == 1
+
+
+def _audit_lines(*events: tuple[str, str]) -> str:
+    import json as _json
+
+    return "\n".join(_json.dumps({"event": event, "ts": ts, "schema_version": 1}) for event, ts in events) + "\n"
+
+
+def test_rotation_heartbeat_is_the_last_healthy_audit_event(tmp_path) -> None:
+    """worker-01 2026-09-15: 164 failed rotations after the last success at 04:2x,
+    no finding for six hours. The journal's last successful invocation is the clock."""
+    from datetime import UTC, datetime
+
+    audit = tmp_path / "audit.jsonl"
+    audit.write_text(
+        _audit_lines(
+            ("credential_expiry_proved", "2026-09-15T04:24:00+00:00"),
+            ("rotation_succeeded", "2026-09-15T04:24:01+00:00"),
+            ("rotation_failed", "2026-09-15T04:49:56+00:00"),
+            ("rotation_failed", "2026-09-15T05:19:00+00:00"),
+        )
+    )
+    now = datetime(2026, 9, 15, 6, 17, tzinfo=UTC)
+    snapshot = infra_monitor.read_rotation_health_snapshot(
+        audit, max_age_seconds=2700, now=now
+    )
+    assert snapshot.error is None
+    assert snapshot.last_healthy_at == datetime(2026, 9, 15, 4, 24, 1, tzinfo=UTC)
+    assert snapshot.stalled is True
+    report = infra_monitor.evaluate(
+        {}, None, minimum_active_workers=0, max_stalled_seconds=900,
+        prometheus_ready=True, rotation_health=snapshot,
+    )
+    assert report.failures == ("credential_rotation_stalled:6779s>2700s",)
+    assert {infra_monitor.finding_key(f) for f in report.failures} == {
+        "credential_rotation_stalled"
+    }
+    payload = infra_monitor._json_report(report)
+    assert payload["rotation_health"]["stalled"] is True
+    assert payload["rotation_health"]["last_healthy_at"] == "2026-09-15T04:24:01+00:00"
+
+
+def test_a_fresh_rotation_heartbeat_is_healthy_even_after_a_deferred_run(tmp_path) -> None:
+    from datetime import UTC, datetime
+
+    audit = tmp_path / "audit.jsonl"
+    audit.write_text(
+        _audit_lines(
+            ("credential_expiry_proved", "2026-09-15T12:00:00+00:00"),
+            ("rotation_deferred_not_due", "2026-09-15T12:00:01+00:00"),
+        )
+    )
+    now = datetime(2026, 9, 15, 12, 20, tzinfo=UTC)
+    snapshot = infra_monitor.read_rotation_health_snapshot(
+        audit, max_age_seconds=2700, now=now
+    )
+    assert snapshot.last_healthy_at == datetime(2026, 9, 15, 12, 0, 1, tzinfo=UTC)
+    assert snapshot.stalled is False and snapshot.age_seconds == 1199.0
+    report = infra_monitor.evaluate(
+        {}, None, minimum_active_workers=0, max_stalled_seconds=900,
+        prometheus_ready=True, rotation_health=snapshot,
+    )
+    assert report.ok
+
+
+def test_a_missing_rotation_journal_is_a_probe_failure_not_health(tmp_path) -> None:
+    from datetime import UTC, datetime
+
+    now = datetime(2026, 9, 15, 12, 0, tzinfo=UTC)
+    snapshot = infra_monitor.read_rotation_health_snapshot(
+        tmp_path / "absent.jsonl", max_age_seconds=2700, now=now
+    )
+    assert snapshot.error is not None and snapshot.stalled is False
+    report = infra_monitor.evaluate(
+        {}, None, minimum_active_workers=0, max_stalled_seconds=900,
+        prometheus_ready=True, rotation_health=snapshot,
+    )
+    assert report.failures == (
+        f"rotation_probe_failed:FileNotFoundError: [Errno 2] No such file or directory: "
+        f"'{tmp_path / 'absent.jsonl'}'",
+    )
+
+
+def test_fresh_credential_proof_with_rotation_failure_is_still_a_stall(tmp_path) -> None:
+    """Pre-mutation expiry proof must not mask a failure loop (worker-01 shape)."""
+    from datetime import UTC, datetime
+
+    audit = tmp_path / "audit.jsonl"
+    audit.write_text(
+        _audit_lines(
+            ("credential_expiry_proved", "2026-09-15T06:16:00+00:00"),
+            ("rotation_failed", "2026-09-15T06:16:30+00:00"),
+        )
+    )
+    now = datetime(2026, 9, 15, 6, 17, tzinfo=UTC)
+    snapshot = infra_monitor.read_rotation_health_snapshot(
+        audit, max_age_seconds=2700, now=now
+    )
+    assert snapshot.last_healthy_at is None
+    assert snapshot.stalled is True
+    report = infra_monitor.evaluate(
+        {}, None, minimum_active_workers=0, max_stalled_seconds=900,
+        prometheus_ready=True, rotation_health=snapshot,
+    )
+    assert report.failures == ("credential_rotation_stalled:never>2700s",)
+
+
+@pytest.mark.parametrize(
+    ("ts", "expected_iso"),
+    [
+        ("2026-09-15T12:00:01+00:00", "2026-09-15T12:00:01+00:00"),
+        ("2026-09-15T12:00:01Z", "2026-09-15T12:00:01+00:00"),
+        ("2026-09-15T12:00:01", "2026-09-15T12:00:01+00:00"),
+    ],
+)
+def test_rotation_audit_timestamp_parsing(tmp_path, ts: str, expected_iso: str) -> None:
+    from datetime import datetime
+
+    parsed = infra_monitor._parse_audit_timestamp(ts)
+    assert parsed is not None
+    assert parsed.isoformat() == expected_iso
+    audit = tmp_path / "audit.jsonl"
+    audit.write_text(
+        json.dumps({"event": "rotation_deferred_not_due", "ts": ts, "schema_version": 1}) + "\n"
+    )
+    moment = datetime.fromisoformat(expected_iso)
+    snapshot = infra_monitor.read_rotation_health_snapshot(
+        audit, max_age_seconds=2700, now=moment
+    )
+    assert snapshot.error is None
+    assert snapshot.last_healthy_at == datetime.fromisoformat(expected_iso)
+    assert snapshot.age_seconds == 0.0
+
+
+def test_a_journal_with_failures_only_is_a_stall(tmp_path) -> None:
+    from datetime import UTC, datetime
+
+    audit = tmp_path / "audit.jsonl"
+    audit.write_text(_audit_lines(("rotation_failed", "2026-09-15T05:19:00+00:00")))
+    now = datetime(2026, 9, 15, 6, 0, tzinfo=UTC)
+    snapshot = infra_monitor.read_rotation_health_snapshot(
+        audit, max_age_seconds=2700, now=now
+    )
+    assert snapshot.stalled is True and snapshot.last_healthy_at is None
+    report = infra_monitor.evaluate(
+        {}, None, minimum_active_workers=0, max_stalled_seconds=900,
+        prometheus_ready=True, rotation_health=snapshot,
+    )
+    assert report.failures == ("credential_rotation_stalled:never>2700s",)

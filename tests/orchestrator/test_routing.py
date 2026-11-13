@@ -2,9 +2,45 @@
 
 from __future__ import annotations
 
-from command_center import agent_runner
+from command_center import agent_runner, local_model_gates
 from command_center.orchestrator.planner import PlanLimits, _payload_for, repo_route
-from command_center.orchestrator.routing import ROUTING_MATRIX, cascade_for
+from command_center.orchestrator.routing import (
+    BOUNDED_IMPLEMENTATION_TASK_CLASS,
+    BILLING_MODE_API_METERED,
+    BILLING_MODE_SUBSCRIPTION,
+    BILLING_MODE_UNKNOWN,
+    ROUTING_MATRIX,
+    billing_mode_for_executor,
+    cascade_for,
+    classify_task_class,
+    metered_executors,
+)
+
+
+def test_bounded_implementation_is_fail_closed_until_promoted():
+    assert not local_model_gates.is_promoted(BOUNDED_IMPLEMENTATION_TASK_CLASS)
+    assert cascade_for(BOUNDED_IMPLEMENTATION_TASK_CLASS) == cascade_for(
+        "implementation"
+    )
+
+
+def test_promoted_bounded_implementation_leads_with_isolated_aider():
+    for _ in range(local_model_gates.PROMOTION_SAMPLE_FLOOR):
+        local_model_gates.record_benchmark_run(
+            BOUNDED_IMPLEMENTATION_TASK_CLASS, True
+        )
+    cascade = cascade_for(BOUNDED_IMPLEMENTATION_TASK_CLASS)
+    assert cascade[0] == {"executor": "aider", "task_type": "implementation"}
+    assert "aider" in agent_runner.PRINCIPAL_EXECUTOR_BINARIES
+
+
+def test_bounded_classification_is_explicit_title_only_opt_in():
+    assert (
+        classify_task_class("[docs] fix typo", "x")
+        == BOUNDED_IMPLEMENTATION_TASK_CLASS
+    )
+    assert classify_task_class("Refactor auth", "[docs] misleading") == "implementation"
+
 
 #: The executors the worker can actually run, read from the SAME table the
 #: worker itself gates on (`handlers._run_agent` refuses any executor absent
@@ -102,6 +138,16 @@ def test_unknown_task_class_falls_back_to_implementation():
     assert cascade_for("martian") == cascade_for("implementation")
 
 
+def test_owner_billing_mode_table_is_pinned() -> None:
+    assert billing_mode_for_executor("grok") == BILLING_MODE_API_METERED
+    assert billing_mode_for_executor("cursor") == BILLING_MODE_API_METERED
+    assert billing_mode_for_executor("openai_http") == BILLING_MODE_API_METERED
+    assert billing_mode_for_executor("codex") == BILLING_MODE_SUBSCRIPTION
+    assert billing_mode_for_executor("claude") == BILLING_MODE_SUBSCRIPTION
+    assert billing_mode_for_executor("copilot") == BILLING_MODE_UNKNOWN
+    assert list(metered_executors()) == ["cursor", "grok", "openai_http"]
+
+
 def test_default_repo_routes_include_crm_lane(monkeypatch) -> None:
     """CRM backlog tasks must be dispatchable without a per-host override.
 
@@ -151,3 +197,47 @@ def test_dispatch_prompt_asks_for_the_commit_and_not_for_a_pull_request() -> Non
     assert "HEAD_SHA: <the branch head commit sha>" in prompt
     # The instruction that asked the agent to publish its own work is gone.
     assert "When you open or update a pull request" not in prompt
+
+
+def test_owner_cascade_orders_all_isolated_providers_by_task_class(monkeypatch):
+    monkeypatch.setenv("AICC_EXECUTOR_PROFILE", "owner-cascade")
+    assert [x["executor"] for x in cascade_for("implementation")] == [
+        "claude", "codex", "cursor", "grok",
+    ]
+    assert [x["executor"] for x in cascade_for("review")] == [
+        "codex", "claude", "cursor", "grok",
+    ]
+    assert all(x["executor"] in agent_runner.PRINCIPAL_EXECUTOR_BINARIES
+               for x in cascade_for("review"))
+    changed = cascade_for("review")
+    changed[0]["model"] = "wrong-provider-model"
+    assert cascade_for("review")[0]["model"] is None
+
+
+def test_owner_cascade_model_only_route_matches_broker_capability(monkeypatch):
+    from command_center.orchestrator import review_merge
+    monkeypatch.setenv("AICC_EXECUTOR_PROFILE", "owner-cascade")
+    route = review_merge._model_only_review_cascade()
+    assert [x["executor"] for x in route] == ["grok"]
+    assert route[0]["task_type"] == "independent_review"
+    assert route[0]["capability"] == "model_only"
+
+
+def test_owner_cascade_cursor_model_override(monkeypatch):
+    monkeypatch.setenv("AICC_EXECUTOR_PROFILE", "owner-cascade")
+    monkeypatch.setenv("AICC_CURSOR_MODEL", "composer-2.5")
+    link = next(x for x in cascade_for("review") if x["executor"] == "cursor")
+    assert link["model"] == "composer-2.5"
+
+
+def test_mac_subscription_is_opt_in_model_only_not_a_writer(monkeypatch):
+    from command_center.orchestrator import review_merge
+    monkeypatch.setenv('AICC_EXECUTOR_PROFILE','owner-cascade')
+    monkeypatch.setenv('AICC_CLAUDE_MAC_ENABLED','1')
+    assert [x['executor'] for x in review_merge._model_only_review_cascade()]==['claude','grok']
+    assert all(x['capability']=='model_only' for x in review_merge._model_only_review_cascade())
+    assert cascade_for('implementation')[0]['executor']=='claude'
+    # Implementation still uses the existing server broker development profile,
+    # never the Mac's zero-tool inference transport.
+    manifest=agent_runner.build_principal_isolation_manifest(repository_path=__import__('pathlib').Path.cwd(),prompt='text',task_type='implementation',timeout_seconds=60,executor='claude',model=None)
+    assert manifest['profile']=='trusted_development'

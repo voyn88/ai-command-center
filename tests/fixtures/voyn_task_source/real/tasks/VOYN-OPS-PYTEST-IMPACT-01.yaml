@@ -1,0 +1,11 @@
+# Мигрировано из outputs/VOYN_TASKS_BACKLOG.md скриптом tools/migrate_backlog.py. Строка оригинала: 1088.
+id: "VOYN-OPS-PYTEST-IMPACT-01"
+project: "aios"
+title: "Включить pytest-testmon и pytest-xdist во всех применимых Python-проектах."
+why: "Включить pytest-testmon и pytest-xdist во всех применимых Python-проектах."
+priority: "P0"
+owner: "owner-unassigned"
+reviewer: "reviewer-unassigned"
+acceptance: "baseline `.testmondata` привязан к source+coverage checksum; stale/missing/low-confidence и high-risk diff запускают полный suite; каждый xdist worker имеет изолированные DB/filesystem/ports; историческая балансировка; merge/main/nightly сохраняют полный gate; escape-rate и time-to-first-failure измеряются."
+status: "OPEN"
+depends_on: []

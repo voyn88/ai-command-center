@@ -7,7 +7,7 @@
     "copilot": "pkg/node_modules/@github/copilot-linux-x64/copilot"
   },
   "packages": {
-    "@anthropic-ai/claude-code": "2.1.231",
+    "@anthropic-ai/claude-code": "2.1.251",
     "@github/copilot": "1.0.80",
     "@openai/codex": "0.149.0"
   },

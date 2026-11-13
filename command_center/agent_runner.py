@@ -122,6 +122,15 @@ CLAUDE_BINARY = "claude"
 # the service already runs as that user), which systemd does not add for it.
 CODEX_BINARY = os.environ.get("AICC_CODEX_BINARY") or "codex"
 COPILOT_BINARY = os.environ.get("AICC_COPILOT_BINARY") or "copilot"
+AIDER_BINARY = os.environ.get("AICC_AIDER_BINARY") or "aider"
+OLLAMA_BINARY = os.environ.get("AICC_OLLAMA_BINARY") or "ollama"
+#: The exact Ollama tag the AICC Fleet benchmark (`scripts/aicc_aider_benchmark.py`)
+#: measures and `command_center.local_model_gates` gates promotion on (AICC Fleet
+#: decision 2026-09-03, voyn-worker-01). `aider_preflight` checks for this EXACT
+#: tag, not a prefix match: a different tag pulled under the same daemon (e.g.
+#: an `-instruct` variant) was never benchmarked and must not be dispatched to
+#: silently under this name.
+DEFAULT_AIDER_MODEL = "qwen2.5-coder:14b"
 
 # The worker never elevates and keeps NoNewPrivileges=yes.  A root-owned,
 # socket-activated launcher is the sole bridge to the separate aicc-agent UID.
@@ -144,6 +153,7 @@ PRINCIPAL_EXECUTOR_BINARIES: dict[str, str] = {
     "cursor": "/opt/aicc/providers/cursor/agent",
     "claude": "/opt/aicc/toolchains/current/bin/claude",
     "codex": "/opt/aicc/toolchains/current/bin/codex",
+    "aider": "/opt/aicc/toolchains/current/bin/aider",
     # Copilot is DELIBERATELY absent: ADR-0010 keeps it disabled under
     # principal isolation because its login credential carries GitHub /
     # repository authority -- staging it would hand untrusted model code the
@@ -151,7 +161,9 @@ PRINCIPAL_EXECUTOR_BINARIES: dict[str, str] = {
     # b311666). The retry-loop hazard that once motivated listing it is
     # closed in handlers instead: an unavailable executor falls through the
     # cascade to the next link rather than respinning forever.
+    #
 }
+CLAUDE_MAC_AGENT_BINARY = "/usr/libexec/aicc-claude-mac-agent"
 _PRINCIPAL_ISOLATION_FAILURE = "AICC_AGENT_LAUNCH_INFRA_FAILURE"
 
 # Codex 0.149.0 on worker-01 can exit zero after its vendor bwrap fails to
@@ -504,7 +516,7 @@ def build_principal_isolation_manifest(
         "workspace": str(repository_path.resolve(strict=True)),
         "executor": executor,
         "profile": (
-            "model_only" if executor == "grok" and task_type in MODEL_ONLY_TASK_TYPES
+            "model_only" if executor in {"grok", "claude"} and task_type in MODEL_ONLY_TASK_TYPES
             else profile_for_task_type(task_type)
         ),
         "prompt": prompt,
@@ -549,6 +561,14 @@ def principal_executor_preflight(executor: str) -> tuple[bool, str]:
     if Path(binary).is_file() and os.access(binary, os.X_OK):
         return True, ""
     return False, f"isolated executor binary is unavailable: {binary}"
+
+
+def claude_mac_preflight() -> tuple[bool, str]:
+    """A missing immutable adapter is an unavailable route during rollout."""
+    path = Path(CLAUDE_MAC_AGENT_BINARY)
+    if path.is_file() and os.access(path, os.X_OK):
+        return True, ""
+    return False, "Claude Mac inference adapter unavailable"
 
 
 def _principal_launcher_environment() -> dict[str, str]:
@@ -941,7 +961,7 @@ def build_codex_command(
 
     Profile mapping, deliberately equivalent rather than merely similar:
 
-    * `PROFILE_READ_ONLY`   -> `--sandbox read-only`. The sandbox is the
+    * `PROFILE_READ_ONLY`   -> `--sandbox read-only` outside principal isolation. The sandbox is the
       enforcement, exactly as `--tools` is for Claude: a read-only sandbox
       cannot write the tree no matter what the model decides to attempt.
     * `PROFILE_TRUSTED_DEVELOPMENT` -> `--sandbox workspace-write`, which
@@ -962,17 +982,19 @@ def build_codex_command(
     executor, so nothing downstream has to learn a second format.
     """
     profile = profile_for_task_type(task_type)
-    if profile == PROFILE_READ_ONLY:
-        sandbox = "read-only"
-    elif principal_isolation_required():
+    if principal_isolation_required():
         # Under principal isolation the systemd unit the broker builds is the
         # boundary (dynamic uid, only /workspace writable, ProtectSystem=
         # strict, no capabilities); Codex's own bubblewrap on top mounted
         # .git read-only, so the commit the fleet contract requires could
         # never land (worker-01 2026-09-09). Owner decision 2026-09-09: no
-        # inner sandbox INSIDE the unit. The launcher builds the same argv
+        # inner sandbox INSIDE the unit. Read-only units additionally bind
+        # /workspace read-only; their nested bwrap cannot initialize under
+        # ProcSubset=pid. The launcher builds the same argv
         # (a test pins both against each other).
         sandbox = "danger-full-access"
+    elif profile == PROFILE_READ_ONLY:
+        sandbox = "read-only"
     else:
         sandbox = "workspace-write"
     command = [
@@ -1062,6 +1084,100 @@ def build_copilot_command(
     return command
 
 
+def build_aider_command(
+    prompt: str,
+    *,
+    task_type: str,
+    model: str | None = None,
+) -> list[str]:
+    """The `aider` argv for the free, benchmark-gated local-model executor
+    (AICC Fleet decision 2026-09-03: aider + local Ollama `DEFAULT_AIDER_MODEL`
+    on voyn-worker-01, for low-risk bounded-implementation task classes only —
+    see `orchestrator.routing.BOUNDED_IMPLEMENTATION_TASK_CLASS` and
+    `command_center.local_model_gates`).
+
+    Fail-closed on `task_type`, unlike every other builder here: aider has no
+    read-only sandbox mode at all -- every invocation of it can write the
+    tree it is pointed at -- so there is no profile mapping to make for
+    `PROFILE_READ_ONLY`/model-only task types, only a refusal. The routing
+    cascade only ever offers this executor `task_type="implementation"`, but
+    this builder re-validates independently rather than trusting that,
+    exactly as `build_openai_http_command` re-validates MODEL_ONLY: an argv
+    builder is reachable from more than one caller, and a hand-built cascade
+    link or a future routing bug must not be able to hand a mutating tool a
+    reviewer/model-only task silently.
+
+    `--message` (not the interactive REPL) makes this a single non-interactive
+    turn, matching every other executor's one-shot dispatch. `--yes-always`
+    auto-confirms aider's own edit/commit prompts, since nothing here is
+    present to answer them. The prompt is passed as ONE argv element (never
+    interpolated into a shell string), so it is inert against shell
+    metacharacters regardless of content -- the same property every other
+    `build_*_command` in this module already has from using `subprocess.Popen`
+    with an argv list, never `shell=True`.
+
+    `model`, when given, is used verbatim if it already names a LiteLLM
+    provider (contains `/`) — a caller that already resolved the full spec
+    should not have it silently mangled. Otherwise it (or the default) is
+    prefixed with `ollama_chat/`, aider's LiteLLM routing prefix for a local
+    Ollama-served model.
+    """
+    if task_type not in MUTATING_TASK_TYPES:
+        raise ValueError(
+            f"aider has no read-only mode and refuses task_type {task_type!r}; "
+            f"only {sorted(MUTATING_TASK_TYPES)} may dispatch to it"
+        )
+    resolved_model = model or DEFAULT_AIDER_MODEL
+    if "/" not in resolved_model:
+        resolved_model = f"ollama_chat/{resolved_model}"
+    return [
+        AIDER_BINARY,
+        "--model",
+        resolved_model,
+        "--yes-always",
+        "--no-check-update",
+        "--no-analytics",
+        "--message",
+        prompt,
+    ]
+
+
+def aider_preflight(
+    binary: str | None = None, *, model: str | None = None
+) -> tuple[bool, str]:
+    """`(available, message)` for the aider CLI AND its local Ollama backend.
+
+    Three things must hold, checked in order so the message names the actual
+    gap: the `aider` binary is on PATH, the `ollama` binary is on PATH, and
+    `ollama list`'s stdout names the EXACT `model` (default
+    `DEFAULT_AIDER_MODEL`) as a pulled tag -- deliberately an exact match on
+    each line's first (name) column, never a substring test. A substring test
+    would let an unrelated, never-benchmarked tag that merely shares the
+    benchmarked tag as a prefix (e.g. `qwen2.5-coder:14b-instruct` containing
+    `qwen2.5-coder:14b`) read as "the benchmarked model is available", which
+    is exactly the "reachable but serving a different model" hazard this
+    preflight exists to catch before a dispatch reaches `build_aider_command`.
+    """
+    resolved_binary = binary or AIDER_BINARY
+    if shutil.which(resolved_binary) is None:
+        return False, f"aider CLI {resolved_binary!r} is not available on PATH"
+    if shutil.which(OLLAMA_BINARY) is None:
+        return False, f"ollama CLI {OLLAMA_BINARY!r} is not available on PATH"
+    listed = subprocess.run(
+        [OLLAMA_BINARY, "list"], capture_output=True, text=True, check=False
+    )
+    if listed.returncode != 0:
+        detail = listed.stderr.strip() or "ollama daemon is not reachable"
+        return False, f"ollama list failed: {detail}"
+    target = model or DEFAULT_AIDER_MODEL
+    pulled_names = {
+        parts[0] for line in listed.stdout.splitlines() if (parts := line.split())
+    }
+    if target not in pulled_names:
+        return False, f"ollama model {target!r} is not pulled"
+    return True, ""
+
+
 #: executor id -> the NAME of its argv builder in this module. The worker
 #: refuses any executor absent from this table (`handlers._run_agent`), so an
 #: unknown/unproven name can never silently burn a cascade attempt on a
@@ -1081,6 +1197,7 @@ COMMAND_BUILDERS: dict[str, str] = {
     "codex": "build_codex_command",
     "copilot": "build_copilot_command",
     "openai_http": "build_openai_http_command",
+    "aider": "build_aider_command",
 }
 
 
@@ -1297,8 +1414,10 @@ class RunResult:
             # A report discussing HTTP errors must not trigger another run.
             return self.stderr.strip() in {
                 f"provider HTTP {code}"
-                for code in (401, 403, 429, 500, 502, 503, 504)
+                for code in (401, 402, 403, 429, 500, 502, 503, 504)
             }
+        if executor == "cursor" and self.stderr.strip().startswith("Cannot use this model:"):
+            return True
         signatures = {
             "cursor": _CODEX_RETRYABLE_FAILURE_SIGNATURES + _COPILOT_RETRYABLE_FAILURE_SIGNATURES,
             "copilot": _COPILOT_RETRYABLE_FAILURE_SIGNATURES,
@@ -1314,7 +1433,12 @@ class RunResult:
         if self.status != "failed" or not self.exit_code:
             return None
         if executor == "grok":
-            return "HTTP 429" if self.stderr.strip() == "provider HTTP 429" else None
+            # Billing refusal must cool down the same account as rate limiting.
+            # Match only the broker's fixed stderr diagnostic, never task prose.
+            return {
+                "provider HTTP 402": "HTTP 402",
+                "provider HTTP 429": "HTTP 429",
+            }.get(self.stderr.strip())
         signatures = {
             "claude": ("hit your session limit", "hit your usage limit", "usage limit reached"),
             "codex": ("hit your usage limit", "usage limit reached"),
@@ -1759,7 +1883,12 @@ def _safe_path_component(value: str, fallback: str) -> str:
 
 
 def report_path_for(run: dict) -> Path:
-    project = _safe_path_component(run.get("project") or "UNKNOWN", "UNKNOWN")
+    # Keep both runtime generations on the same canonical project identity.
+    # Persisted historical report paths remain readable by
+    # runtime.reports.resolve_report_path; only newly written paths converge.
+    from command_center.runtime.reports import project_path_component
+
+    project = project_path_component(run.get("project"))
     started = run.get("started_at") or run.get("created_at") or models.iso_now()
     try:
         started_dt = datetime.fromisoformat(started)

@@ -302,6 +302,20 @@ environment variables, so existing installs and the test suite are unaffected:
 - `AICC_RUNTIME_VACUUM_ON_START=1` — run `VACUUM` after a clean prune to reclaim disk. VACUUM rewrites
   the database under an exclusive lock, so enable it only on a single-host install that can briefly
   pause other writers.
+- `AICC_RUNTIME_VACUUM_FREE_RATIO=<0..1>` — run `VACUUM` on startup only once the freelist share of
+  the file (`PRAGMA freelist_count` / `PRAGMA page_count`) is at or above this fraction, e.g. `0.5`
+  to vacuum once half the file is reclaimable empty space. This is the threshold to reach for over
+  `AICC_RUNTIME_VACUUM_ON_START`: it avoids rewriting the file on every startup when there is nothing
+  to reclaim, and — unlike retention pruning — it also catches bloat left behind by ordinary
+  task-delete cascades, not just expired `run_event` rows.
+
+`DELETE` never shrinks the SQLite file on its own; the freed pages stay allocated until something
+runs `VACUUM`. A `runtime.db` that has pruned or deleted heavily without either VACUUM knob enabled
+can end up mostly empty space on disk — a live 137-row database occupying 346MB, 84,446 of its
+84,527 pages on the freelist, is what that looks like in practice. `maintenance.archive_and_prune`
+(`command_center/runtime/maintenance.py`) is the deliberate, rollback-safe counterpart for an
+  operator to run by hand — backup, cold-archive to compressed JSONL, prune, integrity-check, and
+  optionally VACUUM. Automatic retention is wired through that same safe path.
 
 ## Execution lifecycle
 
@@ -474,9 +488,16 @@ CI's required gate is unaffected either way — it always runs the full suite.
 `.github/workflows/ci.yml` checks the committed diff for whitespace errors and runs Ruff, byte
 compilation, and pytest for pull requests into `main`, pushes to `main`, and manual dispatches on
 Python 3.14, plus a `windows-latest` job covering the automated half of the desktop leg. The workflow
-uses a read-only token, pins actions to commit SHAs, and cancels superseded runs for the same ref. It
-does not itself configure branch protection; repository settings must separately require the check if
-merges are to be blocked on it.
+uses a read-only token, pins actions to commit SHAs, and cancels superseded runs for the same ref.
+
+`main` requires `Final merge gate` and `Acceptance gate (independent verdict on exact SHA)`
+(`strict: true`, so a queued branch must be current with `main`); force-push and branch deletion are
+denied. A GitHub merge queue is enabled on `main` (squash, `maximumEntriesToBuild: 5`): entries build
+and test the prospective merged result in batches, and a conflicting entry is dropped without
+stalling the rest of the queue — see `.github/workflows/ci.yml`'s `merge_group` trigger. The merge
+tick treats an entry the queue is already building as a free wait: it spends no merge action and
+never branch-updates it (that would push a new head and evict it from the queue), so serialized
+integration costs the fleet no parallelism. `docs/operations/MERGE_QUEUE.md` is the operator page.
 
 ## Current limitations and risks
 
@@ -492,8 +513,9 @@ merges are to be blocked on it.
 - `app.py` and several runtime/Portfolio service modules are large, concentrated change surfaces.
 - A static type checker is configured (permissive, non-strict) via `pyproject.toml` and surfaced as a
   non-blocking CI step; it is not yet a merge gate and the codebase is not fully typed.
-- The checked-in CI workflow does not itself enforce branch protection. Enable "Require status checks
-  to pass before merging" on `main` with the `Quality gates` check to make it a real gate.
+- Approvals are required to be zero on `main`'s branch protection by design: authors and the review
+  agents run under the same account, so a GitHub-approval requirement is structurally unsatisfiable
+  here. Acceptance instead comes from the independent-review marker keyed to the exact head SHA.
 - The execution-queue lock is same-host and cooperative; raw queue mutation primitives can bypass it,
   and there is no distributed coordination.
 - Scheduler decisions are point-in-time advice, not persisted claims. Task-id, capacity, and

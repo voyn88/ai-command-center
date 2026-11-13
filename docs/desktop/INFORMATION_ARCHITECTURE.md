@@ -142,8 +142,9 @@ row. This mirrors `WORKSPACE_HOME_ARCHITECTURE.md` §3's existing rule that Home
 
 ## 11. Empty and error-state navigation behavior
 
-- A page that has nothing to show (e.g. Home with all six projects unconfigured — the expected
-  fresh-install default, per `WORKSPACE_HOME_ARCHITECTURE.md` §7.1) renders its `EmptyState`
+- A page that has nothing to show (e.g. Home with every project in the canonical registry
+  unconfigured — the expected fresh-install default, per `WORKSPACE_HOME_ARCHITECTURE.md` §7.1
+  and [ADR 0009](../adr/0009-canonical-project-registry-and-validating-task-import.md)) renders its `EmptyState`
   component with a clear next action (e.g. "Configure a repository path" → navigates to
   Projects), never a blank pane.
 - A page-level failure (e.g. a single project's git discovery failing) renders `ErrorState` for

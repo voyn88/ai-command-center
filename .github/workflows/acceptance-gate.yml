@@ -7,15 +7,20 @@ name: Acceptance gate
 on:
   pull_request:
     branches: [main]
-    types: [opened, synchronize, reopened, labeled, unlabeled]
+    # Label removals run no gate and must not create a newer skipped suite.
+    # Window entry/canary additions still run the unchanged quality gates.
+    types: [opened, synchronize, reopened, labeled]
   pull_request_review:
     types: [submitted, edited, dismissed]
   merge_group:
     types: [checks_requested]
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha }}-${{ ((github.event_name == 'pull_request' && (github.event.action == 'labeled' || github.event.action == 'unlabeled') && !startsWith(github.event.label.name, 'release-gate-canary-') && !(github.event.action == 'labeled' && (github.event.label.name == 'review-window:active' || github.event.label.name == 'queue-active'))) || (github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'review-window:active') && !contains(github.event.pull_request.labels.*.name, 'queue-active') && !startsWith(github.event.label.name, 'release-gate-canary-'))) && github.run_id || 'head' }}
-  cancel-in-progress: true
+  # Review bursts must not cancel the running required check on this exact head.
+  # Different PR heads and synthetic merge-group heads have separate groups.
+  # GitHub may still replace a pending run; this protects the running run only.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || 'merge-group' }}-${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}-${{ ((github.event_name == 'pull_request' && (github.event.action == 'labeled' || github.event.action == 'unlabeled') && !startsWith(github.event.label.name, 'release-gate-canary-') && !(github.event.action == 'labeled' && (github.event.label.name == 'review-window:active' || github.event.label.name == 'queue-active'))) || (github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'review-window:active') && !contains(github.event.pull_request.labels.*.name, 'queue-active') && !startsWith(github.event.label.name, 'release-gate-canary-'))) && github.run_id || 'head' }}
+  cancel-in-progress: false
 
 permissions:
   contents: read

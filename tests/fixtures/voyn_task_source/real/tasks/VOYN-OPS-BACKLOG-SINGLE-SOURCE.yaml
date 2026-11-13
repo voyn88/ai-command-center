@@ -1,0 +1,14 @@
+# Мигрировано из outputs/VOYN_TASKS_BACKLOG.md скриптом tools/migrate_backlog.py. Строка оригинала: 254.
+id: "VOYN-OPS-BACKLOG-SINGLE-SOURCE"
+project: "aios"
+title: "Существуют две расходящиеся копии бэклога"
+why: "Существуют две расходящиеся копии бэклога: `outputs/VOYN_TASKS_BACKLOG.md` (источник правды по указанию владельца) и `roadmap/work/VOYN_TASKS_BACKLOG.md`. В `work/`-копии `VOYN-W1-AD/DIG/UI` помечены `DONE (aicc#266/267/269 merged)`, в источнике правды те же задачи `OPEN`. Дашборд `VOYN_BACKLOG_DASHBOARD.md` собирается из `work/`-копии, то есть отчётность строится не по источнику правды."
+priority: "P2"
+owner: "Ops / Platform"
+reviewer: "reviewer-unassigned"
+acceptance: "одна физическая копия бэклога (вторая — симлинк или удалена), дашборд читает источник правды, статусы W1 согласованы с фактическими доказательствами."
+status: "READY_TO_REVIEW"
+wave: "0"
+depends_on: []
+evidence:
+  test: "ссылок на PR/коммит в тексте нет; см. строку 254 в outputs/VOYN_TASKS_BACKLOG.md"

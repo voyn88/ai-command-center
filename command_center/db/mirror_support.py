@@ -23,12 +23,14 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
+from enum import Enum
 from typing import Any, Iterable
 
 __all__ = [
     "MIRROR_UNAVAILABLE",
     "ColumnCodec",
+    "TimestampWriter",
     "divergence",
     "render_authority_timestamp",
     "to_instant",
@@ -65,22 +67,38 @@ def to_instant(value: str) -> datetime:
     return parsed if parsed.tzinfo is not None else parsed.astimezone()
 
 
-def render_authority_timestamp(value: datetime) -> str:
-    """Render `timestamptz` back into exactly what `models.iso_now()` emits.
+class TimestampWriter(Enum):
+    """Timestamp spellings used by authoritative stores.
 
-    Naive local, second precision, no offset. An earlier version rendered UTC
-    with a `Z` suffix "matching what the application writes" — it does not, and
-    the result was a divergence check that called every row different, which is
-    a cutover gate permanently red. A red gate nobody can satisfy is one
-    somebody eventually satisfies by loosening the comparison.
-
-    `timespec="seconds"` matches `iso_now` and is therefore lossless for every
-    column mirrored today. It is *not* the right renderer for a store that
-    writes `datetime.now(UTC).isoformat()` — eight of those are queued for
-    later waves, and copying this onto them reproduces the same class of defect
-    in reverse. Tracked as `VOYN-W0-AICC-MIRROR-RENDER-SHARED`, a declared
-    blocker on the first such table.
+    This belongs to the mirror schema because PostgreSQL's ``timestamptz``
+    preserves an instant, not the spelling the writer used for it.  A mirror
+    must therefore name the writer whose spelling it has to reconstruct.
     """
+
+    ISO_NOW = "iso_now"
+    AWARE_UTC = "aware_utc"
+
+
+def render_authority_timestamp(
+    value: datetime, writer: TimestampWriter = TimestampWriter.ISO_NOW
+) -> str:
+    """Render `timestamptz` in the authoritative writer's format.
+
+    The default writer uses naive local time, second precision, and no offset.
+    An earlier version rendered UTC with a `Z` suffix "matching what the
+    application writes" — it does not, and the result was a divergence check
+    that called every row different, which is a cutover gate permanently red.
+    A red gate nobody can satisfy is one somebody eventually satisfies by
+    loosening the comparison.
+
+    `TimestampWriter.ISO_NOW` reproduces naive local, second precision text.
+    `TimestampWriter.AWARE_UTC` reproduces `datetime.now(UTC).isoformat()`:
+    UTC with an offset and the writer's automatic microsecond precision.  The
+    choice is made by each `ColumnCodec`, next to the schema columns, instead
+    of being inferred from a value after `timestamptz` has erased its spelling.
+    """
+    if writer is TimestampWriter.AWARE_UTC:
+        return value.astimezone(UTC).isoformat()
     return value.astimezone().replace(tzinfo=None).isoformat(timespec="seconds")
 
 
@@ -117,6 +135,15 @@ class ColumnCodec:
     flags: frozenset[str] = field(default_factory=frozenset)
     #: Columns PostgreSQL declares `jsonb` while the authority stores JSON text.
     json_values: frozenset[str] = field(default_factory=frozenset)
+    #: Timestamp columns written by `datetime.now(UTC).isoformat()` rather than
+    #: the default `models.iso_now()` writer.
+    aware_utc_timestamps: frozenset[str] = field(default_factory=frozenset)
+
+    def __post_init__(self) -> None:
+        unknown = self.aware_utc_timestamps - self.timestamps
+        if unknown:
+            names = ", ".join(sorted(unknown))
+            raise ValueError(f"aware UTC writers must be timestamp columns: {names}")
 
     def to_column(self, name: str, value: Any) -> Any:
         """The authority's shape -> the PostgreSQL column's type.
@@ -160,43 +187,72 @@ class ColumnCodec:
         if name in self.flags:
             return None if value is None else int(bool(value))
         if name in self.timestamps and isinstance(value, datetime):
-            return render_authority_timestamp(value)
+            writer = (
+                TimestampWriter.AWARE_UTC
+                if name in self.aware_utc_timestamps
+                else TimestampWriter.ISO_NOW
+            )
+            return render_authority_timestamp(value, writer)
         return value
 
-    def comparable(self, name: str, value: Any) -> Any:
+    def comparable(self, name: str, value: Any, *, side: str) -> Any:
         """One column's value reduced to what a comparison should look at.
 
-        Two reductions, and they are not symmetric by accident. Booleans are
-        normalised unconditionally — `True` and `1` mean the same thing in
-        every table this reconciles. JSON is normalised only for the columns a
-        table declared as `jsonb`, because parsing a string that merely looks
-        like JSON would make two rows agree on a column the target stores as
-        text, which is a false clean rather than a false difference.
+        `side` is `"authority"` or `"mirror"`, and the two are deliberately
+        not treated the same way for `jsonb` columns. The mirror's value has
+        already been through the driver, which parses `jsonb` on its own —
+        `to_authority` hands it over untouched — so it is never re-parsed
+        here; doing so a second time is where the previous version of this
+        method lost the one bit that mattered.
 
-        Unparseable text compares as itself, and the guarantee that follows is
-        narrower than it first appears. `to_column` refuses such text, so no
-        *unparseable* value reaches the mirror; but a `jsonb` column may hold a
-        JSON **string scalar**, which the driver returns as a plain `str`, and
-        this method cannot tell which side it is looking at. Mirror `"not
-        json"` — a perfectly valid `jsonb` string — therefore compares equal to
-        authority text `not json`, which is a false clean.
+        The authority's value is raw text and is always parsed. `to_column`
+        guarantees that unparseable text never reaches the mirror, so if the
+        authority's text fails to parse, *no* mirror value can be its
+        counterpart — not even one that happens to be the identical `str`.
+        That was the false clean this method used to produce: a `jsonb`
+        column may hold a JSON **string scalar**, which the driver returns as
+        a plain `str`, and comparing it against unparseable authority text of
+        the same characters — `not json` — with no parsing on either side
+        made the two indistinguishable. Returning a sentinel that never
+        compares equal, instead of the raw string, reports that row divergent
+        unconditionally rather than by accident of matching bytes. Found by
+        independent review, against the flat claim an earlier docstring made
+        that this could not happen; fixed as
+        `VOYN-W0-AICC-MIRROR-JSON-SCALAR-AMBIGUITY`.
 
-        Unreachable for every column mirrored today: all of them are written by
-        `json.dumps`, which never emits a bare scalar here. Stated rather than
-        fixed because the fix belongs where the sides are distinguishable, not
-        in a method that sees two values and no provenance —
-        `VOYN-W0-AICC-MIRROR-JSON-SCALAR-AMBIGUITY`. Found by independent
-        review, which produced the counterexample against the flat claim this
-        docstring used to make.
+        Booleans are normalised unconditionally, on either side — `True` and
+        `1` mean the same thing in every table this reconciles.
         """
         if isinstance(value, bool):
             return int(value)
-        if name in self.json_values and isinstance(value, str):
+        if name in self.json_values and side == "authority" and isinstance(value, str):
             try:
                 return json.loads(value)
             except json.JSONDecodeError:
-                return value
+                return _UnparseableJSON(value)
         return value
+
+
+class _UnparseableJSON:
+    """Sentinel for authority text a `jsonb` column declared but cannot parse.
+
+    `ColumnCodec.to_column` refuses such text before it can reach the mirror,
+    so by construction no mirror value is its counterpart — including a
+    mirror `str` that happens to share its characters (see `comparable`).
+    Comparing equal to nothing, ever, is what makes that row report divergent
+    instead of matching by accident.
+    """
+
+    __slots__ = ("raw",)
+
+    def __init__(self, raw: str) -> None:
+        self.raw = raw
+
+    def __eq__(self, other: object) -> bool:
+        return False
+
+    def __repr__(self) -> str:
+        return f"_UnparseableJSON({self.raw!r})"
 
 
 def divergence(
@@ -268,7 +324,8 @@ def divergence(
         fields = sorted(
             name
             for name in names
-            if compare(name, row.get(name)) != compare(name, counterpart.get(name))
+            if compare(name, row.get(name), side="authority")
+            != compare(name, counterpart.get(name), side="mirror")
         )
         if fields:
             differences.append(
@@ -292,14 +349,15 @@ def _reported(row_key: tuple) -> Any:
     return row_key[0] if len(row_key) == 1 else row_key
 
 
-def _comparable(_name: str, value: Any) -> Any:
+def _comparable(_name: str, value: Any, *, side: str) -> Any:
     """The comparison for a table that passed no codec: booleans only.
 
     SQLite hands back the integers it stores, so a correctly round-tripped
     boolean would otherwise read as a difference on every row. The column name
-    is accepted and ignored so this and `ColumnCodec.comparable` are the same
-    shape — the caller should not have two ways to compare.
+    and `side` are accepted and ignored so this and `ColumnCodec.comparable`
+    are the same shape — the caller should not have two ways to compare.
     """
+    del side
     if isinstance(value, bool):
         return int(value)
     return value

@@ -24,13 +24,23 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from command_center.observability.trace import log_span
 from command_center.orchestrator.coordination import (
     apply_advisory_order,
     coordination_enabled,
     coordination_stopped,
     load_advisory_order,
 )
-from command_center.orchestrator.routing import cascade_for
+from command_center.dispatch.models import DEFER_COST_DATA_UNAVAILABLE, DEFER_DAILY_BUDGET
+from command_center.orchestrator.routing import (
+    BILLING_MODE_API_METERED,
+    BILLING_MODE_SUBSCRIPTION,
+    BILLING_MODE_UNKNOWN,
+    billing_mode_for_executor,
+    cascade_for,
+    classify_task_class,
+    metered_executors,
+)
 from command_center.worker.payloads import AGENT_RUN_SCHEMA_VERSION
 
 __all__ = [
@@ -67,6 +77,22 @@ class PlanLimits:
     #: RESUME). Bounded so a large parked backlog drains gradually across
     #: ticks instead of flooding OPEN in one; 0 disables the reconcile.
     max_resumes_per_tick: int = 10
+    #: Per-tick cap on READY_TO_REVIEW -> OPEN auto-recoveries for a task
+    #: carrying no `pr` evidence at all (VOYN-W0-AICC-TICK-STALL-WATCHDOG,
+    #: live shape: VOYN-W0-AICC-SRV-07a stuck READY_TO_REVIEW with nothing
+    #: on its branch for days -- `reconcile_pr_evidence` only ever records
+    #: evidence it finds, so a task with none to find sat skipped
+    #: `no_open_pr_on_task_branch` every tick forever; 0018's
+    #: `backlog_recover_stuck_ready_to_review` is the sanctioned way out but
+    #: nothing automated ever called it). 0 disables the reconcile.
+    max_stuck_ready_recoveries_per_tick: int = 5
+    #: How long a READY_TO_REVIEW task must sit with no `pr` evidence before
+    #: the reconcile above is allowed to touch it -- long enough that a
+    #: publish genuinely still in flight (or a PR an operator is in the
+    #: middle of opening by hand for a `reconcile_pr_evidence` pickup) is
+    #: never raced, short enough that a truly stuck task gets another
+    #: attempt within the hour rather than sitting for days.
+    stuck_ready_min_age_seconds: int = 1800
     #: The planner's dispatch-only backpressure fence: once this many
     #: READY_TO_REVIEW tasks are carrying `pr` evidence, this tick dispatches
     #: nothing new, so implementation supply stops outrunning review/merge
@@ -82,6 +108,9 @@ class PlanLimits:
     only_task_id: str | None = None
     #: Distinct tick identity; repository leases keep the canonical planner id.
     tick_owner: str | None = None
+    #: FinOps B1: global trailing-24h ceiling for metered token-billed routes.
+    #: 0 disables the dollar threshold only; unknown spend still fail-closed.
+    max_metered_spend_usd_24h: float = 3.0
 
 
 @dataclass(slots=True)
@@ -94,6 +123,9 @@ class PlanReport:
     #: (task, original park reason) — DEFER_TO_USER technical parks the 0014
     #: gate returned to OPEN this tick (VOYN-W0-AICC-DEFER-AUTO-RESUME).
     resumed: list[tuple[str, str]] = field(default_factory=list)
+    #: task_id — READY_TO_REVIEW tasks with no `pr` evidence at all, sent
+    #: back to OPEN this tick for a fresh attempt (0018 recovery gate).
+    recovered_stuck_ready: list[str] = field(default_factory=list)
     planner_busy: bool = False
     #: The review backlog count that tripped `PlanLimits.review_backlog_
     #: limit` this tick (None when the fence never fired). Ingest and the
@@ -116,6 +148,9 @@ class PlanReport:
     idle_trickle: bool = False
     #: Functional candidates held back by the fence this tick (count only).
     fenced: int = 0
+    #: (task_id, executor, reason) for links removed from the outgoing cascade
+    #: before dispatch by FinOps B1 filtering.
+    links_excluded: list[tuple[str, str, str]] = field(default_factory=list)
 
 
 # Repo → (canonical project_id, worker-host repository path). The worker's
@@ -217,7 +252,7 @@ def _payload_for(
     ``untrusted=False`` is on the authority of the planner being the control
     plane acting on the canonical store.
     """
-    cascade = cascade_for("implementation")
+    cascade = cascade_for(classify_task_class(task["title"], task["body"]))
     project_id, repository_path = route
     if mode == "split":
         prompt = (
@@ -275,6 +310,93 @@ def _payload_for(
         "backlog_task_id": task["task_id"],
     }
     return payload, len(cascade)
+
+
+def _metered_spend_24h_usd(_rows: Any) -> float | None:
+    """Metered spend facts for FinOps B1.
+
+    B1 runs before B2/B3 ledger wiring: the server chain does not yet persist
+    per-link metered dollar facts into PostgreSQL for `cursor`/`grok`/`openai_http`.
+    Until that lands, metered spend is treated as unknown (fail-closed at link level).
+    """
+    return None
+
+
+def _filter_cascade_for_budget(
+    cascade: Any, *, spend_24h_usd: float | None, limits: PlanLimits
+) -> tuple[list[dict[str, Any]], str | None, list[tuple[str, str]]]:
+    """Drop gated links from a cascade; refuse only when nothing remains."""
+    if not isinstance(cascade, list):
+        return [], DEFER_COST_DATA_UNAVAILABLE, []
+
+    metered_reason = (
+        DEFER_COST_DATA_UNAVAILABLE
+        if spend_24h_usd is None
+        else DEFER_DAILY_BUDGET
+    )
+    metered_blocked = spend_24h_usd is None or (
+        limits.max_metered_spend_usd_24h > 0
+        and spend_24h_usd >= limits.max_metered_spend_usd_24h
+    )
+    filtered: list[dict[str, Any]] = []
+    excluded: list[tuple[str, str]] = []
+    saw_unknown = False
+    for link in cascade:
+        if not isinstance(link, dict):
+            return [], DEFER_COST_DATA_UNAVAILABLE, []
+        executor = link.get("executor")
+        if not isinstance(executor, str) or not executor:
+            return [], DEFER_COST_DATA_UNAVAILABLE, []
+        mode = billing_mode_for_executor(executor)
+        if mode == BILLING_MODE_SUBSCRIPTION:
+            filtered.append(dict(link))
+            continue
+        if mode == BILLING_MODE_API_METERED:
+            if metered_blocked:
+                excluded.append((executor, metered_reason))
+            else:
+                filtered.append(dict(link))
+            continue
+        # Unknown executor billing mode is always fail-closed at link level.
+        saw_unknown = True
+        excluded.append((executor, "unknown_billing_mode"))
+
+    if filtered:
+        return filtered, None, excluded
+    if spend_24h_usd is None or saw_unknown:
+        return [], DEFER_COST_DATA_UNAVAILABLE, excluded
+    return [], DEFER_DAILY_BUDGET, excluded
+
+
+def _planner_finops_excluded_executors(
+    cascade: Any, *, spend_24h_usd: float | None, limits: PlanLimits
+) -> list[str]:
+    """Planner marker for worker-side FinOps filtering.
+
+    While metered spend is unknown or over the threshold, mark every metered
+    executor from the billing table regardless of this planner process profile,
+    plus any unknown executors present in the cascade.
+    """
+    metered_blocked = spend_24h_usd is None or (
+        limits.max_metered_spend_usd_24h > 0
+        and spend_24h_usd >= limits.max_metered_spend_usd_24h
+    )
+    if not metered_blocked:
+        return []
+
+    excluded = set(metered_executors())
+    if isinstance(cascade, list):
+        for link in cascade:
+            if not isinstance(link, dict):
+                continue
+            executor = link.get("executor")
+            if (
+                isinstance(executor, str)
+                and executor
+                and billing_mode_for_executor(executor) == BILLING_MODE_UNKNOWN
+            ):
+                excluded.add(executor)
+    return sorted(excluded)
 
 
 _DEFAULT_PLAN_LIMITS = PlanLimits()
@@ -375,6 +497,46 @@ class Planner:
                         if ok:
                             report.resumed.append((task_id, park_reason))
 
+                # Reconcile READY_TO_REVIEW tasks that will never acquire `pr`
+                # evidence on their own (VOYN-W0-AICC-TICK-STALL-WATCHDOG):
+                # `reconcile_pr_evidence` (BO-S3b) only ever RECORDS evidence
+                # it finds on the task's own branch -- a task with nothing to
+                # find there is skipped `no_open_pr_on_task_branch` and left
+                # untouched, by design (that function never changes a
+                # status). Nothing else in the pipeline revisits a
+                # READY_TO_REVIEW row either: `backlog_transition`'s adjacency
+                # has no edge out of it except DONE/REJECTED, and
+                # `backlog_return_to_pool` only accepts IN_PROGRESS. 0018's
+                # `backlog_recover_stuck_ready_to_review` is the sanctioned
+                # exit (READY_TO_REVIEW -> OPEN, refused outright if any `pr`
+                # evidence exists) but had no automated caller, so a task that
+                # reached this state -- a completed-but-unpublished run (0011
+                # closed that for NEW ingests; this covers whatever bug or
+                # manual edit produces it regardless) -- stayed wedged
+                # forever. The age floor keeps this from racing a publish
+                # genuinely still in flight or an operator mid-way through
+                # hand-opening the PR `reconcile_pr_evidence` is meant to pick
+                # up; the function's own evidence re-check under the row lock
+                # is the real safety net either way.
+                if limits.max_stuck_ready_recoveries_per_tick > 0:
+                    stuck_ready = self._rows(
+                        "SELECT t.task_id FROM backlog_task t "
+                        "WHERE t.status = 'READY_TO_REVIEW' AND t.kind = 'task' "
+                        "AND t.updated_at < now() - (%s * interval '1 second') "
+                        "AND NOT EXISTS (SELECT 1 FROM backlog_evidence e "
+                        "WHERE e.task_id = t.task_id AND e.kind = 'pr') "
+                        "ORDER BY t.updated_at LIMIT %s",
+                        (limits.stuck_ready_min_age_seconds,
+                         limits.max_stuck_ready_recoveries_per_tick),
+                    )
+                    for (task_id,) in stuck_ready:
+                        ok, _reason, _revision = self._row(
+                            "SELECT * FROM backlog_recover_stuck_ready_to_review(%s)",
+                            (task_id,),
+                        )
+                        if ok:
+                            report.recovered_stuck_ready.append(task_id)
+
                 # Fail-closed monitors record what they measured (0021
                 # monitor_finding); every open finding becomes a pipeline task
                 # once, so a red monitor is a task the fleet fixes rather than a
@@ -451,6 +613,10 @@ class Planner:
                 "       task_class "
                 "FROM backlog_eligible"
             )
+            try:
+                spend_24h_usd = _metered_spend_24h_usd(self._rows)
+            except Exception:  # noqa: BLE001 — fail closed for metered paths
+                spend_24h_usd = None
             # Advisory reorder from coordination v2 (Grok). Stale/unknown ids
             # are ignored; backlog_dispatch still re-checks eligibility under
             # the row lock. Missing/unreadable state → original order.
@@ -493,6 +659,28 @@ class Planner:
                     continue
                 mode = "split" if _split_requested(self._rows, task_id) else "implement"
                 payload, budget = _payload_for(task, limits, route, mode=mode)
+                filtered_cascade, gate_reason, excluded_links = _filter_cascade_for_budget(
+                    payload.get("cascade"),
+                    spend_24h_usd=spend_24h_usd,
+                    limits=limits,
+                )
+                for excluded_executor, excluded_reason in excluded_links:
+                    report.links_excluded.append((task_id, excluded_executor, excluded_reason))
+                excluded_executors = _planner_finops_excluded_executors(
+                    payload.get("cascade"),
+                    spend_24h_usd=spend_24h_usd,
+                    limits=limits,
+                )
+                if gate_reason is not None:
+                    report.refused.append((task_id, gate_reason))
+                    continue
+                payload["cascade"] = filtered_cascade
+                if excluded_executors:
+                    payload["finops_excluded_executors"] = excluded_executors
+                payload["task_type"] = str(
+                    filtered_cascade[0].get("task_type") or payload["task_type"]
+                )
+                budget = len(filtered_cascade)
                 if mode == "split":
                     report.split_dispatched.append(task_id)
                 ok, reason, work_item_id, _revision = self._row(
@@ -508,6 +696,13 @@ class Planner:
                 )
                 if ok:
                     report.dispatched.append((task_id, work_item_id))
+                    log_span(
+                        "plan",
+                        task_id=task_id,
+                        work_item_id=work_item_id,
+                        wave=wave,
+                        priority=priority,
+                    )
                 elif reason == "earlier_wave_has_eligible_work":
                     report.skipped_by_wave_gate.append((task_id, reason))
                 elif reason == "wip_exhausted":

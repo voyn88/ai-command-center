@@ -55,6 +55,35 @@ fi
 PGPORT_VALUE="${AICC_PG_PORT:-5432}"
 
 command -v pg_dump >/dev/null || { echo "pg_dump not found in PATH" >&2; exit 127; }
+command -v psql >/dev/null       || { echo "psql not found in PATH" >&2; exit 127; }
+
+# pg_dump refuses to dump a newer server; failing here (before writing anything)
+# turns a silent nightly cron failure into an actionable operator message.
+PG_DUMP_MAJOR="$(pg_dump --version | awk '{print $3}' | cut -d. -f1)"
+if [[ ! "$PG_DUMP_MAJOR" =~ ^[0-9]+$ ]]; then
+    echo "could not parse pg_dump major version from: $(pg_dump --version)" >&2
+    exit 1
+fi
+SERVER_VERSION_NUM="$(
+    PGPASSWORD="$AICC_PG_PASSWORD" psql \
+        --host="$AICC_PG_HOST" \
+        --port="$PGPORT_VALUE" \
+        --username="$AICC_PG_USER" \
+        --dbname="$AICC_PG_DB" \
+        --tuples-only --no-align --no-psqlrc \
+        --command="SHOW server_version_num"
+)"
+SERVER_VERSION_NUM="${SERVER_VERSION_NUM//[[:space:]]/}"
+if [[ ! "$SERVER_VERSION_NUM" =~ ^[0-9]+$ ]]; then
+    echo "could not read PostgreSQL server_version_num (got: '${SERVER_VERSION_NUM}')" >&2
+    exit 1
+fi
+SERVER_MAJOR=$((SERVER_VERSION_NUM / 10000))
+if [[ "$PG_DUMP_MAJOR" -lt "$SERVER_MAJOR" ]]; then
+    echo "pg_dump client is PostgreSQL ${PG_DUMP_MAJOR}.x but server is ${SERVER_MAJOR}.x;" >&2
+    echo "install a client at or above the server major version before backing up." >&2
+    exit 1
+fi
 
 # Backups routinely contain every row in the system, so a directory this script
 # creates is owner-only. An existing directory is left alone: it may be an

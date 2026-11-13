@@ -1,3 +1,6 @@
+import { useTranslation } from 'react-i18next'
+import { humanStatus, REPO_STATE_KEYS } from '../lib/labels'
+
 type StatusRowProps = {
   project: string
   state: string | null
@@ -11,13 +14,15 @@ type StatusRowProps = {
 // warning-colored.
 const REPO_STATE_COLOR: Record<string, string> = {
   ok: 'var(--ok)',
-  unconfigured: 'var(--tx3)',
+  unconfigured: 'var(--tx3-aa)',
   invalid_path: 'var(--bad)',
   not_git_repo: 'var(--bad)',
 }
 
 export default function StatusRow({ project, state, unknownLabel }: StatusRowProps) {
-  const color = state ? REPO_STATE_COLOR[state] || 'var(--tx3)' : 'var(--tx3)'
+  const { t } = useTranslation()
+  const status = humanStatus(REPO_STATE_KEYS, state, t)
+  const color = state ? REPO_STATE_COLOR[state] || 'var(--tx3-aa)' : 'var(--tx3-aa)'
   return (
     <div
       style={{
@@ -29,9 +34,9 @@ export default function StatusRow({ project, state, unknownLabel }: StatusRowPro
       }}
     >
       <span style={{ color: 'var(--tx)', fontSize: '0.84rem' }}>{project}</span>
-      <span style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.72rem', color: 'var(--tx2)' }}>
+      <span title={state || undefined} style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.75rem', color: 'var(--tx2)' }}>
         <span style={{ width: 7, height: 7, borderRadius: '50%', background: color, display: 'inline-block' }} />
-        {state || unknownLabel}
+        {state ? status.label : unknownLabel}
       </span>
     </div>
   )

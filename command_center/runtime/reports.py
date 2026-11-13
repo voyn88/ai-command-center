@@ -17,6 +17,7 @@ import os
 from datetime import datetime
 from pathlib import Path
 
+from command_center import project_config
 from command_center.models import iso_now
 from command_center.storage import atomic_write_text
 
@@ -53,8 +54,19 @@ def _safe_path_component(value: str, fallback: str) -> str:
     return cleaned or fallback
 
 
+def project_path_component(project: str | None) -> str:
+    """Return the canonical, contained directory component for a project.
+
+    Known ids, display names, and historical aliases share one report
+    directory.  Unknown values retain the previous sanitized representation
+    instead of being guessed into a registered project.
+    """
+    canonical = project_config.canonical_project_id(project) or "UNKNOWN"
+    return _safe_path_component(canonical, "UNKNOWN")
+
+
 def report_path_for(run: dict) -> Path:
-    project = _safe_path_component(run.get("project") or "UNKNOWN", "UNKNOWN")
+    project = project_path_component(run.get("project"))
     started = run.get("started_at") or run.get("created_at") or iso_now()
     try:
         started_dt = datetime.fromisoformat(started)

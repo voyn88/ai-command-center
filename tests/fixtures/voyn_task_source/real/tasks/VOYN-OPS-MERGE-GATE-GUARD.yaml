@@ -1,0 +1,15 @@
+# Мигрировано из outputs/VOYN_TASKS_BACKLOG.md скриптом tools/migrate_backlog.py. Строка оригинала: 221.
+id: "VOYN-OPS-MERGE-GATE-GUARD"
+project: "aios"
+title: "Оснастка, берущая оба инварианта на себя до появления платформенного гейта"
+why: "Оснастка, берущая оба инварианта на себя до появления платформенного гейта: `scripts/merge_when_green.sh <pr> <reviewed-sha>` отказывает при head ≠ отревьюированный SHA (3), упавшей или неразрешённо-skipped проверке (4), необъявившемся обязательном гейте (5), незавершённых проверках к дедлайну (6), сдвиге head во время ожидания (7)."
+priority: "P2"
+owner: "Platform / SRE"
+reviewer: "reviewer-unassigned"
+acceptance: "Критерий приёмки в исходном Markdown не указан; уточнить у владельца"
+status: "DONE"
+wave: "0"
+depends_on: []
+evidence:
+  pr: "#230"
+  sha: "5bc9633"

@@ -19,8 +19,10 @@ from pathlib import Path
 import pytest
 
 from command_center import agent_runner, workspace_provisioning
+from command_center.orchestrator import review_merge
 from command_center.orchestrator.publish import PublishResult
 from command_center.worker import handlers as handlers_for_pin
+from command_center import prepush_prescreen
 from command_center.worker.handlers import build_handlers
 from command_center.worker.payloads import PayloadError, parse_agent_run
 
@@ -146,6 +148,16 @@ def handler(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(
         workspace_provisioning, "remove_workspace", lambda *a, **kw: "removed"
+    )
+    # The prescreen is a real subprocess-shelling seam (ruff, git, pytest, an
+    # optional ollama/aider binary) -- faked here at the same module-seam
+    # level as `run_claude_code`/provisioning above, so the default fixture
+    # stays hermetic. Its own subprocess plumbing is covered directly in
+    # tests/worker/test_prepush_prescreen.py.
+    monkeypatch.setattr(
+        prepush_prescreen,
+        "run_prepush_prescreen",
+        lambda *a, **kw: prepush_prescreen.PrescreenReport(),
     )
     # The writer-lease gate is a real external seam: it shells out to the
     # lease tool whenever VOYN_LEASE_DSN names an authority, and this host
@@ -1030,7 +1042,7 @@ def test_long_output_travels_as_tails(handler, monkeypatch) -> None:
     assert len(outcome.result["stderr_tail"]) == 4000
 
 
-def test_timed_out_run_is_ok_not_redelivered(handler, monkeypatch) -> None:
+def test_timed_out_mutating_run_is_ok_not_redelivered(handler, monkeypatch) -> None:
     """A timed-out run may have half-executed its mutations; redelivery
     would re-apply them. It is a *result* (status timed_out), never the
     never-started retryable path — pinned because the mutant
@@ -1049,8 +1061,122 @@ def test_timed_out_run_is_ok_not_redelivered(handler, monkeypatch) -> None:
         )
 
     monkeypatch.setattr(agent_runner, "run_claude_code", timed_out)
-    outcome = run_agent(_payload(), _event(), 1)
+    outcome = run_agent(_payload(task_type="implementation"), _event(), 1)
     assert outcome.ok and outcome.result["status"] == "timed_out"
+
+
+def test_timed_out_review_retries_as_bounded_infrastructure_wait(
+    handler, monkeypatch
+) -> None:
+    """A read-only timeout has no verdict or side effects. It must not
+    succeed and permanently occupy the deterministic same-head review key."""
+    run_agent, _ = handler
+
+    def timed_out(**kwargs):
+        return agent_runner.RunResult(
+            status="timed_out",
+            exit_code=None,
+            stdout="",
+            stderr="agent exceeded 120 seconds",
+            duration_seconds=120.0,
+            started_at="2026-08-29T00:00:00+00:00",
+            completed_at="2026-08-29T00:02:00+00:00",
+        )
+
+    monkeypatch.setattr(agent_runner, "run_claude_code", timed_out)
+    outcome = run_agent(_payload(task_type="independent_review"), _event(), 1)
+
+    assert not outcome.ok
+    assert outcome.retryable and outcome.infra_wait
+    assert "review timeout" in outcome.reason
+
+
+@pytest.mark.parametrize("failure_kind", ["quota", "timeout", "network"])
+def test_same_head_review_transient_failure_cycle_is_non_terminal_and_bounded(
+    handler, monkeypatch, failure_kind
+) -> None:
+    """Exercise the whole unchanged-head contract across orchestrator and worker.
+
+    A transient model failure must leave the one deterministic review item
+    retryable, never create a succeeded result without a verdict, and never
+    escape the queue's independent, bounded infrastructure-wait budget by
+    minting another item on the next review tick.
+    """
+    run_agent, _ = handler
+    task_id = "VOYN-W0-SAME-HEAD-TRANSIENT"
+    pr_url = "https://github.com/o/ai-command-center/pull/7"
+    head_sha = "a" * 40
+    monkeypatch.setattr(review_merge, "_rows", lambda *args: [(task_id, pr_url)])
+    monkeypatch.setattr(
+        review_merge,
+        "_pr_diff_and_head",
+        lambda *args: review_merge._PRSnapshot.create("diff", "b" * 40, head_sha),
+    )
+    monkeypatch.setattr(
+        "command_center.orchestrator.planner.repo_route",
+        lambda repo: ("AICC", "/srv/aicc"),
+    )
+
+    if failure_kind == "quota":
+        stdout = json.dumps(
+            {
+                "is_error": True,
+                "terminal_reason": "api_error",
+                "api_error_status": 429,
+                "result": "You've hit your session limit",
+            }
+        )
+        failed_run = agent_runner.RunResult(
+            status="failed", exit_code=1, stdout=stdout, stderr="",
+            duration_seconds=0.1, started_at="t0", completed_at="t1",
+        )
+    elif failure_kind == "timeout":
+        failed_run = agent_runner.RunResult(
+            status="timed_out", exit_code=None, stdout="", stderr="agent timed out",
+            duration_seconds=120.0, started_at="t0", completed_at="t1",
+        )
+    else:
+        failed_run = agent_runner.RunResult(
+            status="failed", exit_code=None, stdout="",
+            stderr="network error: connection refused",
+            duration_seconds=0.1, started_at="t0", completed_at="t1",
+        )
+    monkeypatch.setattr(agent_runner, "run_claude_code", lambda **kwargs: failed_run)
+
+    items: dict[str, dict] = {}
+
+    def enqueue(_queue, key, payload, queued_task_id, max_attempts):
+        items.setdefault(
+            key,
+            {
+                "payload": payload,
+                "task_id": queued_task_id,
+                "max_attempts": max_attempts,
+                "state": "ready",
+                "infra_wait_count": 0,
+            },
+        )
+
+    infra_wait_cap = 2
+    observed_states = []
+    for _ in range(infra_wait_cap + 1):
+        review_merge.review_once(object(), enqueue, "/srv/aicc")
+        assert len(items) == 1
+        item = next(iter(items.values()))
+        outcome = run_agent(item["payload"], _event(), 1)
+        assert not outcome.ok and outcome.retryable and outcome.infra_wait
+        assert outcome.result == {}, "transient failure must not publish a verdict result"
+        item["infra_wait_count"] += 1
+        item["state"] = (
+            "dead" if item["infra_wait_count"] > infra_wait_cap else "ready"
+        )
+        observed_states.append(item["state"])
+
+    key, item = next(iter(items.items()))
+    assert f":7:{head_sha}:{review_merge._REVIEW_POLICY_VERSION}:" in key
+    assert item["task_id"] == task_id
+    assert item["state"] == "dead"
+    assert observed_states == ["ready", "ready", "dead"]
 
 
 def test_every_payload_defect_is_non_retryable() -> None:
@@ -1211,6 +1337,80 @@ def test_absent_cascade_keeps_the_single_executor_behaviour(handler) -> None:
     assert runs[-1]["task_type"] == _payload()["task_type"]
 
 
+# -- aider + local Ollama (AICC Fleet decision 2026-09-03): a free,
+# benchmark-gated executor for bounded_implementation. It is checked with
+# its own preflight (never the generic `claude_cli_preflight`). Under principal
+# isolation the worker verifies both the exact Ollama model and the broker's
+# fixed executable before dispatch.
+
+
+def test_aider_preflight_checks_the_aider_cli_and_ollama_daemon(handler, monkeypatch):
+    run_agent, runs = handler
+    checked = []
+
+    def preflight(**_kwargs):
+        checked.append("called")
+        return False, "aider cli not found"
+
+    monkeypatch.setattr(agent_runner, "aider_preflight", preflight)
+    payload = _cascade_payload()
+    payload["task_type"] = "implementation"
+    payload["cascade"] = [
+        {"executor": "aider", "task_type": "implementation"},
+        {"executor": "claude", "task_type": "implementation"},
+    ]
+    outcome = run_agent(payload, _event(), 1)
+    assert outcome.ok
+    assert checked == ["called"]
+    # The FULL run ledger, not just its last entry: a bug that dispatched
+    # aider anyway before falling through to claude on preflight failure
+    # would still pass an assertion on `runs[-1]` alone. aider mutates the
+    # worktree with no dry-run/read-only mode, so this is the
+    # safety-critical path -- it must never have executed anything before
+    # the fallback.
+    assert len(runs) == 1, runs
+    assert runs[0]["executor"] == "claude"
+
+
+def test_aider_is_available_when_its_preflight_passes(handler, monkeypatch):
+    run_agent, runs = handler
+    monkeypatch.setattr(agent_runner, "aider_preflight", lambda **_kwargs: (True, ""))
+    payload = _cascade_payload()
+    payload["task_type"] = "implementation"
+    payload["cascade"] = [{"executor": "aider", "task_type": "implementation"}]
+    outcome = run_agent(payload, _event(), 1)
+    assert outcome.ok, outcome.reason
+    assert len(runs) == 1
+    assert runs[0]["executor"] == "aider"
+
+
+def test_aider_uses_model_and_broker_preflights_under_principal_isolation(
+    handler, monkeypatch
+):
+    checked = []
+    monkeypatch.setattr(
+        agent_runner,
+        "aider_preflight",
+        lambda **kwargs: checked.append(("model", kwargs["binary"])) or (True, ""),
+    )
+    monkeypatch.setattr(
+        agent_runner,
+        "principal_executor_preflight",
+        lambda executor: checked.append(("broker", executor)) or (True, ""),
+    )
+    monkeypatch.setenv(agent_runner.PRINCIPAL_ISOLATION_REQUIRED_ENV, "required")
+    available, detail, reason = handlers_for_pin._executor_preflight(
+        "aider", "implementation"
+    )
+    assert available is True
+    assert detail == ""
+    assert reason == "isolated aider cli unavailable"
+    assert checked == [
+        ("model", agent_runner.PRINCIPAL_EXECUTOR_BINARIES["aider"]),
+        ("broker", "aider"),
+    ]
+
+
 # -- machine outcome extraction (BO-S3) ---------------------------------------
 
 
@@ -1332,6 +1532,61 @@ def test_other_publish_failures_are_not_lease_waits(handler, monkeypatch) -> Non
     assert not outcome.ok and outcome.retryable is True
     assert outcome.lease_wait is False
     assert outcome.infra_wait is False
+
+
+def test_prescreen_runs_before_push_scoped_to_workspace_and_base_sha(
+    handler, monkeypatch, tmp_path
+) -> None:
+    """The bounded prescreen runs against the exact workspace and base SHA."""
+    import command_center.worker.handlers as handlers_module
+
+    run_agent, _runs = handler
+    monkeypatch.setenv("AICC_PUBLISH_DEPLOY_KEY", "/dev/null")
+    monkeypatch.setattr(
+        handlers_module,
+        "publish_run",
+        lambda repository, cfg: PublishResult(ok=True, branch=f"backlog/{cfg.task}"),
+    )
+    calls: list = []
+
+    def fake_prescreen(workspace, *, base_sha=None, time_budget_seconds=None):
+        calls.append({"workspace": Path(workspace), "base_sha": base_sha})
+        return prepush_prescreen.PrescreenReport(
+            steps=[prepush_prescreen.StepResult("ruff", ran=True, passed=True)]
+        )
+
+    monkeypatch.setattr(prepush_prescreen, "run_prepush_prescreen", fake_prescreen)
+
+    outcome = run_agent(
+        _payload(task_type="implementation", backlog_task_id="VOYN-W0-REAL-TASK"),
+        _event(),
+        1,
+    )
+    assert outcome.ok
+    assert len(calls) == 1
+    assert calls[0]["workspace"] == isolated_path(tmp_path, "VOYN-W0-REAL-TASK")
+    assert calls[0]["base_sha"] == "0" * 40  # _FakeEvidence.base_sha
+    assert outcome.result["prepush_prescreen"]["summary"] == "prescreen: 1/1 steps clean"
+
+
+def test_prescreen_not_invoked_without_a_publish_deploy_key(
+    handler, monkeypatch
+) -> None:
+    """Local-only mode (no `AICC_PUBLISH_DEPLOY_KEY`) never pushes, so there is
+    nothing for a pre-*push* prescreen to protect -- it must not run there."""
+    run_agent, _runs = handler
+    monkeypatch.delenv("AICC_PUBLISH_DEPLOY_KEY", raising=False)
+    calls: list = []
+    monkeypatch.setattr(
+        prepush_prescreen,
+        "run_prepush_prescreen",
+        lambda *a, **kw: calls.append((a, kw)) or prepush_prescreen.PrescreenReport(),
+    )
+
+    outcome = run_agent(_payload(task_type="implementation"), _event(), 1)
+    assert outcome.ok
+    assert calls == []
+    assert "prepush_prescreen" not in outcome.result
 
 
 def test_a_bare_hex_string_is_not_a_head_sha(handler, monkeypatch) -> None:
@@ -3047,3 +3302,67 @@ def test_read_only_isolated_checkout_packs_refs_after_a_wholesale_pr_fetch(
     loose_dirs = [p for p in loose.iterdir() if p.is_dir()] if loose.exists() else []
     assert loose_dirs == [], loose_dirs
     handlers_module._remove_read_only_isolated_checkout(target)
+
+
+def test_owner_cascade_rewrites_queued_review_and_clears_old_model(handler, monkeypatch):
+    run_agent, runs = handler
+    monkeypatch.setenv("AICC_EXECUTOR_PROFILE", "owner-cascade")
+    monkeypatch.setattr(agent_runner, "codex_workspace_write_preflight", lambda: (True, "ok"))
+    result = run_agent(_payload(model="old-claude-model"), _event(), 1)
+    assert result.ok
+    assert runs[0]["executor"] == "codex"
+    assert runs[0]["model"] is None
+    assert runs[0]["task_type"] == "review"
+
+
+def test_provider_failure_at_tail_wraps_to_untried_provider(handler, monkeypatch):
+    run_agent, _ = handler
+    called = []
+    def run(**kwargs):
+        executor = kwargs["executor"]
+        called.append(executor)
+        return agent_runner.RunResult(
+            status="failed" if executor == "grok" else "completed",
+            exit_code=1 if executor == "grok" else 0,
+            stdout="" if executor == "grok" else '{"result":"done"}',
+            stderr="provider HTTP 403" if executor == "grok" else "",
+            duration_seconds=.1, started_at="t0", completed_at="t1",
+        )
+    monkeypatch.setattr(agent_runner, "run_claude_code", run)
+    payload = _payload(cascade=[
+        {"executor":"cursor", "task_type":"review", "model":"auto"},
+        {"executor":"grok", "task_type":"review", "model":"grok-4.6"},
+    ])
+    outcome = run_agent(payload, _event(), 2)
+    assert outcome.ok
+    assert called == ["grok", "cursor"]
+
+
+def test_provider_wrap_never_repeats_failed_provider_within_delivery(handler, monkeypatch):
+    run_agent, _ = handler
+    called = []
+    def run(**kwargs):
+        executor = kwargs["executor"]
+        called.append(executor)
+        return agent_runner.RunResult(
+            status="failed", exit_code=1, stdout="",
+            stderr="provider HTTP 403" if executor == "grok" else "usage limit reached",
+            duration_seconds=.1, started_at="t0", completed_at="t1",
+        )
+    monkeypatch.setattr(agent_runner, "run_claude_code", run)
+    payload = _payload(cascade=[
+        {"executor":"cursor", "task_type":"review", "model":"auto"},
+        {"executor":"grok", "task_type":"review", "model":"grok-4.6"},
+    ])
+    outcome = run_agent(payload, _event(), 2)
+    assert not outcome.ok and outcome.infra_wait
+    assert called == ["grok", "cursor"]
+
+
+def test_operator_pause_refuses_before_mutating_agent_launch(handler, monkeypatch):
+    run_agent, runs = handler
+    monkeypatch.setenv('AICC_MUTATING_EXECUTION_PAUSED','1')
+    outcome=run_agent(_payload(task_type='implementation',untrusted=False),_event(),1)
+    assert not outcome.ok and outcome.infra_wait
+    assert outcome.reason=='mutating execution paused by operator'
+    assert runs==[]

@@ -617,6 +617,14 @@ def test_registry_import_does_not_pollute_published_release(tmp_path, monkeypatc
     monkeypatch.delenv("PYTHONPYCACHEPREFIX", raising=False)
 
     def run(args, **kwargs):
+        # pytest-cov 6 instruments child interpreters via COV_CORE_*.
+        # This child imports a synthetic release, not repository source; its
+        # temporary paths must not enter coverage sent to another CI runner.
+        # Keep the real deploy environment and bytecode flags otherwise intact.
+        kwargs["env"] = {
+            key: value for key, value in kwargs["env"].items()
+            if not key.startswith("COV_CORE_")
+        }
         return subprocess.run(
             [sys.executable, *args[1:]], capture_output=True, text=True, check=False,
             **kwargs,

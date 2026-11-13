@@ -141,22 +141,37 @@ def platform_base_url() -> str | None:
     )
 
 
+class _NoIdentityRedirects(urllib.request.HTTPRedirectHandler):
+    """Only the configured whoami endpoint may receive the caller's token.
+
+    A redirect is not an identity response, even on the same origin. Refusing
+    it also prevents cross-origin forwarding and HTTPS-to-HTTP downgrades.
+    The resulting HTTPError retains the 3xx status; _whoami fails closed.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 def _http_get_json(url: str, token: str, timeout: float) -> tuple[int, bytes]:
     """One authenticated GET. The seam the test suite replaces.
 
     Returns ``(status, body)``. Raises :class:`PlatformUnavailable` when there
     is no usable answer at all — a socket error, a timeout, a DNS failure.
     ``HTTPError`` is *not* an outage: it carries a real status line, so it is
-    returned as a status for the caller to interpret.
+    returned as a status for the caller to interpret. Redirects are never
+    followed: urllib's default redirect handler would forward Authorization.
     """
     request = urllib.request.Request(  # noqa: S310 - scheme validated by platform_base_url()
         url, headers={"Authorization": f"Bearer {token}", "Accept": "application/json"}
     )
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
+        opener = urllib.request.build_opener(_NoIdentityRedirects())
+        with opener.open(request, timeout=timeout) as response:  # noqa: S310
             return int(response.status), response.read()
     except urllib.error.HTTPError as exc:
-        return int(exc.code), exc.read()
+        with exc:
+            return int(exc.code), exc.read()
     except (urllib.error.URLError, OSError, ValueError) as exc:
         raise PlatformUnavailable(f"whoami transport failure: {exc}") from exc
 

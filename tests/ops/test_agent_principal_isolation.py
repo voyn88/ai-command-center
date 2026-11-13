@@ -209,10 +209,20 @@ def test_codex_development_profile_runs_without_its_inner_sandbox_inside_the_uni
     assert command[-1] == "make one local commit"
 
 
-def test_codex_read_only_profile_keeps_the_read_only_sandbox(launcher, tmp_path):
-    command = launcher._provider_command(_manifest(tmp_path, profile="read_only"))
-    assert command[command.index("--sandbox") + 1] == "read-only"
-    assert "danger-full-access" not in command
+def test_codex_read_only_profile_keeps_the_kernel_filesystem_boundary(launcher, monkeypatch, tmp_path):
+    manifest = _manifest(tmp_path, profile="read_only")
+    command = launcher._provider_command(manifest)
+    assert command[command.index("--sandbox") + 1] == "danger-full-access"
+    monkeypatch.setattr(launcher, "_validate_environment_file", lambda *a, **kw: False)
+    unit = launcher._systemd_command(manifest, Path('/run/aicc-agent-homes/test'),
+        'aicc-agent-test.service', 'aicc-agent-launcher@test.service', tmp_path.parent, tmp_path)
+    assert f'--property=BindReadOnlyPaths={tmp_path}:/workspace' in unit
+    assert '--property=ReadWritePaths=/agent-home' in unit
+    assert not any(x.startswith('--property=BindPaths=') and x.endswith(':/workspace') for x in unit)
+    for property in ('ProtectSystem=strict', 'ProtectHome=tmpfs', 'ProtectProc=invisible',
+                     'ProcSubset=pid', 'ProtectKernelTunables=yes', 'NoNewPrivileges=yes',
+                     'DynamicUser=yes', 'CapabilityBoundingSet=', 'AmbientCapabilities='):
+        assert '--property=' + property in unit
 
 
 def test_copilot_is_fail_closed_until_auth_is_model_only(launcher, tmp_path):
@@ -1492,18 +1502,20 @@ def _purged_directories(profile, tmp_path):
 def test_worker_profile_is_unchanged_and_is_the_default(tmp_path):
     """An existing caller that knows nothing about profiles must install
     exactly what it always installed."""
-    tx, explicit = _specs("worker", tmp_path)
-    default = {
-        spec.target
-        for spec in tx.default_specs(
-            Path(__file__).parents[2],
-            authority_env=tmp_path / "authority.env",
-            claude_auth=tmp_path / "claude.json",
-            codex_auth=tmp_path / "codex.json",
-            resolve_identities=False,
-        )
-    }
-    assert explicit == default
+    tx, explicit_specs = _profile_specs("worker", tmp_path)
+    default_specs = tx.default_specs(
+        Path(__file__).parents[2],
+        authority_env=tmp_path / "authority.env",
+        claude_auth=tmp_path / "claude.json",
+        codex_auth=tmp_path / "codex.json",
+        resolve_identities=False,
+    )
+
+    # Whole specs, not just target names: a removal spec also names a target,
+    # so comparing name sets would call an install and a purge of the same
+    # path "unchanged".
+    assert explicit_specs == default_specs
+    explicit = {spec.target for spec in explicit_specs if not spec.remove}
     assert tx.WORKER_ONLY_TARGETS <= explicit
 
 
@@ -1537,8 +1549,15 @@ def test_control_profile_purges_exactly_what_it_drops(tmp_path):
     stays live without the paired removal."""
     tx, _control = _specs("control", tmp_path)
 
-    assert _purged("control", tmp_path) == tx.WORKER_ONLY_TARGETS
-    assert _purged("worker", tmp_path) == set()
+    # `DESIRED_ABSENT_TARGETS` is not a profile drop: those paths belong to
+    # no profile, are declared absent on every host, and ride whichever
+    # generation installs next -- which is why the worker profile carries
+    # them and nothing else.
+    declared_absent = {declared.target for declared in tx.DESIRED_ABSENT_TARGETS}
+    assert not declared_absent & tx.WORKER_ONLY_TARGETS
+
+    assert _purged("control", tmp_path) == tx.WORKER_ONLY_TARGETS | declared_absent
+    assert _purged("worker", tmp_path) == declared_absent
     assert _purged_directories("worker", tmp_path) == []
 
 
@@ -1561,9 +1580,11 @@ def test_control_purges_the_worker_only_directories_child_before_parent(tmp_path
                 f"{other} is removed after its own parent {directory}"
             )
     ordered = [spec.target for spec in specs if spec.remove]
-    assert ordered[: len(ordered) - len(directories)] == sorted(
-        tx.WORKER_ONLY_TARGETS
-    ), "a directory is removed before the files this generation takes out of it"
+    files = ordered[: len(ordered) - len(directories)]
+    declared_absent = [declared.target for declared in tx.DESIRED_ABSENT_TARGETS]
+    assert files == sorted(tx.WORKER_ONLY_TARGETS) + declared_absent, (
+        "a directory is removed before the files this generation takes out of it"
+    )
 
     # Operator data created by the agent layer is not an artefact of it.
     for kept in ("/srv/aicc-workspaces", "/srv/aicc-quarantine"):
@@ -2784,3 +2805,86 @@ def test_workspace_walk_names_descriptor_exhaustion_honestly(
     with pytest.raises(launcher.LaunchRefused) as refused:
         launcher._prepare_workspace_permissions(workspace)
     assert "ran out of file descriptors" in str(refused.value)
+
+
+def test_mac_model_only_claude_has_no_local_auth_or_writable_workspace(launcher, monkeypatch, tmp_path):
+    manifest = _manifest(tmp_path, executor='claude', profile='model_only')
+    manifest['model'] = None
+    launcher._load_manifest(json.dumps(manifest).encode())
+    checked=[]
+    def validate(path, executor, **kw):
+        checked.append((path, executor, kw))
+        return True
+    monkeypatch.setattr(launcher,'_validate_environment_file',validate)
+    command=launcher._systemd_command(manifest,Path('/run/aicc-agent-homes/test'),'aicc-agent-test.service','aicc-agent-launcher@test.service',tmp_path.parent,tmp_path)
+    assert command[-3:]==[launcher.CLAUDE_MAC_BINARY,'--',manifest['prompt']]
+    assert f'--property=BindReadOnlyPaths={tmp_path}:/workspace' in command
+    assert '--property=ReadWritePaths=/agent-home' in command
+    assert len(checked)==1 and checked[0][0]==launcher.CLAUDE_MAC_ENV_FILE
+    assert checked[0][2]['allowed_keys']==frozenset({'AICC_CLAUDE_MAC_TOKEN', 'AICC_CLAUDE_MAC_CA_B64'})
+    assert checked[0][2]['root_private'] is True
+    assert not any('agent-claude.env' in x for x in command)
+    manifest['model']='untrusted-model'
+    with pytest.raises(launcher.LaunchRefused,match='managed on the Mac'):
+        launcher._load_manifest(json.dumps(manifest).encode())
+
+
+def test_mac_adapter_preflight_uses_the_brokers_fixed_binary(launcher):
+    assert agent_runner.CLAUDE_MAC_AGENT_BINARY == launcher.CLAUDE_MAC_BINARY
+
+
+def test_mac_transport_environment_is_root_private_not_shared_with_agents(launcher, monkeypatch, tmp_path):
+    env_file = tmp_path / "transport.env"
+    env_file.write_text("AICC_CLAUDE_MAC_TOKEN=" + "a" * 64 + "\nAICC_CLAUDE_MAC_CA_B64=public-certificate\n")
+    real_stat = launcher.Path.lstat
+    def host_metadata(path):
+        value = real_stat(path)
+        if path != env_file:
+            return value
+        return SimpleNamespace(st_mode=value.st_mode, st_uid=0, st_gid=0)
+    monkeypatch.setattr(launcher.Path, "lstat", host_metadata)
+    keys = frozenset({"AICC_CLAUDE_MAC_TOKEN", "AICC_CLAUDE_MAC_CA_B64"})
+    env_file.chmod(0o600)
+    assert launcher._validate_environment_file(env_file, "claude", allowed_keys=keys, root_private=True)
+    env_file.chmod(0o640)
+    with pytest.raises(launcher.LaunchRefused, match="ownership or mode"):
+        launcher._validate_environment_file(env_file, "claude", allowed_keys=keys, root_private=True)
+    env_file.chmod(0o600)
+    env_file.write_text("GH_TOKEN=publisher-secret\n")
+    with pytest.raises(launcher.LaunchRefused, match="not allowlisted"):
+        launcher._validate_environment_file(env_file, "claude", allowed_keys=keys, root_private=True)
+
+
+@pytest.mark.parametrize("executor,profile", [
+    ("claude", "read_only"), ("claude", "trusted_development"),
+    ("claude", "model_only"), ("codex", "read_only"),
+    ("codex", "trusted_development"), ("grok", "read_only"),
+    ("grok", "model_only"), ("cursor", "read_only"),
+])
+def test_transient_prompt_argv_disables_systemd_expansion(
+    launcher, monkeypatch, tmp_path, executor, profile,
+):
+    # Only environment-file validation is stubbed: exercise the real envelope,
+    # provider argv and systemd builder. No provider or systemd process is run.
+    monkeypatch.setattr(launcher, "_validate_environment_file", lambda *a, **k: True)
+    # Construct dollar syntax so this bootstrap fix's own review diff stays
+    # byte-invariant even when reviewed through the old expanding launcher.
+    dollar = chr(36)
+    prompt = f'SQL {dollar}{dollar} body {dollar}{dollar}; offset={dollar}{{offset}}; {dollar}HOME; "quoted"; `literal`\nюникод'
+    manifest = _manifest(tmp_path, executor=executor, profile=profile, prompt=prompt)
+    admitted = launcher._load_manifest(json.dumps(manifest).encode())
+    command = launcher._systemd_command(
+        admitted, Path("/run/aicc-agent-homes/literal"), "aicc-agent-literal.service",
+        "aicc-agent-launcher@literal.service", tmp_path.parent, tmp_path,
+    )
+    boundary = command.index("--")
+    options, provider = command[:boundary], command[boundary + 1:]
+    assert [v for v in options if v.startswith("--expand-environment")] == [
+        "--expand-environment=no",
+    ]
+    assert provider == launcher._provider_command(admitted)
+    assert provider.count(prompt) == 1
+    assert provider[provider.index(prompt)].encode() == manifest["prompt"].encode()
+    assert "--property=NoNewPrivileges=yes" in options
+    if profile != "trusted_development":
+        assert f"--property=BindReadOnlyPaths={tmp_path}:/workspace" in options

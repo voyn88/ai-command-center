@@ -16,3 +16,12 @@ import { cleanup } from '@testing-library/react'
 afterEach(() => {
   cleanup()
 })
+
+// The app now defaults to Russian; existing screen tests assert English
+// strings, so pin every test to English unless it switches language itself.
+import { beforeEach } from 'vitest'
+import i18n from './lib/i18n'
+
+beforeEach(async () => {
+  await i18n.changeLanguage('en')
+})

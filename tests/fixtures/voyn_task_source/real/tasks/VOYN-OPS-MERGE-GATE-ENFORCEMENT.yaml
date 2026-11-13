@@ -1,0 +1,14 @@
+# Мигрировано из outputs/VOYN_TASKS_BACKLOG.md скриптом tools/migrate_backlog.py. Строка оригинала: 213.
+id: "VOYN-OPS-MERGE-GATE-ENFORCEMENT"
+project: "aios"
+title: "Задача разделена на платформенную часть (-PLATFORM, DEFER_TO_USER) и оснастку (-GUARD, DONE), потому что…"
+why: "[Исходный статус в Markdown: SPLIT; в схеме такого статуса нет] Задача разделена на платформенную часть (`-PLATFORM`, DEFER_TO_USER) и оснастку (`-GUARD`, DONE), потому что платформенный путь закрыт планом GitHub, а инвариант закрывать нужно сейчас."
+priority: "P2"
+owner: "Platform / SRE"
+reviewer: "reviewer-unassigned"
+acceptance: "на `main` включена защита ветки с обязательными checks (`Change scope`, `Tests (pytest)` все шарды, `Type check (mypy)`, `Lint (ruff)`, `Security scan`, `Contract sha drift gate`, `Package build`, `Register conformance`) и включён auto-merge; попытка merge с незавершёнными проверками отклоняется платформой, а не дисциплиной агента."
+status: "BLOCKED"
+wave: "0"
+depends_on:
+  - "VOYN-OPS-MERGE-GATE-PLATFORM"
+  - "VOYN-OPS-MERGE-GATE-GUARD"

@@ -133,9 +133,10 @@ merged as one large change.
 
 - **Scope**: implement `EmptyState`, `ErrorState`, `LoadingSkeleton` per `DESIGN_SYSTEM.md` §7.15–
   §7.17; wire every edge case in `WORKSPACE_HOME_SPEC.md` §15 (unconfigured, invalid path,
-  non-git, detached HEAD, all-six-unconfigured, per-project failure isolation); implement the
-  accessible-name/description wiring from `DESIGN_SYSTEM.md` §4 for every Home component; verify
-  the dual-layer BANK/LEGAL redaction regression (`WORKSPACE_HOME_SPEC.md` §10).
+  non-git, detached HEAD, every canonical-registry project unconfigured, per-project failure
+  isolation; see [ADR 0009](../adr/0009-canonical-project-registry-and-validating-task-import.md));
+  implement the accessible-name/description wiring from `DESIGN_SYSTEM.md` §4 for every Home
+  component; verify the dual-layer BANK/LEGAL redaction regression (`WORKSPACE_HOME_SPEC.md` §10).
 - **Dependencies**: D2C.
 - **Files expected**: updates to the D2C component files; `EmptyState`/`ErrorState`/
   `LoadingSkeleton` widget files.

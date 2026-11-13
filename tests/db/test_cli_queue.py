@@ -52,6 +52,51 @@ def test_queue_redrive_requires_the_item_id() -> None:
         build_parser().parse_args(["queue-redrive"])
 
 
+def test_backlog_recover_stuck_ready_to_review_requires_a_task_id() -> None:
+    args = build_parser().parse_args(
+        ["backlog-recover-stuck-ready-to-review", "VOYN-W0-X"]
+    )
+    assert args.command == "backlog-recover-stuck-ready-to-review"
+    assert args.task_id == "VOYN-W0-X"
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["backlog-recover-stuck-ready-to-review"])
+
+
+def test_backlog_recover_stuck_ready_to_review_reports_the_0018_verdict(
+    monkeypatch,
+) -> None:
+    """The CLI is the only operator surface for the 0018 recovery gate
+    (``backlog_recover_stuck_ready_to_review``) -- before this command existed,
+    a task stuck in READY_TO_REVIEW with no `pr` evidence (its PR never
+    opened, or closed/merged without evidence recorded) had no way back to
+    OPEN at all: `reconcile_pr_evidence` only ever looks for an OPEN pull
+    request, so it would report the exact same skip on every tick forever.
+    """
+    from contextlib import nullcontext
+
+    from command_center.db import cli
+    from command_center.db.backlog_store import BacklogStore
+
+    monkeypatch.setattr(cli, "load_config", lambda: object())
+    monkeypatch.setattr(cli.pool, "open_pool", lambda _config: None)
+    monkeypatch.setattr(cli.pool, "close_pool", lambda: None)
+    monkeypatch.setattr(cli.pool, "connection", lambda: nullcontext(object()))
+
+    monkeypatch.setattr(
+        BacklogStore,
+        "recover_stuck_ready_to_review",
+        lambda self, task_id: (True, "OPEN", 3),
+    )
+    assert cli.main(["backlog-recover-stuck-ready-to-review", "VOYN-W0-X"]) == 0
+
+    monkeypatch.setattr(
+        BacklogStore,
+        "recover_stuck_ready_to_review",
+        lambda self, task_id: (False, "has_pr_evidence", 3),
+    )
+    assert cli.main(["backlog-recover-stuck-ready-to-review", "VOYN-W0-X"]) == 1
+
+
 def test_backlog_merge_reconcile_defaults_repo_path_to_cwd() -> None:
     args = build_parser().parse_args(["backlog-merge-reconcile"])
     assert args.command == "backlog-merge-reconcile"
@@ -115,7 +160,9 @@ def test_backlog_review_enqueues_ahead_of_implementation_dispatch() -> None:
         "payload": {"kind": "review"},
         "task_id": "VOYN-W0-X",
         "max_attempts": 1,
-        "priority": 100,
+        # Assert the task's specified lane, not merely a positive value: a
+        # wrong hard-coded priority must fail this starvation regression.
+        "priority": 10,
     }]
     assert calls[0]["priority"] > 0
 

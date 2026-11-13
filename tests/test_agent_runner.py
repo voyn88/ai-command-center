@@ -1073,6 +1073,7 @@ def test_command_builders_table_covers_every_wired_executor(monkeypatch):
         "codex",
         "copilot",
         "openai_http",
+        "aider",
     }
     for name in agent_runner.COMMAND_BUILDERS:
         builder = agent_runner._command_builder(name)
@@ -1082,10 +1083,38 @@ def test_command_builders_table_covers_every_wired_executor(monkeypatch):
             command = builder(
                 "x", task_type="independent_review", model="groq/m"
             )
+        elif name == "aider":
+            command = builder("x", task_type="implementation")
         else:
             command = builder("x", task_type="review")
         assert isinstance(command, list) and command, name
         assert all(isinstance(part, str) for part in command), name
+
+
+def test_aider_command_is_mutating_only_and_keeps_prompt_as_one_argument():
+    prompt = "fix it; rm -rf / #$(whoami)`id`"
+    command = agent_runner.build_aider_command(prompt, task_type="implementation")
+    assert command[-1] == prompt
+    assert command[command.index("--model") + 1] == (
+        f"ollama_chat/{agent_runner.DEFAULT_AIDER_MODEL}"
+    )
+    with pytest.raises(ValueError):
+        agent_runner.build_aider_command("review", task_type="review")
+
+
+def test_aider_preflight_requires_the_exact_benchmarked_model(monkeypatch):
+    monkeypatch.setattr(agent_runner.shutil, "which", lambda _name: "/usr/bin/x")
+    listing = f"{agent_runner.DEFAULT_AIDER_MODEL}-instruct id size modified\n"
+    monkeypatch.setattr(
+        agent_runner.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args, 0, stdout=listing, stderr=""
+        ),
+    )
+    available, message = agent_runner.aider_preflight()
+    assert available is False
+    assert agent_runner.DEFAULT_AIDER_MODEL in message
 
 
 @pytest.mark.parametrize("executor", ["grok", "cursor"])
@@ -1242,6 +1271,8 @@ def test_codex_development_sandbox_is_danger_full_access_only_under_principal_is
     assert _sandbox_argument(ar.build_codex_command("p", task_type="implementation")) == "workspace-write"
     monkeypatch.setenv(ar.PRINCIPAL_ISOLATION_REQUIRED_ENV, "required")
     assert _sandbox_argument(ar.build_codex_command("p", task_type="implementation")) == "danger-full-access"
+    assert _sandbox_argument(ar.build_codex_command("p", task_type="review")) == "danger-full-access"
+    monkeypatch.delenv(ar.PRINCIPAL_ISOLATION_REQUIRED_ENV)
     assert _sandbox_argument(ar.build_codex_command("p", task_type="review")) == "read-only"
 
 
@@ -1257,7 +1288,7 @@ def _provider_error_run(status="failed", exit_code=1, stdout="", stderr=""):
     )
 
 
-@pytest.mark.parametrize("code", [401, 403, 429, 500, 502, 503, 504])
+@pytest.mark.parametrize("code", [401, 402, 403, 429, 500, 502, 503, 504])
 def test_grok_provider_refusal_allows_bounded_fallback(code):
     run = _provider_error_run(stderr=f"provider HTTP {code}\n")
     assert run.is_executor_provider_error("grok")
@@ -1278,6 +1309,26 @@ def test_quota_circuit_expires_and_never_shortens_an_existing_window():
 def test_quota_circuit_refuses_invalid_deadlines(seconds):
     with pytest.raises(ValueError, match="finite and positive"):
         agent_runner.record_executor_exhausted("cursor", cooldown_seconds=seconds)
+
+
+@pytest.mark.parametrize("status,exit_code,stdout,stderr,expected", [
+    ("failed", 1, "", "provider HTTP 402", "HTTP 402"),
+    ("failed", 1, "", "provider HTTP 402\n", "HTTP 402"),
+    ("completed", 0, "", "provider HTTP 402", None),
+    ("failed", None, "", "provider HTTP 402", None),
+    ("failed", 0, "", "provider HTTP 402", None),
+    ("failed", 1, "", "provider HTTP 401", None),
+    ("failed", 1, "", "provider HTTP 403", None),
+    ("failed", 1, "", "provider HTTP 429", "HTTP 429"),
+    ("failed", 1, "", "provider HTTP 402\nadditional task prose", None),
+    ("failed", 1, "provider HTTP 402", "tests failed", None),
+    ("failed", 1, "", "quoted provider HTTP 402", None),
+])
+def test_grok_billing_refusal_triggers_quota_circuit_only_for_fixed_diagnostic(
+    status, exit_code, stdout, stderr, expected
+):
+    run = _provider_error_run(status, exit_code, stdout, stderr)
+    assert run.executor_quota_signature("grok") == expected
 
 
 def test_quota_signature_ignores_success_and_quoted_stdout():
@@ -1335,3 +1386,10 @@ def test_a_codex_task_failure_without_a_signature_stays_a_task_failure():
 def test_an_unknown_executor_never_matches_free_text_signatures():
     run = _provider_error_run(stderr="unauthorized")
     assert run.is_executor_provider_error("claude") is False
+
+
+def test_cursor_unavailable_model_is_provider_refusal():
+    diagnostic = "Cannot use this model: auto. Available models: composer-2.5"
+    assert _provider_error_run(stderr=diagnostic).is_executor_provider_error("cursor")
+    assert not _provider_error_run(status="completed", exit_code=0, stdout=diagnostic).is_executor_provider_error("cursor")
+    assert not _provider_error_run(stdout=diagnostic, stderr="tests failed").is_executor_provider_error("cursor")

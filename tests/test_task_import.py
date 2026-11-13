@@ -432,9 +432,9 @@ def test_apply_writes_all_tasks_to_store(tmp_path, monkeypatch):
     validation = ti.validate_task_package(parsed)
     ti.apply_task_package(tmp_path, parsed, validation)
 
-    # Each create() does its own locked write; one write per imported task.
-    assert len(calls) == 3
-    # After all writes the store contains exactly the 3 imported tasks.
+    # The entire JSON package commits once after graph validation under lock.
+    assert len(calls) == 1
+    # The atomic write contains exactly the 3 imported tasks.
     assert len(calls[-1]) == 3
 
 

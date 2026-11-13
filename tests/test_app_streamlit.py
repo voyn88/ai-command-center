@@ -1767,6 +1767,31 @@ def test_recommendations_panel_launch_blocked_by_dirty_tree_shows_reason(fake_cl
     assert report["git_status"]["dirty"] is True
 
 
+def test_recommendations_panel_hides_launch_controls_for_master_projection_task():
+    """A master-projection record (the read-only backlog fallback view,
+    `source: "master"` / `read_only: True`) must never offer "В очередь" or
+    "Запустить" from the Recommended Tasks panel — `execution_queue.enqueue`
+    already refuses to queue one, so an enabled button here would be a
+    promise the queue cannot keep (VOYN-W0-AICC-READONLY-LAUNCH-SURFACES)."""
+    _seed_tasks(
+        [
+            {
+                "id": "master-reco",
+                "title": "Master backlog task",
+                "source": "master",
+                "read_only": True,
+            }
+        ]
+    )
+    at = _at_on_page("kanban")
+    assert not at.exception
+    button_keys = {b.key for b in at.button}
+    assert "kanban_reco_master-reco_launch" not in button_keys
+    assert "kanban_reco_master-reco_enqueue" not in button_keys
+    infos = [i.value for i in at.info]
+    assert any("read-only" in i for i in infos)
+
+
 def test_queue_launch_ready_blocked_by_dirty_tree_shows_reason(fake_claude, tmp_path):
     """Same regression as above, for the "🚀 Запустить готовые" / "Запустить
     следующую готовую задачу" queue-panel buttons: a skipped entry (dirty
@@ -1993,3 +2018,25 @@ def test_execution_queue_panel_launch_ready_button_present_once_queued():
     assert not at.exception
     assert any(b.key == "exec_queue_launch_ready" for b in at.button)
     assert any(b.key == "exec_queue_launch_next" for b in at.button)
+
+
+@pytest.mark.parametrize("provenance", [{"source": "master", "read_only": True}, {"source": "master"}, {"read_only": True}])
+def test_overview_readonly_recommendation_has_open_but_no_launch(provenance):
+    _seed_tasks([{"id": "overview-readonly", "title": "Read-only recommendation", **provenance}])
+    at = _at_on_page("dashboard")
+    assert not at.exception
+    assert any("Read-only recommendation" in item.value for item in at.markdown)
+    assert "home_hero_launch" not in {button.key for button in at.button}
+    at.button(key="home_hero_open_task").click().run()
+    assert not at.exception
+    assert at.session_state["nav_page"] == "kanban"
+
+
+def test_overview_ordinary_recommendation_preserves_launch_navigation():
+    _seed_tasks([{"id": "overview-ordinary", "title": "Ordinary recommendation", "read_only": False}])
+    at = _at_on_page("dashboard")
+    assert not at.exception
+    assert "home_hero_open_task" in {button.key for button in at.button}
+    at.button(key="home_hero_launch").click().run()
+    assert not at.exception
+    assert at.session_state["nav_page"] == "execution_center"

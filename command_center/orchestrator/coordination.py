@@ -441,9 +441,15 @@ def coordinate_once(
     candidates = (
         load_candidates() if load_candidates is not None else _load_candidates(factory, limits)
     )
+    local_simple = (os.environ if environ is None else environ).get("AICC_LOCAL_SIMPLE_ENABLED") == "1"
     snapshot_hash, compact_rows, blocker_hash = build_candidate_snapshot(
-        candidates, max_candidates=limits.max_candidates
+        candidates, max_candidates=min(limits.max_candidates, 8) if local_simple else limits.max_candidates
     )
+    if local_simple:
+        # A route change must not inherit a previous provider's permanent
+        # unchanged-blocker suppression. Existing CAS/idempotency still owns it.
+        snapshot_hash = hashlib.sha256(f"local-simple-v1:{snapshot_hash}".encode()).hexdigest()
+        blocker_hash = hashlib.sha256(f"local-simple-v1:{blocker_hash}".encode()).hexdigest()
     report.snapshot_hash = snapshot_hash
     report.blocker_hash = blocker_hash
     eligible_ids = {row["task_id"] for row in compact_rows}
@@ -515,6 +521,17 @@ def coordinate_once(
         "cascade": cascade,
         "mode": "coordination_v2",
     }
+    # Advisory ordering is simple, schema-validated work, not acceptance.
+    # The worker keeps the existing queue lease and falls back read-only.
+    if local_simple:
+        from command_center.worker.simple_tasks import MAX_INPUT_BYTES
+        if len(compact_rows) <= 8 and len(json.dumps(compact_rows, ensure_ascii=False).encode()) <= MAX_INPUT_BYTES:
+            payload = {
+                "kind": "simple_task", "v": 1, "operation": "order_tasks",
+                "input": compact_rows, "project_id": limits.project_id,
+                "repository_path": limits.repository_path,
+                "mode": "coordination_v2",
+            }
     # SQL owns both the claim and queue write in one transaction. Do not
     # split these operations into callbacks using unrelated connections.
     queued = _row(

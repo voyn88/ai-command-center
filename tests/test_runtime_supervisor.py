@@ -330,6 +330,7 @@ def test_report_failure_retains_ownership_and_leaves_visible_unfinalized_run(
     def fail_report(*args, **kwargs):
         raise RuntimeError("injected report persistence failure")
 
+    real_save_report = supervisor.reports.save_report
     monkeypatch.setattr(supervisor.reports, "save_report", fail_report)
 
     sup = supervisor.Supervisor()
@@ -343,23 +344,34 @@ def test_report_failure_retains_ownership_and_leaves_visible_unfinalized_run(
     with sup._active_lock:
         active = sup._active[run["id"]]
 
-    hold_file.unlink()
-    assert active.supervision_finished_event.wait(timeout=10)
-    assert not active.done_event.is_set()
+    try:
+        hold_file.unlink()
+        assert active.supervision_finished_event.wait(timeout=10)
+        assert not active.done_event.is_set()
 
-    final = db.get_run(sup.db_path, run["id"])
-    assert final["state"] == "COMPLETED"
-    assert final["exit_code"] == 0
-    assert final["finalized_at"] is None
-    assert run["id"] in sup.active_run_ids()
-    assert db.get_report(sup.db_path, run["id"]) is None
+        final = db.get_run(sup.db_path, run["id"])
+        assert final["state"] == "COMPLETED"
+        assert final["exit_code"] == 0
+        assert final["finalized_at"] is None
+        assert run["id"] in sup.active_run_ids()
+        assert db.get_report(sup.db_path, run["id"]) is None
 
-    events = db.list_run_events(sup.db_path, run["id"])
-    assert any(
-        event["event_type"] == "lifecycle"
-        and event["payload"].get("lifecycle") == "report_persistence_failed"
-        for event in events
-    )
+        events = db.list_run_events(sup.db_path, run["id"])
+        assert any(
+            event["event_type"] == "lifecycle"
+            and event["payload"].get("lifecycle") == "report_persistence_failed"
+            for event in events
+        )
+    finally:
+        # The failure deliberately retains process-wide ownership. Recover it
+        # through the real finalization path before the next test resets data.
+        monkeypatch.setattr(supervisor.reports, "save_report", real_save_report)
+        hold_file.unlink(missing_ok=True)
+        recovered = sup.wait_for_run(run["id"], timeout=10)
+        assert recovered["finalized_at"] is not None
+        assert run["id"] not in sup.active_run_ids()
+        with supervisor._PROCESS_OWNED_RUNS_GUARD:
+            assert run["id"] not in supervisor._PROCESS_OWNED_RUNS
 
 
 def test_supervision_failure_persists_failed_before_signalling_waiters(

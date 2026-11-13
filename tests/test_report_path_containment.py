@@ -52,3 +52,29 @@ def test_legit_ids_are_preserved(tmp_path, monkeypatch):
     assert path.parent == tmp_path / "AICC"
     assert path.name.endswith("_claude.md")
     assert "AICC-AUDIT-0" in path.name  # task_id truncated to 12 chars, unmodified
+
+
+def test_known_project_name_uses_canonical_directory(tmp_path, monkeypatch):
+    monkeypatch.setattr(agent_runner, "REPORTS_ROOT", tmp_path)
+    run = {
+        "task_id": "AICC-AUDIT-001",
+        "project": "AI Command Center",
+        "agent": "claude",
+        "started_at": "2026-07-29T00:00:00",
+    }
+
+    assert agent_runner.report_path_for(run).parent == tmp_path / "AICC"
+
+
+def test_historical_noncanonical_reference_remains_resolvable_via_agent_runner(
+    tmp_path, monkeypatch,
+):
+    from command_center.runtime import reports
+
+    monkeypatch.setattr(reports, "REPORTS_ROOT", tmp_path)
+    historical = tmp_path / "AI_Command_Center" / "old.md"
+    historical.parent.mkdir()
+    historical.write_text("legacy", encoding="utf-8")
+
+    run = {"report_path": "reports/AI_Command_Center/old.md"}
+    assert agent_runner.resolve_report_path(run) == historical.resolve()

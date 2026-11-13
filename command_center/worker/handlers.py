@@ -49,11 +49,13 @@ from pathlib import Path
 from typing import Any
 
 from command_center import agent_runner, project_config, workspace_provisioning
+from command_center.observability.trace import log_span
 from command_center.ops.source_clone_refresh import refresh_source_clone
 from command_center.orchestrator import gh_access
 from command_center.orchestrator.publish import PublishConfig, publish_run
 from command_center.orchestrator.routing import cascade_for
-from command_center.worker import writer_lease
+from command_center import prepush_prescreen
+from command_center.worker import admission, writer_lease
 from command_center.worker.daemon import Handler, HandlerOutcome
 from command_center.worker.payloads import PayloadError, parse_agent_run
 from command_center.worker.worktree_lease import blocking_lease
@@ -671,9 +673,26 @@ def _executor_preflight(executor: str, task_type: str) -> tuple[bool, str, str]:
     if executor == "codex" and task_type in agent_runner.MUTATING_TASK_TYPES:
         available, detail = agent_runner.codex_workspace_write_preflight()
         return available, detail, "codex workspace-write sandbox unavailable"
+    if executor == "claude" and task_type in agent_runner.MODEL_ONLY_TASK_TYPES and os.environ.get("AICC_CLAUDE_MAC_ENABLED") == "1":
+        if not agent_runner.principal_isolation_required():
+            return False, "Claude Mac requires principal isolation", "model-only executor unavailable"
+        available, detail = agent_runner.claude_mac_preflight()
+        return available, detail, "Claude Mac inference adapter unavailable"
     if agent_runner.principal_isolation_required():
+        if executor == "aider":
+            # The broker stages the mutating CLI under the isolated agent
+            # principal, while this worker-side probe additionally proves the
+            # exact benchmarked Ollama tag is locally available.
+            available, detail = agent_runner.aider_preflight(
+                binary=agent_runner.PRINCIPAL_EXECUTOR_BINARIES["aider"]
+            )
+            if not available:
+                return False, detail, "aider cli or ollama daemon unavailable"
         available, detail = agent_runner.principal_executor_preflight(executor)
         return available, detail, f"isolated {executor} cli unavailable"
+    if executor == "aider":
+        available, detail = agent_runner.aider_preflight()
+        return available, detail, "aider cli or ollama daemon unavailable"
     if executor == "codex":
         available, detail = agent_runner.claude_cli_preflight(agent_runner.CODEX_BINARY)
         return available, detail, "codex cli unavailable"
@@ -687,7 +706,8 @@ def _executor_preflight(executor: str, task_type: str) -> tuple[bool, str, str]:
 
 
 def _run_agent(
-    payload: dict[str, Any], lease_lost: threading.Event, attempt_no: int = 1
+    payload: dict[str, Any], lease_lost: threading.Event, attempt_no: int = 1,
+    *, apply_operator_profile: bool = True,
 ) -> HandlerOutcome:
     request = parse_agent_run(payload)
     if isinstance(request, PayloadError):
@@ -697,14 +717,29 @@ def _run_agent(
 
     # Explicit operator profile also covers already queued subscription work.
     # Preserve the requested capability class, prompt, task and idempotency key.
-    if os.environ.get("AICC_EXECUTOR_PROFILE") == "owner-alternatives":
+    if apply_operator_profile and os.environ.get("AICC_EXECUTOR_PROFILE") in {"owner-alternatives", "owner-cascade"}:
         requested_type = request.task_type
-        request = replace(request, cascade=tuple(
+        profiled = [
             {**entry, "task_type": requested_type}
-            for entry in cascade_for("implementation")
+            for entry in cascade_for(
+                "implementation" if requested_type in agent_runner.MUTATING_TASK_TYPES else "review"
+            )
             if requested_type not in agent_runner.MODEL_ONLY_TASK_TYPES
             or entry["executor"] == "grok"
-        ))
+            or (entry["executor"] == "claude" and os.environ.get("AICC_CLAUDE_MAC_ENABLED") == "1")
+        ]
+        if request.finops_excluded_executors:
+            excluded = set(request.finops_excluded_executors)
+            profiled = [
+                entry for entry in profiled if str(entry.get("executor")) not in excluded
+            ]
+            if not profiled:
+                return HandlerOutcome(
+                    ok=False,
+                    infra_wait=True,
+                    reason="finops: all profile links excluded (cost_data_unavailable)",
+                )
+        request = replace(request, cascade=tuple(profiled))
 
     link = _cascade_link(request, attempt_no)
     cascade_step = (
@@ -730,6 +765,8 @@ def _run_agent(
             )
         task_type = str(link.get("task_type", task_type))
         model_override = link.get("model")
+        if "model" in link:
+            model = None
         if isinstance(model_override, str) and model_override.strip():
             model = model_override
 
@@ -790,6 +827,8 @@ def _run_agent(
             task_type = candidate_task_type
             model = request.model
             model_override = candidate.get("model")
+            if "model" in candidate:
+                model = None
             if isinstance(model_override, str) and model_override.strip():
                 model = model_override
             available, detail, unavailable_reason = (
@@ -986,6 +1025,13 @@ def _run_agent(
             stack.callback(_remove_read_only_isolated_checkout, checkout)
             run_repository = checkout
         if task_type in agent_runner.MUTATING_TASK_TYPES:
+            try:
+                stack.enter_context(admission.hold(request.project_id))
+            except admission.AdmissionRefused as exc:
+                return HandlerOutcome(
+                    ok=False, reason=str(exc), retryable=True,
+                    lease_wait=exc.contention, infra_wait=not exc.contention,
+                )
             expected_branch = f"backlog/{backlog_task}"
             try:
                 isolated_workspace = _isolated_workspace_path(
@@ -1089,6 +1135,12 @@ def _run_agent(
                     # only once, when `stack.close()` runs in this function's
                     # own `finally`.
                     full_lifecycle_lease_held = True
+                    log_span(
+                        "lease",
+                        task_id=backlog_task,
+                        repository=str(repository),
+                        isolated_workspace=str(isolated_workspace),
+                    )
                 except writer_lease.WriterLeaseUnavailable as exc:
                     # Another writer already holds this task's lease, or the
                     # authority refused/could not be reached: a data refusal,
@@ -1210,6 +1262,13 @@ def _run_agent(
                     retryable=True,
                 )
             run_repository = Path(evidence.workspace_path)
+            log_span(
+                "workspace",
+                task_id=backlog_task,
+                workspace_path=evidence.workspace_path,
+                expected_branch=evidence.expected_branch,
+                provision_outcome=evidence.provision_outcome,
+            )
 
         # VOYN-W0-AICC-FORCED-AGENT-CANCELLATION: the same `lease_lost` event
         # this function already checked once, above, *before* starting the
@@ -1230,8 +1289,18 @@ def _run_agent(
         # visibility-window expiry / supersession in `work_queue_store`,
         # unaffected by this change — it closes the narrower, previously-open
         # gap that the OS process kept running regardless of that decision.
+        log_span(
+            "agent",
+            task_id=backlog_task,
+            executor=executor,
+            task_type=task_type,
+            model=model,
+        )
         route_failovers: list[dict[str, Any]] = []
+        tried_steps: set[int] = set()
         while True:
+            if cascade_step is not None:
+                tried_steps.add(cascade_step)
             run = agent_runner.run_claude_code(
                 repository_path=run_repository,
                 prompt=request.prompt,
@@ -1291,9 +1360,10 @@ def _run_agent(
                     and cascade_step is not None
                     and not lease_lost.is_set()
                 ):
-                    for candidate_step in range(
-                        cascade_step + 1, len(request.cascade) + 1
-                    ):
+                    for offset in range(1, len(request.cascade)):
+                        candidate_step = ((cascade_step - 1 + offset) % len(request.cascade)) + 1
+                        if candidate_step in tried_steps:
+                            continue
                         candidate = request.cascade[candidate_step - 1]
                         candidate_executor = str(candidate.get("executor"))
                         if candidate_executor not in agent_runner.COMMAND_BUILDERS:
@@ -1319,6 +1389,8 @@ def _run_agent(
                         task_type = candidate_task_type
                         model = request.model
                         model_override = candidate.get("model")
+                        if "model" in candidate:
+                            model = None
                         if isinstance(model_override, str) and model_override.strip():
                             model = model_override
                         link = candidate
@@ -1341,7 +1413,10 @@ def _run_agent(
             if not unchanged or cascade_step is None:
                 break
             fallback_selected = False
-            for candidate_step in range(cascade_step + 1, len(request.cascade) + 1):
+            for offset in range(1, len(request.cascade)):
+                candidate_step = ((cascade_step - 1 + offset) % len(request.cascade)) + 1
+                if candidate_step in tried_steps:
+                    continue
                 candidate = request.cascade[candidate_step - 1]
                 candidate_executor = str(candidate.get("executor"))
                 if candidate_executor not in agent_runner.COMMAND_BUILDERS:
@@ -1365,6 +1440,8 @@ def _run_agent(
                 task_type = candidate_task_type
                 model = request.model
                 model_override = candidate.get("model")
+                if "model" in candidate:
+                    model = None
                 if isinstance(model_override, str) and model_override.strip():
                     model = model_override
                 link = candidate
@@ -1528,6 +1605,28 @@ def _run_agent(
                 retryable=True,
                 infra_wait=True,
             )
+        if (
+            run.status == "timed_out"
+            and task_type not in agent_runner.MUTATING_TASK_TYPES
+        ):
+            # A read-only review timeout has produced no verdict and has no
+            # side effects to protect. Completing it would permanently
+            # occupy the deterministic (task, PR, head, policy) review key
+            # with an unusable result. Retry it through the independently
+            # bounded infrastructure-wait path. Mutating timeouts remain
+            # results because repeating them can duplicate side effects.
+            checkpoint_failure = checkpoint_preserved_candidate()
+            if checkpoint_failure is not None:
+                return checkpoint_failure
+            return HandlerOutcome(
+                ok=False,
+                reason=(
+                    "executor infrastructure failure (review timeout): "
+                    f"{_tail(result_text or run.stderr) or 'agent timed out'}"
+                ),
+                retryable=True,
+                infra_wait=True,
+            )
         non_mutating_copilot_failure = (
             executor == "copilot"
             and task_type not in agent_runner.MUTATING_TASK_TYPES
@@ -1616,6 +1715,18 @@ def _run_agent(
                     reason="guarded publish authority is incomplete",
                     retryable=True,
                 )
+            # VOYN-W0-AICC-PREPUSH-LOCAL-PRESCREEN: a bounded, best-effort local
+            # pass over the agent's own (still dirty) workspace, run before the
+            # checkpoint commit below so any ruff/aider fix it applies is swept
+            # into that same commit rather than needing one of its own. Runs
+            # only on the path that is actually about to push -- the local-only
+            # (`deploy_key` unset) branch further down never publishes, so there
+            # is nothing here for a prescreen to protect. Never raises and never
+            # blocks: `prepush_prescreen.run_prepush_prescreen`'s contract is
+            # advisory-only, matching `command_center.audit.checks.base.Check`.
+            result["prepush_prescreen"] = prepush_prescreen.run_prepush_prescreen(
+                run_repository, base_sha=evidence.base_sha
+            ).as_payload()
             try:
                 candidate_sha, checkpointed_dirty_worktree = (
                     workspace_provisioning.checkpoint_dirty_task_workspace(
@@ -1707,10 +1818,28 @@ def _run_agent(
                         ),
                     )
             except workspace_provisioning.WorkspaceVerificationError as exc:
+                # A completed executor run must not leave an uncheckpointed
+                # clone at the live task path: the next delivery would reuse
+                # the same poisoned tree and spend another attempt before it
+                # could make progress. Preserve it outside the resume path.
+                quarantined = None
+                if isolated_workspace is not None:
+                    quarantined = workspace_provisioning.quarantine_task_workspace(
+                        isolated_workspace
+                    )
                 return HandlerOutcome(
                     ok=False,
-                    reason=f"guarded publish preparation failed at {exc.failed_step}: {exc.detail}",
+                    reason=(
+                        f"guarded publish preparation failed at {exc.failed_step}: "
+                        f"{exc.detail}; uncheckpointed clone "
+                        + (
+                            f"quarantined at {quarantined}"
+                            if quarantined
+                            else "could not be quarantined"
+                        )
+                    ),
                     retryable=True,
+                    infra_wait=quarantined is not None,
                 )
             result["publish"] = {
                 "ok": pub.ok,
@@ -1835,4 +1964,9 @@ def _run_agent(
 
 
 def build_handlers() -> dict[str, Handler]:
-    return {"agent_run": _run_agent}
+    from command_center.worker.simple_tasks import run_simple_task
+
+    def simple_task(payload, lease_lost, attempt_no=1):
+        return run_simple_task(payload, lease_lost, attempt_no, remote_run=_run_agent)
+
+    return {"agent_run": _run_agent, "simple_task": simple_task}

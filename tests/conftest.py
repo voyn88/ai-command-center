@@ -226,6 +226,12 @@ def remove_data_dir_when_quiet(
 ) -> None:
     """`shutil.rmtree(directory)`, but not while a runtime writer is still live."""
     stragglers = quiesce_background_writers(quiesce_timeout)
+    if stragglers:
+        raise AssertionError(
+            f"Refusing to remove the isolated data dir {directory}: "
+            f"known background writers still live: {stragglers}. "
+            "Finish or recover retained runs before resetting test data."
+        )
     last_error: OSError | None = None
     for _ in range(_RMTREE_ATTEMPTS):
         if not directory.exists():
@@ -321,6 +327,7 @@ def isolated_module_data_constants(isolated_data_dir, monkeypatch):
     on import ordering — makes isolation hold regardless of when/how each module was
     first imported into the test process."""
     from command_center import activity_log, agent_runner, chat_service, portfolio_config, project_config
+    from command_center import local_model_gates
 
     monkeypatch.setattr(project_config, "DATA_DIR", isolated_data_dir)
     monkeypatch.setattr(project_config, "CONFIG_FILE", isolated_data_dir / "project_config.json")
@@ -332,6 +339,9 @@ def isolated_module_data_constants(isolated_data_dir, monkeypatch):
     monkeypatch.setattr(chat_service, "CHATS_FILE", isolated_data_dir / "chats.json")
     monkeypatch.setattr(portfolio_config, "DATA_DIR", isolated_data_dir)
     monkeypatch.setattr(portfolio_config, "CONFIG_FILE", isolated_data_dir / "portfolio_config.json")
+    monkeypatch.setattr(local_model_gates, "DATA_DIR", isolated_data_dir)
+    monkeypatch.setattr(local_model_gates, "LEDGER_FILE", isolated_data_dir / "local_model_gates.jsonl")
+    monkeypatch.setattr(local_model_gates, "LEDGER_LOCK_FILE", isolated_data_dir / "local_model_gates.lock")
 
 
 @pytest.fixture(autouse=True)
