@@ -352,6 +352,8 @@ def test_the_unit_takes_no_environment_or_arguments_and_is_sandboxed():
         "usercustomize.py",
         "evil.pth",
         "json/__init__.py",
+        "app.py",
+        "clients/__init__.py",
         "command_center/__init__.py",
         "command_center/ops/__init__.py",
         "command_center/ops/anything_new.py",
@@ -389,7 +391,6 @@ def test_ordinary_application_files_are_deployed_unattended():
         "command_center/worker/handlers.py",
         "tests/x.py",
         "docs/x.md",
-        "app.py",
     ):
         assert deploy.classify_change([path]) is None, path
 
@@ -458,3 +459,43 @@ def test_the_health_check_requires_the_new_release_to_run_from_itself(host, monk
     assert not ok and "does not run from itself" in why
     monkeypatch.setattr(deploy, "_run", fake(f"{base}/command_center/__init__.py\n/usr\n"))
     assert deploy.health_check(cfg, first)[0] is False
+
+
+def test_a_copied_venv_pointing_at_an_editable_install_of_another_release_is_refused(host):
+    origin, mirror, cfg, first = host
+    _advance(origin, mirror, "advance")
+    site = cfg.release_root / first / ".venv" / "lib" / "site-packages"
+    site.mkdir(parents=True)
+    (site / "__editable__.command_center.py").write_text(
+        f"MAPPING = {{'command_center': '{cfg.release_root}/{first}/command_center'}}\n"
+    )
+    report = _run(cfg, FakeTx(cfg))
+    assert report.outcome == "REFUSED" and "points at another release" in report.detail
+
+
+def test_the_creation_command_line_in_pyvenv_cfg_is_not_a_pointer(host):
+    origin, mirror, cfg, first = host
+    new = _advance(origin, mirror, "advance")
+    venv = cfg.release_root / first / ".venv"
+    (venv / "pyvenv.cfg").write_text(
+        "home = /usr/bin\n"
+        f"command = /usr/bin/python3 -m venv {cfg.release_root}/{first}/.venv\n"
+    )
+    report = _run(cfg, FakeTx(cfg))
+    assert (report.outcome, report.detail) == ("DEPLOYED", "selected")
+    assert (cfg.release_root / new).is_dir()
+
+
+def test_a_pyvenv_home_inside_a_release_is_refused(host):
+    origin, mirror, cfg, first = host
+    _advance(origin, mirror, "advance")
+    venv = cfg.release_root / first / ".venv"
+    (venv / "pyvenv.cfg").write_text(f"home = {cfg.release_root}/{first}/.venv/bin\n")
+    report = _run(cfg, FakeTx(cfg))
+    assert report.outcome == "REFUSED"
+
+
+def test_without_stdlib_module_names_top_level_python_files_fail_closed(monkeypatch):
+    monkeypatch.delattr(deploy.sys, "stdlib_module_names", raising=False)
+    assert deploy.classify_change(["something.py"]) is not None
+    assert deploy.classify_change(["docs/x.md"]) is None

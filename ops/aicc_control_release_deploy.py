@@ -63,7 +63,8 @@ _MECHANISM = re.compile(
             r"^command_center/ops/",
             r"^command_center/__init__\.py$",
             r"^command_center/deployment/",
-            r"^[^/]+\.(pth|pyc|so)$",
+            r"^[^/]+\.(pth|pyc|so|py)$",
+            r"^[^/]+/__init__\.py$",
             r"^\.github/",
         )
     )
@@ -247,7 +248,11 @@ def resolve_target(cfg: ControlConfig) -> str:
 def _shadows_python(path: str) -> bool:
     first = path.split("/", 1)[0]
     stem = first[:-3] if first.endswith(".py") else first
-    stdlib = getattr(sys, "stdlib_module_names", frozenset())
+    if not hasattr(sys, "stdlib_module_names"):
+        # Python < 3.10 cannot say what shadows it: every top-level module
+        # or package change is then a human decision (fail closed).
+        return first.endswith(".py") or "/" in path and path.endswith("__init__.py")
+    stdlib = sys.stdlib_module_names
     return stem in _STARTUP_HOOKS or (stem in stdlib and (first != stem or "/" in path))
 
 
@@ -320,27 +325,44 @@ def _trusted_venv(cfg: ControlConfig, sha: str) -> Path:
 
 def _stale_pointers(venv: Path, own_release: Path) -> list[str]:
     """Venv files that make Python import from, or run, a DIFFERENT release
-    directory (a copied venv keeps the absolute paths it was created with)."""
+    directory (a copied venv keeps the absolute paths it was created with).
+
+    Only lines that Python acts on count: path lines of ``.pth`` files,
+    ``.egg-link`` files, editable-install finders and ``direct_url.json``, and
+    the ``home =`` line of ``pyvenv.cfg``.  The informational ``command =`` line
+    of ``pyvenv.cfg`` names the venv's creation path and is ignored."""
     found: list[str] = []
-    marker = "/releases/"
     own = str(own_release)
+
+    def foreign(text: str) -> bool:
+        return "/releases/" in text and own not in text
+
     for current, _dirs, files in os.walk(venv, followlinks=False):
         for name in files:
-            if not (name.endswith((".pth", ".egg-link")) or name == "pyvenv.cfg"):
-                continue
             path = Path(current) / name
-            try:
-                text = path.read_text(errors="replace")
-            except OSError:
+            rel = str(path.relative_to(venv))
+            if name == "pyvenv.cfg":
+                lines = [
+                    x for x in _read_lines(path) if x.split("=", 1)[0].strip() == "home"
+                ]
+            elif (
+                name.endswith((".pth", ".egg-link"))
+                or name == "direct_url.json"
+                or (name.startswith("__editable__") and name.endswith(".py"))
+            ):
+                lines = _read_lines(path)
+            else:
                 continue
-            for line in text.splitlines():
-                if marker in line and own not in line and line.strip().startswith("/"):
-                    found.append(str(path.relative_to(venv)))
-                    break
-                if name == "pyvenv.cfg" and marker in line and own not in line:
-                    found.append(str(path.relative_to(venv)))
-                    break
+            if any(foreign(line) for line in lines):
+                found.append(rel)
     return found
+
+
+def _read_lines(path: Path) -> list[str]:
+    try:
+        return path.read_text(errors="replace").splitlines()
+    except OSError:
+        return []
 
 
 def stage_release(cfg: ControlConfig, sha: str, current: str, install_tx) -> Path:
