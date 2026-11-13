@@ -12,11 +12,11 @@ After=local-fs.target
 [Service]
 Type=oneshot
 User=root
-WorkingDirectory=/opt/aicc
+WorkingDirectory=/opt/aicc/current
 # gh reads the fleet GitHub App store, the same read-only layout the infra
 # monitor uses; it decides whether a task clone's pull request is closed.
 Environment=GH_CONFIG_DIR=/var/lib/aicc/github/gh
-ExecStart=/opt/aicc/.venv/bin/python -m command_center.ops.disk_guard
+ExecStart=/opt/aicc/current/.venv/bin/python -m command_center.ops.disk_guard
 TimeoutStartSec=20min
 Nice=10
 IOSchedulingClass=idle

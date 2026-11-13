@@ -767,11 +767,15 @@ def _fake_host(tmp_path: Path) -> dict[str, str]:
     systemctl = bin_dir / "systemctl"
     systemctl.write_text('#!/bin/sh\necho "$@" >> "$FAKE_SYSTEMCTL_LOG"\n')
     systemctl.chmod(0o755)
+    wrapper_dir = tmp_path / "interpreter"
+    wrapper_dir.mkdir()
+    wrapper = wrapper_dir / "python"
+    wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+    wrapper.chmod(0o755)
     return {
         **os.environ,
         "AICC_RELEASE_DIR": str(release),
-        "AICC_APP_DIR": str(ROOT),
-        "AICC_VENV_PYTHON": sys.executable,
+        "AICC_VENV_PYTHON": str(wrapper),
         "AICC_OPS_SETTINGS": str(tmp_path / "etc" / "ops-autonomy.env"),
         "AICC_OPS_STATE_DIR": str(tmp_path / "state"),
         "AICC_OPS_LOG_DIR": str(tmp_path / "logs"),
@@ -779,6 +783,8 @@ def _fake_host(tmp_path: Path) -> dict[str, str]:
         "AICC_JOURNALD_DIR": str(tmp_path / "journald"),
         "AICC_SYSTEMCTL": str(systemctl),
         "AICC_OPS_ALLOW_NONROOT": "1",
+        "AICC_OPS_TRUST_OWNER": __import__("getpass").getuser(),
+        "AICC_OPS_TEST_ROOT": str(tmp_path),
         "FAKE_SYSTEMCTL_LOG": str(tmp_path / "systemctl.log"),
         "PYTHONPATH": str(ROOT),
     }
@@ -1522,3 +1528,150 @@ def test_the_state_and_log_directories_are_readable_by_the_unprivileged_beacon(
         mode = (tmp_path / name).stat().st_mode & 0o777
         assert mode == 0o755, (name, oct(mode))
         assert (tmp_path / name / "beacon").is_dir()
+
+
+def _releases_layout(tmp_path: Path, base: Path | None = None) -> dict[str, str]:
+    """The real fleet layout: current -> releases/<sha>, .venv -> runtime-venv."""
+    env = _fake_host(tmp_path)
+    base = base or tmp_path / "opt-aicc"
+    sha_dir = base / "releases" / ("a" * 40)
+    sha_dir.parent.mkdir(parents=True)
+    __import__("shutil").copytree(env["AICC_RELEASE_DIR"], sha_dir)
+    (sha_dir / "command_center").symlink_to(ROOT / "command_center")
+    runtime = base / "runtime-venv"
+    (runtime / "bin").mkdir(parents=True)
+    # a wrapper inside the sandbox: the installer follows links, and the real
+    # interpreter (a CI toolcache, a Homebrew cellar) is not ours to own
+    wrapper = runtime / "bin" / "python"
+    wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+    wrapper.chmod(0o755)
+    (sha_dir / ".venv").symlink_to(runtime)
+    (base / "current").symlink_to(sha_dir)
+    env.pop("PYTHONPATH")
+    env.pop("AICC_VENV_PYTHON")
+    env["AICC_RELEASE_DIR"] = str(base / "current")
+    return env
+
+
+def test_installer_uses_the_release_venv_and_imports_from_the_release(tmp_path):
+    env = _releases_layout(tmp_path)
+    (tmp_path / "units").mkdir()
+    done = _run_installer(env, "--role", "control")
+    assert done.returncode == 0, done.stdout + done.stderr
+    # an overridden layout is written into a drop-in per unit
+    current = env["AICC_RELEASE_DIR"]
+    for unit, module in (
+        ("voyn-ops-disk-guard", "disk_guard"),
+        ("voyn-ops-beacon", "status_beacon"),
+        ("voyn-ops-self-heal", "self_heal"),
+    ):
+        text = (tmp_path / "units" / f"{unit}.service.d" / "layout.conf").read_text()
+        assert f"WorkingDirectory={current}\n" in text
+        assert f"ExecStart={current}/.venv/bin/python -m command_center.ops.{module}" in text
+    assert _run_installer(env, "--uninstall").returncode == 0
+    assert not list((tmp_path / "units").glob("*.service.d"))
+
+
+def test_installer_stops_when_the_release_has_no_interpreter(tmp_path):
+    env = _releases_layout(tmp_path)
+    (Path(env["AICC_RELEASE_DIR"]) / ".venv").unlink()
+    done = _run_installer(env, "--role", "worker")
+    assert done.returncode != 0
+    assert "no interpreter" in done.stderr
+
+
+def test_shipped_units_name_the_release_layout_not_a_separate_venv():
+    for unit in ("disk-guard", "beacon", "self-heal"):
+        text = (ROOT / f"deploy/systemd/voyn-ops-{unit}.service").read_text()
+        assert "WorkingDirectory=/opt/aicc/current\n" in text
+        assert "ExecStart=/opt/aicc/current/.venv/bin/python -m " in text
+        assert "/opt/aicc/.venv" not in text
+
+
+def test_a_group_writable_parent_of_the_release_link_is_refused(tmp_path):
+    env = _releases_layout(tmp_path)
+    parent = Path(env["AICC_RELEASE_DIR"]).parent
+    parent.chmod(0o775)
+    (tmp_path / "units").mkdir()
+    done = _run_installer(env, "--role", "worker")
+    assert done.returncode != 0
+    assert str(parent) in done.stderr
+    assert "chmod 755" in done.stderr
+    assert not list((tmp_path / "units").glob("*.service"))
+    parent.chmod(0o755)
+    assert _run_installer(env, "--role", "worker").returncode == 0
+
+
+def test_a_group_writable_releases_directory_is_refused(tmp_path):
+    env = _releases_layout(tmp_path)
+    releases = Path(env["AICC_RELEASE_DIR"]).resolve().parent
+    releases.chmod(0o775)
+    (tmp_path / "units").mkdir()
+    done = _run_installer(env, "--role", "worker")
+    assert done.returncode != 0
+    assert str(releases) in done.stderr
+    releases.chmod(0o755)
+
+
+def test_an_untrusted_owner_is_refused_even_when_modes_are_tight(tmp_path):
+    env = _releases_layout(tmp_path)
+    env["AICC_OPS_TRUST_OWNER"] = "nobody-here"
+    (tmp_path / "units").mkdir()
+    done = _run_installer(env, "--role", "worker")
+    assert done.returncode != 0
+    assert "must be owned by root" in done.stderr
+
+
+def test_layout_paths_with_odd_characters_are_refused(tmp_path):
+    env = _releases_layout(tmp_path)
+    odd = tmp_path / "opt aicc"
+    odd.mkdir()
+    env["AICC_RELEASE_DIR"] = str(odd)
+    done = _run_installer(env, "--role", "worker")
+    assert done.returncode != 0
+    assert "letters, digits" in done.stderr
+
+
+def test_a_sticky_parent_above_the_fixture_is_passed_in_tests(tmp_path):
+    sandbox = tmp_path / "sandbox"
+    fixture = sandbox / "fx"
+    fixture.mkdir(parents=True)
+    env = _releases_layout(tmp_path, base=fixture / "opt-aicc")
+    # the fixture lives below a sticky 1777 directory, like /tmp on a runner
+    sandbox.chmod(0o1777)
+    env["AICC_OPS_TEST_ROOT"] = str(fixture)
+    (tmp_path / "units").mkdir()
+    try:
+        done = _run_installer(env, "--role", "worker")
+        assert done.returncode == 0, done.stdout + done.stderr
+    finally:
+        sandbox.chmod(0o755)
+
+
+def test_sticky_release_directories_are_refused_on_a_host(tmp_path):
+    for mode in (0o1777, 0o1775, 0o777):
+        for target in ("release", "venv", "releases", "base"):
+            env = _releases_layout(tmp_path / f"{mode}-{target}")
+            current = Path(env["AICC_RELEASE_DIR"])
+            real = current.resolve()
+            path = {
+                "release": real,
+                "venv": real / ".venv",
+                "releases": real.parent,
+                "base": current.parent,
+            }[target].resolve()
+            path.chmod(mode)
+            (tmp_path / f"{mode}-{target}" / "units").mkdir(exist_ok=True)
+            done = _run_installer(env, "--role", "worker")
+            path.chmod(0o755)
+            assert done.returncode != 0, (oct(mode), target)
+            assert str(path) in done.stderr, (oct(mode), target)
+
+
+def test_a_release_outside_trusted_ownership_is_refused_without_test_variables(tmp_path):
+    env = _releases_layout(tmp_path)
+    for name in ("AICC_OPS_TRUST_OWNER", "AICC_OPS_TEST_ROOT"):
+        env.pop(name)
+    done = _run_installer(env, "--role", "worker")
+    assert done.returncode != 0
+    assert "must be owned by root" in done.stderr

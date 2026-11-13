@@ -21,12 +21,17 @@
 #      files of the same name are saved first), writes the disk guard's
 #      sandbox drop-in from the settings, enables the timers;
 #   4. changes nothing else: no package, no firewall, no user, no secret.
+# Layout: units run in /opt/aicc/current (-> releases/<sha>) with its .venv;
+# AICC_RELEASE_DIR / AICC_VENV_PYTHON override both (written as unit drop-ins).
 # Rollback: --uninstall removes exactly what install added.
 set -euo pipefail
 
-RELEASE_DIR="${AICC_RELEASE_DIR:-/opt/aicc/current}"
-APP_DIR="${AICC_APP_DIR:-/opt/aicc}"
-VENV_PY="${AICC_VENV_PYTHON:-$APP_DIR/.venv/bin/python}"
+# Layout of a fleet host: /opt/aicc/current -> releases/<sha>, and the
+# interpreter is the release's own .venv (on a worker that is a link to the
+# runtime venv).  There is no /opt/aicc/.venv.  Both are overridable.
+DEFAULT_RELEASE_DIR=/opt/aicc/current
+RELEASE_DIR="${AICC_RELEASE_DIR:-$DEFAULT_RELEASE_DIR}"
+VENV_PY="${AICC_VENV_PYTHON:-$RELEASE_DIR/.venv/bin/python}"
 SETTINGS="${AICC_OPS_SETTINGS:-/etc/aicc/ops-autonomy.env}"
 STATE_DIR="${AICC_OPS_STATE_DIR:-/var/lib/voyn-ops}"
 LOG_DIR="${AICC_OPS_LOG_DIR:-/var/log/voyn-ops}"
@@ -113,23 +118,70 @@ join_existing_dirs() { # prints colon-joined list of the arguments that are dirs
   printf '%s' "$out"
 }
 
-root_only_writable() { # PATH -> ok only if owned by root and not writable by group/other
-  [ "${AICC_OPS_ALLOW_NONROOT:-}" = 1 ] && return 0
-  local real owner mode
-  real="$(readlink -f "$1")"
-  owner="$(stat -c %U "$real" 2>/dev/null)" || return 1
-  mode="$(stat -c %a "$real" 2>/dev/null)" || return 1
-  [ "$owner" = root ] || return 1
-  local g="${mode: -2:1}" o="${mode: -1}"
+file_owner() { stat -c %U "$1" 2>/dev/null || stat -f %Su "$1" 2>/dev/null; }
+file_mode() { stat -c %a "$1" 2>/dev/null || { stat -f %p "$1" 2>/dev/null | sed 's/.*\(....\)$/\1/'; }; }
+
+# AICC_OPS_TRUST_OWNER lets the test suite trust its own account; on a host it
+# is never set and only root is trusted.
+trusted_owner() { [ "$1" = root ] || [ -n "${AICC_OPS_TRUST_OWNER:-}" -a "$1" = "${AICC_OPS_TRUST_OWNER:-}" ]; }
+
+above_test_root() { # DIR -> true only when DIR is a strict ancestor of the test fixture
+  local root
+  [ -n "${AICC_OPS_TEST_ROOT:-}" ] || return 1
+  root="$(readlink -f "$AICC_OPS_TEST_ROOT")" || return 1
+  case "$root/" in "${1%/}/"?*) return 0 ;; esac
+  return 1
+}
+
+dir_or_file_safe() { # PATH [ancestor] -> trusted owner, no group/other write
+  local owner mode g o
+  owner="$(file_owner "$1")" || return 1
+  mode="$(file_mode "$1")" || return 1
+  trusted_owner "$owner" || return 1
+  while [ ${#mode} -lt 4 ]; do mode="0$mode"; done
+  g="${mode:2:1}"; o="${mode:3:1}"
+  if [ "${2:-}" = ancestor ] && [ -d "$1" ] && [ $((${mode:0:1} & 1)) -eq 1 ] \
+      && above_test_root "$1"; then
+    # Test runs only: AICC_OPS_TEST_ROOT (never set on a host) names the
+    # fixture; the sticky temporary directories ABOVE it may be passed.  The
+    # release, its .venv, releases/ and /opt/aicc never get this, because
+    # `python -m` puts the working directory first on sys.path and a sticky
+    # directory still lets anyone add a file there.
+    return 0
+  fi
   [ $((g & 2)) -eq 0 ] && [ $((o & 2)) -eq 0 ]
+}
+
+root_only_writable() { # PATH -> the object AND every directory above it are root-only
+  # Whoever can rename /opt/aicc/current or write /opt/aicc/releases swaps the
+  # code root runs, so the whole chain counts, above the link and above its
+  # target (security review U2).
+  local p="$1" real d
+  real="$(readlink -f "$p")" || return 1
+  if [ -L "$p" ]; then
+    # the link itself (current): its owner decides who can repoint it
+    trusted_owner "$(file_owner "$p")" || { BAD_PATH="$p"; return 1; }
+  fi
+  dir_or_file_safe "$real" || { BAD_PATH="$real"; return 1; }
+  for d in "$(dirname "$p")" "$(dirname "$real")"; do
+    d="$(readlink -f "$d")" || return 1
+    while :; do
+      dir_or_file_safe "$d" ancestor || { BAD_PATH="$d"; return 1; }
+      [ "$d" = / ] && break
+      d="$(dirname "$d")"
+    done
+  done
+  return 0
 }
 
 preflight() {
   # these run as root from systemd: whoever can write there controls root
-  local p
-  for p in "$RELEASE_DIR" "$APP_DIR/.venv" "$VENV_PY"; do
+  local p BAD_PATH=""
+  printf '%s\n%s\n' "$RELEASE_DIR" "$VENV_PY" | grep -vqE '^/[A-Za-z0-9._/-]+$' \
+    && die "release and interpreter paths may only contain letters, digits, dot, dash, underscore and slash"
+  for p in "$RELEASE_DIR" "$RELEASE_DIR/.venv" "$VENV_PY"; do
     [ -e "$p" ] || continue
-    root_only_writable "$p" || die "$p must be owned by root and not writable by group or others before root timers may run code from it"
+    root_only_writable "$p" || die "$BAD_PATH must be owned by root and not writable by group or others before root timers may run code from $p (the directories above it count too). Owner fix: chown root:root $BAD_PATH and chmod 755 $BAD_PATH, then run this again"
   done
   [ -x "$VENV_PY" ] || die "no interpreter at $VENV_PY (is the fleet release deployed on this host?)"
   local u
@@ -137,7 +189,7 @@ preflight() {
     [ -f "$RELEASE_DIR/deploy/systemd/$u.service" ] && [ -f "$RELEASE_DIR/deploy/systemd/$u.timer" ] \
       || die "release $RELEASE_DIR has no $u unit files yet: wait until this host has deployed the release that contains them, then run this again"
   done
-  (cd "$APP_DIR" && "$VENV_PY" - <<'PY') || die "the deployed release does not import the self-care modules"
+  (cd "$RELEASE_DIR" && "$VENV_PY" - <<'PY') || die "the deployed release does not import the self-care modules"
 import command_center.ops.disk_guard
 import command_center.ops.status_beacon
 import command_center.ops.self_heal
@@ -196,6 +248,32 @@ write_disk_guard_dropin() {
     echo "# written by install-ops-autonomy.sh from $SETTINGS"
     [ -z "$paths" ] || echo "ReadWritePaths=${paths# }"
   } >"$dir/paths.conf"
+}
+
+write_layout_dropins() {
+  # The shipped units name /opt/aicc/current and its .venv.  A host (or a
+  # test) that overrides either gets the same paths written into a drop-in.
+  local u dir mod
+  for u in "${UNITS[@]}"; do
+    dir="$UNIT_DIR/$u.service.d"
+    case "$u" in
+      voyn-ops-disk-guard) mod=disk_guard ;;
+      voyn-ops-beacon) mod=status_beacon ;;
+      *) mod=self_heal ;;
+    esac
+    if [ "$RELEASE_DIR" = "$DEFAULT_RELEASE_DIR" ] && [ "$VENV_PY" = "$DEFAULT_RELEASE_DIR/.venv/bin/python" ]; then
+      rm -f "$dir/layout.conf"
+      continue
+    fi
+    mkdir -p "$dir"
+    {
+      echo "[Service]"
+      echo "# written by install-ops-autonomy.sh: this host's release layout"
+      echo "WorkingDirectory=$RELEASE_DIR"
+      echo "ExecStart="
+      echo "ExecStart=$VENV_PY -m command_center.ops.$mod"
+    } >"$dir/layout.conf"
+  done
 }
 
 prepare_beacon_account() {
@@ -258,6 +336,7 @@ install_all() {
     done
   done
   write_disk_guard_dropin
+  write_layout_dropins
   "$SYSTEMCTL" daemon-reload
   for u in "${UNITS[@]}"; do
     "$SYSTEMCTL" enable --now "$u.timer"
@@ -320,7 +399,7 @@ uninstall_all() {
     "$SYSTEMCTL" disable --now "$u.timer" 2>/dev/null || true
     rm -f "$UNIT_DIR/$u.timer" "$UNIT_DIR/$u.service"
   done
-  rm -rf "$UNIT_DIR/voyn-ops-disk-guard.service.d" "$UNIT_DIR/voyn-ops-beacon.service.d"
+  rm -rf "$UNIT_DIR/voyn-ops-disk-guard.service.d" "$UNIT_DIR/voyn-ops-beacon.service.d" "$UNIT_DIR/voyn-ops-self-heal.service.d"
   if [ -f "$JOURNALD_DIR/voyn-ops.conf" ]; then
     rm -f "$JOURNALD_DIR/voyn-ops.conf"
     "$SYSTEMCTL" restart systemd-journald
