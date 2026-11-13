@@ -1,0 +1,51 @@
+# Control-host release deploy (merged main -> immutable root-owned release).
+#
+# Replaces the voynadmin `voyn-aicc-self-deploy` tick on a control host: that
+# tick cannot (and must not be able to) write the root-owned /opt/aicc.  This
+# unit takes NO arguments and NO environment: see
+# ops/aicc_control_release_deploy.py for the policy.  A change to this unit,
+# to that script or to anything else that decides what root runs is never
+# deployed by it: it stops with MANUAL and waits for a manual bootstrap.
+#
+# The timer is shipped but NOT enabled by any installer: enabling it is a
+# separate owner decision.
+[Unit]
+Description=AICC control release deploy (merged main -> immutable root-owned release)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/
+ExecCondition=/usr/bin/test ! -e /run/aicc-staged-rollout.lock
+# -I: no environment, no user site, no script-directory imports
+ExecStart=/usr/bin/python3 -I -B /opt/aicc/current/ops/aicc_control_release_deploy.py
+RuntimeMaxSec=1200
+Nice=10
+IOSchedulingClass=idle
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/aicc /var/lib/aicc-principal-isolation /run
+# chown/chmod the staged tree, read other accounts' files, `runuser` for the
+# unprivileged health check; nothing else.
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_FOWNER CAP_SETUID CAP_SETGID
+AmbientCapabilities=
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallFilter=@system-service @privileged
+SystemCallErrorNumber=EPERM
+# fetch from the public repository only
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+MemoryDenyWriteExecute=true
