@@ -1,0 +1,12 @@
+# Not enabled by any installer: the owner turns it on (see the service file).
+[Unit]
+Description=AICC control release deploy tick
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=10min
+RandomizedDelaySec=60
+Persistent=false
+
+[Install]
+WantedBy=timers.target
