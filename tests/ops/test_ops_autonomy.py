@@ -1848,3 +1848,47 @@ def test_the_probe_command_uses_only_console_safe_characters():
         if line.startswith("#   bash /opt/aicc/current/ops/disk-guard-probe.sh"):
             command = line.removeprefix("#   ")
             assert all(ch.islower() or ch.isdigit() or ch in " -./" for ch in command)
+
+
+def _probe_unit(env) -> Path:
+    return Path(env["AICC_RELEASE_DIR"]) / "deploy/systemd/voyn-ops-disk-guard.service"
+
+
+def test_the_probe_stops_when_the_unit_has_a_continued_line(tmp_path):
+    env = _probe_script_env(tmp_path)
+    unit = _probe_unit(env)
+    unit.write_text(unit.read_text().replace("Nice=10", "Nice=\\\n10"))
+    done = _run_probe_script(env)
+    assert done.returncode != 0 and "continued line" in done.stderr
+    assert not Path(env["FAKE_RUN_ARGS"]).exists()
+
+
+@pytest.mark.parametrize(
+    "gone", ["ProtectSystem=strict", "NoNewPrivileges=true", "CapabilityBoundingSet="]
+)
+def test_the_probe_refuses_to_run_without_the_sandbox_properties(tmp_path, gone):
+    env = _probe_script_env(tmp_path)
+    unit = _probe_unit(env)
+    kept = [
+        line for line in unit.read_text().splitlines() if not line.startswith(gone)
+    ]
+    unit.write_text("\n".join(kept) + "\n")
+    done = _run_probe_script(env)
+    assert done.returncode != 0 and "refusing to run unconfined" in done.stderr
+    assert not Path(env["FAKE_RUN_ARGS"]).exists()
+
+
+def test_the_probe_has_a_runtime_limit_and_ignores_overrides_off_the_test_switch(
+    tmp_path,
+):
+    env = _probe_script_env(tmp_path)
+    assert _run_probe_script(env).returncode == 0
+    args = Path(env["FAKE_RUN_ARGS"]).read_text().splitlines()
+    assert "RuntimeMaxSec=1200" in args
+    # without the test switch the overrides are ignored and root is required
+    env.pop("AICC_OPS_ALLOW_NONROOT")
+    done = subprocess.run(
+        ["bash", str(PROBE_SCRIPT)], env={**env, "AICC_RELEASE_DIR": "/x"},
+        capture_output=True, text=True,
+    )
+    assert done.returncode != 0
