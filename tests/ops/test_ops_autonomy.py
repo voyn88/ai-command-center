@@ -1697,3 +1697,83 @@ def test_an_intermediate_symlink_with_an_untrusted_owner_is_refused(tmp_path):
     done = _run_installer(env, "--role", "worker")
     assert done.returncode != 0
     assert str(hop) in done.stderr or "must be owned by root" in done.stderr
+
+
+# --------------------------------------------------------------------------
+# switching the owner-Mac review path off and back on
+
+MAC_SCRIPT = ROOT / "ops/mac-path.sh"
+_MARKER = "needle-text-that-must-never-be-printed"
+
+
+def _mac_env(tmp_path):
+    control = tmp_path / "executor-routing.env"
+    worker = tmp_path / "executors.env"
+    lines = ["AICC_EXECUTOR_PROFILE=owner-cascade", "AICC_CLAUDE_MAC_ENABLED=1"]
+    lines.append(f"SOME_VALUE={_MARKER}")
+    control.write_text("\n".join(lines) + "\n")
+    control.chmod(0o640)
+    worker.write_text("OTHER=1\n")
+    return {
+        **os.environ,
+        "AICC_MAC_PATH_FILES": f"{control} {worker} {tmp_path / 'absent.env'}",
+        "AICC_OPS_ALLOW_NONROOT": "1",
+    }, control, worker
+
+
+def _mac(env, *args):
+    return subprocess.run(
+        ["bash", str(MAC_SCRIPT), *args], env=env, capture_output=True, text=True
+    )
+
+
+def test_mac_path_off_changes_one_line_keeps_a_copy_and_prints_no_content(tmp_path):
+    env, control, worker = _mac_env(tmp_path)
+    original = control.read_text()
+    done = _mac(env, "off")
+    assert done.returncode == 0, done.stderr
+    assert _MARKER not in done.stdout + done.stderr
+    assert control.read_text() == original.replace(
+        "AICC_CLAUDE_MAC_ENABLED=1", "AICC_CLAUDE_MAC_ENABLED=0"
+    )
+    assert (control.stat().st_mode & 0o777) == 0o640
+    backups = list(tmp_path.glob("executor-routing.env.before-mac-off-*"))
+    assert len(backups) == 1 and backups[0].read_text() == original
+    assert worker.read_text() == "OTHER=1\n"  # no key there: untouched, not created
+    assert "not set" in done.stdout and "changed files: 1" in done.stdout
+
+
+def test_mac_path_off_twice_is_a_no_op_and_on_puts_the_line_back(tmp_path):
+    env, control, _ = _mac_env(tmp_path)
+    original = control.read_text()
+    assert _mac(env, "off").returncode == 0
+    again = _mac(env, "off")
+    assert "changed files: 0" in again.stdout
+    assert len(list(tmp_path.glob("executor-routing.env.before-mac-off-*"))) == 1
+    control.write_text(control.read_text() + "ADDED=later\n")
+    back = _mac(env, "on")
+    assert back.returncode == 0, back.stderr
+    assert control.read_text() == original + "ADDED=later\n"
+
+
+def test_mac_path_status_shows_only_the_flag(tmp_path):
+    env, control, _ = _mac_env(tmp_path)
+    done = _mac(env, "status")
+    assert "AICC_CLAUDE_MAC_ENABLED=1" in done.stdout
+    assert _MARKER not in done.stdout and "owner-cascade" not in done.stdout
+    assert "not on this host" in done.stdout
+
+
+def test_mac_path_needs_root_and_a_known_action(tmp_path):
+    env, _, _ = _mac_env(tmp_path)
+    assert _mac(env, "nonsense").returncode != 0
+    env.pop("AICC_OPS_ALLOW_NONROOT")
+    done = _mac(env, "off")
+    assert done.returncode != 0 and "run as root" in done.stderr
+
+
+def test_the_mac_path_commands_use_only_console_safe_characters():
+    for line in MAC_SCRIPT.read_text().splitlines():
+        if line.startswith("#   bash /opt/aicc/current/ops/mac-path.sh"):
+            command = line.removeprefix("#   ").split("  ")[0]
+            assert all(ch.islower() or ch.isdigit() or ch in " -./" for ch in command)
