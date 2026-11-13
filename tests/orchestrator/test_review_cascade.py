@@ -12,9 +12,9 @@ def test_review_payload_carries_the_two_step_cascade(monkeypatch):
     monkeypatch.setattr(
         review_merge,
         "_rows",
-        lambda *args: [
-            ("VOYN-W0-X", "https://github.com/o/ai-command-center/pull/7")
-        ],
+        _rows_with_implementer(
+            "VOYN-W0-X", "https://github.com/o/ai-command-center/pull/7"
+        ),
     )
     monkeypatch.setattr(
         review_merge, "_pr_diff_and_head",
@@ -70,7 +70,7 @@ def test_same_head_review_ticks_reuse_one_bounded_cycle(monkeypatch):
     not mint fresh work and thereby evade the item's retry bounds."""
     task = ("VOYN-W0-SAME-HEAD", "https://github.com/o/ai-command-center/pull/7")
     head = "a" * 40
-    monkeypatch.setattr(review_merge, "_rows", lambda *args: [task])
+    monkeypatch.setattr(review_merge, "_rows", _rows_with_implementer(*task))
     monkeypatch.setattr(
         review_merge,
         "_pr_diff_and_head",
@@ -133,17 +133,19 @@ def test_empty_review_route_fails_closed_without_enqueuing(monkeypatch):
     assert report.skipped == [("VOYN-W0-X", "no_review_executor_route")]
 
 
-def _rows_with_implementer(task_id, pr_url, implementer):
+def _rows_with_implementer(task_id, pr_url, implementer=None):
     """A `_rows` fake that answers the review scan's task/PR query with a
     single row, and the independence check's implementer-history query
     (`_implementation_executor`, keyed off its distinctive join) with the
     given implementer's recorded executor -- or no row at all, meaning no
-    implementation history was found."""
+    implementation history was found. Cursor and priority queries have no rows."""
 
     def rows(_factory, sql, _params=()):
         if "work_result wr JOIN work_item" in sql:
             return [({"executor": implementer},)] if implementer else []
-        return [(task_id, pr_url)]
+        if "FROM backlog_task" in sql:
+            return [(task_id, pr_url)]
+        return []
 
     return rows
 
@@ -275,9 +277,9 @@ def test_owner_alternatives_review_filters_keep_grok_4_6_exclude_cursor(monkeypa
     monkeypatch.setattr(
         review_merge,
         "_rows",
-        lambda *args: [
-            ("VOYN-W0-X", "https://github.com/o/ai-command-center/pull/7")
-        ],
+        _rows_with_implementer(
+            "VOYN-W0-X", "https://github.com/o/ai-command-center/pull/7"
+        ),
     )
     monkeypatch.setattr(
         review_merge,
@@ -343,7 +345,7 @@ def test_review_tick_only_fills_available_global_wip(monkeypatch):
     def rows(_factory, sql, params=()):
         if "count(DISTINCT task_id)" in sql:
             return [(7,)]
-        return tasks
+        return tasks if "FROM backlog_task" in sql else []
 
     monkeypatch.setattr(review_merge, "_rows", rows)
     monkeypatch.setattr(
@@ -376,7 +378,9 @@ def test_review_once_skips_closed_pr_as_pr_not_open_without_diff_fetch(monkeypat
     monkeypatch.setattr(
         review_merge,
         "_rows",
-        lambda *args: [("VOYN-W0-CLOSED", "https://github.com/o/ai-command-center/pull/7")],
+        _rows_with_implementer(
+            "VOYN-W0-CLOSED", "https://github.com/o/ai-command-center/pull/7"
+        ),
     )
     monkeypatch.setattr(
         review_merge,

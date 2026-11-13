@@ -20,7 +20,16 @@ GOOD_PR = "https://github.com/voyn88/ai-command-center/pull/969"
 MERGED_PR = "https://github.com/voyn88/ai-command-center/pull/1019"
 
 
-def test_malformed_pr_url_is_cleared_by_review_once(monkeypatch):
+@pytest.fixture
+def empty_review_priority(monkeypatch):
+    def rows(_factory, sql, _params=()):
+        assert "backlog_review_priority_pop" in sql
+        return []
+
+    monkeypatch.setattr(review_merge, "_rows", rows)
+
+
+def test_malformed_pr_url_is_cleared_by_review_once(monkeypatch, empty_review_priority):
     cleared: list[tuple[str, str, str]] = []
 
     monkeypatch.setattr(
@@ -95,7 +104,7 @@ def test_publish_and_merge_clear_malformed_without_calling_gh(monkeypatch):
     assert merge.skipped[0][1].startswith("malformed_pr_url:cleared:")
 
 
-def test_shape_valid_unrouted_pr_is_not_cleared(monkeypatch):
+def test_shape_valid_unrouted_pr_is_not_cleared(monkeypatch, empty_review_priority):
     """A real-shaped URL for a repo missing from the route table is an
     operator fact (add the route), not bogus evidence -- leave it alone."""
     cleared: list[object] = []
