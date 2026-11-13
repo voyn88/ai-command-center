@@ -119,6 +119,15 @@ def _git(repo_path: str, args: list[str], timeout: int) -> subprocess.CompletedP
     return _run_bounded(["git", *args], timeout, cwd=repo_path)
 
 
+def _git_decision(
+    repo_path: str, args: list[str], timeout: int
+) -> subprocess.CompletedProcess[str]:
+    """git for the dependency-manifest decision: replacement refs
+    (`refs/replace/*`) in the writable clone must not change which objects or
+    ancestors this decision sees."""
+    return _git(repo_path, ["--no-replace-objects", *args], timeout)
+
+
 def _systemctl(args: list[str], timeout: int) -> subprocess.CompletedProcess[str]:
     """Passwordless-sudo systemctl -- the exact grant the hosts already carry
     (`sudo -n`: never prompt; a missing grant is a refusal, not a hang)."""
@@ -236,10 +245,10 @@ def _manifest_base(
     deployed = _deployed_release_sha(Path(cfg.release_root))
     if deployed is None:
         return head
-    known = _git(repo_path, ["cat-file", "-e", f"{deployed}^{{commit}}"], timeout)
+    known = _git_decision(repo_path, ["cat-file", "-e", f"{deployed}^{{commit}}"], timeout)
     if known.returncode != 0:
         return head
-    ancestor = _git(
+    ancestor = _git_decision(
         repo_path, ["merge-base", "--is-ancestor", deployed, target_sha], timeout
     )
     return deployed if ancestor.returncode == 0 else head
@@ -381,7 +390,7 @@ def self_deploy_once(
     if dirty.returncode != 0 or dirty.stdout.strip():
         return finish("refused", "checkout_dirty")
     base = _manifest_base(repo_path, cfg, report.target_sha, timeout)
-    changed = _git(
+    changed = _git_decision(
         repo_path,
         ["diff", "--name-only", f"{base}..{report.target_sha}"],
         timeout,

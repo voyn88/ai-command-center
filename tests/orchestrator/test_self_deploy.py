@@ -408,6 +408,75 @@ def test_a_manifest_change_after_the_deployed_release_still_refuses(
     assert "dependency_change_requires_manual_deploy" in report.detail
 
 
+def test_the_manifest_decision_ignores_replacement_refs(
+    pair, calls, tmp_path, monkeypatch
+):
+    origin, clone, first = pair
+    bumped = _commit(origin, "bump deps", filename="uv.lock", content="lock v2")
+    _commit(origin, "advance")
+    release_root = tmp_path / "opt-aicc"
+    _install_release(release_root, bumped)
+    seen: list[list[str]] = []
+    real = self_deploy._run_bounded
+
+    def spy(argv, timeout, **kw):
+        seen.append(list(argv))
+        return real(argv, timeout, **kw)
+
+    monkeypatch.setattr(self_deploy, "_run_bounded", spy)
+    self_deploy_once(str(clone), _cfg(tmp_path, release_root=str(release_root)))
+    decision = [
+        a
+        for a in seen
+        if "cat-file" in a
+        or ("diff" in a and "--name-only" in a)
+        or ("merge-base" in a and "HEAD" not in a)
+    ]
+    assert decision and all("--no-replace-objects" in a for a in decision)
+
+
+def test_a_deployed_sha_that_is_not_an_ancestor_of_the_target_keeps_the_strict_base(
+    pair, calls, tmp_path
+):
+    origin, clone, first = pair
+    _commit(origin, "bump deps", filename="uv.lock", content="lock v2")
+    side = _commit(clone, "local side commit", filename="side.txt")  # not in origin
+    _git(clone, "reset", "-q", "--hard", first)
+    release_root = tmp_path / "opt-aicc"
+    _install_release(release_root, side)
+    report = self_deploy_once(
+        str(clone), _cfg(tmp_path, release_root=str(release_root))
+    )
+    assert report.outcome == "refused"
+
+
+@pytest.mark.parametrize("kind", ["absolute", "malformed", "not_a_symlink", "absent"])
+def test_odd_release_selectors_keep_the_strict_base(pair, calls, tmp_path, kind):
+    origin, clone, first = pair
+    _commit(origin, "bump deps", filename="uv.lock", content="lock v2")
+    release_root = tmp_path / "opt-aicc"
+    release_root.mkdir()
+    current = release_root / "current"
+    if kind == "absolute":
+        current.symlink_to(tmp_path)
+    elif kind == "malformed":
+        current.symlink_to("releases/not-a-sha")
+    elif kind == "not_a_symlink":
+        current.mkdir()
+    report = self_deploy_once(
+        str(clone), _cfg(tmp_path, release_root=str(release_root))
+    )
+    assert report.outcome in {"refused", "failed"}
+    assert "deployed" != report.outcome
+
+
+def test_without_a_release_root_the_base_is_the_clone_head(pair, calls, tmp_path):
+    origin, clone, first = pair
+    _commit(origin, "bump deps", filename="uv.lock", content="lock v2")
+    report = self_deploy_once(str(clone), _cfg(tmp_path))
+    assert report.outcome == "refused"
+
+
 def test_an_unknown_deployed_sha_keeps_the_strict_base(pair, calls, tmp_path):
     origin, clone, first = pair
     _commit(origin, "bump deps", filename="uv.lock", content="lock v2")
