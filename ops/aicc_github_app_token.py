@@ -37,6 +37,7 @@ import base64
 import grp
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -64,6 +65,8 @@ CONTROL_PERMISSIONS = {
 }
 API = "https://api.github.com"
 JWT_LIFETIME_SECONDS = 540
+_PERMISSION_NAME = re.compile(r"^[a-z][a-z_]{0,63}$")
+_PERMISSION_LEVELS = ("read", "write", "admin")
 
 
 def _b64(raw: bytes) -> str:
@@ -181,6 +184,59 @@ def store(document: dict, root: Path, *, group: str = "aicc-worker", chown: bool
     )
 
 
+def parse_permissions(items) -> dict:
+    """``["contents=read", ...]`` -> ``{"contents": "read"}``; anything odd is a usage error."""
+    result: dict = {}
+    for item in items:
+        name, sep, level = str(item).partition("=")
+        if not sep or not _PERMISSION_NAME.match(name) or level not in _PERMISSION_LEVELS:
+            raise ValueError(f"--permission expects NAME=read|write|admin, got {item!r}")
+        if name in result and result[name] != level:
+            raise ValueError(f"--permission {name} given twice with different levels")
+        result[name] = level
+    return result
+
+
+def store_narrow(document: dict, path: Path, *, fleet_root: Path = DEFAULT_ROOT) -> None:
+    """Write a narrow-purpose token to ``path`` only: one file, 0600, never lane-readable.
+
+    The fleet store (`DEFAULT_ROOT`) is read by the agents, so a token minted for
+    one private repository must never land in it: the target may not be inside
+    the fleet store (checked on resolved paths, symlinks included). The file is
+    created owner-only from the first byte (no chmod window) and replaced
+    atomically; when run as root (the only way the App key is readable) the
+    owner is root."""
+    token = str(document["token"])
+    if not token.startswith(("ghs_", "ghp_")) or len(token) > 1024 or any(c.isspace() for c in token):
+        raise ValueError("installation token has an unexpected shape")
+    if not path.is_absolute():
+        raise ValueError("--token-file must be an absolute path")
+    target = path.parent.resolve() / path.name
+    for forbidden in {fleet_root.resolve(), DEFAULT_ROOT.resolve()}:
+        if target == forbidden or forbidden in target.parents:
+            raise ValueError(f"--token-file must not be inside the fleet token store {forbidden}")
+    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp = target.with_name(target.name + ".tmp")
+    try:
+        tmp.unlink()
+    except FileNotFoundError:
+        pass
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(token + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, target)
+
+
+def _refusal_text(exc: urllib.error.HTTPError) -> str:
+    try:
+        message = str(json.load(exc).get("message", ""))[:300]
+    except Exception:  # noqa: BLE001 - the body is advisory only
+        message = ""
+    return f"HTTP {exc.code}" + (f": {message}" if message else "")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--app-id", default=os.environ.get("AICC_GITHUB_APP_ID", ""))
@@ -188,10 +244,29 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--pem", type=Path, default=Path(os.environ.get("AICC_GITHUB_APP_PEM", str(DEFAULT_PEM))))
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT)
     parser.add_argument("--repository", action="append", default=None)
+    parser.add_argument(
+        "--permission",
+        action="append",
+        default=None,
+        metavar="NAME=LEVEL",
+        help="narrow-purpose token: request exactly these permissions (repeatable). "
+        "Requires --repository and --token-file; without it the fleet token is minted as before.",
+    )
+    parser.add_argument(
+        "--token-file",
+        type=Path,
+        default=None,
+        help="narrow-purpose token: absolute output file (0600, never inside the fleet store)",
+    )
     args = parser.parse_args(argv)
     if not args.app_id or not args.installation_id:
         print("AICC_GITHUB_APP_ID and AICC_GITHUB_INSTALLATION_ID are required", file=sys.stderr)
         return 2
+    if args.permission is None and args.token_file is not None:
+        print("--token-file is only valid together with --permission", file=sys.stderr)
+        return 2
+    if args.permission is not None:
+        return _main_narrow(args)
     document = mint(
         args.app_id,
         args.installation_id,
@@ -205,6 +280,52 @@ def main(argv: list[str] | None = None) -> int:
         "expires_at": document.get("expires_at"),
         "permissions": document.get("permissions"),
         "repositories": [r.get("full_name") for r in document.get("repositories", [])],
+    }))
+    return 0
+
+
+def _main_narrow(args) -> int:
+    """A separate, narrow installation token (e.g. contents:read on one repository).
+
+    No defaults and no fallback: the caller names every repository and
+    permission, and a request the App cannot satisfy fails loudly instead of
+    silently minting something broader."""
+    try:
+        permissions = parse_permissions(args.permission)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    if not args.repository or args.token_file is None:
+        print("--permission requires --repository and --token-file (no defaults for a narrow token)", file=sys.stderr)
+        return 2
+    try:
+        document = mint(
+            args.app_id,
+            args.installation_id,
+            args.pem,
+            repositories=args.repository,
+            permissions=permissions,
+        )
+    except urllib.error.HTTPError as exc:
+        if exc.code in (403, 404, 422):
+            print(
+                "GitHub refused the narrow token (" + _refusal_text(exc) + "): the App installation "
+                f"must include the repositories {list(args.repository)} and already hold "
+                f"{permissions}; a token cannot ask for more than the App has been granted",
+                file=sys.stderr,
+            )
+            return 3
+        raise
+    try:
+        store_narrow(document, args.token_file, fleet_root=args.root)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    print(json.dumps({
+        "expires_at": document.get("expires_at"),
+        "permissions": document.get("permissions"),
+        "repositories": [r.get("full_name") for r in document.get("repositories", [])],
+        "token_file": str(args.token_file),
     }))
     return 0
 
