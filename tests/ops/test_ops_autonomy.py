@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -1830,6 +1831,198 @@ def test_an_intermediate_symlink_with_an_untrusted_owner_is_refused(tmp_path):
 
 
 # --------------------------------------------------------------------------
+# owner probe: a dry run at raised thresholds, safe by construction
+
+
+def _probe_env(tmp_path, monkeypatch, **extra):
+    clones = tmp_path / "clones"
+    clones.mkdir(exist_ok=True)
+    settings = tmp_path / "s.env"
+    settings.write_text(
+        f"OPS_CLONE_ROOTS={clones}\nOPS_DISK_GUARD_DRY_RUN=0\n"
+        f"OPS_DISK_LOG={tmp_path / 'dg.jsonl'}\nOPS_DISK_LOCK={tmp_path / 'dg.lock'}\n"
+        f"OPS_DISK_PATH={tmp_path}\n"
+    )
+    for key, value in extra.items():
+        monkeypatch.setenv(key, value)
+    return settings, clones
+
+
+def _fake_disk(monkeypatch, free_pct: float) -> None:
+    total = 1_000_000_000_000
+    usage = type("U", (), {"total": total, "free": int(total * free_pct / 100)})()
+    monkeypatch.setattr(disk_guard.shutil, "disk_usage", lambda p: usage)
+
+
+def test_the_probe_is_dry_even_when_settings_and_environment_say_live(
+    tmp_path, monkeypatch, capsys
+):
+    settings, clones = _probe_env(tmp_path, monkeypatch, OPS_DISK_GUARD_DRY_RUN="0")
+    clone = _clone(clones, "merged-one")
+    monkeypatch.setattr(
+        disk_guard,
+        "run_command",
+        _fake_runner({"merged-one": {"pulls": [_pr("MERGED", 10)]}}),
+    )
+    _fake_disk(monkeypatch, 30.6)
+    monkeypatch.setattr(disk_guard, "process_paths", lambda *a, **k: [])
+    monkeypatch.setattr(disk_guard, "mount_points", lambda *a, **k: [])
+    seen_live = []
+    real = disk_guard.run_guard
+
+    def spy(cfg, **kw):
+        seen_live.append(cfg.dry_run)
+        return real(cfg, runner=kw.get("runner", disk_guard.run_command), **{
+            k: v for k, v in kw.items() if k != "runner"
+        })
+
+    monkeypatch.setattr(disk_guard, "run_guard", spy)
+    assert disk_guard.main(["--probe", "--settings", str(settings)]) == 0
+    out = capsys.readouterr().out
+    assert seen_live == [True]
+    assert clone.exists()
+    assert "PROBE (dry run" in out and "merged-one" in out
+    assert "would_remove: 1 entries" in out
+    assert not (tmp_path / "dg.jsonl").exists()  # nothing written to the journal
+
+
+def test_the_probe_cannot_be_combined_with_live_and_thresholds_need_the_probe(
+    tmp_path, capsys
+):
+    with pytest.raises(SystemExit):
+        disk_guard.main(["--probe", "--live"])
+    with pytest.raises(SystemExit):
+        disk_guard.main(["--low-free-pct", "45"])
+    with pytest.raises(SystemExit):
+        disk_guard.main(["--probe", "--low-free-pct", "50", "--target-free-pct", "40"])
+    with pytest.raises(SystemExit):
+        disk_guard.main(["--probe", "--low-free-pct", "0"])
+
+
+def test_a_probe_above_the_threshold_says_so(tmp_path, monkeypatch, capsys):
+    settings, _ = _probe_env(tmp_path, monkeypatch)
+    _fake_disk(monkeypatch, 90.0)
+    assert (
+        disk_guard.main(
+            ["--probe", "--low-free-pct", "45", "--settings", str(settings)]
+        )
+        == 0
+    )
+    assert "was not crossed" in capsys.readouterr().out
+
+
+PROBE_SCRIPT = ROOT / "ops/disk-guard-probe.sh"
+
+
+def _probe_script_env(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake = bin_dir / "systemd-run"
+    fake.write_text('#!/bin/sh\nprintf "%s\n" "$@" > "$FAKE_RUN_ARGS"\n')
+    fake.chmod(0o755)
+    release = tmp_path / "release"
+    shutil.copytree(ROOT / "deploy", release / "deploy")
+    py = tmp_path / "python"
+    py.write_text("#!/bin/sh\n")
+    py.chmod(0o755)
+    return {
+        **os.environ,
+        "AICC_RELEASE_DIR": str(release),
+        "AICC_VENV_PYTHON": str(py),
+        "AICC_SYSTEMD_RUN": str(fake),
+        "AICC_OPS_ALLOW_NONROOT": "1",
+        "FAKE_RUN_ARGS": str(tmp_path / "args.txt"),
+    }
+
+
+def _run_probe_script(env, *args):
+    return subprocess.run(
+        ["bash", str(PROBE_SCRIPT), *args], env=env, capture_output=True, text=True
+    )
+
+
+def test_the_probe_script_reuses_the_unit_sandbox_and_forces_probe_mode(tmp_path):
+    env = _probe_script_env(tmp_path)
+    done = _run_probe_script(env, "45", "60")
+    assert done.returncode == 0, done.stderr
+    args = Path(env["FAKE_RUN_ARGS"]).read_text().splitlines()
+    unit = (ROOT / "deploy/systemd/voyn-ops-disk-guard.service").read_text()
+    for needed in ("ProtectSystem=strict", "NoNewPrivileges=true", "CapabilityBoundingSet="):
+        assert needed in unit
+        assert any(a.startswith(needed) for a in args), needed
+    assert "ExecStart" not in " ".join(a for a in args if a != "-p" and "=" in a)
+    tail = args[args.index("--") + 1 :]
+    assert "--probe" in tail and "--live" not in tail
+    assert tail[-4:] == ["--low-free-pct", "45", "--target-free-pct", "60"]
+
+
+@pytest.mark.parametrize(
+    "bad", [("abc",), ("45", "30"), ("0", "50"), ("45", "101"), ("4 5",)]
+)
+def test_the_probe_script_rejects_odd_thresholds(tmp_path, bad):
+    env = _probe_script_env(tmp_path)
+    done = _run_probe_script(env, *bad)
+    assert done.returncode != 0
+    assert not Path(env["FAKE_RUN_ARGS"]).exists()
+
+
+def test_the_probe_script_needs_root_unless_in_a_test(tmp_path):
+    env = _probe_script_env(tmp_path)
+    env.pop("AICC_OPS_ALLOW_NONROOT")
+    done = _run_probe_script(env)
+    assert done.returncode != 0 and "run as root" in done.stderr
+
+
+def test_the_probe_command_uses_only_console_safe_characters():
+    for line in PROBE_SCRIPT.read_text().splitlines():
+        if line.startswith("#   bash /opt/aicc/current/ops/disk-guard-probe.sh"):
+            command = line.removeprefix("#   ")
+            assert all(ch.islower() or ch.isdigit() or ch in " -./" for ch in command)
+
+
+def _probe_unit(env) -> Path:
+    return Path(env["AICC_RELEASE_DIR"]) / "deploy/systemd/voyn-ops-disk-guard.service"
+
+
+def test_the_probe_stops_when_the_unit_has_a_continued_line(tmp_path):
+    env = _probe_script_env(tmp_path)
+    unit = _probe_unit(env)
+    unit.write_text(unit.read_text().replace("Nice=10", "Nice=\\\n10"))
+    done = _run_probe_script(env)
+    assert done.returncode != 0 and "continued line" in done.stderr
+    assert not Path(env["FAKE_RUN_ARGS"]).exists()
+
+
+@pytest.mark.parametrize(
+    "gone", ["ProtectSystem=strict", "NoNewPrivileges=true", "CapabilityBoundingSet="]
+)
+def test_the_probe_refuses_to_run_without_the_sandbox_properties(tmp_path, gone):
+    env = _probe_script_env(tmp_path)
+    unit = _probe_unit(env)
+    kept = [
+        line for line in unit.read_text().splitlines() if not line.startswith(gone)
+    ]
+    unit.write_text("\n".join(kept) + "\n")
+    done = _run_probe_script(env)
+    assert done.returncode != 0 and "refusing to run unconfined" in done.stderr
+    assert not Path(env["FAKE_RUN_ARGS"]).exists()
+
+
+def test_the_probe_has_a_runtime_limit_and_ignores_overrides_off_the_test_switch(
+    tmp_path,
+):
+    env = _probe_script_env(tmp_path)
+    assert _run_probe_script(env).returncode == 0
+    args = Path(env["FAKE_RUN_ARGS"]).read_text().splitlines()
+    assert "RuntimeMaxSec=1200" in args
+    # without the test switch the overrides are ignored and root is required
+    env.pop("AICC_OPS_ALLOW_NONROOT")
+    done = subprocess.run(
+        ["bash", str(PROBE_SCRIPT)], env={**env, "AICC_RELEASE_DIR": "/x"},
+        capture_output=True, text=True,
+    )
+    assert done.returncode != 0
+
 # switching the owner-Mac review path off and back on
 
 MAC_SCRIPT = ROOT / "ops/mac-path.sh"
