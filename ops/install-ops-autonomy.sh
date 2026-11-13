@@ -123,11 +123,16 @@ file_mode() { stat -c %a "$1" 2>/dev/null || { stat -f %p "$1" 2>/dev/null | sed
 
 # AICC_OPS_TRUST_OWNER lets the test suite trust its own account; on a host it
 # is never set and only root is trusted.
-trusted_owner() { [ "$1" = root ] || [ -n "${AICC_OPS_TRUST_OWNER:-}" -a "$1" = "${AICC_OPS_TRUST_OWNER:-}" ]; }
+# They count only together with AICC_OPS_ALLOW_NONROOT=1 (itself test-only).
+trusted_owner() {
+  [ "$1" = root ] && return 0
+  [ "${AICC_OPS_ALLOW_NONROOT:-}" = 1 ] && [ -n "${AICC_OPS_TRUST_OWNER:-}" ] \
+    && [ "$1" = "$AICC_OPS_TRUST_OWNER" ]
+}
 
 above_test_root() { # DIR -> true only when DIR is a strict ancestor of the test fixture
   local root
-  [ -n "${AICC_OPS_TEST_ROOT:-}" ] || return 1
+  [ "${AICC_OPS_ALLOW_NONROOT:-}" = 1 ] && [ -n "${AICC_OPS_TEST_ROOT:-}" ] || return 1
   root="$(readlink -f "$AICC_OPS_TEST_ROOT")" || return 1
   case "$root/" in "${1%/}/"?*) return 0 ;; esac
   return 1
@@ -158,10 +163,17 @@ root_only_writable() { # PATH -> the object AND every directory above it are roo
   # target (security review U2).
   local p="$1" real d
   real="$(readlink -f "$p")" || return 1
-  if [ -L "$p" ]; then
-    # the link itself (current): its owner decides who can repoint it
-    trusted_owner "$(file_owner "$p")" || { BAD_PATH="$p"; return 1; }
-  fi
+  # every symlink on the way (not only the last) is owned by a trusted account
+  local walk="" part rest="${p#/}"
+  while [ -n "$rest" ]; do
+    part="${rest%%/*}"
+    if [ "$part" = "$rest" ]; then rest=""; else rest="${rest#*/}"; fi
+    [ -n "$part" ] || continue
+    walk="$walk/$part"
+    if [ -L "$walk" ]; then
+      trusted_owner "$(file_owner "$walk")" || { BAD_PATH="$walk"; return 1; }
+    fi
+  done
   dir_or_file_safe "$real" || { BAD_PATH="$real"; return 1; }
   for d in "$(dirname "$p")" "$(dirname "$real")"; do
     d="$(readlink -f "$d")" || return 1
@@ -316,11 +328,14 @@ install_all() {
   [ -n "$role" ] || die "cannot tell the host role from its name: add --role worker or --role control"
   preflight
   mkdir -p "$STATE_DIR/beacon" "$LOG_DIR/beacon"
-  # World-readable on purpose: the unprivileged beacon reads the self-heal
-  # state, and neither directory holds a secret (decisions and counters only).
-  chmod 0755 "$STATE_DIR" "$LOG_DIR"
   write_settings_once
   prepare_beacon_account
+  # Journals name clone paths and decisions: not world-readable.  The beacon's
+  # account reads the self-heal state through the group.
+  if getent passwd aicc-worker >/dev/null 2>&1 && [ "${AICC_OPS_ALLOW_NONROOT:-}" != 1 ]; then
+    chgrp aicc-worker "$STATE_DIR" "$LOG_DIR"
+  fi
+  chmod 0750 "$STATE_DIR" "$LOG_DIR"
   write_journald_cap
   local stamp backup u f own=(-o root -g root)
   [ "${AICC_OPS_ALLOW_NONROOT:-}" != 1 ] || own=()
