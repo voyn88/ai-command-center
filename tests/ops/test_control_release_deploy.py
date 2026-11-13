@@ -357,9 +357,12 @@ def test_the_unit_takes_no_environment_or_arguments_and_is_sandboxed():
         "command_center/__init__.py",
         "command_center/ops/__init__.py",
         "command_center/ops/anything_new.py",
+        "command_center/ops/infra_monitor.py",
         "command_center/deployment/self_deploy.py",
         "ops/anything.py",
         "deploy/anything",
+        "deploy/systemd/voyn-infra-monitor.service",
+        "deploy/systemd/voyn-queue-monitor.service",
         ".github/workflows/ci.yml",
     ],
 )

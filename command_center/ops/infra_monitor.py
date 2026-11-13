@@ -3,6 +3,16 @@
 The predecessor lived only in ``/usr/local/sbin`` and watched retired unit
 names.  This module deliberately derives health from the templated worker
 lanes, the durable queue, and the configured metrics endpoint instead.
+
+Unit restart history lives in ``$STATE_DIRECTORY/crash-loop-samples.json``
+(the first directory if systemd provides several), defaulting to
+``/var/lib/voyn-infra-monitor/crash-loop-samples.json``. The hardened oneshot
+needs ``StateDirectory=voyn-infra-monitor`` to persist it. ``--crash-loop-restarts``
+defaults to 5; only growth strictly above it within ``--crash-loop-window-seconds``
+(default 600, ten minutes) is a crash loop. Missing/unusable history starts fresh.
+The state directory must already exist and be writable. If persistence fails,
+one stderr warning reports degraded crash-loop detection, with no crash-loop
+finding or exit-code change from that failure alone; other probes still run.
 """
 
 from __future__ import annotations
@@ -10,8 +20,11 @@ from __future__ import annotations
 import argparse
 import http.client
 import json
+import math
 import os
 import subprocess
+import sys
+import tempfile
 import time
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timezone
@@ -104,9 +117,10 @@ class UnitHealthSnapshot:
     (70 305) while every monitor stayed green, because each probe asked
     `is-active` of its own hand-picked units and a `Restart=always` unit is
     `activating` again by the time anyone looks. NRestarts is the number that
-    cannot be hidden. Template instances (per-connection launcher units)
+    cannot be hidden; only its growth within the sampled window is a fault.
+    Template instances (per-connection launcher units)
     collapse to one `template@*.service` in both listings -- crash loops carry
-    the highest NRestarts among the instances, failed units their count -- so
+    the highest restart growth among the instances, failed units their count -- so
     a hundred dead connections are one finding, not a hundred.
 
     A unit this host no longer HAS is reported separately (`retired_units`)
@@ -601,7 +615,8 @@ def _template_name(unit: str) -> str:
 
 
 def evaluate_unit_health(
-    units: dict[str, UnitState], *, crash_loop_restarts: int
+    units: dict[str, UnitState], *, crash_loop_restarts: int,
+    restart_growth: dict[str, int] | None = None,
 ) -> UnitHealthSnapshot:
     """Split the host's units into faults and residue.
 
@@ -645,6 +660,7 @@ def evaluate_unit_health(
     """
     if crash_loop_restarts < 1:
         raise ValueError("crash_loop_restarts must be at least 1")
+    restart_growth = restart_growth or {}
     loops: dict[str, int] = {}
     failed: dict[str, int] = {}
     retired: dict[str, int] = {}
@@ -663,8 +679,9 @@ def evaluate_unit_health(
             if state.active_state == "failed":
                 retired[key] = retired.get(key, 0) + 1
             continue
-        if state.restarts >= crash_loop_restarts:
-            loops[key] = max(loops.get(key, 0), state.restarts)
+        growth = restart_growth.get(unit, 0)
+        if growth > crash_loop_restarts:
+            loops[key] = max(loops.get(key, 0), growth)
         if state.active_state == "failed":
             failed[key] = failed.get(key, 0) + 1
     return UnitHealthSnapshot(
@@ -680,7 +697,92 @@ def _unit_listing(entries: tuple[tuple[str, int], ...]) -> str:
     return f"{shown},+{hidden}_more" if hidden > 0 else shown
 
 
-def read_unit_health_snapshot(*, crash_loop_restarts: int) -> UnitHealthSnapshot:
+def _crash_loop_state_path() -> Path:
+    directory = os.environ.get("STATE_DIRECTORY", "").split(":", 1)[0]
+    return Path(directory or "/var/lib/voyn-infra-monitor") / "crash-loop-samples.json"
+
+
+def _read_restart_samples(path: Path) -> dict[str, list[list[float | int]]]:
+    """A corrupt or unreadable history is no history, not a host failure."""
+    try:
+        samples = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(samples, dict):
+            return {}
+        for history in samples.values():
+            if not isinstance(history, list):
+                return {}
+            for sample in history:
+                if (
+                    not isinstance(sample, list)
+                    or len(sample) != 2
+                    or type(sample[0]) not in (int, float)
+                    or not math.isfinite(sample[0])
+                    or type(sample[1]) is not int
+                    or sample[1] < 0
+                ):
+                    return {}
+            if any(
+                newer[0] < older[0] or newer[1] < older[1]
+                for older, newer in zip(history, history[1:])
+            ):
+                return {}
+        return samples
+    except (OSError, ValueError, UnicodeError, OverflowError):
+        return {}
+
+
+def _restart_growth(
+    units: dict[str, UnitState], *, window_seconds: int
+) -> dict[str, int]:
+    """Persist per-unit baselines across oneshots, pruning to the current window."""
+    if window_seconds < 1:
+        raise ValueError("crash_loop_window_seconds must be at least 1")
+    path = _crash_loop_state_path()
+    previous = _read_restart_samples(path)
+    now = time.time()
+    samples: dict[str, list[list[float | int]]] = {}
+    growth: dict[str, int] = {}
+    for unit, state in units.items():
+        if state.load_state == RETIRED_LOAD_STATE:
+            continue
+        history = previous.get(unit, [])
+        # A reset or backwards clock invalidates this unit's entire baseline.
+        if history and (now < history[-1][0] or state.restarts < history[-1][1]):
+            history = []
+        history = [sample for sample in history if sample[0] >= now - window_seconds]
+        growth[unit] = state.restarts - history[0][1] if history else 0
+        samples[unit] = [*history, [now, state.restarts]]
+    # Rebuild from the current unit set so vanished units cannot retain history.
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent, delete=False
+        ) as handle:
+            temporary = Path(handle.name)
+            json.dump(samples, handle)
+        os.replace(temporary, path)
+    except OSError:
+        # Without durable samples, discard even growth from readable old history.
+        # systemd creates the directory; an old unit may still have a read-only
+        # /var/lib or no directory at all. Keep stdout's JSON and other probes intact.
+        print(
+            f"WARNING: crash-loop detection is degraded (no finding): "
+            f"cannot persist restart samples at {path}",
+            file=sys.stderr,
+        )
+        return {}
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+    return growth
+
+
+def read_unit_health_snapshot(
+    *, crash_loop_restarts: int, crash_loop_window_seconds: int = 600
+) -> UnitHealthSnapshot:
     """Two unprivileged systemctl calls for the whole host, never raising."""
     try:
         listed = subprocess.run(
@@ -726,7 +828,10 @@ def read_unit_health_snapshot(*, crash_loop_restarts: int) -> UnitHealthSnapshot
             raise RuntimeError(
                 f"systemctl show returned {len(units)} of {len(names)} units"
             )
-        return evaluate_unit_health(units, crash_loop_restarts=crash_loop_restarts)
+        return evaluate_unit_health(
+            units, crash_loop_restarts=crash_loop_restarts,
+            restart_growth=_restart_growth(units, window_seconds=crash_loop_window_seconds),
+        )
     except Exception as exc:  # noqa: BLE001 - see read_pr_window_snapshot
         return UnitHealthSnapshot(
             crash_loops=(),
@@ -1244,7 +1349,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--crash-loop-restarts",
         type=_positive_int,
         default=5,
-        help="NRestarts at or above which a unit is a crash loop (default 5, minimum 1).",
+        help="Restart growth must exceed this count within the window (default 5, minimum 1).",
+    )
+    parser.add_argument(
+        "--crash-loop-window-seconds",
+        type=_positive_int,
+        default=600,
+        help="Trailing restart sample window (default 600 seconds: 10 minutes).",
     )
     parser.add_argument(
         "--deploy-lag-repo",
@@ -1362,7 +1473,10 @@ def main(argv: list[str] | None = None) -> int:
             else None
         )
         unit_health = (
-            read_unit_health_snapshot(crash_loop_restarts=args.crash_loop_restarts)
+            read_unit_health_snapshot(
+                crash_loop_restarts=args.crash_loop_restarts,
+                crash_loop_window_seconds=args.crash_loop_window_seconds,
+            )
             if args.unit_health
             else None
         )

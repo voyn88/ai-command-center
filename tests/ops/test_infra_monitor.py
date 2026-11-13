@@ -250,6 +250,16 @@ def test_systemd_probes_keep_database_access_off_the_worker_host() -> None:
     assert "Unit=voyn-aicc-source-clone-refresh.service" in refresh_timer
 
 
+@pytest.mark.parametrize("unit", ["voyn-infra-monitor", "voyn-queue-monitor"])
+def test_monitor_units_have_writable_restart_history_under_hardening(unit) -> None:
+    directives = Path(f"deploy/systemd/{unit}.service").read_text().splitlines()
+    assert "StateDirectory=voyn-infra-monitor" in directives
+    assert "StateDirectoryMode=0750" in directives
+    assert "User=voynadmin" in directives
+    assert "ProtectSystem=strict" in directives
+    assert "ProtectHome=read-only" in directives
+
+
 def test_evaluate_can_skip_queue_without_hiding_worker_failures() -> None:
     healthy = evaluate(
         {"voyn-aicc-worker@1.service": "active"},
@@ -923,6 +933,229 @@ Legend: LOAD   → Reflects whether the unit definition was properly loaded.
 """
 
 
+@pytest.fixture
+def restart_probe(monkeypatch):
+    """Each call is a new oneshot run, sharing only the on-disk history."""
+
+    def probe(timestamp, restarts, **settings):
+        monkeypatch.setattr(infra_monitor.time, "time", lambda: timestamp)
+
+        def run(args, **kwargs):
+            stdout = (
+                "\n".join(f"{unit} loaded active running" for unit in restarts)
+                if args[1] == "list-units"
+                else "\n".join(
+                    _show_block(unit, count, "active") for unit, count in restarts.items()
+                )
+            )
+            return subprocess.CompletedProcess(args, 0, stdout=stdout, stderr="")
+
+        monkeypatch.setattr(infra_monitor.subprocess, "run", run)
+        settings.setdefault("crash_loop_restarts", 5)
+        snapshot = infra_monitor.read_unit_health_snapshot(**settings)
+        assert snapshot.error is None
+        return snapshot
+
+    return probe
+
+
+@pytest.fixture(autouse=True)
+def isolated_restart_history(monkeypatch, tmp_path):
+    monkeypatch.setenv("STATE_DIRECTORY", str(tmp_path))
+
+
+def test_crash_loop_unchanged_cumulative_count_stays_green(restart_probe) -> None:
+    restart_probe(1000, {"voyn-aicc-pgtunnel.service": 7})
+    snapshot = restart_probe(1120, {"voyn-aicc-pgtunnel.service": 7})
+    report = evaluate(
+        {}, None, minimum_active_workers=0, max_stalled_seconds=900,
+        prometheus_ready=True, unit_health=snapshot,
+    )
+    assert report.ok, report.failures
+    assert snapshot.crash_loops == ()
+
+
+def test_crash_loop_growth_above_threshold_inside_window(restart_probe) -> None:
+    restart_probe(1000, {"ollama.service": 46258})
+    assert restart_probe(1120, {"ollama.service": 46263}).crash_loops == ()
+    assert restart_probe(1240, {"ollama.service": 46264}).crash_loops == (
+        ("ollama.service", 6),
+    )
+
+
+def test_crash_loop_growth_spread_beyond_window_is_green(restart_probe) -> None:
+    for timestamp, count in [(1000, 7), (1240, 9), (1480, 11), (1720, 13)]:
+        assert restart_probe(timestamp, {"ollama.service": count}).crash_loops == ()
+
+
+def test_crash_loop_counter_reset_starts_new_baseline(restart_probe) -> None:
+    restart_probe(1000, {"ollama.service": 46258})
+    assert restart_probe(1120, {"ollama.service": 7}).crash_loops == ()
+    assert restart_probe(1240, {"ollama.service": 13}).crash_loops == (
+        ("ollama.service", 6),
+    )
+
+
+@pytest.mark.parametrize("contents", [
+    "{broken", "[]", '{"ollama.service": null}',
+    '{"ollama.service": [[1000, "seven"]]}',
+    '{"ollama.service": [[NaN, 7]]}',
+    '{"ollama.service": [[1000, 7], [900, 8]]}',
+    '{"ollama.service": [[900, 8], [1000, 7]]}',
+])
+def test_crash_loop_corrupt_history_starts_fresh(restart_probe, tmp_path, contents) -> None:
+    restart_probe(1000, {"ollama.service": 7})
+    (state_file,) = tmp_path.iterdir()
+    state_file.write_text(contents, encoding="utf-8")
+    assert restart_probe(1120, {"ollama.service": 46258}).crash_loops == ()
+    assert restart_probe(1240, {"ollama.service": 46264}).crash_loops == (
+        ("ollama.service", 6),
+    )
+
+
+def test_crash_loop_first_run_records_baseline(restart_probe, tmp_path) -> None:
+    assert restart_probe(1000, {"ollama.service": 46258}).crash_loops == ()
+    (state_file,) = tmp_path.iterdir()
+    assert json.loads(state_file.read_text()) == {"ollama.service": [[1000, 46258]]}
+
+
+def test_crash_loop_clock_backwards_starts_new_baseline(restart_probe) -> None:
+    restart_probe(1000, {"ollama.service": 7})
+    assert restart_probe(900, {"ollama.service": 13}).crash_loops == ()
+    assert restart_probe(1020, {"ollama.service": 19}).crash_loops == (
+        ("ollama.service", 6),
+    )
+
+
+def test_crash_loop_disappeared_unit_history_is_dropped(restart_probe, tmp_path) -> None:
+    restart_probe(1000, {"gone.service": 7, "kept.service": 0})
+    restart_probe(1120, {"kept.service": 0})
+    (state_file,) = tmp_path.iterdir()
+    assert "gone.service" not in json.loads(state_file.read_text())
+    assert restart_probe(1240, {"gone.service": 100, "kept.service": 0}).crash_loops == ()
+
+
+def test_crash_loop_unreadable_history_starts_fresh(restart_probe, monkeypatch) -> None:
+    restart_probe(1000, {"ollama.service": 7})
+    original = Path.read_text
+
+    def read(path, *args, **kwargs):
+        if path.name == "crash-loop-samples.json":
+            raise PermissionError("unreadable history")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read)
+    assert restart_probe(1120, {"ollama.service": 46258}).crash_loops == ()
+
+
+def test_crash_loop_window_boundary_and_expiry(restart_probe, tmp_path) -> None:
+    restart_probe(1000, {"ollama.service": 7})
+    assert restart_probe(1600, {"ollama.service": 13}).crash_loops == (
+        ("ollama.service", 6),
+    )
+    assert restart_probe(1601, {"ollama.service": 13}).crash_loops == ()
+    (state_file,) = tmp_path.iterdir()
+    assert json.loads(state_file.read_text()) == {
+        "ollama.service": [[1600, 13], [1601, 13]],
+    }
+
+
+@pytest.mark.parametrize("operation", ["create", "replace"])
+def test_crash_loop_write_failure_discards_growth_and_preserves_state(
+    restart_probe, monkeypatch, tmp_path, capsys, operation,
+) -> None:
+    restart_probe(1000, {"ollama.service": 7})
+    (state_file,) = tmp_path.iterdir()
+    before = state_file.read_bytes()
+
+    def fail_write(*args, **kwargs):
+        raise PermissionError("read-only state directory")
+
+    if operation == "create":
+        monkeypatch.setattr(infra_monitor.tempfile, "NamedTemporaryFile", fail_write)
+    else:
+        monkeypatch.setattr(infra_monitor.os, "replace", fail_write)
+    assert restart_probe(1120, {"ollama.service": 46258}).crash_loops == ()
+    assert state_file.read_bytes() == before
+    assert list(tmp_path.iterdir()) == [state_file]
+    assert capsys.readouterr().err.splitlines() == [
+        "WARNING: crash-loop detection is degraded (no finding): "
+        f"cannot persist restart samples at {state_file}"
+    ]
+
+
+@pytest.mark.parametrize("storage", ["missing", "permission_denied", "read_only"])
+@pytest.mark.parametrize("metrics_ready", [True, False])
+def test_main_unavailable_restart_storage_warns_without_changing_exit_code(
+    monkeypatch, tmp_path, capsys, storage, metrics_ready,
+) -> None:
+    directory = tmp_path / "state"
+    state_file = directory / "crash-loop-samples.json"
+    monkeypatch.setenv("STATE_DIRECTORY", str(directory))
+    monkeypatch.setattr(infra_monitor.time, "time", lambda: 1120)
+    if storage != "missing":
+        directory.mkdir()
+        state_file.write_text(json.dumps({"ollama.service": [[1000, 7]]}))
+
+        def fail_write(*args, **kwargs):
+            if storage == "permission_denied":
+                raise PermissionError("state directory is not writable")
+            raise OSError("Read-only file system")
+
+        monkeypatch.setattr(infra_monitor.tempfile, "NamedTemporaryFile", fail_write)
+
+    def run(args, **kwargs):
+        stdout = (
+            "ollama.service loaded active running"
+            if args[1] == "list-units"
+            else _show_block("ollama.service", 46258, "active")
+        )
+        return subprocess.CompletedProcess(args, 0, stdout=stdout, stderr="")
+
+    recorded = []
+    monkeypatch.setattr(infra_monitor.subprocess, "run", run)
+    monkeypatch.setattr(infra_monitor, "prometheus_is_ready", lambda _url: metrics_ready)
+    monkeypatch.setattr(infra_monitor, "record_findings", lambda *args: recorded.append(args))
+    result = infra_monitor.main([
+        "--skip-workers", "--skip-queue", "--minimum-active-workers", "0",
+        "--prometheus-url", "http://m/ready", "--unit-health",
+        "--record-findings", "test-monitor",
+    ])
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    expected_failures = [] if metrics_ready else ["prometheus_unready"]
+    assert result == (0 if metrics_ready else 1)
+    assert payload["failures"] == expected_failures
+    assert payload["unit_health"]["error"] is None
+    assert payload["unit_health"]["crash_loops"] == []
+    assert recorded[0][1] == tuple(expected_failures)
+    assert captured.err.splitlines() == [
+        "WARNING: crash-loop detection is degraded (no finding): "
+        f"cannot persist restart samples at {state_file}"
+    ]
+    if storage == "missing":
+        assert not directory.exists()
+
+
+def test_crash_loop_state_directory_resolution(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("STATE_DIRECTORY", f"{tmp_path}:{tmp_path / 'other'}")
+    assert infra_monitor._crash_loop_state_path() == tmp_path / "crash-loop-samples.json"
+    monkeypatch.delenv("STATE_DIRECTORY")
+    assert infra_monitor._crash_loop_state_path() == Path(
+        "/var/lib/voyn-infra-monitor/crash-loop-samples.json"
+    )
+
+
+def test_crash_loop_custom_threshold_and_window(restart_probe) -> None:
+    settings = {"crash_loop_restarts": 2, "crash_loop_window_seconds": 120}
+    restart_probe(1000, {"ollama.service": 7}, **settings)
+    assert restart_probe(1121, {"ollama.service": 13}, **settings).crash_loops == ()
+    assert restart_probe(1200, {"ollama.service": 16}, **settings).crash_loops == (
+        ("ollama.service", 3),
+    )
+
+
 def test_unit_health_parses_systemctl_show_blocks() -> None:
     units = infra_monitor.parse_unit_show(SHOW_OUTPUT)
     assert units["ollama.service"].restarts == 315891
@@ -943,9 +1176,10 @@ def test_service_names_survive_headers_markers_and_the_legend() -> None:
 
 def test_a_crash_looping_unit_is_a_finding_and_instances_collapse_by_template() -> None:
     snapshot = infra_monitor.evaluate_unit_health(
-        infra_monitor.parse_unit_show(SHOW_OUTPUT), crash_loop_restarts=5
+        infra_monitor.parse_unit_show(SHOW_OUTPUT), crash_loop_restarts=5,
+        restart_growth={"ollama.service": 6},
     )
-    assert snapshot.crash_loops == (("ollama.service", 315891),)
+    assert snapshot.crash_loops == (("ollama.service", 6),)
     # Per-connection template instances are one failed template with a count,
     # not one finding per connection.
     assert snapshot.failed_units == (("aicc-agent-launcher@*.service", 2),)
@@ -958,7 +1192,7 @@ def test_a_crash_looping_unit_is_a_finding_and_instances_collapse_by_template() 
         unit_health=snapshot,
     )
     assert set(report.failures) == {
-        "crash_loop:1:ollama.service=315891",
+        "crash_loop:1:ollama.service=6",
         "failed_units:1:aicc-agent-launcher@*.service=2",
     }
     assert {infra_monitor.finding_key(f) for f in report.failures} == {
@@ -976,7 +1210,12 @@ def test_crash_looping_template_instances_collapse_to_the_highest_count() -> Non
         ]
     )
     snapshot = infra_monitor.evaluate_unit_health(
-        infra_monitor.parse_unit_show(show), crash_loop_restarts=5
+        infra_monitor.parse_unit_show(show), crash_loop_restarts=5,
+        restart_growth={
+            "aicc-agent-launcher@1-1-984.service": 7,
+            "aicc-agent-launcher@2-2-984.service": 12,
+            "aicc-agent-launcher@3-3-984.service": 5,
+        },
     )
     assert snapshot.crash_loops == (("aicc-agent-launcher@*.service", 12),)
 
@@ -987,7 +1226,8 @@ def test_the_finding_detail_is_capped_not_unbounded() -> None:
         for i in range(infra_monitor.UNIT_LISTING_CAP + 3)
     )
     snapshot = infra_monitor.evaluate_unit_health(
-        infra_monitor.parse_unit_show(show), crash_loop_restarts=5
+        infra_monitor.parse_unit_show(show), crash_loop_restarts=5,
+        restart_growth={f"svc{i}.service": 9 for i in range(infra_monitor.UNIT_LISTING_CAP + 3)},
     )
     report = infra_monitor.evaluate(
         {}, None, minimum_active_workers=0, max_stalled_seconds=900,
@@ -999,19 +1239,21 @@ def test_the_finding_detail_is_capped_not_unbounded() -> None:
     assert failure.count("=9") == infra_monitor.UNIT_LISTING_CAP
 
 
-def test_the_threshold_boundary_is_inclusive_and_a_few_restarts_are_not_a_loop() -> None:
+def test_the_threshold_boundary_is_exclusive_and_a_few_restarts_are_not_a_loop() -> None:
     show = "\n".join(
         [
             SHOW_HEALTHY,
             SHOW_FEW_RESTARTS,
             _show_block("exactly.service", 5, "active"),
             _show_block("almost.service", 4, "active"),
+            _show_block("above.service", 6, "active"),
         ]
     )
     snapshot = infra_monitor.evaluate_unit_health(
-        infra_monitor.parse_unit_show(show), crash_loop_restarts=5
+        infra_monitor.parse_unit_show(show), crash_loop_restarts=5,
+        restart_growth={"exactly.service": 5, "almost.service": 4, "above.service": 6},
     )
-    assert snapshot.crash_loops == (("exactly.service", 5),)
+    assert snapshot.crash_loops == (("above.service", 6),)
     assert snapshot.failed_units == ()
 
     quiet = infra_monitor.evaluate_unit_health(
@@ -1041,9 +1283,13 @@ def test_unit_health_probe_failure_fails_closed() -> None:
 
 
 def test_unit_health_snapshot_asks_systemctl_for_every_service_and_never_raises(
-    monkeypatch,
+    monkeypatch, tmp_path,
 ) -> None:
     calls: list[list[str]] = []
+    monkeypatch.setattr(infra_monitor.time, "time", lambda: 1000)
+    (tmp_path / "crash-loop-samples.json").write_text(
+        json.dumps({"ollama.service": [[880, 315885]]}), encoding="utf-8"
+    )
 
     def _run(args, **_kwargs):
         calls.append(args)
@@ -1069,7 +1315,7 @@ def test_unit_health_snapshot_asks_systemctl_for_every_service_and_never_raises(
     monkeypatch.setattr(infra_monitor.subprocess, "run", _run)
     snapshot = infra_monitor.read_unit_health_snapshot(crash_loop_restarts=5)
     assert snapshot.error is None
-    assert snapshot.crash_loops == (("ollama.service", 315891),)
+    assert snapshot.crash_loops == (("ollama.service", 6),)
     assert snapshot.failed_units == (("aicc-agent-launcher@*.service", 2),)
     listing, show = calls
     assert listing[:2] == ["systemctl", "list-units"]
@@ -1189,13 +1435,14 @@ def test_a_unit_this_host_does_have_is_still_a_fault_when_it_fails() -> None:
         ]
     )
     snapshot = infra_monitor.evaluate_unit_health(
-        infra_monitor.parse_unit_show(show), crash_loop_restarts=5
+        infra_monitor.parse_unit_show(show), crash_loop_restarts=5,
+        restart_growth={"ollama.service": 6},
     )
     assert snapshot.failed_units == (
         ("voyn-aicc-pgtunnel.service", 1),
         ("voyn-aicc-source-clone-refresh.service", 1),
     )
-    assert snapshot.crash_loops == (("ollama.service", 315891),)
+    assert snapshot.crash_loops == (("ollama.service", 6),)
     assert snapshot.retired_units == (("voyn-aicc-worker-2.service", 1),)
 
     report = infra_monitor.evaluate(
@@ -1602,15 +1849,25 @@ def test_a_half_configured_deploy_lag_probe_is_a_usage_error() -> None:
         )
     with pytest.raises(SystemExit):
         infra_monitor.parse_args(["--prometheus-url", "http://m/ready", "--crash-loop-restarts", "0"])
+    with pytest.raises(SystemExit):
+        infra_monitor.parse_args(["--prometheus-url", "http://m/ready", "--crash-loop-window-seconds", "0"])
+    defaults = infra_monitor.parse_args(["--prometheus-url", "http://m/ready"])
+    assert defaults.crash_loop_restarts == 5
+    assert defaults.crash_loop_window_seconds == 600
 
 
 def test_main_reports_the_host_probes_when_enabled(monkeypatch, capsys) -> None:
     monkeypatch.setattr(infra_monitor, "prometheus_is_ready", lambda _url: True)
+
+    def unit_health(crash_loop_restarts, crash_loop_window_seconds):
+        assert crash_loop_restarts == 3
+        assert crash_loop_window_seconds == 240
+        return infra_monitor.UnitHealthSnapshot(
+            crash_loops=(("ollama.service", 6),), failed_units=()
+        )
+
     monkeypatch.setattr(
-        infra_monitor, "read_unit_health_snapshot",
-        lambda crash_loop_restarts: infra_monitor.UnitHealthSnapshot(
-            crash_loops=(("ollama.service", 315891),), failed_units=()
-        ),
+        infra_monitor, "read_unit_health_snapshot", unit_health,
     )
     monkeypatch.setattr(
         infra_monitor, "read_deploy_lag_snapshot",
@@ -1621,12 +1878,13 @@ def test_main_reports_the_host_probes_when_enabled(monkeypatch, capsys) -> None:
             "--skip-workers", "--skip-queue", "--minimum-active-workers", "0",
             "--prometheus-url", "http://m/ready",
             "--unit-health",
+            "--crash-loop-restarts", "3", "--crash-loop-window-seconds", "240",
             "--deploy-lag-repo", "voyn88/voyn-logistics-crm",
             "--deploy-lag-version-url", "http://127.0.0.1:8089/version",
         ]
     )
     payload = json.loads(capsys.readouterr().out)
-    assert payload["unit_health"]["crash_loops"] == [["ollama.service", 315891]]
+    assert payload["unit_health"]["crash_loops"] == [["ollama.service", 6]]
     assert payload["deploy_lag"]["lagging"] is True
     assert payload["deploy_lag"]["undeployed_commits"] == 6
     assert any(f.startswith("crash_loop:") for f in payload["failures"])
