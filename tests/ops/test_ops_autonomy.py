@@ -1568,7 +1568,10 @@ def test_installer_uses_the_release_venv_and_imports_from_the_release(tmp_path):
     ):
         text = (tmp_path / "units" / f"{unit}.service.d" / "layout.conf").read_text()
         assert f"WorkingDirectory={current}\n" in text
-        assert f"ExecStart={current}/.venv/bin/python -m command_center.ops.{module}" in text
+        assert (
+            f"ExecStart={current}/.venv/bin/python -m command_center.ops.{module}"
+            in text
+        )
     assert _run_installer(env, "--uninstall").returncode == 0
     assert not list((tmp_path / "units").glob("*.service.d"))
 
@@ -1669,7 +1672,9 @@ def test_sticky_release_directories_are_refused_on_a_host(tmp_path):
             assert str(path) in done.stderr, (oct(mode), target)
 
 
-def test_a_release_outside_trusted_ownership_is_refused_without_test_variables(tmp_path):
+def test_a_release_outside_trusted_ownership_is_refused_without_test_variables(
+    tmp_path,
+):
     env = _releases_layout(tmp_path)
     for name in ("AICC_OPS_TRUST_OWNER", "AICC_OPS_TEST_ROOT"):
         env.pop(name)
@@ -1677,6 +1682,131 @@ def test_a_release_outside_trusted_ownership_is_refused_without_test_variables(t
     assert done.returncode != 0
     assert "must be owned by root" in done.stderr
 
+
+# --------------------------------------------------------------------------
+# CTO condition for --live: data the guard must never list as removable
+
+#: one example path per thing the CRM CTO named as untouchable
+_NEVER_EXAMPLES = [
+    "/var/lib/postgresql/16/main",
+    "/var/lib/pgbackrest/archive",
+    "/etc/pgbackrest/pgbackrest.conf",
+    "/home/svc/.local/state/voyn-crm/migrations",
+    "/opt/voyn-crm/releases/20261113",
+    "/srv/voyn/attachments/2026",
+    "/home/svc/actions-runner/_work",
+    "/var/lib/docker/overlay2",
+]
+
+
+@pytest.mark.parametrize("example", _NEVER_EXAMPLES)
+def test_named_data_paths_are_protected_by_name(example, tmp_path):
+    assert disk_guard.is_protected(Path(example))
+    assert disk_guard.refused_path(Path(example), cache=False) is not None
+    assert disk_guard.never_reason(Path(example), _cfg(tmp_path)) == "protected_name"
+
+
+def test_a_configured_never_path_blocks_itself_its_children_and_its_parents(tmp_path):
+    keep = tmp_path / "area" / "data-store"
+    keep.mkdir(parents=True)
+    cfg = _cfg(tmp_path, OPS_DISK_NEVER_PATHS=str(keep))
+    assert disk_guard.never_reason(keep, cfg) == "never_path"
+    assert disk_guard.never_reason(keep / "child", cfg) == "never_path"
+    assert disk_guard.never_reason(tmp_path / "area", cfg) == "never_path"
+    assert disk_guard.never_reason(tmp_path / "elsewhere", cfg) is None
+
+
+def test_a_never_path_clone_is_not_reported_as_removable_even_in_dry_run(tmp_path):
+    cfg = _cfg(tmp_path, OPS_DISK_GUARD_DRY_RUN="1")
+    clone = _clone(tmp_path / "clones", "ok-clone")
+    cfg.never_paths = (clone,)
+    journal, lines = _journal(tmp_path)
+    run = _fake_runner({"ok-clone": {"pulls": [_pr("MERGED", 10)]}})
+    result = disk_guard.run_guard(
+        cfg, runner=run, journal=journal, free_pct=_low, cwds=[], mounts=[]
+    )
+    assert result["would_remove"] == []
+    assert clone.exists()
+    assert any('"never_path"' in line for line in lines)
+
+
+@pytest.mark.parametrize(
+    "ignored",
+    [
+        ".env",
+        "app/.env.production",
+        "data/app.sqlite3",
+        "db/local.db",
+        "keys/x.pem",
+        "pgdata/PG_VERSION",
+        "\u043a\u043b\u044e\u0447.pem",
+        "certs/a.p12",
+        "dump/prod.sql",
+        "home/id_rsa",
+        "cfg/credentials.json",
+        "prod.env",
+    ],
+)
+def test_a_clone_with_sensitive_ignored_files_is_kept(tmp_path, ignored):
+    assert disk_guard.sensitive_ignored(ignored)
+    root = tmp_path / "clones"
+    root.mkdir()
+    _clone(root, "local-data")
+
+    def run(argv, timeout=30):
+        if "ls-files" in argv:
+            return 0, "node_modules/a.js\0" + ignored + "\0", ""
+        return _fake_runner({"local-data": {"pulls": [_pr("MERGED", 10)]}})(
+            argv, timeout
+        )
+
+    cfg = _cfg(tmp_path)
+    candidates, skipped = disk_guard.plan_clones(
+        cfg, now=time.time(), runner=run, cwds=[], mounts=[]
+    )
+    assert candidates == []
+    assert skipped[0]["why"] == "sensitive_ignored_file"
+
+
+def test_ordinary_ignored_files_and_example_env_files_do_not_block(tmp_path):
+    assert (
+        disk_guard.sensitive_ignored("node_modules/x/index.js\n.env.example\n") is None
+    )
+
+
+def test_unreadable_ignored_listing_keeps_the_clone(tmp_path):
+    root = tmp_path / "clones"
+    root.mkdir()
+    _clone(root, "odd")
+
+    def run(argv, timeout=30):
+        if "ls-files" in argv:
+            return 1, "", "boom"
+        return _fake_runner({"odd": {"pulls": [_pr("MERGED", 10)]}})(argv, timeout)
+
+    candidates, skipped = disk_guard.plan_clones(
+        _cfg(tmp_path), now=time.time(), runner=run, cwds=[], mounts=[]
+    )
+    assert candidates == [] and skipped[0]["why"] == "ignored_files_unreadable"
+
+
+def test_the_ignored_listing_is_requested_nul_separated_so_names_are_never_quoted(
+    tmp_path,
+):
+    seen: list[list[str]] = []
+
+    def run(argv, timeout=30):
+        seen.append(list(argv))
+        return _fake_runner({"c": {"pulls": [_pr("MERGED", 10)]}})(argv, timeout)
+
+    root = tmp_path / "clones"
+    root.mkdir()
+    _clone(root, "c")
+    disk_guard.plan_clones(
+        _cfg(tmp_path), now=time.time(), runner=run, cwds=[], mounts=[]
+    )
+    listing = [a for a in seen if "ls-files" in a]
+    assert listing and "-z" in listing[0]
 
 def test_test_variables_do_nothing_without_the_nonroot_switch(tmp_path):
     env = _releases_layout(tmp_path)
@@ -1892,3 +2022,120 @@ def test_the_probe_has_a_runtime_limit_and_ignores_overrides_off_the_test_switch
         capture_output=True, text=True,
     )
     assert done.returncode != 0
+
+# switching the owner-Mac review path off and back on
+
+MAC_SCRIPT = ROOT / "ops/mac-path.sh"
+_MARKER = "needle-text-that-must-never-be-printed"
+
+
+def _mac_env(tmp_path):
+    control = tmp_path / "executor-routing.env"
+    worker = tmp_path / "executors.env"
+    lines = ["AICC_EXECUTOR_PROFILE=owner-cascade", "AICC_CLAUDE_MAC_ENABLED=1"]
+    lines.append(f"SOME_VALUE={_MARKER}")
+    control.write_text("\n".join(lines) + "\n")
+    control.chmod(0o640)
+    worker.write_text("OTHER=1\n")
+    return {
+        **os.environ,
+        "AICC_MAC_PATH_FILES": f"{control} {worker} {tmp_path / 'absent.env'}",
+        "AICC_OPS_ALLOW_NONROOT": "1",
+    }, control, worker
+
+
+def _mac(env, *args):
+    return subprocess.run(
+        ["bash", str(MAC_SCRIPT), *args], env=env, capture_output=True, text=True
+    )
+
+
+def test_mac_path_off_changes_one_line_keeps_a_copy_and_prints_no_content(tmp_path):
+    env, control, worker = _mac_env(tmp_path)
+    original = control.read_text()
+    done = _mac(env, "off")
+    assert done.returncode == 0, done.stderr
+    assert _MARKER not in done.stdout + done.stderr
+    assert control.read_text() == original.replace(
+        "AICC_CLAUDE_MAC_ENABLED=1", "AICC_CLAUDE_MAC_ENABLED=0"
+    )
+    assert (control.stat().st_mode & 0o777) == 0o640
+    backups = list(tmp_path.glob("executor-routing.env.before-mac-off-*"))
+    assert len(backups) == 1 and backups[0].read_text() == original
+    assert worker.read_text() == "OTHER=1\n"  # no key there: untouched, not created
+    assert "not set" in done.stdout and "changed files: 1" in done.stdout
+
+
+def test_mac_path_off_twice_is_a_no_op_and_on_puts_the_line_back(tmp_path):
+    env, control, _ = _mac_env(tmp_path)
+    original = control.read_text()
+    assert _mac(env, "off").returncode == 0
+    again = _mac(env, "off")
+    assert "changed files: 0" in again.stdout
+    assert len(list(tmp_path.glob("executor-routing.env.before-mac-off-*"))) == 1
+    control.write_text(control.read_text() + "ADDED=later\n")
+    back = _mac(env, "on")
+    assert back.returncode == 0, back.stderr
+    assert control.read_text() == original + "ADDED=later\n"
+
+
+def test_mac_path_status_shows_only_the_flag(tmp_path):
+    env, control, _ = _mac_env(tmp_path)
+    done = _mac(env, "status")
+    assert "AICC_CLAUDE_MAC_ENABLED=1" in done.stdout
+    assert _MARKER not in done.stdout and "owner-cascade" not in done.stdout
+    assert "not on this host" in done.stdout
+
+
+def test_mac_path_needs_root_and_a_known_action(tmp_path):
+    env, _, _ = _mac_env(tmp_path)
+    assert _mac(env, "nonsense").returncode != 0
+    env.pop("AICC_OPS_ALLOW_NONROOT")
+    done = _mac(env, "off")
+    assert done.returncode != 0 and "run as root" in done.stderr
+
+
+def test_the_mac_path_commands_use_only_console_safe_characters():
+    for line in MAC_SCRIPT.read_text().splitlines():
+        if line.startswith("#   bash /opt/aicc/current/ops/mac-path.sh"):
+            command = line.removeprefix("#   ").split("  ")[0]
+            assert all(ch.islower() or ch.isdigit() or ch in " -./" for ch in command)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        'AICC_CLAUDE_MAC_ENABLED="1"',
+        "export AICC_CLAUDE_MAC_ENABLED=1",
+        "AICC_CLAUDE_MAC_ENABLED=1 # owner",
+        "AICC_CLAUDE_MAC_ENABLED=yes",
+    ],
+)
+def test_mac_path_off_refuses_to_call_an_unusual_line_switched_off(tmp_path, line):
+    env, control, _ = _mac_env(tmp_path)
+    control.write_text(f"A=1\n{line}\nB=2\n")
+    done = _mac(env, "off")
+    assert done.returncode != 0
+    assert "NOT switched off" in done.stdout
+    assert control.read_text() == f"A=1\n{line}\nB=2\n"  # left exactly as it was
+    assert not list(tmp_path.glob("executor-routing.env.before-mac-off-*"))
+
+
+def test_mac_path_leaves_no_temporary_copy_and_ignores_the_file_override_off_the_switch(
+    tmp_path,
+):
+    env, control, _ = _mac_env(tmp_path)
+    assert _mac(env, "off").returncode == 0
+    assert not list(tmp_path.glob("*.tmp.*"))
+    env.pop("AICC_OPS_ALLOW_NONROOT")
+    done = _mac(env, "status")
+    assert done.returncode != 0  # root is required first; the override is moot
+
+
+def test_mac_path_on_does_not_invent_a_missing_line(tmp_path):
+    env, control, _ = _mac_env(tmp_path)
+    assert _mac(env, "off").returncode == 0
+    control.write_text("ONLY=this\n")
+    done = _mac(env, "on")
+    assert "no AICC_CLAUDE_MAC_ENABLED line now" in done.stdout
+    assert control.read_text() == "ONLY=this\n"
