@@ -351,7 +351,7 @@ def test_asking_for_more_than_the_app_has_is_a_clear_error_and_not_retried(code,
     target = tmp_path / "t"
     rc = module.main(_args(
         tmp_path, "--permission", "contents=read", "--permission", "administration=write",
-        "--repository", "voyn-backlog", "--token-file", str(target),
+        "--repository", "voyn-backlog", "--token-file", str(target), "--allow-write",
     ))
     err = capsys.readouterr().err
     assert rc == 3
@@ -368,3 +368,101 @@ def test_an_existing_narrow_token_file_is_replaced_not_widened(tmp_path):
     module.store_narrow({"token": _TOKEN}, target)
     assert target.read_text() == _TOKEN + "\n"
     assert stat.S_IMODE(target.stat().st_mode) == 0o600
+
+
+def test_a_wider_reply_than_requested_is_never_stored(tmp_path, monkeypatch, capsys):
+    module = _module()
+    monkeypatch.setattr(module, "_openssl_sign", lambda pem, payload: b"s")
+
+    def reply(extra_permissions, repos):
+        class _R(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def urlopen(request, timeout):
+            return _R(json.dumps({
+                "token": _TOKEN, "expires_at": "x",
+                "permissions": {"contents": "read", "metadata": "read", **extra_permissions},
+                "repositories": [{"name": r, "full_name": f"voyn88/{r}"} for r in repos],
+            }).encode())
+        monkeypatch.setattr(module.urllib.request, "urlopen", urlopen)
+
+    cases = [
+        ({"contents": "write"}, ["voyn-backlog"]),       # wider level
+        ({"pull_requests": "read"}, ["voyn-backlog"]),   # extra permission
+        ({}, ["voyn-backlog", "aios"]),                  # extra repository
+        ({}, ["aios"]),                                  # different repository
+        ({}, []),                                        # none
+    ]
+    for i, (extra, repos) in enumerate(cases):
+        reply(extra, repos)
+        target = tmp_path / f"t{i}"
+        rc = module.main(_args(tmp_path, "--permission", "contents=read", "--repository", "voyn-backlog",
+                               "--token-file", str(target)))
+        assert rc == 2 and not target.exists(), cases[i]
+    reply({}, ["voyn-backlog"])
+    assert module.main(_args(tmp_path, "--permission", "contents=read", "--repository", "voyn-backlog",
+                             "--token-file", str(tmp_path / "ok"))) == 0
+    assert _TOKEN not in capsys.readouterr().err
+
+
+def test_an_unreadable_reply_without_permissions_is_not_stored(tmp_path):
+    module = _module()
+    with pytest.raises(ValueError):
+        module.check_narrow_response({"token": _TOKEN}, ["r"], {"contents": "read"})
+
+
+def test_the_token_directory_must_be_closed_to_other_writers(tmp_path):
+    module = _module()
+    for mode in (0o777, 0o770, 0o720):
+        d = tmp_path / f"d{mode:o}"
+        d.mkdir()
+        d.chmod(mode)
+        with pytest.raises(ValueError):
+            module.store_narrow({"token": _TOKEN}, d / "t")
+        assert not (d / "t").exists()
+    ok = tmp_path / "ok"
+    ok.mkdir()
+    ok.chmod(0o700)
+    module.store_narrow({"token": _TOKEN}, ok / "t")
+    assert (ok / "t").read_text() == _TOKEN + "\n"
+
+
+def test_write_levels_need_the_explicit_flag(tmp_path, monkeypatch):
+    module = _module()
+    calls = []
+    _fake_urlopen(module, monkeypatch, calls=calls)
+    base = _args(tmp_path, "--permission", "contents=write", "--repository", "r", "--token-file", str(tmp_path / "t"))
+    assert module.main(base) == 2 and calls == []
+    assert module.main(base + ["--allow-write"]) == 0
+    assert calls == [{"permissions": {"contents": "write"}, "repositories": ["r"]}]
+
+
+def test_other_failures_print_one_short_line_without_a_traceback(tmp_path, monkeypatch, capsys):
+    module = _module()
+    _fake_urlopen(module, monkeypatch, error=401)
+    rc = module.main(_args(tmp_path, "--permission", "contents=read", "--repository", "r", "--token-file", str(tmp_path / "t")))
+    assert rc == 4 and "HTTP 401" in capsys.readouterr().err
+
+    def boom(request, timeout):
+        raise urllib.error.URLError("secret-host.internal")
+    monkeypatch.setattr(module.urllib.request, "urlopen", boom)
+    rc = module.main(_args(tmp_path, "--permission", "contents=read", "--repository", "r", "--token-file", str(tmp_path / "t")))
+    err = capsys.readouterr().err
+    assert rc == 4 and "URLError" in err and "secret-host" not in err
+
+
+def test_the_narrow_mode_uses_the_given_app_identity_and_key_not_the_fleets(tmp_path, monkeypatch):
+    module = _module()
+    seen = {}
+    monkeypatch.setattr(module, "app_jwt", lambda app_id, pem, **k: seen.update(app=app_id, pem=pem) or "jwt")
+    _fake_urlopen(module, monkeypatch)
+    monkeypatch.setattr(module, "app_jwt", lambda app_id, pem, **k: seen.update(app=app_id, pem=pem) or "jwt")
+    reader_pem = tmp_path / "reader.pem"
+    rc = module.main(["--app-id", "777", "--installation-id", "888", "--pem", str(reader_pem),
+                      "--permission", "contents=read", "--repository", "voyn-backlog",
+                      "--token-file", str(tmp_path / "t")])
+    assert rc == 0 and seen == {"app": "777", "pem": reader_pem}
