@@ -1738,6 +1738,12 @@ def test_a_never_path_clone_is_not_reported_as_removable_even_in_dry_run(tmp_pat
         "db/local.db",
         "keys/x.pem",
         "pgdata/PG_VERSION",
+        "\u043a\u043b\u044e\u0447.pem",
+        "certs/a.p12",
+        "dump/prod.sql",
+        "home/id_rsa",
+        "cfg/credentials.json",
+        "prod.env",
     ],
 )
 def test_a_clone_with_sensitive_ignored_files_is_kept(tmp_path, ignored):
@@ -1748,7 +1754,7 @@ def test_a_clone_with_sensitive_ignored_files_is_kept(tmp_path, ignored):
 
     def run(argv, timeout=30):
         if "ls-files" in argv:
-            return 0, ignored + "\n", ""
+            return 0, "node_modules/a.js\0" + ignored + "\0", ""
         return _fake_runner({"local-data": {"pulls": [_pr("MERGED", 10)]}})(
             argv, timeout
         )
@@ -1781,3 +1787,22 @@ def test_unreadable_ignored_listing_keeps_the_clone(tmp_path):
         _cfg(tmp_path), now=time.time(), runner=run, cwds=[], mounts=[]
     )
     assert candidates == [] and skipped[0]["why"] == "ignored_files_unreadable"
+
+
+def test_the_ignored_listing_is_requested_nul_separated_so_names_are_never_quoted(
+    tmp_path,
+):
+    seen: list[list[str]] = []
+
+    def run(argv, timeout=30):
+        seen.append(list(argv))
+        return _fake_runner({"c": {"pulls": [_pr("MERGED", 10)]}})(argv, timeout)
+
+    root = tmp_path / "clones"
+    root.mkdir()
+    _clone(root, "c")
+    disk_guard.plan_clones(
+        _cfg(tmp_path), now=time.time(), runner=run, cwds=[], mounts=[]
+    )
+    listing = [a for a in seen if "ls-files" in a]
+    assert listing and "-z" in listing[0]

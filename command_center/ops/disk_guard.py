@@ -90,7 +90,20 @@ PROTECTED_TOKENS = (
 )
 #: Names that, present as an IGNORED file inside a clone, mean the clone holds
 #: data that exists nowhere else (``git status`` does not list ignored files).
-SENSITIVE_IGNORED_NAMES = (".env", ".sqlite", ".sqlite3", ".db", ".pem", ".key")
+SENSITIVE_IGNORED_SUFFIXES = (
+    ".env",
+    ".sqlite",
+    ".sqlite3",
+    ".db",
+    ".pem",
+    ".key",
+    ".p12",
+    ".pfx",
+    ".kdbx",
+    ".dump",
+    ".sql",
+)
+SENSITIVE_IGNORED_PREFIXES = ("id_rsa", "id_ed25519", "id_ecdsa", "credentials")
 SENSITIVE_IGNORED_DIRS = ("pgdata", "attachments", "uploads", "backups", "backup")
 KEEP_MARKER = ".aicc-keep"
 #: Roots and caches must be at least this deep (``/a/b/c``) and never one of
@@ -250,20 +263,24 @@ def never_reason(path: Path, cfg: Config) -> str | None:
 
 
 def sensitive_ignored(listing: str) -> str | None:
-    """First ignored file name in a ``git ls-files --others --ignored`` listing
-    that marks irreplaceable local data (env files, databases, keys)."""
-    for line in listing.splitlines():
-        parts = [part.lower() for part in line.split("/") if part]
+    """First ignored file in a ``git ls-files -z --others --ignored`` listing
+    (NUL separated, so no quoting of non-ASCII names) that marks irreplaceable
+    local data: env files, databases, dumps, keys, credentials."""
+    for entry in listing.replace("\n", "\0").split("\0"):
+        parts = [part.lower() for part in entry.split("/") if part]
         if not parts:
             continue
         name = parts[-1]
-        if name == ".env" or name.startswith(".env."):
-            if not name.endswith((".example", ".sample", ".template")):
-                return line
-        elif name.endswith(SENSITIVE_IGNORED_NAMES[1:]):
-            return line
+        if name.startswith(".env") and not name.endswith(
+            (".example", ".sample", ".template")
+        ):
+            return entry
+        if name.endswith(SENSITIVE_IGNORED_SUFFIXES):
+            return entry
+        if name.startswith(SENSITIVE_IGNORED_PREFIXES) and not name.endswith(".pub"):
+            return entry
         if any(part in SENSITIVE_IGNORED_DIRS for part in parts[:-1]):
-            return line
+            return entry
     return None
 
 
@@ -494,7 +511,7 @@ def clone_verdict(
         return False, "has_stash"
     # ignored files are invisible to `status`: .env, local databases, keys
     ignored = _git(
-        path, ["ls-files", "--others", "--ignored", "--exclude-standard"], runner
+        path, ["ls-files", "-z", "--others", "--ignored", "--exclude-standard"], runner
     )
     if ignored is None:
         return False, "ignored_files_unreadable"
