@@ -349,7 +349,21 @@ def minimal_view(doc: Mapping[str, Any], low_free_pct: int) -> dict[str, Any]:
         "degraded_count": reasons,
         "disk_free_pct": free,
         "last_verdict_age_min": doc.get("last_verdict_age_min"),
+        "mac_review_link": mac_link_word(doc),
     }
+
+
+def mac_link_word(doc: Mapping[str, Any]) -> str | None:
+    """Is the owner-Mac review tunnel up?  ``up`` / ``down`` on a worker (its
+    loopback is where the tunnel ends), ``None`` elsewhere.  A fixed word, no
+    address; it does not count as a degraded reason: after the Mac path is
+    switched off, ``down`` is the expected state."""
+    if doc.get("role") != "worker":
+        return None
+    listening = (doc.get("review_tunnel") or {}).get("listening")
+    if listening is None:
+        return None
+    return "up" if listening else "down"
 
 
 def render(doc: Mapping[str, Any]) -> str:
