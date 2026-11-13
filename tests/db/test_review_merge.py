@@ -2369,6 +2369,49 @@ def test_unchanged_branch_update_does_not_mark_priority(rig, monkeypatch):  # no
     ) == []
 
 
+def test_priority_pop_returns_fifo_with_deterministic_ties(rig, admin_conn):  # noqa: F811
+    app_factory, store, _ = rig
+    from tests.db.test_backlog_planner import _task
+
+    # Physical insertion order differs from timestamp, task and PR order.
+    entries = [
+        ("VOYN-W0-PRIO-B", "https://github.com/x/repo-d2/pull/402", "2026-01-03"),
+        ("VOYN-W0-PRIO-A", "https://github.com/x/repo-d2/pull/402", "2026-01-02"),
+        ("VOYN-W0-PRIO-C", "https://github.com/x/repo-d2/pull/401", "2026-01-01"),
+        ("VOYN-W0-PRIO-A", "https://github.com/x/repo-d2/pull/401", "2026-01-02"),
+        ("VOYN-W0-PRIO-D", "https://github.com/x/repo-d2/pull/401", "2026-01-03"),
+    ]
+    for task_id in dict.fromkeys(task for task, _, _ in entries):
+        assert store.upsert_task(_task(task_id))[0]
+    marked = []
+    for i, (task_id, pr_url, queued_at) in enumerate(entries):
+        head = f"{i + 1:040x}"
+        assert review_merge._rows(
+            app_factory,
+            "SELECT ok FROM backlog_review_priority_mark(%s, %s, %s)",
+            (task_id, pr_url, head),
+        ) == [(True,)]
+        with admin_conn.cursor() as cur:
+            cur.execute(
+                "UPDATE backlog_review_priority SET queued_at = %s::timestamptz "
+                "WHERE task_id = %s AND pr_url = %s",
+                (queued_at + "T00:00:00Z", task_id, pr_url),
+            )
+        marked.append((task_id, pr_url, head))
+
+    def pop(limit):
+        return review_merge._rows(
+            app_factory, "SELECT * FROM backlog_review_priority_pop(%s)", (limit,),
+        )
+
+    assert pop(-1) == []
+    assert pop(0) == []
+    assert pop(2) == [marked[2], marked[3]]
+    assert pop(2) == [marked[1], marked[0]]
+    assert pop(10) == [marked[4]]
+    assert pop(10) == []
+
+
 def test_priority_review_precedes_rotation_and_keeps_rotation_share(
     rig, _test_repo_routes, monkeypatch  # noqa: F811
 ):

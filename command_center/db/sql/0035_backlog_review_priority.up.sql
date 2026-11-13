@@ -43,13 +43,19 @@ RETURNS TABLE (task_id text, pr_url text, expected_head text)
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path = pg_catalog, public AS $$
 BEGIN
     RETURN QUERY
-    DELETE FROM backlog_review_priority p
-     WHERE p.ctid IN (
-        SELECT r.ctid FROM backlog_review_priority r
-         ORDER BY r.queued_at, r.task_id, r.pr_url
-         LIMIT greatest(p_limit, 0)
-     )
-    RETURNING p.task_id, p.pr_url, p.expected_head;
+    -- Ordering the limited selection does not order DELETE's RETURNING rows.
+    -- Preserve FIFO (with primary-key tie-breakers) in the returned batch too.
+    WITH popped AS (
+        DELETE FROM backlog_review_priority p
+         WHERE p.ctid IN (
+            SELECT r.ctid FROM backlog_review_priority r
+             ORDER BY r.queued_at, r.task_id, r.pr_url
+             LIMIT greatest(p_limit, 0)
+         )
+        RETURNING p.task_id, p.pr_url, p.expected_head, p.queued_at
+    )
+    SELECT q.task_id, q.pr_url, q.expected_head FROM popped q
+     ORDER BY q.queued_at, q.task_id, q.pr_url;
 END
 $$;
 
