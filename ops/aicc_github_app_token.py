@@ -37,6 +37,7 @@ import base64
 import grp
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -64,6 +65,10 @@ CONTROL_PERMISSIONS = {
 }
 API = "https://api.github.com"
 JWT_LIFETIME_SECONDS = 540
+_PERMISSION_NAME = re.compile(r"^[a-z][a-z_]{0,63}$")
+_PERMISSION_LEVELS = ("read", "write", "admin")
+#: GitHub adds ``metadata: read`` to every installation token by itself.
+_IMPLICIT_PERMISSIONS = {"metadata": "read"}
 
 
 def _b64(raw: bytes) -> str:
@@ -181,6 +186,97 @@ def store(document: dict, root: Path, *, group: str = "aicc-worker", chown: bool
     )
 
 
+def parse_permissions(items) -> dict:
+    """``["contents=read", ...]`` -> ``{"contents": "read"}``; anything odd is a usage error."""
+    result: dict = {}
+    for item in items:
+        name, sep, level = str(item).partition("=")
+        if not sep or not _PERMISSION_NAME.match(name) or level not in _PERMISSION_LEVELS:
+            raise ValueError(f"--permission expects NAME=read|write|admin, got {item!r}")
+        if name in result and result[name] != level:
+            raise ValueError(f"--permission {name} given twice with different levels")
+        result[name] = level
+    return result
+
+
+def store_narrow(document: dict, path: Path, *, fleet_root: Path = DEFAULT_ROOT) -> None:
+    """Write a narrow-purpose token to ``path`` only: one file, 0600, never lane-readable.
+
+    The fleet store (`DEFAULT_ROOT`) is read by the agents, so a token minted for
+    one private repository must never land in it: the target may not be inside
+    the fleet store (checked on resolved paths, symlinks included). The file is
+    created owner-only from the first byte (no chmod window) and replaced
+    atomically; when run as root (the only way the App key is readable) the
+    owner is root. The directory the file lands in must be owned by the
+    caller and closed to group/other writes -- in a writable directory another
+    user could swap the temp file before the rename. The consumer must delete
+    the file after use; the token lives at most 60 minutes anyway."""
+    token = str(document["token"])
+    if not token.startswith(("ghs_", "ghp_")) or len(token) > 1024 or any(c.isspace() for c in token):
+        raise ValueError("installation token has an unexpected shape")
+    if not path.is_absolute():
+        raise ValueError("--token-file must be an absolute path")
+    target = path.parent.resolve() / path.name
+    for forbidden in {fleet_root.resolve(), DEFAULT_ROOT.resolve()}:
+        if target == forbidden or forbidden in target.parents:
+            raise ValueError(f"--token-file must not be inside the fleet token store {forbidden}")
+    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    info = target.parent.stat()
+    if info.st_uid != os.geteuid() or info.st_mode & 0o022:
+        raise ValueError(
+            f"{target.parent} must be owned by the current user and not writable by group or others"
+        )
+    tmp = target.with_name(target.name + ".tmp")
+    try:
+        tmp.unlink()
+    except FileNotFoundError:
+        pass
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(token + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, target)
+    dir_fd = os.open(target.parent, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
+def check_narrow_response(document: dict, repositories, permissions) -> None:
+    """Refuse a token GitHub issued wider than what was asked for.
+
+    Compared before anything is written: every returned permission must be one
+    that was requested (at most the requested level; GitHub's implicit
+    ``metadata: read`` is fine) and the returned repositories must be exactly
+    the requested names."""
+    rank = {level: i for i, level in enumerate(_PERMISSION_LEVELS)}
+    granted = document.get("permissions")
+    if not isinstance(granted, dict) or not granted:
+        raise ValueError("GitHub's reply carries no permissions to verify; token not stored")
+    allowed = {**_IMPLICIT_PERMISSIONS, **permissions}
+    for name, level in granted.items():
+        if name not in allowed or rank.get(level, 99) > rank[allowed[name]]:
+            raise ValueError(
+                f"GitHub issued a wider token than requested ({name}={level}); token not stored"
+            )
+    returned = document.get("repositories")
+    if not isinstance(returned, list):
+        raise ValueError("GitHub's reply carries no repository list to verify; token not stored")
+    names = {str(r.get("name") or str(r.get("full_name", "")).rpartition("/")[2]) for r in returned if isinstance(r, dict)}
+    if len(names) != len(returned) or names != set(repositories):
+        raise ValueError("GitHub issued the token for different repositories than requested; token not stored")
+
+
+def _refusal_text(exc: urllib.error.HTTPError) -> str:
+    try:
+        message = str(json.load(exc).get("message", ""))[:300]
+    except Exception:  # noqa: BLE001 - the body is advisory only
+        message = ""
+    return f"HTTP {exc.code}" + (f": {message}" if message else "")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--app-id", default=os.environ.get("AICC_GITHUB_APP_ID", ""))
@@ -188,10 +284,34 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--pem", type=Path, default=Path(os.environ.get("AICC_GITHUB_APP_PEM", str(DEFAULT_PEM))))
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT)
     parser.add_argument("--repository", action="append", default=None)
+    parser.add_argument(
+        "--permission",
+        action="append",
+        default=None,
+        metavar="NAME=LEVEL",
+        help="narrow-purpose token: request exactly these permissions (repeatable). "
+        "Requires --repository and --token-file; without it the fleet token is minted as before.",
+    )
+    parser.add_argument(
+        "--token-file",
+        type=Path,
+        default=None,
+        help="narrow-purpose token: absolute output file (0600, never inside the fleet store)",
+    )
+    parser.add_argument(
+        "--allow-write",
+        action="store_true",
+        help="narrow-purpose token: required to request a write/admin level (read-only otherwise)",
+    )
     args = parser.parse_args(argv)
     if not args.app_id or not args.installation_id:
         print("AICC_GITHUB_APP_ID and AICC_GITHUB_INSTALLATION_ID are required", file=sys.stderr)
         return 2
+    if args.permission is None and args.token_file is not None:
+        print("--token-file is only valid together with --permission", file=sys.stderr)
+        return 2
+    if args.permission is not None:
+        return _main_narrow(args)
     document = mint(
         args.app_id,
         args.installation_id,
@@ -205,6 +325,60 @@ def main(argv: list[str] | None = None) -> int:
         "expires_at": document.get("expires_at"),
         "permissions": document.get("permissions"),
         "repositories": [r.get("full_name") for r in document.get("repositories", [])],
+    }))
+    return 0
+
+
+def _main_narrow(args) -> int:
+    """A separate, narrow installation token (e.g. contents:read on one repository).
+
+    No defaults and no fallback: the caller names every repository and
+    permission, and a request the App cannot satisfy fails loudly instead of
+    silently minting something broader."""
+    try:
+        permissions = parse_permissions(args.permission)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    if not args.allow_write and any(level != "read" for level in permissions.values()):
+        print("--permission with write/admin needs the explicit --allow-write", file=sys.stderr)
+        return 2
+    if not args.repository or args.token_file is None:
+        print("--permission requires --repository and --token-file (no defaults for a narrow token)", file=sys.stderr)
+        return 2
+    try:
+        document = mint(
+            args.app_id,
+            args.installation_id,
+            args.pem,
+            repositories=args.repository,
+            permissions=permissions,
+        )
+    except urllib.error.HTTPError as exc:
+        if exc.code in (403, 404, 422):
+            print(
+                "GitHub refused the narrow token (" + _refusal_text(exc) + "): the App installation "
+                f"must include the repositories {list(args.repository)} and already hold "
+                f"{permissions}; a token cannot ask for more than the App has been granted",
+                file=sys.stderr,
+            )
+            return 3
+        print(f"GitHub token request failed ({_refusal_text(exc)})", file=sys.stderr)
+        return 4
+    except (urllib.error.URLError, OSError, subprocess.CalledProcessError, ValueError, KeyError) as exc:
+        print(f"narrow token could not be minted ({type(exc).__name__})", file=sys.stderr)
+        return 4
+    try:
+        check_narrow_response(document, args.repository, permissions)
+        store_narrow(document, args.token_file, fleet_root=args.root)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    print(json.dumps({
+        "expires_at": document.get("expires_at"),
+        "permissions": document.get("permissions"),
+        "repositories": [r.get("full_name") for r in document.get("repositories", [])],
+        "token_file": str(args.token_file),
     }))
     return 0
 
