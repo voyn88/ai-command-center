@@ -448,7 +448,7 @@ def test_the_columns_needing_value_conversion_are_the_documented_ones(
 ) -> None:
     """The map's headline hazard, pinned.
 
-    108 of 402 columns change type, and 78 of them are `TEXT` -> `timestamptz`.
+    112 of 420 columns change type, and 82 of them are `TEXT` -> `timestamptz`.
     `command_center/models.py:iso_now` writes naive local time with no offset, so
     those strings are reinterpreted under the importer's session time zone —
     a silent, unrecoverable shift. The count is asserted so the migration cannot
@@ -469,13 +469,13 @@ def test_the_columns_needing_value_conversion_are_the_documented_ones(
             elif target == "boolean" and declared.startswith("INT"):
                 conversions["boolean"] += 1
 
-    assert conversions["timestamptz"] == 78
+    assert conversions["timestamptz"] == 82
     assert conversions["jsonb"] == 22
     assert conversions["boolean"] == 8
-    assert sum(conversions.values()) == 108
+    assert sum(conversions.values()) == 112
     assert sum(
         len(spec["columns"]) for spec in postgres_schema["tables"].values()
-    ) == 402
+    ) == 420
 
 
 def test_the_migration_order_is_derivable_and_acyclic(postgres_schema) -> None:
@@ -501,5 +501,5 @@ def test_the_migration_order_is_derivable_and_acyclic(postgres_schema) -> None:
     # five-wave shape was in fact unpinned. The sizes are pinned instead: a table
     # that changes wave has changed its dependency position, which is a planning
     # fact the map states and therefore has to defend.
-    assert [len(w) for w in waves] == [11, 9, 1, 11, 2]
+    assert [len(w) for w in waves] == [12, 10, 1, 11, 2]
     assert waves[2] == ["run"], "wave 3 is the bottleneck ten wave-4 tables depend on"

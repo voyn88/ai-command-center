@@ -527,6 +527,30 @@ CREATE TABLE owner_item (
     project_ref text
 );
 
+CREATE TABLE counterfactual_decision (
+    id            text PRIMARY KEY,
+    title         text        NOT NULL,
+    description   text        NOT NULL DEFAULT '',
+    criticality   text        NOT NULL DEFAULT 'normal',
+    status        text        NOT NULL DEFAULT 'draft',
+    chosen_option text        NOT NULL DEFAULT '',
+    rationale     text        NOT NULL DEFAULT '',
+    owner         text,
+    project_ref   text,
+    decided_at    timestamptz,
+    version       integer     NOT NULL DEFAULT 0,
+    created_at    timestamptz NOT NULL,
+    updated_at    timestamptz NOT NULL
+);
+
+CREATE TABLE counterfactual_alternative (
+    id               text PRIMARY KEY,
+    decision_id      text        NOT NULL REFERENCES counterfactual_decision(id) ON DELETE CASCADE,
+    option           text        NOT NULL,
+    rejection_reason text        NOT NULL DEFAULT '',
+    created_at       timestamptz NOT NULL
+);
+
 CREATE INDEX idx_session_task_id ON session(task_id);
 CREATE INDEX idx_run_session_id ON run(session_id);
 CREATE INDEX idx_run_state ON run(state);
@@ -589,3 +613,7 @@ CREATE INDEX idx_model_entry_status ON model_entry(status);
 CREATE INDEX idx_model_event_model_id ON model_event(model_id);
 CREATE INDEX idx_owner_item_done ON owner_item(done);
 CREATE INDEX idx_owner_item_project ON owner_item(project_ref);
+CREATE INDEX idx_counterfactual_decision_criticality ON counterfactual_decision(criticality);
+CREATE INDEX idx_counterfactual_decision_project ON counterfactual_decision(project_ref);
+CREATE INDEX idx_counterfactual_decision_status ON counterfactual_decision(status);
+CREATE INDEX idx_counterfactual_alternative_decision ON counterfactual_alternative(decision_id);
