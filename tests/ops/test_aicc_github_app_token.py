@@ -466,3 +466,57 @@ def test_the_narrow_mode_uses_the_given_app_identity_and_key_not_the_fleets(tmp_
                       "--permission", "contents=read", "--repository", "voyn-backlog",
                       "--token-file", str(tmp_path / "t")])
     assert rc == 0 and seen == {"app": "777", "pem": reader_pem}
+
+
+def test_store_puts_the_directories_in_the_lane_group_not_just_the_files(tmp_path, monkeypatch):
+    """control-01 2026-11-14: the minter made the store directory root:root, so
+    the lane account could not traverse to the token it may read."""
+    module = _module()
+    calls = []
+    paths = {}
+    real_open = module.os.open
+
+    def tracking_open(path, flags, *a, **k):
+        fd = real_open(path, flags, *a, **k)
+        paths[fd] = Path(path)
+        return fd
+
+    monkeypatch.setattr(module.os, "open", tracking_open)
+    monkeypatch.setattr(module.os, "chown", lambda *a: None)
+    monkeypatch.setattr(module.os, "fchown", lambda fd, uid, gid: calls.append((paths[fd], uid, gid)))
+    monkeypatch.setattr(module.grp, "getgrnam", lambda name: type("G", (), {"gr_gid": 4242})())
+    root = tmp_path / "github"
+    module.store({"token": "ghs_secret", "expires_at": "x"}, root)
+    assert (root, 0, 4242) in calls
+    assert (root / "gh", 0, 4242) in calls
+    assert (root.stat().st_mode & 0o777) == 0o750
+    assert ((root / "gh").stat().st_mode & 0o777) == 0o750
+
+
+def test_store_tightens_a_directory_that_was_created_with_wider_rights(tmp_path, monkeypatch):
+    module = _module()
+    monkeypatch.setattr(module.os, "chown", lambda *a: None)
+    monkeypatch.setattr(module.os, "fchown", lambda *a: None)
+    monkeypatch.setattr(module.grp, "getgrnam", lambda name: type("G", (), {"gr_gid": 1})())
+    root = tmp_path / "github"
+    (root / "gh").mkdir(parents=True, mode=0o755)
+    os_chmod = __import__("os").chmod
+    os_chmod(root, 0o755)
+    module.store({"token": "ghs_secret", "expires_at": "x"}, root)
+    assert (root.stat().st_mode & 0o777) == 0o750
+
+
+def test_store_does_not_follow_a_link_standing_in_for_the_directory(tmp_path, monkeypatch):
+    module = _module()
+    monkeypatch.setattr(module.os, "chown", lambda *a: None)
+    monkeypatch.setattr(module.os, "fchown", lambda *a: None)
+    monkeypatch.setattr(module.grp, "getgrnam", lambda name: type("G", (), {"gr_gid": 1})())
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    elsewhere.chmod(0o755)
+    root = tmp_path / "github"
+    root.mkdir()
+    (root / "gh").symlink_to(elsewhere)
+    with pytest.raises(OSError):
+        module.store({"token": "ghs_secret", "expires_at": "x"}, root)
+    assert (elsewhere.stat().st_mode & 0o777) == 0o755  # untouched
