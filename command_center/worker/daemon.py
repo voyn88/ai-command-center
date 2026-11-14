@@ -114,6 +114,11 @@ class WorkerConfig:
     # from waiting long on a quiet host.
     idle_min_seconds: float = 1.0
     idle_max_seconds: float = 30.0
+    # None preserves the unpartitioned protocol for non-fleet callers. Fleet
+    # services set a complementary include/exclude filter so review capacity
+    # cannot be consumed by implementation work (or vice versa).
+    task_types: tuple[str, ...] | None = None
+    include_task_types: bool = True
 
 
 class WorkerDaemon:
@@ -279,10 +284,15 @@ class WorkerDaemon:
                     # written by a dying drain cycle can never stick.
                     self._notify("WATCHDOG=1\nSTATUS=aicc-ready")
                     self._attempt_active = True
-                    claimed = self._store.claim(
-                        self._config.queue,
-                        visibility_seconds=self._config.visibility_seconds,
-                    )
+                    claim_kwargs: dict[str, Any] = {
+                        "visibility_seconds": self._config.visibility_seconds
+                    }
+                    if self._config.task_types is not None:
+                        claim_kwargs.update(
+                            task_types=self._config.task_types,
+                            include_task_types=self._config.include_task_types,
+                        )
+                    claimed = self._store.claim(self._config.queue, **claim_kwargs)
                     if isinstance(claimed, QueueRefusal):
                         self._attempt_active = False
                 if isinstance(claimed, QueueRefusal):

@@ -79,7 +79,12 @@ class WorkQueueStore:
     # -- protocol -------------------------------------------------------------
 
     def claim(
-        self, queue: str, *, visibility_seconds: int = 300
+        self,
+        queue: str,
+        *,
+        visibility_seconds: int = 300,
+        task_types: tuple[str, ...] | None = None,
+        include_task_types: bool = True,
     ) -> ClaimedWork | QueueRefusal:
         """Claim the next ready item, or report why not.
 
@@ -90,10 +95,22 @@ class WorkQueueStore:
         """
         token = secrets.token_hex(32)
         token_hash = hashlib.sha256(token.encode("ascii")).hexdigest()
-        row = self._call(
-            "SELECT * FROM queue_claim(%s, %s, %s)",
-            (queue, token_hash, visibility_seconds),
-        )
+        if task_types is None:
+            row = self._call(
+                "SELECT * FROM queue_claim(%s, %s, %s)",
+                (queue, token_hash, visibility_seconds),
+            )
+        else:
+            row = self._call(
+                "SELECT * FROM queue_claim_by_task_types(%s, %s, %s, %s::jsonb, %s)",
+                (
+                    queue,
+                    token_hash,
+                    visibility_seconds,
+                    json.dumps(task_types),
+                    include_task_types,
+                ),
+            )
         if not row["ok"]:
             return QueueRefusal(reason=row["reason"])
         payload = row["payload"]

@@ -95,6 +95,39 @@ def test_a_claimed_item_is_dispatched_and_completed() -> None:
     assert ("complete", "wat-1", {"echoed": 1}) in store.calls
 
 
+def test_worker_passes_claim_lane_filter_to_store() -> None:
+    class FilterStore(ScriptedStore):
+        def claim(
+            self, queue, *, visibility_seconds, task_types=None, include_task_types=True
+        ):
+            self.calls.append(
+                ("claim_filter", queue, visibility_seconds, task_types, include_task_types)
+            )
+            return QueueRefusal(reason="no_work")
+
+    store = FilterStore([])
+    daemon = WorkerDaemon(
+        store,
+        {},
+        WorkerConfig(
+            visibility_seconds=3,
+            task_types=("independent_review", "verification_review"),
+            include_task_types=True,
+        ),
+    )
+    _run_until_idle(daemon, store)
+
+    assert store.calls == [
+        (
+            "claim_filter",
+            "execution",
+            3,
+            ("independent_review", "verification_review"),
+            True,
+        )
+    ]
+
+
 def test_a_failing_handler_reports_fail_not_complete() -> None:
     store = ScriptedStore([_work({"kind": "boom"})])
 
