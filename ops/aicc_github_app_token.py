@@ -154,6 +154,16 @@ def store(document: dict, root: Path, *, group: str = "aicc-worker", chown: bool
     gid = grp.getgrnam(group).gr_gid if chown else -1
     root.mkdir(mode=0o750, parents=True, exist_ok=True)
     (root / "gh").mkdir(mode=0o750, exist_ok=True)
+    # The store directories themselves must be root:<lane group> 0750 on every
+    # host.  A worker gets that from tmpfiles (aicc-agent.conf); a control host
+    # does not install that file, so the first mint created them root:root and
+    # the lane account (aicc-worker) could not even traverse to its own token
+    # (control-01 2026-11-14: beacon "no_token_file").  The directories hold
+    # only what the 0640 files already show to the same group.
+    for directory in (root, root / "gh"):
+        os.chmod(directory, 0o750)
+        if chown:
+            os.chown(directory, 0, gid)
 
     def put(path: Path, text: str, mode: int) -> None:
         tmp = path.with_name(path.name + ".tmp")
