@@ -115,6 +115,10 @@ def test_fleet_status_defaults_to_the_whole_fleet() -> None:
         ["fleet-status", "--state", "suspended", "--limit", "5"]
     )
     assert scoped.state == "suspended" and scoped.limit == 5
+    rooted = build_parser().parse_args(
+        ["fleet-status", "--workspace-root", "/tmp/task-clones"]
+    )
+    assert rooted.workspace_root == "/tmp/task-clones"
     with pytest.raises(SystemExit):
         build_parser().parse_args(["fleet-status", "--state", "bogus"])
 
