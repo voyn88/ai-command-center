@@ -2323,12 +2323,139 @@ def test_review_once_no_longer_enqueues_an_eager_adjudication(rig, _test_repo_ro
 
 # --- VOYN-W0-AICC-MERGE-TRAIN-COORDINATOR: keep behind PRs from gridlocking --
 
+
+def test_changed_branch_update_marks_exact_head_priority(rig, monkeypatch):  # noqa: F811
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-IVR-CHANGED"
+    pr_url = "https://github.com/x/y/pull/390"
+    _ready(store, app_factory, task_id, pr_url)
+    old_head, new_head = "a" * 40, "b" * 40
+    monkeypatch.setattr(
+        review_merge, "_pr_diff_and_head",
+        lambda *_: _snapshot_result(new_head, "diff --git a/x b/x\n+new\n"),
+    )
+
+    review_merge._mark_changed_head_for_priority_review(
+        app_factory, "/tmp", task_id, pr_url,
+        _snapshot_result(old_head, "diff --git a/x b/x\n+old\n"), new_head,
+    )
+
+    rows = review_merge._rows(
+        app_factory,
+        "SELECT task_id, pr_url, expected_head FROM backlog_review_priority",
+    )
+    assert rows == [(task_id, pr_url, new_head)]
+
+
+def test_unchanged_branch_update_does_not_mark_priority(rig, monkeypatch):  # noqa: F811
+    app_factory, store, _ = rig
+    task_id = "VOYN-W0-IVR-STABLE"
+    pr_url = "https://github.com/x/y/pull/391"
+    _ready(store, app_factory, task_id, pr_url)
+    old_head, new_head = "c" * 40, "d" * 40
+    stable_diff = "diff --git a/x b/x\n+stable\n"
+    monkeypatch.setattr(
+        review_merge, "_pr_diff_and_head",
+        lambda *_: _snapshot_result(new_head, stable_diff),
+    )
+
+    review_merge._mark_changed_head_for_priority_review(
+        app_factory, "/tmp", task_id, pr_url,
+        _snapshot_result(old_head, stable_diff), new_head,
+    )
+
+    assert review_merge._rows(
+        app_factory, "SELECT task_id FROM backlog_review_priority"
+    ) == []
+
+
+def test_priority_pop_returns_fifo_with_deterministic_ties(rig, admin_conn):  # noqa: F811
+    app_factory, store, _ = rig
+    from tests.db.test_backlog_planner import _task
+
+    # Physical insertion order differs from timestamp, task and PR order.
+    entries = [
+        ("VOYN-W0-PRIO-B", "https://github.com/x/repo-d2/pull/402", "2026-01-03"),
+        ("VOYN-W0-PRIO-A", "https://github.com/x/repo-d2/pull/402", "2026-01-02"),
+        ("VOYN-W0-PRIO-C", "https://github.com/x/repo-d2/pull/401", "2026-01-01"),
+        ("VOYN-W0-PRIO-A", "https://github.com/x/repo-d2/pull/401", "2026-01-02"),
+        ("VOYN-W0-PRIO-D", "https://github.com/x/repo-d2/pull/401", "2026-01-03"),
+    ]
+    for task_id in dict.fromkeys(task for task, _, _ in entries):
+        assert store.upsert_task(_task(task_id))[0]
+    marked = []
+    for i, (task_id, pr_url, queued_at) in enumerate(entries):
+        head = f"{i + 1:040x}"
+        assert review_merge._rows(
+            app_factory,
+            "SELECT ok FROM backlog_review_priority_mark(%s, %s, %s)",
+            (task_id, pr_url, head),
+        ) == [(True,)]
+        with admin_conn.cursor() as cur:
+            cur.execute(
+                "UPDATE backlog_review_priority SET queued_at = %s::timestamptz "
+                "WHERE task_id = %s AND pr_url = %s",
+                (queued_at + "T00:00:00Z", task_id, pr_url),
+            )
+        marked.append((task_id, pr_url, head))
+
+    def pop(limit):
+        return review_merge._rows(
+            app_factory, "SELECT * FROM backlog_review_priority_pop(%s)", (limit,),
+        )
+
+    assert pop(-1) == []
+    assert pop(0) == []
+    assert pop(2) == [marked[2], marked[3]]
+    assert pop(2) == [marked[1], marked[0]]
+    assert pop(10) == [marked[4]]
+    assert pop(10) == []
+
+
+def test_priority_review_precedes_rotation_and_keeps_rotation_share(
+    rig, _test_repo_routes, monkeypatch  # noqa: F811
+):
+    app_factory, store, _ = rig
+    rotation = ("VOYN-W0-AAA-ROT", "https://github.com/x/repo-d2/pull/400")
+    priorities = [
+        (f"VOYN-W0-ZZZ-PRIO-{i}", f"https://github.com/x/repo-d2/pull/{410 + i}")
+        for i in range(3)
+    ]
+    head = "e" * 40
+    for current_task, current_pr in [rotation, *priorities]:
+        _ready(store, app_factory, current_task, current_pr)
+        SNAPSHOTS[current_pr] = _snapshot(head)
+    for current_task, current_pr in priorities:
+        review_merge._rows(
+            app_factory,
+            "SELECT backlog_review_priority_mark(%s, %s, %s)",
+            (current_task, current_pr, head),
+        )
+    monkeypatch.setattr(
+        review_merge, "_review_window_read_decision",
+        lambda *_: review_merge._PrWindowReadDecision(True, "review_window_active"),
+    )
+    recorded = []
+
+    review_once(
+        app_factory,
+        lambda _q, _k, _p, current_task, _a: recorded.append(current_task),
+        "/tmp",
+        ReviewConfig(max_per_tick=4, max_priority_per_tick=3, max_active_reviews=100),
+    )
+
+    assert recorded[:3] == [task for task, _ in priorities]
+    assert recorded[3] == rotation[0]
+
+
 def test_merge_train_updates_a_behind_pr(rig, monkeypatch):  # noqa: F811
     """A PR only BEHIND main (base advanced after it branched) is brought
     current with a pinned REST branch update so it re-enters the merge path instead
     of gridlocking; nothing is merged this tick."""
     app_factory, store, _ = rig
-    _ready(store, app_factory, "VOYN-W0-MT1", "https://github.com/x/y/pull/41")
+    task_id = "VOYN-W0-MT1"
+    pr_url = "https://github.com/x/y/pull/41"
+    _ready(store, app_factory, task_id, pr_url)
     head = "a" * 40
     calls = []
 
@@ -2347,14 +2474,27 @@ def test_merge_train_updates_a_behind_pr(rig, monkeypatch):  # noqa: F811
         return subprocess.CompletedProcess(argv, 1, "", "?")
 
     monkeypatch.setattr(review_merge, "_gh", fake_gh)
+    new_head = "d" * 40
+    snapshots = iter([
+        _snapshot_result(head, "diff --git a/x b/x\n+old\n"),
+        _snapshot_result(new_head, "diff --git a/x b/x\n+new\n"),
+    ])
+    monkeypatch.setattr(review_merge, "_pr_diff_and_head", lambda *_: next(snapshots))
+    monkeypatch.setattr(
+        review_merge, "_carry_over_marker_if_patch_id_stable", lambda *_a, **_kw: False,
+    )
     updated_heads = []
     def update(repo, url, expected_head):
         updated_heads.append(expected_head)
-        return "d" * 40, "branch_updated_behind_main"
+        return new_head, "branch_updated_behind_main"
     monkeypatch.setattr(review_merge, "_update_behind_branch", update)
     report = merge_once(app_factory, "/tmp")
     assert updated_heads == [head]
-    assert ("VOYN-W0-MT1", "branch_updated_behind_main") in report.skipped
+    assert (task_id, "branch_updated_behind_main") in report.skipped
+    assert review_merge._rows(
+        app_factory,
+        "SELECT task_id, pr_url, expected_head FROM backlog_review_priority",
+    ) == [(task_id, pr_url, new_head)]
     assert not report.merged
 
 

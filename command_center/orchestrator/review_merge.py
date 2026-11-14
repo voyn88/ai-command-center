@@ -161,6 +161,10 @@ class ReviewConfig:
     #: in the tick functions (review of ce948c0: an unbounded scan meant
     #: unbounded API traffic and runtime regardless of the action cap).
     scan_cap: int = 40
+    #: Invalidated exact-head verdicts are examined before the rotating scan.
+    #: Keep this below the normal action budget so ordinary rotation retains a
+    #: share of every default-sized tick.
+    max_priority_per_tick: int = 3
     #: Check contexts that must be PRESENT and green on the head before the
     #: merge tick may merge. Branch protection names the same two. Without
     #: this, a head whose gates never ran (a run skipped by a workflow
@@ -1923,10 +1927,31 @@ def _review_once(
     last_processed = None
     cascade = _model_only_review_cascade()
     actions = 0
+    priority_heads: dict[tuple[str, str], str] = {}
+    if task_id is None and cascade:
+        # A one-slot tick is necessarily all priority or all rotation; for any
+        # larger tick reserve at least one action for deterministic rotation.
+        priority_budget = action_limit if action_limit == 1 else max(action_limit - 1, 0)
+        priority_limit = min(max(cfg.max_priority_per_tick, 0), priority_budget)
+        if priority_limit:
+            priority_rows = _rows(
+                factory,
+                "SELECT * FROM backlog_review_priority_pop(%s)",
+                (priority_limit,),
+            )
+            priority_heads = {
+                (priority_task, priority_pr): expected_head
+                for priority_task, priority_pr, expected_head in priority_rows
+            }
+            priority_pairs = [(row[0], row[1]) for row in priority_rows]
+            priority_keys = set(priority_pairs)
+            tasks = priority_pairs + [pair for pair in tasks if pair not in priority_keys]
     for task_id, pr_url in tasks:  # noqa: PLR1704
         if actions >= action_limit:
             break
-        last_processed = (task_id, pr_url)
+        is_priority = (task_id, pr_url) in priority_heads
+        if not is_priority:
+            last_processed = (task_id, pr_url)
         if not cascade:
             report.skipped.append((task_id, "no_review_executor_route"))
             continue
@@ -1967,6 +1992,10 @@ def _review_once(
             continue
         snapshot = fetched.snapshot
         assert snapshot is not None
+        expected_head = priority_heads.get((task_id, pr_url))
+        if expected_head is not None and snapshot.head != expected_head:
+            report.skipped.append((task_id, "priority_head_moved"))
+            continue
         key = _review_key(task_id, pr_url, snapshot)
         if key is None:
             report.skipped.append((task_id, f"no_repo_route: {pr_url!r}"))
@@ -4391,6 +4420,30 @@ def _carry_over_marker_if_patch_id_stable(
     return ok
 
 
+def _mark_changed_head_for_priority_review(
+    factory: Any,
+    repo_path: str,
+    task_id: str,
+    pr_url: str,
+    before: _PRSnapshotResult | _PRSnapshot | None,
+    expected_head: str,
+) -> None:
+    """Persist priority only when a branch update really changed the diff."""
+    before = _coerce_pr_snapshot_result(before)
+    after = _coerce_pr_snapshot_result(_pr_diff_and_head(repo_path, pr_url))
+    if not before.ok or not after.ok:
+        return
+    old_snapshot, new_snapshot = before.snapshot, after.snapshot
+    assert old_snapshot is not None and new_snapshot is not None
+    if new_snapshot.head != expected_head or new_snapshot.digest == old_snapshot.digest:
+        return
+    _rows(
+        factory,
+        "SELECT backlog_review_priority_mark(%s, %s, %s)",
+        (task_id, pr_url, expected_head),
+    )
+
+
 def _pull_for_pr_url(repo_path: str, pr_url: str) -> dict[str, Any] | None:
     parsed = _owner_repo_number_from_pr_url(pr_url)
     if parsed is None:
@@ -4940,6 +4993,7 @@ def _merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -
                     continue
                 branch_updates += 1
                 actions += 1
+                pre_update_snapshot = _pr_diff_and_head(repo_path, pr_url)
                 updated_head, update_reason = _update_behind_branch(repo_path, pr_url, detail)
                 if updated_head is not None:
                     # The new head is a fresh, unmarked commit even though
@@ -4954,6 +5008,11 @@ def _merge_once(factory: Any, repo_path: str, cfg: ReviewConfig | None = None) -
                     carried = _carry_over_marker_if_patch_id_stable(
                         repo_path, pr_url, task_id, expected_head=updated_head
                     )
+                    if not carried:
+                        _mark_changed_head_for_priority_review(
+                            factory, repo_path, task_id, pr_url,
+                            pre_update_snapshot, updated_head,
+                        )
                     report.skipped.append((
                         task_id,
                         "branch_updated_marker_carried_over" if carried

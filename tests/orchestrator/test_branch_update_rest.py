@@ -92,6 +92,10 @@ def prepare_merge_tick(monkeypatch, count=1, ready=True, state="BEHIND"):
                         r._PrWindowReadDecision(True, "active", {"state": "open"}))
     monkeypatch.setattr(r, "_pr_is_mergeable", lambda *a: (ready, OLD if ready else "no_accept_marker_on_head"))
     monkeypatch.setattr(r, "_merge_state", lambda *a: state)
+    monkeypatch.setattr(
+        r, "_pr_diff_and_head",
+        lambda *a: r._PRSnapshotResult(r._PRSnapshot.create("diff", BASE, OLD), "ok"),
+    )
     return tasks
 
 

@@ -126,6 +126,7 @@ ALL_TABLES: tuple[str, ...] = (
     "monitor_finding",
     "backlog_task_remediation",
     "backlog_scan_cursor",
+    "backlog_review_priority",
     "backlog_writer_lease",
     "coordinator_state",
     "completion",
@@ -318,6 +319,7 @@ _APP_BACKLOG_TABLES: dict[str, frozenset[str]] = {
     "backlog_writer_lease": _READ,
     "backlog_task_remediation": _READ,
     "backlog_scan_cursor": _READ,
+    "backlog_review_priority": _READ,
     # Coordination v2: reads only; every write is a SECURITY DEFINER CAS.
     "coordinator_state": _READ,
 }
@@ -330,6 +332,7 @@ _WORKER_BACKLOG_TABLES: dict[str, frozenset[str]] = {
     "backlog_writer_lease": _NONE,
     "backlog_task_remediation": _NONE,
     "backlog_scan_cursor": _NONE,
+    "backlog_review_priority": _NONE,
     "coordinator_state": _NONE,
 }
 
@@ -595,6 +598,9 @@ _APP_BACKLOG_FUNCTIONS = (
     # The persisted scan cursor for the tick windows (0015): returns this
     # tick's offset and advances atomically per invocation.
     "backlog_scan_claim(text, text, text)",
+    # 0035: bounded exact-head priority path; no raw table writes.
+    "backlog_review_priority_mark(text, text, text)",
+    "backlog_review_priority_pop(integer)",
     # Triage of raw findings (0008): UNTRIAGED -> OPEN/NEEDS_REFINEMENT/DONE/DECIDED.
     "backlog_triage(text, text, text)",
     # Evidence hygiene (0030): remove proven malformed PR evidence.

@@ -1106,7 +1106,11 @@ def test_same_head_review_transient_failure_cycle_is_non_terminal_and_bounded(
     task_id = "VOYN-W0-SAME-HEAD-TRANSIENT"
     pr_url = "https://github.com/o/ai-command-center/pull/7"
     head_sha = "a" * 40
-    monkeypatch.setattr(review_merge, "_rows", lambda *args: [(task_id, pr_url)])
+
+    def rows(_factory, sql, _params=()):
+        return [(task_id, pr_url)] if "FROM backlog_task" in sql else []
+
+    monkeypatch.setattr(review_merge, "_rows", rows)
     monkeypatch.setattr(
         review_merge,
         "_pr_diff_and_head",
