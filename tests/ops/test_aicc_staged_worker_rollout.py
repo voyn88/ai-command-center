@@ -29,10 +29,17 @@ def _module():
     # owner so ordinary parser tests exercise content handling; dedicated
     # tests below override this seam to prove ownership rejection.
     real_fstat = module._registry_fstat
-    # The lane-input probe nsenters a live PID; ordinary tests take the
-    # visible answer, dedicated tests below override this seam.
+    # The lane-input / lease-authority probes nsenter a live PID; ordinary
+    # tests take the visible/reachable answer, dedicated tests below
+    # override these seams.
     module._real_lane_inputs_visible = module._lane_inputs_visible
     module._lane_inputs_visible = lambda pid, uid, data_dir, environment=(): None
+    module._real_lane_lease_authority_reachable = (
+        module._lane_lease_authority_reachable
+    )
+    module._lane_lease_authority_reachable = (
+        lambda pid, uid, environment=(): None
+    )
 
     class RootRegistryStat:
         def __init__(self, value):
