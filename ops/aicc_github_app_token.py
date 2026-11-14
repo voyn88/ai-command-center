@@ -161,9 +161,15 @@ def store(document: dict, root: Path, *, group: str = "aicc-worker", chown: bool
     # (control-01 2026-11-14: beacon "no_token_file").  The directories hold
     # only what the 0640 files already show to the same group.
     for directory in (root, root / "gh"):
-        os.chmod(directory, 0o750)
-        if chown:
-            os.chown(directory, 0, gid)
+        # by descriptor, never by name: a link swapped in for the directory
+        # must not move the chmod/chown elsewhere
+        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fchmod(fd, 0o750)
+            if chown:
+                os.fchown(fd, 0, gid)
+        finally:
+            os.close(fd)
 
     def put(path: Path, text: str, mode: int) -> None:
         tmp = path.with_name(path.name + ".tmp")
