@@ -37,6 +37,12 @@ from pathlib import Path
 from command_center import backlog_client, read_model, storage, tasks_repository
 from command_center.runtime import runs_read
 
+from .delivery_health import (
+    PipelineHealthSource,
+    build_pipeline_health,
+    lanes_from_health,
+    postgres_source_from_env,
+)
 from .task_titles import load_cache, title_for
 
 _LOG = logging.getLogger(__name__)
@@ -287,8 +293,17 @@ def build_projection(
     db_path: Path | None = None,
     backlog_path: Path | None = None,
     titles_path: Path | None = None,
+    pipeline_source: PipelineHealthSource | None = None,
+    run_journal: bool = True,
 ) -> dict:
-    """Assemble the projection dict from the repository's read surfaces."""
+    """Assemble the projection dict from the repository's read surfaces.
+
+    ``pipeline_source`` adds the ``pipeline_health`` block (control-plane DB
+    facts, see `native_gateway.delivery_health`); without one the block is
+    simply absent. ``run_journal=False`` declares that this host has no local
+    run journal by design (the control plane: its lanes are the queue's
+    active attempts), so its absence is not reported as degradation.
+    """
     now = datetime.now(UTC)
     degraded = False
 
@@ -300,7 +315,10 @@ def build_projection(
     runs: list[dict] = []
     resolved_db = db_path or (storage.resolve_data_dir(root) / "runtime.db")
     try:
-        runs = runs_read.list_unified_runs(resolved_db, root=root, limit=_EVENT_LIMIT)
+        if run_journal:
+            runs = runs_read.list_unified_runs(
+                resolved_db, root=root, limit=_EVENT_LIMIT
+            )
     except Exception:  # noqa: BLE001 -- any journal failure degrades, never breaks the artifact
         # The run journal is optional context for the calm overview; its
         # unavailability degrades freshness, it must not hide the task list.
@@ -316,19 +334,43 @@ def build_projection(
         )
         degraded = True
 
+    health: dict | None = None
+    if pipeline_source is not None:
+        try:
+            health = build_pipeline_health(pipeline_source.read(), now)
+        except Exception:  # noqa: BLE001 -- the DB being down degrades, never breaks
+            _LOG.warning("Pipeline health unavailable for projection", exc_info=True)
+            degraded = True
+
+    lanes = _map_lanes(runs, now)
+    if not run_journal and health is not None:
+        lanes = lanes_from_health(health)
+
     payload = {
         "projection_version": PROJECTION_VERSION,
         "degraded": degraded,
         "projects": _map_projects(tasks),
         "tasks": [_map_task(t) for t in tasks],
-        "lanes": _map_lanes(runs, now),
+        "lanes": lanes,
         "events": _map_events(runs),
         "dialogs": _map_dialogs(root),
         "goal": _wave_goal(rich_records),
         "decisions": [],
     }
+    if health is not None:
+        payload["pipeline_health"] = health
+    # The revision names the observable STATE, so the moving observation
+    # clock must not mint a new revision on every tick (that would defeat
+    # the gateway's ETag/304 path). Queue ages still move it — they are state.
+    digest_payload = dict(payload)
+    if health is not None:
+        digest_payload["pipeline_health"] = {
+            k: v for k, v in health.items() if k != "observed_at"
+        }
     digest = hashlib.sha256(
-        json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        json.dumps(digest_payload, sort_keys=True, ensure_ascii=False).encode(
+            "utf-8"
+        )
     ).hexdigest()
     payload["revision"] = f"r-{digest[:12]}"
     payload["generated_at"] = _iso_now()
@@ -342,9 +384,16 @@ def write_projection(
     db_path: Path | None = None,
     backlog_path: Path | None = None,
     titles_path: Path | None = None,
+    pipeline_source: PipelineHealthSource | None = None,
+    run_journal: bool = True,
 ) -> dict:
     projection = build_projection(
-        root, db_path=db_path, backlog_path=backlog_path, titles_path=titles_path
+        root,
+        db_path=db_path,
+        backlog_path=backlog_path,
+        titles_path=titles_path,
+        pipeline_source=pipeline_source,
+        run_journal=run_journal,
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     storage.atomic_write_json(out_path, projection)
@@ -371,6 +420,17 @@ def main(argv: list[str] | None = None) -> int:
         help="Russian title cache from native_gateway.localize_titles",
     )
     parser.add_argument(
+        "--pipeline-health",
+        action="store_true",
+        help="add the pipeline_health block from the control DB (AICC_PG_* env)",
+    )
+    parser.add_argument(
+        "--no-run-journal",
+        action="store_true",
+        help="this host keeps no local run journal (control plane); lanes come "
+        "from the queue's active attempts instead",
+    )
+    parser.add_argument(
         "--interval",
         type=int,
         default=0,
@@ -378,21 +438,33 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    while True:
-        projection = write_projection(
-            args.root,
-            args.out,
-            db_path=args.db,
-            backlog_path=args.backlog,
-            titles_path=args.titles,
-        )
-        print(
-            f"projection {projection['revision']} → {args.out} "
-            f"(tasks={len(projection['tasks'])}, degraded={projection['degraded']})"
-        )
-        if args.interval <= 0:
-            return 0
-        time.sleep(args.interval)
+    pipeline_source: PipelineHealthSource | None = None
+    close = None
+    if args.pipeline_health:
+        pipeline_source, close = postgres_source_from_env()
+    try:
+        while True:
+            projection = write_projection(
+                args.root,
+                args.out,
+                db_path=args.db,
+                backlog_path=args.backlog,
+                titles_path=args.titles,
+                pipeline_source=pipeline_source,
+                run_journal=not args.no_run_journal,
+            )
+            print(
+                f"projection {projection['revision']} → {args.out} "
+                f"(tasks={len(projection['tasks'])}, "
+                f"degraded={projection['degraded']}, "
+                f"pipeline_health={'pipeline_health' in projection})"
+            )
+            if args.interval <= 0:
+                return 0
+            time.sleep(args.interval)
+    finally:
+        if close is not None:
+            close()
 
 
 if __name__ == "__main__":

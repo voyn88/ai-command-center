@@ -1,0 +1,51 @@
+# Writes the AICC Native Gateway projection artifact once
+# (native_gateway.projection_producer), including the `pipeline_health`
+# block read from the control database: queue counts, active lanes, executor
+# login failures, backlog counts, DEFER_TO_USER owner escalations and the
+# infra monitor's open findings. Read-only against the database (SELECT on
+# the public views aicc_app already holds); the only file it writes is the
+# artifact under its own StateDirectory.
+#
+# --no-run-journal: the control plane keeps no local run journal by design --
+# its lanes ARE the queue's active attempts -- so the missing journal is not
+# reported as degradation.
+[Unit]
+Description=AICC Native Gateway projection producer (control DB -> projection artifact)
+After=network-online.target postgresql@16-main.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=voynadmin
+WorkingDirectory=/opt/aicc/current
+StateDirectory=aicc-gateway
+StateDirectoryMode=0750
+Environment=AICC_GATEWAY_PROJECTION=/var/lib/aicc-gateway/projection.json
+# The producer's local AICC data dir (tasks.json, chats.json) -- created
+# empty on first run; the control plane's task state is in the database.
+Environment=AICC_DATA_DIR=/var/lib/aicc-gateway/data
+EnvironmentFile=-/etc/aicc/native-gateway-projection.env
+# The control DB settings (AICC_PG_*) come from the same preprod .env every
+# control tick sources; it lives in the running user's home, so the path is
+# resolved by the shell, overridable with AICC_PREPROD_ENV.
+ExecStart=/bin/bash -c 'projection="$${AICC_GATEWAY_PROJECTION}"; data="$${AICC_DATA_DIR}"; set -a && . "$${AICC_PREPROD_ENV:-$$HOME/aicc-preprod/.env}" && set +a && AICC_DATA_DIR="$$data" exec /opt/aicc/current/.venv/bin/python -m native_gateway.projection_producer --root /opt/aicc/current --out "$$projection" --pipeline-health --no-run-journal'
+TimeoutStartSec=50s
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=read-only
+ProtectSystem=strict
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

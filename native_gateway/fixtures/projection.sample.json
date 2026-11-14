@@ -34,5 +34,18 @@
   ],
   "decisions": [
     {"id": "dec-001", "title": "Adopt merge queue", "status": "accepted", "decided_at": "2026-08-23T05:20:00Z", "summary": "Serialize integration through the platform merge queue."}
-  ]
+  ],
+  "pipeline_health": {
+    "observed_at": "2026-08-26T00:00:00Z",
+    "queue": {"ready": 3, "claimed": 2, "dead": 1, "succeeded_last_hour": 7, "oldest_ready_age_seconds": 95},
+    "active_lanes": [
+      {"role": "aicc_worker", "attempts": 2, "heartbeat_age_seconds": 14}
+    ],
+    "executor_auth_failures_30m": 0,
+    "backlog_by_status": {"DEFER_TO_USER": 1, "DONE": 40, "IN_PROGRESS": 2, "OPEN": 5},
+    "owner_escalations": [
+      {"task_id": "VOYN-EXAMPLE-002", "title": "Blocked migration", "priority": "P1", "updated_at": "2026-08-25T22:00:00Z"}
+    ],
+    "monitor": {"verdict": "failing", "open_findings": 1, "failures": ["dead_letter_growth"], "last_seen_at": "2026-08-25T23:58:00Z"}
+  }
 }
