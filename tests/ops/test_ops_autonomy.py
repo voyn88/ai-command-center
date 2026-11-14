@@ -2176,3 +2176,37 @@ def test_mac_path_on_does_not_invent_a_missing_line(tmp_path):
     done = _mac(env, "on")
     assert "no AICC_CLAUDE_MAC_ENABLED line now" in done.stdout
     assert control.read_text() == "ONLY=this\n"
+
+
+# --- the beacon says WHY it cannot read the token ---------------------------
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads everything")
+def test_the_beacon_names_the_real_reason_for_an_unreadable_token(tmp_path):
+    def reason(path):
+        try:
+            path.read_text()
+        except OSError as exc:
+            return status_beacon.token_read_failure(path, exc)
+        return "readable"
+
+    assert reason(tmp_path / "absent") == "no_token_file"
+    secret = tmp_path / "tok"
+    secret.write_text("x")
+    secret.chmod(0o000)
+    assert reason(secret) == "token_file_not_readable"
+    secret.chmod(0o600)
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    inner = locked / "token"
+    inner.write_text("x")
+    locked.chmod(0o600)  # no search permission on the directory
+    try:
+        assert reason(inner) == "token_dir_not_traversable"
+    finally:
+        locked.chmod(0o700)
+
+
+def test_an_unusual_oserror_is_a_fixed_word_not_a_path():
+    word = status_beacon.token_read_failure(Path("/x/y"), OSError(5, "boom /x/y"))
+    assert word == "token_file_error"
