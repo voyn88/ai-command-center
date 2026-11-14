@@ -53,6 +53,24 @@ unacceptable for any host reachable over a network. The loopback exemption
 exists for the single-host compose deployment, where the database is not
 reachable off the machine at all.
 
+### Connection poolers must run in session mode, not transaction mode
+
+The claim/audit model (`0002_queue_claim`, `0003_worker_enrollment`) treats
+`session_user` as a provable identity: a trigger stamps it into
+`claimed_by_role`, and a grant makes it the only route to a write — no
+argument ever carries an actor. A transaction-mode pooler (e.g. PgBouncer in
+`transaction` pool mode) breaks that silently: it terminates the client's
+authentication itself and multiplexes every caller onto backend connections
+under its own shared role, so `session_user` is that one role for every
+caller behind it. Queries still run and claims still succeed — they are just
+all unattributable, and no `SELECT` afterwards can tell.
+
+`open_pool()` proves `session_user` matches `AICC_PG_USER` once per pool and
+refuses to start otherwise (`command_center/db/pool.py`, `PoolIdentityError`).
+If `AICC_PG_HOST` must point at a pooler, it has to run in `session` pool mode
+(one backend connection per client for its lifetime) rather than
+`transaction` mode.
+
 ## Roles
 
 Three roles, provisioned by `render_bootstrap()` / `render_table_grants()` and
