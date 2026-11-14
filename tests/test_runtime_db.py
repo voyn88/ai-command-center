@@ -2,6 +2,7 @@ import itertools
 import multiprocessing
 import sqlite3
 import threading
+import time
 import uuid
 from pathlib import Path
 
@@ -750,6 +751,85 @@ def test_migrate_on_existing_populated_db_does_not_lose_data(tmp_path):
     task = db.create_task(path, project="AIOS", title="t", task_type="implementation")
     db.migrate(path)  # re-run against a populated db
     assert db.get_task(path, task["id"]) is not None
+
+
+def test_migration_24_partial_index_build_over_populated_run_table_is_bounded(
+    tmp_path, monkeypatch
+):
+    """Every migration from 16 to the current head either creates a brand-new,
+    empty table or does a metadata-only ``ALTER TABLE ADD COLUMN`` on an
+    existing one — except migration 24, whose ``CREATE INDEX ... WHERE
+    finalized_at IS NULL`` must scan every pre-existing ``run`` row (all of
+    them match: the column was just added, still NULL) to build the index.
+    That is the one migration in the set whose cost scales with the size of
+    the live database rather than being O(1), and the one this repository's
+    tests had never exercised against a non-trivial ``run`` population.
+
+    Bulk-inserts 50k `run` rows directly (bypassing `create_run`, which does
+    far more per call than this needs) to stand in for a long-lived,
+    heavily-used database, then times migration 24 alone. A generous bound
+    (SQLite builds a B-tree index in O(n log n), so 50k rows should take low
+    single-digit seconds at most) — enough to catch a regression to a
+    per-row Python step without making the test flaky on a slow CI box.
+    """
+    path = tmp_path / "runtime-v23-populated.db"
+    current_migrations = list(db.MIGRATIONS)
+    with monkeypatch.context() as pre_v24:
+        pre_v24.setattr(db, "MIGRATIONS", [m for m in current_migrations if m[0] < 24])
+        pre_v24.setattr(db, "SCHEMA_VERSION", 23)
+        db.migrate(path)
+
+    task = db.create_task(path, project="AIOS", title="scale", task_type="implementation")
+    session = db.create_session(
+        path, task_id=task["id"], project="AIOS", repository_path="/tmp/scale"
+    )
+    now = db.iso_now()
+    row_count = 50_000
+    rows = [
+        (
+            f"run-{i}",
+            session["id"],
+            task["id"],
+            i,
+            "COMPLETED",
+            "AIOS",
+            "implementation",
+            "/tmp/scale",
+            "prompt",
+            now,
+            now,
+        )
+        for i in range(row_count)
+    ]
+    with db.connect(path) as conn:
+        with db.transaction(conn):
+            conn.executemany(
+                "INSERT INTO run (id, session_id, task_id, sequence, state, project, "
+                "task_type, repository_path, prompt, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                rows,
+            )
+
+    with monkeypatch.context() as at_v24:
+        at_v24.setattr(db, "MIGRATIONS", [m for m in current_migrations if m[0] <= 24])
+        at_v24.setattr(db, "SCHEMA_VERSION", 24)
+        start = time.monotonic()
+        db.migrate(path)
+        elapsed = time.monotonic() - start
+
+    assert db.current_schema_version(path) == 24
+    assert elapsed < 30.0, (
+        f"migration 24's partial index took {elapsed:.2f}s over {row_count} rows "
+        "-- investigate before running it against the live runtime.db"
+    )
+    with db.connect(path) as conn:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(run)").fetchall()}
+        assert "finalized_at" in columns
+        unfinalized = conn.execute(
+            "SELECT COUNT(*) AS c FROM run INDEXED BY idx_run_unfinalized "
+            "WHERE finalized_at IS NULL"
+        ).fetchone()["c"]
+    assert unfinalized == row_count
 
 
 # --------------------------------------------------------------------------
