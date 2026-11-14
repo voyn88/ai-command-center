@@ -33,10 +33,16 @@ Three pieces, all data:
   backlog task through the existing ``backlog_upsert_task`` protocol — the
   same inbox ``_remediate_rejection`` already uses for machine-created
   follow-up work, so the escalation flows through the ordinary
-  OPEN -> ... -> DONE pipeline with no new dispatch code. The watchdog never
-  mutates the stalled items themselves: its whole write surface is the
-  ledger and the new escalation task. Existing review/merge timers invoke
-  it after recording each observation; no extra daemon or unit is needed.
+  OPEN -> ... -> DONE pipeline with no new dispatch code. The generic
+  watchdog never mutates stalled items: its write surface is the ledger and
+  the new escalation task. Existing review/merge timers invoke it after
+  recording each observation; no extra daemon or unit is needed.
+- :func:`recover_ready_without_open_pr_streaks` — the one deliberately
+  narrow repair for ``pr_evidence`` stalls. After GitHub has reported no open
+  PR on the task branch for the full watchdog threshold, it invokes the
+  existing evidence-guarded recovery protocol to return the task to OPEN.
+  That gives the publisher another attempt instead of leaving a state which
+  no review tick can ever consume.
 """
 
 from __future__ import annotations
@@ -48,6 +54,7 @@ from datetime import datetime
 from typing import Any
 
 __all__ = [
+    "PrEvidenceRecoveryReport",
     "StallEpisode",
     "TickSnapshot",
     "WatchdogConfig",
@@ -56,6 +63,7 @@ __all__ = [
     "escalation_task_id",
     "new_tick_id",
     "record_skips",
+    "recover_ready_without_open_pr_streaks",
     "watchdog_once",
 ]
 
@@ -132,6 +140,14 @@ class StallEpisode:
     last_seen_at: datetime
 
 
+@dataclass(slots=True)
+class PrEvidenceRecoveryReport:
+    """Outcome of the bounded READY_TO_REVIEW recovery pass."""
+
+    recovered: list[str] = field(default_factory=list)
+    refused: list[tuple[str, str]] = field(default_factory=list)
+
+
 @dataclass(frozen=True, slots=True)
 class WatchdogConfig:
     #: Consecutive same-reason ticks before a stall is escalated.
@@ -201,6 +217,49 @@ def escalation_task_id(episode: StallEpisode) -> str:
 
     identity = "\0".join((episode.tick_kind,episode.task_id,episode.reason,episode.first_tick_id))
     return f"{episode.task_id}-STALL-{hashlib.sha256(identity.encode()).hexdigest()[:16]}"
+
+
+def recover_ready_without_open_pr_streaks(
+    conn: Any, *, threshold: int = 5
+) -> PrEvidenceRecoveryReport:
+    """Requeue tasks after a sustained, verified absence of an open PR.
+
+    Only the latest ``pr_evidence`` observation is considered. The database
+    recovery function is the final authority: it refuses a task which is no
+    longer READY_TO_REVIEW or which acquired PR evidence after the lookup,
+    making this safe against a concurrent publisher.
+    """
+    if threshold < 1:
+        raise ValueError(f"threshold must be >= 1, got {threshold}")
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT s.task_id "
+            "FROM tick_observation o "
+            "JOIN tick_skip_event s USING (tick_kind, tick_id) "
+            "WHERE o.tick_kind = 'pr_evidence' "
+            "AND o.id = (SELECT max(id) FROM tick_observation "
+            "            WHERE tick_kind = 'pr_evidence') "
+            "AND s.reason = 'no_open_pr_on_task_branch' "
+            "AND s.consecutive_ticks >= %s "
+            "ORDER BY s.task_id",
+            (threshold,),
+        )
+        task_ids = [row[0] for row in cur.fetchall()]
+
+    report = PrEvidenceRecoveryReport()
+    for task_id in task_ids:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM backlog_recover_stuck_ready_to_review(%s)",
+                (task_id,),
+            )
+            verdict = cur.fetchone()
+        if verdict and verdict[0]:
+            report.recovered.append(task_id)
+            continue
+        reason = (verdict[1] if verdict and len(verdict) > 1 else "") or "unknown"
+        report.refused.append((task_id, str(reason)))
+    return report
 
 
 def _load_episodes(conn: Any, threshold: int) -> list[StallEpisode]:
