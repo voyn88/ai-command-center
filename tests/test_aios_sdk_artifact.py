@@ -59,6 +59,20 @@ def test_checksum_mismatch_fails_closed_without_writing_wheel(tmp_path):
     assert not (tmp_path / lock.wheel_filename).exists()
 
 
+def test_manifest_matching_a_tampered_wheel_is_still_rejected_by_the_pinned_lock(tmp_path):
+    """A compromised release can republish a malicious wheel together with a
+    SHA256SUMS entry that matches it, so manifest self-consistency alone must
+    not be enough — the pinned lock.wheel_sha256 has to independently reject
+    a wheel it never accepted, even when the manifest agrees with it.
+    """
+    lock = load_lock()
+    wheel = b"malicious-payload"
+    manifest = f"{hashlib.sha256(wheel).hexdigest()}  {lock.wheel_filename}\n"
+    with pytest.raises(ArtifactError, match="locked wheel checksum mismatch"):
+        persist_verified_wheel(wheel, manifest, tmp_path, lock)
+    assert not (tmp_path / lock.wheel_filename).exists()
+
+
 def _release_payload(lock, *, draft: bool = False, tag: str | None = None) -> dict:
     return {
         "tag_name": tag or lock.release_tag,

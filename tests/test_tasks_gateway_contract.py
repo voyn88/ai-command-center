@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 import multiprocessing
+import os
+import subprocess
+import sys
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -137,6 +140,57 @@ def _concurrent_map_put(
 def test_gateway_contract_imports_without_aios_sdk_and_is_runtime_checkable():
     assert tasks_gateway.TasksGateway is not None
     assert tasks_gateway.TaskDTO.__module__ == "command_center.application.tasks_gateway"
+
+    assert isinstance(FakeGateway(), tasks_gateway.TasksGateway)
+
+    class _MissingCreateTask:
+        def list_tasks(self):
+            ...
+
+        def get_task(self, task_id):
+            ...
+
+        def assign_task(self, task_id, assignee):
+            ...
+
+        def start_task(self, task_id):
+            ...
+
+        def complete_task(self, task_id):
+            ...
+
+        def cancel_task(self, task_id):
+            ...
+
+    assert not isinstance(_MissingCreateTask(), tasks_gateway.TasksGateway), (
+        "runtime_checkable must reject an object missing part of the contract, "
+        "or isinstance() checks against TasksGateway are decorative"
+    )
+
+    probe = (
+        "import sys\n"
+        "from command_center.application import tasks_gateway\n"
+        "leaked = sorted(\n"
+        "    name for name in sys.modules\n"
+        "    if name == 'aios_sdk' or name.startswith('aios_sdk.')\n"
+        "    or name == 'command_center.application.aios_tasks'\n"
+        ")\n"
+        "sys.stdout.write(','.join(leaked))\n"
+    )
+    source_root = Path(__file__).resolve().parents[1]
+    completed = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=source_root,
+        env={"PATH": os.environ.get("PATH", ""), "PYTHONPATH": str(source_root)},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "", (
+        "importing tasks_gateway alone pulled in the AIOS SDK adapter: "
+        f"{completed.stdout.strip()}"
+    )
 
 
 def test_create_request_is_minimal_and_idempotency_key_is_stable():
