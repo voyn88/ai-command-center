@@ -1,0 +1,9 @@
+{
+  "degraded_count": 2,
+  "disk_free_pct": 58.72,
+  "heartbeat_unix": 1794688236,
+  "last_verdict_age_min": null,
+  "role": "control",
+  "schema": 1,
+  "status": "degraded"
+}
