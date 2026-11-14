@@ -15,6 +15,7 @@ from command_center.db.backlog_parser import ParsedTask
 from command_center.ops.tick_stall_watchdog import (
     WatchdogConfig,
     record_skips,
+    recover_ready_without_open_pr_streaks,
     watchdog_once,
 )
 from tests.db.test_backlog_planner import (  # noqa: F401 — pytest fixtures
@@ -208,3 +209,71 @@ def test_escalations_cannot_recursively_spawn_more_escalations(rig, suffix):  # 
             record_skips(conn, "review_marker", f"child-{index}", [(child, REASON)])
     assert not watchdog_once(app_factory).escalated
     assert len(_escalations(app_factory)) == 1
+
+
+def _ready_without_pr(store, task_id: str) -> None:
+    ok, reason, _changed = store.upsert_task(
+        ParsedTask(
+            task_id=task_id,
+            wave="0",
+            priority="P1",
+            status="READY_TO_REVIEW",
+            kind="task",
+            title="Ready but unpublished",
+            body="",
+            repo="repo-one",
+            line_no=1,
+        )
+    )
+    assert ok, reason
+
+
+def _pr_evidence_ticks(app_factory, task_id: str, count: int) -> None:
+    with app_factory() as conn:
+        for index in range(count):
+            record_skips(
+                conn,
+                "pr_evidence",
+                f"pr-evidence-{index}",
+                [(task_id, "no_open_pr_on_task_branch")],
+            )
+
+
+def test_sustained_missing_pr_requeues_ready_task(rig) -> None:  # noqa: F811
+    app_factory, store, _queue = rig
+    task_id = "VOYN-W0-WD-PR-RECOVER"
+    _ready_without_pr(store, task_id)
+    _pr_evidence_ticks(app_factory, task_id, 5)
+
+    with app_factory() as conn:
+        report = recover_ready_without_open_pr_streaks(conn, threshold=5)
+
+    assert report.recovered == [task_id]
+    assert report.refused == []
+    assert _task_row(app_factory, task_id)[0] == "OPEN"
+
+
+def test_missing_pr_recovery_waits_for_full_streak(rig) -> None:  # noqa: F811
+    app_factory, store, _queue = rig
+    task_id = "VOYN-W0-WD-PR-WAIT"
+    _ready_without_pr(store, task_id)
+    _pr_evidence_ticks(app_factory, task_id, 4)
+
+    with app_factory() as conn:
+        report = recover_ready_without_open_pr_streaks(conn, threshold=5)
+
+    assert report.recovered == []
+    assert _task_row(app_factory, task_id)[0] == "READY_TO_REVIEW"
+
+
+def test_missing_pr_recovery_uses_only_latest_observation(rig) -> None:  # noqa: F811
+    app_factory, store, _queue = rig
+    task_id = "VOYN-W0-WD-PR-RESET"
+    _ready_without_pr(store, task_id)
+    _pr_evidence_ticks(app_factory, task_id, 5)
+    with app_factory() as conn:
+        record_skips(conn, "pr_evidence", "pr-evidence-reset", [])
+        report = recover_ready_without_open_pr_streaks(conn, threshold=5)
+
+    assert report.recovered == []
+    assert _task_row(app_factory, task_id)[0] == "READY_TO_REVIEW"
