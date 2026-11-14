@@ -660,23 +660,35 @@ def test_dry_run_only_journals(tmp_path):
     assert any('"would_restart"' in line for line in lines)
 
 
+_TUNNEL_ON = {"OPS_HEAL_TUNNEL_SIGNAL": "1"}
+
+
+def test_the_tunnel_signal_is_off_unless_the_host_opts_in(tmp_path):
+    """Live 2026-11-13: 15 would_restart of tailscaled in a day for a port that
+    nothing needs once the Mac review path is off."""
+    runner = _Recorder(_heal_runner(held_by="tailscaled"))
+    for now in (1000, 1300):
+        _heal(tmp_path, runner, now=now)
+    assert runner.restarts == []
+
+
 def test_the_tunnel_signal_needs_tailscaled_to_hold_the_port(tmp_path):
     owned = _Recorder(_heal_runner(held_by="tailscaled"))
     for now in (1000, 1300):
-        _heal(tmp_path, owned, now=now)
+        _heal(tmp_path, owned, now=now, settings=_TUNNEL_ON)
     assert owned.restarts == ["tailscaled.service"]
     other = tmp_path / "other"
     other.mkdir()
     nobody = _Recorder(_heal_runner(held_by=None))
     for now in (1000, 1300):
-        _heal(other, nobody, now=now)
+        _heal(other, nobody, now=now, settings=_TUNNEL_ON)
     assert nobody.restarts == []
 
 
 def test_a_healthy_tunnel_answer_is_left_alone(tmp_path):
     runner = _Recorder(_heal_runner(held_by="tailscaled", tunnel_code="501"))
     for now in (1000, 1300):
-        _heal(tmp_path, runner, now=now)
+        _heal(tmp_path, runner, now=now, settings=_TUNNEL_ON)
     assert runner.restarts == []
 
 
@@ -2164,3 +2176,37 @@ def test_mac_path_on_does_not_invent_a_missing_line(tmp_path):
     done = _mac(env, "on")
     assert "no AICC_CLAUDE_MAC_ENABLED line now" in done.stdout
     assert control.read_text() == "ONLY=this\n"
+
+
+# --- the beacon says WHY it cannot read the token ---------------------------
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads everything")
+def test_the_beacon_names_the_real_reason_for_an_unreadable_token(tmp_path):
+    def reason(path):
+        try:
+            path.read_text()
+        except OSError as exc:
+            return status_beacon.token_read_failure(path, exc)
+        return "readable"
+
+    assert reason(tmp_path / "absent") == "no_token_file"
+    secret = tmp_path / "tok"
+    secret.write_text("x")
+    secret.chmod(0o000)
+    assert reason(secret) == "token_file_not_readable"
+    secret.chmod(0o600)
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    inner = locked / "token"
+    inner.write_text("x")
+    locked.chmod(0o600)  # no search permission on the directory
+    try:
+        assert reason(inner) == "token_dir_not_traversable"
+    finally:
+        locked.chmod(0o700)
+
+
+def test_an_unusual_oserror_is_a_fixed_word_not_a_path():
+    word = status_beacon.token_read_failure(Path("/x/y"), OSError(5, "boom /x/y"))
+    assert word == "token_file_error"
