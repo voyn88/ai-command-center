@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import socket
 import sys
@@ -494,6 +495,21 @@ def publish_branch(
     return str(commit["sha"])
 
 
+def token_read_failure(path: Path, exc: OSError) -> str:
+    """A fixed word for why the token file could not be read, never a path."""
+    if isinstance(exc, FileNotFoundError):
+        return "no_token_file"
+    if isinstance(exc, PermissionError):
+        # which step of the walk stops us: a directory above, or the file
+        probe = path.parent
+        while probe != probe.parent:
+            if not os.access(probe, os.X_OK):
+                return "token_dir_not_traversable"
+            probe = probe.parent
+        return "token_file_not_readable"
+    return "token_file_error"
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     parser.add_argument("--print", action="store_true", help="print, do not publish")
@@ -525,8 +541,10 @@ def main(argv: list[str] | None = None) -> int:
         )
         try:
             token = token_file.read_text(encoding="utf-8").strip()
-        except OSError:
-            journal.write("publish_skipped", why="no_token_file")
+        except OSError as exc:
+            # name the real cause: "missing" and "not allowed to read" need
+            # different fixes (path vs permissions/ACL on a directory above)
+            journal.write("publish_skipped", why=token_read_failure(token_file, exc))
             return 0
         if not token:
             journal.write("publish_skipped", why="empty_token")
