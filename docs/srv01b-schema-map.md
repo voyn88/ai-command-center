@@ -22,7 +22,7 @@ PostgreSQL. Документ описывает, тест доказывает.
 
 | Величина | Значение |
 | --- | --- |
-| `SCHEMA_VERSION` SQLite | 23 |
+| `SCHEMA_VERSION` SQLite | **снимок 23** (2026-08-13; живое значение — `command_center.runtime.db.SCHEMA_VERSION`, не цитировать отсюда; см. `docs/operations/SCHEMA_VERSION_DRIFT.md`) |
 | Доменных таблиц SQLite | **33** (+ служебная `schema_version`) |
 | Таблиц PostgreSQL | **33** |
 | Соответствие | **1:1, сирот нет ни с одной стороны** |

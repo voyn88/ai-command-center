@@ -486,6 +486,63 @@ def test_v25_offline_cutover_rejects_future_schema(tmp_path, monkeypatch):
 # database only ever recorded a real migration version, so those are exactly the
 # ones that must upgrade cleanly; the gap fills in on merge without changing this
 # test.
+def test_deployed_schema_behind_code_upgrades_16_to_23(tmp_path, monkeypatch):
+    """VOYN-W0-AICC-SQLITE-SCHEMA-16-TO-23 (deployed-schema-behind-code).
+
+    The backlog reconcile that spawned this task read a retired "16 domain
+    tables" survey count and a snapshotted ``SCHEMA_VERSION=23`` as if the
+    live ``runtime.db`` were stranded at migration 16 while code sat at 23.
+    That reading never described a real file (see
+    ``docs/operations/SCHEMA_VERSION_DRIFT.md``). What *would* be a real
+    "deployed schema behind code" inside that window is a file whose ledger
+    stopped at 16 under a binary compiled at 23 — and that case is already
+    the migrate-on-open contract: the next process that opens the file
+    forward-migrates it in place, with no separate operator step.
+
+    Pin that contract at the exact 16→23 window the task named, so a future
+    triage cannot reopen "deployed-schema-behind-code" as a one-shot bump.
+    """
+    path = tmp_path / "runtime-deployed-behind-v16.db"
+    current_migrations = list(db.MIGRATIONS)
+    migrations_through_16 = [m for m in current_migrations if m[0] <= 16]
+    migrations_through_23 = [m for m in current_migrations if m[0] <= 23]
+
+    with monkeypatch.context() as at_16:
+        at_16.setattr(db, "MIGRATIONS", migrations_through_16)
+        at_16.setattr(db, "SCHEMA_VERSION", 16)
+        db.migrate(path)
+        assert db.current_schema_version(path) == 16
+        with db.connect(path) as conn:
+            assert (
+                conn.execute(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type='table' AND name='contact'"
+                ).fetchone()
+                is None
+            )
+
+    with monkeypatch.context() as at_23:
+        at_23.setattr(db, "MIGRATIONS", migrations_through_23)
+        at_23.setattr(db, "SCHEMA_VERSION", 23)
+        db.migrate(path)
+        assert db.current_schema_version(path) == 23
+
+    with db.connect(path) as conn:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        digest_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(digest_item)")
+        }
+    assert {"contact", "message", "networking_invitation"} <= tables
+    # v16's own columns must still be present after the forward migrate —
+    # "behind code" upgrades, it does not rebuild from scratch.
+    assert {"day", "position"} <= digest_columns
+
+
 @pytest.mark.parametrize(
     "historical_version",
     [version for version, _ in db.MIGRATIONS if version < db.SCHEMA_VERSION],
