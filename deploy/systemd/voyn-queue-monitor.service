@@ -6,6 +6,8 @@ Wants=network-online.target tailscaled.service postgresql.service prometheus.ser
 [Service]
 Type=oneshot
 User=voynadmin
+StateDirectory=voyn-infra-monitor
+StateDirectoryMode=0750
 WorkingDirectory=/home/voynadmin/aicc-preprod/repo
 EnvironmentFile=/home/voynadmin/aicc-preprod/.env
 # --pr-window-repo runs one `gh pr list` per tick and turns "an open fleet PR
