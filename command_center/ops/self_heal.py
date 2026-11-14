@@ -43,6 +43,7 @@ from command_center.ops.host_care_common import (
     Journal,
     Runner,
     StateFile,
+    as_bool,
     as_dry_run,
     as_int,
     exclusive_lock,
@@ -122,7 +123,14 @@ def detect(settings: Mapping[str, str], runner: Runner) -> dict[str, tuple[str, 
             "tailscale cannot report an address",
         )
     port = as_int(settings.get("OPS_TUNNEL_PORT"), 17443)
-    if tunnel_held_by(runner, port) == "tailscaled" and tunnel_http_dead(runner, port):
+    # Off by default: the review tunnel to the owner's Mac is no longer part of
+    # the normal path, and a restart of tailscaled drops the mesh the owner
+    # uses to reach the host.  Opt in with OPS_HEAL_TUNNEL_SIGNAL=1.
+    if (
+        as_bool(settings.get("OPS_HEAL_TUNNEL_SIGNAL"), False)
+        and tunnel_held_by(runner, port) == "tailscaled"
+        and tunnel_http_dead(runner, port)
+    ):
         signals["tunnel_port_held_by_tailscaled"] = (
             "tailscaled.service",
             "review port held by tailscaled and not answering",

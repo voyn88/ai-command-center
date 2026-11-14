@@ -660,23 +660,35 @@ def test_dry_run_only_journals(tmp_path):
     assert any('"would_restart"' in line for line in lines)
 
 
+_TUNNEL_ON = {"OPS_HEAL_TUNNEL_SIGNAL": "1"}
+
+
+def test_the_tunnel_signal_is_off_unless_the_host_opts_in(tmp_path):
+    """Live 2026-11-13: 15 would_restart of tailscaled in a day for a port that
+    nothing needs once the Mac review path is off."""
+    runner = _Recorder(_heal_runner(held_by="tailscaled"))
+    for now in (1000, 1300):
+        _heal(tmp_path, runner, now=now)
+    assert runner.restarts == []
+
+
 def test_the_tunnel_signal_needs_tailscaled_to_hold_the_port(tmp_path):
     owned = _Recorder(_heal_runner(held_by="tailscaled"))
     for now in (1000, 1300):
-        _heal(tmp_path, owned, now=now)
+        _heal(tmp_path, owned, now=now, settings=_TUNNEL_ON)
     assert owned.restarts == ["tailscaled.service"]
     other = tmp_path / "other"
     other.mkdir()
     nobody = _Recorder(_heal_runner(held_by=None))
     for now in (1000, 1300):
-        _heal(other, nobody, now=now)
+        _heal(other, nobody, now=now, settings=_TUNNEL_ON)
     assert nobody.restarts == []
 
 
 def test_a_healthy_tunnel_answer_is_left_alone(tmp_path):
     runner = _Recorder(_heal_runner(held_by="tailscaled", tunnel_code="501"))
     for now in (1000, 1300):
-        _heal(tmp_path, runner, now=now)
+        _heal(tmp_path, runner, now=now, settings=_TUNNEL_ON)
     assert runner.restarts == []
 
 
