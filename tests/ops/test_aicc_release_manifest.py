@@ -135,28 +135,133 @@ def test_git_blob_oid_fails_closed_when_trusted_git_cannot_execute(monkeypatch, 
         module._git_blob_oid(b"payload")
 
 
+#: Privileged release modules must obtain Git object identities from trusted
+#: Git (`hash-object`), never by hashing bytes themselves: an in-process SHA-1
+#: is a second, weaker authority for the same question, and it is the one an
+#: attacker with a chosen-prefix collision gets to aim at.
+SHA1_NAMES = ("sha1", "sha-1", "sha_1")
+
+
+def _sha1_uses(source: str, filename: str) -> list[str]:
+    """Every way this source could compute SHA-1 in-process.
+
+    Deliberately over-broad on the dynamic cases: `hashlib.new(algorithm)` with
+    a non-literal name cannot be proven safe by reading the file, and an
+    unprovable call is exactly what this fitness test must not wave through.
+    """
+    tree = ast.parse(source, filename=filename)
+
+    def names_sha1(value: object) -> bool:
+        return isinstance(value, str) and value.strip().lower().replace(
+            "-", ""
+        ).replace("_", "") == "sha1"
+
+    # Bindings that ARE hashlib.sha1 under another name, however imported.
+    aliases: set[str] = set()
+    constructors: set[str] = {"new"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "hashlib":
+            for alias in node.names:
+                if names_sha1(alias.name):
+                    aliases.add(alias.asname or alias.name)
+                elif alias.name == "new":
+                    constructors.add(alias.asname or alias.name)
+    # `sha1 = hashlib.sha1` / `digest = sha1` style rebinding.
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if not isinstance(target, ast.Name):
+            continue
+        value = node.value
+        if (isinstance(value, ast.Attribute) and names_sha1(value.attr)) or (
+            isinstance(value, ast.Name) and value.id in aliases
+        ):
+            aliases.add(target.id)
+
+    findings: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        called = ""
+        if isinstance(func, ast.Attribute):
+            called = func.attr
+        elif isinstance(func, ast.Name):
+            called = func.id
+        if names_sha1(called) or called in aliases:
+            findings.append(f"{filename}:{node.lineno}: calls {called}")
+            continue
+        if called not in constructors:
+            continue
+        # `hashlib.new(...)`: the algorithm is the first positional argument
+        # or the `name=` keyword, and it must be a literal that is not SHA-1.
+        algorithm: ast.expr | None = node.args[0] if node.args else None
+        for keyword in node.keywords:
+            if keyword.arg == "name":
+                algorithm = keyword.value
+        if algorithm is None:
+            continue
+        if not isinstance(algorithm, ast.Constant):
+            findings.append(
+                f"{filename}:{node.lineno}: {called}() algorithm is not a literal"
+            )
+        elif names_sha1(algorithm.value):
+            findings.append(f"{filename}:{node.lineno}: {called}('sha1')")
+    return findings
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    (
+        "import hashlib\nhashlib.sha1(b'x')\n",
+        "from hashlib import sha1\nsha1(b'x')\n",
+        "from hashlib import sha1 as digest\ndigest(b'x')\n",
+        "import hashlib\nsha1 = hashlib.sha1\nsha1(b'x')\n",
+        "import hashlib\nhashlib.new('sha1', b'x')\n",
+        "import hashlib\nhashlib.new(name='sha1')\n",
+        "import hashlib\nhashlib.new('SHA-1')\n",
+        "from hashlib import new\nnew('sha1')\n",
+        "from hashlib import new as build\nbuild('sha1')\n",
+        "import hashlib\nhashlib.new(ALGORITHM)\n",
+    ),
+)
+def test_the_sha1_detector_catches_every_spelling_it_claims_to(hostile):
+    """The fitness test below is only worth its assertion if it actually
+    detects the code it forbids. An attribute-call check does not: it misses
+    `from hashlib import sha1`, any alias, the `name=` keyword and a
+    non-literal algorithm, so the invariant could be violated with the test
+    still green (independent review on 988de49). These are the spellings that
+    must not slip through."""
+    assert _sha1_uses(hostile, "hostile.py")
+
+
+@pytest.mark.parametrize(
+    "benign",
+    (
+        "import hashlib\nhashlib.sha256(b'x')\n",
+        "import hashlib\nhashlib.new('sha256')\n",
+        "import hashlib\nhashlib.new(name='sha256')\n",
+        "# sha1 is never computed in this process\nvalue = 'sha1 is mentioned'\n",
+    ),
+)
+def test_the_sha1_detector_does_not_flag_trusted_digests(benign):
+    """A detector that flags SHA-256 or prose is a detector that gets disabled."""
+    assert _sha1_uses(benign, "benign.py") == []
+
+
 def test_privileged_release_modules_do_not_compute_sha1_in_process():
     root = Path(__file__).parents[2]
+    findings: list[str] = []
     for relative in (
         "ops/aicc_exact_sha_bootstrap.py",
         "ops/aicc_install_transaction.py",
+        "ops/aicc_principal_recovery_generator.py",
     ):
-        source = (root / relative).read_text(encoding="utf-8")
-        tree = ast.parse(source, filename=relative)
-        forbidden = []
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
-                continue
-            if node.func.attr == "sha1":
-                forbidden.append(node.lineno)
-            if (
-                node.func.attr == "new"
-                and node.args
-                and isinstance(node.args[0], ast.Constant)
-                and str(node.args[0].value).lower() == "sha1"
-            ):
-                forbidden.append(node.lineno)
-        assert forbidden == []
+        findings.extend(
+            _sha1_uses((root / relative).read_text(encoding="utf-8"), relative)
+        )
+    assert findings == []
 
 
 def _trusted(module, path: Path, manifest: Path, release_id: str = RELEASE_ID):
@@ -632,6 +737,25 @@ def test_read_only_release_still_verifies(committed, tmp_path):
         )
     finally:
         subprocess.run(["chmod", "-R", "u+w", str(tree)], check=True)
+
+
+def test_git_tree_authority_recurses_into_directories(committed):
+    """`git ls-tree` without `-r` emits a `tree` entry per top-level directory,
+    and the entry grammar here accepts only `blob`/`commit` -- so every commit
+    that contains a directory (all of them) refused with "unparseable Git tree
+    entry" and no release could be verified or selected at all (independent
+    review on 988de49). The authority must see the files, not the directories.
+    """
+    module = _module()
+    repo, _tree, sha = committed
+
+    blobs = module._git_tree_blobs(repo, sha)
+
+    assert "command_center/worker.py" in blobs
+    assert "deploy/run.sh" in blobs
+    assert not any(relative in {"command_center", "deploy"} for relative in blobs)
+    assert blobs["deploy/run.sh"][1] == 0o755
+    assert blobs["command_center/worker.py"][1] == 0o644
 
 
 def test_git_authority_ignores_a_planted_replacement_object(committed, tmp_path):
