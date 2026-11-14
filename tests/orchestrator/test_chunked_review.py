@@ -66,6 +66,9 @@ def publish(monkeypatch, snapshot, review_rows):
     monkeypatch.setattr(review_merge, "_rows", fake_rows)
     monkeypatch.setattr(review_merge, "_pr_diff_and_head", lambda *_: review_merge._PRSnapshotResult(snapshot, "ok"))
     monkeypatch.setattr(review_merge, "_has_accept_marker", lambda *_: (False, HEAD))
+    monkeypatch.setattr(
+        review_merge, "_marker_standing", lambda *_a, **_k: (review_merge._MARKER_ABSENT, HEAD)
+    )
     monkeypatch.setattr(review_merge, "_acceptance_app_credentials", object)
     monkeypatch.setattr(
         review_merge, "_post_marker_as_bot",

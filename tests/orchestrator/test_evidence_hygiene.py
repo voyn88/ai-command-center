@@ -148,6 +148,11 @@ def test_transient_pr_view_failed_is_not_cleared(monkeypatch):
         "_has_accept_marker_with_pull",
         lambda *_a, **_k: (False, ""),
     )
+    monkeypatch.setattr(
+        review_merge,
+        "_marker_standing",
+        lambda *_a, **_k: ("", ""),
+    )
     report = review_merge.publish_review_verdicts(object(), "/srv/aicc")
     assert cleared == []
     assert report.skipped == [("VOYN-W0-TV", "pr_view_failed")]
