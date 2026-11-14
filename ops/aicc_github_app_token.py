@@ -165,7 +165,9 @@ def store(document: dict, root: Path, *, group: str = "aicc-worker", chown: bool
         # must not move the chmod/chown elsewhere
         fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
-            os.fchmod(fd, 0o750)
+            # a directory, not a file: root:<lane group> 0750 exactly as on a
+            # worker (tmpfiles); every secret inside stays 0640
+            os.fchmod(fd, 0o750)  # nosec B103
             if chown:
                 os.fchown(fd, 0, gid)
         finally:
