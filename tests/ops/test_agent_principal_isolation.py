@@ -2597,7 +2597,7 @@ def test_the_launcher_can_write_the_model_auth_store_it_writes_refreshed_tokens_
 # review-window labeller had exactly one committed unit
 # (deploy/systemd/aicc-backlog-pr-window.{service,timer}) and it names a
 # layout control-01 does not have -- User=aicc-worker, /usr/bin/python,
-# /srv/ai-command-center. Nothing installed it there, control-01 runs
+# /srv/ai-command-center. Nothing installed it there, control-01 ran
 # hand-made voyn-aicc-{planner,review,merge,reaper,self-deploy} units only,
 # and the window-gated workflows (CI, Acceptance gate, boundary fitness) run
 # on a PR ONLY while it carries a review-window label. So every fleet PR
@@ -2605,6 +2605,10 @@ def test_the_launcher_can_write_the_model_auth_store_it_writes_refreshed_tokens_
 # until an operator installed a unit by hand at 21:15 UTC. A hand-made unit
 # lasts exactly as long as the host does; these tests are what makes the
 # rebuilt host keep it.
+#
+# VOYN-W0-AICC-UNMANAGED-LIVE-UNITS extends the same rule to self-deploy on
+# control and pgtunnel on worker: live production units with no installer are
+# defects, and "no installer" is not proof a unit is dead.
 # ---------------------------------------------------------------------------
 
 
@@ -2625,6 +2629,8 @@ def test_the_control_profile_installs_the_pr_window_tick(tmp_path):
         "voyn-aicc-remediate.timer",
         "voyn-aicc-pr-window.service",
         "voyn-aicc-pr-window.timer",
+        "voyn-aicc-self-deploy.service",
+        "voyn-aicc-self-deploy.timer",
     )
     for unit in tx.CONTROL_ONLY_UNITS:
         assert f"/etc/systemd/system/{unit}" in control
@@ -2742,6 +2748,81 @@ def test_the_installer_starts_the_control_timers_after_it_commits(tmp_path):
     assert text.index(enable) < text.index(
         "echo \"AICC_AGENT_PRINCIPAL_ISOLATION_INSTALLED\""
     ), "a failed enable must not be announced as a completed install"
+
+
+def test_control_self_deploy_is_repo_owned_not_hand_made(tmp_path):
+    """VOYN-W0-AICC-UNMANAGED-LIVE-UNITS: live on control-01 without an
+    installer is not allowed. The control profile installs the unit files and
+    the post-commit enable starts the timer; the worker profile neither
+    installs nor enables it (it retires the leftover instead)."""
+    tx, control = _specs("control", tmp_path)
+    _tx, worker = _specs("worker", tmp_path)
+    text = _installer_text()
+
+    assert "voyn-aicc-self-deploy.service" in tx.CONTROL_ONLY_UNITS
+    assert "voyn-aicc-self-deploy.timer" in tx.CONTROL_ONLY_UNITS
+    assert "voyn-aicc-self-deploy.timer" in tx.CONTROL_ONLY_TIMERS
+    assert "/etc/systemd/system/voyn-aicc-self-deploy.service" in control
+    assert "/etc/systemd/system/voyn-aicc-self-deploy.timer" in control
+    assert "/etc/systemd/system/voyn-aicc-self-deploy.service" not in worker
+    assert "/etc/systemd/system/voyn-aicc-self-deploy.timer" not in worker
+    _assert_command_inside_shell_if(
+        text,
+        "systemctl disable --now voyn-aicc-self-deploy.timer >/dev/null 2>&1 || true",
+        'if [ "$install_profile" = "worker" ]; then',
+    )
+
+
+def test_worker_pgtunnel_is_repo_owned_and_enabled_before_lanes(tmp_path):
+    """VOYN-W0-AICC-UNMANAGED-LIVE-UNITS: the tunnel every lane Requires=
+    must come from the worker generation, not a hand-made unit file, and
+    must be enabled before the staged rollout starts claimers against it."""
+    tx, worker = _specs("worker", tmp_path)
+    _tx, control = _specs("control", tmp_path)
+    text = _installer_text()
+
+    assert tx.WORKER_LIVE_UNITS == ("voyn-aicc-pgtunnel.service",)
+    assert "/etc/systemd/system/voyn-aicc-pgtunnel.service" in worker
+    assert "/etc/systemd/system/voyn-aicc-pgtunnel.service" in tx.WORKER_ONLY_TARGETS
+    assert "/etc/systemd/system/voyn-aicc-pgtunnel.service" not in control
+    enable = "systemctl enable --now voyn-aicc-pgtunnel.service"
+    _assert_command_inside_shell_if(
+        text, enable, 'if [ "$install_profile" = "worker" ]; then'
+    )
+    assert text.index(enable) < text.index(
+        "run_rollout rollout --lanes /etc/aicc/worker-lanes --assume-timers-held"
+    )
+
+
+def test_inactive_unit_candidates_are_not_deleted_on_missing_installer_alone():
+    """Inactivity on both hosts is necessary for deletion, not sufficient.
+
+    The 2026-08-30 recon listed aicc-worker / queue-reaper / worktree-prune /
+    credential-rotation* as deletion candidates because they were
+    not-found/inactive. That is the same shape as an unfinished deploy seam
+    (credential rotation is the supported worker path; queue-reaper and
+    worktree-prune are the production callers of live Python entrypoints) and
+    the same lesson as queue_store / record_mirror: 'only tests import it' or
+    'no installer' is not proof of deadness. Authority deletion is a
+    separate reversible PR after production-path proof, not this one."""
+    root = Path(__file__).parents[2]
+    retained = (
+        "aicc-worker.service",
+        "aicc-queue-reaper.service",
+        "aicc-queue-reaper.timer",
+        "aicc-worktree-prune.service",
+        "aicc-worktree-prune.timer",
+        "voyn-aicc-credential-rotation.service",
+        "voyn-aicc-credential-rotation.timer",
+        "voyn-aicc-credential-rotation-alert@.service",
+    )
+    for name in retained:
+        assert (root / "deploy/systemd" / name).is_file(), name
+    # Migration-seam modules the recon also almost deleted: still present.
+    assert (root / "command_center/queue_store.py").is_file()
+    assert (root / "command_center/db/queue_store.py").is_file()
+    assert (root / "command_center/record_mirror.py").is_file()
+    assert (root / "command_center/db/table_mirror.py").is_file()
 
 
 def test_workspace_walk_holds_descriptors_per_pending_directory_not_per_visited_one(

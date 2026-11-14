@@ -11,8 +11,12 @@ wheels уже в runtime-venv). Код из voynadmin-writable checkout
 `git archive` + `record_release_manifest` / `publish_release_tree` /
 `verify_release_manifest` / `select_release`.
 
-Control-01 по-прежнему использует `voyn-aicc-self-deploy` (migrations). Worker
-вариант `voyn-aicc-self-deploy-worker` **снят**.
+Control-01 по-прежнему использует `voyn-aicc-self-deploy` (migrations); unit
+файлы и timer ставит control-профиль installer'а
+(`CONTROL_ONLY_UNITS` / `CONTROL_ONLY_TIMERS`, см.
+`docs/operations/SYSTEMD_UNIT_AUTHORITY.md`). Worker вариант
+`voyn-aicc-self-deploy-worker` **снят**; leftover `voyn-aicc-self-deploy`
+на worker installer явно `disable --now`.
 
 ## Unit
 
