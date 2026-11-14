@@ -29,7 +29,7 @@ NAV_GROUPS: tuple[tuple[str, tuple[str, ...], bool], ...] = (
     # The core destinations the redesign keeps: overview, planning, execution,
     # projects, git. Chat/reports/generated/context are no longer their own
     # sidebar entries — they live inside the project view (task 02661825).
-    ("Основное", ("dashboard", "command", "kanban", "task_deps", "execution_center", "projects", "git_center"), True),
+    ("Основное", ("dashboard", "command", "kanban", "task_deps", "execution_center", "fleet", "projects", "git_center"), True),
     # A single, plain-language destination for a board member or investor
     # (VOYN-MIN-BOARD-LAUNCH) — kept out of "Основное" so the operator's core
     # five-destination scan is not diluted by a screen operators don't need.
