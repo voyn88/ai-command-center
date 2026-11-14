@@ -167,6 +167,17 @@ rather than raw strings. Two columns stay `text` on purpose — `owner_item.due`
 and `digest_item.day` are free-form day keys in the source and are not
 guaranteed to parse as dates.
 
+**Volume is unmeasured.** The row-count and backfill-duration figures that have
+circulated for this migration (on the order of 1.22M rows, ~6.5 minutes) come
+from extrapolating a single table's ratio in a 35 MB synthetic fixture (200,000
+`message` rows generated against 50 `contact` rows) up to the full schema —
+not from measuring production. The live database's sixteen domain tables are
+currently empty (137 rows across the whole file). Any capacity or downtime
+planning for `VOYN-W0-AICC-SRV-07` — and any dependent decision that assumes a
+migration window, such as `VOYN-W0-AICC-SRV-09` — must cite these numbers as an
+extrapolation, not a measurement, until the importer runs against real
+production volume. See [DR-SRV07-VOLUME-EXTRAPOLATION-001](../DECISIONS.md).
+
 ## Health probes
 
 | Endpoint | Meaning | Behaviour |
