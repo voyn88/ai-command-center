@@ -22,7 +22,7 @@ import command_center.runtime.db as db  # facade (late-bound; see docstring)
 # full script after a partially-applied migration is always safe)
 # --------------------------------------------------------------------------
 
-SCHEMA_VERSION = 25
+SCHEMA_VERSION = 26
 
 _SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS task (
@@ -1360,6 +1360,35 @@ CREATE INDEX IF NOT EXISTS idx_networking_invitation_project ON networking_invit
 """
 
 
+# VOYN-MIN-SILENT-AUDIT: the Silent Audit Simulator's one table, additive and
+# standalone (no foreign keys into any other family). One row per candidate
+# sha a silent pass ever recorded a result for — `candidate_sha` is UNIQUE so a
+# retried pass for the same sha is a first-write-wins no-op (see
+# `db.silent_audit.record_silent_audit_result`), which is exactly the evidence
+# `command_center.audit.silent.evaluate_silent_audit_coverage` counts against
+# the acceptance bar ("90% of changes carry a silent audit result before
+# merge"). A row is written whether the pass succeeded or not (`ok`) — the bar
+# is about an audit having been *attempted* for the change, not about it being
+# clean.
+_SCHEMA_V26 = """
+CREATE TABLE IF NOT EXISTS silent_audit_result (
+    id TEXT PRIMARY KEY,
+    candidate_sha TEXT NOT NULL UNIQUE,
+    project TEXT NOT NULL,
+    ok INTEGER NOT NULL,
+    checks_json TEXT NOT NULL DEFAULT '[]',
+    finding_count INTEGER NOT NULL DEFAULT 0,
+    deduped INTEGER NOT NULL DEFAULT 0,
+    error TEXT,
+    started_at TEXT,
+    completed_at TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_silent_audit_result_project ON silent_audit_result(project);
+"""
+
+
 # Each migration is either a raw SQL script (applied via `executescript`, every
 # statement `IF NOT EXISTS`) or a callable(conn) for changes — like `ALTER
 # TABLE ADD COLUMN` — that need their own idempotency check.
@@ -1394,4 +1423,5 @@ MIGRATIONS: list[tuple[int, str | Callable[[sqlite3.Connection], None]]] = [
     (23, _SCHEMA_V23),
     (24, _migration_24_add_finalized_at),
     (25, _migration_25_add_finalization_claim),
+    (26, _SCHEMA_V26),
 ]

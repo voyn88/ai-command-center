@@ -21,6 +21,13 @@ from __future__ import annotations
 
 from command_center.audit.registry import CheckRegistry, default_registry
 from command_center.audit.runner import AuditRunner, CollectResult
+from command_center.audit.silent import (
+    SilentAuditCoverage,
+    SilentAuditResult,
+    evaluate_silent_audit_coverage,
+    mini_sandbox,
+    run_silent_audit,
+)
 from command_center.audit.types import (
     CheckContext,
     Finding,
@@ -33,6 +40,11 @@ __all__ = [
     "CheckContext",
     "CheckRegistry",
     "Finding",
+    "SilentAuditCoverage",
+    "SilentAuditResult",
     "default_owner_for",
     "default_registry",
+    "evaluate_silent_audit_coverage",
+    "mini_sandbox",
+    "run_silent_audit",
 ]

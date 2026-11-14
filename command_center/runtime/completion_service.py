@@ -671,6 +671,13 @@ class CompletionOrchestrator:
             self._apply_assessment(row, pre, now=now)
             return runtime_db.get_completion(self.db_path, row["run_id"]), False
 
+        # The row leaves EXECUTION_FINISHED/VALIDATING_RESULT for good from here
+        # on (both branches below transition it forward), so this is the one
+        # point per run a candidate sha is both known and about to move toward a
+        # pull request: fire the Silent Audit Simulator's best-effort, sandboxed
+        # pass for it. Never affects control flow — see `_fire_silent_audit`.
+        self._fire_silent_audit(row, state)
+
         if not policy.validation_required:
             # Skip straight to the PR phase.
             self._transition(
@@ -733,6 +740,33 @@ class CompletionOrchestrator:
                 progressed=False,
             )
         return runtime_db.get_completion(self.db_path, row["run_id"]), outcome.passed
+
+    def _fire_silent_audit(self, row: dict, state) -> None:
+        """Best-effort, fire-and-forget Silent Audit Simulator pass for the
+        candidate this run is about to carry toward a pull request.
+
+        Guarded on every side: a missing head commit is skipped rather than
+        audited under a placeholder sha, and the call itself can raise nothing
+        that reaches the caller — a broken check, a sandbox-copy failure, or a
+        persistence error becomes a recorded failed result (or, at worst, no
+        record at all), never a completion-pipeline failure. This is the one
+        privileged actor's *only* use of the audit engine; it never blocks or
+        redirects the merge decision the evaluator already made.
+        """
+        head_sha = state.head_commit
+        if not head_sha:
+            return
+        try:
+            from command_center.api import audit_service
+
+            audit_service.record_silent_audit(
+                candidate_sha=head_sha,
+                project=row.get("project") or "AICC",
+                target=Path(row["repository_path"]),
+                db_path=self.db_path,
+            )
+        except Exception:  # noqa: BLE001 — never let a silent pass touch completion
+            pass
 
     def _step_pull_request(self, row: dict, *, policy: CompletionPolicy, now: datetime) -> tuple[dict, bool]:
         repo = Path(row["repository_path"])
